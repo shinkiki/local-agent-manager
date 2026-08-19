@@ -1,0 +1,47 @@
+[package]
+name = "agent-manager-core"
+version = "0.1.0"
+description = "Platform-independent domain and application core for Agent Manager"
+edition = "2021"
+publish = false
+license = "MIT"
+repository = "https://github.com/shinkiki/local-agent-manager"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+walkdir = "2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+fs4 = "1.1"
+portable-pty = "0.9"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
+cron = "0.15"
+bytes = "1"
+base64 = "0.22"
+futures-util = "0.3"
+flate2 = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-tungstenite = "0.20"
+hyper-util = { version = "0.1", features = ["tokio"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "rustls"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+zeroize = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "vendored", "crypto-rust"] }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_UI_Shell"] }
+
+[dev-dependencies]
+tempfile = "3"

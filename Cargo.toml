@@ -1,0 +1,7 @@
+[workspace]
+members = [
+  "crates/agent-manager-core",
+  "crates/agent-manager-server",
+  "src-tauri",
+]
+resolver = "2"

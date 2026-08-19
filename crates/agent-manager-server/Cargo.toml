@@ -1,0 +1,11 @@
+[package]
+name = "agent-manager-server"
+version = "0.1.0"
+description = "Loopback-only HTTP adapter for Agent Manager remote access"
+edition = "2021"
+publish = false
+license = "MIT"
+repository = "https://github.com/shinkiki/local-agent-manager"
+
+[dependencies]
+agent-manager-core = { path = "../agent-manager-core" }

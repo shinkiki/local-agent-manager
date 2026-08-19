@@ -1,0 +1,57 @@
+{
+  "name": "agent-manager-tauri",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local-first desktop manager for Claude Code, OpenAI Codex, and Google Antigravity sessions",
+  "author": "shinkiki",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shinkiki/local-agent-manager.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shinkiki/local-agent-manager/issues"
+  },
+  "homepage": "https://github.com/shinkiki/local-agent-manager#readme",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "remote": "npm run build && cargo run -p agent-manager-server -- --static-dir dist",
+    "tauri": "node ./scripts/tauri-cli.mjs",
+    "tauri:dev:remote-write": "./scripts/restart-dev.sh --remote-write",
+    "tauri:dev:restart": "./scripts/restart-dev.sh",
+    "tauri:dev:restart:remote-write": "./scripts/restart-dev.sh --remote-write",
+    "tauri:dev:signed": "tauri dev --runner ./scripts/macos/signed-dev-runner.sh",
+    "tauri:build:signed": "./scripts/macos/signed-build.sh",
+    "server:build:signed": "./scripts/macos/signed-server-build.sh",
+    "keychain:migrate:v2": "cargo run --release -p agent-manager-server -- migrate-keychain-v2",
+    "rust:fmt": "cargo fmt --all --check",
+    "rust:clippy": "cargo clippy --workspace --all-targets -- -D warnings",
+    "rust:test": "cargo test --workspace",
+    "check": "npm run build && npm run rust:fmt && npm run rust:clippy && npm run rust:test"
+  },
+  "dependencies": {
+    "@shikijs/core": "^4.4.3",
+    "@shikijs/engine-javascript": "^4.4.3",
+    "@shikijs/langs": "^4.4.3",
+    "@shikijs/themes": "^4.4.3",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.7.2",
+    "@tauri-apps/plugin-opener": "^2",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "lucide-react": "^1.28.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.4"
+  }
+}
