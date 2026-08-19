@@ -50,20 +50,18 @@ export function LogoMark({ size = 37 }: { size?: number }) {
   );
 }
 
-/** AIA 마크: 나침반 — 타륜 앱 아이콘과 같은 항해 도구 계열. 링·4방위 틱·NE 방향 바늘(앞쪽 솔리드, 뒤쪽 반투명)로 16px에서도 형태가 유지된다. */
+/** AIA 마크: 나침반 베젤(링·4방위 틱) 중앙에 타륜 허브와 같은 `>` 표식을 2시(북동) 방향으로 회전 — 프롬프트 셰브론이 곧 나침반 바늘이 된다. viewBox를 꽉 채워 소형 컨테이너에서도 여백 없이 읽힌다. */
 export function AiaMark({ size = 16 }: { size?: number }) {
   return (
     <svg className="aia-mark" width={size} height={size} viewBox="0 0 32 32" fill="currentColor" aria-hidden="true">
-      <circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" strokeWidth="2.4" />
-      <g stroke="currentColor" strokeWidth="1.7" opacity="0.55" fill="none">
-        <path d="M16 5.1 L16 7.1" />
-        <path d="M26.9 16 L24.9 16" />
-        <path d="M16 26.9 L16 24.9" />
-        <path d="M5.1 16 L7.1 16" />
+      <circle cx="16" cy="16" r="14.2" fill="none" stroke="currentColor" strokeWidth="2.6" />
+      <g stroke="currentColor" strokeWidth="2.2" fill="none">
+        <path d="M16 4.1 L16 6.6" />
+        <path d="M27.9 16 L25.4 16" />
+        <path d="M16 27.9 L16 25.4" />
+        <path d="M4.1 16 L6.6 16" />
       </g>
-      <path d="M8.79 23.21 L18.19 18.19 L13.81 13.81 Z" opacity="0.42" />
-      <path d="M23.21 8.79 L18.19 18.19 L13.81 13.81 Z" />
-      <circle cx="16" cy="16" r="2.1" />
+      <path d="M12.6 9.4 L20.4 16 L12.6 22.6" fill="none" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" transform="rotate(-45 16 16) translate(1.8 0)" />
     </svg>
   );
 }

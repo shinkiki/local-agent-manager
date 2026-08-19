@@ -527,7 +527,7 @@ export function AiaChatPopup({ open, provider, providerName, providerConnected, 
   return (
     <aside className={`aia-chat-popup${open ? " open" : ""}`} aria-label="AIA 시스템 에이전트" aria-hidden={!open}>
       <header className="aia-chat-header">
-        <div className="aia-avatar"><AiaMark size={18} /></div>
+        <div className="aia-avatar"><AiaMark size={24} /></div>
         <div><strong>AIA <span>아이아</span></strong><small><i className={`terminal-status terminal-status-${phase}`} />Agent Manager ({providerName})</small></div>
         <div className="aia-header-actions">
           {providerConnected && <button type="button" onClick={() => void newConversation()} disabled={starting} title={session ? "새 AIA 대화" : "AIA 다시 시작"}><RefreshCw size={15} /></button>}
@@ -537,7 +537,7 @@ export function AiaChatPopup({ open, provider, providerName, providerConnected, 
 
       {!providerConnected ? (
         <div className="aia-unavailable">
-          <AiaMark size={28} />
+          <AiaMark size={34} />
           <strong>AIA를 시작하려면 {providerName} CLI 연결이 필요합니다.</strong>
           <small>시스템 설정 &gt; 시스템 에이전트에서 다른 공급자를 고를 수도 있습니다.</small>
           <button className="button primary" type="button" onClick={onConnectProvider}>{providerName} 연결</button>

@@ -765,7 +765,7 @@ function App() {
               title={!aiaProviderId
                 ? AIA_DISABLED_HINT
                 : aiaAttention?.kind === "approval" ? "AIA 권한 승인이 필요합니다" : aiaAttention ? "AIA 답변을 확인하세요" : "AIA 열기"}
-            ><AiaMark size={16} /><span className="aia-trigger-name">AIA</span>{aiaAttention && <span className="aia-attention-label" aria-hidden="true">...</span>}</button>
+            ><AiaMark size={18} /><span className="aia-trigger-name">AIA</span>{aiaAttention && <span className="aia-attention-label" aria-hidden="true">...</span>}</button>
             <ChatAttentionCenter snapshot={visibleChatAttention} sessions={snapshot.sessions} onOpen={openAttentionItem} onMarkAllRead={markAllAttentionRead} onClearRead={clearReadAttention} onDismiss={dismissAttention} />
           </div>
         </header>
