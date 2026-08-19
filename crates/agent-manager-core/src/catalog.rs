@@ -1,4 +1,4 @@
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
@@ -357,6 +357,7 @@ fn compose_manager_snapshot(
     let metadata = store::load_metadata(app_data_dir)?;
     let mut sessions = raw_catalog_sessions(persisted);
     sessions.retain(|session| !is_aia_workspace_session(session, app_data_dir));
+    sessions = dedupe_sessions_by_identity(sessions);
     for session in &mut sessions {
         apply_session_metadata(session, &metadata.sessions);
     }
@@ -416,6 +417,48 @@ fn raw_catalog_sessions(persisted: &PersistedSessionCatalog) -> Vec<SessionSumma
     sessions.extend(persisted.codex_sessions.clone());
     sessions.extend(persisted.antigravity_sessions.clone());
     sessions
+}
+
+/// 같은 공급자의 같은 세션 ID는 하나의 논리 세션이므로 목록에 한 번만 남긴다.
+/// macOS는 한글 경로를 NFD로 정규화해 저장하므로 `~/.claude/projects` 아래에
+/// 같은 작업 경로가 NFC/NFD 두 디렉터리로 갈라지고 같은 세션 기록이 양쪽에 남을 수 있다.
+/// 이때 최신·완전한 쪽을 결정론적으로 남겨 새로고침마다 순서가 흔들리지 않게 한다.
+fn dedupe_sessions_by_identity(sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
+    let mut positions: HashMap<(ProviderId, String), usize> = HashMap::new();
+    let mut deduped: Vec<SessionSummary> = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let key = (session.source, session.id.clone());
+        match positions.get(&key) {
+            Some(&index) => {
+                if prefers_session(&session, &deduped[index]) {
+                    deduped[index] = session;
+                }
+            }
+            None => {
+                positions.insert(key, deduped.len());
+                deduped.push(session);
+            }
+        }
+    }
+    deduped
+}
+
+/// 같은 논리 세션의 후보 중 남길 항목을 고른다. 최근 갱신 → 더 많은 메시지 →
+/// 더 큰 파일 순으로 비교하고, 모두 같으면 파일 경로가 앞서는 쪽을 남겨 결과를 고정한다.
+fn prefers_session(candidate: &SessionSummary, current: &SessionSummary) -> bool {
+    match session_completeness(candidate).cmp(&session_completeness(current)) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => candidate.file_path < current.file_path,
+    }
+}
+
+fn session_completeness(session: &SessionSummary) -> (i64, u64, u64) {
+    (
+        session.updated_at.unwrap_or(i64::MIN),
+        session.message_count.unwrap_or_default(),
+        session.size_bytes.unwrap_or_default(),
+    )
 }
 
 pub fn load_manager_snapshot(app_data_dir: &Path) -> Result<ManagerSnapshot, CoreError> {
@@ -846,19 +889,20 @@ fn reconcile_claude_target(
     persisted: &mut PersistedSessionCatalog,
     id: &str,
 ) -> Result<bool, CoreError> {
-    let previous_index = persisted.claude.iter().position(|entry| {
-        Path::new(&entry.path)
-            .file_stem()
-            .and_then(|value| value.to_str())
-            == Some(id)
-    });
     let Some(path) = find_claude_session_path(home, id) else {
-        if let Some(index) = previous_index {
-            persisted.claude.remove(index);
-            return Ok(true);
-        }
-        return Ok(false);
+        let before = persisted.claude.len();
+        persisted
+            .claude
+            .retain(|entry| claude_entry_id(entry) != Some(id));
+        return Ok(persisted.claude.len() != before);
     };
+    // 같은 ID의 기록 파일이 여러 디렉터리에 있을 수 있으므로 파일 경로로 대상을 찾는다.
+    // 파일 이름만 비교하면 다른 파일의 스캔 결과를 엉뚱한 항목에 덮어써 사본이 생긴다.
+    let path_text = path.to_string_lossy().into_owned();
+    let previous_index = persisted
+        .claude
+        .iter()
+        .position(|entry| entry.path == path_text);
     let fingerprint = fingerprint_file(&path)?;
     let previous = previous_index.map(|index| persisted.claude[index].clone());
     if previous
@@ -901,18 +945,46 @@ fn claude_session_paths(home: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// 같은 세션 기록이 여러 프로젝트 디렉터리(NFC/NFD 정규화 차이 등)에 남아 있어도
+/// 항상 같은 파일을 고르도록 최근 수정 → 큰 파일 → 앞선 경로 순으로 결정한다.
+/// 디렉터리 순회 순서에 기대면 목록과 상세 화면이 서로 다른 파일을 볼 수 있다.
 fn find_claude_session_path(home: &Path, id: &str) -> Option<PathBuf> {
     let projects = fs::read_dir(home.join(".claude/projects")).ok()?;
+    let mut best: Option<((i64, u64), PathBuf)> = None;
     for project in projects.flatten() {
         if !project.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
         let candidate = project.path().join(format!("{id}.jsonl"));
-        if candidate.is_file() {
-            return Some(candidate);
+        let Ok(metadata) = fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let rank = (
+            system_time_ms(metadata.modified().ok()).unwrap_or(i64::MIN),
+            metadata.len(),
+        );
+        let better = match best.as_ref() {
+            Some((best_rank, best_path)) => match rank.cmp(best_rank) {
+                Ordering::Greater => true,
+                Ordering::Less => false,
+                Ordering::Equal => candidate < *best_path,
+            },
+            None => true,
+        };
+        if better {
+            best = Some((rank, candidate));
         }
     }
-    None
+    best.map(|(_, path)| path)
+}
+
+fn claude_entry_id(entry: &ClaudeCatalogEntry) -> Option<&str> {
+    Path::new(&entry.path)
+        .file_stem()
+        .and_then(|value| value.to_str())
 }
 
 fn fingerprint_file(path: &Path) -> Result<FileFingerprint, CoreError> {
@@ -2929,6 +3001,171 @@ mod tests {
             file_path: String::new(),
             meta: SessionMeta::default(),
         }
+    }
+
+    fn claude_session_file_in(home: &Path, project_name: &str, id: &str) -> PathBuf {
+        let project = home.join(".claude/projects").join(project_name);
+        fs::create_dir_all(&project).expect("claude project directory");
+        project.join(format!("{id}.jsonl"))
+    }
+
+    fn claude_turns(count: usize, minute_offset: usize) -> Vec<Value> {
+        (0..count)
+            .map(|index| {
+                json!({
+                    "type": "user",
+                    "timestamp": format!("2026-08-06T01:{:02}:00Z", index + minute_offset),
+                    "cwd": "/workspace/project",
+                    "message": {"content": format!("turn {index}")}
+                })
+            })
+            .collect()
+    }
+
+    fn dedupe_candidate(
+        id: &str,
+        updated_at: i64,
+        message_count: u64,
+        path: &str,
+    ) -> SessionSummary {
+        SessionSummary {
+            source: ProviderId::Claude,
+            id: id.to_owned(),
+            updated_at: Some(updated_at),
+            message_count: Some(message_count),
+            file_path: path.to_owned(),
+            ..session_with_cwd(id, PathBuf::from("/workspace/project"))
+        }
+    }
+
+    #[test]
+    fn manager_snapshot_keeps_one_entry_per_session_identity() {
+        let sessions = vec![
+            dedupe_candidate("shared", 100, 97, "/b.jsonl"),
+            dedupe_candidate("shared", 200, 102, "/a.jsonl"),
+            dedupe_candidate("other", 150, 12, "/c.jsonl"),
+        ];
+
+        let deduped = dedupe_sessions_by_identity(sessions);
+
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].id, "shared");
+        assert_eq!(deduped[0].message_count, Some(102));
+        assert_eq!(deduped[0].file_path, "/a.jsonl");
+        assert_eq!(deduped[1].id, "other");
+    }
+
+    #[test]
+    fn session_identity_dedupe_keeps_different_sources_and_breaks_ties_by_path() {
+        let mut codex = dedupe_candidate("shared", 100, 5, "/codex.jsonl");
+        codex.source = ProviderId::Codex;
+        let sessions = vec![
+            dedupe_candidate("shared", 100, 5, "/z.jsonl"),
+            codex,
+            dedupe_candidate("shared", 100, 5, "/a.jsonl"),
+        ];
+
+        let deduped = dedupe_sessions_by_identity(sessions);
+
+        assert_eq!(deduped.len(), 2, "다른 공급자의 같은 ID는 별개 세션이다");
+        assert_eq!(deduped[0].source, ProviderId::Claude);
+        assert_eq!(
+            deduped[0].file_path, "/a.jsonl",
+            "모든 지표가 같으면 경로가 앞선 항목으로 고정한다"
+        );
+        assert_eq!(deduped[1].source, ProviderId::Codex);
+    }
+
+    #[test]
+    fn claude_session_recorded_in_two_project_directories_lists_once() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let data = root.path().join("data");
+        // macOS는 한글 경로를 NFD로 저장해 같은 작업 경로가 두 프로젝트 디렉터리로 갈라진다.
+        let stale = claude_session_file_in(
+            &home,
+            "-Users-me-Documents-\u{1102}\u{1173}",
+            TEST_SESSION_ID,
+        );
+        let latest = claude_session_file_in(&home, "-Users-me-Documents-\u{b4dc}", TEST_SESSION_ID);
+        write_json_lines(&stale, &claude_turns(2, 0));
+        write_json_lines(&latest, &claude_turns(4, 10));
+
+        let catalog =
+            SessionCatalog::open_with_home(data.clone(), home.clone()).expect("session catalog");
+        let snapshot = catalog.manager_snapshot().expect("initial snapshot");
+        assert_eq!(
+            snapshot.sessions.len(),
+            1,
+            "같은 논리 세션은 한 번만 보여야 한다"
+        );
+        assert_eq!(snapshot.sessions[0].message_count, Some(4));
+        assert_eq!(snapshot.sessions[0].file_path, latest.to_string_lossy());
+        assert_eq!(
+            find_claude_session_path(&home, TEST_SESSION_ID).as_deref(),
+            Some(latest.as_path()),
+            "상세 조회도 목록과 같은 기록 파일을 읽어야 한다"
+        );
+
+        catalog
+            .refresh_session(ProviderId::Claude, TEST_SESSION_ID)
+            .expect("single session refresh");
+        let refreshed = catalog.manager_snapshot().expect("refreshed snapshot");
+        assert_eq!(
+            refreshed.sessions.len(),
+            1,
+            "단일 세션 갱신 후에도 중복이 없어야 한다"
+        );
+        assert_eq!(refreshed.sessions[0].message_count, Some(4));
+
+        catalog.reconcile().expect("full reconciliation");
+        let reconciled = catalog.manager_snapshot().expect("reconciled snapshot");
+        assert_eq!(
+            reconciled.sessions.len(),
+            1,
+            "전체 조정 후에도 중복이 되살아나면 안 된다"
+        );
+        assert_eq!(reconciled.sessions[0].message_count, Some(4));
+        assert_eq!(reconciled.sessions[0].file_path, latest.to_string_lossy());
+    }
+
+    #[test]
+    fn refreshing_one_session_does_not_overwrite_another_files_catalog_entry() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        // 경로 순으로는 오래된 기록이 앞서고, 실제로 고를 파일은 뒤쪽에 있는 실제 재현 배치다.
+        let stale = claude_session_file_in(&home, "project-a", TEST_SESSION_ID);
+        let latest = claude_session_file_in(&home, "project-b", TEST_SESSION_ID);
+        write_json_lines(&stale, &claude_turns(2, 0));
+        write_json_lines(&latest, &claude_turns(4, 10));
+
+        let mut persisted = PersistedSessionCatalog::default();
+        reconcile_provider_cache(&home, &mut persisted, None, None).expect("initial scan");
+        assert_eq!(
+            persisted.claude.len(),
+            2,
+            "파일별 증분 스캔 상태는 그대로 유지한다"
+        );
+
+        reconcile_claude_target(&home, &mut persisted, TEST_SESSION_ID).expect("targeted refresh");
+
+        assert_eq!(persisted.claude.len(), 2);
+        let paths = persisted
+            .claude
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&stale.to_string_lossy().into_owned()));
+        assert!(paths.contains(&latest.to_string_lossy().into_owned()));
+        let stale_entry = persisted
+            .claude
+            .iter()
+            .find(|entry| entry.path == stale.to_string_lossy())
+            .expect("stale entry");
+        assert_eq!(
+            stale_entry.scan.message_count, 2,
+            "다른 파일의 스캔 결과가 덮어써지면 안 된다"
+        );
     }
 
     #[test]

@@ -26,6 +26,7 @@ import { selectAiaAttention, withoutAiaAttention } from "./lib/aiaAttention";
 import { aiaRuntimeProvider } from "./lib/aiaRuntime";
 import { accountUsageDisplayState } from "./lib/accountUsage";
 import { useI18n } from "./lib/i18n";
+import { normalizeManagerSnapshot } from "./lib/sessionCatalog";
 import { applyAccentColor, applyThemeMode, loadAccentColor, loadThemeMode, saveAccentColor, saveThemeMode } from "./lib/theme";
 import { notifyAutoSwitchEvents, notifyNewAttention } from "./lib/webNotifications";
 import { listen } from "@tauri-apps/api/event";
@@ -141,7 +142,7 @@ function App() {
   const refresh = useCallback(async (propagateError = false) => {
     setError(null);
     try {
-      const next = await getManagerSnapshot();
+      const next = normalizeManagerSnapshot(await getManagerSnapshot());
       snapshotRef.current = next;
       setSnapshot(next);
       setReconnecting(false);
@@ -764,7 +765,7 @@ function App() {
               title={!aiaProviderId
                 ? AIA_DISABLED_HINT
                 : aiaAttention?.kind === "approval" ? "AIA 권한 승인이 필요합니다" : aiaAttention ? "AIA 답변을 확인하세요" : "AIA 열기"}
-            ><AiaMark size={16} /><span className="aia-trigger-name">AIA</span>{aiaAttention && <span className="aia-attention-label" aria-hidden="true">...</span>}</button>
+            ><AiaMark size={18} /><span className="aia-trigger-name">AIA</span>{aiaAttention && <span className="aia-attention-label" aria-hidden="true">...</span>}</button>
             <ChatAttentionCenter snapshot={visibleChatAttention} sessions={snapshot.sessions} onOpen={openAttentionItem} onMarkAllRead={markAllAttentionRead} onClearRead={clearReadAttention} onDismiss={dismissAttention} />
           </div>
         </header>
