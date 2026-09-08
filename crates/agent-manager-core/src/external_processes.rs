@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::ProviderId;
+#[cfg(unix)]
+use crate::process_signal;
 use crate::CoreError;
 
 const SIGTERM_GRACE: Duration = Duration::from_secs(3);
@@ -91,36 +93,12 @@ pub fn terminate_external_provider_processes(
     Ok(terminate_processes(provider, targets))
 }
 
-/// 외부 공급자 CLI 프로세스가 하나라도 실행 중인지 판정한다. 프로세스 표
-/// 조회가 실패하면 보수적으로 실행 중으로 간주한다.
-#[cfg(unix)]
-pub(crate) fn external_provider_process_running(provider: ProviderId) -> bool {
-    list_external_provider_processes(provider)
-        .map(|processes| !processes.is_empty())
-        .unwrap_or(true)
-}
-
-/// Windows는 아직 프로세스 트리 스냅숏을 지원하지 않아 tasklist 이미지 이름
-/// 휴리스틱으로만 판정한다.
-#[cfg(not(unix))]
-pub(crate) fn external_provider_process_running(provider: ProviderId) -> bool {
-    let output = Command::new("tasklist")
-        .args(["/FO", "CSV", "/NH"])
-        .output();
-    let Ok(output) = output else {
-        return true;
-    };
-    let lower = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-    match provider {
-        ProviderId::Codex => lower.contains("codex.exe"),
-        ProviderId::Claude => lower.contains("claude.exe"),
-        ProviderId::Antigravity => false,
-    }
-}
-
 #[cfg(unix)]
 fn snapshot_process_table() -> Result<Vec<PsEntry>, CoreError> {
-    let output = Command::new("/bin/ps")
+    let ps = crate::process_signal::ps_executable().map_err(|error| {
+        CoreError::Runtime(format!("프로세스 목록을 조회하지 못했습니다: {error}"))
+    })?;
+    let output = Command::new(ps)
         .args(["-axo", "pid=,ppid=,uid=,args="])
         .output()
         .map_err(|error| {
@@ -256,12 +234,71 @@ fn matches_provider_command(provider: ProviderId, command: &str) -> bool {
     if token_matches(first, target) {
         return true;
     }
-    if matches!(basename(first), Some("node" | "bun" | "deno")) {
-        if let Some(script) = tokens.next() {
-            return token_matches(script, target);
+    if let Some(runtime) = runtime_wrapper(first) {
+        while let Some(token) = tokens.next() {
+            if runtime_option_consumes_next_argument(runtime, token) {
+                let _ = tokens.next();
+                continue;
+            }
+            if token.starts_with('-') {
+                continue;
+            }
+            return token_matches(token, target);
         }
     }
     false
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeWrapper {
+    Node,
+    Bun,
+    Deno,
+}
+
+fn runtime_wrapper(executable: &str) -> Option<RuntimeWrapper> {
+    match basename(executable) {
+        Some("node") => Some(RuntimeWrapper::Node),
+        Some("bun") => Some(RuntimeWrapper::Bun),
+        Some("deno") => Some(RuntimeWrapper::Deno),
+        _ => None,
+    }
+}
+
+/// 런타임 옵션 중 다음 토큰을 값으로 소비하는, 명시적으로 알고 있는 옵션만
+/// 건너뛴다. 알 수 없는 옵션은 소비하지 않아 실제 스크립트를 놓치지 않는다.
+fn runtime_option_consumes_next_argument(runtime: RuntimeWrapper, option: &str) -> bool {
+    match runtime {
+        RuntimeWrapper::Node => matches!(
+            option,
+            "-e" | "--eval"
+                | "-p"
+                | "--print"
+                | "-r"
+                | "--require"
+                | "--import"
+                | "--loader"
+                | "--experimental-loader"
+                | "--conditions"
+        ),
+        RuntimeWrapper::Bun => matches!(
+            option,
+            "-r" | "--require" | "--import" | "--preload" | "--conditions"
+        ),
+        RuntimeWrapper::Deno => matches!(
+            option,
+            "--import-map"
+                | "--config"
+                | "--lock"
+                | "--cert"
+                | "--location"
+                | "--seed"
+                | "--v8-flags"
+                | "--inspect"
+                | "--inspect-brk"
+                | "--inspect-wait"
+        ),
+    }
 }
 
 fn token_matches(token: &str, target: &str) -> bool {
@@ -342,10 +379,9 @@ fn terminate_processes(
 
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: libc::c_int) {
-    // 이미 사라진 프로세스(ESRCH)는 성공 경로이므로 결과는 확인하지 않는다.
-    unsafe {
-        libc::kill(pid as libc::pid_t, signal);
-    }
+    // 이미 사라진 프로세스는 성공 경로이고, 남은 프로세스는 어차피 유예 시간 뒤에 다시
+    // 확인하므로 전달 결과는 보지 않는다.
+    let _ = process_signal::signal_pid(pid, signal);
 }
 
 #[cfg(unix)]
@@ -366,13 +402,13 @@ fn wait_for_exit(
 
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
-    let pid = pid as libc::pid_t;
     // 자신의 자식이었던 프로세스가 좀비로 남지 않게 기회가 될 때마다 회수한다.
-    let mut status: libc::c_int = 0;
-    unsafe {
-        libc::waitpid(pid, &mut status, libc::WNOHANG);
-    }
-    unsafe { libc::kill(pid, 0) == 0 }
+    process_signal::reap_zombie_child(pid);
+    // 신호를 보낼 권한이 없는 프로세스는 종료를 확인할 수단도 없으므로 종료로 본다.
+    matches!(
+        process_signal::signal_pid(pid, 0),
+        Ok(process_signal::SignalDelivery::Delivered)
+    )
 }
 
 #[cfg(test)]
@@ -412,6 +448,26 @@ mod tests {
         assert!(matches_provider_command(
             claude,
             "node /opt/tools/claude --ide"
+        ));
+        assert!(matches_provider_command(
+            claude,
+            "node --max-old-space-size=4096 /opt/tools/claude --ide"
+        ));
+        assert!(matches_provider_command(
+            claude,
+            "node -r preload /opt/tools/claude --ide"
+        ));
+        assert!(matches_provider_command(
+            claude,
+            "node --require preload --import bootstrap.mjs --experimental-loader loader.mjs --conditions development /opt/tools/claude --ide"
+        ));
+        assert!(matches_provider_command(
+            claude,
+            "bun --preload bootstrap.ts /opt/tools/claude --ide"
+        ));
+        assert!(matches_provider_command(
+            claude,
+            "deno --config deno.json /opt/tools/claude --ide"
         ));
         assert!(matches_provider_command(
             codex,

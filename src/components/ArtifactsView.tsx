@@ -7,7 +7,8 @@ import { artifactGroupTranslationId, artifactTranslationId, useMenuTranslations 
 import type { ArtifactDetail, ArtifactGroup, ArtifactSummary, SystemAutomationSnapshot, TranslatedDetail, TranslationSummary } from "../types";
 import { MarkdownPreview } from "./MarkdownPreview";
 import { Drawer, EmptyState, ErrorBanner, LoadingState } from "./Shared";
-import { TranslationProgress } from "./TranslationProgress";
+import { TranslateResourceButton, TranslationProgress } from "./TranslationProgress";
+import { errorText } from "../lib/errorText";
 
 export function ArtifactsView({ groups, automation, onAutomationChange }: { groups: ArtifactGroup[]; automation: SystemAutomationSnapshot | null; onAutomationChange: (snapshot: SystemAutomationSnapshot) => void }) {
   const { text } = useI18n();
@@ -35,10 +36,10 @@ export function ArtifactsView({ groups, automation, onAutomationChange }: { grou
       </section>
       {filtered.length === 0 ? <EmptyState title={text("아티팩트가 없습니다", "No artifacts")} detail={text("Antigravity brain 폴더의 작업 목록·계획·워크스루를 탐지합니다.", "Tasks, plans, and walkthroughs are discovered from Antigravity brain folders.")} /> : (
         <section className="artifact-groups">
-          {filtered.map((group) => <ArtifactGroupCard group={group} translations={translationEnabled ? translations.records : new Map()} key={`${group.rootName}:${group.conversationId}`} onSelect={setSelected} />)}
+          {filtered.map((group) => <ArtifactGroupCard group={group} translations={translations.records} key={`${group.rootName}:${group.conversationId}`} onSelect={setSelected} />)}
         </section>
       )}
-      {selected && <ArtifactDrawer artifact={selected} translated={translationEnabled ? translations.records.get(artifactTranslationId(selected.rootName, selected.conversationId, selected.name)) : undefined} translationRevision={automation?.revision ?? 0} onClose={() => setSelected(null)} />}
+      {selected && <ArtifactDrawer artifact={selected} translated={translations.records.get(artifactTranslationId(selected.rootName, selected.conversationId, selected.name))} automation={automation} onAutomationChange={onAutomationChange} onClose={() => setSelected(null)} />}
     </div>
   );
 }
@@ -69,7 +70,8 @@ function ArtifactGroupCard({ group, translations, onSelect }: { group: ArtifactG
   );
 }
 
-function ArtifactDrawer({ artifact, translated, translationRevision, onClose }: { artifact: ArtifactSummary; translated?: TranslationSummary; translationRevision: number; onClose: () => void }) {
+function ArtifactDrawer({ artifact, translated, automation, onAutomationChange, onClose }: { artifact: ArtifactSummary; translated?: TranslationSummary; automation: SystemAutomationSnapshot | null; onAutomationChange: (snapshot: SystemAutomationSnapshot) => void; onClose: () => void }) {
+  const translationRevision = automation?.revision ?? 0;
   const { text } = useI18n();
   const [detail, setDetail] = useState<ArtifactDetail | null>(null);
   const [translatedDetail, setTranslatedDetail] = useState<TranslatedDetail | null>(null);
@@ -81,11 +83,24 @@ function ArtifactDrawer({ artifact, translated, translationRevision, onClose }: 
       translated ? getTranslatedDetail("artifacts", artifactTranslationId(artifact.rootName, artifact.conversationId, artifact.name)) : Promise.resolve(null),
     ])
       .then(([value, translatedValue]) => { if (active) { setDetail(value); setTranslatedDetail(translatedValue); } })
-      .catch((cause: unknown) => active && setError(cause instanceof Error ? cause.message : String(cause)));
+      .catch((cause: unknown) => active && setError(errorText(cause)));
     return () => { active = false; };
   }, [artifact, translated, translationRevision]);
   return (
-    <Drawer title={<span data-user-content>{artifactTypeName(artifact.artifactType, artifact.name, text)}</span>} onClose={onClose}>
+    <Drawer
+      title={<span data-user-content>{artifactTypeName(artifact.artifactType, artifact.name, text)}</span>}
+      actions={(
+        <TranslateResourceButton
+          menu="artifacts"
+          resourceId={artifactTranslationId(artifact.rootName, artifact.conversationId, artifact.name)}
+          alsoResourceIds={[artifactGroupTranslationId(artifact.rootName, artifact.conversationId)]}
+          translated={Boolean(translated)}
+          automation={automation}
+          onAutomationChange={onAutomationChange}
+        />
+      )}
+      onClose={onClose}
+    >
       {error && <ErrorBanner message={error} />}
       {!detail && !error ? <LoadingState label={text("아티팩트를 읽고 있습니다", "Reading artifact")} /> : detail && (
         <>
@@ -108,10 +123,15 @@ function isMarkdownArtifact(name: string): boolean {
   return /\.(md|markdown)$/i.test(name);
 }
 
+const artifactTypeLabels: Readonly<Record<string, readonly [ko: string, en: string]>> = {
+  ARTIFACT_TYPE_TASK: ["작업 목록", "Task list"],
+  ARTIFACT_TYPE_IMPLEMENTATION_PLAN: ["구현 계획", "Implementation plan"],
+  ARTIFACT_TYPE_WALKTHROUGH: ["워크스루", "Walkthrough"],
+};
+
 function artifactTypeName(type: string | null, fallback: string, text: (ko: string, en: string) => string): string {
-  if (type === "ARTIFACT_TYPE_TASK") return text("작업 목록", "Task list");
-  if (type === "ARTIFACT_TYPE_IMPLEMENTATION_PLAN") return text("구현 계획", "Implementation plan");
-  if (type === "ARTIFACT_TYPE_WALKTHROUGH") return text("워크스루", "Walkthrough");
+  const label = type ? artifactTypeLabels[type] : undefined;
+  if (label) return text(...label);
   return fallback.replace(/\.md$/i, "");
 }
 

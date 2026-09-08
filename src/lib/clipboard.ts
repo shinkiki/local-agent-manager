@@ -1,5 +1,8 @@
+export const EMPTY_CLIPBOARD_TEXT_ERROR = "복사할 내용이 없습니다.";
+export const UNSUPPORTED_CLIPBOARD_ERROR = "이 환경에서는 클립보드에 쓸 수 없습니다.";
+
 export async function writeClipboardText(text: string): Promise<void> {
-  if (!text) throw new Error("복사할 내용이 없습니다.");
+  if (!text) throw new Error(EMPTY_CLIPBOARD_TEXT_ERROR);
 
   if (navigator.clipboard?.writeText) {
     try {
@@ -12,7 +15,7 @@ export async function writeClipboardText(text: string): Promise<void> {
   }
 
   if (!fallbackCopyText(text)) {
-    throw new Error("이 환경에서는 클립보드에 쓸 수 없습니다.");
+    throw new Error(UNSUPPORTED_CLIPBOARD_ERROR);
   }
 }
 

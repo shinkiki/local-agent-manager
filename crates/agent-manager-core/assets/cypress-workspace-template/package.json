@@ -1,0 +1,6 @@
+{
+  "name": "agent-manager-cypress-workspace",
+  "private": true,
+  "description": "Agent Manager Cypress 자동화 작업공간. 설정 → 자동화 탭의 '설치'가 devDependencies에 cypress를 넣는다.",
+  "devDependencies": {}
+}

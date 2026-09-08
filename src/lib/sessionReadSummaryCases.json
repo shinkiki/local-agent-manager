@@ -1,0 +1,105 @@
+{
+  "note": "세션 참조 정책 한 줄 요약 규칙. src/lib/sessionReadPolicy.ts와 crates/agent-manager-core/src/session_context.rs가 이 파일을 함께 읽어 같은 문구를 내는지 검증한다.",
+  "cases": [
+    {
+      "name": "사용하지 않으면 다른 값이 무엇이든 한 문구로 끝난다",
+      "policy": {
+        "enabled": false,
+        "projectScope": "allRegistered",
+        "providers": ["codex"],
+        "period": { "kind": "recentDays", "days": 30 },
+        "detail": "limitedTranscript",
+        "maxSessions": 500
+      },
+      "summary": "세션 참조 사용 안 함"
+    },
+    {
+      "name": "전체 등록 프로젝트에 지난주 작업 근거",
+      "policy": {
+        "enabled": true,
+        "projectScope": "allRegistered",
+        "providers": ["codex", "claude"],
+        "period": { "kind": "relative", "unit": "week", "count": 1 },
+        "detail": "workRationale",
+        "maxSessions": 100
+      },
+      "summary": "전체 등록 프로젝트 · Codex/Claude · 지난주 · 작업 근거 · 최대 100개"
+    },
+    {
+      "name": "일정 작업 경로와 보고기간 기본값",
+      "policy": {
+        "enabled": true,
+        "projectScope": "scheduleCwd",
+        "providers": [],
+        "period": { "kind": "reportPeriod" },
+        "detail": "summary",
+        "maxSessions": 50
+      },
+      "summary": "일정 작업 경로 · 전체 공급자 · 보고기간 · 요약 · 최대 50개"
+    },
+    {
+      "name": "선택 프로젝트 수와 최근 N일",
+      "policy": {
+        "enabled": true,
+        "projectScope": "selected",
+        "projects": ["/tmp/a", "/tmp/b", "/tmp/c"],
+        "providers": ["claude"],
+        "period": { "kind": "recentDays", "days": 14 },
+        "detail": "limitedTranscript",
+        "maxSessions": 20
+      },
+      "summary": "선택 프로젝트 3개 · Claude · 최근 14일 · 제한된 원문 · 최대 20개"
+    },
+    {
+      "name": "기본값이 아닌 상태·연결 파일·민감정보 수준은 뒤에 붙는다",
+      "policy": {
+        "enabled": true,
+        "projectScope": "allRegistered",
+        "providers": ["antigravity"],
+        "period": { "kind": "relative", "unit": "month", "count": 1 },
+        "statuses": ["completed", "failed"],
+        "detail": "workRationale",
+        "maxSessions": 200,
+        "includeLinkedFiles": true,
+        "redaction": "strict"
+      },
+      "summary": "전체 등록 프로젝트 · Antigravity · 지난달 · 작업 근거 · 최대 200개 · 완료·실패만 · 연결 파일 포함 · 민감정보 강력 제거"
+    },
+    {
+      "name": "상대 기간 복수 단위와 직접 범위",
+      "policy": {
+        "enabled": true,
+        "projectScope": "scheduleCwd",
+        "providers": ["codex"],
+        "period": { "kind": "relative", "unit": "day", "count": 3 },
+        "detail": "summary",
+        "maxSessions": 10
+      },
+      "summary": "일정 작업 경로 · Codex · 지난 3일 · 요약 · 최대 10개"
+    },
+    {
+      "name": "어제와 지난 2주",
+      "policy": {
+        "enabled": true,
+        "projectScope": "scheduleCwd",
+        "providers": [],
+        "period": { "kind": "relative", "unit": "day", "count": 1 },
+        "detail": "summary",
+        "maxSessions": 5
+      },
+      "summary": "일정 작업 경로 · 전체 공급자 · 어제 · 요약 · 최대 5개"
+    },
+    {
+      "name": "직접 지정한 절대 범위",
+      "policy": {
+        "enabled": true,
+        "projectScope": "allRegistered",
+        "providers": [],
+        "period": { "kind": "absoluteRange", "from": 1000, "to": 2000 },
+        "detail": "workRationale",
+        "maxSessions": 50
+      },
+      "summary": "전체 등록 프로젝트 · 전체 공급자 · 직접 범위 · 작업 근거 · 최대 50개"
+    }
+  ]
+}

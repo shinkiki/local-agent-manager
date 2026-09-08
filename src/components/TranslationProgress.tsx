@@ -1,6 +1,83 @@
-import { RotateCcw } from "lucide-react";
+import { Languages, RotateCcw } from "lucide-react";
+import { useState } from "react";
+import { translateResource } from "../lib/ipc";
 import { useI18n } from "../lib/i18n";
-import type { TranslationStatus } from "../types";
+import type { SystemAutomationSnapshot, TranslationMenu, TranslationStatus } from "../types";
+import { errorText } from "../lib/errorText";
+
+/**
+ * 상세 화면에서 리소스 하나를 번역·재번역하는 버튼. 메뉴 자동번역 토글과 무관하게
+ * 동작하며, 이미 번역이 있으면 캐시를 건너뛰고 다시 번역한다. 원문 그대로 돌아온
+ * 번역을 항목 단위로 되돌릴 수 있는 유일한 경로다.
+ */
+export function TranslateResourceButton({ menu, resourceId, alsoResourceIds, translated, automation, onAutomationChange }: {
+  menu: TranslationMenu;
+  resourceId: string;
+  /**
+   * 같은 클릭으로 함께 번역할 딸린 리소스. 아티팩트 드로어가 대화 그룹 제목을 함께
+   * 올리는 데 쓴다. 원문이 없어 실패해도 버튼 상태에는 반영하지 않는다.
+   */
+  alsoResourceIds?: string[];
+  translated: boolean;
+  automation: SystemAutomationSnapshot | null;
+  onAutomationChange: (snapshot: SystemAutomationSnapshot) => void;
+}) {
+  const { text } = useI18n();
+  const [requesting, setRequesting] = useState(false);
+  const [requestError, setRequestError] = useState<string | null>(null);
+  const job = (automation?.resourceTranslations ?? [])
+    .find((item) => item.menu === menu && item.resourceId === resourceId);
+  const running = requesting || job?.phase === "queued" || job?.phase === "running";
+  const failure = requestError ?? (job?.phase === "error" ? job.lastError : null);
+  // 시스템 에이전트가 없으면 어떤 번역도 실행할 수 없다. 누를 수 있게 두면 매번
+  // 같은 오류만 돌려주므로 이유를 붙여 막는다.
+  const unavailable = !automation?.settings.systemProvider;
+  // 진행 숫자는 별도 노드로 둔다. 라벨 텍스트 노드를 그대로 유지해야 추가 언어 UI
+  // 번역이 이 버튼에도 적용된다.
+  const progress = running && job && job.segmentTotal > 1
+    ? ` ${job.segmentCompleted}/${job.segmentTotal}`
+    : "";
+  const label = running
+    ? text("번역 중", "Translating")
+    : failure
+      ? text("번역 실패", "Translation failed")
+      : translated
+        ? text("재번역", "Retranslate")
+        : text("번역", "Translate");
+  const request = async () => {
+    setRequesting(true);
+    setRequestError(null);
+    try {
+      let snapshot = await translateResource(menu, resourceId);
+      for (const extra of alsoResourceIds ?? []) {
+        if (extra === resourceId) continue;
+        try {
+          snapshot = await translateResource(menu, extra);
+        } catch {
+          // 딸린 리소스는 원문이 없을 수 있다. 주 리소스 번역은 계속 진행한다.
+        }
+      }
+      onAutomationChange(snapshot);
+    } catch (cause) {
+      setRequestError(errorText(cause));
+    } finally {
+      setRequesting(false);
+    }
+  };
+  return (
+    <button
+      className={`button compact${failure && !running ? " danger-subtle" : " secondary"}`}
+      type="button"
+      disabled={running || unavailable}
+      title={failure ?? (unavailable
+        ? text("먼저 CLI가 연결된 시스템 에이전트를 선택하세요.", "Select a connected system agent first.")
+        : undefined)}
+      onClick={() => { void request(); }}
+    >
+      <Languages size={13} aria-hidden="true" />{label}{progress && <span>{progress}</span>}
+    </button>
+  );
+}
 
 export function TranslationProgress({ enabled, status, error, onRetry }: {
   enabled: boolean;

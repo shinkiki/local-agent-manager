@@ -46,4 +46,10 @@ cargo test --workspace
 npm run tauri build -- --no-bundle
 ```
 
+## 기여물의 라이선스
+
+이 프로젝트는 [MIT](LICENSE-MIT)와 [Apache License 2.0](LICENSE-APACHE) 듀얼 라이선스로 배포됩니다. 별도의 명시가 없는 한, 기여한 변경도 두 라이선스 모두로 배포되는 것에 동의하는 것으로 봅니다(Apache-2.0 §5).
+
+의존성을 추가·변경·삭제했다면 `npm run notices:generate`로 `THIRD-PARTY-NOTICES.md`를 다시 만들어 같은 PR에 포함합니다. GPL·AGPL·SSPL 계열 의존성은 추가하지 않습니다.
+
 보안 취약점은 공개 이슈나 PR로 먼저 공개하지 말고 [보안 정책](.github/SECURITY.md)을 따라 제보해 주세요.

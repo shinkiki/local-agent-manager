@@ -88,6 +88,11 @@ pub fn run() {
                 tray = tray.icon(icon);
             }
             tray.build(app)?;
+            // macOS 알림 아이콘 귀속: 플러그인은 dev 실행에서 com.apple.Terminal로 고정하므로
+            // 첫 알림 전에 설치된 앱 번들 ID로 선점한다. set_application은 프로세스당 1회만
+            // 적용되며, 설치본이 없어 번들 조회가 실패하면 기존 동작으로 조용히 폴백된다.
+            #[cfg(target_os = "macos")]
+            let _ = notify_rust::set_application(&app.config().identifier);
             // Core notifications are detected by frontend polling. The shell
             // requests only the OS presentation permission here.
             let _ = app.notification().request_permission();
@@ -149,7 +154,14 @@ fn spawn_single_backend(app: &tauri::App) -> Result<(), Box<dyn std::error::Erro
     // cause the shell to trust unvalidated frontend input.
     let tailscale =
         agent_manager_core::load_tailscale_backend_launch(&app_data_dir, service_settings.port)
-            .unwrap_or(None);
+            .unwrap_or_default();
+    // 로그 파일을 못 열어도 백엔드 기동은 막지 않는다. 그 경우에만 출력을 버린다.
+    let (child_stdout, child_stderr) = match open_backend_log(&app_data_dir)
+        .and_then(|file| file.try_clone().map(|out| (out, file)))
+    {
+        Ok((out, err)) => (Stdio::from(out), Stdio::from(err)),
+        Err(_) => (Stdio::null(), Stdio::null()),
+    };
     let mut child = Command::new(executable)
         .args(backend_child_args(
             service_settings.port,
@@ -158,8 +170,8 @@ fn spawn_single_backend(app: &tauri::App) -> Result<(), Box<dyn std::error::Erro
             tailscale.as_ref(),
         ))
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(child_stdout)
+        .stderr(child_stderr)
         .spawn()?;
     app.manage(BackendLifetime {
         _stdin: Mutex::new(child.stdin.take()),
@@ -171,6 +183,15 @@ fn spawn_single_backend(app: &tauri::App) -> Result<(), Box<dyn std::error::Erro
             let _ = child.wait();
         })?;
     Ok(())
+}
+
+/// 백엔드 자식의 stdout/stderr를 받는 로그 파일을 연다. 포트 충돌·저장소 잠금·설정
+/// 손상 같은 기동 실패는 자식의 stderr에만 남으므로, 버리면 화면에는 "연결이
+/// 끊겼습니다"만 보이고 원인을 알 수 없다. 앱 기동마다 새로 써 크기가 계속 자라지
+/// 않는다.
+fn open_backend_log(app_data_dir: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(app_data_dir)?;
+    std::fs::File::create(app_data_dir.join("backend-service.log"))
 }
 
 fn backend_child_args(
@@ -188,6 +209,8 @@ fn backend_child_args(
         "--app-data-dir".into(),
         app_data_dir.as_os_str().to_owned(),
     ];
+    // 원격에 변경 권한을 줄지는 이 인자가 아니라 백엔드 서비스 설정의 `remoteWrite`가
+    // 정한다. 셸이 한 번 더 정하면 설정 화면의 토글과 어긋난다.
     if let Some(tailscale) = tailscale {
         args.extend([
             "--tailscale-host".into(),
@@ -195,9 +218,6 @@ fn backend_child_args(
             "--tailscale-user".into(),
             tailscale.login.clone().into(),
         ]);
-        if tailscale.remote_write {
-            args.push("--remote-write".into());
-        }
     }
     args.extend([
         "--shutdown-on-stdin-eof".into(),
@@ -233,11 +253,28 @@ mod tests {
     }
 
     #[test]
+    fn backend_log_is_rewritten_on_each_launch() {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-manager-backend-log-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            use std::io::Write;
+            let mut first = open_backend_log(&dir).expect("first log file");
+            writeln!(first, "이전 실행의 출력").expect("first write");
+        }
+        let _ = open_backend_log(&dir).expect("relaunch log file");
+        let content = std::fs::read_to_string(dir.join("backend-service.log")).expect("read log");
+        assert_eq!(content, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn local_backend_child_has_no_tailscale_arguments() {
         let args = args_as_strings(None);
         assert!(!args.iter().any(|arg| arg == "--tailscale-host"));
         assert!(!args.iter().any(|arg| arg == "--tailscale-user"));
-        assert!(!args.iter().any(|arg| arg == "--remote-write"));
     }
 
     #[test]
@@ -245,7 +282,6 @@ mod tests {
         let launch = TailscaleBackendLaunch {
             host: "device.example.ts.net".to_owned(),
             login: "user@example.com".to_owned(),
-            remote_write: true,
         };
         let args = args_as_strings(Some(&launch));
         assert!(args
@@ -254,6 +290,7 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--tailscale-user", "user@example.com"]));
-        assert!(args.iter().any(|arg| arg == "--remote-write"));
+        // 원격 write는 백엔드가 저장된 설정에서 직접 읽는다(설정 지점 단일화).
+        assert!(!args.iter().any(|arg| arg == "--remote-write"));
     }
 }

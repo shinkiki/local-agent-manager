@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { getMenuTranslations } from "./ipc";
 import type { MenuTranslations, TranslationMenu, TranslationSummary } from "../types";
+import { errorText } from "./errorText";
 
 export function useMenuTranslations(menu: TranslationMenu, revision: number) {
   const [data, setData] = useState<MenuTranslations | null>(null);
@@ -15,7 +16,7 @@ export function useMenuTranslations(menu: TranslationMenu, revision: number) {
         setError(null);
       })
       .catch((cause) => {
-        if (active) setError(cause instanceof Error ? cause.message : String(cause));
+        if (active) setError(errorText(cause));
       });
     return () => { active = false; };
   }, [menu, revision]);

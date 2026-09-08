@@ -1,21 +1,24 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
 use std::path::Path;
 
-use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::app_data_file::write_private_json;
+use crate::store_lock;
 use crate::CoreError;
 
-const SETTINGS_SCHEMA_VERSION: u32 = 2;
+const SETTINGS_SCHEMA_VERSION: u32 = 3;
+const IDENTITY_SETTINGS_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SETTINGS_SCHEMA_VERSION: u32 = 1;
 const SETTINGS_FILE_NAME: &str = "backend-service-settings.json";
 const SETTINGS_LOCK_FILE_NAME: &str = "backend-service-settings-v1.lock";
 
 pub const DEFAULT_BACKEND_SERVICE_PORT: u16 = 54_178;
+/// 원격 UI에 데스크톱과 같은 변경 권한을 주는 것이 기본값이다. 원격 경로 자체가
+/// Tailscale 서비스를 켜야만 열리는 명시적 선택이고, 이 설정이 생기기 전의 데스크톱
+/// 동작도 그러했다. 좁히려면 설정 → 백엔드 서비스에서 끈다.
+pub const DEFAULT_BACKEND_REMOTE_WRITE: bool = true;
 pub const MIN_BACKEND_SERVICE_PORT: u16 = 1024;
 pub const MAX_BACKEND_SERVICE_PORT: u16 = u16::MAX;
 
@@ -27,6 +30,9 @@ pub struct BackendServiceSettings {
     /// Clients compare this with `/api/access` before issuing domain requests so
     /// an unrelated backend on the same loopback port cannot be reused.
     pub store_id: String,
+    /// 원격(Tailscale) UI에 데스크톱과 같은 변경 권한을 줄지. G11의 원격 write
+    /// 모드를 켜고 끄는 단일 설정 지점이며, 실행 중인 백엔드에도 즉시 반영된다.
+    pub remote_write: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -35,12 +41,23 @@ struct StoredBackendServiceSettings {
     schema_version: u32,
     port: u16,
     store_id: String,
+    remote_write: bool,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsEnvelope {
     schema_version: u32,
+}
+
+/// 원격 write 설정이 들어오기 전 스키마. 그때의 데스크톱은 Tailscale을 켜면 항상
+/// 원격 write였으므로, 이관은 [`DEFAULT_BACKEND_REMOTE_WRITE`]로 그 동작을 유지한다.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityStoredBackendServiceSettings {
+    schema_version: u32,
+    port: u16,
+    store_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,10 +86,31 @@ pub fn save_backend_service_settings(
     port: u16,
 ) -> Result<BackendServiceSettings, CoreError> {
     validate_port(port)?;
+    mutate_backend_service_settings(app_data_dir, |settings| {
+        settings.port = port;
+    })
+}
+
+/// 원격 UI에 변경 권한을 줄지 저장한다. 화면 토글과 헤드리스 기동 인자가 함께
+/// 쓰는 유일한 저장 지점이다.
+pub fn save_backend_service_remote_write(
+    app_data_dir: impl AsRef<Path>,
+    remote_write: bool,
+) -> Result<BackendServiceSettings, CoreError> {
+    mutate_backend_service_settings(app_data_dir, |settings| {
+        settings.remote_write = remote_write;
+    })
+}
+
+/// 잠금 아래에서 기존 설정을 읽어 변경하고 다시 쓴 뒤 최신 설정을 돌려준다.
+fn mutate_backend_service_settings(
+    app_data_dir: impl AsRef<Path>,
+    mutate: impl FnOnce(&mut BackendServiceSettings),
+) -> Result<BackendServiceSettings, CoreError> {
     with_settings_lock(app_data_dir.as_ref(), |canonical_app_data_dir| {
         let mut settings = load_settings_unlocked(canonical_app_data_dir)?;
-        settings.port = port;
-        save_settings_unlocked(canonical_app_data_dir, settings)?;
+        mutate(&mut settings);
+        save_settings_unlocked(canonical_app_data_dir, &settings)?;
         load_settings_unlocked(canonical_app_data_dir)
     })
 }
@@ -93,30 +131,19 @@ fn with_settings_lock<T>(
 ) -> Result<T, CoreError> {
     fs::create_dir_all(app_data_dir)?;
     let canonical_app_data_dir = fs::canonicalize(app_data_dir)?;
-    let lock = open_private_file(&canonical_app_data_dir.join(SETTINGS_LOCK_FILE_NAME), false)?;
-    FileExt::lock(&lock).map_err(|error| {
-        CoreError::Runtime(format!(
-            "백엔드 서비스 설정 잠금을 얻지 못했습니다: {error}"
-        ))
-    })?;
-    let result = action(&canonical_app_data_dir);
-    let unlock = FileExt::unlock(&lock).map_err(|error| {
-        CoreError::Runtime(format!(
-            "백엔드 서비스 설정 잠금을 해제하지 못했습니다: {error}"
-        ))
-    });
-    match (result, unlock) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(value), Ok(())) => Ok(value),
-    }
+    let _lock = store_lock::acquire(
+        &canonical_app_data_dir,
+        SETTINGS_LOCK_FILE_NAME,
+        "백엔드 서비스 설정",
+    )?;
+    action(&canonical_app_data_dir)
 }
 
 fn load_settings_unlocked(app_data_dir: &Path) -> Result<BackendServiceSettings, CoreError> {
     let path = app_data_dir.join(SETTINGS_FILE_NAME);
     if !path.exists() {
         let settings = new_settings(DEFAULT_BACKEND_SERVICE_PORT);
-        save_settings_unlocked(app_data_dir, settings.clone())?;
+        save_settings_unlocked(app_data_dir, &settings)?;
         return Ok(settings);
     }
     let bytes = fs::read(path)?;
@@ -129,14 +156,27 @@ fn load_settings_unlocked(app_data_dir: &Path) -> Result<BackendServiceSettings,
             Ok(BackendServiceSettings {
                 port: stored.port,
                 store_id,
+                remote_write: stored.remote_write,
             })
+        }
+        IDENTITY_SETTINGS_SCHEMA_VERSION => {
+            let stored: IdentityStoredBackendServiceSettings = serde_json::from_slice(&bytes)?;
+            debug_assert_eq!(stored.schema_version, IDENTITY_SETTINGS_SCHEMA_VERSION);
+            validate_port(stored.port)?;
+            let settings = BackendServiceSettings {
+                port: stored.port,
+                store_id: validate_store_id(&stored.store_id)?,
+                remote_write: DEFAULT_BACKEND_REMOTE_WRITE,
+            };
+            save_settings_unlocked(app_data_dir, &settings)?;
+            Ok(settings)
         }
         LEGACY_SETTINGS_SCHEMA_VERSION => {
             let stored: LegacyStoredBackendServiceSettings = serde_json::from_slice(&bytes)?;
             debug_assert_eq!(stored.schema_version, LEGACY_SETTINGS_SCHEMA_VERSION);
             validate_port(stored.port)?;
             let settings = new_settings(stored.port);
-            save_settings_unlocked(app_data_dir, settings.clone())?;
+            save_settings_unlocked(app_data_dir, &settings)?;
             Ok(settings)
         }
         schema_version => Err(CoreError::Conflict(format!(
@@ -149,6 +189,7 @@ fn new_settings(port: u16) -> BackendServiceSettings {
     BackendServiceSettings {
         port,
         store_id: Uuid::new_v4().to_string(),
+        remote_write: DEFAULT_BACKEND_REMOTE_WRITE,
     }
 }
 
@@ -165,93 +206,23 @@ fn validate_store_id(store_id: &str) -> Result<String, CoreError> {
     Ok(canonical)
 }
 
+impl From<&BackendServiceSettings> for StoredBackendServiceSettings {
+    fn from(settings: &BackendServiceSettings) -> Self {
+        Self {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            port: settings.port,
+            store_id: settings.store_id.clone(),
+            remote_write: settings.remote_write,
+        }
+    }
+}
+
 fn save_settings_unlocked(
     app_data_dir: &Path,
-    settings: BackendServiceSettings,
+    settings: &BackendServiceSettings,
 ) -> Result<(), CoreError> {
-    let destination = app_data_dir.join(SETTINGS_FILE_NAME);
-    let temporary = app_data_dir.join(format!(".{SETTINGS_FILE_NAME}.{}.tmp", Uuid::new_v4()));
-    let stored = StoredBackendServiceSettings {
-        schema_version: SETTINGS_SCHEMA_VERSION,
-        port: settings.port,
-        store_id: settings.store_id,
-    };
-    let bytes = serde_json::to_vec_pretty(&stored)?;
-    let result = (|| -> Result<(), CoreError> {
-        let mut file = open_private_file(&temporary, true)?;
-        file.write_all(&bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        drop(file);
-        replace_file(&temporary, &destination)?;
-        sync_app_data_dir(app_data_dir)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn open_private_file(path: &Path, create_new: bool) -> Result<File, CoreError> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    if create_new {
-        options.create_new(true);
-    } else {
-        options.create(true).truncate(false);
-    }
-    #[cfg(unix)]
-    options.mode(0o600);
-    Ok(options.open(path)?)
-}
-
-#[cfg(not(windows))]
-fn replace_file(temporary: &Path, destination: &Path) -> Result<(), CoreError> {
-    fs::rename(temporary, destination)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn replace_file(temporary: &Path, destination: &Path) -> Result<(), CoreError> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let source = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let target = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            target.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        Err(CoreError::Io(std::io::Error::last_os_error()))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn sync_app_data_dir(app_data_dir: &Path) -> Result<(), CoreError> {
-    File::open(app_data_dir)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_app_data_dir(_app_data_dir: &Path) -> Result<(), CoreError> {
-    Ok(())
+    let stored = StoredBackendServiceSettings::from(settings);
+    write_private_json(&app_data_dir.join(SETTINGS_FILE_NAME), &stored)
 }
 
 #[cfg(test)]
@@ -295,6 +266,57 @@ mod tests {
         assert_eq!(value["schemaVersion"], SETTINGS_SCHEMA_VERSION);
         assert_eq!(value["port"], 5188);
         assert_eq!(value["storeId"], saved.store_id);
+        assert_eq!(value["remoteWrite"], DEFAULT_BACKEND_REMOTE_WRITE);
+    }
+
+    #[test]
+    fn remote_write_is_stored_beside_the_port_and_keeps_the_identity() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let initial = load_backend_service_settings(directory.path()).expect("initial settings");
+        assert_eq!(initial.remote_write, DEFAULT_BACKEND_REMOTE_WRITE);
+
+        let disabled = save_backend_service_remote_write(directory.path(), false)
+            .expect("disable remote write");
+
+        assert!(!disabled.remote_write);
+        assert_eq!(disabled.store_id, initial.store_id);
+        assert_eq!(disabled.port, initial.port);
+        // 포트 저장은 원격 write 설정을 건드리지 않는다.
+        assert!(
+            !save_backend_service_settings(directory.path(), 5188)
+                .expect("save port")
+                .remote_write
+        );
+        assert!(
+            save_backend_service_remote_write(directory.path(), true)
+                .expect("enable remote write")
+                .remote_write
+        );
+    }
+
+    /// 원격 write 설정이 없던 저장본은 그때의 동작(Tailscale을 켜면 원격도 변경 가능)을
+    /// 그대로 유지한 채 이관돼야 한다. 갱신 뒤 폰에서 갑자기 읽기 전용이 되면 안 된다.
+    #[test]
+    fn schema_v2_is_migrated_with_remote_write_left_on() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store_id = "7cb5018a-4a90-438a-a2c4-d1fd5c660cec";
+        fs::write(
+            directory.path().join(SETTINGS_FILE_NAME),
+            format!(r#"{{"schemaVersion":2,"port":5217,"storeId":"{store_id}"}}"#),
+        )
+        .expect("identity settings");
+
+        let migrated = load_backend_service_settings(directory.path()).expect("migrated settings");
+
+        assert_eq!(migrated.port, 5217);
+        assert_eq!(migrated.store_id, store_id);
+        assert!(migrated.remote_write);
+        let value: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.path().join(SETTINGS_FILE_NAME)).expect("migrated file"),
+        )
+        .expect("migrated JSON");
+        assert_eq!(value["schemaVersion"], SETTINGS_SCHEMA_VERSION);
+        assert_eq!(value["remoteWrite"], true);
     }
 
     #[test]
@@ -354,7 +376,7 @@ mod tests {
         fs::write(
             directory.path().join(SETTINGS_FILE_NAME),
             format!(
-                "{{\"schemaVersion\":{SETTINGS_SCHEMA_VERSION},\"port\":{},\"storeId\":\"{}\"}}",
+                "{{\"schemaVersion\":{SETTINGS_SCHEMA_VERSION},\"port\":{},\"storeId\":\"{}\",\"remoteWrite\":true}}",
                 MIN_BACKEND_SERVICE_PORT - 1,
                 Uuid::new_v4()
             ),
@@ -371,7 +393,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         fs::write(
             directory.path().join(SETTINGS_FILE_NAME),
-            r#"{"schemaVersion":3,"port":4178,"storeId":"7cb5018a-4a90-438a-a2c4-d1fd5c660cec"}"#,
+            r#"{"schemaVersion":4,"port":4178,"storeId":"7cb5018a-4a90-438a-a2c4-d1fd5c660cec"}"#,
         )
         .expect("future settings");
 
@@ -385,8 +407,9 @@ mod tests {
     fn corrupt_or_invalid_identity_settings_fail_without_being_overwritten() {
         for contents in [
             b"not JSON".as_slice(),
-            br#"{"schemaVersion":2,"port":4178,"storeId":"not-a-uuid"}"#.as_slice(),
-            br#"{"schemaVersion":2,"port":4178,"storeId":"7CB5018A-4A90-438A-A2C4-D1FD5C660CEC"}"#
+            br#"{"schemaVersion":3,"port":4178,"storeId":"not-a-uuid","remoteWrite":true}"#
+                .as_slice(),
+            br#"{"schemaVersion":3,"port":4178,"storeId":"7CB5018A-4A90-438A-A2C4-D1FD5C660CEC","remoteWrite":true}"#
                 .as_slice(),
         ] {
             let directory = tempfile::tempdir().expect("temporary directory");
@@ -411,20 +434,6 @@ mod tests {
                 .port,
             5188
         );
-    }
-
-    #[test]
-    fn settings_lock_is_exclusive_between_file_handles() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let lock_path = directory.path().join(SETTINGS_LOCK_FILE_NAME);
-        let first = open_private_file(&lock_path, false).expect("first lock handle");
-        FileExt::lock(&first).expect("first lock");
-        let contender = open_private_file(&lock_path, false).expect("contending lock handle");
-
-        assert!(matches!(
-            FileExt::try_lock(&contender),
-            Err(fs4::TryLockError::WouldBlock)
-        ));
     }
 
     #[cfg(unix)]

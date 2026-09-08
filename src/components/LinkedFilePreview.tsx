@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 import type { ThemedTokenWithVariants, TokenStyles } from "@shikijs/core";
 import { Download, FileText, X } from "lucide-react";
 import { codeLanguageForPath, highlightCode, type CodeLanguage } from "../lib/codeHighlight";
 import { formatBytes } from "../lib/format";
 import type { LinkedFile } from "../types";
 import { MarkdownPreview } from "./MarkdownPreview";
-import { ErrorBanner, LoadingState } from "./Shared";
+import { ErrorBanner, LoadingState, useEscapeToClose } from "./Shared";
+import { errorText } from "../lib/errorText";
 
 const UNSUPPORTED_PREVIEW_MESSAGE = "미리보기를 지원하지 않는 파일입니다.";
 
@@ -32,7 +33,7 @@ export function useLinkedFilePreview(loadFile: (href: string) => Promise<LinkedF
           setState({
             status: "error",
             href,
-            message: cause instanceof Error ? cause.message : String(cause),
+            message: errorText(cause),
           });
         }
       });
@@ -50,10 +51,16 @@ export function LinkedFilePreview({
   state,
   onClose,
   onDownload,
+  linkImports = false,
+  onOpenLocalLink,
 }: {
   state: LinkedFilePreviewState;
   onClose: () => void;
   onDownload: (href: string) => Promise<void>;
+  /** 지침 문서의 `@경로` 가져오기를 링크로 보여준다. */
+  linkImports?: boolean;
+  /** 미리보기 안의 로컬 링크를 다시 열어 연결 문서를 이어 볼 수 있게 한다. */
+  onOpenLocalLink?: (href: string) => void;
 }) {
   const codeRef = useRef<HTMLDivElement>(null);
   const [downloading, setDownloading] = useState(false);
@@ -61,21 +68,10 @@ export function LinkedFilePreview({
   const file = state.status === "ready" ? state.file : null;
   const codeLanguage = useMemo(() => file ? codeLanguageForPath(file.relativePath) : null, [file]);
   const isMarkdown = codeLanguage?.id === "markdown";
-  const highlightedLines = useHighlightedCode(file?.content ?? null, isMarkdown ? null : codeLanguage);
   const lines = useMemo(() => file?.content.split("\n").length ?? 0, [file]);
   const targetLine = file?.targetLine && file.targetLine <= lines ? file.targetLine : null;
-  const lineNumbers = useMemo(
-    () => Array.from({ length: lines }, (_, index) => String(index + 1)).join("\n"),
-    [lines],
-  );
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  useEscapeToClose(onClose);
 
   useEffect(() => {
     if (!targetLine || !codeRef.current) return;
@@ -96,7 +92,7 @@ export function LinkedFilePreview({
     try {
       await onDownload(state.href);
     } catch (cause) {
-      setDownloadError(cause instanceof Error ? cause.message : String(cause));
+      setDownloadError(errorText(cause));
     } finally {
       setDownloading(false);
     }
@@ -140,14 +136,15 @@ export function LinkedFilePreview({
             <ErrorBanner message={state.message} />
           ) : isMarkdown ? (
             <div className="linked-file-markdown">
-              <MarkdownPreview source={state.file.content} />
+              <MarkdownPreview source={state.file.content} linkImports={linkImports} onOpenLocalLink={onOpenLocalLink} />
             </div>
           ) : (
-            <div className="linked-file-code" ref={codeRef}>
-              {targetLine && <span className="linked-file-line-highlight" style={{ "--target-line": targetLine - 1 } as CSSProperties} aria-hidden="true" />}
-              <pre className="linked-file-line-numbers" aria-hidden="true">{lineNumbers}</pre>
-              <pre className="linked-file-source"><code>{highlightedLines ? renderHighlightedLines(highlightedLines) : state.file.content}</code></pre>
-            </div>
+            <HighlightedCodeBlock
+              content={state.file.content}
+              language={codeLanguage}
+              targetLine={targetLine}
+              containerRef={codeRef}
+            />
           )}
         </div>
       </section>
@@ -155,7 +152,46 @@ export function LinkedFilePreview({
   );
 }
 
-function useHighlightedCode(content: string | null, language: CodeLanguage | null) {
+/**
+ * 하이라이팅한 소스를 줄 번호와 함께 보여주는 읽기 전용 코드 블록. 링크 문서 미리보기와
+ * 문서 파일 창이 같은 마크업·같은 하이라이팅 절차를 쓰므로 여기 한 벌만 둔다.
+ */
+export function HighlightedCodeBlock({
+  content,
+  language,
+  className,
+  ariaLabel,
+  targetLine = null,
+  containerRef,
+}: {
+  content: string;
+  language: CodeLanguage | null;
+  className?: string;
+  ariaLabel?: string;
+  /** 가리킬 줄(1부터). 해당 줄에 강조 띠를 그린다. */
+  targetLine?: number | null;
+  containerRef?: RefObject<HTMLDivElement | null>;
+}) {
+  const highlightedLines = useHighlightedCode(content, language);
+  const lineNumbers = useMemo(
+    () => Array.from({ length: content.split("\n").length }, (_, index) => String(index + 1)).join("\n"),
+    [content],
+  );
+
+  return (
+    <div
+      className={className ? `linked-file-code ${className}` : "linked-file-code"}
+      ref={containerRef}
+      aria-label={ariaLabel}
+    >
+      {targetLine && <span className="linked-file-line-highlight" style={{ "--target-line": targetLine - 1 } as CSSProperties} aria-hidden="true" />}
+      <pre className="linked-file-line-numbers" aria-hidden="true">{lineNumbers}</pre>
+      <pre className="linked-file-source"><code>{highlightedLines ? renderHighlightedLines(highlightedLines) : content}</code></pre>
+    </div>
+  );
+}
+
+function useHighlightedCode(content: string, language: CodeLanguage | null) {
   const [highlighted, setHighlighted] = useState<{
     content: string;
     languageId: CodeLanguage["id"];

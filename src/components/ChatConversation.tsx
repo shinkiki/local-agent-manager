@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useEffect,
   useRef,
   useState,
@@ -24,14 +25,19 @@ import {
   upsertChatTurnState,
   type ChatTimelineTurn,
 } from "../lib/chatTimeline";
+import { splitAgentMessageMeta } from "../lib/agentMessageMeta";
+import { collectChatSkillUsages, isSkillUsageEntry } from "../lib/skillUsage";
 import { MarkdownPreview } from "./MarkdownPreview";
+import { AgentMessageMetaList } from "./AgentMessageMeta";
 import { ChatActivityGroup } from "./ChatActivityGroup";
+import { ChatSkillUsageCard } from "./ChatSkillUsage";
 import { ChatToolCard } from "./ChatToolCard";
 import { ChatAttachmentList } from "./ChatAttachments";
 import { ChatApprovalCard, type ChatApprovalPrompt } from "./Shared";
 import { CopyAction } from "./CopyAction";
 import { SpeechPlaybackAction } from "./VoiceControls";
 import { isReadableFinalResponse } from "../lib/voice";
+import { useI18n } from "../lib/i18n";
 
 export type ChatEntry =
   | { type: "message"; id: string; role: string; kind: string; text: string; attachments: ChatInputFile[] }
@@ -47,6 +53,7 @@ export function ChatScrollControls({ targetRef, onScrollAwayFromLatest, onScroll
   onScrollAwayFromLatest?: () => void;
   onScrollToLatest?: () => void;
 }) {
+  const { text } = useI18n();
   const lastScrollTopRef = useRef(0);
   const [state, setState] = useState({
     scrollable: false,
@@ -125,14 +132,42 @@ export function ChatScrollControls({ targetRef, onScrollAwayFromLatest, onScroll
   const scrollOnClick = (event: ReactMouseEvent<HTMLButtonElement>, top: number, destination: "top" | "bottom") => {
     if (event.detail === 0) scroll(top, destination);
   };
-  return <nav className="chat-scroll-controls" aria-label="대화 위치 이동">
-    <button className={state.activeTarget === "top" ? "is-active" : undefined} type="button" aria-label="대화 맨 위로 이동" title="맨 위" disabled={state.atTop} onPointerDown={(event) => scrollOnPointerDown(event, 0, "top")} onClick={(event) => scrollOnClick(event, 0, "top")}>
+  return <nav className="chat-scroll-controls" aria-label={text("대화 위치 이동", "Move within the conversation")}>
+    <button className={state.activeTarget === "top" ? "is-active" : undefined} type="button" aria-label={text("대화 맨 위로 이동", "Go to the top of the conversation")} title={text("맨 위", "Top")} disabled={state.atTop} onPointerDown={(event) => scrollOnPointerDown(event, 0, "top")} onClick={(event) => scrollOnClick(event, 0, "top")}>
       <ChevronsUp size={16} strokeWidth={2.2} aria-hidden="true" />
     </button>
-    <button className={state.activeTarget === "bottom" ? "is-active" : undefined} type="button" aria-label="대화 맨 아래로 이동" title="맨 아래" disabled={state.atBottom} onPointerDown={(event) => scrollOnPointerDown(event, targetRef.current?.scrollHeight ?? 0, "bottom")} onClick={(event) => scrollOnClick(event, targetRef.current?.scrollHeight ?? 0, "bottom")}>
+    <button className={state.activeTarget === "bottom" ? "is-active" : undefined} type="button" aria-label={text("대화 맨 아래로 이동", "Go to the bottom of the conversation")} title={text("맨 아래", "Bottom")} disabled={state.atBottom} onPointerDown={(event) => scrollOnPointerDown(event, targetRef.current?.scrollHeight ?? 0, "bottom")} onClick={(event) => scrollOnClick(event, targetRef.current?.scrollHeight ?? 0, "bottom")}>
       <ChevronsDown size={16} strokeWidth={2.2} aria-hidden="true" />
     </button>
   </nav>;
+}
+
+/** 마지막 사용자 메시지를 식별하는 키. 새 메시지를 보내면 값이 바뀐다. */
+export function lastUserMessageKey(turns: ChatTurn[]): string | null {
+  for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+    const entries = turns[turnIndex].entries;
+    for (let entryIndex = entries.length - 1; entryIndex >= 0; entryIndex -= 1) {
+      const entry = entries[entryIndex];
+      if (entry.type === "message" && entry.role === "user" && entry.kind === "message") {
+        return `${turns[turnIndex].id}:${entry.id}`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * 컨테이너 안에서 마지막 사용자 메시지가 화면 맨 위에 오도록 스크롤한다.
+ * 라이브 채팅(.chat-message-user)과 세션 트랜스크립트(.message-user)를 함께 다룬다.
+ */
+export function scrollToLastUserMessage(container: HTMLElement | null): boolean {
+  if (!container) return false;
+  const messages = container.querySelectorAll<HTMLElement>(".chat-message-user, .message-user");
+  const target = messages[messages.length - 1];
+  if (!target) return false;
+  const top = target.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
+  container.scrollTo({ top: Math.max(0, top - 12), behavior: "auto" });
+  return true;
 }
 
 interface ChatEventTargets {
@@ -192,11 +227,14 @@ export function applyChatEvent(event: ChatEvent, targets: ChatEventTargets) {
       {
         type: "approval",
         id: event.id,
+        kind: event.kind,
+        questions: event.questions ?? [],
         title: event.title,
         detail: event.detail ?? "",
         options: event.options,
         interactive: event.interactive,
         resolved: null,
+        answers: {},
       },
     ]));
     return;
@@ -205,7 +243,7 @@ export function applyChatEvent(event: ChatEvent, targets: ChatEventTargets) {
     setTurns((current) => current.map((turn) => ({
       ...turn,
       entries: turn.entries.map((entry) => entry.type === "approval" && entry.id === event.id
-        ? { ...entry, resolved: event.decision }
+        ? { ...entry, resolved: event.decision, answers: event.answers ?? {} }
         : entry),
     })));
     return;
@@ -241,23 +279,29 @@ export function ChatConversationTurn({ turn, chatId, className = "", onDecision,
           return <ChatEntryView entry={segment.entry} chatId={chatId} copyReady={!running} speechReady={isReadableFinalResponse(turn.status, segment.entry === lastAssistantMessage)} onDecision={onDecision} onOpenLocalLink={onOpenLocalLink} key={segment.key} />;
         }
         const activities = segment.entries as ChatActivityEntry[];
+        // 스킬 실행은 작업 로그에서 빼내 대화 흐름에 사용 스킬 카드로 세운다. 로그 안의
+        // 도구 호출 하나로 남으면 무엇이 걸렸는지 펼치기 전까지 보이지 않는다.
+        const skillUsages = collectChatSkillUsages(activities);
+        const logged = activities.filter((entry) => !isSkillUsageEntry(entry));
         const active = running && index === segments.length - 1;
         const status = active
           ? "running"
           : !running && index === lastActivityIndex
             ? turn.status
-            : completedChatActivityStatus(activities);
-        return <ChatActivityGroup
-          entries={activities}
-          active={active}
-          status={status}
-          statusText={chatTurnStatusLabel(status)}
-          summary={chatActivitySummary(activities)}
-          meta={index === lastActivityIndex ? chatTurnDuration(turn) : undefined}
-          entryKey={chatEntryKey}
-          renderEntry={(entry) => <ChatEntryView entry={entry} chatId={chatId} copyReady={!running} onDecision={onDecision} onOpenLocalLink={onOpenLocalLink} />}
-          key={segment.key}
-        />;
+            : completedChatActivityStatus(logged);
+        return <Fragment key={segment.key}>
+          <ChatSkillUsageCard usages={skillUsages} />
+          {logged.length > 0 && <ChatActivityGroup
+            entries={logged}
+            active={active}
+            status={status}
+            statusText={chatTurnStatusLabel(status)}
+            summary={chatActivitySummary(logged)}
+            meta={index === lastActivityIndex ? chatTurnDuration(turn) : undefined}
+            entryKey={chatEntryKey}
+            renderEntry={(entry) => <ChatEntryView entry={entry} chatId={chatId} copyReady={!running} onDecision={onDecision} onOpenLocalLink={onOpenLocalLink} />}
+          />}
+        </Fragment>;
       })}
     </section>
   );
@@ -272,13 +316,16 @@ export function ChatEntryView({ entry, chatId, copyReady = true, speechReady = f
   onOpenLocalLink?: (href: string) => void;
 }) {
   if (entry.type === "message") {
-    const copyable = entry.role === "assistant" && entry.kind === "message" && Boolean(entry.text);
+    // 공급자가 붙인 메타 블록은 본문이 아니다. 복사와 읽어주기도 걷어낸 본문만 쓴다.
+    const { text, meta } = splitAgentMessageMeta(entry.text);
+    const copyable = entry.role === "assistant" && entry.kind === "message" && Boolean(text);
     const finalResponse = copyable && speechReady;
     return <article className={`chat-message chat-message-${entry.role} chat-message-${entry.kind}`}>
       <strong>{entry.kind === "reasoning" ? "진행 상황" : entry.role === "user" ? "사용자" : "에이전트"}</strong>
-      {finalResponse && <SpeechPlaybackAction responseId={`${chatId ?? "chat"}:${entry.id}`} text={entry.text} />}
-      {copyable && <CopyAction value={entry.text} kind="response" className="message-copy-action" disabled={!copyReady} />}
-      {entry.text && <div className="chat-message-markdown"><MarkdownPreview source={entry.text} compact copyable={copyable && copyReady} onOpenLocalLink={onOpenLocalLink} /></div>}
+      {finalResponse && <SpeechPlaybackAction responseId={`${chatId ?? "chat"}:${entry.id}`} text={text} />}
+      {copyable && <CopyAction value={text} kind="response" className="message-copy-action" disabled={!copyReady} />}
+      {text && <div className="chat-message-markdown"><MarkdownPreview source={text} compact copyable={copyable && copyReady} onOpenLocalLink={onOpenLocalLink} /></div>}
+      <AgentMessageMetaList meta={meta} />
       <ChatAttachmentList chatId={chatId} files={entry.attachments} />
     </article>;
   }
@@ -287,13 +334,6 @@ export function ChatEntryView({ entry, chatId, copyReady = true, speechReady = f
   }
   if (entry.type === "approval") return <ChatApprovalCard prompt={entry} onDecision={onDecision} />;
   return <article className="chat-event-error">{entry.text}</article>;
-}
-
-export function activityMatches(entry: ChatEntry, filter: "all" | "tool" | "reasoning" | "error"): boolean {
-  if (filter === "all") return entry.type !== "message" || entry.kind === "reasoning" || entry.role === "user";
-  if (filter === "tool") return entry.type === "tool";
-  if (filter === "reasoning") return entry.type === "message" && entry.kind === "reasoning";
-  return entry.type === "error" || entry.type === "approval";
 }
 
 export function chatEntryKey(entry: ChatEntry): string {

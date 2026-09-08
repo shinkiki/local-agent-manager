@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+#[cfg(windows)]
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -14,9 +15,15 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::catalog::{load_session_summary, SessionCatalog};
+use crate::chat::resolve_executable;
+use crate::credential_profiles::CLAUDE_SECURESTORAGE_CONFIG_DIR;
 use crate::domain::ProviderId;
-use crate::providers::inspect_local_environment;
-use crate::{AccountRuntimeLease, AccountSupervisor, CoreError};
+#[cfg(unix)]
+use crate::process_signal;
+use crate::user_home;
+use crate::{
+    AccountRuntimeLease, AccountSupervisor, CoreError, ResumeAccountPolicy, UnscopedRuntimeKind,
+};
 
 const RECONNECT_GRACE: Duration = Duration::from_secs(120);
 const REAPER_INTERVAL: Duration = Duration::from_secs(1);
@@ -56,7 +63,7 @@ pub struct TerminalAccountLoginRequest {
     pub rows: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TerminalPhase {
     Running,
@@ -67,12 +74,54 @@ pub enum TerminalPhase {
 }
 
 impl TerminalPhase {
+    pub const ALL: &'static [Self] = &[
+        Self::Running,
+        Self::Detached,
+        Self::Stopping,
+        Self::Exited,
+        Self::Failed,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Detached => "detached",
+            Self::Stopping => "stopping",
+            Self::Exited => "exited",
+            Self::Failed => "failed",
+        }
+    }
+
     fn can_attach(self) -> bool {
         matches!(self, Self::Running | Self::Detached)
     }
 
     fn can_restart(self) -> bool {
         self == Self::Exited
+    }
+}
+
+impl std::fmt::Display for TerminalPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TerminalPhase {
+    type Err = CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "running" => Ok(Self::Running),
+            "detached" => Ok(Self::Detached),
+            "stopping" => Ok(Self::Stopping),
+            "exited" => Ok(Self::Exited),
+            "failed" => Ok(Self::Failed),
+            _ => Err(CoreError::InvalidInput(format!(
+                "알 수 없는 터미널 상태입니다: {}",
+                s
+            ))),
+        }
     }
 }
 
@@ -163,6 +212,31 @@ struct RuntimeState {
     exit_code: Option<u32>,
 }
 
+impl RuntimeState {
+    /// 재연결 시 돌려줄 최근 출력만 보관하고, 한 번이라도 앞부분을 버렸는지 기록한다.
+    fn append_replay(&mut self, data: &[u8]) {
+        self.replay.extend(data.iter().copied());
+        if self.replay.len() > MAX_REPLAY_BYTES {
+            let overflow = self.replay.len() - MAX_REPLAY_BYTES;
+            self.replay.drain(..overflow);
+            self.replay_truncated = true;
+        }
+    }
+
+    /// 재연결 대기를 끝낸다. 지금 붙어 있거나 곧 정리될 터미널은 만료 시각을 갖지 않는다.
+    fn clear_deadlines(&mut self) {
+        self.reconnect_deadline = None;
+        self.expires_at = None;
+    }
+
+    /// 프로세스가 끝난 터미널을 재연결 유예 동안만 남겨 둔다. 유예 시각은 내부 청소용이라
+    /// 화면에 노출하는 재연결 마감(`reconnect_deadline`)과 달리 비워 둔다.
+    fn begin_exit_grace(&mut self) {
+        self.expires_at = Some(Instant::now() + RECONNECT_GRACE);
+        self.reconnect_deadline = None;
+    }
+}
+
 struct LaunchSpec {
     executable: PathBuf,
     cwd: PathBuf,
@@ -222,25 +296,90 @@ impl TerminalSupervisor {
             session_id: request.session_id.clone(),
         };
 
+        // 세션에 묶인 계정으로 재개한다. 자격증명이 계정별로 갈려 있어 다른 계정으로
+        // 붙으면 그 계정의 한도를 쓰고 사용량 집계도 세션과 어긋난다.
+        let account_id = self.session_account_id(request.source, &request.session_id);
+        let profile_env = self.account_credential_env(request.source, account_id.as_deref())?;
         self.open_with(
             key,
             request.cols,
             request.rows,
             || {
-                resolve_launch_spec(
+                let mut spec = resolve_launch_spec(
                     &self.inner.app_data_dir,
                     self.inner.session_catalog.as_ref(),
                     &request,
-                )
+                )?;
+                spec.env.extend(profile_env);
+                Ok(spec)
             },
             || {
                 self.inner
                     .accounts
                     .as_ref()
-                    .map(|accounts| accounts.acquire_runtime(request.source, None, None))
+                    .map(|accounts| accounts.acquire_runtime(request.source, account_id.as_deref()))
                     .transpose()
             },
         )
+    }
+
+    /// 이 세션을 재개할 계정. 채팅 이어가기와 같은 규칙이다 — 세션에 고정된 계정이
+    /// 있으면 그 계정, 없으면 이어가기 정책에 따라 마지막 실행 계정 또는 현재 활성
+    /// 계정을 쓴다.
+    fn session_account_id(&self, source: ProviderId, session_id: &str) -> Option<String> {
+        let accounts = self.inner.accounts.as_ref()?;
+        let app_data_dir = &self.inner.app_data_dir;
+        crate::store::session_pinned_account_id(app_data_dir, source, session_id)
+            .or_else(|| match accounts.resume_account_policy() {
+                Ok(ResumeAccountPolicy::ActiveAccount) => None,
+                Ok(ResumeAccountPolicy::LastUsedAccount) => {
+                    crate::store::session_last_used_account_id(app_data_dir, source, session_id)
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[terminal] 이어가기 계정 정책을 읽지 못해 활성 계정으로 재개합니다: {error}"
+                    );
+                    None
+                }
+            })
+            .filter(|account_id| accounts.account_is_usable(source, account_id))
+            .or_else(|| accounts.active_account_id(source).ok().flatten())
+    }
+
+    /// 계정별 자격증명 프로필 환경변수. 계정에 귀속된 터미널은 그 계정의 격리 프로필로만
+    /// 뜬다 — 공유 CLI 홈에는 다른 로그인이 들어 있을 수 있어 폴백하지 않는다. 계정이
+    /// 없는 터미널(설정·로그인)은 환경변수 없이 뜬다.
+    fn account_credential_env(
+        &self,
+        source: ProviderId,
+        account_id: Option<&str>,
+    ) -> Result<Vec<(String, String)>, CoreError> {
+        let (Some(accounts), Some(account_id)) = (self.inner.accounts.as_ref(), account_id) else {
+            return Ok(Vec::new());
+        };
+        match accounts.runtime_credential_profile(source, account_id) {
+            Ok(Some(profile)) => Ok(profile.env),
+            Ok(None) => Err(CoreError::Conflict(format!(
+                "{source} 계정의 자격증명 격리를 준비하지 못해 터미널을 열 수 없습니다"
+            ))),
+            Err(error) => Err(CoreError::Conflict(format!(
+                "{source} 계정 터미널 프로필을 준비하지 못했습니다: {error}"
+            ))),
+        }
+    }
+
+    /// 계정에 묶이지 않는 터미널(설정·로그인)의 실행 임차. 계정 감독자가 없는
+    /// 원격 구성에서는 임차 없이 뜬다.
+    fn unscoped_lease(
+        &self,
+        provider: ProviderId,
+        kind: UnscopedRuntimeKind,
+    ) -> Result<Option<AccountRuntimeLease>, CoreError> {
+        self.inner
+            .accounts
+            .as_ref()
+            .map(|accounts| accounts.acquire_unscoped_runtime(provider, kind))
+            .transpose()
     }
 
     pub fn open_setup(
@@ -257,19 +396,16 @@ impl TerminalSupervisor {
             request.cols,
             request.rows,
             resolve_setup_launch_spec,
-            || {
-                self.inner
-                    .accounts
-                    .as_ref()
-                    .map(|accounts| accounts.acquire_unscoped_runtime(request.source))
-                    .transpose()
-            },
+            || self.unscoped_lease(request.source, UnscopedRuntimeKind::SharedHome),
         )
     }
 
+    /// `remote`는 이 요청이 Tailscale 원격 UI에서 왔는지다. 로그인 CLI의 인증 방식을
+    /// 여기서 갈라야 하므로 클라이언트가 보낸 값이 아니라 서버가 판정한 접근 종류를 받는다.
     pub fn open_account_login(
         &self,
         request: TerminalAccountLoginRequest,
+        remote: bool,
     ) -> Result<TerminalAttachment, CoreError> {
         validate_identifier(&request.login_id)?;
         validate_size(request.cols, request.rows)?;
@@ -287,8 +423,12 @@ impl TerminalSupervisor {
             key,
             request.cols,
             request.rows,
-            || resolve_account_login_launch_spec(login),
-            || accounts.acquire_unscoped_runtime(provider).map(Some),
+            || resolve_account_login_launch_spec(login, remote),
+            || {
+                accounts
+                    .acquire_unscoped_runtime(provider, UnscopedRuntimeKind::IsolatedLogin)
+                    .map(Some)
+            },
         )
     }
 
@@ -465,6 +605,11 @@ impl TerminalRuntime {
         command.cwd(spec.cwd.as_os_str());
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
+        // PTY로 셸이 아니라 CLI를 직접 띄우므로 프로필이 PATH를 보정해 주지 않는다.
+        // GUI 실행 시 빠지는 공통 디렉터리만 상속 PATH 뒤에 덧붙인다.
+        if let Some(path) = crate::providers::appended_search_path() {
+            command.env("PATH", path);
+        }
         for (key, value) in spec.env {
             command.env(key, value);
         }
@@ -535,8 +680,7 @@ impl TerminalRuntime {
         }
         if state.phase == TerminalPhase::Detached {
             state.phase = TerminalPhase::Running;
-            state.reconnect_deadline = None;
-            state.expires_at = None;
+            state.clear_deadlines();
         }
         let info = self.info(&state);
         sender
@@ -611,8 +755,7 @@ impl TerminalRuntime {
                 return;
             }
             state.phase = TerminalPhase::Stopping;
-            let info = self.info(&state);
-            try_send(&mut state, TerminalEvent::State { session: info });
+            self.emit_state(&mut state);
         }
         if let Ok(mut killer) = self.killer.lock() {
             let _ = killer.kill();
@@ -685,10 +828,8 @@ impl TerminalRuntime {
                 return;
             }
             state.phase = TerminalPhase::Stopping;
-            state.reconnect_deadline = None;
-            state.expires_at = None;
-            let info = self.info(&state);
-            try_send(&mut state, TerminalEvent::State { session: info });
+            state.clear_deadlines();
+            self.emit_state(&mut state);
         }
     }
 
@@ -716,12 +857,7 @@ impl TerminalRuntime {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        state.replay.extend(data.iter().copied());
-        if state.replay.len() > MAX_REPLAY_BYTES {
-            let overflow = state.replay.len() - MAX_REPLAY_BYTES;
-            state.replay.drain(..overflow);
-            state.replay_truncated = true;
-        }
+        state.append_replay(data);
         try_send(
             &mut state,
             TerminalEvent::Output {
@@ -742,8 +878,7 @@ impl TerminalRuntime {
         }
         state.phase = TerminalPhase::Exited;
         state.exit_code = code;
-        state.expires_at = Some(Instant::now() + RECONNECT_GRACE);
-        state.reconnect_deadline = None;
+        state.begin_exit_grace();
         if let Ok(mut session_lock) = self.session_lock.lock() {
             *session_lock = None;
         }
@@ -753,8 +888,7 @@ impl TerminalRuntime {
             }
         }
         try_send(&mut state, TerminalEvent::Exit { code });
-        let info = self.info(&state);
-        try_send(&mut state, TerminalEvent::State { session: info });
+        self.emit_state(&mut state);
     }
 
     fn mark_failed(&self, message: String) {
@@ -762,11 +896,9 @@ impl TerminalRuntime {
             return;
         };
         state.phase = TerminalPhase::Failed;
-        state.expires_at = Some(Instant::now() + RECONNECT_GRACE);
-        state.reconnect_deadline = None;
+        state.begin_exit_grace();
         try_send(&mut state, TerminalEvent::Error { message });
-        let info = self.info(&state);
-        try_send(&mut state, TerminalEvent::State { session: info });
+        self.emit_state(&mut state);
         drop(state);
         if let Ok(mut killer) = self.killer.lock() {
             let _ = killer.kill();
@@ -779,6 +911,12 @@ impl TerminalRuntime {
             .ok()
             .and_then(|state| state.expires_at)
             .is_some_and(|expires_at| expires_at <= now)
+    }
+
+    /// 지금 상태를 구독자에게 알린다. 상태를 바꾼 자리는 모두 이 한 줄로 닫는다.
+    fn emit_state(&self, state: &mut RuntimeState) {
+        let info = self.info(state);
+        try_send(state, TerminalEvent::State { session: info });
     }
 
     fn info(&self, state: &RuntimeState) -> TerminalSessionInfo {
@@ -880,29 +1018,9 @@ fn resolve_launch_spec(
         .cwd
         .as_deref()
         .ok_or_else(|| CoreError::InvalidInput("세션 작업 경로가 없습니다".to_owned()))?;
-    let cwd = fs::canonicalize(cwd)?;
-    if !cwd.is_dir() {
-        return Err(CoreError::InvalidInput(
-            "세션 작업 경로가 디렉터리가 아닙니다".to_owned(),
-        ));
-    }
-    let provider = inspect_local_environment()?
-        .providers
-        .into_iter()
-        .find(|provider| provider.provider == request.source)
-        .ok_or_else(|| CoreError::NotFound("공급자 정보를 찾을 수 없습니다".to_owned()))?;
-    let executable = provider
-        .cli
-        .path
-        .ok_or_else(|| CoreError::NotFound("공급자 CLI가 설치되어 있지 않습니다".to_owned()))?;
-    let executable = fs::canonicalize(executable)?;
-    if !executable.is_file() {
-        return Err(CoreError::InvalidInput(
-            "공급자 CLI 경로가 실행 파일이 아닙니다".to_owned(),
-        ));
-    }
+    let cwd = canonical_dir(cwd, "세션 작업 경로가 디렉터리가 아닙니다")?;
     Ok(LaunchSpec {
-        executable,
+        executable: resolve_executable(request.source)?,
         cwd,
         args: resume_args(request.source, &request.session_id),
         env: Vec::new(),
@@ -910,16 +1028,10 @@ fn resolve_launch_spec(
 }
 
 fn resolve_setup_launch_spec() -> Result<LaunchSpec, CoreError> {
-    let cwd = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .ok_or(CoreError::HomeDirectoryUnavailable)?;
-    let cwd = fs::canonicalize(cwd)?;
-    if !cwd.is_dir() {
-        return Err(CoreError::InvalidInput(
-            "사용자 홈 경로가 디렉터리가 아닙니다".to_owned(),
-        ));
-    }
+    let cwd = canonical_dir(
+        user_home::home_dir()?,
+        "사용자 홈 경로가 디렉터리가 아닙니다",
+    )?;
 
     #[cfg(windows)]
     let (executable, args) = (
@@ -933,12 +1045,7 @@ fn resolve_setup_launch_spec() -> Result<LaunchSpec, CoreError> {
     #[cfg(all(unix, not(target_os = "macos")))]
     let (executable, args) = (PathBuf::from("/bin/sh"), vec!["-l".to_owned()]);
 
-    let executable = fs::canonicalize(executable)?;
-    if !executable.is_file() {
-        return Err(CoreError::InvalidInput(
-            "설정 터미널 셸이 실행 파일이 아닙니다".to_owned(),
-        ));
-    }
+    let executable = canonical_file(executable, "설정 터미널 셸이 실행 파일이 아닙니다")?;
     Ok(LaunchSpec {
         executable,
         cwd,
@@ -949,24 +1056,34 @@ fn resolve_setup_launch_spec() -> Result<LaunchSpec, CoreError> {
 
 fn resolve_account_login_launch_spec(
     login: crate::AccountLoginSessionView,
+    remote: bool,
 ) -> Result<LaunchSpec, CoreError> {
-    let provider = inspect_local_environment()?
-        .providers
-        .into_iter()
-        .find(|provider| provider.provider == login.provider)
-        .ok_or_else(|| CoreError::NotFound("공급자 정보를 찾을 수 없습니다".to_owned()))?;
-    let executable = provider
-        .cli
-        .path
-        .ok_or_else(|| CoreError::NotFound("공급자 CLI가 설치되어 있지 않습니다".to_owned()))?;
-    let executable = fs::canonicalize(executable)?;
-    let cwd = fs::canonicalize(&login.profile_path)?;
-    if !cwd.is_dir() || !executable.is_file() {
-        return Err(CoreError::InvalidInput(
-            "계정 로그인 실행 경로가 올바르지 않습니다".to_owned(),
-        ));
-    }
-    let args = match login.provider {
+    let executable = resolve_executable(login.provider)?;
+    let cwd = canonical_dir(
+        &login.profile_path,
+        "계정 로그인 실행 경로가 올바르지 않습니다",
+    )?;
+    let args = account_login_args(login.provider, remote)?;
+    Ok(LaunchSpec {
+        executable,
+        cwd,
+        args,
+        env: account_login_env(&login),
+    })
+}
+
+/// 로그인 CLI 인자.
+///
+/// Codex는 원격 요청일 때만 `--device-auth`를 쓴다. 기본 `codex login`은 loopback PKCE라
+/// `redirect_uri`가 `http://localhost:1455/auth/callback`으로 고정되고 로그인 서버도
+/// 그 머신의 localhost에만 뜬다. 브라우저가 호스트에 있는 로컬 UI에서는 이 콜백이 그대로
+/// 닿아 브라우저가 알아서 끝내주므로 기본 방식이 손이 덜 간다. 반대로 Tailscale 경유 웹 UI는
+/// 브라우저가 다른 기기에 있어 콜백이 CLI에 절대 도달하지 못하고, CLI가 stdin의 코드
+/// 붙여넣기를 읽지 않으므로 터미널 입력으로도 우회할 수 없다. 그래서 원격에서만 로컬 콜백이
+/// 필요 없는 device 코드 방식으로 바꾼다.
+fn account_login_args(provider: ProviderId, remote: bool) -> Result<Vec<String>, CoreError> {
+    Ok(match provider {
+        ProviderId::Codex if remote => vec!["login".to_owned(), "--device-auth".to_owned()],
         ProviderId::Codex => vec!["login".to_owned()],
         ProviderId::Claude => vec![
             "auth".to_owned(),
@@ -978,13 +1095,48 @@ fn resolve_account_login_launch_spec(
                 "Antigravity 계정 로그인은 지원하지 않습니다".to_owned(),
             ))
         }
-    };
-    Ok(LaunchSpec {
-        executable,
-        cwd,
-        args,
-        env: vec![(login.environment_variable, login.profile_path)],
     })
+}
+
+/// 로그인 CLI를 임시 프로필에 가두는 환경변수.
+///
+/// Claude 자격증명 저장소는 `CLAUDE_SECURESTORAGE_CONFIG_DIR`이 파일 경로와 Keychain
+/// 서비스명을 단독으로 정한다. `CLAUDE_CONFIG_DIR`만 넘기면 로그인 CLI가 이 프로세스가
+/// 물려받은 값을 그대로 써서 다른 계정의 격리 프로필에 토큰을 쓰고, 로그인 완료 저장은
+/// 임시 프로필에서 자격증명을 찾지 못해 실패한다. 두 값을 함께 임시 프로필로 고정해
+/// 설정과 자격증명이 같은 자리에 남게 한다.
+fn account_login_env(login: &crate::AccountLoginSessionView) -> Vec<(String, String)> {
+    let mut env = vec![(
+        login.environment_variable.clone(),
+        login.profile_path.clone(),
+    )];
+    if login.provider == ProviderId::Claude {
+        env.push((
+            CLAUDE_SECURESTORAGE_CONFIG_DIR.to_owned(),
+            login.profile_path.clone(),
+        ));
+    }
+    env
+}
+
+/// 실행 스펙의 작업 경로를 확정한다. 세 실행 스펙이 각자 canonicalize 후 디렉터리인지
+/// 확인하고 있어 한 자리로 모았다. 경로마다 어긋났을 때 보여줄 문구가 달라 문구는 받는다.
+fn canonical_dir(path: impl AsRef<Path>, mismatch: &str) -> Result<PathBuf, CoreError> {
+    let path = fs::canonicalize(path)?;
+    if !path.is_dir() {
+        return Err(CoreError::InvalidInput(mismatch.to_owned()));
+    }
+    Ok(path)
+}
+
+/// 실행 파일 쪽의 같은 확인. 공급자 CLI는 `resolve_executable`이 같은 검사를 품고 있어
+/// 여기 남는 것은 설정 터미널의 셸뿐이다.
+fn canonical_file(path: impl AsRef<Path>, mismatch: &str) -> Result<PathBuf, CoreError> {
+    let path = fs::canonicalize(path)?;
+    if !path.is_file() {
+        return Err(CoreError::InvalidInput(mismatch.to_owned()));
+    }
+    Ok(path)
 }
 
 fn resume_args(source: ProviderId, session_id: &str) -> Vec<String> {
@@ -996,7 +1148,7 @@ fn resume_args(source: ProviderId, session_id: &str) -> Vec<String> {
 }
 
 fn acquire_session_lock(lock_dir: &Path, key: &SessionKey) -> Result<File, CoreError> {
-    let path = lock_dir.join(format!("{}-{}.lock", key.source.as_str(), key.session_id));
+    let path = lock_dir.join(format!("{}-{}.lock", key.source, key.session_id));
     let file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -1014,12 +1166,7 @@ fn acquire_session_lock(lock_dir: &Path, key: &SessionKey) -> Result<File, CoreE
 }
 
 fn validate_identifier(id: &str) -> Result<(), CoreError> {
-    if id.is_empty()
-        || id.len() > 200
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
+    if !crate::identifier::is_slug(id, 200) {
         return Err(CoreError::InvalidInput("잘못된 세션 ID입니다".to_owned()));
     }
     Ok(())
@@ -1055,32 +1202,20 @@ fn unix_millis_after(duration: Duration) -> i64 {
 /// 그 밖의 권한·플랫폼 오류는 계정 전환을 중단할 수 있도록 숨기지 않는다.
 #[cfg(unix)]
 fn send_terminal_signal(pid: u32, signal: libc::c_int) -> Result<bool, String> {
-    let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
-    if result == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(false)
-    } else {
-        Err(error.to_string())
+    match process_signal::signal_pid(pid, signal) {
+        Ok(process_signal::SignalDelivery::Delivered) => Ok(true),
+        Ok(process_signal::SignalDelivery::Gone) => Ok(false),
+        Err(error) => Err(error.to_string()),
     }
 }
 
 #[cfg(unix)]
 fn terminal_pid_exists(pid: u32) -> Result<bool, CoreError> {
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if result == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ESRCH) => Ok(false),
-        Some(libc::EPERM) => Ok(true),
-        _ => Err(CoreError::Runtime(format!(
+    process_signal::pid_exists(pid).map_err(|error| {
+        CoreError::Runtime(format!(
             "터미널 프로세스 {pid} 상태를 확인하지 못했습니다: {error}"
-        ))),
-    }
+        ))
+    })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, CoreError> {
@@ -1092,6 +1227,69 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn login_view(
+        provider: ProviderId,
+        environment_variable: &str,
+    ) -> crate::AccountLoginSessionView {
+        crate::AccountLoginSessionView {
+            id: "login-1".to_owned(),
+            provider,
+            account_id: None,
+            environment_variable: environment_variable.to_owned(),
+            profile_path: "/tmp/login-profile".to_owned(),
+            command: String::new(),
+        }
+    }
+
+    /// Claude 자격증명 저장소는 `CLAUDE_SECURESTORAGE_CONFIG_DIR`이 정한다. 이 값을 함께
+    /// 넘기지 않으면 로그인 CLI가 물려받은 다른 계정의 격리 프로필에 토큰을 쓴다.
+    #[test]
+    fn claude_login_pins_both_the_config_and_the_credential_store() {
+        assert_eq!(
+            account_login_env(&login_view(ProviderId::Claude, "CLAUDE_CONFIG_DIR")),
+            [
+                (
+                    "CLAUDE_CONFIG_DIR".to_owned(),
+                    "/tmp/login-profile".to_owned()
+                ),
+                (
+                    "CLAUDE_SECURESTORAGE_CONFIG_DIR".to_owned(),
+                    "/tmp/login-profile".to_owned()
+                ),
+            ]
+        );
+    }
+
+    /// Codex는 `CODEX_HOME` 하나가 홈 전체를 옮기므로 그대로 둔다.
+    #[test]
+    fn codex_login_keeps_a_single_home_variable() {
+        assert_eq!(
+            account_login_env(&login_view(ProviderId::Codex, "CODEX_HOME")),
+            [("CODEX_HOME".to_owned(), "/tmp/login-profile".to_owned())]
+        );
+    }
+
+    /// Codex 계정 로그인은 원격 웹 UI에서도 완주해야 하므로 그때만 loopback 콜백이 필요한
+    /// 기본 `codex login`을 버리고 device 코드로 간다. 로컬 UI는 콜백이 닿으므로 그대로 둔다.
+    #[test]
+    fn codex_account_login_uses_device_code_flow_only_when_remote() {
+        assert_eq!(
+            account_login_args(ProviderId::Codex, true).expect("codex remote args"),
+            ["login", "--device-auth"]
+        );
+        assert_eq!(
+            account_login_args(ProviderId::Codex, false).expect("codex local args"),
+            ["login"]
+        );
+        for remote in [true, false] {
+            assert_eq!(
+                account_login_args(ProviderId::Claude, remote).expect("claude args"),
+                ["auth", "login", "--claudeai"]
+            );
+            assert!(account_login_args(ProviderId::Antigravity, remote).is_err());
+        }
+    }
 
     #[test]
     fn provider_resume_arguments_are_fixed() {
@@ -1144,12 +1342,22 @@ mod tests {
 
     #[test]
     fn replay_buffer_keeps_the_most_recent_bytes() {
-        let mut replay = VecDeque::from(vec![1_u8; MAX_REPLAY_BYTES]);
-        replay.extend([2_u8; 10]);
-        let overflow = replay.len() - MAX_REPLAY_BYTES;
-        replay.drain(..overflow);
-        assert_eq!(replay.len(), MAX_REPLAY_BYTES);
-        assert_eq!(replay.back(), Some(&2));
+        let mut state = RuntimeState {
+            phase: TerminalPhase::Running,
+            subscriber: None,
+            replay: VecDeque::from(vec![1_u8; MAX_REPLAY_BYTES]),
+            replay_truncated: false,
+            reconnect_deadline: None,
+            expires_at: None,
+            exit_code: None,
+        };
+
+        state.append_replay(&[2_u8; 10]);
+
+        assert_eq!(state.replay.len(), MAX_REPLAY_BYTES);
+        assert_eq!(state.replay.front(), Some(&1));
+        assert_eq!(state.replay.back(), Some(&2));
+        assert!(state.replay_truncated);
     }
 
     #[test]
@@ -1245,5 +1453,23 @@ mod tests {
         assert_eq!(cleanup.requested_count, 1);
         assert_eq!(cleanup.stopped_count, 1);
         assert!(cleanup.failed.is_empty());
+    }
+
+    #[test]
+    fn test_terminal_phase_enum() {
+        use std::str::FromStr;
+
+        for &phase in TerminalPhase::ALL {
+            let s = phase.to_string();
+            assert_eq!(phase.as_str(), s);
+            assert_eq!(TerminalPhase::from_str(&s).unwrap(), phase);
+
+            // serde_json 직렬화 및 역직렬화 라운드트립 검증
+            let json = serde_json::to_string(&phase).unwrap();
+            assert_eq!(json, format!("\"{}\"", s));
+            let deserialized: TerminalPhase = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, phase);
+        }
+        assert!(TerminalPhase::from_str("unknown").is_err());
     }
 }

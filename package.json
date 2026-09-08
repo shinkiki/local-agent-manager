@@ -1,10 +1,10 @@
 {
   "name": "agent-manager-tauri",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local-first desktop manager for Claude Code, OpenAI Codex, and Google Antigravity sessions",
   "author": "shinkiki",
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/shinkiki/local-agent-manager.git"
@@ -26,11 +26,15 @@
     "tauri:dev:signed": "tauri dev --runner ./scripts/macos/signed-dev-runner.sh",
     "tauri:build:signed": "./scripts/macos/signed-build.sh",
     "server:build:signed": "./scripts/macos/signed-server-build.sh",
+    "notices:generate": "node ./scripts/generate-third-party-notices.mjs",
     "keychain:migrate:v2": "cargo run --release -p agent-manager-server -- migrate-keychain-v2",
     "rust:fmt": "cargo fmt --all --check",
     "rust:clippy": "cargo clippy --workspace --all-targets -- -D warnings",
     "rust:test": "cargo test --workspace",
-    "check": "npm run build && npm run rust:fmt && npm run rust:clippy && npm run rust:test"
+    "check": "npm run build && npm run rust:fmt && npm run rust:clippy && npm run rust:test",
+    "test:unit": "node --experimental-strip-types --test --test-reporter=dot src/lib/*.test.mjs",
+    "test:e2e": "node scripts/e2e.mjs",
+    "test:e2e:open": "node scripts/e2e.mjs --open"
   },
   "dependencies": {
     "@shikijs/core": "^4.4.3",
@@ -51,6 +55,7 @@
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "cypress": "15.21.1",
     "typescript": "~5.8.3",
     "vite": "^7.0.4"
   }

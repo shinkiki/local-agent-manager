@@ -40,6 +40,52 @@ jobs:
       - name: Verify Tauri packaging build
         run: npm run tauri build -- --no-bundle
 
+  windows-desktop:
+    # 데스크톱 앱은 Windows에서도 배포한다. macOS/Linux 잡은 cfg(windows) 분기를
+    # 한 줄도 컴파일하지 않으므로 깨진 채로 넘어간다. 번들 생성과 서명은
+    # release-windows.yml이 맡고, 여기서는 컴파일만 확인한다.
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Verify Tauri packaging build
+        run: npm run tauri build -- --no-bundle
+
+  linux-headless:
+    # 헤드리스 서버는 리눅스(NAS/컨테이너)에서도 돌아야 한다. macOS 잡만으로는
+    # cfg(unix)/cfg(not(macos)) 경로가 전혀 컴파일되지 않아 깨진 채로 넘어간다.
+    # 데스크톱 크레이트(src-tauri)는 웹뷰 의존성 때문에 여기서 제외한다.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Lint headless crates
+        run: cargo clippy --locked -p agent-manager-core -p agent-manager-server --all-targets -- -D warnings
+
+      - name: Test headless crates
+        run: cargo test --locked -p agent-manager-core -p agent-manager-server
+
   secret-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10

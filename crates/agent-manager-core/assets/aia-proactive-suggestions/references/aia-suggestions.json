@@ -1,0 +1,140 @@
+{
+  "schemaVersion": 1,
+  "packId": "agent-manager-default",
+  "version": "1.2.0",
+  "displayName": "Agent Manager 기본 선제 제안",
+  "suggestions": [
+    {
+      "id": "provider-cli-missing",
+      "kind": "providerCliMissing",
+      "enabled": true,
+      "severity": "error",
+      "priority": 100,
+      "titleTemplate": "{providerName} CLI 연결을 확인하세요",
+      "detailTemplate": "사용하던 공급자 CLI를 찾을 수 없습니다.",
+      "promptTemplate": "{providerName} CLI 연결 상태와 설치 경로를 읽기 전용으로 확인하고 복구 절차를 제안해줘. 변경은 내가 승인한 뒤 적용해줘.",
+      "parameters": {},
+      "rearm": { "afterResolved": true }
+    },
+    {
+      "id": "account-auth-error",
+      "kind": "accountAuthError",
+      "enabled": true,
+      "severity": "error",
+      "priority": 95,
+      "titleTemplate": "{providerName} 계정 인증을 확인하세요",
+      "detailTemplate": "계정 인증 상태가 정상이 아닙니다.",
+      "promptTemplate": "{providerName} 계정의 인증 상태를 비밀값 없이 확인하고 안전한 복구 방법을 제안해줘. 변경은 내가 승인한 뒤 적용해줘.",
+      "parameters": {},
+      "rearm": { "afterResolved": true }
+    },
+    {
+      "id": "account-auto-switch-missing",
+      "kind": "accountAutoSwitchMissing",
+      "enabled": true,
+      "severity": "info",
+      "priority": 55,
+      "titleTemplate": "{providerName} 자동 전환을 설정할 수 있습니다",
+      "detailTemplate": "사용 가능한 계정이 여러 개지만 자동 전환이 꺼져 있습니다.",
+      "promptTemplate": "{providerName} 계정 자동 전환의 현재 설정과 영향을 확인하고 권장 설정을 제안해줘. 변경은 내가 승인한 뒤 적용해줘.",
+      "parameters": { "minAccounts": 2 },
+      "rearm": { "afterResolved": true }
+    },
+    {
+      "id": "scheduler-paused",
+      "kind": "schedulerPaused",
+      "enabled": true,
+      "severity": "warning",
+      "priority": 75,
+      "titleTemplate": "반복 요청이 모두 일시정지되었습니다",
+      "detailTemplate": "필요한 자동 작업이 멈춰 있는지 확인하세요.",
+      "promptTemplate": "반복 요청의 일시정지 상태와 영향을 확인하고 재개할 항목을 제안해줘. 변경은 내가 승인한 뒤 적용해줘.",
+      "parameters": {},
+      "rearm": { "afterResolved": true }
+    },
+    {
+      "id": "schedule-run-failed",
+      "kind": "scheduleRunFailed",
+      "enabled": true,
+      "severity": "error",
+      "priority": 90,
+      "titleTemplate": "{scheduleName} 실행 실패를 확인하세요",
+      "detailTemplate": "최근 반복 요청 실행이 완료되지 않았습니다.",
+      "promptTemplate": "{scheduleName} 반복 요청의 최근 실패 원인을 읽기 전용으로 확인하고 복구 절차를 제안해줘. 변경은 내가 승인한 뒤 적용해줘.",
+      "parameters": { "lookbackHours": 24 },
+      "rearm": { "afterResolved": true }
+    },
+    {
+      "id": "translation-failed",
+      "kind": "translationFailed",
+      "enabled": true,
+      "severity": "warning",
+      "priority": 65,
+      "titleTemplate": "번역 실패 항목을 확인하세요",
+      "detailTemplate": "일부 UI 번역을 완료하지 못했습니다.",
+      "promptTemplate": "최근 번역 실패 상태를 확인하고 안전한 재시도 방법을 제안해줘. 변경은 내가 승인한 뒤 적용해줘.",
+      "parameters": { "minFailureCount": 1 },
+      "rearm": { "afterResolved": true }
+    },
+    {
+      "id": "project-session-cleanup",
+      "kind": "projectSessionCleanup",
+      "enabled": true,
+      "severity": "info",
+      "priority": 45,
+      "titleTemplate": "{projectName} 세션을 정리할 수 있습니다",
+      "detailTemplate": "{projectPath}에 폴더가 지정되지 않은 세션이 많습니다.",
+      "promptTemplate": "{projectName} 프로젝트의 최근 세션을 업무별로 분류하고 적절한 세션 폴더 구성을 제안해줘. 실제 변경은 내가 승인한 뒤 적용해줘.",
+      "parameters": { "minSessions": 8, "minUnfiled": 5, "minUnfiledRatio": 0.6, "rearmDelta": 3 },
+      "rearm": { "afterResolved": true }
+    },
+    {
+      "id": "interrupted-session-reminder",
+      "kind": "interruptedSessionReminder",
+      "enabled": true,
+      "severity": "warning",
+      "priority": 60,
+      "titleTemplate": "중단된 {sessionTitle} 작업을 이어갈 수 있습니다",
+      "detailTemplate": "중단된 요청이 아직 다시 시작되지 않았습니다.",
+      "promptTemplate": "중단된 {sessionTitle} 세션의 마지막 요청과 진행 내용을 확인하고, 이어서 처리할 다음 요청 초안만 만들어줘. 자동으로 재개하거나 전송하지 마.",
+      "parameters": { "delayMinutes": 30, "expiresDays": 7 },
+      "rearm": { "afterResolved": true }
+    },
+    {
+      "id": "skill-content-changed",
+      "kind": "skillContentChanged",
+      "enabled": true,
+      "severity": "info",
+      "priority": 80,
+      "titleTemplate": "{skillName} 스킬 내용이 바뀌었습니다",
+      "detailTemplate": "변경된 스킬 내용을 지금 검토할 수 있습니다.",
+      "promptTemplate": "{skillName} 공통 스킬의 현재 내용을 읽기 전용으로 확인하고, 최근 변경으로 생긴 문제와 개선점을 짧게 정리해줘. 수정이나 재배포는 내가 승인한 뒤 진행해줘.",
+      "parameters": { "expiresHours": 24, "maxResults": 3 },
+      "rearm": { "afterResolved": true }
+    },
+    {
+      "id": "feature-tip",
+      "kind": "featureTip",
+      "enabled": true,
+      "severity": "info",
+      "priority": 10,
+      "titleTemplate": "Agent Manager의 유용한 기능을 확인하세요",
+      "detailTemplate": "현재 작업 방식에 도움이 되는 기능이 있습니다.",
+      "promptTemplate": "현재 앱 상태에서 아직 활용하지 않은 유용한 기능 한 가지와 사용 방법을 짧게 알려줘. 변경이나 실행은 내가 승인한 뒤 진행해줘.",
+      "parameters": { "featureId": "general", "oncePerVersion": true },
+      "rearm": { "afterResolved": false }
+    },
+    {
+      "id": "resource-translation-tip",
+      "kind": "featureTip",
+      "enabled": true,
+      "severity": "info",
+      "priority": 12,
+      "titleTemplate": "항목 하나만 골라 번역할 수 있습니다",
+      "detailTemplate": "스킬·에이전트·산출물·지침 상세에서 그 항목만 지금 번역하거나 다시 번역합니다.",
+      "promptTemplate": "메뉴 자동번역을 켜지 않고 항목 단위로 번역하는 방법과, 저장된 번역이 원문 그대로일 때 다시 번역하는 방법을 짧게 알려줘. 변경이나 실행은 내가 승인한 뒤 진행해줘.",
+      "parameters": { "featureId": "resource-translation", "oncePerVersion": true },
+      "rearm": { "afterResolved": false }
+    }
+  ]
+}

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::file_kind::ensure_within_limit;
 use crate::CoreError;
 
 const MAX_LINKED_FILE_BYTES: u64 = 5 * 1024 * 1024;
@@ -65,7 +66,18 @@ pub(crate) fn read_linked_file_download_from(
     base: &Path,
     href: &str,
 ) -> Result<LinkedFileDownload, CoreError> {
-    let resolved = resolve_linked_file(root, base, href, MAX_LINKED_FILE_DOWNLOAD_BYTES)?;
+    read_linked_file_download_within(root, base, href, MAX_LINKED_FILE_DOWNLOAD_BYTES)
+}
+
+/// 상한을 직접 정해 내려받는다. 지침 보관은 원본 한도(파일당 2MB)를 넘는 문서를
+/// 애초에 읽지 않아야 하므로, 크기를 확인한 뒤에 읽는 이 경로를 쓴다.
+pub(crate) fn read_linked_file_download_within(
+    root: &Path,
+    base: &Path,
+    href: &str,
+    max_bytes: u64,
+) -> Result<LinkedFileDownload, CoreError> {
+    let resolved = resolve_linked_file(root, base, href, max_bytes)?;
     Ok(LinkedFileDownload {
         bytes: fs::read(&resolved.path)?,
         relative_path: resolved.relative_path,
@@ -153,9 +165,7 @@ fn resolve_linked_file(
             "링크 대상이 일반 파일이 아닙니다".to_owned(),
         ));
     }
-    if metadata.len() > max_bytes {
-        return Err(CoreError::TooLarge(max_bytes));
-    }
+    ensure_within_limit(&metadata, max_bytes)?;
 
     let relative_path = path
         .strip_prefix(&root)

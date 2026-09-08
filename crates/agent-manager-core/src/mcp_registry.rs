@@ -1,27 +1,32 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::time::Duration;
 
-use fs4::FileExt;
 use reqwest::blocking::{Client, Response};
-use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::app_data_file::open_private_append_file;
+use crate::clock::now_ms;
+use crate::json_store::{JsonStore, SchemaVersioned};
+use crate::text_limit;
 use crate::CoreError;
 
-const STORE_FILE: &str = "aia-mcp-interfaces.json";
-const STORE_LOCK_FILE: &str = "aia-mcp-interfaces.lock";
+const STORE_VERSION: u32 = 1;
+const STORE: JsonStore = JsonStore {
+    file: "aia-mcp-interfaces.json",
+    lock_file: "aia-mcp-interfaces.lock",
+    label: "AIA MCP 저장소",
+    version: STORE_VERSION,
+};
 const AUDIT_FILE: &str = "aia-mcp-audit.jsonl";
 const PREVIOUS_AUDIT_FILE: &str = "aia-mcp-audit.previous.jsonl";
-const STORE_VERSION: u32 = 1;
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 const MAX_REMOTE_BODY_BYTES: usize = 512 * 1024;
 const MAX_EXPOSED_RESULT_BYTES: usize = 256 * 1024;
@@ -72,13 +77,13 @@ pub(crate) struct McpInterfaceCallRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct McpRemoteTool {
-    name: String,
-    title: Option<String>,
-    description: Option<String>,
-    input_schema: Value,
-    read_only: bool,
-    destructive: bool,
+pub(crate) struct McpRemoteTool {
+    pub(crate) name: String,
+    pub(crate) title: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) input_schema: Value,
+    pub(crate) read_only: bool,
+    pub(crate) destructive: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,6 +116,12 @@ struct McpInterfaceStore {
     interfaces: BTreeMap<String, StoredMcpInterface>,
 }
 
+impl SchemaVersioned for McpInterfaceStore {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
 impl Default for McpInterfaceStore {
     fn default() -> Self {
         Self {
@@ -131,9 +142,12 @@ struct McpAuditEvent {
     outcome: String,
 }
 
-struct McpHttpSession {
+pub(crate) struct McpHttpSession {
     client: Client,
     url: String,
+    /// 원격 서버에 붙일 `Authorization` 헤더 값. 외부 플러그인 검증처럼 인증이 있는
+    /// 서버에 접속할 때만 채워지며, 로그·오류 문구에는 절대 넣지 않는다.
+    authorization: Option<String>,
     session_id: Option<String>,
     next_id: u64,
 }
@@ -458,53 +472,15 @@ impl McpInterfaceRegistry {
         &self,
         action: impl FnOnce() -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
-        fs::create_dir_all(&self.app_data_dir)?;
-        let lock = open_private_file(&self.app_data_dir.join(STORE_LOCK_FILE), false)?;
-        lock.lock().map_err(|error| {
-            CoreError::Runtime(format!("AIA MCP 저장소 잠금을 얻지 못했습니다: {error}"))
-        })?;
-        let result = action();
-        let _ = FileExt::unlock(&lock);
-        result
+        STORE.with_lock(&self.app_data_dir, action)
     }
 
     fn load_store_unlocked(&self) -> Result<McpInterfaceStore, CoreError> {
-        let path = self.app_data_dir.join(STORE_FILE);
-        if !path.is_file() {
-            return Ok(McpInterfaceStore::default());
-        }
-        let store: McpInterfaceStore = serde_json::from_slice(&fs::read(path)?)?;
-        if store.schema_version != STORE_VERSION {
-            return Err(CoreError::Conflict(format!(
-                "지원하지 않는 AIA MCP 저장소 버전입니다: {}",
-                store.schema_version
-            )));
-        }
-        Ok(store)
+        STORE.load_unlocked(&self.app_data_dir)
     }
 
     fn save_store_unlocked(&self, store: &McpInterfaceStore) -> Result<(), CoreError> {
-        let path = self.app_data_dir.join(STORE_FILE);
-        let temporary = self
-            .app_data_dir
-            .join(format!(".{STORE_FILE}.{}.tmp", Uuid::new_v4()));
-        let result = (|| {
-            let mut file = open_private_file(&temporary, true)?;
-            file.write_all(&serde_json::to_vec_pretty(store)?)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            drop(file);
-            if cfg!(windows) && path.exists() {
-                fs::remove_file(&path)?;
-            }
-            fs::rename(&temporary, &path)?;
-            File::open(&self.app_data_dir)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temporary);
-        }
-        result
+        STORE.save_unlocked(&self.app_data_dir, store)
     }
 
     fn append_audit_unlocked(&self, event: McpAuditEvent) -> Result<(), CoreError> {
@@ -519,7 +495,7 @@ impl McpInterfaceRegistry {
             }
             fs::rename(&path, previous)?;
         }
-        let mut file = open_private_file(&path, false)?;
+        let mut file = open_private_append_file(&path)?;
         file.write_all(&serde_json::to_vec(&event)?)?;
         file.write_all(b"\n")?;
         file.sync_data()?;
@@ -558,6 +534,13 @@ impl McpAuditEvent {
 
 impl McpHttpSession {
     fn connect(url: &str) -> Result<(Self, Value), CoreError> {
+        Self::connect_with_authorization(url, None)
+    }
+
+    pub(crate) fn connect_with_authorization(
+        url: &str,
+        authorization: Option<&str>,
+    ) -> Result<(Self, Value), CoreError> {
         let client = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(TOOL_TIMEOUT)
@@ -570,6 +553,7 @@ impl McpHttpSession {
         let mut session = Self {
             client,
             url: url.to_owned(),
+            authorization: authorization.map(str::to_owned),
             session_id: None,
             next_id: 1,
         };
@@ -588,11 +572,11 @@ impl McpHttpSession {
         Ok((session, initialize))
     }
 
-    fn list_tools(&mut self) -> Result<Value, CoreError> {
+    pub(crate) fn list_tools(&mut self) -> Result<Value, CoreError> {
         self.rpc("tools/list", json!({}))
     }
 
-    fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, CoreError> {
+    pub(crate) fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, CoreError> {
         self.rpc("tools/call", json!({"name": name, "arguments": arguments}))
     }
 
@@ -614,7 +598,7 @@ impl McpHttpSession {
                 .unwrap_or("알 수 없는 MCP JSON-RPC 오류");
             return Err(CoreError::Runtime(format!(
                 "MCP {method} 요청이 실패했습니다: {}",
-                truncate_text(message, 300)
+                text_limit::truncate_chars(message, 300)
             )));
         }
         value
@@ -642,6 +626,9 @@ impl McpHttpSession {
             .json(&payload);
         if let Some(session_id) = &self.session_id {
             request = request.header("mcp-session-id", session_id);
+        }
+        if let Some(authorization) = &self.authorization {
+            request = request.header(AUTHORIZATION, authorization);
         }
         let response = request.send().map_err(|error| {
             CoreError::Runtime(format!("MCP 서버에 연결하지 못했습니다: {error}"))
@@ -685,7 +672,7 @@ fn probe_remote(url: &str) -> Result<(McpHttpSession, McpInterfaceProbe), CoreEr
     ))
 }
 
-fn parse_tools(result: &Value) -> Result<Vec<McpRemoteTool>, CoreError> {
+pub(crate) fn parse_tools(result: &Value) -> Result<Vec<McpRemoteTool>, CoreError> {
     if result
         .get("nextCursor")
         .and_then(Value::as_str)
@@ -723,11 +710,11 @@ fn parse_tools(result: &Value) -> Result<Vec<McpRemoteTool>, CoreError> {
             title: raw
                 .get("title")
                 .and_then(Value::as_str)
-                .map(|value| truncate_text(value, 120)),
+                .map(|value| text_limit::truncate_chars(value, 120)),
             description: raw
                 .get("description")
                 .and_then(Value::as_str)
-                .map(|value| truncate_text(value, 500)),
+                .map(|value| text_limit::truncate_chars(value, 500)),
             input_schema: raw
                 .get("inputSchema")
                 .filter(|schema| schema.is_object())
@@ -825,7 +812,7 @@ fn parse_sse_json(text: &str) -> Result<Value, CoreError> {
     ))
 }
 
-fn bounded_remote_result(result: Value) -> Value {
+pub(crate) fn bounded_remote_result(result: Value) -> Value {
     let serialized_bytes = serde_json::to_vec(&result)
         .map(|bytes| bytes.len())
         .unwrap_or(MAX_EXPOSED_RESULT_BYTES + 1);
@@ -872,16 +859,7 @@ fn validate_endpoint(input: &str) -> Result<String, CoreError> {
 }
 
 fn validate_interface_id(value: &str) -> Result<(), CoreError> {
-    if value.is_empty()
-        || value.len() > 64
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
-        })
-        || !value
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-    {
+    if !crate::identifier::is_lowercase_slug(value, 64) {
         return Err(CoreError::InvalidInput(
             "인터페이스 id는 영문 소문자나 숫자로 시작하는 64자 이하의 소문자·숫자·_·- 조합이어야 합니다"
                 .to_owned(),
@@ -918,7 +896,7 @@ fn validate_enabled_tools(values: &[String]) -> Result<Vec<String>, CoreError> {
     Ok(unique.into_iter().collect())
 }
 
-fn validate_tool_name(value: &str) -> Result<(), CoreError> {
+pub(crate) fn validate_tool_name(value: &str) -> Result<(), CoreError> {
     if value.is_empty()
         || value.len() > 128
         || value
@@ -932,40 +910,8 @@ fn validate_tool_name(value: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn open_private_file(path: &Path, create_new: bool) -> Result<File, CoreError> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    if create_new {
-        options.create_new(true);
-    } else {
-        options
-            .create(true)
-            .append(path.file_name().and_then(|name| name.to_str()) == Some(AUDIT_FILE));
-    }
-    #[cfg(unix)]
-    options.mode(0o600);
-    options.open(path).map_err(CoreError::Io)
-}
-
-fn empty_object() -> Value {
+pub(crate) fn empty_object() -> Value {
     json!({})
-}
-
-fn truncate_text(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let text = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{text}…")
-    } else {
-        text
-    }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 #[cfg(test)]

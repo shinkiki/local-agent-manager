@@ -206,12 +206,10 @@ fn decode_header_component(value: &str) -> Result<String, String> {
 }
 
 fn decode_hex(byte: u8) -> Result<u8, String> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err("링크 파일 헤더 인코딩이 올바르지 않습니다".to_owned()),
-    }
+    (byte as char)
+        .to_digit(16)
+        .map(|d| d as u8)
+        .ok_or_else(|| "링크 파일 헤더 인코딩이 올바르지 않습니다".to_owned())
 }
 
 #[cfg(test)]

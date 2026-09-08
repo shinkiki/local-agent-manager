@@ -4,7 +4,8 @@ import { useI18n } from "../lib/i18n";
 import { useMenuTranslations } from "../lib/translations";
 import type { AgentDefinition, AgentDetail, SystemAutomationSnapshot, TranslatedDetail, TranslationSummary } from "../types";
 import { Drawer, EmptyState, ErrorBanner, LoadingState } from "./Shared";
-import { TranslationProgress } from "./TranslationProgress";
+import { TranslateResourceButton, TranslationProgress } from "./TranslationProgress";
+import { errorText } from "../lib/errorText";
 
 export function AgentsView({ agents, automation, onAutomationChange }: { agents: AgentDefinition[]; automation: SystemAutomationSnapshot | null; onAutomationChange: (snapshot: SystemAutomationSnapshot) => void }) {
   const { text } = useI18n();
@@ -24,10 +25,16 @@ export function AgentsView({ agents, automation, onAutomationChange }: { agents:
         <input className="search-input wide" value={query} onChange={(event) => setQuery(event.target.value)} placeholder={text("에이전트명·설명·도구 검색", "Search agent, description, or tool")} />
         <span className="toolbar-count">Claude {text("에이전트", "agents")} {filtered.length.toLocaleString()}{text("개", "")}</span>
       </section>
-      {filtered.length === 0 ? <EmptyState title={text("에이전트 정의가 없습니다", "No agent definitions")} detail={text("~/.claude/agents의 Markdown 정의를 탐지합니다.", "Markdown definitions are discovered from ~/.claude/agents.")} /> : (
+      {filtered.length === 0 ? (
+        // 원본이 0건인 것과 검색으로 좁혀 0건이 된 것은 다른 상황이다. 검색어가 있으면 탐지 경로 안내가
+        // 아니라 검색어를 지우는 되돌림 길을 알리고, 전체 개수를 함께 적어 정의가 사라진 게 아님을 보인다.
+        needle && agents.length > 0
+          ? <EmptyState title={text("검색 결과가 없습니다", "No matching agents")} detail={text(`검색어를 지우거나 다른 낱말로 찾아보세요. (전체 ${agents.length.toLocaleString()}개)`, `Clear the search or try another term. (${agents.length.toLocaleString()} total)`)} />
+          : <EmptyState title={text("에이전트 정의가 없습니다", "No agent definitions")} detail={text("~/.claude/agents의 Markdown 정의를 탐지합니다.", "Markdown definitions are discovered from ~/.claude/agents.")} />
+      ) : (
         <section className="card-grid agent-grid">
           {filtered.map((agent) => {
-            const translated = translationEnabled ? translations.records.get(agent.path) : undefined;
+            const translated = translations.records.get(agent.path);
             return (
             <button className="entity-card agent-card" type="button" key={agent.path} onClick={() => setSelected(agent)}>
               <div className="agent-avatar">A</div>
@@ -39,12 +46,13 @@ export function AgentsView({ agents, automation, onAutomationChange }: { agents:
           );})}
         </section>
       )}
-      {selected && <AgentDrawer agent={selected} translated={translationEnabled ? translations.records.get(selected.path) : undefined} translationRevision={automation?.revision ?? 0} onClose={() => setSelected(null)} />}
+      {selected && <AgentDrawer agent={selected} translated={translations.records.get(selected.path)} automation={automation} onAutomationChange={onAutomationChange} onClose={() => setSelected(null)} />}
     </div>
   );
 }
 
-function AgentDrawer({ agent, translated, translationRevision, onClose }: { agent: AgentDefinition; translated?: TranslationSummary; translationRevision: number; onClose: () => void }) {
+function AgentDrawer({ agent, translated, automation, onAutomationChange, onClose }: { agent: AgentDefinition; translated?: TranslationSummary; automation: SystemAutomationSnapshot | null; onAutomationChange: (snapshot: SystemAutomationSnapshot) => void; onClose: () => void }) {
+  const translationRevision = automation?.revision ?? 0;
   const { text } = useI18n();
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [translatedDetail, setTranslatedDetail] = useState<TranslatedDetail | null>(null);
@@ -53,11 +61,15 @@ function AgentDrawer({ agent, translated, translationRevision, onClose }: { agen
     let active = true;
     Promise.all([getAgentDetail(agent.name), translated ? getTranslatedDetail("agents", agent.path) : Promise.resolve(null)])
       .then(([value, translatedValue]) => { if (active) { setDetail(value); setTranslatedDetail(translatedValue); } })
-      .catch((cause: unknown) => active && setError(cause instanceof Error ? cause.message : String(cause)));
+      .catch((cause: unknown) => active && setError(errorText(cause)));
     return () => { active = false; };
   }, [agent.name, agent.path, translated, translationRevision]);
   return (
-    <Drawer title={<><span className="agent-avatar small">A</span><span data-user-content>{translated?.fields.name ?? agent.name}</span></>} onClose={onClose}>
+    <Drawer
+      title={<><span className="agent-avatar small">A</span><span data-user-content>{translated?.fields.name ?? agent.name}</span></>}
+      actions={<TranslateResourceButton menu="agents" resourceId={agent.path} translated={Boolean(translated)} automation={automation} onAutomationChange={onAutomationChange} />}
+      onClose={onClose}
+    >
       {error && <ErrorBanner message={error} />}
       {!detail && !error ? <LoadingState label={text("에이전트 정의를 읽고 있습니다", "Reading agent definition")} /> : detail && (
         <>

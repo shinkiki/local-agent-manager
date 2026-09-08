@@ -1,0 +1,61 @@
+# Agent Manager 헤드리스 서버 + Tailscale 사이드카.
+#
+# 두 컨테이너가 네트워크 네임스페이스를 공유한다(`network_mode: service:tailscale`).
+# 그래서 서버는 지금처럼 127.0.0.1에만 바인딩한 채로도 사이드카의 `tailscale serve`가
+# 그 루프백을 그대로 프록시할 수 있다. 서버 포트는 NAS의 LAN에 노출되지 않는다.
+#
+# 인증은 서버의 authorize()가 결정한다. 루프백 Host 헤더이거나 `tailscale serve`가
+# 붙여 주는 Tailscale-User-Login 헤더가 허용된 사용자와 일치해야 한다. 그래서 LAN IP로
+# 우회 접속하는 경로가 없고, 리버스 프록시로 Host를 위조해 넣는 구성은 인증을 통째로
+# 무력화하므로 쓰면 안 된다.
+#
+# Funnel(공개 인터넷 노출)은 켜지 않는다. Funnel 요청에는 tailnet 신원이 없어 서버가
+# 어차피 403으로 막고, 켜 봐야 공격면만 넓어진다.
+
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: agent-manager-tailscale
+    hostname: ${TS_HOSTNAME:-agent-manager}
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:?TS_AUTHKEY가 필요합니다}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_USERSPACE: "false"
+    volumes:
+      - ./data/tailscale:/var/lib/tailscale
+      - ./serve.json:/config/serve.json:ro
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    restart: unless-stopped
+
+  agent-manager:
+    build:
+      context: ../..
+      dockerfile: deploy/synology/Dockerfile
+    image: agent-manager-server:local
+    container_name: agent-manager
+    depends_on:
+      - tailscale
+    # 사이드카의 네임스페이스를 그대로 쓴다. 여기서 ports를 열 수 없고, 열 필요도 없다.
+    network_mode: service:tailscale
+    # 필수. 에이전트 CLI가 남기는 고아 자식을 PID 1이 회수하지 못하면 좀비로 쌓이고,
+    # 프로세스 그룹 종료 확인이 영원히 끝나지 않아 채팅 강제 종료가 멈춘다.
+    init: true
+    environment:
+      # 시크릿 서비스 잠금 해제 암호. NAS 디스크를 확보한 사람은 볼트를 열 수 있는
+      # 구성이므로, 이 값과 ./data는 같은 등급으로 보호해야 한다.
+      KEYRING_PASSWORD: ${KEYRING_PASSWORD:?KEYRING_PASSWORD가 필요합니다}
+      # tailscale serve가 붙여 주는 신원 헤더와 대조할 값.
+      TAILSCALE_HOST: ${TAILSCALE_HOST:?TAILSCALE_HOST가 필요합니다}
+      TAILSCALE_USER: ${TAILSCALE_USER:?TAILSCALE_USER가 필요합니다}
+      AGENT_MANAGER_PORT: "4178"
+      # 원격에서 변경 작업까지 허용할지. 기본은 읽기 전용이다.
+      AGENT_MANAGER_REMOTE_WRITE: ${AGENT_MANAGER_REMOTE_WRITE:-false}
+    volumes:
+      - ./data/agent-manager:/data
+      - ${WORKSPACE_DIR:-./workspace}:/workspace
+    restart: unless-stopped

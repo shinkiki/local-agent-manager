@@ -30,7 +30,9 @@ Manager frontend/backend processes, then starts one standalone backend and the
 Tauri development frontend. Ctrl+C stops both processes.
 
   --remote-write  Require the current Tailscale identity and Serve target, and
-                  expose the backend with remote write access.
+                  expose the backend with remote write access. The flag records
+                  that choice in the stored backend service setting, which the
+                  Settings → 백엔드 서비스 toggle also owns.
 EOF
 }
 
@@ -57,19 +59,24 @@ read_port() {
 }
 
 PORT="$(read_port)"
-EXPECTED_PROTOCOL="$(sed -n 's/^const EXPECTED_BACKEND_PROTOCOL_VERSION = \([0-9][0-9]*\);$/\1/p' "$REPO_ROOT/src/lib/ipc.ts")"
+EXPECTED_PROTOCOL="$(sed -n 's/^const EXPECTED_BACKEND_PROTOCOL_VERSION = \([0-9][0-9]*\);$/\1/p' "$REPO_ROOT/src/lib/ipcTransport.ts")"
 [ -n "$EXPECTED_PROTOCOL" ] || fail "프런트엔드 API 프로토콜 버전을 확인하지 못했습니다."
 
 listener_pids() {
   lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | sort -u || true
 }
 
+# lsof의 -Fn 출력에서 첫 이름 한 줄만 뽑는 절차는 실행파일(txt)과 작업 디렉터리(cwd)가 같다.
+process_lsof_name() {
+  lsof -a -p "$1" -d "$2" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
+}
+
 process_executable() {
-  lsof -a -p "$1" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
+  process_lsof_name "$1" txt
 }
 
 process_cwd() {
-  lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
+  process_lsof_name "$1" cwd
 }
 
 process_command() {
@@ -80,20 +87,38 @@ redacted_command() {
   process_command "$1" | sed -E 's/(--tailscale-user )[[:graph:]]+/\1[redacted]/g'
 }
 
+# 이 저장소가 띄우는 실행파일의 자리는 디버그·릴리스(서버)와 디버그·릴리스·번들·설치본(Tauri)이고,
+# 백엔드 판정과 프런트엔드 판정이 같은 목록을 본다. 한쪽만 고쳐 목록이 갈라지지 않도록 여기 둔다.
+is_server_executable() {
+  case "$1" in
+    "$REPO_ROOT/target/debug/agent-manager-server"|"$REPO_ROOT/target/release/agent-manager-server")
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+is_tauri_executable() {
+  case "$1" in
+    "$REPO_ROOT/target/debug/agent-manager-tauri"|"$REPO_ROOT/target/release/agent-manager-tauri"|"$REPO_ROOT/target/release/bundle/macos/Agent Manager.app/Contents/MacOS/agent-manager-tauri"|"/Applications/Agent Manager.app/Contents/MacOS/agent-manager-tauri")
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 assert_known_backend() {
   local pid executable command
   pid="$1"
   executable="$(process_executable "$pid")"
   command="$(process_command "$pid")"
-  case "$executable" in
-    "$REPO_ROOT/target/debug/agent-manager-server"|"$REPO_ROOT/target/release/agent-manager-server")
-      return 0
-      ;;
-    "$REPO_ROOT/target/debug/agent-manager-tauri"|"$REPO_ROOT/target/release/agent-manager-tauri"|"/Applications/Agent Manager.app/Contents/MacOS/agent-manager-tauri")
-      [[ "$command" == *" --backend"* ]] && return 0
-      ;;
-  esac
-  fail "포트 $PORT의 PID $pid가 허용된 Agent Manager 백엔드가 아닙니다: $(redacted_command "$pid")"
+  if is_server_executable "$executable"; then
+    return 0
+  fi
+  if is_tauri_executable "$executable" && [[ "$command" == *" --backend"* ]]; then
+    return 0
+  fi
+  fail "포트 ${PORT}의 PID ${pid}가 허용된 Agent Manager 백엔드가 아닙니다: $(redacted_command "$pid")"
 }
 
 assert_known_frontend() {
@@ -102,44 +127,58 @@ assert_known_frontend() {
   executable="$(process_executable "$pid")"
   cwd="$(process_cwd "$pid")"
   command="$(process_command "$pid")"
-  case "$executable" in
-    "$REPO_ROOT/target/debug/agent-manager-tauri"|"$REPO_ROOT/target/release/agent-manager-tauri"|"/Applications/Agent Manager.app/Contents/MacOS/agent-manager-tauri")
-      return 0
-      ;;
-  esac
+  if is_tauri_executable "$executable"; then
+    return 0
+  fi
   if [ "$cwd" = "$REPO_ROOT" ] && [[ "$command" == *"vite"* || "$command" == *"tauri-cli.mjs"* || "$command" == *"@tauri-apps/cli/tauri.js"* ]]; then
     return 0
   fi
-  fail "PID $pid가 이 저장소의 Agent Manager 개발 프런트엔드가 아닙니다: $(redacted_command "$pid")"
+  fail "PID ${pid}가 이 저장소의 Agent Manager 개발 프런트엔드가 아닙니다: $(redacted_command "$pid")"
+}
+
+# 프로세스가 종료될 때까지 일정 주기마다 상태를 확인한다.
+wait_pid_exit() {
+  local pid attempts interval attempt
+  pid="$1"
+  attempts="$2"
+  interval="$3"
+  for attempt in $(seq 1 "$attempts"); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep "$interval"
+  done
+  kill -0 "$pid" 2>/dev/null || return 0
+  return 1
 }
 
 stop_pid() {
-  local pid label attempt
+  local pid label
   pid="$1"
   label="$2"
   kill -0 "$pid" 2>/dev/null || return 0
   echo "$label 정상 종료 요청: PID $pid"
   kill -TERM "$pid"
-  for attempt in $(seq 1 40); do
-    kill -0 "$pid" 2>/dev/null || return 0
-    sleep 0.25
-  done
+  if wait_pid_exit "$pid" 40 0.25; then
+    return 0
+  fi
   echo "$label 강제 종료: PID $pid"
   kill -KILL "$pid"
-  for attempt in $(seq 1 20); do
-    kill -0 "$pid" 2>/dev/null || return 0
-    sleep 0.1
-  done
-  fail "$label PID $pid가 종료되지 않았습니다."
+  if wait_pid_exit "$pid" 20 0.1; then
+    return 0
+  fi
+  fail "$label PID ${pid}가 종료되지 않았습니다."
 }
 
 frontend_candidate_pids() {
   {
     lsof -nP -iTCP:"$FRONTEND_PORT" -sTCP:LISTEN -t 2>/dev/null || true
-    pgrep -f 'target/debug/agent-manager-tauri' 2>/dev/null || true
-    pgrep -f '/Applications/Agent Manager.app/Contents/MacOS/agent-manager-tauri' 2>/dev/null || true
-    pgrep -f 'scripts/tauri-cli.mjs dev' 2>/dev/null || true
-    pgrep -f '@tauri-apps/cli/tauri.js dev' 2>/dev/null || true
+    for pattern in \
+      'target/debug/agent-manager-tauri' \
+      "$REPO_ROOT/target/release/bundle/macos/Agent Manager.app/Contents/MacOS/agent-manager-tauri" \
+      '/Applications/Agent Manager.app/Contents/MacOS/agent-manager-tauri' \
+      'scripts/tauri-cli.mjs dev' \
+      '@tauri-apps/cli/tauri.js dev'; do
+      pgrep -f "$pattern" 2>/dev/null || true
+    done
   } | awk -v self="$$" -v parent="$PPID" '$1 != self && $1 != parent' | sort -un
 }
 
@@ -158,11 +197,11 @@ stop_existing_backend() {
   pids="$(listener_pids)"
   [ -n "$pids" ] || return 0
   count="$(printf '%s\n' "$pids" | wc -l | tr -d ' ')"
-  [ "$count" = "1" ] || fail "포트 $PORT 리스너가 $count개라 자동 종료하지 않습니다."
+  [ "$count" = "1" ] || fail "포트 $PORT 리스너가 ${count}개라 자동 종료하지 않습니다."
   pid="$pids"
   assert_known_backend "$pid"
   stop_pid "$pid" "기존 백엔드"
-  [ -z "$(listener_pids)" ] || fail "포트 $PORT의 기존 리스너가 남아 있습니다."
+  [ -z "$(listener_pids)" ] || fail "포트 ${PORT}의 기존 리스너가 남아 있습니다."
 }
 
 tailscale_executable() {
@@ -244,18 +283,22 @@ wait_for_frontend() {
   fail "Tauri 개발 프런트엔드가 제한 시간 안에 시작되지 않았습니다."
 }
 
+# 이 스크립트가 직접 띄운 자식을 끝낼 때는 "살아 있으면 TERM을 보내고 거둔다"가 전부다.
+terminate_child() {
+  local pid
+  pid="$1"
+  [ -n "$pid" ] || return 0
+  kill -0 "$pid" 2>/dev/null || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
 cleanup() {
   local status
   status=$?
   trap - EXIT INT TERM
-  if [ -n "$FRONTEND_PID" ] && kill -0 "$FRONTEND_PID" 2>/dev/null; then
-    kill -TERM "$FRONTEND_PID" 2>/dev/null || true
-    wait "$FRONTEND_PID" 2>/dev/null || true
-  fi
-  if [ -n "$BACKEND_PID" ] && kill -0 "$BACKEND_PID" 2>/dev/null; then
-    kill -TERM "$BACKEND_PID" 2>/dev/null || true
-    wait "$BACKEND_PID" 2>/dev/null || true
-  fi
+  terminate_child "$FRONTEND_PID"
+  terminate_child "$BACKEND_PID"
   exit "$status"
 }
 trap cleanup EXIT INT TERM

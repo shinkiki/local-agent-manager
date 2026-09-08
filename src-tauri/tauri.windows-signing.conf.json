@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "windows": {
+      "signCommand": {
+        "cmd": "powershell",
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "& \"$env:AGENT_MANAGER_WINDOWS_SIGN_SCRIPT\" -Path \"%1\""
+        ]
+      }
+    }
+  }
+}

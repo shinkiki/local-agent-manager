@@ -3,7 +3,7 @@ import { Check, Copy, TriangleAlert } from "lucide-react";
 import { writeClipboardText } from "../lib/clipboard";
 import { useI18n } from "../lib/i18n";
 
-type CopyKind = "response" | "section" | "code";
+type CopyKind = "response" | "section" | "code" | "path";
 type CopyState = "idle" | "copying" | "copied" | "failed";
 
 export function CopyAction({
@@ -12,7 +12,11 @@ export function CopyAction({
   className = "",
   disabled = false,
 }: {
-  value: string;
+  /**
+   * 문자열이거나, 누를 때 값을 만드는 함수. 함수형은 렌더 시점에 값을 만들지 않으므로
+   * 화면에 눌리지도 않을 복사 대상을 미리 뽑아 두는 비용을 없앤다.
+   */
+  value: string | (() => string);
   kind: CopyKind;
   className?: string;
   disabled?: boolean;
@@ -24,7 +28,9 @@ export function CopyAction({
     ? text("응답 복사", "Copy response")
     : kind === "section"
       ? text("섹션 복사", "Copy section")
-      : text("코드 복사", "Copy code");
+      : kind === "path"
+        ? text("경로 복사", "Copy path")
+        : text("코드 복사", "Copy code");
   const stateLabel = state === "copied"
     ? text("복사됨", "Copied")
     : state === "failed"
@@ -39,11 +45,13 @@ export function CopyAction({
   }, []);
 
   const copy = async () => {
-    if (disabled || state === "copying" || !value) return;
+    if (disabled || state === "copying") return;
+    const resolved = typeof value === "function" ? value() : value;
+    if (!resolved) return;
     if (resetTimerRef.current !== null) window.clearTimeout(resetTimerRef.current);
     setState("copying");
     try {
-      await writeClipboardText(value);
+      await writeClipboardText(resolved);
       setState("copied");
     } catch {
       setState("failed");

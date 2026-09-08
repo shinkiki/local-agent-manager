@@ -1,12 +1,10 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
 use std::path::Path;
 
 use serde::Serialize;
-use uuid::Uuid;
 
+use crate::app_data_file::write_private_json;
+use crate::clock::now_ms;
 use crate::CoreError;
 
 const RESET_MARKER: &str = "account-storage-reset-v1.json";
@@ -42,28 +40,10 @@ pub fn prepare_account_management_storage(app_data_dir: &Path) -> Result<(), Cor
     }
     let marker = ResetMarker {
         schema_version: 1,
-        completed_at: crate::storage_reset::now_ms(),
+        completed_at: now_ms(),
         removed,
     };
-    let temporary = app_data_dir.join(format!(".{RESET_MARKER}.{}.tmp", Uuid::new_v4()));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(&temporary)?;
-    file.write_all(&serde_json::to_vec_pretty(&marker)?)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(temporary, marker_path)?;
-    Ok(())
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or(0)
+    write_private_json(&marker_path, &marker)
 }
 
 #[cfg(test)]

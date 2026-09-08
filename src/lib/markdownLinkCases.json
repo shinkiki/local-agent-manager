@@ -1,0 +1,62 @@
+[
+  {
+    "name": "가져오기 표기와 마크다운 링크를 나온 순서대로 모은다",
+    "source": "# 지침\n\n@context/agent/rules.md 를 먼저 읽고 [소스 맵](docs/source-map.md)을 본다.\n",
+    "links": ["context/agent/rules.md", "docs/source-map.md"]
+  },
+  {
+    "name": "코드 펜스와 인라인 코드 안의 경로는 링크가 아니다",
+    "source": "```\n@fenced/ignored.md\n```\n\n`@inline/ignored.md` 는 예시이고 @real/doc.md 는 링크다.\n",
+    "links": ["real/doc.md"]
+  },
+  {
+    "name": "같은 주소는 한 번만 모은다",
+    "source": "@a/one.md\n\n[다시](a/one.md)\n",
+    "links": ["a/one.md"]
+  },
+  {
+    "name": "확장자도 슬래시도 없는 토큰은 경로로 보지 않는다",
+    "source": "@mention 은 사람이고 @team/notes.md 는 문서다. @notes.md 도 문서다.\n",
+    "links": ["team/notes.md", "notes.md"]
+  },
+  {
+    "name": "경로 뒤 문장 부호는 경로에서 떼어낸다",
+    "source": "먼저 @context/rules.md, 다음 @context/next.md).\n",
+    "links": ["context/rules.md", "context/next.md"]
+  },
+  {
+    "name": "외부 주소와 앵커는 로컬 문서가 아니다",
+    "source": "[웹](https://example.com/doc.md) [메일](mailto:a@b.com) [앵커](#section) [문서](local.md)\n",
+    "links": ["local.md"]
+  },
+  {
+    "name": "홈 표기와 절대 경로, 상위 경로도 링크로 모은다",
+    "source": "@~/.codex/shared.md 와 [절대](/etc/agent/doc.md), [상위](../sibling/doc.md)\n",
+    "links": ["~/.codex/shared.md", "/etc/agent/doc.md", "../sibling/doc.md"]
+  },
+  {
+    "name": "프로토콜처럼 콜론이 들어간 주소는 렌더링하지 않으므로 모으지 않는다",
+    "source": "[이상한](weird:target.md) [정상](plain/target.md)\n",
+    "links": ["plain/target.md"]
+  },
+  {
+    "name": "줄 번호가 붙은 링크는 주소를 그대로 남긴다",
+    "source": "[규칙 12줄](context/rules.md#L12)\n",
+    "links": ["context/rules.md#L12"]
+  },
+  {
+    "name": "이메일 주소는 가져오기 표기가 아니다",
+    "source": "문의는 person@team.example.com 으로.\n",
+    "links": []
+  },
+  {
+    "name": "CRLF 줄바꿈도 같은 결과를 낸다",
+    "source": "# 지침\r\n\r\n@context/rules.md\r\n",
+    "links": ["context/rules.md"]
+  },
+  {
+    "name": "여는 괄호 뒤 가져오기 표기도 링크로 본다",
+    "source": "규칙(@context/rules.md)을 본다.\n",
+    "links": ["context/rules.md"]
+  }
+]

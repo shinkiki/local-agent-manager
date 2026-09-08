@@ -25,8 +25,9 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. Rust sources and Cargo artifacts are rebuilt by Tauri/Cargo. Watching them here
+      //    makes Vite rescan a potentially huge target directory during every Rust build.
+      ignored: ["**/src-tauri/**", "**/crates/**", "**/target/**"],
     },
   },
 }));

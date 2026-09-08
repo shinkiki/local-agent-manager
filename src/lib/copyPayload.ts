@@ -1,4 +1,4 @@
-export function normalizeClipboardText(text: string): string {
+function normalizeClipboardText(text: string): string {
   return text.replace(/\r\n?/g, "\n");
 }
 
@@ -10,7 +10,14 @@ export function joinMarkdownBlocks(blocks: string[]): string {
 }
 
 export function markdownSectionAtLine(source: string, headingLine: number): string {
-  const lines = normalizeClipboardText(source).split("\n");
+  return markdownSectionFromLines(normalizeClipboardText(source).split("\n"), headingLine);
+}
+
+/**
+ * 줄 단위로 이미 나눠 둔 원문에서 섹션을 잘라낸다. 제목마다 원문을 다시 정규화하고
+ * 쪼개면 제목 수 × 원문 길이만큼 일하게 되므로, 렌더당 한 번 나눈 줄을 넘겨 재사용한다.
+ */
+export function markdownSectionFromLines(lines: string[], headingLine: number): string {
   const heading = lines[headingLine]?.match(/^(#{1,6})\s+.+$/);
   if (!heading) return "";
 

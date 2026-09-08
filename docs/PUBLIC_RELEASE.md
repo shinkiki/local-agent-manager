@@ -5,13 +5,13 @@
 ## 1. 권리와 개인정보
 
 - [ ] 소스와 아이콘을 공개할 권리가 있는지 확인합니다.
-- [x] MIT 라이선스를 선택합니다.
-- [x] `LICENSE`를 추가하고 README, npm, Cargo 메타데이터를 MIT로 맞춥니다.
+- [x] MIT와 Apache-2.0 듀얼 라이선스(`MIT OR Apache-2.0`)를 선택합니다.
+- [x] `LICENSE-MIT`과 `LICENSE-APACHE`를 추가하고 README, npm, Cargo 메타데이터를 `MIT OR Apache-2.0`으로 맞춥니다.
 - [x] 공개 `main` 이력을 지정한 공개용 작성자 정보의 단일 커밋으로 재작성합니다.
 - [x] 공급자 이름과 상표가 공식 제휴 또는 보증을 의미하지 않는다고 README에 명시합니다.
-- [ ] 바이너리를 배포한다면 npm·Cargo 전이 의존성의 라이선스를 감사하고 필요한 third-party notice를 함께 제공합니다.
+- [x] 바이너리를 배포한다면 npm·Cargo 전이 의존성의 라이선스를 감사하고 필요한 third-party notice를 함께 제공합니다. `npm run notices:generate`로 `THIRD-PARTY-NOTICES.md`를 만들고, 앱 번들의 `licenses/`에 라이선스 전문과 함께 포함합니다.
 
-MIT 라이선스 전문과 저작권 표시는 저장소 루트의 `LICENSE`를 기준으로 합니다.
+라이선스 전문과 저작권 표시는 저장소 루트의 `LICENSE-MIT`, `LICENSE-APACHE`를 기준으로 하며, 사용자는 두 라이선스 중 하나를 선택할 수 있습니다.
 
 ## 2. 로컬 감사
 

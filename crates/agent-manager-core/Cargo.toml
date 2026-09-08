@@ -1,10 +1,10 @@
 [package]
 name = "agent-manager-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "Platform-independent domain and application core for Agent Manager"
 edition = "2021"
 publish = false
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/shinkiki/local-agent-manager"
 
 [dependencies]
@@ -13,7 +13,10 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
+toml = "1"
+unicode-normalization = "0.1"
 walkdir = "2"
+same-file = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 fs4 = "1.1"
 portable-pty = "0.9"
@@ -33,7 +36,9 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 zeroize = "1"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+# libc는 macOS 전용 Keychain 호출만이 아니라 process_signal/terminal/external_processes의
+# cfg(unix) 경로에서도 쓴다. 리눅스에서도 링크되도록 unix 전체를 대상으로 선언한다.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
@@ -41,7 +46,7 @@ keyring = { version = "3", features = ["sync-secret-service", "vendored", "crypt
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Power", "Win32_System_Threading", "Win32_UI_Shell"] }
 
 [dev-dependencies]
 tempfile = "3"
