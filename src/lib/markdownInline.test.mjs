@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   MARKDOWN_INLINE_TOKEN,
-  markdownAngleToken,
   markdownEscapedChar,
   markdownUnderscoreIsIntraword,
   unescapeMarkdown,
@@ -22,6 +21,18 @@ test("이스케이프는 가려진 글자만 남기고 표기를 열지 않는�
   // 문장부호가 아닌 글자 앞의 백슬래시는 이스케이프가 아니라 글자 그대로다.
   assert.deepEqual(tokens("경로 C:\\temp"), []);
   assert.equal(markdownEscapedChar("**굵게**"), null);
+});
+
+test("토큰과 되돌림이 같은 문자 집합을 이스케이프로 본다", () => {
+  // 두 규칙이 같은지는 문자 범위를 눈으로 대조해야만 알 수 있었다. ASCII 전 범위를
+  // 훑어 두면 한쪽만 넓어지는 어긋남(본문에서는 사라진 백슬래시가 링크 주소에만 남는 것)이
+  // 통과할 수 없다.
+  for (let code = 0x21; code <= 0x7e; code += 1) {
+    const char = String.fromCharCode(code);
+    const escapable = !/[0-9A-Za-z]/.test(char);
+    assert.deepEqual(tokens(`a\\${char}b`), escapable ? [`\\${char}`] : [], char);
+    assert.equal(unescapeMarkdown(`a\\${char}b`), escapable ? `a${char}b` : `a\\${char}b`, char);
+  }
 });
 
 test("같은 글자를 쓰는 강조는 긴 표기부터 통째로 잡는다", () => {
@@ -49,20 +60,10 @@ test("이미지 표기는 느낌표까지 한 토큰으로 잡는다", () => {
   assert.deepEqual(tokens("[문서](a.md)"), ["[문서](a.md)"]);
 });
 
-test("아는 HTML 표기만 걷어내고 부등호는 글자로 남긴다", () => {
-  assert.deepEqual(markdownAngleToken("<br>"), { kind: "break" });
-  assert.deepEqual(markdownAngleToken("<br />"), { kind: "break" });
-  assert.deepEqual(markdownAngleToken("<b>"), { kind: "markup" });
-  assert.deepEqual(markdownAngleToken("</details>"), { kind: "markup" });
-  assert.deepEqual(markdownAngleToken('<img src="a.png" />'), { kind: "markup" });
-  assert.deepEqual(markdownAngleToken("<https://example.com>"), {
-    kind: "autolink",
-    href: "https://example.com",
-  });
-  // 모르는 태그는 숨기지 않는다. 무엇이 지워졌는지 화면만 보고 알 수 없기 때문이다.
-  assert.equal(markdownAngleToken("<oai-mem-citation>"), null);
-  assert.equal(markdownAngleToken("<3"), null);
+test("표기가 아닌 부등호는 토큰으로 잡지 않는다", () => {
+  // 덩이를 잡는 규칙은 여기, 잡은 덩이의 정체를 가르는 규칙은 markdownAngle에 있다.
   assert.deepEqual(tokens("n < m 이고 m > k"), []);
+  assert.deepEqual(tokens("<https://example.com> 참고"), ["<https://example.com>"]);
 });
 
 test("코드 스팬 안의 백슬래시는 손대지 않는다", () => {

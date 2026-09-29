@@ -54,11 +54,14 @@ use crate::accounts::{
 use crate::clock::now_ms;
 use crate::credential_profiles;
 use crate::json_store::{JsonStore, SchemaVersioned};
-use crate::mcp_registry::{parse_tools, McpHttpSession};
+use crate::loopback_host::{is_loopback_url_host, validate_mcp_endpoint};
+use crate::mcp_registry::{parse_tools, McpHttpSession, McpRemoteTool};
 use crate::text_limit;
 use crate::CoreError;
 
 const STORE_VERSION: u32 = 1;
+/// 플러그인 하나가 가질 수 있는 다른 이름 수.
+const MAX_PLUGIN_NAMES: usize = 8;
 const STORE: JsonStore = JsonStore {
     file: "external-plugins.json",
     lock_file: "external-plugins.lock",
@@ -93,6 +96,8 @@ const OAUTH_CLIENT_NAME: &str = "Agent Manager";
 pub struct HostedMcpPreset {
     pub id: &'static str,
     pub display_name: &'static str,
+    /// 등록 폼에 미리 채우는 다른 이름들. 사용자가 고쳐서 저장한다.
+    pub names: &'static [&'static str],
     pub url: &'static str,
     pub auth: PluginAuthKind,
     /// 화면이 아이콘과 안내 문구를 고르는 브랜드 키.
@@ -170,6 +175,7 @@ pub const HOSTED_MCPS: [HostedMcpPreset; 7] = [
     HostedMcpPreset {
         id: "jira",
         display_name: "Jira · Confluence",
+        names: &["지라", "컨플루언스", "아틀라시안"],
         url: "https://mcp.atlassian.com/v2/mcp",
         auth: PluginAuthKind::OAuth,
         brand: "atlassian",
@@ -182,6 +188,7 @@ pub const HOSTED_MCPS: [HostedMcpPreset; 7] = [
     HostedMcpPreset {
         id: "github",
         display_name: "GitHub",
+        names: &["깃허브", "깃헙"],
         url: "https://api.githubcopilot.com/mcp/",
         auth: PluginAuthKind::OAuthDevice,
         brand: "github",
@@ -194,6 +201,7 @@ pub const HOSTED_MCPS: [HostedMcpPreset; 7] = [
     HostedMcpPreset {
         id: "figma",
         display_name: "Figma (Dev Mode)",
+        names: &["피그마"],
         url: "http://127.0.0.1:3845/mcp",
         auth: PluginAuthKind::None,
         brand: "figma",
@@ -204,6 +212,7 @@ pub const HOSTED_MCPS: [HostedMcpPreset; 7] = [
     HostedMcpPreset {
         id: "gmail",
         display_name: "Gmail",
+        names: &["지메일"],
         url: "https://gmailmcp.googleapis.com/mcp/v1",
         auth: PluginAuthKind::OAuth,
         brand: "google",
@@ -214,6 +223,7 @@ pub const HOSTED_MCPS: [HostedMcpPreset; 7] = [
     HostedMcpPreset {
         id: "google-drive",
         display_name: "Google Drive",
+        names: &["구글 드라이브", "드라이브"],
         url: "https://drivemcp.googleapis.com/mcp/v1",
         auth: PluginAuthKind::OAuth,
         brand: "google",
@@ -224,6 +234,7 @@ pub const HOSTED_MCPS: [HostedMcpPreset; 7] = [
     HostedMcpPreset {
         id: "google-calendar",
         display_name: "Google Calendar",
+        names: &["구글 캘린더", "캘린더"],
         url: "https://calendarmcp.googleapis.com/mcp/v1",
         auth: PluginAuthKind::OAuth,
         brand: "google",
@@ -234,6 +245,7 @@ pub const HOSTED_MCPS: [HostedMcpPreset; 7] = [
     HostedMcpPreset {
         id: "google-docs",
         display_name: "Google Docs",
+        names: &["구글 독스", "구글 문서"],
         url: "https://docsmcp.googleapis.com/mcp/v1",
         auth: PluginAuthKind::OAuth,
         brand: "google",
@@ -423,6 +435,61 @@ struct OAuthClientRecord {
     authorized_at: Option<i64>,
     #[serde(default)]
     access_expires_at: Option<i64>,
+    /// 인증 서버가 refresh token을 회복 불가능하게 거절한 시각(invalid_grant 등). 이 값이
+    /// 있으면 저장된 토큰으로는 다시 붙을 수 없으므로 `credential_ready`가 내려가고 화면은
+    /// "인증 필요"를 보인다. 다시 인증해 토큰을 저장하면 지운다.
+    #[serde(default)]
+    grant_lost_at: Option<i64>,
+}
+
+/// 인증 흐름마다 기록에 남는 두 값이 갈린다. 디바이스 인가에는 동적 등록도 콜백도 없어
+/// 둘 다 비어 있고, 콜백 방식은 다음 인증도 같은 포트를 열어야 해서 redirect URI를 남긴다.
+enum OAuthFlowBinding {
+    Callback { redirect_uri: String },
+    Device,
+}
+
+impl OAuthClientRecord {
+    /// 인증을 다시 시작할 때 저장하는 기록. 엔드포인트와 client_id는 이번 탐색 결과로
+    /// 새로 쓰고, 승인 시각 두 값은 아직 살아 있는 토큰을 가리키므로 이전 기록에서
+    /// 이어받는다. 콜백 방식과 디바이스 인가가 이 아홉 칸을 각자 적고 있었다 —
+    /// 한쪽만 손보면 다른 흐름의 기록이 조용히 달라진다.
+    fn renewed(
+        metadata: &OAuthServerMetadata,
+        previous: Option<&OAuthClientRecord>,
+        client_id: String,
+        scope: Option<String>,
+        binding: OAuthFlowBinding,
+    ) -> Self {
+        let (registration_endpoint, redirect_uri) = match binding {
+            OAuthFlowBinding::Callback { redirect_uri } => {
+                (metadata.registration_endpoint.clone(), redirect_uri)
+            }
+            OAuthFlowBinding::Device => (None, String::new()),
+        };
+        let (authorized_at, access_expires_at) = carried_grant(previous);
+        Self {
+            authorization_endpoint: metadata.authorization_endpoint.clone(),
+            token_endpoint: metadata.token_endpoint.clone(),
+            registration_endpoint,
+            client_id,
+            redirect_uri,
+            resource: metadata.resource.clone(),
+            scope,
+            authorized_at,
+            access_expires_at,
+            grant_lost_at: previous.and_then(|record| record.grant_lost_at),
+        }
+    }
+}
+
+/// 이미 받아 둔 승인 시각과 접근 토큰 만료. 기록을 다시 쓰는 자리와 화면용 보기가
+/// 같은 두 값을 각자 더듬고 있어 한 이름으로 모은다.
+fn carried_grant(record: Option<&OAuthClientRecord>) -> (Option<i64>, Option<i64>) {
+    (
+        record.and_then(|record| record.authorized_at),
+        record.and_then(|record| record.access_expires_at),
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,6 +497,12 @@ struct OAuthClientRecord {
 struct StoredPlugin {
     id: String,
     display_name: String,
+    /// 이 플러그인을 부르는 다른 말들(9.12). 계획 색인의 플러그인 칸과 라우터 힌트가
+    /// 여기서 나온다 — "노션에 정리해줘"의 "노션"이 notion-* 도구에 닿는 길이다.
+    /// `None`은 아직 한 번도 정해지지 않은 옛 레코드라 읽을 때 씨앗으로 한 번 채우고,
+    /// `Some(vec![])`은 사용자가 비운 것이라 그대로 둔다.
+    #[serde(default)]
+    names: Option<Vec<String>>,
     /// 원격 MCP 주소. `NotionToken`은 백엔드가 띄우는 서버라 비어 있다.
     #[serde(default)]
     url: Option<String>,
@@ -485,6 +558,8 @@ impl Default for PluginStore {
 pub struct ExternalPluginView {
     pub id: String,
     pub display_name: String,
+    /// 이 플러그인을 부르는 다른 말들. 계획 색인과 라우터 힌트에 실린다.
+    pub names: Vec<String>,
     pub url: Option<String>,
     pub auth: PluginAuthKind,
     pub enabled: bool,
@@ -522,47 +597,47 @@ pub struct ExternalPluginsSnapshot {
     pub hosted_presets: &'static [HostedMcpPreset],
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegisterExternalPluginRequest {
-    pub id: String,
-    pub display_name: String,
-    #[serde(default)]
-    pub url: Option<String>,
-    pub auth: PluginAuthKind,
-    /// Bearer·NotionToken의 비밀값. 저장 뒤 응답에는 나가지 않는다.
-    #[serde(default)]
-    pub token: Option<String>,
-    /// 동적 등록을 지원하지 않는 인증 서버용 수동 client_id.
-    #[serde(default)]
-    pub client_id: Option<String>,
-    /// 수동 client_id에 딸린 client_secret(구글 등). 저장 뒤 응답에는 나가지 않는다.
-    #[serde(default)]
-    pub client_secret: Option<String>,
-    /// authorize 요청에 실을 scope. 비우면 프리셋 기본값이나 디스커버리 결과를 쓴다.
-    #[serde(default)]
-    pub scope: Option<String>,
+/// 등록된 외부 MCP의 이름만 간추린 것. 기본도구 카탈로그가 어떤 서비스가 붙는지 보일 때 쓴다.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalPluginSummary {
+    /// 사용 중이고 자격증명이 준비돼 실제로 붙는 플러그인의 (id, 표시 이름).
+    /// id는 프록시 주소의 마지막 조각이라, 자기 설정에 주소를 적어 두는 공급자가
+    /// 그 플러그인을 실제로 등록해 뒀는지 대조하는 데 쓴다.
+    pub attachable: Vec<(String, String)>,
+    /// 사용 중이지만 인증·토큰이 아직 없어 붙지 않는 플러그인 수.
+    pub pending: usize,
 }
 
+/// 등록과 편집이 함께 받는 플러그인 매니페스트. 두 입구는 받는 칸이 같고 칸마다
+/// 읽는 규칙만 갈리므로(그 갈림은 `ManifestIntent`가 쥔다) 한 구조체로 받는다.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UpdateExternalPluginRequest {
-    /// MCP 서버 이름과 loopback 프록시 경로에 쓰이는 불변 식별자.
+pub struct ExternalPluginManifestRequest {
+    /// MCP 서버 이름과 loopback 프록시 경로에 쓰이는 불변 식별자. 편집은 조회 키로만
+    /// 받고 바꾸지 않는다.
     pub id: String,
     pub display_name: String,
+    /// 이 플러그인을 부르는 다른 말들. 등록에서 비우면 프리셋 씨앗으로 채우고, 편집에서
+    /// 값이 오지 않으면(None) 기존 목록을 지킨다.
+    #[serde(default)]
+    pub names: Option<Vec<String>>,
     #[serde(default)]
     pub url: Option<String>,
     pub auth: PluginAuthKind,
-    /// Bearer·NotionToken 설정이 바뀔 때만 필수다. 비어 있으면 호환되는 기존 토큰을 유지한다.
+    /// Bearer·NotionToken의 비밀값. 저장 뒤 응답에는 나가지 않는다. 편집에서는 인증
+    /// 설정이 바뀔 때만 필수고, 비어 있으면 호환되는 기존 토큰을 유지한다.
     #[serde(default)]
     pub token: Option<String>,
-    /// 값이 전달되면 기존 OAuth 등록·자격증명을 초기화하고 이 client_id로 다시 인증한다.
+    /// 동적 등록을 지원하지 않는 인증 서버용 수동 client_id. 편집에서 값이 전달되면
+    /// 기존 OAuth 등록·자격증명을 초기화하고 이 client_id로 다시 인증한다.
     #[serde(default)]
     pub client_id: Option<String>,
-    /// 수동 client_id에 딸린 client_secret. client_id와 함께 올 때만 유효하다.
+    /// 수동 client_id에 딸린 client_secret(구글 등). 저장 뒤 응답에는 나가지 않고,
+    /// client_id와 함께 올 때만 유효하다.
     #[serde(default)]
     pub client_secret: Option<String>,
-    /// authorize scope. 값이 바뀌면 기존 인증을 버리고 새 동의를 받는다.
+    /// authorize 요청에 실을 scope. 비우면 프리셋 기본값이나 디스커버리 결과를 쓰고,
+    /// 편집에서 값이 바뀌면 기존 인증을 버리고 새 동의를 받는다.
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -746,7 +821,8 @@ impl ExternalPluginRegistry {
     }
 
     /// 붙일 플러그인과 그 도구 정책. 채팅은 시작 시점의 정책을 그대로 들고 간다(P7).
-    /// 제한(`Deny`)은 프록시가 매 요청마다 다시 확인하므로 이 값과 무관하게 즉시 듣는다.
+    /// 사용 토글·자격증명과 제한(`Deny`)은 프록시가 매 요청마다 다시 확인하므로 이 값과
+    /// 무관하게 즉시 듣는다.
     pub fn attachable_plugins(&self) -> Result<Vec<AttachablePlugin>, CoreError> {
         let store = self.with_store_lock(|| self.load_store_unlocked())?;
         Ok(store
@@ -757,21 +833,44 @@ impl ExternalPluginRegistry {
             .collect())
     }
 
+    /// 붙는 플러그인의 (id, 다른 이름들). 계획 색인의 플러그인 칸과 라우터 힌트가 쓴다.
+    pub fn attachable_names(&self) -> Result<Vec<(String, Vec<String>)>, CoreError> {
+        let store = self.with_store_lock(|| self.load_store_unlocked())?;
+        Ok(store
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.enabled && credential_ready(plugin))
+            .map(|plugin| (plugin.id.clone(), plugin.names.clone().unwrap_or_default()))
+            .collect())
+    }
+
+    /// 기본도구 카탈로그가 쓰는 요약. 채팅 시작마다 읽으므로 `snapshot`과 달리 npx 탐색·
+    /// OAuth 대기 조회 같은 부수 작업을 하지 않고, 주소·자격증명도 싣지 않는다.
+    pub fn summary(&self) -> Result<ExternalPluginSummary, CoreError> {
+        let store = self.with_store_lock(|| self.load_store_unlocked())?;
+        let enabled = store.plugins.iter().filter(|plugin| plugin.enabled);
+        let mut summary = ExternalPluginSummary::default();
+        for plugin in enabled {
+            if credential_ready(plugin) {
+                summary
+                    .attachable
+                    .push((plugin.id.clone(), plugin.display_name.clone()));
+            } else {
+                summary.pending += 1;
+            }
+        }
+        Ok(summary)
+    }
+
     /// AIA가 호출할 수 있는 플러그인의 현재 도구 계약을 프록시 경유로 읽는다. 플러그인이
     /// 꺼져 있거나 자격증명이 준비되지 않았으면 도구를 노출하지 않는다.
     pub fn aia_tool_catalog(&self, id: &str, proxy_base: &str) -> Result<Value, CoreError> {
-        let plugin = self.require_aia_attachable_plugin(id)?;
-        let (mut session, initialize) =
-            McpHttpSession::connect_with_authorization(&format!("{proxy_base}/{id}"), None)?;
-        let tools = parse_tools(&session.list_tools()?)?;
-        let server_info = initialize.get("serverInfo").cloned().unwrap_or(Value::Null);
+        let plugin = self.require_attachable_plugin(id)?;
+        let (_session, initialize, tools) = connect_through_proxy(proxy_base, id)?;
         Ok(json!({
             "pluginId": plugin.id,
             "displayName": plugin.display_name,
-            "serverName": server_info
-                .get("title")
-                .or_else(|| server_info.get("name"))
-                .and_then(Value::as_str),
+            "serverName": crate::mcp_registry::server_name(&initialize),
             "tools": tools,
             "contentTrust": "untrusted"
         }))
@@ -792,12 +891,8 @@ impl ExternalPluginRegistry {
                 "외부 플러그인 도구 arguments는 객체여야 합니다".to_owned(),
             ));
         }
-        let plugin = self.require_aia_attachable_plugin(&request.id)?;
-        let (mut session, _) = McpHttpSession::connect_with_authorization(
-            &format!("{proxy_base}/{}", request.id),
-            None,
-        )?;
-        let tools = parse_tools(&session.list_tools()?)?;
+        let plugin = self.require_attachable_plugin(&request.id)?;
+        let (mut session, _, tools) = connect_through_proxy(proxy_base, &request.id)?;
         let tool = tools
             .iter()
             .find(|tool| tool.name == request.tool)
@@ -818,38 +913,26 @@ impl ExternalPluginRegistry {
 
     pub fn register(
         &self,
-        request: RegisterExternalPluginRequest,
+        request: ExternalPluginManifestRequest,
     ) -> Result<ExternalPluginView, CoreError> {
-        validate_plugin_id(&request.id)?;
-        let display_name = validate_display_name(&request.display_name)?;
-        let url = validate_request_url(request.auth, request.url.as_deref())?;
-        let token = validate_request_token(request.auth, request.token.as_deref(), true)?;
-        let manual_client_id = request
-            .client_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(validate_client_id)
-            .transpose()?;
-        if manual_client_id.is_some() && !request.auth.is_oauth() {
-            return Err(CoreError::InvalidInput(
-                "clientId는 OAuth 방식에서만 쓰입니다".to_owned(),
-            ));
-        }
-        // 디바이스 인가에는 동적 등록이 없다. client_id 없이는 승인 화면을 열 수 없으므로
-        // 등록 단계에서 막아, 인증을 눌러야 아는 실패를 만들지 않는다.
-        if request.auth == PluginAuthKind::OAuthDevice && manual_client_id.is_none() {
-            return Err(CoreError::InvalidInput(
-                "디바이스 인가 방식은 서버에서 만든 앱의 clientId가 필요합니다".to_owned(),
-            ));
-        }
-        let manual_client_secret =
-            validate_manual_client_secret(request.client_secret.as_deref(), &manual_client_id)?;
-        let scope = validate_scope(request.scope.as_deref(), request.auth)?;
+        let ValidatedManifest {
+            display_name,
+            names,
+            url,
+            token,
+            manual_client_id,
+            manual_client_secret,
+            scope,
+            ..
+        } = validate_manifest(ManifestIntent::Register, &request)?;
         let now = now_ms();
+        // 화면은 프리셋 씨앗을 채워 보낸다. 안 보낸 등록(원격 API·옛 화면)은 여기서 채운다.
+        let names =
+            names.unwrap_or_else(|| crate::opencode_config::seed_names(&request.id, &display_name));
         let mut plugin = StoredPlugin {
             id: request.id.clone(),
             display_name,
+            names: Some(names),
             url,
             auth: request.auth,
             enabled: true,
@@ -912,9 +995,7 @@ impl ExternalPluginRegistry {
             let before = store.plugins.len();
             store.plugins.retain(|plugin| plugin.id != id);
             if store.plugins.len() == before {
-                return Err(CoreError::NotFound(
-                    "등록된 외부 플러그인을 찾을 수 없습니다".to_owned(),
-                ));
+                return Err(plugin_not_found());
             }
             // 비밀값이 남는 쪽이 더 나쁘다. 저장 파일보다 보안 저장소를 먼저 지운다.
             delete_os_keychain_password(KEYCHAIN_SERVICE, id)?;
@@ -928,28 +1009,18 @@ impl ExternalPluginRegistry {
     /// 보안 저장소와 확인 결과를 함께 초기화한다(P1·P2·P4·P5).
     pub fn update(
         &self,
-        request: UpdateExternalPluginRequest,
+        request: ExternalPluginManifestRequest,
     ) -> Result<ExternalPluginView, CoreError> {
-        validate_plugin_id(&request.id)?;
-        let display_name = validate_display_name(&request.display_name)?;
-        let url = validate_request_url(request.auth, request.url.as_deref())?;
-        let token = validate_request_token(request.auth, request.token.as_deref(), false)?;
-        let client_id_was_supplied = request.client_id.is_some();
-        let manual_client_id = request
-            .client_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(validate_client_id)
-            .transpose()?;
-        if client_id_was_supplied && !request.auth.is_oauth() {
-            return Err(CoreError::InvalidInput(
-                "clientId는 OAuth 방식에서만 쓰입니다".to_owned(),
-            ));
-        }
-        let manual_client_secret =
-            validate_manual_client_secret(request.client_secret.as_deref(), &manual_client_id)?;
-        let scope = validate_scope(request.scope.as_deref(), request.auth)?;
+        let ValidatedManifest {
+            display_name,
+            names,
+            url,
+            token,
+            manual_client_id,
+            client_id_was_supplied,
+            manual_client_secret,
+            scope,
+        } = validate_manifest(ManifestIntent::Update, &request)?;
 
         let id = request.id;
         let updated = self.with_store_lock(|| {
@@ -958,87 +1029,32 @@ impl ExternalPluginRegistry {
                 .plugins
                 .iter()
                 .position(|plugin| plugin.id == id)
-                .ok_or_else(|| {
-                    CoreError::NotFound("등록된 외부 플러그인을 찾을 수 없습니다".to_owned())
-                })?;
-            // scope가 바뀌면 이미 받은 동의 범위와 달라진다. 같은 등록을 계속 쓰면 예전
-            // 범위의 refresh token이 남으므로 연결이 바뀐 것으로 보고 다시 인증하게 한다.
-            let connection_changed = {
-                let plugin = &store.plugins[index];
-                plugin.url != url
-                    || plugin.auth != request.auth
-                    || (request.auth.is_oauth() && client_id_was_supplied)
-                    || (request.auth.is_oauth() && plugin.scope != scope)
+                .ok_or_else(plugin_not_found)?;
+            let edit = PluginEdit {
+                auth: request.auth,
+                url: &url,
+                scope: &scope,
+                token: token.as_deref(),
+                manual_client_id: manual_client_id.as_deref(),
+                manual_client_secret: manual_client_secret.as_deref(),
+                client_id_was_supplied,
             };
-            if request.auth == PluginAuthKind::OAuthDevice
-                && manual_client_id.is_none()
-                && store.plugins[index]
-                    .oauth
-                    .as_ref()
-                    .is_none_or(|record| record.client_id.is_empty())
-            {
-                return Err(CoreError::InvalidInput(
-                    "디바이스 인가 방식은 서버에서 만든 앱의 clientId가 필요합니다".to_owned(),
-                ));
-            }
-            if connection_changed
-                && matches!(request.auth, PluginAuthKind::Bearer | PluginAuthKind::NotionToken)
-                && token.is_none()
-            {
-                return Err(CoreError::InvalidInput(
-                    "서버 주소나 인증 방식을 바꿀 때는 새 토큰을 함께 입력해야 합니다"
-                        .to_owned(),
-                ));
-            }
-            // 연결 지점이나 자격증명이 바뀌면 이전 연결 확인 결과는 다른 서버의 것이다.
-            let verification_stale = connection_changed || token.is_some();
-            // 보안 저장소는 비밀이 얽힌 편집만 지난다. 새 토큰을 쓰거나, 연결이 바뀌어
-            // 이전 설정이 남겼을 수 있는 비밀을 지워야 할 때다. 인증 없는 서버끼리의
-            // 편집은 지울 것도 쓸 것도 없으므로 OS 보안 저장소를 건드리지 않는다.
-            let plugin_may_hold_secret = {
-                let plugin = &store.plugins[index];
-                plugin.auth.needs_secret() || plugin.secret_stored_at.is_some()
-            };
-            let secret_store_touched = token.is_some()
-                || manual_client_secret.is_some()
-                || (connection_changed && plugin_may_hold_secret);
-            let previous_secret = if secret_store_touched {
+            let plan = PluginEditPlan::decide(&store.plugins[index], &edit)?;
+            let previous_secret = if plan.secret_store_touched {
                 Some(read_secret(&id)?)
             } else {
                 None
             };
 
-            if connection_changed {
+            if plan.connection_changed {
                 cancel_pending_oauth(&id);
                 stop_managed_server(&id);
             } else if token.is_some() && request.auth == PluginAuthKind::NotionToken {
                 // 내장 서버는 옛 토큰으로 떠 있다. 다음 요청이 새 토큰으로 다시 띄운다.
                 stop_managed_server(&id);
             }
-            if secret_store_touched {
-                match (&token, request.auth) {
-                    (Some(token), PluginAuthKind::Bearer | PluginAuthKind::NotionToken) => {
-                        write_secret(&id, &token_secret_document(token, request.auth))?
-                    }
-                    (None, PluginAuthKind::OAuth | PluginAuthKind::OAuthDevice)
-                        if manual_client_secret.is_some() =>
-                    {
-                        // 수동 client_id가 함께 오는 편집이라 connection_changed가 참이고,
-                        // 이전 토큰은 새 문서로 폐기된다. 토큰은 첫 인증이 다시 채운다.
-                        write_secret(
-                            &id,
-                            &SecretDocument {
-                                client_secret: manual_client_secret.clone(),
-                                ..SecretDocument::default()
-                            },
-                        )?
-                    }
-                    (
-                        None,
-                        PluginAuthKind::None | PluginAuthKind::OAuth | PluginAuthKind::OAuthDevice,
-                    ) => delete_os_keychain_password(KEYCHAIN_SERVICE, &id)?,
-                    _ => unreachable!("validated plugin edit credential state"),
-                }
+            if plan.secret_store_touched {
+                write_edited_secret(&id, &edit)?;
             }
 
             let now = now_ms();
@@ -1056,10 +1072,13 @@ impl ExternalPluginRegistry {
             .filter(|client_id| !client_id.is_empty());
             let plugin = &mut store.plugins[index];
             plugin.display_name = display_name.clone();
+            if let Some(names) = names.clone() {
+                plugin.names = Some(names);
+            }
             plugin.url = url.clone();
             plugin.auth = request.auth;
             plugin.scope = scope.clone();
-            if connection_changed {
+            if plan.connection_changed {
                 plugin.oauth = if request.auth.is_oauth() {
                     manual_client_id
                         .clone()
@@ -1069,9 +1088,9 @@ impl ExternalPluginRegistry {
                     None
                 };
             }
-            if verification_stale {
-                plugin.secret_stored_at = (token.is_some() || manual_client_secret.is_some())
-                    .then_some(now);
+            if plan.verification_stale {
+                plugin.secret_stored_at =
+                    (token.is_some() || manual_client_secret.is_some()).then_some(now);
                 plugin.server_name = None;
                 plugin.tools.clear();
                 plugin.last_verified_at = None;
@@ -1081,22 +1100,13 @@ impl ExternalPluginRegistry {
             let updated = plugin.clone();
             if let Err(error) = self.save_store_unlocked(&store) {
                 if let Some(previous_secret) = previous_secret {
-                    let restored = match previous_secret {
-                        Some(document) => write_secret(&id, &document),
-                        None => delete_os_keychain_password(KEYCHAIN_SERVICE, &id),
-                    };
-                    if let Err(restore_error) = restored {
-                        return Err(CoreError::Runtime(format!(
-                            "외부 플러그인 저장 실패 뒤 자격증명을 복원하지 못했습니다: {restore_error}"
-                        )));
-                    }
+                    restore_edited_secret(&id, previous_secret)?;
                 }
                 return Err(error);
             }
             Ok(updated)
         })?;
-        let pending = pending_oauth_ids();
-        Ok(plugin_view(&updated, pending.contains(&updated.id)))
+        Ok(plugin_view_with_pending(&updated))
     }
 
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<ExternalPluginView, CoreError> {
@@ -1104,12 +1114,10 @@ impl ExternalPluginRegistry {
         if !enabled {
             stop_managed_server(id);
         }
-        let pending = pending_oauth_ids();
-        self.update_plugin(id, |plugin| {
+        self.update_plugin_view(id, |plugin| {
             plugin.enabled = enabled;
             Ok(())
         })
-        .map(|plugin| plugin_view(&plugin, pending.contains(&plugin.id)))
     }
 
     /// 도구 하나의 허용/확인/제한을 저장한다. 확인(기본값)은 항목을 지워 저장 파일이
@@ -1124,8 +1132,7 @@ impl ExternalPluginRegistry {
         validate_plugin_id(id)?;
         let tool = tool.trim().to_owned();
         crate::mcp_registry::validate_tool_name(&tool)?;
-        let pending = pending_oauth_ids();
-        self.update_plugin(id, |plugin| {
+        self.update_plugin_view(id, |plugin| {
             if policy == PluginToolPolicy::Ask {
                 plugin.tool_policies.remove(&tool);
             } else {
@@ -1133,7 +1140,6 @@ impl ExternalPluginRegistry {
             }
             Ok(())
         })
-        .map(|plugin| plugin_view(&plugin, pending.contains(&plugin.id)))
     }
 
     /// 현재 알려진 도구와 이미 정책이 남아 있는 도구를 한 번의 저장으로 같은 값에 맞춘다.
@@ -1144,8 +1150,7 @@ impl ExternalPluginRegistry {
         policy: PluginToolPolicy,
     ) -> Result<ExternalPluginView, CoreError> {
         validate_plugin_id(id)?;
-        let pending = pending_oauth_ids();
-        self.update_plugin(id, |plugin| {
+        self.update_plugin_view(id, |plugin| {
             if policy == PluginToolPolicy::Ask {
                 plugin.tool_policies.clear();
                 return Ok(());
@@ -1162,13 +1167,11 @@ impl ExternalPluginRegistry {
             plugin.tool_policies = tools.into_iter().map(|tool| (tool, policy)).collect();
             Ok(())
         })
-        .map(|plugin| plugin_view(&plugin, pending.contains(&plugin.id)))
     }
 
     pub fn set_token(&self, id: &str, token: &str) -> Result<ExternalPluginView, CoreError> {
         validate_plugin_id(id)?;
-        let pending = pending_oauth_ids();
-        let updated = self.update_plugin(id, |plugin| {
+        let view = self.update_plugin_view(id, |plugin| {
             let token = validate_token(token, plugin.auth)?;
             let document = match plugin.auth {
                 PluginAuthKind::Bearer => SecretDocument {
@@ -1192,30 +1195,21 @@ impl ExternalPluginRegistry {
         })?;
         // 내장 서버는 옛 토큰으로 떠 있다. 다음 요청이 새 토큰으로 다시 띄운다.
         stop_managed_server(id);
-        Ok(plugin_view(&updated, pending.contains(&updated.id)))
+        Ok(view)
     }
 
     /// 프록시 주소로 initialize·tools/list를 실행해 연결과 인증을 확인하고 결과를 기록한다.
     /// CLI가 실제로 쓰는 경로(프록시)를 그대로 지나므로 여기서 성공하면 채팅에서도 붙는다.
     pub fn verify(&self, id: &str, proxy_base: &str) -> Result<ExternalPluginView, CoreError> {
         validate_plugin_id(id)?;
-        let pending = pending_oauth_ids();
         let outcome = (|| {
-            let (mut session, initialize) =
-                McpHttpSession::connect_with_authorization(&format!("{proxy_base}/{id}"), None)?;
-            let tools = parse_tools(&session.list_tools()?)?;
-            let server_info = initialize.get("serverInfo").cloned().unwrap_or(Value::Null);
-            let server_name = server_info
-                .get("title")
-                .or_else(|| server_info.get("name"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            let (_session, initialize, tools) = connect_through_proxy(proxy_base, id)?;
             Ok::<_, CoreError>((
-                server_name,
+                crate::mcp_registry::server_name(&initialize),
                 tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>(),
             ))
         })();
-        let updated = self.update_plugin(id, |plugin| {
+        self.update_plugin_view(id, |plugin| {
             match &outcome {
                 Ok((server_name, tools)) => {
                     plugin.server_name = server_name.clone();
@@ -1228,12 +1222,14 @@ impl ExternalPluginRegistry {
                 }
             }
             Ok(())
-        })?;
-        Ok(plugin_view(&updated, pending.contains(&updated.id)))
+        })
     }
 
     // -- OAuth ---------------------------------------------------------------
 
+    /// 두 OAuth 갈래가 공통으로 거치는 앞자락 — 진행 중인 인가를 끊고, 플러그인이 OAuth
+    /// 방식인지와 서버 주소를 확인하고, 인증 서버 메타데이터와 scope를 확정한다. 갈래별
+    /// 몸통은 [`Self::begin_device_oauth`]와 [`Self::begin_callback_oauth`]에 있다.
     pub fn begin_oauth(&self, id: &str) -> Result<ExternalPluginOAuthStart, CoreError> {
         validate_plugin_id(id)?;
         cancel_pending_oauth(id);
@@ -1255,6 +1251,18 @@ impl ExternalPluginRegistry {
         if plugin.auth == PluginAuthKind::OAuthDevice {
             return self.begin_device_oauth(&plugin, metadata, scope);
         }
+        self.begin_callback_oauth(&plugin, metadata, scope)
+    }
+
+    /// 콜백 방식(RFC 7636 PKCE). 루프백 포트를 열어 인증 서버가 코드를 돌려줄 자리를
+    /// 만들고, 사용자가 브라우저에서 승인하면 그 코드를 토큰으로 바꾼다.
+    fn begin_callback_oauth(
+        &self,
+        plugin: &StoredPlugin,
+        metadata: OAuthServerMetadata,
+        scope: Option<String>,
+    ) -> Result<ExternalPluginOAuthStart, CoreError> {
+        let id = plugin.id.as_str();
         let stored = plugin.oauth.clone();
         let stored_port = stored
             .as_ref()
@@ -1263,72 +1271,34 @@ impl ExternalPluginRegistry {
         let listener = bind_callback_listener(stored_port)?;
         let port = listener.local_addr()?.port();
         let redirect_uri = format!("http://127.0.0.1:{port}/callback");
-        // 인증 서버·redirect가 그대로면 등록을 재사용한다. 세션마다 새로 등록하면 이전
-        // refresh token이 고아가 되어 매번 다시 로그인하게 된다.
-        let mut client_secret: Option<String> = None;
-        let client_id = match stored.as_ref() {
-            Some(record) if can_reuse_client_registration(record, &redirect_uri, &metadata) => {
-                if let Some(document) = read_secret(id)? {
-                    client_secret = document.client_secret.clone();
-                }
-                record.client_id.clone()
-            }
-            _ => {
-                let registration_endpoint = metadata.registration_endpoint.clone().ok_or_else(|| {
-                    CoreError::Conflict(
-                        "인증 서버가 동적 클라이언트 등록을 지원하지 않습니다. 서버에서 발급한 client_id(필요하면 client_secret도)를 플러그인 등록 시 입력해 주세요"
-                            .to_owned(),
-                    )
-                })?;
-                let registered =
-                    register_oauth_client(&registration_endpoint, &redirect_uri, scope.as_deref())?;
-                client_secret = registered.client_secret;
-                registered.client_id
-            }
-        };
+        let (client_id, client_secret) = self.resolve_oauth_client(
+            id,
+            stored.as_ref(),
+            &redirect_uri,
+            &metadata,
+            scope.as_deref(),
+        )?;
         let verifier = random_urlsafe(32);
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let state = random_urlsafe(24);
-        let mut authorization_url = Url::parse(&metadata.authorization_endpoint).map_err(|_| {
-            CoreError::Runtime("인증 서버 authorization_endpoint가 올바르지 않습니다".to_owned())
-        })?;
-        {
-            let mut query = authorization_url.query_pairs_mut();
-            query
-                .append_pair("response_type", "code")
-                .append_pair("client_id", &client_id)
-                .append_pair("redirect_uri", &redirect_uri)
-                .append_pair("code_challenge", &challenge)
-                .append_pair("code_challenge_method", "S256")
-                .append_pair("state", &state)
-                .append_pair("resource", &metadata.resource);
-            if let Some(scope) = &scope {
-                query.append_pair("scope", scope);
-            }
-            if is_google_authorization_endpoint(&metadata.authorization_endpoint) {
-                // 구글은 access_type=offline 없이는 refresh token을 주지 않고,
-                // 재동의에서 다시 받으려면 prompt=consent가 필요하다.
-                query
-                    .append_pair("access_type", "offline")
-                    .append_pair("prompt", "consent");
-            }
-        }
-        let record = OAuthClientRecord {
-            authorization_endpoint: metadata.authorization_endpoint.clone(),
-            token_endpoint: metadata.token_endpoint.clone(),
-            registration_endpoint: metadata.registration_endpoint.clone(),
-            client_id: client_id.clone(),
-            redirect_uri: redirect_uri.clone(),
-            resource: metadata.resource.clone(),
-            scope: scope.clone(),
-            authorized_at: stored.as_ref().and_then(|record| record.authorized_at),
-            access_expires_at: stored.as_ref().and_then(|record| record.access_expires_at),
-        };
-        self.update_plugin(id, |plugin| {
-            plugin.oauth = Some(record.clone());
-            plugin.last_error = None;
-            Ok(())
-        })?;
+        let authorization_url = build_authorization_url(
+            &metadata,
+            &client_id,
+            &redirect_uri,
+            &challenge,
+            &state,
+            scope.as_deref(),
+        )?;
+        let record = OAuthClientRecord::renewed(
+            &metadata,
+            stored.as_ref(),
+            client_id.clone(),
+            scope.clone(),
+            OAuthFlowBinding::Callback {
+                redirect_uri: redirect_uri.clone(),
+            },
+        );
+        self.save_oauth_record(id, record)?;
         if let Some(secret) = &client_secret {
             // 등록 응답에 client_secret이 왔으면 토큰과 같은 문서에 보관한다.
             let mut document = read_secret(id)?.unwrap_or_default();
@@ -1336,19 +1306,8 @@ impl ExternalPluginRegistry {
             write_secret(id, &document)?;
         }
 
-        let cancel = Arc::new(AtomicBool::new(false));
         let expires_at = now_ms() + OAUTH_CALLBACK_TIMEOUT.as_millis() as i64;
-        if let Ok(mut pending) = pending_oauth().lock() {
-            pending.insert(
-                id.to_owned(),
-                PendingOAuth {
-                    cancel: Arc::clone(&cancel),
-                    expires_at,
-                },
-            );
-        }
-        let registry = self.clone();
-        let plugin_id = id.to_owned();
+        let cancel = register_pending_oauth(id, expires_at);
         let exchange = OAuthExchange {
             token_endpoint: metadata.token_endpoint,
             client_id,
@@ -1358,38 +1317,16 @@ impl ExternalPluginRegistry {
             code_verifier: verifier,
             state,
         };
-        thread::Builder::new()
-            .name(format!("agent-manager-plugin-oauth-{plugin_id}"))
-            .spawn(move || {
-                let outcome = wait_for_callback(&listener, &exchange.state, &cancel)
-                    .and_then(|code| exchange_code(&exchange, &code));
-                if let Ok(mut pending) = pending_oauth().lock() {
-                    pending.remove(&plugin_id);
-                }
-                if cancel.load(Ordering::Acquire) {
-                    return;
-                }
-                let result = match outcome {
-                    Ok(tokens) => registry.store_oauth_tokens(&plugin_id, tokens),
-                    Err(error) => registry
-                        .update_plugin(&plugin_id, |plugin| {
-                            plugin.last_error = Some(format!(
-                                "OAuth 인증 실패: {}",
-                                text_limit::truncate_chars(&error.to_string(), 300)
-                            ));
-                            Ok(())
-                        })
-                        .map(|_| ()),
-                };
-                if let Err(error) = result {
-                    eprintln!(
-                        "[external-plugins] {plugin_id} OAuth 결과를 기록하지 못했습니다: {error}"
-                    );
-                }
-            })
-            .map_err(|error| {
-                CoreError::Runtime(format!("OAuth 콜백 스레드를 시작할 수 없습니다: {error}"))
-            })?;
+        self.spawn_oauth_worker(
+            format!("agent-manager-plugin-oauth-{id}"),
+            id.to_owned(),
+            cancel,
+            CALLBACK_OAUTH_LABELS,
+            move |cancel| {
+                wait_for_callback(&listener, &exchange.state, cancel)
+                    .and_then(|code| exchange_code(&exchange, &code))
+            },
+        )?;
         Ok(ExternalPluginOAuthStart {
             id: id.to_owned(),
             authorization_url: authorization_url.to_string(),
@@ -1429,89 +1366,41 @@ impl ExternalPluginRegistry {
         let id = plugin.id.clone();
         let client_secret = read_secret(&id)?.and_then(|document| document.client_secret);
         let authorization = request_device_code(&device_endpoint, &client_id, scope.as_deref())?;
-        let record = OAuthClientRecord {
-            authorization_endpoint: metadata.authorization_endpoint.clone(),
-            token_endpoint: metadata.token_endpoint.clone(),
-            registration_endpoint: None,
-            client_id: client_id.clone(),
-            // 디바이스 인가에는 콜백이 없다. 다음 인증도 loopback 포트를 열지 않는다.
-            redirect_uri: String::new(),
-            resource: metadata.resource.clone(),
-            scope: scope.clone(),
-            authorized_at: plugin
-                .oauth
-                .as_ref()
-                .and_then(|record| record.authorized_at),
-            access_expires_at: plugin
-                .oauth
-                .as_ref()
-                .and_then(|record| record.access_expires_at),
-        };
-        self.update_plugin(&id, |plugin| {
-            plugin.oauth = Some(record.clone());
-            plugin.last_error = None;
-            Ok(())
-        })?;
+        let record = OAuthClientRecord::renewed(
+            &metadata,
+            plugin.oauth.as_ref(),
+            client_id.clone(),
+            scope.clone(),
+            OAuthFlowBinding::Device,
+        );
+        self.save_oauth_record(&id, record)?;
 
-        let cancel = Arc::new(AtomicBool::new(false));
         // 승인 대기 상한은 콜백 방식과 같게 두되, 서버가 더 짧은 만료를 주면 그쪽을 따른다.
         let expires_at = now_ms()
             + (authorization.expires_in * 1000).min(OAUTH_CALLBACK_TIMEOUT.as_millis() as i64);
-        if let Ok(mut pending) = pending_oauth().lock() {
-            pending.insert(
-                id.clone(),
-                PendingOAuth {
-                    cancel: Arc::clone(&cancel),
-                    expires_at,
-                },
-            );
-        }
-        let registry = self.clone();
-        let plugin_id = id.clone();
+        let cancel = register_pending_oauth(&id, expires_at);
         let token_endpoint = metadata.token_endpoint.clone();
         let device_code = authorization.device_code.clone();
         let interval = authorization.interval;
         let user_code = authorization.user_code.clone();
         let verification_url = authorization.verification_url.clone();
-        thread::Builder::new()
-            .name(format!("agent-manager-plugin-device-{plugin_id}"))
-            .spawn(move || {
-                let outcome = wait_for_device_authorization(
+        self.spawn_oauth_worker(
+            format!("agent-manager-plugin-device-{id}"),
+            id.clone(),
+            cancel,
+            DEVICE_OAUTH_LABELS,
+            move |cancel| {
+                wait_for_device_authorization(
                     &token_endpoint,
                     &client_id,
                     &device_code,
                     client_secret.as_deref(),
                     interval,
                     expires_at,
-                    &cancel,
-                );
-                if let Ok(mut pending) = pending_oauth().lock() {
-                    pending.remove(&plugin_id);
-                }
-                if cancel.load(Ordering::Acquire) {
-                    return;
-                }
-                let result = match outcome {
-                    Ok(tokens) => registry.store_oauth_tokens(&plugin_id, tokens),
-                    Err(error) => registry
-                        .update_plugin(&plugin_id, |plugin| {
-                            plugin.last_error = Some(format!(
-                                "디바이스 인가 실패: {}",
-                                text_limit::truncate_chars(&error.to_string(), 300)
-                            ));
-                            Ok(())
-                        })
-                        .map(|_| ()),
-                };
-                if let Err(error) = result {
-                    eprintln!(
-                        "[external-plugins] {plugin_id} 디바이스 인가 결과를 기록하지 못했습니다: {error}"
-                    );
-                }
-            })
-            .map_err(|error| {
-                CoreError::Runtime(format!("디바이스 인가 스레드를 시작할 수 없습니다: {error}"))
-            })?;
+                    cancel,
+                )
+            },
+        )?;
         Ok(ExternalPluginOAuthStart {
             id,
             authorization_url: verification_url,
@@ -1536,23 +1425,20 @@ impl ExternalPluginRegistry {
             }
             document.expires_at = tokens.expires_at;
             write_secret(id, &document)?;
-            let mut store = self.load_store_unlocked()?;
-            let plugin = store
-                .plugins
-                .iter_mut()
-                .find(|plugin| plugin.id == id)
-                .ok_or_else(|| {
-                    CoreError::NotFound("등록된 외부 플러그인을 찾을 수 없습니다".to_owned())
-                })?;
+            let expires_at = tokens.expires_at;
             let now = now_ms();
-            plugin.secret_stored_at = Some(now);
-            plugin.updated_at = now;
-            plugin.last_error = None;
-            if let Some(record) = plugin.oauth.as_mut() {
-                record.authorized_at = Some(now);
-                record.access_expires_at = tokens.expires_at;
-            }
-            self.save_store_unlocked(&store)
+            self.edit_plugin_unlocked(id, |plugin| {
+                plugin.secret_stored_at = Some(now);
+                plugin.last_error = None;
+                if let Some(record) = plugin.oauth.as_mut() {
+                    record.authorized_at = Some(now);
+                    record.access_expires_at = expires_at;
+                    record.grant_lost_at = None;
+                }
+                Ok(())
+            })?
+            .ok_or_else(plugin_not_found)?;
+            Ok(())
         })
     }
 
@@ -1566,7 +1452,10 @@ impl ExternalPluginRegistry {
         request: ProxyRequest,
     ) -> Result<ProxyResponse, CoreError> {
         validate_plugin_id(id)?;
-        let plugin = self.find_plugin(id)?;
+        // 프록시 주소는 이제 부팅 사이에 유지되고, 실행 단위 주입 없이 자기 설정에 주소를
+        // 적어 둔 CLI도 직접 들어온다. 시작 시점의 주입 목록만으로는 "꺼진 플러그인은
+        // 붙지 않는다"를 더 이상 보장하지 못하므로 매 요청마다 다시 확인한다.
+        let plugin = self.require_attachable_plugin(id)?;
         // 제한한 도구는 상류에 닿기 전에 막는다. 목록에서도 지우므로 CLI는 그런 도구가
         // 있다는 사실조차 모르지만, 이전 턴의 목록을 들고 있는 실행이 뒤늦게 부를 수 있다.
         let intent = ProxyIntent::of(&request.body);
@@ -1591,15 +1480,9 @@ impl ExternalPluginRegistry {
                     return Ok(hide_denied_tools(retried, &intent, &plugin.tool_policies));
                 }
                 Ok(None) => {}
-                Err(error) => {
-                    let _ = self.update_plugin(id, |plugin| {
-                        plugin.last_error = Some(format!(
-                            "인증이 만료되어 다시 인증해야 합니다: {}",
-                            text_limit::truncate_chars(&error.to_string(), 200)
-                        ));
-                        Ok(())
-                    });
-                }
+                // 실패 사유는 refresh_oauth_access가 이미 last_error에 남겼다. 상류 401 응답을
+                // 그대로 돌려주면 CLI는 인증 문제로 읽는다.
+                Err(_) => {}
             }
         }
         Ok(hide_denied_tools(response, &intent, &plugin.tool_policies))
@@ -1639,6 +1522,11 @@ impl ExternalPluginRegistry {
 
     /// 현재 access token, 필요하면 갱신한 값. `force`는 상류가 401을 돌려준 뒤의 재시도다.
     /// refresh token이 없으면 None — 사용자가 다시 인증해야 한다.
+    ///
+    /// 갱신 실패는 여기서 `last_error`에 남긴다. 예전엔 일반 요청 경로의 실패가 502 본문으로만
+    /// 나가고 저장소에는 아무 흔적이 없어, 토큰이 죽은 뒤에도 화면은 정상처럼 보였다.
+    /// 인증 서버가 grant 자체를 거절하면(`invalid_grant` 등) 다음 요청마다 죽은 토큰으로
+    /// 되풀이해도 소용없으므로 `grant_lost_at`을 찍어 "인증 필요"로 내린다.
     fn refresh_oauth_access(
         &self,
         plugin: &StoredPlugin,
@@ -1664,27 +1552,71 @@ impl ExternalPluginRegistry {
                         .map(|token| Zeroizing::new(format!("Bearer {token}")))
                 });
             };
-            let tokens = refresh_tokens(record, &refresh_token, document.client_secret.as_deref())?;
+            let tokens =
+                match refresh_tokens(record, &refresh_token, document.client_secret.as_deref()) {
+                    Ok(tokens) => tokens,
+                    Err(failure) => {
+                        let message = if failure.unrecoverable {
+                            format!("인증 서버가 저장된 refresh token을 거절했습니다. 다시 인증해야 합니다: {}", failure.message)
+                        } else {
+                            format!("접근 토큰 갱신에 실패했습니다(다음 요청에서 다시 시도): {}", failure.message)
+                        };
+                        self.record_refresh_failure_unlocked(&plugin.id, &message, failure.unrecoverable)?;
+                        return Err(CoreError::Runtime(message));
+                    }
+                };
             document.access_token = Some(tokens.access_token.clone());
             // OAuth 2.1은 공개 클라이언트의 refresh token을 회전시킨다. 새 값이 오면 즉시 바꾼다.
-            if let Some(rotated) = tokens.refresh_token {
-                document.refresh_token = Some(rotated);
+            let rotated = tokens.refresh_token.is_some();
+            if let Some(next) = tokens.refresh_token {
+                document.refresh_token = Some(next);
             }
             document.expires_at = tokens.expires_at;
-            write_secret(&plugin.id, &document)?;
-            let mut store = self.load_store_unlocked()?;
-            if let Some(stored) = store.plugins.iter_mut().find(|item| item.id == plugin.id) {
-                if let Some(record) = stored.oauth.as_mut() {
-                    record.access_expires_at = tokens.expires_at;
-                }
-                stored.updated_at = now_ms();
-                self.save_store_unlocked(&store)?;
+            if let Err(error) = write_secret(&plugin.id, &document) {
+                // 서버는 이미 새 토큰을 발급했고(회전이면 옛 refresh token은 죽었다) 우리는 그 값을
+                // 잃었다. 회전됐다면 저장된 토큰으로는 다시 갱신할 수 없으니 재인증으로 보낸다.
+                let message = format!(
+                    "갱신된 토큰을 보안 저장소에 쓰지 못했습니다{}: {}",
+                    if rotated { "(회전된 refresh token 유실, 다시 인증해야 합니다)" } else { "" },
+                    text_limit::truncate_chars(&error.to_string(), 200)
+                );
+                self.record_refresh_failure_unlocked(&plugin.id, &message, rotated)?;
+                return Err(CoreError::Runtime(message));
             }
+            let expires_at = tokens.expires_at;
+            self.edit_plugin_unlocked(&plugin.id, |stored| {
+                if let Some(record) = stored.oauth.as_mut() {
+                    record.access_expires_at = expires_at;
+                    record.grant_lost_at = None;
+                }
+                stored.last_error = None;
+                Ok(())
+            })?;
             Ok(Some(Zeroizing::new(format!(
                 "Bearer {}",
                 tokens.access_token
             ))))
         })
+    }
+
+    /// 갱신 실패를 저장소와 stderr에 남긴다. 저장소 잠금을 이미 잡은 자리에서만 부른다.
+    fn record_refresh_failure_unlocked(
+        &self,
+        id: &str,
+        message: &str,
+        grant_lost: bool,
+    ) -> Result<(), CoreError> {
+        eprintln!("[external-plugins] {id}: {message}");
+        self.edit_plugin_unlocked(id, |plugin| {
+            plugin.last_error = Some(text_limit::truncate_chars(message, 300));
+            if grant_lost {
+                if let Some(record) = plugin.oauth.as_mut() {
+                    record.grant_lost_at = Some(now_ms());
+                }
+            }
+            Ok(())
+        })?;
+        Ok(())
     }
 
     // -- 저장소 -----------------------------------------------------------------
@@ -1696,13 +1628,11 @@ impl ExternalPluginRegistry {
                 .plugins
                 .into_iter()
                 .find(|plugin| plugin.id == id)
-                .ok_or_else(|| {
-                    CoreError::NotFound("등록된 외부 플러그인을 찾을 수 없습니다".to_owned())
-                })
+                .ok_or_else(plugin_not_found)
         })
     }
 
-    fn require_aia_attachable_plugin(&self, id: &str) -> Result<StoredPlugin, CoreError> {
+    fn require_attachable_plugin(&self, id: &str) -> Result<StoredPlugin, CoreError> {
         validate_plugin_id(id)?;
         let plugin = self.find_plugin(id)?;
         if !plugin.enabled {
@@ -1716,26 +1646,135 @@ impl ExternalPluginRegistry {
         Ok(plugin)
     }
 
+    /// 인증 서버가 그대로면 지난 등록을 재사용한다. 세션마다 새로 등록하면 이전 refresh
+    /// token이 고아가 되어 매번 다시 로그인하게 된다. 돌려주는 값은 (client_id, client_secret).
+    fn resolve_oauth_client(
+        &self,
+        id: &str,
+        stored: Option<&OAuthClientRecord>,
+        redirect_uri: &str,
+        metadata: &OAuthServerMetadata,
+        scope: Option<&str>,
+    ) -> Result<(String, Option<String>), CoreError> {
+        if let Some(record) = stored {
+            if can_reuse_client_registration(record, redirect_uri, metadata) {
+                let client_secret = read_secret(id)?.and_then(|document| document.client_secret);
+                return Ok((record.client_id.clone(), client_secret));
+            }
+        }
+        let registration_endpoint = metadata.registration_endpoint.clone().ok_or_else(|| {
+            CoreError::Conflict(
+                "인증 서버가 동적 클라이언트 등록을 지원하지 않습니다. 서버에서 발급한 client_id(필요하면 client_secret도)를 플러그인 등록 시 입력해 주세요"
+                    .to_owned(),
+            )
+        })?;
+        let registered = register_oauth_client(&registration_endpoint, redirect_uri, scope)?;
+        Ok((registered.client_id, registered.client_secret))
+    }
+
+    /// 인증을 시작하며 확정한 OAuth 레코드를 저장하고 지난 실패 문구를 지운다.
+    fn save_oauth_record(&self, id: &str, record: OAuthClientRecord) -> Result<(), CoreError> {
+        self.update_plugin(id, |plugin| {
+            plugin.oauth = Some(record);
+            plugin.last_error = None;
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// 승인을 기다리는 스레드 하나. 콜백 방식과 디바이스 인가는 기다리는 방법만 다르고,
+    /// 결과를 받은 뒤 하는 일(대기 목록 정리·취소 확인·토큰 저장·실패 문구 기록)은 같다.
+    fn spawn_oauth_worker<F>(
+        &self,
+        thread_name: String,
+        plugin_id: String,
+        cancel: Arc<AtomicBool>,
+        labels: OAuthFlowLabels,
+        wait: F,
+    ) -> Result<(), CoreError>
+    where
+        F: FnOnce(&AtomicBool) -> Result<TokenResponse, CoreError> + Send + 'static,
+    {
+        let registry = self.clone();
+        thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let outcome = wait(&cancel);
+                if let Ok(mut pending) = pending_oauth().lock() {
+                    pending.remove(&plugin_id);
+                }
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                let result = match outcome {
+                    Ok(tokens) => registry.store_oauth_tokens(&plugin_id, tokens),
+                    Err(error) => registry
+                        .update_plugin(&plugin_id, |plugin| {
+                            plugin.last_error = Some(format!(
+                                "{} 실패: {}",
+                                labels.failure,
+                                text_limit::truncate_chars(&error.to_string(), 300)
+                            ));
+                            Ok(())
+                        })
+                        .map(|_| ()),
+                };
+                if let Err(error) = result {
+                    let outcome_label = labels.outcome;
+                    eprintln!(
+                        "[external-plugins] {plugin_id} {outcome_label} 결과를 기록하지 못했습니다: {error}"
+                    );
+                }
+            })
+            .map(|_| ())
+            .map_err(|error| {
+                CoreError::Runtime(format!(
+                    "{} 스레드를 시작할 수 없습니다: {error}",
+                    labels.thread
+                ))
+            })
+    }
+
     fn update_plugin(
         &self,
         id: &str,
         update: impl FnOnce(&mut StoredPlugin) -> Result<(), CoreError>,
     ) -> Result<StoredPlugin, CoreError> {
         self.with_store_lock(|| {
-            let mut store = self.load_store_unlocked()?;
-            let plugin = store
-                .plugins
-                .iter_mut()
-                .find(|plugin| plugin.id == id)
-                .ok_or_else(|| {
-                    CoreError::NotFound("등록된 외부 플러그인을 찾을 수 없습니다".to_owned())
-                })?;
-            update(plugin)?;
-            plugin.updated_at = now_ms();
-            let updated = plugin.clone();
-            self.save_store_unlocked(&store)?;
-            Ok(updated)
+            self.edit_plugin_unlocked(id, update)?
+                .ok_or_else(plugin_not_found)
         })
+    }
+
+    /// 저장소 잠금을 이미 잡은 자리에서 플러그인 하나를 고쳐 쓴다. "읽고 · id로 찾고 ·
+    /// 고치고 · `updated_at`을 찍고 · 저장한다"를 자리마다 손으로 되풀이하던 것을 모았다.
+    /// 없는 id는 오류가 아니라 `None`이다 — 토큰 갱신 결과를 남기는 자리는 그 사이 삭제된
+    /// 플러그인을 조용히 넘겨야 하고, 있어야만 하는 자리는 `None`을 제 오류로 올린다.
+    fn edit_plugin_unlocked(
+        &self,
+        id: &str,
+        edit: impl FnOnce(&mut StoredPlugin) -> Result<(), CoreError>,
+    ) -> Result<Option<StoredPlugin>, CoreError> {
+        let mut store = self.load_store_unlocked()?;
+        let Some(plugin) = store.plugins.iter_mut().find(|item| item.id == id) else {
+            return Ok(None);
+        };
+        edit(plugin)?;
+        plugin.updated_at = now_ms();
+        let updated = plugin.clone();
+        self.save_store_unlocked(&store)?;
+        Ok(Some(updated))
+    }
+
+    /// `update_plugin`에 이어 화면용 보기까지 만든다. 설정 하나를 고치고 그 결과를
+    /// 그대로 돌려주는 명령들이 같은 세 줄을 되풀이하지 않게 한다.
+    fn update_plugin_view(
+        &self,
+        id: &str,
+        update: impl FnOnce(&mut StoredPlugin) -> Result<(), CoreError>,
+    ) -> Result<ExternalPluginView, CoreError> {
+        self.update_plugin(id, update)
+            .map(|plugin| plugin_view_with_pending(&plugin))
     }
 
     fn with_store_lock<T>(
@@ -1746,7 +1785,15 @@ impl ExternalPluginRegistry {
     }
 
     fn load_store_unlocked(&self) -> Result<PluginStore, CoreError> {
-        STORE.load_unlocked(&self.app_data_dir)
+        let mut store = STORE.load_unlocked(&self.app_data_dir)?;
+        // 9.12 이전 레코드는 다른 이름이 없다. 한 번만 씨앗으로 채워 저장한다.
+        if seed_missing_names(&mut store) {
+            // 읽기 경로다 — 저장이 막혀도(읽기 전용 폴더) 읽기는 살린다. 다음 읽기가 다시 심는다.
+            if let Err(error) = self.save_store_unlocked(&store) {
+                eprintln!("[plugins] 다른 이름 씨앗을 저장하지 못했습니다: {error}");
+            }
+        }
+        Ok(store)
     }
 
     fn save_store_unlocked(&self, store: &PluginStore) -> Result<(), CoreError> {
@@ -1756,6 +1803,184 @@ impl ExternalPluginRegistry {
 
 /// 동적 등록을 지원하지 않는 인증 서버용으로 client_id만 미리 기억하는 OAuth 레코드.
 /// 엔드포인트와 redirect URI는 첫 인증 때 디스커버리로 채운다.
+/// 인가 흐름마다 다른 것은 사용자에게 보일 문구뿐이다.
+#[derive(Clone, Copy)]
+struct OAuthFlowLabels {
+    /// 플러그인 카드에 남길 실패 문구의 앞부분.
+    failure: &'static str,
+    /// 결과 기록 자체가 실패했을 때 콘솔에 적을 흐름 이름.
+    outcome: &'static str,
+    /// 스레드를 띄우지 못했을 때 사용자에게 돌려줄 흐름 이름.
+    thread: &'static str,
+}
+
+const CALLBACK_OAUTH_LABELS: OAuthFlowLabels = OAuthFlowLabels {
+    failure: "OAuth 인증",
+    outcome: "OAuth",
+    thread: "OAuth 콜백",
+};
+
+const DEVICE_OAUTH_LABELS: OAuthFlowLabels = OAuthFlowLabels {
+    failure: "디바이스 인가",
+    outcome: "디바이스 인가",
+    thread: "디바이스 인가",
+};
+
+/// 저장된 플러그인 한 건에 대한 편집 요청. 검증을 지난 매니페스트 값만 담는다.
+struct PluginEdit<'a> {
+    auth: PluginAuthKind,
+    url: &'a Option<String>,
+    scope: &'a Option<String>,
+    token: Option<&'a str>,
+    manual_client_id: Option<&'a str>,
+    manual_client_secret: Option<&'a str>,
+    client_id_was_supplied: bool,
+}
+
+/// 편집 한 건이 무엇을 무효로 만드는지에 대한 판정. 저장 파일·보안 저장소·확인 결과를
+/// 건드리는 세 갈래가 같은 조건에서 갈라지므로 한자리에서 결정한다.
+struct PluginEditPlan {
+    connection_changed: bool,
+    verification_stale: bool,
+    secret_store_touched: bool,
+}
+
+impl PluginEditPlan {
+    fn decide(existing: &StoredPlugin, edit: &PluginEdit<'_>) -> Result<Self, CoreError> {
+        // scope가 바뀌면 이미 받은 동의 범위와 달라진다. 같은 등록을 계속 쓰면 예전
+        // 범위의 refresh token이 남으므로 연결이 바뀐 것으로 보고 다시 인증하게 한다.
+        let connection_changed = existing.url != *edit.url
+            || existing.auth != edit.auth
+            || (edit.auth.is_oauth() && edit.client_id_was_supplied)
+            || (edit.auth.is_oauth() && existing.scope != *edit.scope);
+        if edit.auth == PluginAuthKind::OAuthDevice
+            && edit.manual_client_id.is_none()
+            && existing
+                .oauth
+                .as_ref()
+                .is_none_or(|record| record.client_id.is_empty())
+        {
+            return Err(CoreError::InvalidInput(
+                "디바이스 인가 방식은 서버에서 만든 앱의 clientId가 필요합니다".to_owned(),
+            ));
+        }
+        if connection_changed
+            && matches!(
+                edit.auth,
+                PluginAuthKind::Bearer | PluginAuthKind::NotionToken
+            )
+            && edit.token.is_none()
+        {
+            return Err(CoreError::InvalidInput(
+                "서버 주소나 인증 방식을 바꿀 때는 새 토큰을 함께 입력해야 합니다".to_owned(),
+            ));
+        }
+        // 보안 저장소는 비밀이 얽힌 편집만 지난다. 새 토큰을 쓰거나, 연결이 바뀌어
+        // 이전 설정이 남겼을 수 있는 비밀을 지워야 할 때다. 인증 없는 서버끼리의
+        // 편집은 지울 것도 쓸 것도 없으므로 OS 보안 저장소를 건드리지 않는다.
+        let plugin_may_hold_secret =
+            existing.auth.needs_secret() || existing.secret_stored_at.is_some();
+        Ok(Self {
+            connection_changed,
+            // 연결 지점이나 자격증명이 바뀌면 이전 연결 확인 결과는 다른 서버의 것이다.
+            verification_stale: connection_changed || edit.token.is_some(),
+            secret_store_touched: edit.token.is_some()
+                || edit.manual_client_secret.is_some()
+                || (connection_changed && plugin_may_hold_secret),
+        })
+    }
+}
+
+/// 편집이 자격증명을 건드릴 때 보안 저장소에 그 결과를 남긴다.
+fn write_edited_secret(id: &str, edit: &PluginEdit<'_>) -> Result<(), CoreError> {
+    match (edit.token, edit.auth) {
+        (Some(token), PluginAuthKind::Bearer | PluginAuthKind::NotionToken) => {
+            write_secret(id, &token_secret_document(token, edit.auth))
+        }
+        (None, PluginAuthKind::OAuth | PluginAuthKind::OAuthDevice)
+            if edit.manual_client_secret.is_some() =>
+        {
+            // 수동 client_id가 함께 오는 편집이라 connection_changed가 참이고,
+            // 이전 토큰은 새 문서로 폐기된다. 토큰은 첫 인증이 다시 채운다.
+            write_secret(
+                id,
+                &SecretDocument {
+                    client_secret: edit.manual_client_secret.map(str::to_owned),
+                    ..SecretDocument::default()
+                },
+            )
+        }
+        (None, PluginAuthKind::None | PluginAuthKind::OAuth | PluginAuthKind::OAuthDevice) => {
+            delete_os_keychain_password(KEYCHAIN_SERVICE, id)
+        }
+        _ => unreachable!("validated plugin edit credential state"),
+    }
+}
+
+/// 저장에 실패했을 때 보안 저장소를 편집 전 상태로 되돌린다.
+fn restore_edited_secret(id: &str, previous: Option<SecretDocument>) -> Result<(), CoreError> {
+    let restored = match previous {
+        Some(document) => write_secret(id, &document),
+        None => delete_os_keychain_password(KEYCHAIN_SERVICE, id),
+    };
+    restored.map_err(|error| {
+        CoreError::Runtime(format!(
+            "외부 플러그인 저장 실패 뒤 자격증명을 복원하지 못했습니다: {error}"
+        ))
+    })
+}
+
+/// 인가 대기 목록에 이 플러그인을 올리고 취소 신호를 돌려준다.
+fn register_pending_oauth(id: &str, expires_at: i64) -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    if let Ok(mut pending) = pending_oauth().lock() {
+        pending.insert(
+            id.to_owned(),
+            PendingOAuth {
+                cancel: Arc::clone(&cancel),
+                expires_at,
+            },
+        );
+    }
+    cancel
+}
+
+/// 사용자를 보낼 authorize 주소를 만든다.
+fn build_authorization_url(
+    metadata: &OAuthServerMetadata,
+    client_id: &str,
+    redirect_uri: &str,
+    challenge: &str,
+    state: &str,
+    scope: Option<&str>,
+) -> Result<Url, CoreError> {
+    let mut authorization_url = Url::parse(&metadata.authorization_endpoint).map_err(|_| {
+        CoreError::Runtime("인증 서버 authorization_endpoint가 올바르지 않습니다".to_owned())
+    })?;
+    {
+        let mut query = authorization_url.query_pairs_mut();
+        query
+            .append_pair("response_type", "code")
+            .append_pair("client_id", client_id)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("code_challenge", challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("state", state)
+            .append_pair("resource", &metadata.resource);
+        if let Some(scope) = scope {
+            query.append_pair("scope", scope);
+        }
+        if is_google_authorization_endpoint(&metadata.authorization_endpoint) {
+            // 구글은 access_type=offline 없이는 refresh token을 주지 않고,
+            // 재동의에서 다시 받으려면 prompt=consent가 필요하다.
+            query
+                .append_pair("access_type", "offline")
+                .append_pair("prompt", "consent");
+        }
+    }
+    Ok(authorization_url)
+}
+
 fn new_manual_oauth_record(client_id: String) -> OAuthClientRecord {
     OAuthClientRecord {
         authorization_endpoint: String::new(),
@@ -1767,6 +1992,7 @@ fn new_manual_oauth_record(client_id: String) -> OAuthClientRecord {
         scope: None,
         authorized_at: None,
         access_expires_at: None,
+        grant_lost_at: None,
     }
 }
 
@@ -1842,11 +2068,9 @@ fn credential_ready(plugin: &StoredPlugin) -> bool {
         return true;
     }
     if plugin.auth.is_oauth() {
-        return plugin
-            .oauth
-            .as_ref()
-            .is_some_and(|record| record.authorized_at.is_some())
-            && plugin.secret_stored_at.is_some();
+        return plugin.oauth.as_ref().is_some_and(|record| {
+            record.authorized_at.is_some() && record.grant_lost_at.is_none()
+        }) && plugin.secret_stored_at.is_some();
     }
     plugin.secret_stored_at.is_some()
 }
@@ -1865,11 +2089,31 @@ fn ensure_aia_tool_access(
     }))
 }
 
+/// 저장소에 없는 id로 들어온 요청의 공통 오류. 조회·수정 경로가 같은 문구를 쓰게 한다.
+/// 프록시 주소를 지나 이 플러그인의 상류 MCP에 붙고 도구 목록까지 읽는다. AIA 도구
+/// 카탈로그·도구 호출·연결 확인이 같은 세 걸음을 각자 적고 있었다. 프록시를 그대로
+/// 지나는 것이 요점이라(여기서 성공하면 채팅에서도 붙는다) 주소 조립도 함께 둔다.
+fn connect_through_proxy(
+    proxy_base: &str,
+    id: &str,
+) -> Result<(McpHttpSession, Value, Vec<McpRemoteTool>), CoreError> {
+    let (mut session, initialize) =
+        McpHttpSession::connect_with_authorization(&format!("{proxy_base}/{id}"), None)?;
+    let tools = parse_tools(&session.list_tools()?)?;
+    Ok((session, initialize, tools))
+}
+
+fn plugin_not_found() -> CoreError {
+    CoreError::NotFound("등록된 외부 플러그인을 찾을 수 없습니다".to_owned())
+}
+
 fn plugin_view(plugin: &StoredPlugin, oauth_pending: bool) -> ExternalPluginView {
     let credential_ready = credential_ready(plugin);
+    let (authorized_at, access_expires_at) = carried_grant(plugin.oauth.as_ref());
     ExternalPluginView {
         id: plugin.id.clone(),
         display_name: plugin.display_name.clone(),
+        names: plugin.names.clone().unwrap_or_default(),
         url: plugin.url.clone(),
         auth: plugin.auth,
         enabled: plugin.enabled,
@@ -1882,17 +2126,16 @@ fn plugin_view(plugin: &StoredPlugin, oauth_pending: bool) -> ExternalPluginView
         tools: plugin.tools.clone(),
         last_verified_at: plugin.last_verified_at,
         last_error: plugin.last_error.clone(),
-        authorized_at: plugin
-            .oauth
-            .as_ref()
-            .and_then(|record| record.authorized_at),
-        access_expires_at: plugin
-            .oauth
-            .as_ref()
-            .and_then(|record| record.access_expires_at),
+        authorized_at,
+        access_expires_at,
         created_at: plugin.created_at,
         updated_at: plugin.updated_at,
     }
+}
+
+/// 방금 저장한 플러그인을 화면용 보기로 바꾼다. 대기 중인 OAuth 표시는 이 시점에 읽는다.
+fn plugin_view_with_pending(plugin: &StoredPlugin) -> ExternalPluginView {
+    plugin_view(plugin, pending_oauth_ids().contains(&plugin.id))
 }
 
 fn pending_oauth_ids() -> BTreeSet<String> {
@@ -1947,6 +2190,124 @@ pub(crate) fn validate_plugin_id(value: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// 앞단 검증이 갈리는 두 지점. 등록은 토큰을 반드시 받고 디바이스 인가의 client_id를
+/// 그 자리에서 요구하지만, 편집은 생략된 토큰을 "기존 유지"로 읽고 client_id는 값이
+/// 전달됐는지 자체를 연결 변경 신호로 쓴다.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManifestIntent {
+    Register,
+    Update,
+}
+
+struct ValidatedManifest {
+    display_name: String,
+    names: Option<Vec<String>>,
+    url: Option<String>,
+    token: Option<String>,
+    manual_client_id: Option<String>,
+    /// 값이 실려 왔는지 자체. 빈 문자열이어도 참이라 편집은 이것으로 연결 변경을 읽는다.
+    client_id_was_supplied: bool,
+    manual_client_secret: Option<String>,
+    scope: Option<String>,
+}
+
+/// 등록·편집이 저장소 잠금 밖에서 똑같이 거치던 매니페스트 검증. 검사 순서가 곧
+/// 사용자가 처음 보는 오류라서 원래 순서를 그대로 지킨다.
+fn validate_manifest(
+    intent: ManifestIntent,
+    input: &ExternalPluginManifestRequest,
+) -> Result<ValidatedManifest, CoreError> {
+    validate_plugin_id(&input.id)?;
+    let display_name = validate_display_name(&input.display_name)?;
+    let names = input.names.as_deref().map(validate_names).transpose()?;
+    let url = validate_request_url(input.auth, input.url.as_deref())?;
+    let token = validate_request_token(
+        input.auth,
+        input.token.as_deref(),
+        intent == ManifestIntent::Register,
+    )?;
+    let client_id_was_supplied = input.client_id.is_some();
+    let manual_client_id = input
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(validate_client_id)
+        .transpose()?;
+    let client_id_in_play = match intent {
+        ManifestIntent::Register => manual_client_id.is_some(),
+        ManifestIntent::Update => client_id_was_supplied,
+    };
+    if client_id_in_play && !input.auth.is_oauth() {
+        return Err(CoreError::InvalidInput(
+            "clientId는 OAuth 방식에서만 쓰입니다".to_owned(),
+        ));
+    }
+    // 디바이스 인가에는 동적 등록이 없다. client_id 없이는 승인 화면을 열 수 없으므로
+    // 등록 단계에서 막아, 인증을 눌러야 아는 실패를 만들지 않는다. 편집은 기존 등록에
+    // 남은 client_id를 이어 쓸 수 있어 저장소를 읽는 자리에서 따로 본다.
+    if intent == ManifestIntent::Register
+        && input.auth == PluginAuthKind::OAuthDevice
+        && manual_client_id.is_none()
+    {
+        return Err(CoreError::InvalidInput(
+            "디바이스 인가 방식은 서버에서 만든 앱의 clientId가 필요합니다".to_owned(),
+        ));
+    }
+    let manual_client_secret =
+        validate_manual_client_secret(input.client_secret.as_deref(), &manual_client_id)?;
+    let scope = validate_scope(input.scope.as_deref(), input.auth)?;
+    Ok(ValidatedManifest {
+        display_name,
+        names,
+        url,
+        token,
+        manual_client_id,
+        client_id_was_supplied,
+        manual_client_secret,
+        scope,
+    })
+}
+
+/// 다른 이름 목록을 다듬는다 — 앞뒤 공백을 떼고, 빈 것과 겹치는 것을 빼고, 표시 이름과
+/// 같은 규칙(제어문자 없는 1~80자)으로 검사한다. 여덟 개면 충분하다.
+fn validate_names(values: &[String]) -> Result<Vec<String>, CoreError> {
+    let mut names: Vec<String> = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() || names.iter().any(|known| known == value) {
+            continue;
+        }
+        if !TextShape::DISPLAY_NAME.accepts(value) {
+            return Err(CoreError::InvalidInput(
+                "플러그인 다른 이름은 제어문자 없는 1~80자여야 합니다".to_owned(),
+            ));
+        }
+        names.push(value.to_owned());
+    }
+    if names.len() > MAX_PLUGIN_NAMES {
+        return Err(CoreError::InvalidInput(format!(
+            "플러그인 다른 이름은 {MAX_PLUGIN_NAMES}개까지만 둘 수 있습니다"
+        )));
+    }
+    Ok(names)
+}
+
+/// 옛 레코드(`names: None`)에 씨앗을 한 번 채운다. 바뀐 것이 있으면 true.
+fn seed_missing_names(store: &mut PluginStore) -> bool {
+    let mut changed = false;
+    for plugin in &mut store.plugins {
+        if plugin.names.is_none() {
+            plugin.names = Some(crate::opencode_config::seed_names(
+                &plugin.id,
+                &plugin.display_name,
+            ));
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// 등록·편집이 같은 규칙으로 URL을 받는다. Notion 내부 통합 토큰 방식은 서버를 Agent
 /// Manager가 직접 띄우므로 URL 자체를 거절한다.
 fn validate_request_url(
@@ -1962,7 +2323,7 @@ fn validate_request_url(
         }
         return Ok(None);
     }
-    Ok(Some(validate_endpoint(url.unwrap_or_default())?))
+    Ok(Some(validate_mcp_endpoint(url.unwrap_or_default())?))
 }
 
 /// 토큰을 받는 방식이면 검사해서 돌려주고, 받지 않는 방식이면 값이 온 것 자체를 거절한다.
@@ -2001,9 +2362,62 @@ fn token_secret_document(token: &str, auth: PluginAuthKind) -> SecretDocument {
     }
 }
 
+/// 한 줄 입력값이 지켜야 하는 모양. 검사 다섯 벌이 "길이 상한"과 "못 들어갈 글자 종류"를
+/// 각자 손으로 적고 있어서, 값마다 다른 것만 여기 두고 판정은 한 자리로 모은다. 빈 값의
+/// 의미는 칸마다 다르므로(어떤 칸은 오류, 어떤 칸은 "고르지 않음") 여기서 보지 않는다.
+#[derive(Clone, Copy)]
+struct TextShape {
+    /// 길이 상한. 사람이 읽는 이름만 글자 수로 세고, 나머지는 바이트로 센다.
+    limit: usize,
+    count_chars: bool,
+    /// 공백까지 막을지. 식별자·비밀값류는 막고, 사람이 읽는 이름과 공백으로 나뉜
+    /// scope 목록은 허용한다.
+    deny_whitespace: bool,
+}
+
+impl TextShape {
+    const DISPLAY_NAME: Self = Self {
+        limit: 80,
+        count_chars: true,
+        deny_whitespace: false,
+    };
+    const CLIENT_ID: Self = Self {
+        limit: 256,
+        count_chars: false,
+        deny_whitespace: true,
+    };
+    const CLIENT_SECRET: Self = Self {
+        limit: 512,
+        count_chars: false,
+        deny_whitespace: true,
+    };
+    const SCOPE: Self = Self {
+        limit: 1024,
+        count_chars: false,
+        deny_whitespace: false,
+    };
+    const TOKEN: Self = Self {
+        limit: MAX_TOKEN_CHARS,
+        count_chars: false,
+        deny_whitespace: true,
+    };
+
+    fn accepts(self, value: &str) -> bool {
+        let length = if self.count_chars {
+            value.chars().count()
+        } else {
+            value.len()
+        };
+        length <= self.limit
+            && !value
+                .chars()
+                .any(|c| c.is_control() || (self.deny_whitespace && c.is_whitespace()))
+    }
+}
+
 fn validate_display_name(value: &str) -> Result<String, CoreError> {
     let value = value.trim();
-    if value.is_empty() || value.chars().count() > 80 || value.chars().any(char::is_control) {
+    if value.is_empty() || !TextShape::DISPLAY_NAME.accepts(value) {
         return Err(CoreError::InvalidInput(
             "플러그인 표시 이름은 제어문자 없는 1~80자여야 합니다".to_owned(),
         ));
@@ -2012,10 +2426,7 @@ fn validate_display_name(value: &str) -> Result<String, CoreError> {
 }
 
 fn validate_client_id(value: &str) -> Result<String, CoreError> {
-    if value.is_empty()
-        || value.len() > 256
-        || value.chars().any(|c| c.is_control() || c.is_whitespace())
-    {
+    if value.is_empty() || !TextShape::CLIENT_ID.accepts(value) {
         return Err(CoreError::InvalidInput(
             "clientId 형식이 올바르지 않습니다".to_owned(),
         ));
@@ -2037,7 +2448,7 @@ fn validate_manual_client_secret(
             "clientSecret은 clientId와 함께 입력해야 합니다".to_owned(),
         ));
     }
-    if value.len() > 512 || value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+    if !TextShape::CLIENT_SECRET.accepts(value) {
         return Err(CoreError::InvalidInput(
             "clientSecret 형식이 올바르지 않습니다".to_owned(),
         ));
@@ -2056,7 +2467,7 @@ fn validate_scope(value: Option<&str>, auth: PluginAuthKind) -> Result<Option<St
             "scope는 OAuth 방식에서만 쓰입니다".to_owned(),
         ));
     }
-    if value.len() > 1024 || value.chars().any(char::is_control) {
+    if !TextShape::SCOPE.accepts(value) {
         return Err(CoreError::InvalidInput(
             "scope는 제어문자 없는 1024자 이하여야 합니다".to_owned(),
         ));
@@ -2072,10 +2483,7 @@ fn validate_scope(value: Option<&str>, auth: PluginAuthKind) -> Result<Option<St
 
 fn validate_token(value: &str, auth: PluginAuthKind) -> Result<String, CoreError> {
     let value = value.trim();
-    if value.is_empty()
-        || value.len() > MAX_TOKEN_CHARS
-        || value.chars().any(|c| c.is_control() || c.is_whitespace())
-    {
+    if value.is_empty() || !TextShape::TOKEN.accepts(value) {
         return Err(CoreError::InvalidInput(
             "토큰은 공백·제어문자 없는 1~4096자여야 합니다".to_owned(),
         ));
@@ -2090,42 +2498,10 @@ fn validate_token(value: &str, auth: PluginAuthKind) -> Result<String, CoreError
     Ok(value.to_owned())
 }
 
-/// 원격은 HTTPS, 로컬은 loopback HTTP도 허용한다. URL에 인증정보·query·fragment는 거절한다(E2·E3).
-pub(crate) fn validate_endpoint(input: &str) -> Result<String, CoreError> {
-    let url = Url::parse(input.trim())
-        .map_err(|_| CoreError::InvalidInput("올바른 MCP HTTP URL이 아닙니다".to_owned()))?;
-    if !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(CoreError::InvalidInput(
-            "MCP URL에는 사용자정보, 비밀번호, query 또는 fragment를 넣을 수 없습니다".to_owned(),
-        ));
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| CoreError::InvalidInput("MCP URL에 호스트가 없습니다".to_owned()))?;
-    let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]");
-    match url.scheme() {
-        "https" => {}
-        "http" if loopback => {}
-        _ => {
-            return Err(CoreError::InvalidInput(
-                "원격 MCP는 HTTPS만, 로컬 MCP는 loopback HTTP 또는 HTTPS만 허용됩니다".to_owned(),
-            ))
-        }
-    }
-    Ok(url.to_string())
-}
-
 fn validate_https_or_loopback(url: &str, what: &str) -> Result<Url, CoreError> {
     let parsed = Url::parse(url)
         .map_err(|_| CoreError::Runtime(format!("{what} 주소가 올바르지 않습니다")))?;
-    let loopback = matches!(
-        parsed.host_str(),
-        Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
-    );
+    let loopback = parsed.host_str().is_some_and(is_loopback_url_host);
     if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
         return Err(CoreError::Runtime(format!(
             "{what} 주소는 HTTPS여야 합니다"
@@ -2179,133 +2555,19 @@ fn proxy_client() -> Result<Client, CoreError> {
 fn discover_oauth(mcp_url: &str) -> Result<OAuthServerMetadata, CoreError> {
     let client = discovery_client()?;
     let mcp = validate_https_or_loopback(mcp_url, "MCP 서버")?;
-    let canonical_resource = canonical_resource(&mcp);
+    let resource = discover_protected_resource(&client, mcp_url, &mcp);
 
-    let mut resource_metadata_url: Option<String> = None;
-    if let Ok(response) = client
-        .post(mcp_url)
-        .header(CONTENT_TYPE, "application/json")
-        .header(ACCEPT, "application/json, text/event-stream")
-        .body(json!({"jsonrpc":"2.0","id":0,"method":"ping"}).to_string())
-        .send()
-    {
-        if response.status() == StatusCode::UNAUTHORIZED {
-            resource_metadata_url = response
-                .headers()
-                .get(WWW_AUTHENTICATE)
-                .and_then(|value| value.to_str().ok())
-                .and_then(parse_resource_metadata_url);
-        }
-    }
-    let mut candidates = Vec::new();
-    if let Some(url) = resource_metadata_url {
-        candidates.push(url);
-    }
-    let origin = url_origin(&mcp);
-    let path = mcp.path().trim_end_matches('/');
-    if !path.is_empty() {
-        candidates.push(format!(
-            "{origin}/.well-known/oauth-protected-resource{path}"
-        ));
-    }
-    candidates.push(format!("{origin}/.well-known/oauth-protected-resource"));
-
-    let mut authorization_server = origin.clone();
-    let mut resource = canonical_resource.clone();
-    let mut scope: Option<String> = None;
-    let mut found_resource_metadata = false;
-    for candidate in candidates {
-        if let Some(document) = fetch_json(&client, &candidate) {
-            if let Some(server) = document
-                .get("authorization_servers")
-                .and_then(Value::as_array)
-                .and_then(|servers| servers.first())
-                .and_then(Value::as_str)
-            {
-                found_resource_metadata = true;
-                authorization_server = server.trim_end_matches('/').to_owned();
-                if let Some(declared) = document.get("resource").and_then(Value::as_str) {
-                    resource = declared.to_owned();
-                }
-                scope = document
-                    .get("scopes_supported")
-                    .and_then(Value::as_array)
-                    .map(|scopes| {
-                        scopes
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
-                    .filter(|value| !value.is_empty());
-                break;
-            }
-        }
-    }
-    // RFC 9728 메타데이터가 없으면 origin을 인증 서버로 보는 폴백이 구글 공식 MCP에서는
-    // 존재하지 않는 endpoint(`{origin}/authorize`)로 낙착한다. 알려진 구글 MCP는 인증
-    // 서버가 구글 계정임이 확실하므로 그쪽 well-known 조회로 바로 간다.
-    if !found_resource_metadata
-        && hosted_preset_for(mcp_url).is_some_and(|preset| preset.brand == "google")
-    {
-        authorization_server = GOOGLE_AUTHORIZATION_SERVER.to_owned();
-    }
-
-    let as_url = validate_https_or_loopback(&authorization_server, "인증 서버")?;
+    let as_url = validate_https_or_loopback(&resource.authorization_server, "인증 서버")?;
     let as_origin = url_origin(&as_url);
     let as_path = as_url.path().trim_end_matches('/');
-    let mut metadata_candidates = Vec::new();
-    if !as_path.is_empty() {
-        metadata_candidates.push(format!(
-            "{as_origin}/.well-known/oauth-authorization-server{as_path}"
-        ));
-        metadata_candidates.push(format!(
-            "{as_origin}/.well-known/openid-configuration{as_path}"
-        ));
-        metadata_candidates.push(format!(
-            "{as_origin}{as_path}/.well-known/openid-configuration"
-        ));
-    }
-    metadata_candidates.push(format!(
-        "{as_origin}/.well-known/oauth-authorization-server"
-    ));
-    metadata_candidates.push(format!("{as_origin}/.well-known/openid-configuration"));
 
     let mut metadata: Option<OAuthServerMetadata> = None;
-    for candidate in metadata_candidates {
-        if let Some(document) = fetch_json(&client, &candidate) {
-            let (Some(authorize), Some(token)) = (
-                document
-                    .get("authorization_endpoint")
-                    .and_then(Value::as_str),
-                document.get("token_endpoint").and_then(Value::as_str),
-            ) else {
-                continue;
-            };
-            if let Some(methods) = document
-                .get("code_challenge_methods_supported")
-                .and_then(Value::as_array)
-            {
-                if !methods.iter().any(|method| method.as_str() == Some("S256")) {
-                    return Err(CoreError::Conflict(
-                        "인증 서버가 PKCE S256을 지원하지 않아 연결할 수 없습니다".to_owned(),
-                    ));
-                }
-            }
-            metadata = Some(OAuthServerMetadata {
-                authorization_endpoint: authorize.to_owned(),
-                token_endpoint: token.to_owned(),
-                registration_endpoint: document
-                    .get("registration_endpoint")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                device_authorization_endpoint: document
-                    .get("device_authorization_endpoint")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                resource: resource.clone(),
-                scope: scope.clone(),
-            });
+    for candidate in authorization_server_candidates(&as_origin, as_path) {
+        let Some(document) = fetch_json(&client, &candidate) else {
+            continue;
+        };
+        if let Some(found) = parse_authorization_server_metadata(&document, &resource)? {
+            metadata = Some(found);
             break;
         }
     }
@@ -2314,9 +2576,170 @@ fn discover_oauth(mcp_url: &str) -> Result<OAuthServerMetadata, CoreError> {
         token_endpoint: format!("{as_origin}/token"),
         registration_endpoint: Some(format!("{as_origin}/register")),
         device_authorization_endpoint: None,
-        resource,
-        scope,
+        resource: resource.resource,
+        scope: resource.scope,
     });
+    ensure_metadata_endpoints_allowed(&metadata)?;
+    Ok(metadata)
+}
+
+/// protected resource metadata(RFC 9728)에서 읽어낸 인증 서버와 자원 식별자.
+/// 문서를 못 찾으면 MCP 서버 자신의 origin이 그대로 남는다.
+struct ProtectedResource {
+    authorization_server: String,
+    resource: String,
+    scope: Option<String>,
+}
+
+/// 401이 가리킨 문서와 규격이 정한 well-known 위치를 순서대로 뒤져 인증 서버를 정한다.
+fn discover_protected_resource(client: &Client, mcp_url: &str, mcp: &Url) -> ProtectedResource {
+    let origin = url_origin(mcp);
+    let mut discovered = ProtectedResource {
+        authorization_server: origin.clone(),
+        resource: canonical_resource(mcp),
+        scope: None,
+    };
+    let mut found_resource_metadata = false;
+    for candidate in protected_resource_candidates(client, mcp_url, mcp, &origin) {
+        let Some(document) = fetch_json(client, &candidate) else {
+            continue;
+        };
+        let Some(server) = document
+            .get("authorization_servers")
+            .and_then(Value::as_array)
+            .and_then(|servers| servers.first())
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        found_resource_metadata = true;
+        discovered.authorization_server = server.trim_end_matches('/').to_owned();
+        if let Some(declared) = document.get("resource").and_then(Value::as_str) {
+            discovered.resource = declared.to_owned();
+        }
+        discovered.scope = document
+            .get("scopes_supported")
+            .and_then(Value::as_array)
+            .map(|scopes| {
+                scopes
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|value| !value.is_empty());
+        break;
+    }
+    // RFC 9728 메타데이터가 없으면 origin을 인증 서버로 보는 폴백이 구글 공식 MCP에서는
+    // 존재하지 않는 endpoint(`{origin}/authorize`)로 낙착한다. 알려진 구글 MCP는 인증
+    // 서버가 구글 계정임이 확실하므로 그쪽 well-known 조회로 바로 간다.
+    if !found_resource_metadata
+        && hosted_preset_for(mcp_url).is_some_and(|preset| preset.brand == "google")
+    {
+        discovered.authorization_server = GOOGLE_AUTHORIZATION_SERVER.to_owned();
+    }
+    discovered
+}
+
+/// 뒤져 볼 protected resource metadata 주소를 우선순위대로 모은다. 맨 앞은 MCP 서버가
+/// 401의 `WWW-Authenticate`로 직접 알려 준 주소다.
+fn protected_resource_candidates(
+    client: &Client,
+    mcp_url: &str,
+    mcp: &Url,
+    origin: &str,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Ok(response) = client
+        .post(mcp_url)
+        .header(CONTENT_TYPE, "application/json")
+        .header(ACCEPT, "application/json, text/event-stream")
+        .body(json!({"jsonrpc":"2.0","id":0,"method":"ping"}).to_string())
+        .send()
+    {
+        if response.status() == StatusCode::UNAUTHORIZED {
+            candidates.extend(
+                response
+                    .headers()
+                    .get(WWW_AUTHENTICATE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_resource_metadata_url),
+            );
+        }
+    }
+    let path = mcp.path().trim_end_matches('/');
+    if !path.is_empty() {
+        candidates.push(format!(
+            "{origin}/.well-known/oauth-protected-resource{path}"
+        ));
+    }
+    candidates.push(format!("{origin}/.well-known/oauth-protected-resource"));
+    candidates
+}
+
+/// 인증 서버 메타데이터(RFC 8414·OpenID Discovery)를 뒤져 볼 주소를 우선순위대로 모은다.
+fn authorization_server_candidates(as_origin: &str, as_path: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if !as_path.is_empty() {
+        candidates.push(format!(
+            "{as_origin}/.well-known/oauth-authorization-server{as_path}"
+        ));
+        candidates.push(format!(
+            "{as_origin}/.well-known/openid-configuration{as_path}"
+        ));
+        candidates.push(format!(
+            "{as_origin}{as_path}/.well-known/openid-configuration"
+        ));
+    }
+    candidates.push(format!(
+        "{as_origin}/.well-known/oauth-authorization-server"
+    ));
+    candidates.push(format!("{as_origin}/.well-known/openid-configuration"));
+    candidates
+}
+
+/// 인증 서버 메타데이터 문서를 읽는다. 두 필수 endpoint가 없는 문서는 다음 후보로
+/// 넘기려고 `None`이 되고, PKCE S256을 광고하지 않는 서버는 후보를 더 보지 않고 거절한다.
+fn parse_authorization_server_metadata(
+    document: &Value,
+    resource: &ProtectedResource,
+) -> Result<Option<OAuthServerMetadata>, CoreError> {
+    let (Some(authorize), Some(token)) = (
+        document
+            .get("authorization_endpoint")
+            .and_then(Value::as_str),
+        document.get("token_endpoint").and_then(Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    if let Some(methods) = document
+        .get("code_challenge_methods_supported")
+        .and_then(Value::as_array)
+    {
+        if !methods.iter().any(|method| method.as_str() == Some("S256")) {
+            return Err(CoreError::Conflict(
+                "인증 서버가 PKCE S256을 지원하지 않아 연결할 수 없습니다".to_owned(),
+            ));
+        }
+    }
+    Ok(Some(OAuthServerMetadata {
+        authorization_endpoint: authorize.to_owned(),
+        token_endpoint: token.to_owned(),
+        registration_endpoint: document
+            .get("registration_endpoint")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        device_authorization_endpoint: document
+            .get("device_authorization_endpoint")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        resource: resource.resource.clone(),
+        scope: resource.scope.clone(),
+    }))
+}
+
+/// 메타데이터가 알려 준 endpoint도 등록 URL과 같은 관문(HTTPS 또는 loopback)을 지나야 한다.
+fn ensure_metadata_endpoints_allowed(metadata: &OAuthServerMetadata) -> Result<(), CoreError> {
     validate_https_or_loopback(&metadata.authorization_endpoint, "authorization_endpoint")?;
     validate_https_or_loopback(&metadata.token_endpoint, "token_endpoint")?;
     if let Some(registration) = &metadata.registration_endpoint {
@@ -2325,7 +2748,7 @@ fn discover_oauth(mcp_url: &str) -> Result<OAuthServerMetadata, CoreError> {
     if let Some(device) = &metadata.device_authorization_endpoint {
         validate_https_or_loopback(device, "device_authorization_endpoint")?;
     }
-    Ok(metadata)
+    Ok(())
 }
 
 /// RFC 8707 canonical URI: 소문자 scheme·host, 끝 슬래시 없음, query·fragment 없음.
@@ -2470,65 +2893,130 @@ fn exchange_code(exchange: &OAuthExchange, code: &str) -> Result<TokenResponse, 
         ("code_verifier", exchange.code_verifier.clone()),
         ("resource", exchange.resource.clone()),
     ];
-    if let Some(secret) = &exchange.client_secret {
-        form.push(("client_secret", secret.clone()));
-    }
+    push_client_secret(&mut form, exchange.client_secret.as_deref());
     request_tokens(&exchange.token_endpoint, &form)
+}
+
+/// 접근 토큰 갱신 실패. `unrecoverable`은 인증 서버가 grant 자체를 거절한 경우다 —
+/// 같은 refresh token으로 다시 시도해도 결과가 같으므로 사용자가 다시 인증해야 한다.
+/// 네트워크·5xx·해석 실패는 다음 요청에서 다시 시도할 수 있다.
+struct TokenRefreshFailure {
+    unrecoverable: bool,
+    message: String,
+}
+
+/// RFC 6749 5.2에서 refresh token으로는 회복할 수 없는 거절 코드들. `invalid_grant`가
+/// 만료·회수·회전 유실이고, 나머지 둘은 클라이언트 등록이 무효해진 경우다.
+const UNRECOVERABLE_TOKEN_ERRORS: [&str; 3] =
+    ["invalid_grant", "invalid_client", "unauthorized_client"];
+
+fn classify_token_rejection(status: StatusCode, body: &Value) -> TokenRefreshFailure {
+    let code = body.get("error").and_then(Value::as_str).unwrap_or("");
+    TokenRefreshFailure {
+        unrecoverable: status.is_client_error() && UNRECOVERABLE_TOKEN_ERRORS.contains(&code),
+        message: issuance_rejected("토큰", status, body),
+    }
 }
 
 fn refresh_tokens(
     record: &OAuthClientRecord,
     refresh_token: &str,
     client_secret: Option<&str>,
-) -> Result<TokenResponse, CoreError> {
+) -> Result<TokenResponse, TokenRefreshFailure> {
     let mut form = vec![
         ("grant_type", "refresh_token".to_owned()),
         ("refresh_token", refresh_token.to_owned()),
         ("client_id", record.client_id.clone()),
         ("resource", record.resource.clone()),
     ];
+    push_client_secret(&mut form, client_secret);
+    let transient = |error: CoreError| TokenRefreshFailure {
+        unrecoverable: false,
+        message: error.to_string(),
+    };
+    let (status, body) = post_form_json(&record.token_endpoint, "token_endpoint", "토큰", &form)
+        .map_err(transient)?;
+    if !status.is_success() {
+        return Err(classify_token_rejection(status, &body));
+    }
+    parse_token_response(&body).map_err(transient)
+}
+
+/// OAuth endpoint에 form을 싣고 상태 코드와 JSON 본문을 받아 온다. 토큰 교환·갱신,
+/// 디바이스 코드 발급, 디바이스 토큰 폴링이 같은 전처리(주소 검증 → 클라이언트 → form
+/// POST → JSON 해석)를 각자 적고 있었다. `endpoint_label`은 주소 검증 메시지에,
+/// `subject`는 요청·해석 실패 메시지에 쓰인다.
+fn post_form_json(
+    endpoint: &str,
+    endpoint_label: &str,
+    subject: &str,
+    form: &[(&str, String)],
+) -> Result<(StatusCode, Value), CoreError> {
+    validate_https_or_loopback(endpoint, endpoint_label)?;
+    let client = discovery_client()?;
+    let response = client
+        .post(endpoint)
+        .header(ACCEPT, "application/json")
+        .form(form)
+        .send()
+        .map_err(|error| CoreError::Runtime(format!("{subject} 요청이 실패했습니다: {error}")))?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .map_err(|_| CoreError::Runtime(format!("{subject} 응답을 해석하지 못했습니다")))?;
+    Ok((status, body))
+}
+
+/// 인증 서버가 거절 이유로 싣는 칸을 순서대로 본다(RFC 6749 5.2).
+fn oauth_error_reason(body: &Value) -> &str {
+    body.get("error_description")
+        .or_else(|| body.get("error"))
+        .and_then(Value::as_str)
+        .unwrap_or("이유 없음")
+}
+
+/// 인증 서버가 발급을 거절했을 때의 문구. 토큰 교환·갱신과 디바이스 코드 발급이 같은 틀을
+/// 각자 적고 있었다 — 다른 것은 `subject`(무엇의 발급인지)뿐이다. 디바이스 폴링의 두 갈래는
+/// 상태 코드나 이유 중 한쪽이 없는 별개의 문구라 여기에 묶지 않는다.
+fn issuance_rejected(subject: &str, status: StatusCode, body: &Value) -> String {
+    format!(
+        "인증 서버가 {subject} 발급을 거절했습니다 (HTTP {}): {}",
+        status.as_u16(),
+        oauth_error_reason(body)
+    )
+}
+
+/// 응답 본문에서 비어 있지 않은 문자열 칸만 값으로 본다. 토큰 응답과 디바이스 코드 응답이
+/// "칸은 있는데 빈 문자열이면 없는 것"이라는 같은 규칙을 각자 적고 있었다.
+fn non_empty_field(body: &Value, name: &str) -> Option<String> {
+    body.get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// 공개 클라이언트가 아니면 form에 client_secret을 싣는다. 토큰 교환·갱신·디바이스 폴링이
+/// 같은 조건부 한 줄을 각자 적고 있었다.
+fn push_client_secret(form: &mut Vec<(&'static str, String)>, client_secret: Option<&str>) {
     if let Some(secret) = client_secret {
         form.push(("client_secret", secret.to_owned()));
     }
-    request_tokens(&record.token_endpoint, &form)
 }
 
 fn request_tokens(
     token_endpoint: &str,
     form: &[(&str, String)],
 ) -> Result<TokenResponse, CoreError> {
-    validate_https_or_loopback(token_endpoint, "token_endpoint")?;
-    let client = discovery_client()?;
-    let response = client
-        .post(token_endpoint)
-        .header(ACCEPT, "application/json")
-        .form(form)
-        .send()
-        .map_err(|error| CoreError::Runtime(format!("토큰 요청이 실패했습니다: {error}")))?;
-    let status = response.status();
-    let body: Value = response
-        .json()
-        .map_err(|_| CoreError::Runtime("토큰 응답을 해석하지 못했습니다".to_owned()))?;
+    let (status, body) = post_form_json(token_endpoint, "token_endpoint", "토큰", form)?;
     if !status.is_success() {
-        return Err(CoreError::Runtime(format!(
-            "인증 서버가 토큰 발급을 거절했습니다 (HTTP {}): {}",
-            status.as_u16(),
-            body.get("error_description")
-                .or_else(|| body.get("error"))
-                .and_then(Value::as_str)
-                .unwrap_or("이유 없음")
-        )));
+        return Err(CoreError::Runtime(issuance_rejected("토큰", status, &body)));
     }
     parse_token_response(&body)
 }
 
 fn parse_token_response(body: &Value) -> Result<TokenResponse, CoreError> {
-    let access_token = body
-        .get("access_token")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| CoreError::Runtime("토큰 응답에 access_token이 없습니다".to_owned()))?
-        .to_owned();
+    let access_token = non_empty_field(body, "access_token")
+        .ok_or_else(|| CoreError::Runtime("토큰 응답에 access_token이 없습니다".to_owned()))?;
     let expires_at = body
         .get("expires_in")
         .and_then(Value::as_i64)
@@ -2536,11 +3024,7 @@ fn parse_token_response(body: &Value) -> Result<TokenResponse, CoreError> {
         .map(|seconds| now_ms() + seconds * 1000);
     Ok(TokenResponse {
         access_token,
-        refresh_token: body
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned),
+        refresh_token: non_empty_field(body, "refresh_token"),
         expires_at,
     })
 }
@@ -2577,53 +3061,37 @@ fn request_device_code(
     client_id: &str,
     scope: Option<&str>,
 ) -> Result<DeviceAuthorization, CoreError> {
-    validate_https_or_loopback(device_endpoint, "device_authorization_endpoint")?;
-    let client = discovery_client()?;
     let mut form = vec![("client_id", client_id.to_owned())];
     if let Some(scope) = scope {
         form.push(("scope", scope.to_owned()));
     }
-    let response = client
-        .post(device_endpoint)
-        .header(ACCEPT, "application/json")
-        .form(&form)
-        .send()
-        .map_err(|error| {
-            CoreError::Runtime(format!("디바이스 코드 요청이 실패했습니다: {error}"))
-        })?;
-    let status = response.status();
-    let body: Value = response
-        .json()
-        .map_err(|_| CoreError::Runtime("디바이스 코드 응답을 해석하지 못했습니다".to_owned()))?;
+    let (status, body) = post_form_json(
+        device_endpoint,
+        "device_authorization_endpoint",
+        "디바이스 코드",
+        &form,
+    )?;
     if !status.is_success() || body.get("error").is_some() {
-        return Err(CoreError::Runtime(format!(
-            "인증 서버가 디바이스 코드 발급을 거절했습니다 (HTTP {}): {}",
-            status.as_u16(),
-            body.get("error_description")
-                .or_else(|| body.get("error"))
-                .and_then(Value::as_str)
-                .unwrap_or("이유 없음")
+        return Err(CoreError::Runtime(issuance_rejected(
+            "디바이스 코드",
+            status,
+            &body,
         )));
     }
-    let field = |name: &str| {
-        body.get(name)
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    };
-    let device_code = field("device_code").ok_or_else(|| {
+    let device_code = non_empty_field(&body, "device_code").ok_or_else(|| {
         CoreError::Runtime("디바이스 코드 응답에 device_code가 없습니다".to_owned())
     })?;
-    let user_code = field("user_code").ok_or_else(|| {
+    let user_code = non_empty_field(&body, "user_code").ok_or_else(|| {
         CoreError::Runtime("디바이스 코드 응답에 user_code가 없습니다".to_owned())
     })?;
-    let verification_uri = field("verification_uri")
-        .or_else(|| field("verification_url"))
+    let verification_uri = non_empty_field(&body, "verification_uri")
+        .or_else(|| non_empty_field(&body, "verification_url"))
         .ok_or_else(|| {
             CoreError::Runtime("디바이스 코드 응답에 verification_uri가 없습니다".to_owned())
         })?;
     // 코드가 채워진 주소를 주면 그쪽을 연다. 사용자가 코드를 손으로 옮겨 적지 않아도 된다.
-    let verification_url = field("verification_uri_complete").unwrap_or(verification_uri);
+    let verification_url =
+        non_empty_field(&body, "verification_uri_complete").unwrap_or(verification_uri);
     validate_https_or_loopback(&verification_url, "verification_uri")?;
     Ok(DeviceAuthorization {
         device_code,
@@ -2651,26 +3119,13 @@ fn poll_device_token(
     device_code: &str,
     client_secret: Option<&str>,
 ) -> Result<DevicePoll, CoreError> {
-    validate_https_or_loopback(token_endpoint, "token_endpoint")?;
-    let client = discovery_client()?;
     let mut form = vec![
         ("grant_type", DEVICE_CODE_GRANT.to_owned()),
         ("device_code", device_code.to_owned()),
         ("client_id", client_id.to_owned()),
     ];
-    if let Some(secret) = client_secret {
-        form.push(("client_secret", secret.to_owned()));
-    }
-    let response = client
-        .post(token_endpoint)
-        .header(ACCEPT, "application/json")
-        .form(&form)
-        .send()
-        .map_err(|error| CoreError::Runtime(format!("토큰 요청이 실패했습니다: {error}")))?;
-    let status = response.status();
-    let body: Value = response
-        .json()
-        .map_err(|_| CoreError::Runtime("토큰 응답을 해석하지 못했습니다".to_owned()))?;
+    push_client_secret(&mut form, client_secret);
+    let (status, body) = post_form_json(token_endpoint, "token_endpoint", "토큰", &form)?;
     if let Some(error) = body.get("error").and_then(Value::as_str) {
         let description = body
             .get("error_description")
@@ -3063,13 +3518,7 @@ fn send_proxy_request(
     request: &ProxyRequest,
 ) -> Result<ProxyResponse, CoreError> {
     let mut headers = HeaderMap::new();
-    if let Some(value) = request
-        .content_type
-        .as_deref()
-        .and_then(|value| HeaderValue::from_str(value).ok())
-    {
-        headers.insert(CONTENT_TYPE, value);
-    }
+    insert_valid_header(&mut headers, CONTENT_TYPE, request.content_type.as_deref());
     headers.insert(
         ACCEPT,
         request
@@ -3078,23 +3527,17 @@ fn send_proxy_request(
             .and_then(|value| HeaderValue::from_str(value).ok())
             .unwrap_or_else(|| HeaderValue::from_static("application/json, text/event-stream")),
     );
-    if let Some(value) = request
-        .session_id
-        .as_deref()
-        .and_then(|value| HeaderValue::from_str(value).ok())
-    {
-        headers.insert("mcp-session-id", value);
-    }
-    if let Some(value) = request
-        .protocol_version
-        .as_deref()
-        .and_then(|value| HeaderValue::from_str(value).ok())
-    {
-        headers.insert("mcp-protocol-version", value);
-    }
-    if let Some(authorization) = authorization.and_then(|value| HeaderValue::from_str(value).ok()) {
-        headers.insert(AUTHORIZATION, authorization);
-    }
+    insert_valid_header(
+        &mut headers,
+        "mcp-session-id",
+        request.session_id.as_deref(),
+    );
+    insert_valid_header(
+        &mut headers,
+        "mcp-protocol-version",
+        request.protocol_version.as_deref(),
+    );
+    insert_valid_header(&mut headers, AUTHORIZATION, authorization);
     let response = client
         .request(request.method.clone(), upstream)
         .headers(headers)
@@ -3137,6 +3580,16 @@ fn send_proxy_request(
         session_id,
         body: body.to_vec(),
     })
+}
+
+fn insert_valid_header(
+    headers: &mut HeaderMap,
+    name: impl reqwest::header::IntoHeaderName,
+    value: Option<&str>,
+) {
+    if let Some(value) = value.and_then(|value| HeaderValue::from_str(value).ok()) {
+        headers.insert(name, value);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3260,6 +3713,19 @@ mod tests {
     }
 
     #[test]
+    fn proxy_headers_insert_only_valid_values() {
+        let mut headers = HeaderMap::new();
+
+        insert_valid_header(&mut headers, CONTENT_TYPE, Some("application/json"));
+        insert_valid_header(&mut headers, AUTHORIZATION, Some("invalid\nvalue"));
+        insert_valid_header(&mut headers, "mcp-session-id", None);
+
+        assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
+        assert!(!headers.contains_key(AUTHORIZATION));
+        assert!(!headers.contains_key("mcp-session-id"));
+    }
+
+    #[test]
     fn plugin_ids_match_provider_server_name_rules() {
         assert!(validate_plugin_id("notion").is_ok());
         assert!(validate_plugin_id("my-tools_2").is_ok());
@@ -3267,18 +3733,6 @@ mod tests {
         assert!(validate_plugin_id("-lead").is_err());
         assert!(validate_plugin_id("has space").is_err());
         assert!(validate_plugin_id(&"a".repeat(33)).is_err());
-    }
-
-    #[test]
-    fn endpoint_validation_rejects_credentials_and_plain_http_remote() {
-        assert_eq!(
-            validate_endpoint(" https://mcp.notion.com/mcp ").expect("hosted url"),
-            "https://mcp.notion.com/mcp"
-        );
-        assert!(validate_endpoint("http://127.0.0.1:3000/mcp").is_ok());
-        assert!(validate_endpoint("http://mcp.example.com/mcp").is_err());
-        assert!(validate_endpoint("https://user:pw@mcp.example.com/mcp").is_err());
-        assert!(validate_endpoint("https://mcp.example.com/mcp?token=x").is_err());
     }
 
     #[test]
@@ -3311,9 +3765,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let registry = ExternalPluginRegistry::new(directory.path().to_path_buf());
         registry
-            .register(RegisterExternalPluginRequest {
+            .register(ExternalPluginManifestRequest {
                 id: "notion".to_owned(),
                 display_name: "Notion".to_owned(),
+                names: None,
                 url: Some("http://127.0.0.1:1/mcp".to_owned()),
                 auth: PluginAuthKind::None,
                 token: None,
@@ -3328,6 +3783,159 @@ mod tests {
             .expect_err("disabled plugin must stop before connecting");
         assert!(matches!(error, CoreError::Conflict(_)));
         assert!(error.to_string().contains("꺼져"));
+    }
+
+    fn manifest(id: &str, names: Option<Vec<&str>>) -> ExternalPluginManifestRequest {
+        ExternalPluginManifestRequest {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            names: names.map(|list| list.iter().map(|n| (*n).to_owned()).collect()),
+            url: Some("http://127.0.0.1:1/mcp".to_owned()),
+            auth: PluginAuthKind::None,
+            token: None,
+            client_id: None,
+            client_secret: None,
+            scope: None,
+        }
+    }
+
+    // 9.12: 어떤 말이 플러그인을 가리키는지는 플러그인마다 저장된 이름 목록이 말한다.
+    #[test]
+    fn plugin_names_are_seeded_on_register_kept_on_silent_edit_and_replaced_when_sent() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let registry = ExternalPluginRegistry::new(directory.path().to_path_buf());
+        // 이름 없이 등록하면 id 의 브랜드로 씨앗이 채워진다.
+        let view = registry
+            .register(manifest("notion-team", None))
+            .expect("register");
+        assert_eq!(view.names, vec!["노션"]);
+        // 편집에서 목록을 안 보내면 그대로다.
+        let mut silent = manifest("notion-team", None);
+        silent.display_name = "Notion (team)".to_owned();
+        let view = registry.update(silent).expect("update");
+        assert_eq!(view.names, vec!["노션"]);
+        // 보내면 그것으로 바뀐다 — 공백·중복은 다듬고, 비우면 비운 대로 남는다.
+        let view = registry
+            .update(manifest(
+                "notion-team",
+                Some(vec![" 노션 ", "Notion", "노션", ""]),
+            ))
+            .expect("update names");
+        assert_eq!(view.names, vec!["노션", "Notion"]);
+        let view = registry
+            .update(manifest("notion-team", Some(vec![])))
+            .expect("clear");
+        assert!(
+            view.names.is_empty(),
+            "사용자가 비운 목록은 다시 채우지 않는다"
+        );
+        assert_eq!(
+            registry.attachable_names().expect("names"),
+            vec![("notion-team".to_owned(), Vec::<String>::new())]
+        );
+        // 아홉 개는 거절한다.
+        let too_many: Vec<String> = (0..9).map(|i| format!("x{i}")).collect();
+        let error = registry
+            .update(manifest(
+                "notion-team",
+                Some(too_many.iter().map(String::as_str).collect()),
+            ))
+            .expect_err("too many names");
+        assert!(matches!(error, CoreError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn plugin_names_reject_control_characters_and_overlong_entries() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let registry = ExternalPluginRegistry::new(directory.path().to_path_buf());
+        let control = "노\u{7}션".to_owned();
+        let error = registry
+            .register(manifest("notion-a", Some(vec![control.as_str()])))
+            .expect_err("control char");
+        assert!(matches!(error, CoreError::InvalidInput(_)), "{error}");
+        let long = "가".repeat(81);
+        let error = registry
+            .register(manifest("notion-b", Some(vec![long.as_str()])))
+            .expect_err("too long");
+        assert!(matches!(error, CoreError::InvalidInput(_)), "{error}");
+        // 거절된 등록은 아무것도 남기지 않는다.
+        assert!(registry.attachable_names().expect("names").is_empty());
+        // 80자는 받는다.
+        let ok = "가".repeat(80);
+        let view = registry
+            .register(manifest("notion-c", Some(vec![ok.as_str()])))
+            .expect("80 chars");
+        assert_eq!(view.names, vec![ok]);
+    }
+
+    #[test]
+    fn plugin_records_without_names_get_seeded_once_when_the_store_is_read() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let registry = ExternalPluginRegistry::new(directory.path().to_path_buf());
+        registry
+            .register(manifest("github-main", None))
+            .expect("register");
+        // 9.12 이전 파일처럼 names 를 지운다.
+        let path = directory.path().join("external-plugins.json");
+        let text = std::fs::read_to_string(&path).expect("store");
+        let mut store: serde_json::Value = serde_json::from_str(&text).expect("json");
+        store["plugins"][0]
+            .as_object_mut()
+            .expect("plugin")
+            .remove("names");
+        std::fs::write(&path, serde_json::to_string(&store).expect("json")).expect("write");
+        let names = registry.attachable_names().expect("names");
+        assert_eq!(
+            names,
+            vec![(
+                "github-main".to_owned(),
+                vec!["깃허브".to_owned(), "깃헙".to_owned()]
+            )]
+        );
+        // 저장까지 됐으므로 다시 읽어도 씨앗을 또 심지 않는다.
+        let text = std::fs::read_to_string(&path).expect("store");
+        assert!(text.contains("\"names\""), "{text}");
+    }
+
+    fn metadata(authorization_endpoint: &str) -> OAuthServerMetadata {
+        OAuthServerMetadata {
+            authorization_endpoint: authorization_endpoint.to_owned(),
+            token_endpoint: "https://example.com/token".to_owned(),
+            registration_endpoint: None,
+            device_authorization_endpoint: None,
+            resource: "https://example.com/mcp".to_owned(),
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn authorization_url_asks_google_for_a_refresh_token() {
+        let common = build_authorization_url(
+            &metadata("https://example.com/authorize"),
+            "client",
+            "http://127.0.0.1:1/callback",
+            "challenge",
+            "state",
+            None,
+        )
+        .expect("authorize 주소");
+        let query = common.query().unwrap_or_default();
+        assert!(!query.contains("access_type"), "{query}");
+        assert!(!query.contains("scope="), "{query}");
+
+        let google = build_authorization_url(
+            &metadata("https://accounts.google.com/o/oauth2/v2/auth"),
+            "client",
+            "http://127.0.0.1:1/callback",
+            "challenge",
+            "state",
+            Some("openid email"),
+        )
+        .expect("authorize 주소");
+        let query = google.query().unwrap_or_default();
+        assert!(query.contains("access_type=offline"), "{query}");
+        assert!(query.contains("prompt=consent"), "{query}");
+        assert!(query.contains("scope=openid+email"), "{query}");
     }
 
     #[test]
@@ -3418,6 +4026,7 @@ mod tests {
         let stored = StoredPlugin {
             id: "notion".to_owned(),
             display_name: "Notion".to_owned(),
+            names: None,
             url: Some(NOTION_HOSTED_MCP_URL.to_owned()),
             auth: PluginAuthKind::OAuth,
             enabled: true,
@@ -3436,6 +4045,7 @@ mod tests {
                 scope: None,
                 authorized_at: Some(3),
                 access_expires_at: Some(4),
+                grant_lost_at: None,
             }),
             server_name: None,
             tools: Vec::new(),
@@ -3473,6 +4083,7 @@ mod tests {
         let plugin = StoredPlugin {
             id: "notion".to_owned(),
             display_name: "Notion".to_owned(),
+            names: None,
             url: Some(NOTION_HOSTED_MCP_URL.to_owned()),
             auth: PluginAuthKind::OAuth,
             enabled: true,
@@ -3503,9 +4114,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let registry = ExternalPluginRegistry::new(directory.path().to_path_buf());
         let error = registry
-            .register(RegisterExternalPluginRequest {
+            .register(ExternalPluginManifestRequest {
                 id: "notion".to_owned(),
                 display_name: "Notion".to_owned(),
+                names: None,
                 url: Some("https://example.com".to_owned()),
                 auth: PluginAuthKind::NotionToken,
                 token: Some("ntn_x".to_owned()),
@@ -3516,9 +4128,10 @@ mod tests {
             .expect_err("url must be refused");
         assert!(matches!(error, CoreError::InvalidInput(_)));
         let error = registry
-            .register(RegisterExternalPluginRequest {
+            .register(ExternalPluginManifestRequest {
                 id: "notion".to_owned(),
                 display_name: "Notion".to_owned(),
+                names: None,
                 url: None,
                 auth: PluginAuthKind::NotionToken,
                 token: None,
@@ -3529,9 +4142,10 @@ mod tests {
             .expect_err("token required");
         assert!(matches!(error, CoreError::InvalidInput(_)));
         let error = registry
-            .register(RegisterExternalPluginRequest {
+            .register(ExternalPluginManifestRequest {
                 id: "open".to_owned(),
                 display_name: "Open".to_owned(),
+                names: None,
                 url: Some("https://mcp.example.com/mcp".to_owned()),
                 auth: PluginAuthKind::None,
                 token: Some("x".to_owned()),
@@ -3550,6 +4164,7 @@ mod tests {
         let stored = StoredPlugin {
             id: "notion".to_owned(),
             display_name: "Notion".to_owned(),
+            names: None,
             url: Some(NOTION_HOSTED_MCP_URL.to_owned()),
             auth: PluginAuthKind::OAuth,
             enabled: true,
@@ -3568,6 +4183,7 @@ mod tests {
                 scope: None,
                 authorized_at: Some(3),
                 access_expires_at: Some(4),
+                grant_lost_at: None,
             }),
             server_name: Some("Notion".to_owned()),
             tools: vec!["search".to_owned()],
@@ -3584,9 +4200,10 @@ mod tests {
             .expect("save");
         // 표시 이름만 바뀌면 자격증명·연결 확인 결과가 그대로라 보안 저장소도 지나지 않는다.
         let view = registry
-            .update(UpdateExternalPluginRequest {
+            .update(ExternalPluginManifestRequest {
                 id: "notion".to_owned(),
                 display_name: "Notion 팀".to_owned(),
+                names: None,
                 url: Some(NOTION_HOSTED_MCP_URL.to_owned()),
                 auth: PluginAuthKind::OAuth,
                 token: None,
@@ -3611,9 +4228,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let registry = ExternalPluginRegistry::new(directory.path().to_path_buf());
         registry
-            .register(RegisterExternalPluginRequest {
+            .register(ExternalPluginManifestRequest {
                 id: "local".to_owned(),
                 display_name: "Local dev".to_owned(),
+                names: None,
                 url: Some("http://127.0.0.1:3000/mcp".to_owned()),
                 auth: PluginAuthKind::None,
                 token: None,
@@ -3632,9 +4250,10 @@ mod tests {
             })
             .expect("seed verification state");
         let view = registry
-            .update(UpdateExternalPluginRequest {
+            .update(ExternalPluginManifestRequest {
                 id: "local".to_owned(),
                 display_name: "Local dev".to_owned(),
+                names: None,
                 url: Some("http://127.0.0.1:4000/mcp".to_owned()),
                 auth: PluginAuthKind::None,
                 token: None,
@@ -3659,6 +4278,7 @@ mod tests {
         let stored = StoredPlugin {
             id: "api".to_owned(),
             display_name: "API".to_owned(),
+            names: None,
             url: Some("https://mcp.example.com/mcp".to_owned()),
             auth: PluginAuthKind::Bearer,
             enabled: true,
@@ -3684,9 +4304,10 @@ mod tests {
         // 옛 토큰이 새 서버로 전달되면 안 되므로, 주소를 바꾸는 편집은 새 토큰 없이는 거절된다.
         // 이 검증은 보안 저장소 접근 전에 끝난다.
         let error = registry
-            .update(UpdateExternalPluginRequest {
+            .update(ExternalPluginManifestRequest {
                 id: "api".to_owned(),
                 display_name: "API".to_owned(),
+                names: None,
                 url: Some("https://mcp.other.example/mcp".to_owned()),
                 auth: PluginAuthKind::Bearer,
                 token: None,
@@ -3702,9 +4323,10 @@ mod tests {
     fn update_rejects_unknown_plugins_and_mismatched_auth_fields() {
         let directory = tempfile::tempdir().expect("tempdir");
         let registry = ExternalPluginRegistry::new(directory.path().to_path_buf());
-        let missing = registry.update(UpdateExternalPluginRequest {
+        let missing = registry.update(ExternalPluginManifestRequest {
             id: "ghost".to_owned(),
             display_name: "Ghost".to_owned(),
+            names: None,
             url: Some("http://127.0.0.1:3000/mcp".to_owned()),
             auth: PluginAuthKind::None,
             token: None,
@@ -3714,9 +4336,10 @@ mod tests {
         });
         assert!(matches!(missing, Err(CoreError::NotFound(_))));
         // 등록과 같은 규칙: 인증 방식에 맞지 않는 필드는 저장소를 건드리기 전에 거절된다.
-        let token_refused = registry.update(UpdateExternalPluginRequest {
+        let token_refused = registry.update(ExternalPluginManifestRequest {
             id: "ghost".to_owned(),
             display_name: "Ghost".to_owned(),
+            names: None,
             url: Some("http://127.0.0.1:3000/mcp".to_owned()),
             auth: PluginAuthKind::OAuth,
             token: Some("x".to_owned()),
@@ -3725,9 +4348,10 @@ mod tests {
             scope: None,
         });
         assert!(matches!(token_refused, Err(CoreError::InvalidInput(_))));
-        let url_refused = registry.update(UpdateExternalPluginRequest {
+        let url_refused = registry.update(ExternalPluginManifestRequest {
             id: "ghost".to_owned(),
             display_name: "Ghost".to_owned(),
+            names: None,
             url: Some("https://example.com".to_owned()),
             auth: PluginAuthKind::NotionToken,
             token: Some("ntn_x".to_owned()),
@@ -3736,9 +4360,10 @@ mod tests {
             scope: None,
         });
         assert!(matches!(url_refused, Err(CoreError::InvalidInput(_))));
-        let client_id_refused = registry.update(UpdateExternalPluginRequest {
+        let client_id_refused = registry.update(ExternalPluginManifestRequest {
             id: "ghost".to_owned(),
             display_name: "Ghost".to_owned(),
+            names: None,
             url: Some("http://127.0.0.1:3000/mcp".to_owned()),
             auth: PluginAuthKind::None,
             token: None,
@@ -3754,9 +4379,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let registry = ExternalPluginRegistry::new(directory.path().to_path_buf());
         let view = registry
-            .register(RegisterExternalPluginRequest {
+            .register(ExternalPluginManifestRequest {
                 id: "local".to_owned(),
                 display_name: " Local dev ".to_owned(),
+                names: None,
                 url: Some("http://127.0.0.1:3000/mcp".to_owned()),
                 auth: PluginAuthKind::None,
                 token: None,
@@ -3767,9 +4393,10 @@ mod tests {
             .expect("register");
         assert_eq!(view.display_name, "Local dev");
         assert!(view.attachable);
-        let duplicate = registry.register(RegisterExternalPluginRequest {
+        let duplicate = registry.register(ExternalPluginManifestRequest {
             id: "local".to_owned(),
             display_name: "Again".to_owned(),
+            names: None,
             url: Some("http://127.0.0.1:3000/mcp".to_owned()),
             auth: PluginAuthKind::None,
             token: None,
@@ -3799,9 +4426,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let registry = ExternalPluginRegistry::new(directory.path().to_path_buf());
         let error = registry
-            .register(RegisterExternalPluginRequest {
+            .register(ExternalPluginManifestRequest {
                 id: "google-drive".to_owned(),
                 display_name: "Google Drive".to_owned(),
+                names: None,
                 url: Some("https://drivemcp.googleapis.com/mcp/v1".to_owned()),
                 auth: PluginAuthKind::OAuth,
                 token: None,
@@ -3862,7 +4490,7 @@ mod tests {
         assert_eq!(snapshot.hosted_presets.len(), HOSTED_MCPS.len());
         for preset in snapshot.hosted_presets {
             validate_plugin_id(preset.id).expect("preset id");
-            validate_endpoint(preset.url).expect("preset url");
+            validate_mcp_endpoint(preset.url).expect("preset url");
             assert_eq!(
                 hosted_preset_for(&format!("{}/", preset.url.trim_end_matches('/')))
                     .map(|found| found.id),
@@ -3928,9 +4556,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let registry = ExternalPluginRegistry::new(directory.path().to_path_buf());
         let error = registry
-            .register(RegisterExternalPluginRequest {
+            .register(ExternalPluginManifestRequest {
                 id: "github".to_owned(),
                 display_name: "GitHub".to_owned(),
+                names: None,
                 url: Some("https://api.githubcopilot.com/mcp/".to_owned()),
                 auth: PluginAuthKind::OAuthDevice,
                 token: None,
@@ -3941,9 +4570,10 @@ mod tests {
             .expect_err("device flow without a client id");
         assert!(matches!(error, CoreError::InvalidInput(_)));
         let view = registry
-            .register(RegisterExternalPluginRequest {
+            .register(ExternalPluginManifestRequest {
                 id: "github".to_owned(),
                 display_name: "GitHub".to_owned(),
+                names: None,
                 url: Some("https://api.githubcopilot.com/mcp/".to_owned()),
                 auth: PluginAuthKind::OAuthDevice,
                 token: None,
@@ -3962,9 +4592,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let registry = ExternalPluginRegistry::new(directory.path().to_path_buf());
         registry
-            .register(RegisterExternalPluginRequest {
+            .register(ExternalPluginManifestRequest {
                 id: "notion".to_owned(),
                 display_name: "Notion".to_owned(),
+                names: None,
                 url: Some("http://127.0.0.1:1/mcp".to_owned()),
                 auth: PluginAuthKind::None,
                 token: None,
@@ -4051,9 +4682,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let registry = ExternalPluginRegistry::new(directory.path().to_path_buf());
         registry
-            .register(RegisterExternalPluginRequest {
+            .register(ExternalPluginManifestRequest {
                 id: "notion".to_owned(),
                 display_name: "Notion".to_owned(),
+                names: None,
                 url: Some("http://127.0.0.1:1/mcp".to_owned()),
                 auth: PluginAuthKind::None,
                 token: None,
@@ -4096,6 +4728,64 @@ mod tests {
             "https://mcp.notion.com/authorize"
         ));
         assert!(!is_google_authorization_endpoint("not a url"));
+    }
+
+    #[test]
+    fn lost_grant_turns_credential_ready_off_until_reauthorized() {
+        let mut record = new_manual_oauth_record("client".to_owned());
+        record.authorized_at = Some(3);
+        let mut plugin = StoredPlugin {
+            id: "notion".to_owned(),
+            display_name: "Notion".to_owned(),
+            names: None,
+            url: Some(NOTION_HOSTED_MCP_URL.to_owned()),
+            auth: PluginAuthKind::OAuth,
+            enabled: true,
+            scope: None,
+            tool_policies: BTreeMap::new(),
+            created_at: 1,
+            updated_at: 1,
+            secret_stored_at: Some(2),
+            oauth: Some(record),
+            server_name: None,
+            tools: Vec::new(),
+            last_verified_at: None,
+            last_error: None,
+        };
+        assert!(credential_ready(&plugin));
+        plugin.oauth.as_mut().unwrap().grant_lost_at = Some(5);
+        assert!(
+            !credential_ready(&plugin),
+            "거절된 grant로는 새 채팅에 붙지 않는다"
+        );
+        assert!(!plugin_view(&plugin, false).attachable);
+        // 재인증 기록은 인증 서버 메타데이터를 새로 받아 쓰되 grant 유실 표시는 이어받는다.
+        // 토큰 저장(store_oauth_tokens)만이 이 표시를 지운다.
+        plugin.oauth.as_mut().unwrap().grant_lost_at = None;
+        assert!(credential_ready(&plugin));
+    }
+
+    #[test]
+    fn token_rejection_is_unrecoverable_only_for_grant_errors() {
+        let invalid_grant = json!({"error": "invalid_grant", "error_description": "revoked"});
+        let rejected = classify_token_rejection(StatusCode::BAD_REQUEST, &invalid_grant);
+        assert!(rejected.unrecoverable);
+        assert!(rejected.message.contains("HTTP 400"));
+        assert!(rejected.message.contains("revoked"));
+
+        let server_error = json!({"error": "server_error"});
+        assert!(!classify_token_rejection(StatusCode::BAD_GATEWAY, &server_error).unrecoverable);
+
+        // 같은 코드라도 5xx는 서버 쪽 문제로 보고 다음 요청에서 다시 시도한다.
+        assert!(
+            !classify_token_rejection(StatusCode::INTERNAL_SERVER_ERROR, &invalid_grant)
+                .unrecoverable
+        );
+
+        let rate_limited = json!({"error": "temporarily_unavailable"});
+        assert!(
+            !classify_token_rejection(StatusCode::TOO_MANY_REQUESTS, &rate_limited).unrecoverable
+        );
     }
 
     #[test]

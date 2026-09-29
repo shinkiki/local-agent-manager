@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::app_data_file::open_private_append_file;
 use crate::clock::now_ms;
 use crate::json_store::{JsonStore, SchemaVersioned};
+use crate::loopback_host::validate_mcp_endpoint;
 use crate::text_limit;
 use crate::CoreError;
 
@@ -96,6 +97,17 @@ struct McpInterfaceProbe {
     tools: Vec<McpRemoteTool>,
 }
 
+/// 입력 검증을 통과한 등록 요청. 원격 조사 전에 확정되는 값만 담아, 조사 이후 단계가
+/// 다시 검증할 필요가 없음을 타입으로 드러낸다.
+struct ValidatedRegistration {
+    id: String,
+    display_name: String,
+    url: String,
+    enabled_tools: Vec<String>,
+    expected_identity: String,
+    grant_expires_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredMcpInterface {
@@ -107,6 +119,37 @@ struct StoredMcpInterface {
     tools: Vec<McpRemoteTool>,
     granted_at: i64,
     grant_expires_at: Option<i64>,
+}
+
+impl StoredMcpInterface {
+    /// 권한 만료 여부를 확인한다.
+    fn is_expired(&self, now: i64) -> bool {
+        self.grant_expires_at.is_some_and(|expires| expires <= now)
+    }
+
+    /// 카탈로그에 표시할 상태 문자열을 반환한다.
+    fn status(&self, now: i64) -> &'static str {
+        if self.is_expired(now) {
+            "expired"
+        } else {
+            "active"
+        }
+    }
+
+    /// 카탈로그 응답용 JSON 객체로 변환한다.
+    fn to_catalog_json(&self, now: i64) -> Value {
+        json!({
+            "id": self.id,
+            "displayName": self.display_name,
+            "url": self.url,
+            "identityHash": self.identity_hash,
+            "enabledTools": self.enabled_tools,
+            "tools": self.tools,
+            "grantedAt": self.granted_at,
+            "grantExpiresAt": self.grant_expires_at,
+            "status": self.status(now),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -164,19 +207,7 @@ impl McpInterfaceRegistry {
             let interfaces = store
                 .interfaces
                 .values()
-                .map(|interface| {
-                    json!({
-                        "id": interface.id,
-                        "displayName": interface.display_name,
-                        "url": interface.url,
-                        "identityHash": interface.identity_hash,
-                        "enabledTools": interface.enabled_tools,
-                        "tools": interface.tools,
-                        "grantedAt": interface.granted_at,
-                        "grantExpiresAt": interface.grant_expires_at,
-                        "status": if interface.grant_expires_at.is_some_and(|expires| expires <= now) { "expired" } else { "active" }
-                    })
-                })
+                .map(|interface| interface.to_catalog_json(now))
                 .collect::<Vec<_>>();
             Ok(json!({
                 "interfaces": interfaces,
@@ -194,14 +225,14 @@ impl McpInterfaceRegistry {
     }
 
     pub(crate) fn probe(&self, request: McpInterfaceProbeRequest) -> Result<Value, CoreError> {
-        let url = validate_endpoint(&request.url)?;
+        let url = validate_mcp_endpoint(&request.url)?;
         match probe_remote(&url) {
             Ok((_, probe)) => {
-                let _ = self.record_audit("probe", None, None, "succeeded");
+                self.record_probe("succeeded");
                 serde_json::to_value(probe).map_err(CoreError::Json)
             }
             Err(error) => {
-                let _ = self.record_audit("probe", None, None, "failed");
+                self.record_probe("failed");
                 Err(error)
             }
         }
@@ -211,30 +242,8 @@ impl McpInterfaceRegistry {
         &self,
         request: McpInterfaceRegisterRequest,
     ) -> Result<Value, CoreError> {
-        validate_interface_id(&request.id)?;
-        let display_name = validate_display_name(&request.display_name)?;
-        let url = validate_endpoint(&request.url)?;
-        let enabled_tools = validate_enabled_tools(&request.enabled_tools)?;
-        if request.expected_identity.len() != 64
-            || !request
-                .expected_identity
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(CoreError::InvalidInput(
-                "expectedIdentity는 probe 결과의 SHA-256 identityHash여야 합니다".to_owned(),
-            ));
-        }
-        if request
-            .grant_expires_at
-            .is_some_and(|expires| expires <= now_ms())
-        {
-            return Err(CoreError::InvalidInput(
-                "grantExpiresAt은 현재 이후 시각이어야 합니다".to_owned(),
-            ));
-        }
-
-        let (_, probe) = probe_remote(&url)?;
+        let request = validate_registration(request)?;
+        let (_, probe) = probe_remote(&request.url)?;
         if !probe
             .identity_hash
             .eq_ignore_ascii_case(&request.expected_identity)
@@ -245,39 +254,22 @@ impl McpInterfaceRegistry {
                     .to_owned(),
             ));
         }
-        let available = probe
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<BTreeSet<_>>();
-        let missing = enabled_tools
-            .iter()
-            .filter(|tool| !available.contains(tool.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(CoreError::InvalidInput(format!(
-                "MCP 서버에 없는 도구가 포함되어 있습니다: {}",
-                missing.join(", ")
-            )));
-        }
-        let tools = probe
-            .tools
-            .into_iter()
-            .filter(|tool| enabled_tools.iter().any(|enabled| enabled == &tool.name))
-            .collect::<Vec<_>>();
-        let granted_at = now_ms();
-        let stored = StoredMcpInterface {
-            id: request.id.clone(),
-            display_name,
-            url,
+        let tools = select_granted_tools(probe.tools, &request.enabled_tools)?;
+        self.insert_interface(StoredMcpInterface {
+            id: request.id,
+            display_name: request.display_name,
+            url: request.url,
             identity_hash: probe.identity_hash,
-            enabled_tools,
+            enabled_tools: request.enabled_tools,
             tools,
-            granted_at,
+            granted_at: now_ms(),
             grant_expires_at: request.grant_expires_at,
-        };
+        })
+    }
 
+    /// 검증과 대조를 모두 마친 인터페이스를 저장한다. 중복 등록과 총량 한도는 저장 잠금
+    /// 안에서만 판정해야 같은 순간에 들어온 두 등록이 한도를 함께 넘기지 않는다.
+    fn insert_interface(&self, stored: StoredMcpInterface) -> Result<Value, CoreError> {
         self.with_store_lock(|| {
             let mut store = self.load_store_unlocked()?;
             if store.interfaces.contains_key(&stored.id) {
@@ -333,11 +325,22 @@ impl McpInterfaceRegistry {
         self.call(request, false)
     }
 
-    fn call(
+    /// 등록된 MCP 인터페이스를 ID로 조회한다.
+    fn find_interface(&self, id: &str) -> Result<StoredMcpInterface, CoreError> {
+        self.with_store_lock(|| {
+            let store = self.load_store_unlocked()?;
+            store.interfaces.get(id).cloned().ok_or_else(|| {
+                CoreError::NotFound("등록된 MCP 인터페이스를 찾을 수 없습니다".to_owned())
+            })
+        })
+    }
+
+    /// MCP 도구 호출 전 입력 형식, 인터페이스 만료 여부, 도구 허용 여부 및 읽기/실행 접근 경로를 검증한다.
+    fn resolve_callable_tool(
         &self,
-        request: McpInterfaceCallRequest,
+        request: &McpInterfaceCallRequest,
         require_read_only: bool,
-    ) -> Result<Value, CoreError> {
+    ) -> Result<(StoredMcpInterface, McpRemoteTool), CoreError> {
         validate_interface_id(&request.id)?;
         validate_tool_name(&request.tool)?;
         if !request.arguments.is_object() {
@@ -345,90 +348,83 @@ impl McpInterfaceRegistry {
                 "MCP 도구 arguments는 객체여야 합니다".to_owned(),
             ));
         }
-        let interface = self.with_store_lock(|| {
-            let store = self.load_store_unlocked()?;
-            store.interfaces.get(&request.id).cloned().ok_or_else(|| {
-                CoreError::NotFound("등록된 MCP 인터페이스를 찾을 수 없습니다".to_owned())
-            })
-        })?;
-        if interface
-            .grant_expires_at
-            .is_some_and(|expires| expires <= now_ms())
-        {
-            let _ = self.record_audit(
-                "invoke",
-                Some(&request.id),
-                Some(&request.tool),
+        let interface = self.find_interface(&request.id)?;
+        if interface.is_expired(now_ms()) {
+            return Err(self.reject_invoke(
+                &request.id,
+                &request.tool,
                 "grantExpired",
-            );
-            return Err(CoreError::Conflict(
-                "MCP 인터페이스 권한이 만료되었습니다. 다시 등록해 주세요".to_owned(),
+                CoreError::Conflict(
+                    "MCP 인터페이스 권한이 만료되었습니다. 다시 등록해 주세요".to_owned(),
+                ),
             ));
         }
-        let granted_tool = interface
-            .tools
-            .iter()
-            .find(|tool| tool.name == request.tool)
-            .cloned();
-        let Some(granted_tool) = granted_tool else {
-            let _ = self.record_audit(
-                "invoke",
-                Some(&request.id),
-                Some(&request.tool),
+        let Some(granted_tool) = find_tool(&interface.tools, &request.tool).cloned() else {
+            return Err(self.reject_invoke(
+                &request.id,
+                &request.tool,
                 "notGranted",
-            );
-            return Err(CoreError::InvalidInput(
-                "이 인터페이스에 허용되지 않은 MCP 도구입니다".to_owned(),
+                CoreError::InvalidInput("이 인터페이스에 허용되지 않은 MCP 도구입니다".to_owned()),
             ));
         };
         if granted_tool.read_only != require_read_only {
-            let _ = self.record_audit(
-                "invoke",
-                Some(&request.id),
-                Some(&request.tool),
+            return Err(self.reject_invoke(
+                &request.id,
+                &request.tool,
                 "wrongAccessPath",
-            );
-            return Err(CoreError::InvalidInput(if require_read_only {
-                "변경 가능 도구는 interface_execute로 호출해야 합니다".to_owned()
-            } else {
-                "읽기 전용 도구는 interface_read로 호출해야 합니다".to_owned()
-            }));
+                CoreError::InvalidInput(if require_read_only {
+                    "변경 가능 도구는 interface_execute로 호출해야 합니다".to_owned()
+                } else {
+                    "읽기 전용 도구는 interface_read로 호출해야 합니다".to_owned()
+                }),
+            ));
         }
+        Ok((interface, granted_tool))
+    }
 
-        let invocation = (|| {
-            let (mut session, probe) = probe_remote(&interface.url)?;
-            if probe.identity_hash != interface.identity_hash {
-                return Err(CoreError::Conflict(
-                    "등록 이후 MCP 서버 identity가 변경되었습니다. 권한을 회수하고 다시 등록해 주세요"
-                        .to_owned(),
-                ));
-            }
-            let current_tool = probe
-                .tools
-                .iter()
-                .find(|tool| tool.name == request.tool)
-                .ok_or_else(|| {
-                    CoreError::Conflict(
-                        "등록된 MCP 도구가 현재 서버 카탈로그에서 사라졌습니다".to_owned(),
-                    )
-                })?;
-            if current_tool.read_only != granted_tool.read_only {
-                return Err(CoreError::Conflict(
-                    "MCP 도구의 읽기/변경 분류가 등록 이후 달라졌습니다".to_owned(),
-                ));
-            }
-            session.call_tool(&request.tool, request.arguments)
-        })();
+    /// 원격 MCP 세션에 연결하여 identity 및 도구 변경 여부를 검증한 뒤 도구를 실행한다.
+    fn invoke_remote_tool(
+        interface: &StoredMcpInterface,
+        granted_tool: &McpRemoteTool,
+        tool: &str,
+        arguments: Value,
+    ) -> Result<Value, CoreError> {
+        let (mut session, probe) = probe_remote(&interface.url)?;
+        if probe.identity_hash != interface.identity_hash {
+            return Err(CoreError::Conflict(
+                "등록 이후 MCP 서버 identity가 변경되었습니다. 권한을 회수하고 다시 등록해 주세요"
+                    .to_owned(),
+            ));
+        }
+        let current_tool = find_tool(&probe.tools, tool).ok_or_else(|| {
+            CoreError::Conflict("등록된 MCP 도구가 현재 서버 카탈로그에서 사라졌습니다".to_owned())
+        })?;
+        if current_tool.read_only != granted_tool.read_only {
+            return Err(CoreError::Conflict(
+                "MCP 도구의 읽기/변경 분류가 등록 이후 달라졌습니다".to_owned(),
+            ));
+        }
+        session.call_tool(tool, arguments)
+    }
+
+    fn call(
+        &self,
+        request: McpInterfaceCallRequest,
+        require_read_only: bool,
+    ) -> Result<Value, CoreError> {
+        let (interface, granted_tool) = self.resolve_callable_tool(&request, require_read_only)?;
+
+        let invocation =
+            Self::invoke_remote_tool(&interface, &granted_tool, &request.tool, request.arguments);
 
         match invocation {
             Ok(result) => {
                 let remote_error = result.get("isError").and_then(Value::as_bool) == Some(true);
                 let result = bounded_remote_result(result);
                 let audit_recorded = self
-                    .record_audit(
-                        "invoke",
-                        Some(&request.id),
-                        Some(&request.tool),
+                    .record_invoke(
+                        &request.id,
+                        &request.tool,
                         if remote_error {
                             "remoteError"
                         } else {
@@ -449,11 +445,38 @@ impl McpInterfaceRegistry {
                 } else {
                     "failed"
                 };
-                let _ =
-                    self.record_audit("invoke", Some(&request.id), Some(&request.tool), outcome);
-                Err(error)
+                Err(self.reject_invoke(&request.id, &request.tool, outcome, error))
             }
         }
+    }
+
+    /// 조사 감사는 인터페이스도 도구도 아직 정해지지 않은 자리라 결과만 남는다.
+    fn record_probe(&self, outcome: &str) {
+        let _ = self.record_audit("probe", None, None, outcome);
+    }
+
+    /// 도구 호출 감사는 성공·원격오류·거절이 모두 같은 `invoke` 한 줄이다. 행위 이름과
+    /// 두 식별자를 호출 지점마다 다시 적으면 그중 하나만 빠져도 감사가 조용히 갈라진다.
+    fn record_invoke(
+        &self,
+        interface_id: &str,
+        tool: &str,
+        outcome: &str,
+    ) -> Result<(), CoreError> {
+        self.record_audit("invoke", Some(interface_id), Some(tool), outcome)
+    }
+
+    /// 거절은 언제나 "감사 한 줄 + 그 이유의 오류"라 둘을 한 자리에서 만든다. 감사 기록
+    /// 실패가 거절 사유를 덮지 않도록 기록 결과는 버린다.
+    fn reject_invoke(
+        &self,
+        interface_id: &str,
+        tool: &str,
+        outcome: &str,
+        error: CoreError,
+    ) -> CoreError {
+        let _ = self.record_invoke(interface_id, tool, outcome);
+        error
     }
 
     fn record_audit(
@@ -644,21 +667,27 @@ impl McpHttpSession {
     }
 }
 
+/// initialize 응답이 알려 준 상류 서버 이름. 규약상 `title`이 사람에게 보일 이름이고
+/// `name`은 식별자라, 둘 다 있으면 `title`을 쓴다. 동적 MCP 등록과 외부 플러그인의
+/// 카탈로그·연결 확인이 같은 두 칸 들여다보기를 각자 하고 있었다.
+pub(crate) fn server_name(initialize: &Value) -> Option<String> {
+    server_info_field(initialize, "title").or_else(|| server_info_field(initialize, "name"))
+}
+
+fn server_info_field(initialize: &Value, field: &str) -> Option<String> {
+    initialize
+        .get("serverInfo")?
+        .get(field)?
+        .as_str()
+        .map(str::to_owned)
+}
+
 fn probe_remote(url: &str) -> Result<(McpHttpSession, McpInterfaceProbe), CoreError> {
     let (mut session, initialize) = McpHttpSession::connect(url)?;
     let tools_result = session.list_tools()?;
     let tools = parse_tools(&tools_result)?;
-    let server_info = initialize.get("serverInfo").cloned().unwrap_or(Value::Null);
-    let server_name = server_info
-        .get("title")
-        .or_else(|| server_info.get("name"))
-        .and_then(Value::as_str)
-        .unwrap_or("이름 없는 MCP 서버")
-        .to_owned();
-    let server_version = server_info
-        .get("version")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let server_name = server_name(&initialize).unwrap_or_else(|| "이름 없는 MCP 서버".to_owned());
+    let server_version = server_info_field(&initialize, "version");
     let identity_hash = interface_identity(url, &server_name, server_version.as_deref(), &tools)?;
     Ok((
         session,
@@ -830,32 +859,69 @@ pub(crate) fn bounded_remote_result(result: Value) -> Value {
     }
 }
 
-fn validate_endpoint(input: &str) -> Result<String, CoreError> {
-    let url = reqwest::Url::parse(input.trim())
-        .map_err(|_| CoreError::InvalidInput("올바른 MCP HTTP URL이 아닙니다".to_owned()))?;
-    if !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
+/// 등록 요청 중 원격 조사 없이 판정할 수 있는 입력만 먼저 검증한다. 네트워크를 타기 전에
+/// 끝나야 하는 판정을 여기 모아 두면 `register`에는 조사 결과와의 대조만 남는다.
+fn validate_registration(
+    request: McpInterfaceRegisterRequest,
+) -> Result<ValidatedRegistration, CoreError> {
+    validate_interface_id(&request.id)?;
+    let display_name = validate_display_name(&request.display_name)?;
+    let url = validate_mcp_endpoint(&request.url)?;
+    let enabled_tools = validate_enabled_tools(&request.enabled_tools)?;
+    if request.expected_identity.len() != 64
+        || !request
+            .expected_identity
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(CoreError::InvalidInput(
-            "MCP URL에는 사용자정보, 비밀번호, query 또는 fragment를 넣을 수 없습니다".to_owned(),
+            "expectedIdentity는 probe 결과의 SHA-256 identityHash여야 합니다".to_owned(),
         ));
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| CoreError::InvalidInput("MCP URL에 호스트가 없습니다".to_owned()))?;
-    let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
-    match url.scheme() {
-        "https" => {}
-        "http" if loopback => {}
-        _ => {
-            return Err(CoreError::InvalidInput(
-                "원격 MCP는 HTTPS만, 로컬 MCP는 loopback HTTP 또는 HTTPS만 허용됩니다".to_owned(),
-            ))
-        }
+    if request
+        .grant_expires_at
+        .is_some_and(|expires| expires <= now_ms())
+    {
+        return Err(CoreError::InvalidInput(
+            "grantExpiresAt은 현재 이후 시각이어야 합니다".to_owned(),
+        ));
     }
-    Ok(url.to_string())
+    Ok(ValidatedRegistration {
+        id: request.id,
+        display_name,
+        url,
+        enabled_tools,
+        expected_identity: request.expected_identity,
+        grant_expires_at: request.grant_expires_at,
+    })
+}
+
+/// 조사 결과에서 승인된 도구만 골라 낸다. 승인 목록에 서버가 더 이상 제공하지 않는 이름이
+/// 하나라도 있으면 그 이름을 그대로 돌려주며 등록을 거절한다 — 빈손으로 등록해 두면
+/// 사용자는 무엇이 빠졌는지 알 수 없다.
+fn select_granted_tools(
+    probed: Vec<McpRemoteTool>,
+    enabled_tools: &[String],
+) -> Result<Vec<McpRemoteTool>, CoreError> {
+    let available = probed
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let missing = enabled_tools
+        .iter()
+        .filter(|tool| !available.contains(tool.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(CoreError::InvalidInput(format!(
+            "MCP 서버에 없는 도구가 포함되어 있습니다: {}",
+            missing.join(", ")
+        )));
+    }
+    Ok(probed
+        .into_iter()
+        .filter(|tool| enabled_tools.iter().any(|enabled| enabled == &tool.name))
+        .collect())
 }
 
 fn validate_interface_id(value: &str) -> Result<(), CoreError> {
@@ -910,6 +976,11 @@ pub(crate) fn validate_tool_name(value: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// 이름으로 도구를 찾는다. 조사 결과와 저장된 권한 모두 같은 검색 규칙을 사용한다.
+fn find_tool<'a>(tools: &'a [McpRemoteTool], name: &str) -> Option<&'a McpRemoteTool> {
+    tools.iter().find(|tool| tool.name == name)
+}
+
 pub(crate) fn empty_object() -> Value {
     json!({})
 }
@@ -931,16 +1002,6 @@ mod tests {
             read_only: true,
             destructive: false,
         }]
-    }
-
-    #[test]
-    fn endpoint_requires_https_except_for_loopback() {
-        assert!(validate_endpoint("https://example.com/mcp").is_ok());
-        assert!(validate_endpoint("http://127.0.0.1:4179/mcp").is_ok());
-        assert!(validate_endpoint("http://localhost:4179/mcp").is_ok());
-        assert!(validate_endpoint("http://example.com/mcp").is_err());
-        assert!(validate_endpoint("https://example.com/mcp?token=secret").is_err());
-        assert!(validate_endpoint("https://user:secret@example.com/mcp").is_err());
     }
 
     #[test]

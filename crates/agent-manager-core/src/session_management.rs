@@ -8,6 +8,7 @@ use std::sync::mpsc::Receiver;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use fs4::FileExt;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -16,15 +17,73 @@ use uuid::Uuid;
 use crate::app_data_file::{read_private_json, read_private_json_or_default, write_private_json};
 use crate::catalog::{INTERRUPTED_ROLE, RUNTIME_FAILURE_ROLE};
 use crate::clock::now_ms;
+use crate::domain::wire_enum;
 use crate::text_limit;
 use crate::{
-    load_session_detail_with_limit, AccountSnapshot, AccountSupervisor, AutoSwitchReason,
-    AutoSwitchSignal, ChatDeliveryStatus, ChatMessageDelivery, ChatPhase, ChatProfile,
-    ChatSessionInfo, ChatStartRequest, ChatSupervisor, ContentBlock, CoreError, ProviderId,
-    ScheduleFrequency, ScheduleRun, ScheduleRunRound, ScheduleRunStatus, ScheduleSessionStrategy,
-    ScheduledRequest, SchedulerSupervisor, SessionCatalog, SessionSummary, SessionTranscriptLimit,
-    TerminalSupervisor, TranscriptItem,
+    load_session_detail_with_limit, AccountSnapshot, AccountSupervisor, AutoSwitchEventView,
+    AutoSwitchReason, AutoSwitchSignal, ChatDeliveryStatus, ChatMessageDelivery, ChatPhase,
+    ChatProfile, ChatSessionInfo, ChatStartRequest, ChatSupervisor, ContentBlock, CoreError,
+    ProviderId, ScheduleFrequency, ScheduleRun, ScheduleRunRound, ScheduleRunStatus,
+    ScheduleSessionStrategy, ScheduledRequest, SchedulerSupervisor, SessionCatalog, SessionSummary,
+    SessionTranscriptLimit, TerminalSupervisor, TranscriptItem,
 };
+
+/// 저장본·요청 본문에서 문자열 하나와 1:1로 대응하는 열거형에 `ALL`·
+/// `as_str`·`Display`·`FromStr` 네 벌을 변이-문자열 표 하나에서 만든다. 네 벌이 각자
+/// 적혀 있으면 변이를 하나 늘릴 때 한 곳을 빠뜨려도 컴파일은 지나가고, 허용값을 나열한
+/// 오류 문구만 조용히 낡는다. 여기서는 허용값 목록도 같은 표에서 뽑으므로 어긋날 수 없다.
+/// `$label`은 오류 문구 앞머리이고, `=> "주표현" | "별칭"`으로 되읽기 전용 별칭을 덧붙인다
+/// (`as_str`는 언제나 주표현을 돌려준다).
+///
+/// `ALL`은 시험 전용이다. 이 표를 쓰는 열거형의 변이를 전수로 훑는 곳은 왕복 시험뿐이라
+/// 비테스트 빌드에 내면 생산 코드가 쓰지 않는 상수가 되고, `pub`이라 `dead_code`에도
+/// 걸리지 않은 채 공개 API로만 남는다. 그래서 `#[cfg(test)]`로 한정한다 — 훑을 일이
+/// 없는 열거형만 따로 고르던 `no_all` 갈래가 필요 없어지는 이유이기도 하다.
+macro_rules! session_string_enum {
+    ($ty:ident, $label:literal, {
+        $($variant:ident => $value:literal $(| $alias:literal)*),+ $(,)?
+    }) => {
+        impl $ty {
+            #[cfg(test)]
+            pub(crate) const ALL: [Self; [$(stringify!($variant)),+].len()] =
+                [$(Self::$variant),+];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value,)+
+                }
+            }
+        }
+
+        impl std::fmt::Display for $ty {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl std::str::FromStr for $ty {
+            type Err = $crate::CoreError;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s.trim() {
+                    $($value $(| $alias)* => Ok(Self::$variant),)+
+                    _ => Err($crate::CoreError::InvalidInput(format!(
+                        "{}: {}. {} 중 하나를 쓰세요",
+                        $label,
+                        s,
+                        [$($value),+].join("|")
+                    ))),
+                }
+            }
+        }
+    };
+}
+
+/// 세션 참조 정책·스킬 저장소 모듈도 이 표 한 벌을 쓴다. `domain::wire_enum!(choices …)`가
+/// 같은 문구를 만들지만 거기에 딸려 오는 `WIRE_CHOICES` 상수를 쓰지 않는 모듈에서는
+/// `dead_code`가 되므로, 허용값만 알리면 되는 자리는 이 표를 쓴다. 둘을 한 매크로로
+/// 합치는 일은 `domain.rs`를 소유한 쪽 몫이다.
+pub(crate) use session_string_enum;
 
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE: usize = 200;
@@ -63,7 +122,8 @@ pub enum SessionManagementStatus {
 }
 
 impl SessionManagementStatus {
-    pub const ALL: &'static [Self] = &[
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [Self] = &[
         Self::Ready,
         Self::Running,
         Self::WaitingApproval,
@@ -75,52 +135,22 @@ impl SessionManagementStatus {
         Self::Unavailable,
     ];
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ready => "ready",
-            Self::Running => "running",
-            Self::WaitingApproval => "waitingApproval",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Interrupted => "interrupted",
-            Self::Stopped => "stopped",
-            Self::Archived => "archived",
-            Self::Unavailable => "unavailable",
-        }
-    }
-
     fn is_active(self) -> bool {
         matches!(self, Self::Ready | Self::Running | Self::WaitingApproval)
     }
 }
 
-impl std::fmt::Display for SessionManagementStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SessionManagementStatus {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "ready" => Ok(Self::Ready),
-            "running" => Ok(Self::Running),
-            "waitingApproval" => Ok(Self::WaitingApproval),
-            "completed" => Ok(Self::Completed),
-            "failed" => Ok(Self::Failed),
-            "interrupted" => Ok(Self::Interrupted),
-            "stopped" => Ok(Self::Stopped),
-            "archived" => Ok(Self::Archived),
-            "unavailable" => Ok(Self::Unavailable),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 세션 상태입니다: {}",
-                s
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed SessionManagementStatus, "알 수 없는 세션 상태입니다", {
+    Ready => "ready",
+    Running => "running",
+    WaitingApproval => "waitingApproval",
+    Completed => "completed",
+    Failed => "failed",
+    Interrupted => "interrupted",
+    Stopped => "stopped",
+    Archived => "archived",
+    Unavailable => "unavailable",
+});
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -133,45 +163,21 @@ pub enum SessionSortField {
 }
 
 impl SessionSortField {
-    pub const ALL: &'static [Self] = &[
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [Self] = &[
         Self::CreatedAt,
         Self::UpdatedAt,
         Self::Title,
         Self::TurnCount,
     ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::CreatedAt => "createdAt",
-            Self::UpdatedAt => "updatedAt",
-            Self::Title => "title",
-            Self::TurnCount => "turnCount",
-        }
-    }
 }
 
-impl std::fmt::Display for SessionSortField {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SessionSortField {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "createdAt" => Ok(Self::CreatedAt),
-            "updatedAt" => Ok(Self::UpdatedAt),
-            "title" => Ok(Self::Title),
-            "turnCount" => Ok(Self::TurnCount),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 정렬 필드입니다: {}",
-                s
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed SessionSortField, "알 수 없는 정렬 필드입니다", {
+    CreatedAt => "createdAt",
+    UpdatedAt => "updatedAt",
+    Title => "title",
+    TurnCount => "turnCount",
+});
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -182,33 +188,58 @@ pub enum SortDirection {
 }
 
 impl SortDirection {
-    pub const ALL: &'static [Self] = &[Self::Asc, Self::Desc];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Asc => "asc",
-            Self::Desc => "desc",
-        }
-    }
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [Self] = &[Self::Asc, Self::Desc];
 }
 
-impl std::fmt::Display for SortDirection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
+wire_enum!(trimmed SortDirection, "알 수 없는 정렬 방향입니다", {
+    Asc => "asc",
+    Desc => "desc",
+});
+
+/// 세션 목록과 통계가 함께 받는 범위 필터. 두 요청이 같은 축을 각자 적어 두면
+/// 한쪽에만 축이 늘어나 조회 결과가 갈라진다. 축의 정의와 기본값을 여기 한 벌로
+/// 두고 두 요청이 평평하게 펼쳐 받는다(바깥에서 보는 JSON 모양은 그대로다).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionScopeFilters {
+    #[serde(default)]
+    pub source: Option<ProviderId>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// 여러 공급자를 한 번에 좁히는 필터. 비우면 제약이 없고, `source`와 함께 주면
+    /// 둘 다 만족하는 세션만 남는다. 세션 컨텍스트 정책이 공급자 목록을 그대로 넘긴다.
+    ///
+    /// 다중 축은 비어 있으면 직렬화에서 뺀다. 적용 필터 응답이 "그 축에 제약이
+    /// 없었다"를 빈 배열이 아니라 키 없음으로 알려 온 계약을 그대로 잇는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<ProviderId>,
+    /// 여러 프로젝트를 한 번에 좁히는 필터. 통합 보고서가 프로젝트별로 카탈로그를 다시
+    /// 훑지 않도록, 허용된 경로 집합을 한 번에 받는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cwds: Vec<String>,
+    /// 여러 상태를 한 번에 좁히는 필터. 비우면 전체 상태다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statuses: Vec<SessionManagementStatus>,
+    #[serde(default)]
+    pub from: Option<i64>,
+    #[serde(default)]
+    pub to: Option<i64>,
 }
 
-impl std::str::FromStr for SortDirection {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "asc" => Ok(Self::Asc),
-            "desc" => Ok(Self::Desc),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 정렬 방향입니다: {}",
-                s
-            ))),
+impl SessionScopeFilters {
+    /// 범위 축을 그대로 옮긴 적용 필터. 목록에만 있는 축(`status`·`search`)은
+    /// 호출부가 채운다 — 통계는 둘 다 쓰지 않으므로 `None`을 준다.
+    fn applied(
+        &self,
+        status: Option<SessionManagementStatus>,
+        search: Option<String>,
+    ) -> SessionAppliedFilters {
+        SessionAppliedFilters {
+            scope: self.clone(),
+            status,
+            search,
+            unfiled: false,
         }
     }
 }
@@ -216,25 +247,8 @@ impl std::str::FromStr for SortDirection {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionListRequest {
-    #[serde(default)]
-    pub source: Option<ProviderId>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    /// 여러 공급자를 한 번에 좁히는 필터. 비우면 제약이 없고, `source`와 함께 주면
-    /// 둘 다 만족하는 세션만 남는다. 세션 컨텍스트 정책이 공급자 목록을 그대로 넘긴다.
-    #[serde(default)]
-    pub sources: Vec<ProviderId>,
-    /// 여러 프로젝트를 한 번에 좁히는 필터. 통합 보고서가 프로젝트별로 카탈로그를 다시
-    /// 훑지 않도록, 허용된 경로 집합을 한 번에 받는다.
-    #[serde(default)]
-    pub cwds: Vec<String>,
-    /// 여러 상태를 한 번에 좁히는 필터. 비우면 전체 상태다.
-    #[serde(default)]
-    pub statuses: Vec<SessionManagementStatus>,
-    #[serde(default)]
-    pub from: Option<i64>,
-    #[serde(default)]
-    pub to: Option<i64>,
+    #[serde(flatten)]
+    pub scope: SessionScopeFilters,
     #[serde(default)]
     pub status: Option<SessionManagementStatus>,
     #[serde(default)]
@@ -247,6 +261,9 @@ pub struct SessionListRequest {
     pub cursor: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// true 면 어느 폴더에도 넣지 않은 세션만 돌려준다.
+    #[serde(default)]
+    pub unfiled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -263,6 +280,11 @@ pub struct ManagedSessionSummary {
     pub turn_count: u64,
     pub status: SessionManagementStatus,
     pub last_turn_status: Option<String>,
+    /// 이 세션이 들어 있는 폴더 id. 비어 있으면 아직 어느 폴더에도 넣지 않은 세션이다.
+    /// 반복 요청이 "미분류만" 을 고르려면 목록에서 바로 보여야 한다 — 세션마다 메타를
+    /// 따로 묻게 하면 245개 세션에 245번 왕복이다.
+    #[serde(default)]
+    pub folder_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,42 +299,26 @@ pub struct SessionListResponse {
     pub counting_basis: &'static str,
 }
 
+/// 응답에 실어 보내는 적용 필터. 범위 축은 [`SessionScopeFilters`]를 그대로 품는다 —
+/// 축 목록을 여기 한 번 더 베껴 두면 한쪽에만 축이 늘어 요청은 걸렀는데 응답은
+/// 안 걸렀다고 말하는 상태가 된다. 펼쳐 실으므로 바깥에서 보는 JSON 모양은 그대로다.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionAppliedFilters {
-    pub source: Option<ProviderId>,
-    pub cwd: Option<String>,
-    /// 다중 필터는 실제로 적용된 값만 담는다. 비어 있으면 그 축에 제약이 없었다는 뜻이다.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sources: Vec<ProviderId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cwds: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub statuses: Vec<SessionManagementStatus>,
-    pub from: Option<i64>,
-    pub to: Option<i64>,
+    #[serde(flatten)]
+    pub scope: SessionScopeFilters,
     pub status: Option<SessionManagementStatus>,
     pub search: Option<String>,
+    /// 폴더 없는 세션만 남겼는지. 목록에만 있는 축이라 통계는 늘 `false`다.
+    #[serde(default)]
+    pub unfiled: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStatisticsRequest {
-    #[serde(default)]
-    pub source: Option<ProviderId>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    /// `SessionListRequest`와 같은 다중 필터. 세션 컨텍스트 정책이 그대로 넘긴다.
-    #[serde(default)]
-    pub sources: Vec<ProviderId>,
-    #[serde(default)]
-    pub cwds: Vec<String>,
-    #[serde(default)]
-    pub statuses: Vec<SessionManagementStatus>,
-    #[serde(default)]
-    pub from: Option<i64>,
-    #[serde(default)]
-    pub to: Option<i64>,
+    #[serde(flatten)]
+    pub scope: SessionScopeFilters,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -395,68 +401,13 @@ pub enum TranscriptCategory {
     IncompleteItem,
 }
 
-impl TranscriptCategory {
-    pub const ALL: [Self; 5] = [
-        Self::SessionSummary,
-        Self::UserRequest,
-        Self::WorkPerformed,
-        Self::VerificationResult,
-        Self::IncompleteItem,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::SessionSummary => "sessionSummary",
-            Self::UserRequest => "userRequest",
-            Self::WorkPerformed => "workPerformed",
-            Self::VerificationResult => "verificationResult",
-            Self::IncompleteItem => "incompleteItem",
-        }
-    }
-
-    pub fn is_session_summary(self) -> bool {
-        matches!(self, Self::SessionSummary)
-    }
-
-    pub fn is_user_request(self) -> bool {
-        matches!(self, Self::UserRequest)
-    }
-
-    pub fn is_work_performed(self) -> bool {
-        matches!(self, Self::WorkPerformed)
-    }
-
-    pub fn is_verification_result(self) -> bool {
-        matches!(self, Self::VerificationResult)
-    }
-
-    pub fn is_incomplete_item(self) -> bool {
-        matches!(self, Self::IncompleteItem)
-    }
-}
-
-impl std::fmt::Display for TranscriptCategory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for TranscriptCategory {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "sessionSummary" | "session_summary" => Ok(Self::SessionSummary),
-            "userRequest" | "user_request" => Ok(Self::UserRequest),
-            "workPerformed" | "work_performed" => Ok(Self::WorkPerformed),
-            "verificationResult" | "verification_result" => Ok(Self::VerificationResult),
-            "incompleteItem" | "incomplete_item" => Ok(Self::IncompleteItem),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 대화 기록 범주입니다: {s}. sessionSummary|userRequest|workPerformed|verificationResult|incompleteItem 중 하나를 쓰세요"
-            ))),
-        }
-    }
-}
+session_string_enum!(TranscriptCategory, "알 수 없는 대화 기록 범주입니다", {
+    SessionSummary => "sessionSummary" | "session_summary",
+    UserRequest => "userRequest" | "user_request",
+    WorkPerformed => "workPerformed" | "work_performed",
+    VerificationResult => "verificationResult" | "verification_result",
+    IncompleteItem => "incompleteItem" | "incomplete_item",
+});
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -727,6 +678,13 @@ pub struct SystemAuditRecord {
     pub approved: bool,
     pub phase: SystemAuditPhase,
     pub success: Option<bool>,
+    /// 실패한 까닭. 성공·시도 기록에는 없다.
+    ///
+    /// 예전에는 성공 여부만 남겨, 실패한 작업의 원인을 감사 기록만으로는 알 수 없었다.
+    /// 페이싱 회차가 같은 자리에서 스무 번 넘게 떨어지는 동안 무엇이 틀렸는지 알아내려고
+    /// 계약을 세 번 갈아 끼우고서야 원인을 찾았다 — 그 문구는 내내 여기 있었어야 했다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// 이 기록이 어느 실행·대화에 속하는지. 세션 컨텍스트 조회는 인자 해시만으로는
     /// 어느 grant가 썼는지 알 수 없어, principal 라벨을 함께 남긴다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -740,44 +698,10 @@ pub enum SystemAuditPhase {
     Completed,
 }
 
-impl SystemAuditPhase {
-    pub const ALL: [Self; 2] = [Self::Attempted, Self::Completed];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Attempted => "attempted",
-            Self::Completed => "completed",
-        }
-    }
-
-    pub fn is_attempted(self) -> bool {
-        matches!(self, Self::Attempted)
-    }
-
-    pub fn is_completed(self) -> bool {
-        matches!(self, Self::Completed)
-    }
-}
-
-impl std::fmt::Display for SystemAuditPhase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SystemAuditPhase {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "attempted" => Ok(Self::Attempted),
-            "completed" => Ok(Self::Completed),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 감사 단계입니다: {s}. attempted|completed 중 하나를 쓰세요"
-            ))),
-        }
-    }
-}
+session_string_enum!(SystemAuditPhase, "알 수 없는 감사 단계입니다", {
+    Attempted => "attempted",
+    Completed => "completed",
+});
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -817,50 +741,55 @@ pub fn list_sessions(
     chats: &ChatSupervisor,
     request: SessionListRequest,
 ) -> Result<SessionListResponse, CoreError> {
-    validate_time_range(request.from, request.to)?;
+    let scope = SessionFilterScope::resolve(
+        request
+            .scope
+            .applied(request.status, normalized_search(request.search.as_deref())),
+    )?;
     let limit = page_size(request.limit, MAX_PAGE_SIZE)?;
-    let scope = SessionFilterScope::resolve(SessionAppliedFilters {
-        source: request.source,
-        cwd: request.cwd.clone(),
-        sources: request.sources.clone(),
-        cwds: request.cwds.clone(),
-        statuses: request.statuses.clone(),
-        from: request.from,
-        to: request.to,
-        status: request.status,
-        search: normalized_search(request.search.as_deref()),
-    })?;
-    let pager = ForwardPager::open(
+    let pager = CursorPager::open_window(
         "sessions",
         request.cursor.as_deref(),
-        &json!({
-            "source": request.source,
-            "cwd": scope.canonical_cwd,
-            "sources": request.sources,
-            "cwds": scope.canonical_cwds,
-            "statuses": request.statuses,
-            "from": request.from,
-            "to": request.to,
-            "status": request.status,
-            "search": scope.applied.search,
-            "sort": request.sort,
-            "direction": request.direction,
-            "limit": limit,
-        }),
-        limit,
+        [
+            ("source", json!(request.scope.source)),
+            ("cwd", json!(scope.canonical_cwd)),
+            ("sources", json!(request.scope.sources)),
+            ("cwds", json!(scope.canonical_cwds)),
+            ("statuses", json!(request.scope.statuses)),
+            ("status", json!(request.status)),
+            ("search", json!(scope.applied.search)),
+            ("sort", json!(request.sort)),
+            ("direction", json!(request.direction)),
+            ("unfiled", json!(request.unfiled)),
+        ],
+        ListWindow {
+            range: scope.range,
+            limit,
+        },
     )?;
     let mut items = scope.collect_matching(catalog, chats)?;
+    if request.unfiled {
+        retain_unfiled(&mut items);
+    }
     sort_sessions(&mut items, request.sort, request.direction);
     let (items, next_cursor, total) = pager.cut(items, identity)?;
     Ok(SessionListResponse {
         items,
         next_cursor,
         total,
-        applied_filters: scope.applied,
+        applied_filters: SessionAppliedFilters {
+            unfiled: request.unfiled,
+            ..scope.applied
+        },
         sort: request.sort,
         direction: request.direction,
         counting_basis: "저장 세션은 카탈로그 messageCount, 라이브 채팅은 런타임 turnCount를 사용하며 라이브 상태는 chatId 기준으로 중복 제거합니다.",
     })
+}
+
+/// 폴더에 넣지 않은 세션만 남긴다. 라이브 채팅뿐인 항목은 폴더가 없으므로 남는다.
+fn retain_unfiled(items: &mut Vec<ManagedSessionSummary>) {
+    items.retain(|item| item.folder_ids.is_empty());
 }
 
 pub fn get_session_statistics(
@@ -868,18 +797,7 @@ pub fn get_session_statistics(
     chats: &ChatSupervisor,
     request: SessionStatisticsRequest,
 ) -> Result<SessionStatisticsResponse, CoreError> {
-    validate_time_range(request.from, request.to)?;
-    let scope = SessionFilterScope::resolve(SessionAppliedFilters {
-        source: request.source,
-        cwd: request.cwd.clone(),
-        sources: request.sources.clone(),
-        cwds: request.cwds.clone(),
-        statuses: request.statuses.clone(),
-        from: request.from,
-        to: request.to,
-        status: None,
-        search: None,
-    })?;
+    let scope = SessionFilterScope::resolve(request.scope.applied(None, None))?;
     let items = scope.collect_matching(catalog, chats)?;
 
     let mut totals = SessionStatisticsTotals::default();
@@ -983,16 +901,9 @@ pub fn get_session_transcript_page(
 fn validate_transcript_page_request(
     request: &SessionTranscriptPageRequest,
 ) -> Result<usize, CoreError> {
-    validate_time_range(request.from, request.to)?;
-    if request
-        .turn_start
-        .zip(request.turn_end)
-        .is_some_and(|(from, to)| from > to)
-    {
-        return Err(CoreError::InvalidInput(
-            "turnStart는 turnEnd보다 클 수 없습니다".to_owned(),
-        ));
-    }
+    InclusiveRange::new(request.from, request.to).validated(TIME_RANGE_MESSAGE)?;
+    InclusiveRange::new(request.turn_start, request.turn_end)
+        .validated("turnStart는 turnEnd보다 클 수 없습니다")?;
     page_size(request.page_size, MAX_TRANSCRIPT_PAGE_SIZE)
 }
 
@@ -1008,19 +919,19 @@ fn transcript_page(
     request: &SessionTranscriptPageRequest,
     page_size: usize,
 ) -> Result<TranscriptPage, CoreError> {
-    let fingerprint = fingerprint(&json!({
-        "source": request.source,
-        "id": request.id,
-        "from": request.from,
-        "to": request.to,
-        "turnStart": request.turn_start,
-        "turnEnd": request.turn_end,
-        "pageSize": page_size,
-    }))?;
-    let offset = cursor_offset(
-        request.cursor.as_deref(),
+    let pager = CursorPager::open(
         "session-transcript",
-        &fingerprint,
+        request.cursor.as_deref(),
+        &json!({
+            "source": request.source,
+            "id": request.id,
+            "from": request.from,
+            "to": request.to,
+            "turnStart": request.turn_start,
+            "turnEnd": request.turn_end,
+            "pageSize": page_size,
+        }),
+        page_size,
     )?;
     let mut matching = transcript
         .iter()
@@ -1030,18 +941,10 @@ fn transcript_page(
     // 순번은 원본 파일의 읽은 차례라, 앱이 끼운 실행 실패·보완 저장 결과는 순번만으로
     // 정렬하면 일어난 시각과 무관하게 끝으로 몰린다. 시각을 먼저 보고 순번으로 가른다.
     matching.sort_by_key(|item| (item.timestamp.unwrap_or(i64::MIN), item.index));
-    let total_matching = matching.len();
-    let end = total_matching.saturating_sub(offset);
-    let start = end.saturating_sub(page_size);
     let mut page_text_budget = MAX_TRANSCRIPT_PAGE_TEXT_BYTES;
-    let items = matching[start..end]
-        .iter()
-        .map(|item| managed_transcript_item(item, &mut page_text_budget))
-        .collect::<Vec<_>>();
-    let consumed = total_matching.saturating_sub(start);
-    let next_cursor = (start > 0)
-        .then(|| encode_cursor("session-transcript", &fingerprint, consumed))
-        .transpose()?;
+    let (items, next_cursor, total_matching) = pager.cut_tail(&matching, |item| {
+        managed_transcript_item(item, &mut page_text_budget)
+    })?;
     Ok(TranscriptPage {
         items,
         next_cursor,
@@ -1053,60 +956,34 @@ pub fn list_scheduled_requests(
     scheduler: &SchedulerSupervisor,
     request: ScheduledRequestListRequest,
 ) -> Result<ScheduledRequestListResponse, CoreError> {
-    validate_time_range(request.from, request.to)?;
+    let range = InclusiveRange::new(request.from, request.to).validated(TIME_RANGE_MESSAGE)?;
     let limit = page_size(request.limit, MAX_PAGE_SIZE)?;
     let canonical_cwd = canonical_filter_path(request.cwd.as_deref())?;
     let search = normalized_search(request.search.as_deref());
-    let pager = ForwardPager::open(
+    let pager = CursorPager::open_window(
         "scheduled-requests",
         request.cursor.as_deref(),
-        &json!({
-            "id": request.id,
-            "source": request.source,
-            "cwd": canonical_cwd,
-            "accountId": request.account_id,
-            "enabled": request.enabled,
-            "from": request.from,
-            "to": request.to,
-            "search": search,
-            "limit": limit,
-        }),
-        limit,
+        [
+            ("id", json!(request.id)),
+            ("source", json!(request.source)),
+            ("cwd", json!(canonical_cwd)),
+            ("accountId", json!(request.account_id)),
+            ("enabled", json!(request.enabled)),
+            ("search", json!(search)),
+        ],
+        ListWindow { range, limit },
     )?;
     let mut items = scheduler.snapshot()?.schedules;
     items.retain(|item| {
-        request.id.as_ref().is_none_or(|id| &item.id == id)
-            && request
-                .source
-                .is_none_or(|source| item.input.source == source)
-            && request
-                .account_id
-                .as_ref()
-                .is_none_or(|account_id| &item.input.account_id == account_id)
-            && request
-                .enabled
-                .is_none_or(|enabled| item.input.enabled == enabled)
-            && request.from.is_none_or(|from| item.next_run_at >= from)
-            && request.to.is_none_or(|to| item.next_run_at <= to)
-            && canonical_cwd
-                .as_deref()
-                .is_none_or(|cwd| same_cwd(&item.input.cwd, cwd))
-            && search.as_deref().is_none_or(|needle| {
-                searchable(&[
-                    &item.id,
-                    &item.input.name,
-                    &item.input.cwd,
-                    &item.input.account_id,
-                ])
-                .contains(needle)
-            })
+        scheduled_request_matches(
+            item,
+            &request,
+            range,
+            canonical_cwd.as_deref(),
+            search.as_deref(),
+        )
     });
-    items.sort_by(|left, right| {
-        right
-            .updated_at
-            .cmp(&left.updated_at)
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    sort_newest_first(&mut items, |item| (item.updated_at, &item.id));
     let (items, next_cursor, total) = pager.cut(items, schedule_summary)?;
     Ok(ScheduledRequestListResponse {
         items,
@@ -1115,6 +992,37 @@ pub fn list_scheduled_requests(
         prompt_included: false,
         period_basis: "기간 필터는 nextRunAt을 기준으로 양 끝을 포함합니다.",
     })
+}
+
+fn scheduled_request_matches(
+    item: &ScheduledRequest,
+    request: &ScheduledRequestListRequest,
+    range: InclusiveRange<i64>,
+    canonical_cwd: Option<&Path>,
+    search: Option<&str>,
+) -> bool {
+    request.id.as_ref().is_none_or(|id| &item.id == id)
+        && request
+            .source
+            .is_none_or(|source| item.input.source == source)
+        && request
+            .account_id
+            .as_ref()
+            .is_none_or(|account_id| &item.input.account_id == account_id)
+        && request
+            .enabled
+            .is_none_or(|enabled| item.input.enabled == enabled)
+        && range.contains(item.next_run_at)
+        && canonical_cwd.is_none_or(|cwd| same_cwd(&item.input.cwd, cwd))
+        && search.is_none_or(|needle| {
+            searchable(&[
+                &item.id,
+                &item.input.name,
+                &item.input.cwd,
+                &item.input.account_id,
+            ])
+            .contains(needle)
+        })
 }
 
 pub fn get_scheduled_request_detail(
@@ -1133,38 +1041,21 @@ pub fn list_scheduled_runs(
     scheduler: &SchedulerSupervisor,
     request: ScheduleRunListRequest,
 ) -> Result<ScheduleRunListResponse, CoreError> {
-    validate_time_range(request.from, request.to)?;
+    let range = InclusiveRange::new(request.from, request.to).validated(TIME_RANGE_MESSAGE)?;
     let limit = page_size(request.limit, MAX_PAGE_SIZE)?;
-    let pager = ForwardPager::open(
+    let pager = CursorPager::open_window(
         "scheduled-runs",
         request.cursor.as_deref(),
-        &json!({
-            "id": request.id,
-            "scheduleId": request.schedule_id,
-            "status": request.status,
-            "from": request.from,
-            "to": request.to,
-            "limit": limit,
-        }),
-        limit,
+        [
+            ("id", json!(request.id)),
+            ("scheduleId", json!(request.schedule_id)),
+            ("status", json!(request.status)),
+        ],
+        ListWindow { range, limit },
     )?;
     let mut items = scheduler.snapshot()?.runs;
-    items.retain(|item| {
-        request.id.as_ref().is_none_or(|id| &item.id == id)
-            && request
-                .schedule_id
-                .as_ref()
-                .is_none_or(|id| &item.schedule_id == id)
-            && request.status.is_none_or(|status| item.status == status)
-            && request.from.is_none_or(|from| item.scheduled_for >= from)
-            && request.to.is_none_or(|to| item.scheduled_for <= to)
-    });
-    items.sort_by(|left, right| {
-        right
-            .scheduled_for
-            .cmp(&left.scheduled_for)
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    items.retain(|item| schedule_run_matches(item, &request, range));
+    sort_newest_first(&mut items, |item| (item.scheduled_for, &item.id));
     let (items, next_cursor, total) = pager.cut(items, run_summary)?;
     Ok(ScheduleRunListResponse {
         items,
@@ -1172,6 +1063,20 @@ pub fn list_scheduled_runs(
         total,
         detail_included: false,
     })
+}
+
+fn schedule_run_matches(
+    item: &ScheduleRun,
+    request: &ScheduleRunListRequest,
+    range: InclusiveRange<i64>,
+) -> bool {
+    request.id.as_ref().is_none_or(|id| &item.id == id)
+        && request
+            .schedule_id
+            .as_ref()
+            .is_none_or(|id| &item.schedule_id == id)
+        && request.status.is_none_or(|status| item.status == status)
+        && range.contains(item.scheduled_for)
 }
 
 pub fn get_scheduled_run_detail(
@@ -1184,27 +1089,26 @@ pub fn get_scheduled_run_detail(
         .into_iter()
         .find(|item| item.id == id)
         .ok_or_else(|| CoreError::NotFound("반복 요청 실행 이력을 찾을 수 없습니다".to_owned()))?;
-    let summary_truncated = run
-        .summary
-        .as_ref()
-        .is_some_and(|summary| summary.len() > MAX_RUN_SUMMARY_BYTES);
-    let error_truncated = run
-        .error
-        .as_ref()
-        .is_some_and(|error| error.len() > MAX_RUN_ERROR_BYTES);
-    run.summary = run
-        .summary
-        .as_deref()
-        .map(|summary| truncate_text(summary, MAX_RUN_SUMMARY_BYTES));
-    run.error = run
-        .error
-        .as_deref()
-        .map(|error| truncate_text(error, MAX_RUN_ERROR_BYTES));
+    let (summary, summary_truncated) =
+        truncate_optional_text(run.summary.as_deref(), MAX_RUN_SUMMARY_BYTES);
+    let (error, error_truncated) =
+        truncate_optional_text(run.error.as_deref(), MAX_RUN_ERROR_BYTES);
+    run.summary = summary;
+    run.error = error;
     Ok(ScheduleRunDetailResponse {
         run,
         summary_truncated,
         error_truncated,
     })
+}
+
+/// 선택 본문의 길이 제한과 잘림 표시를 같은 판정에서 만든다.
+fn truncate_optional_text(value: Option<&str>, max_bytes: usize) -> (Option<String>, bool) {
+    let truncated = value.is_some_and(|value| value.len() > max_bytes);
+    (
+        value.map(|value| truncate_text(value, max_bytes)),
+        truncated,
+    )
 }
 
 pub fn send_chat_message(
@@ -1218,27 +1122,19 @@ pub fn send_chat_message(
         "message": request.message,
         "queueIfRunning": request.queue_if_running,
     }))?;
-    let key_hash = hash_text(&request.idempotency_key);
-    if let Some(receipt) =
-        claim_idempotency(app_data_dir, "send_chat_message", &key_hash, &request_hash)?
-    {
-        return serde_json::from_value(receipt).map_err(CoreError::from);
-    }
-    let result = chats.send_managed(
-        request.chat_id.trim(),
-        &request.message,
-        request.queue_if_running,
-    );
-    complete_idempotency(
+    execute_idempotent(
         app_data_dir,
-        &key_hash,
-        result
-            .as_ref()
-            .ok()
-            .and_then(|receipt| serde_json::to_value(receipt).ok()),
-        result.is_ok(),
-    )?;
-    result
+        "send_chat_message",
+        &request.idempotency_key,
+        &request_hash,
+        || {
+            chats.send_managed(
+                request.chat_id.trim(),
+                &request.message,
+                request.queue_if_running,
+            )
+        },
+    )
 }
 
 pub fn start_chat(
@@ -1251,40 +1147,60 @@ pub fn start_chat(
         "chat": request.chat,
         "message": request.message,
     }))?;
-    let key_hash = hash_text(&request.idempotency_key);
-    if let Some(receipt) = claim_idempotency(app_data_dir, "start_chat", &key_hash, &request_hash)?
-    {
+    execute_idempotent(
+        app_data_dir,
+        "start_chat",
+        &request.idempotency_key,
+        &request_hash,
+        || {
+            let attachment = chats.start(request.chat)?;
+            let chat_id = attachment.info.chat_id.clone();
+            let initial_provider_session_id = attachment.info.provider_session_id.clone();
+            let delivery = match chats.send_managed(&chat_id, &request.message, false) {
+                Ok(delivery) => delivery,
+                Err(error) => {
+                    let _ = chats.stop(&chat_id);
+                    return Err(error);
+                }
+            };
+            // 내부에서 만든 이 연결만 분리한다. 같은 채팅을 보고 있는 화면이 있으면 남긴다.
+            chats.detach_attachment(&chat_id, attachment.generation)?;
+            let provider_session_id = chats
+                .all_chats()?
+                .into_iter()
+                .find(|chat| chat.chat_id == chat_id)
+                .and_then(|chat| chat.provider_session_id)
+                .or(initial_provider_session_id);
+            Ok(StartChatDelivery {
+                chat_id,
+                provider_session_id,
+                turn_id: delivery.turn_id,
+                queued_at: delivery.queued_at,
+                delivery_status: delivery.delivery_status,
+                detached: true,
+            })
+        },
+    )
+}
+
+/// 채팅 쓰기 작업들이 공유하는 멱등성 수명주기. 기존 영수증이 있으면 실제 작업을
+/// 다시 실행하지 않고 되돌리며, 새 실행의 성공 여부와 영수증 저장 순서를 한곳에서 지킨다.
+fn execute_idempotent<T>(
+    app_data_dir: &Path,
+    operation: &str,
+    idempotency_key: &str,
+    request_hash: &str,
+    execute: impl FnOnce() -> Result<T, CoreError>,
+) -> Result<T, CoreError>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let key_hash = hash_text(idempotency_key);
+    if let Some(receipt) = claim_idempotency(app_data_dir, operation, &key_hash, request_hash)? {
         return serde_json::from_value(receipt).map_err(CoreError::from);
     }
 
-    let result = (|| {
-        let attachment = chats.start(request.chat)?;
-        let chat_id = attachment.info.chat_id.clone();
-        let initial_provider_session_id = attachment.info.provider_session_id.clone();
-        let delivery = match chats.send_managed(&chat_id, &request.message, false) {
-            Ok(delivery) => delivery,
-            Err(error) => {
-                let _ = chats.stop(&chat_id);
-                return Err(error);
-            }
-        };
-        // 내부에서 만든 이 연결만 분리한다. 같은 채팅을 보고 있는 화면이 있으면 남긴다.
-        chats.detach_attachment(&chat_id, attachment.generation)?;
-        let provider_session_id = chats
-            .all_chats()?
-            .into_iter()
-            .find(|chat| chat.chat_id == chat_id)
-            .and_then(|chat| chat.provider_session_id)
-            .or(initial_provider_session_id);
-        Ok(StartChatDelivery {
-            chat_id,
-            provider_session_id,
-            turn_id: delivery.turn_id,
-            queued_at: delivery.queued_at,
-            delivery_status: delivery.delivery_status,
-            detached: true,
-        })
-    })();
+    let result = execute();
     complete_idempotency(
         app_data_dir,
         &key_hash,
@@ -1332,8 +1248,9 @@ pub fn switch_active_provider_account(
 }
 
 /// 자동전환 트리거 신호를 받아 계정을 순환 전환하는 백그라운드 실행기를 시작한다.
-/// 검증과 후보 선택은 AccountSupervisor::plan_auto_switch가 담당하고, 전환 자체는
-/// 수동 전환과 같은 switch_active_provider_account 경로를 재사용한다.
+/// 검증과 후보 선택은 `AccountSupervisor::plan_auto_switches`가 담당하고, 전환 자체는 세션
+/// 재바인딩(`resume_interrupted_sessions`)과 기본 계정 회전
+/// (`AccountSupervisor::request_active_account_rotation`)으로 한다.
 pub fn spawn_auto_switch_loop(
     chats: ChatSupervisor,
     _terminals: TerminalSupervisor,
@@ -1358,89 +1275,140 @@ fn handle_auto_switch_signal(
     let accounts = chats
         .accounts()
         .ok_or_else(|| CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned()))?;
-    let Some(target_account_id) = accounts.plan_auto_switch(signal)? else {
-        return Ok(());
-    };
-    // 모든 계정은 자기 격리 프로필로 실행되므로 한도에 걸린 세션만 다른 계정에 다시 묶고,
-    // 나머지 세션은 자기 계정으로 계속 돌아간다. 대상 계정의 격리가 준비되지 않으면 옮길
-    // 수 없다.
-    if !accounts.ensure_credential_isolation(signal.provider, &target_account_id) {
+    // 쿨다운 안이거나 자동전환이 꺼진 계정의 신호는 여기서 끝낸다. 살아 있는 채팅을 훑고
+    // 고정 세션마다 로그를 남기는 일을 거절될 신호에 되풀이하지 않는다.
+    if !accounts.auto_switch_admissible(signal)? {
         return Ok(());
     }
+    // 이 신호는 두 질문에 답해야 한다. 하나는 "이 계정에 묶인 세션들을 어디로 옮기나" —
+    // 그 세션들이 쓰는 모델군만 보면 된다. 다른 하나는 "기본 계정을 어디로 옮기나" — 앞으로
+    // 열릴 모든 대화의 자리라 지정 계정에서 열려 있던 모델군을 잃지 않는 곳이어야 한다. 한
+    // 후보로 둘을 답하면 Gemini 세션을 살리려고 고른 계정이 Claude·GPT가 다 찬 곳이어서
+    // 그 뒤의 Claude 대화가 전부 막힌 계정에서 열리거나, 세션들이 멀쩡하다는 이유로 소진된
+    // 기본 계정이 그대로 남는다. 부작용(세션 중단·재바인딩) 앞에서 두 답을 모두 정한다.
     let sessions = rebindable_sessions(chats, signal)?;
-    let rebound = resume_interrupted_sessions(chats, sessions, Some(&target_account_id));
+    let session_owned;
+    let models: &[String] = if signal.models.is_empty() {
+        session_owned = session_models(&sessions);
+        &session_owned
+    } else {
+        &signal.models
+    };
+    // 두 질문을 한 잠금 안에서 답한다 — 옮길 세션이 없으면 재바인딩은 묻지 않고, 지정
+    // 계정이 기본 계정일 때만 회전을 묻는다(`plan_auto_switches`).
+    let plan = accounts.plan_auto_switches(signal, (!sessions.is_empty()).then_some(models))?;
+    // 모든 계정은 자기 격리 프로필로 실행되므로 한도에 걸린 세션만 다른 계정에 다시 묶고,
+    // 나머지 세션은 자기 계정으로 계속 돌아간다. 격리가 준비되지 않은 계정으로는 세션도
+    // 기본 계정도 옮기지 않는다 — 옮겨 놓으면 그 계정의 실행 시작이 거부된다. 세션 복구를
+    // 먼저 끝낸다: 회전 목적지의 프로브(공급자 CLI, 최대 20초)가 세션 복구를 늦출 이유는 없다.
+    let rebind_probe = plan
+        .rebind_target
+        .as_deref()
+        .map(|target| accounts.ensure_credential_isolation(signal.provider, target));
+    let rebind_target = plan
+        .rebind_target
+        .as_deref()
+        .filter(|_| rebind_probe == Some(true));
+    let rebound = match rebind_target {
+        Some(target) => resume_interrupted_sessions(chats, sessions, Some(target)),
+        None => 0,
+    };
     // 세션 재바인딩만으로는 새 채팅이 계속 소진된 계정에서 열린다
     // (`resolve_start_account_id`가 기본 계정으로 떨어진다). 한도에 걸린 계정이 곧 기본
-    // 계정일 때만 기본 계정도 함께 옮긴다 — 격리된 다른 계정이 임계치를 넘었다고 멀쩡한
-    // 기본 계정을 밀어내면 안 된다.
-    let limited_is_active =
-        accounts.active_account_id(signal.provider)?.as_deref() == Some(signal.account_id.as_str());
-    let rotated = limited_is_active && rotate_active_account(&accounts, &target_account_id);
-    if !auto_switch_moved_anything(rebound, rotated) {
+    // 계정일 때만 기본 계정도 함께 옮기며, 그 확인은 교체 직전에 다시 한다
+    // (`request_active_account_rotation`). 같은 계정의 프로브를 두 번 돌리지 않는다 —
+    // 재바인딩 쪽에서 이미 실패한 계정이면 그 결과를 그대로 쓴다.
+    let rotate_target = plan.rotate_target.as_deref().filter(|target| {
+        if plan.rebind_target.as_deref() == Some(*target) {
+            rebind_probe == Some(true)
+        } else {
+            accounts.ensure_credential_isolation(signal.provider, target)
+        }
+    });
+    let rotated = rotate_target
+        .is_some_and(|target| rotate_active_account(&accounts, &signal.account_id, target));
+    let Some(to_account_id) = switch_destination(rebind_target, rebound, rotate_target, rotated)
+    else {
         return Ok(());
-    }
-    accounts.record_auto_switch(
+    };
+    // 이벤트에 무엇을 담는지는 기록이 정한다(`record_auto_switch`). 알림은 기록된 이벤트
+    // 하나만 읽어 같은 말을 한다 — 기록하지 못했으면 알림도 내지 않는다.
+    let recorded = accounts.record_auto_switch(
         signal.provider,
         &signal.account_id,
-        &target_account_id,
+        to_account_id,
         signal.reason,
         rebound,
-    );
+        rotated,
+        rebind_target,
+    )?;
     chats.record_account_switch_attention(
         signal.provider,
-        auto_switch_attention_detail(
-            &accounts,
-            &signal.account_id,
-            &target_account_id,
-            signal.reason,
-            rebound,
-        ),
+        auto_switch_attention_detail(&accounts, &recorded),
     );
     Ok(())
 }
 
-/// 이번 신호가 계정 배치를 실제로 바꿨는지. 세션을 하나도 옮기지 않고 기본 계정도
-/// 그대로면 후보만 골라 본 것이라 전환이 아니다.
+/// 이번 신호가 기록에 남길 목적지. 실제로 움직인 쪽만 셈한다 — 세션을 하나도 옮기지 못하고
+/// 기본 계정만 바뀌었으면 그 계정이고, 둘 다 움직였으면 기본 계정이 앞선다(새 대화가 열리는
+/// 자리라 사용자가 가장 먼저 보는 변화다). 아무것도 움직이지 않았으면 None — 전환이 아니다.
 ///
-/// 사유와 무관하게 같은 규칙을 쓴다. 전에는 분산 교체만 걸렀고, 소진·한도 신호는
-/// 결과가 0건이어도 "A → B · 사유" 알림을 띄웠다. 소진된 계정이 기본 계정도 아니고
-/// (기본 계정은 멀쩡하므로 밀어내지 않는다) 그 계정에 묶인 세션도 없으면 옮길 것이
-/// 없는데, 알림만 보면 기본 계정이 옮겨진 것처럼 읽힌다(2026-09-03 실측: axcenter가
-/// 5시간 한도를 채웠지만 살아 있는 Claude 세션은 모두 다른 계정에 묶여 있었고, 기본
-/// 계정은 그대로였는데 전환 알림이 떴다). 소진 자체는 사용량 화면이 100%로 보여 준다.
-///
-/// 기록하지 않으면 60초 쿨다운도 소모되지 않는다. 아무것도 하지 않았으므로 다음
-/// 조회에서 다시 판정하는 것이 맞다.
-fn auto_switch_moved_anything(rebound: usize, rotated: bool) -> bool {
-    rebound > 0 || rotated
+/// 전에는 분산 교체만 걸렀고, 소진·한도 신호는 결과가 0건이어도 "A → B · 사유" 알림을 띄웠다.
+/// 소진된 계정이 기본 계정도 아니고 그 계정에 묶인 세션도 없으면 옮길 것이 없는데, 알림만
+/// 보면 기본 계정이 옮겨진 것처럼 읽힌다(2026-09-03 실측). 기록하지 않으면 60초 쿨다운도
+/// 소모되지 않아 다음 조회에서 다시 판정한다.
+fn switch_destination<'a>(
+    rebind_target: Option<&'a str>,
+    rebound: usize,
+    rotate_target: Option<&'a str>,
+    rotated: bool,
+) -> Option<&'a str> {
+    rotate_target
+        .filter(|_| rotated)
+        .or(rebind_target.filter(|_| rebound > 0))
 }
 
-/// 알림창에 남길 전환 문구. "A → B · 사유(· 세션 N개 복원)" 꼴로, 프런트
-/// `autoSwitchEventSummary`의 transition과 같은 모양이다. 계정 이름을 못 찾으면
-/// (삭제됐거나 스냅샷 실패) id를 그대로 써서 어느 계정 사이의 일인지는 남긴다.
+/// 알림창에 남길 전환 문구. 기록된 이벤트의 계정 id를 표시 이름으로 바꿔 넣는다. 이름을 못
+/// 찾으면(삭제됐거나 잠금 실패) id를 그대로 써서 어느 계정 사이의 일인지는 남긴다.
 fn auto_switch_attention_detail(
     accounts: &AccountSupervisor,
-    from_account_id: &str,
-    to_account_id: &str,
-    reason: AutoSwitchReason,
-    resumed_session_count: usize,
+    event: &AutoSwitchEventView,
 ) -> String {
-    let snapshot = accounts.snapshot().ok();
-    let name = |id: &str| {
-        snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.accounts.iter().find(|account| account.id == id))
-            .map(|account| account.display_name.clone())
-            .unwrap_or_else(|| id.to_owned())
-    };
-    let mut detail = format!(
-        "{} → {} · {}",
-        name(from_account_id),
-        name(to_account_id),
-        reason.label()
-    );
+    let ids = [
+        event.from_account_id.as_str(),
+        event.to_account_id.as_str(),
+        event.sessions_to_account_id.as_deref().unwrap_or_default(),
+    ];
+    let names = accounts.display_names(&ids).unwrap_or_default();
+    auto_switch_attention_text(event, |id| {
+        names.get(id).cloned().unwrap_or_else(|| id.to_owned())
+    })
+}
+
+/// 전환 알림 한 줄. 화면 요약(`src/lib/autoSwitchEvent.ts`의 transition)과 같은 모양이다 —
+/// "A → B · 사유", 기본 계정이 그대로면 "· 기본 계정 유지", 세션을 옮겼으면 "· 세션 N개 복원"
+/// 이고 세션이 기본 계정과 다른 곳으로 갔으면 그 행방까지 말한다. 입력은 기록된 이벤트 하나다.
+fn auto_switch_attention_text(
+    event: &AutoSwitchEventView,
+    name: impl Fn(&str) -> String,
+) -> String {
+    let from = name(&event.from_account_id);
+    let to = name(&event.to_account_id);
+    let sessions_went_to = event.sessions_to_account_id.as_deref().map(&name);
+    let default_rotated = event.default_rotated;
+    let reason = event.reason;
+    let resumed_session_count = event.resumed_session_count;
+    let mut detail = format!("{from} → {to} · {}", reason.label());
+    if !default_rotated {
+        detail.push_str(" · 기본 계정 유지");
+    }
     if resumed_session_count > 0 {
-        detail.push_str(&format!(" · 세션 {resumed_session_count}개 복원"));
+        match sessions_went_to {
+            Some(sessions_to) => detail.push_str(&format!(
+                " · 세션 {resumed_session_count}개는 {sessions_to}로 복원"
+            )),
+            None => detail.push_str(&format!(" · 세션 {resumed_session_count}개 복원")),
+        }
     }
     detail
 }
@@ -1448,8 +1416,12 @@ fn auto_switch_attention_detail(
 /// 새 채팅과 이어가기가 열릴 계정(활성 계정)을 대상 계정으로 옮긴다. 실패는 이미
 /// 끝난 세션 재바인딩을 되돌릴 이유가 아니므로 로그만 남기고 넘어간다.
 /// 예약이 실제로 잡혔으면 true.
-fn rotate_active_account(accounts: &AccountSupervisor, target_account_id: &str) -> bool {
-    match accounts.request_active_account_rotation(target_account_id) {
+fn rotate_active_account(
+    accounts: &AccountSupervisor,
+    from_account_id: &str,
+    target_account_id: &str,
+) -> bool {
+    match accounts.request_active_account_rotation(from_account_id, target_account_id) {
         Ok(rotated) => rotated,
         Err(error) => {
             eprintln!("[auto-switch] 활성 계정을 {target_account_id}로 옮기지 못했습니다: {error}");
@@ -1465,6 +1437,23 @@ struct ResumableChatSession {
     pending_inputs: Vec<String>,
 }
 
+/// 옮길 세션들이 쓰는 모델. 하나라도 모델을 모르는 세션(공급자 기본 모델로 연 채팅)이
+/// 있으면 비운다 — 아는 것만 넘기면 그 세션들이 목적지를 정하고, 모르는 세션은 자기
+/// 모델군이 막힌 계정으로 끌려가 곧바로 한도에 걸린다. 비어 있으면 후보 선택이 계정 전체
+/// 판정으로 폴백한다.
+fn session_models(sessions: &[ResumableChatSession]) -> Vec<String> {
+    let mut models = Vec::new();
+    for session in sessions {
+        let Some(model) = session.info.model.clone() else {
+            return Vec::new();
+        };
+        models.push(model);
+    }
+    models.sort();
+    models.dedup();
+    models
+}
+
 /// 한도에 걸린 계정에서 다른 계정으로 옮길 채팅. 신호가 채팅을 지목하면 그 채팅만,
 /// 사용량 100% 트리거처럼 지목하지 않으면 그 계정에 묶인 세션 전체가 대상이다.
 /// 분산 교체 트리거에서는 유휴 세션만 옮긴다 — 아직 쓸 수 있는 계정이라 진행 중인
@@ -1473,11 +1462,23 @@ fn rebindable_sessions(
     chats: &ChatSupervisor,
     signal: &AutoSwitchSignal,
 ) -> Result<Vec<ResumableChatSession>, CoreError> {
-    Ok(chats
-        .live_chats(ChatProfile::Standard)?
+    // AgentLimited는 채팅이 오류를 기록한 직후 Claude 프로세스를 닫는다. 그래야 이미
+    // 실행된 백그라운드 에이전트의 후속 알림이 같은 제한 계정으로 API 요청을 반복하지
+    // 않는다. 자동전환 신호는 별도 스레드에서 처리되므로 그때는 대상이 live 목록에서
+    // 빠졌을 수 있다. 신호가 정확한 chat_id를 지목한 경우에만 종료된 런타임까지 후보로
+    // 읽고, 아래의 동일 id 필터로 범위를 다시 좁힌다. 사용량 조회가 만든 계정 단위 신호와
+    // 사용자가 직접 멈춘 다른 채팅은 계속 live 목록만 본다.
+    let candidates = if signal.reason == AutoSwitchReason::AgentLimited && signal.chat_id.is_some()
+    {
+        chats.all_chats()?
+    } else {
+        chats.live_chats(ChatProfile::Standard)?
+    };
+    Ok(candidates
         .into_iter()
         .filter(|info| {
-            info.source == signal.provider
+            info.profile == ChatProfile::Standard
+                && info.source == signal.provider
                 && info.provider_session_id.is_some()
                 && info.account_id.as_deref() == Some(signal.account_id.as_str())
                 && signal
@@ -1543,10 +1544,14 @@ fn resume_interrupted_sessions(
             }
         }
         let request = ChatStartRequest {
+            // 다시 붙이는 것이지 새로 여는 것이 아니다. 원래 채팅이 쥐고 있던 것을 그대로
+            // 물려준다 — 계정만 바꾸는 자리에서 권한이 조용히 달라지면 안 된다.
+            system_tools: info.system_tools,
             source: info.source,
             account_id: account_id.map(str::to_owned),
             cwd: info.cwd,
             model: info.model,
+            local_connection_id: info.local_connection_id,
             reasoning_effort: info.reasoning_effort,
             mode: info.mode,
             approval_mode: info.approval_mode,
@@ -1561,6 +1566,7 @@ fn resume_interrupted_sessions(
             profile: ChatProfile::Standard,
             decision_policy: Default::default(),
             aia_runtime: None,
+            record_session: false,
             settings: info.settings,
             startup_cancel: None,
         };
@@ -1630,21 +1636,30 @@ pub fn get_chat_delivery_status(
     result
 }
 
+///
+/// `subject` 는 **이 호출이 어느 채팅에서 왔는지**다. 무인 반복 실행이 시스템 도구를
+/// 쥐게 되면서(2026-09-27) 같은 `aia` 행위자 아래 사람이 시킨 것과 예약 실행이 섞인다.
+/// 사후에 가르려면 호출자가 남아야 한다.
 pub fn append_system_audit(
     app_data_dir: &Path,
     operation: &str,
     arguments: &Value,
     phase: SystemAuditPhase,
     success: Option<bool>,
+    error: Option<&str>,
+    subject: Option<&str>,
 ) -> Result<SystemAuditRecord, CoreError> {
     append_audit_as(
         app_data_dir,
         "aia",
-        None,
+        subject,
         operation,
         arguments,
-        phase,
-        success,
+        AuditOutcome {
+            phase,
+            success,
+            error,
+        },
     )
 }
 
@@ -1665,9 +1680,19 @@ pub fn append_session_context_audit(
         subject,
         operation,
         arguments,
-        phase,
-        success,
+        AuditOutcome {
+            phase,
+            success,
+            error: None,
+        },
     )
+}
+
+/// 한 기록이 말하는 "무슨 일이 있었나". 셋은 늘 함께 다니고 따로 쓰이지 않는다.
+struct AuditOutcome<'a> {
+    phase: SystemAuditPhase,
+    success: Option<bool>,
+    error: Option<&'a str>,
 }
 
 fn append_audit_as(
@@ -1676,9 +1701,13 @@ fn append_audit_as(
     subject: Option<&str>,
     operation: &str,
     arguments: &Value,
-    phase: SystemAuditPhase,
-    success: Option<bool>,
+    outcome: AuditOutcome<'_>,
 ) -> Result<SystemAuditRecord, CoreError> {
+    let AuditOutcome {
+        phase,
+        success,
+        error,
+    } = outcome;
     validate_operation_name(operation)?;
     fs::create_dir_all(app_data_dir)?;
     let lock_file = open_lock(&app_data_dir.join(AUDIT_LOCK_FILE))?;
@@ -1692,6 +1721,7 @@ fn append_audit_as(
         approved: true,
         phase,
         success,
+        error: error.map(str::to_owned),
         subject: subject.map(str::to_owned),
     };
     let result = (|| {
@@ -1711,22 +1741,19 @@ pub fn list_system_audit(
     app_data_dir: &Path,
     request: SystemAuditListRequest,
 ) -> Result<SystemAuditListResponse, CoreError> {
-    validate_time_range(request.from, request.to)?;
+    let range = InclusiveRange::new(request.from, request.to).validated(TIME_RANGE_MESSAGE)?;
     if let Some(operation) = request.operation.as_deref() {
         validate_operation_name(operation)?;
     }
     let limit = page_size(request.limit, MAX_PAGE_SIZE)?;
-    let pager = ForwardPager::open(
+    let pager = CursorPager::open_window(
         "system-audit",
         request.cursor.as_deref(),
-        &json!({
-            "operation": request.operation,
-            "success": request.success,
-            "from": request.from,
-            "to": request.to,
-            "limit": limit,
-        }),
-        limit,
+        [
+            ("operation", json!(request.operation)),
+            ("success", json!(request.success)),
+        ],
+        ListWindow { range, limit },
     )?;
     let path = app_data_dir.join(AUDIT_FILE);
     let mut items = if path.is_file() {
@@ -1746,15 +1773,9 @@ pub fn list_system_audit(
             && request
                 .success
                 .is_none_or(|success| item.success == Some(success))
-            && request.from.is_none_or(|from| item.timestamp >= from)
-            && request.to.is_none_or(|to| item.timestamp <= to)
+            && range.contains(item.timestamp)
     });
-    items.sort_by(|left, right| {
-        right
-            .timestamp
-            .cmp(&left.timestamp)
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    sort_newest_first(&mut items, |item| (item.timestamp, &item.id));
     let (items, next_cursor, total) = pager.cut(items, identity)?;
     Ok(SystemAuditListResponse {
         items,
@@ -1822,6 +1843,7 @@ fn managed_summary_from_session(
             .max(session.message_count.unwrap_or_default()),
         status: live.map_or_else(|| persisted_status(session), live_status),
         last_turn_status: live.and_then(|chat| chat.last_turn_status.clone()),
+        folder_ids: session.meta.folder_ids.clone(),
     }
 }
 
@@ -1843,6 +1865,7 @@ fn managed_summary_from_chat(chat: &ChatSessionInfo) -> ManagedSessionSummary {
         turn_count: chat.turn_count,
         status: live_status(chat),
         last_turn_status: chat.last_turn_status.clone(),
+        folder_ids: Vec::new(),
     }
 }
 
@@ -1880,27 +1903,31 @@ fn live_status(chat: &ChatSessionInfo) -> SessionManagementStatus {
 /// 한 벌만 남긴다.
 struct SessionFilterScope {
     applied: SessionAppliedFilters,
+    range: InclusiveRange<i64>,
     canonical_cwd: Option<PathBuf>,
     canonical_cwds: Vec<PathBuf>,
 }
 
 impl SessionFilterScope {
     /// `raw`의 `cwd`·`cwds`는 요청이 준 날것이고, 여기서 정규화한 값으로 덮어쓴다.
-    fn resolve(raw: SessionAppliedFilters) -> Result<Self, CoreError> {
-        let canonical_cwd = canonical_filter_path(raw.cwd.as_deref())?;
-        let canonical_cwds = canonical_filter_paths(&raw.cwds)?;
-        let applied = SessionAppliedFilters {
-            cwd: canonical_cwd
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
-            cwds: canonical_cwds
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect(),
-            ..raw
-        };
+    /// 시각 범위 검사도 여기서 한다 — 목록과 통계가 같은 축을 쓰는데 검사를 창구마다
+    /// 적으면 한쪽만 빠져도 뒤집힌 범위가 조건 오류 대신 빈 결과로 나간다.
+    fn resolve(mut raw: SessionAppliedFilters) -> Result<Self, CoreError> {
+        let range =
+            InclusiveRange::new(raw.scope.from, raw.scope.to).validated(TIME_RANGE_MESSAGE)?;
+        let canonical_cwd = canonical_filter_path(raw.scope.cwd.as_deref())?;
+        let canonical_cwds = canonical_filter_paths(&raw.scope.cwds);
+        raw.scope.cwd = canonical_cwd
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        raw.scope.cwds = canonical_cwds
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        let applied = raw;
         Ok(Self {
             applied,
+            range,
             canonical_cwd,
             canonical_cwds,
         })
@@ -1918,17 +1945,17 @@ impl SessionFilterScope {
 
     fn matches(&self, item: &ManagedSessionSummary) -> bool {
         let filters = &self.applied;
-        filters.source.is_none_or(|source| item.source == source)
-            && (filters.sources.is_empty() || filters.sources.contains(&item.source))
-            && (filters.statuses.is_empty() || filters.statuses.contains(&item.status))
+        let scope = &filters.scope;
+        scope.source.is_none_or(|source| item.source == source)
+            && (scope.sources.is_empty() || scope.sources.contains(&item.source))
+            && (scope.statuses.is_empty() || scope.statuses.contains(&item.status))
             && self.canonical_cwd.as_deref().is_none_or(|cwd| {
                 item.cwd
                     .as_deref()
                     .is_some_and(|item_cwd| same_cwd(item_cwd, cwd))
             })
             && matches_any_cwd(item.cwd.as_deref(), &self.canonical_cwds)
-            && filters.from.is_none_or(|from| session_time(item) >= from)
-            && filters.to.is_none_or(|to| session_time(item) <= to)
+            && self.range.contains(session_time(item))
             && filters.status.is_none_or(|status| item.status == status)
             && filters.search.as_deref().is_none_or(|needle| {
                 searchable(&[
@@ -1945,6 +1972,19 @@ impl SessionFilterScope {
 
 fn session_time(item: &ManagedSessionSummary) -> i64 {
     item.updated_at.or(item.created_at).unwrap_or_default()
+}
+
+/// 커서 목록 세 자리(반복 요청·실행 이력·감사 기록)가 같이 쓰는 정렬. 최신이 먼저
+/// 오고 같은 시각이면 ID 오름차순으로 끊어, 같은 필터로 다시 물어도 페이지 경계가
+/// 흔들리지 않게 한다.
+fn sort_newest_first<T>(items: &mut [T], key: impl Fn(&T) -> (i64, &str)) {
+    items.sort_by(|left, right| {
+        let (left_time, left_id) = key(left);
+        let (right_time, right_id) = key(right);
+        right_time
+            .cmp(&left_time)
+            .then_with(|| left_id.cmp(right_id))
+    });
 }
 
 fn sort_sessions(
@@ -1986,14 +2026,8 @@ fn accumulate_totals(totals: &mut SessionStatisticsTotals, item: &ManagedSession
 }
 
 fn transcript_matches(item: &TranscriptItem, request: &SessionTranscriptPageRequest) -> bool {
-    request
-        .from
-        .is_none_or(|from| item.timestamp.is_some_and(|value| value >= from))
-        && request
-            .to
-            .is_none_or(|to| item.timestamp.is_some_and(|value| value <= to))
-        && request.turn_start.is_none_or(|from| item.index >= from)
-        && request.turn_end.is_none_or(|to| item.index <= to)
+    InclusiveRange::new(request.from, request.to).contains_known(item.timestamp)
+        && InclusiveRange::new(request.turn_start, request.turn_end).contains(item.index)
 }
 
 fn managed_transcript_item(
@@ -2375,7 +2409,7 @@ fn same_cwd(value: &str, canonical: &Path) -> bool {
 /// 여러 프로젝트 필터를 한 번에 정규화한다. 실체가 없는 경로는 거부하지 않고 버린다.
 /// 세션 컨텍스트 정책은 등록 프로젝트만 넘기는데, 그 사이 폴더가 사라졌다고 조회 전체가
 /// 실패하면 부분 보고조차 못 하게 된다.
-fn canonical_filter_paths(paths: &[String]) -> Result<Vec<PathBuf>, CoreError> {
+fn canonical_filter_paths(paths: &[String]) -> Vec<PathBuf> {
     let mut canonical = Vec::with_capacity(paths.len());
     for path in paths {
         let trimmed = path.trim();
@@ -2388,7 +2422,7 @@ fn canonical_filter_paths(paths: &[String]) -> Result<Vec<PathBuf>, CoreError> {
             }
         }
     }
-    Ok(canonical)
+    canonical
 }
 
 /// 다중 프로젝트 필터. 비어 있으면 제약이 없고, 그렇지 않으면 정규화 결과가 목록에
@@ -2425,14 +2459,45 @@ pub(crate) fn truncate_text(value: &str, max_bytes: usize) -> String {
     text_limit::truncate_bytes_with(value, max_bytes, TRANSCRIPT_TRUNCATION_MARKER)
 }
 
-fn validate_time_range(from: Option<i64>, to: Option<i64>) -> Result<(), CoreError> {
-    if from.zip(to).is_some_and(|(from, to)| from > to) {
-        return Err(CoreError::InvalidInput(
-            "from은 to보다 클 수 없습니다".to_owned(),
-        ));
-    }
-    Ok(())
+/// 목록 창구가 같이 쓰는 양 끝 포함 범위. 어느 쪽이 없으면 그쪽은 열려 있다.
+/// 시각(`i64`)과 턴 번호(`usize`)가 같은 규칙을 쓰므로 축 타입은 열어 둔다.
+#[derive(Debug, Clone, Copy)]
+struct InclusiveRange<T> {
+    from: Option<T>,
+    to: Option<T>,
 }
+
+impl<T: Copy + Ord> InclusiveRange<T> {
+    fn new(from: Option<T>, to: Option<T>) -> Self {
+        Self { from, to }
+    }
+
+    /// 뒤집힌 범위를 거른다. 문구는 축마다 달라 그대로 받는다.
+    fn validated(self, message: &str) -> Result<Self, CoreError> {
+        if self.from.zip(self.to).is_some_and(|(from, to)| from > to) {
+            return Err(CoreError::InvalidInput(message.to_owned()));
+        }
+        Ok(self)
+    }
+
+    /// 값이 범위 안인지. 양 끝을 포함한다.
+    fn contains(self, value: T) -> bool {
+        self.from.is_none_or(|from| value >= from) && self.to.is_none_or(|to| value <= to)
+    }
+
+    /// 축 값이 없는 항목은 그 축에 조건이 걸린 쪽에서 제외된다. 시각이 비어 있는
+    /// 대화 기록 항목을 시각 범위로 좁힐 때의 기존 판정이다.
+    fn contains_known(self, value: Option<T>) -> bool {
+        self.from
+            .is_none_or(|from| value.is_some_and(|value| value >= from))
+            && self
+                .to
+                .is_none_or(|to| value.is_some_and(|value| value <= to))
+    }
+}
+
+/// 시각 범위가 뒤집혔을 때 창구가 함께 쓰는 문구.
+const TIME_RANGE_MESSAGE: &str = "from은 to보다 클 수 없습니다";
 
 fn validate_operation_name(operation: &str) -> Result<(), CoreError> {
     if operation.is_empty()
@@ -2496,15 +2561,18 @@ fn encode_cursor(kind: &str, fingerprint: &str, offset: usize) -> Result<String,
     Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor)?))
 }
 
+fn invalid_page_cursor() -> CoreError {
+    CoreError::InvalidInput("페이지 커서가 올바르지 않습니다".to_owned())
+}
+
 fn cursor_offset(cursor: Option<&str>, kind: &str, fingerprint: &str) -> Result<usize, CoreError> {
     let Some(cursor) = cursor else {
         return Ok(0);
     };
     let bytes = URL_SAFE_NO_PAD
         .decode(cursor)
-        .map_err(|_| CoreError::InvalidInput("페이지 커서가 올바르지 않습니다".to_owned()))?;
-    let cursor: PageCursor = serde_json::from_slice(&bytes)
-        .map_err(|_| CoreError::InvalidInput("페이지 커서가 올바르지 않습니다".to_owned()))?;
+        .map_err(|_| invalid_page_cursor())?;
+    let cursor: PageCursor = serde_json::from_slice(&bytes).map_err(|_| invalid_page_cursor())?;
     if cursor.version != 1 || cursor.kind != kind || cursor.fingerprint != fingerprint {
         return Err(CoreError::InvalidInput(
             "페이지 커서가 현재 조회 조건과 일치하지 않습니다".to_owned(),
@@ -2513,15 +2581,41 @@ fn cursor_offset(cursor: Option<&str>, kind: &str, fingerprint: &str) -> Result<
     Ok(cursor.offset)
 }
 
-/// 앞으로만 넘기는 목록 조회의 커서 해석과 다음 커서 발급을 한 곳에 모은다.
-struct ForwardPager {
+/// 한 방향으로만 넘기는 목록 조회의 커서 해석과 다음 커서 발급을 한 곳에 모은다.
+struct CursorPager {
     kind: &'static str,
     fingerprint: String,
     offset: usize,
     limit: usize,
 }
 
-impl ForwardPager {
+/// 목록 창구 지문에 창구와 무관하게 같은 모양으로 들어가는 값들. 시각 범위는 조건이고
+/// 쪽 크기는 오프셋 해석의 전제라, 둘 다 지문에 들어가야 커서가 조건 변경을 잡아낸다.
+struct ListWindow {
+    range: InclusiveRange<i64>,
+    limit: usize,
+}
+
+impl CursorPager {
+    /// 창구별 조건에 [`ListWindow`]를 합쳐 지문을 만들고 커서를 연다. 시각 범위와 쪽
+    /// 크기를 창구마다 손으로 다시 적으면 `limit`를 지문과 자르기 인자 두 자리에 적게
+    /// 되어 한쪽만 바뀌는 어긋남이 생긴다.
+    fn open_window<const N: usize>(
+        kind: &'static str,
+        cursor: Option<&str>,
+        filters: [(&str, Value); N],
+        window: ListWindow,
+    ) -> Result<Self, CoreError> {
+        let mut criteria = serde_json::Map::new();
+        for (key, value) in filters {
+            criteria.insert(key.to_owned(), value);
+        }
+        criteria.insert("from".to_owned(), json!(window.range.from));
+        criteria.insert("to".to_owned(), json!(window.range.to));
+        criteria.insert("limit".to_owned(), json!(window.limit));
+        Self::open(kind, cursor, &Value::Object(criteria), window.limit)
+    }
+
     /// 조회 조건을 지문으로 굳히고 들어온 커서가 그 조건에서 나온 것인지 확인한다.
     fn open(
         kind: &'static str,
@@ -2558,20 +2652,108 @@ impl ForwardPager {
             .transpose()?;
         Ok((items, next_cursor, total))
     }
+
+    /// 걸러 정렬된 전체의 **끝에서부터** 이번 쪽을 잘라낸다. 대화 기록처럼 최신이 뒤에
+    /// 쌓이는 목록은 뒤에서 앞으로 넘기므로, 커서 오프셋은 이미 넘긴 항목 수를 센다.
+    fn cut_tail<T, U>(
+        &self,
+        items: &[T],
+        map: impl FnMut(&T) -> U,
+    ) -> Result<(Vec<U>, Option<String>, usize), CoreError> {
+        let total = items.len();
+        let end = total.saturating_sub(self.offset);
+        let start = end.saturating_sub(self.limit);
+        let page = items[start..end].iter().map(map).collect::<Vec<_>>();
+        let next_cursor = (start > 0)
+            .then(|| encode_cursor(self.kind, &self.fingerprint, total.saturating_sub(start)))
+            .transpose()?;
+        Ok((page, next_cursor, total))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 결과가 0건인 신호는 사유와 무관하게 전환으로 남지 않는다. 소진·한도 신호에
-    /// 예외를 다시 두면 계정 배치가 그대로인데 "A → B" 알림이 뜬다.
+    /// 기록의 목적지는 실제로 움직인 쪽이다. 결과가 0건인 신호는 사유와 무관하게 전환으로
+    /// 남지 않는다 — 소진·한도 신호에 예외를 다시 두면 계정 배치가 그대로인데 "A → B" 알림이
+    /// 뜬다. 둘 다 움직였고 목적지가 다르면 기본 계정이 앞선다.
     #[test]
-    fn auto_switch_is_recorded_only_when_something_actually_moved() {
-        assert!(auto_switch_moved_anything(2, false));
-        assert!(auto_switch_moved_anything(0, true));
-        assert!(auto_switch_moved_anything(2, true));
-        assert!(!auto_switch_moved_anything(0, false));
+    fn the_recorded_destination_is_the_side_that_actually_moved() {
+        assert_eq!(switch_destination(Some("x"), 2, None, false), Some("x"));
+        assert_eq!(switch_destination(None, 0, Some("y"), true), Some("y"));
+        assert_eq!(switch_destination(Some("x"), 2, Some("y"), true), Some("y"));
+        // 재바인딩 후보는 있었지만 한 세션도 옮기지 못했다 — 회전만 남는다.
+        assert_eq!(switch_destination(Some("x"), 0, Some("y"), true), Some("y"));
+        // 회전 후보는 있었지만 실제로 바뀌지 않았다.
+        assert_eq!(
+            switch_destination(Some("x"), 2, Some("y"), false),
+            Some("x")
+        );
+        assert_eq!(switch_destination(Some("x"), 0, Some("y"), false), None);
+        assert_eq!(switch_destination(None, 0, None, false), None);
+    }
+
+    fn attention_event(
+        resumed_session_count: usize,
+        default_rotated: bool,
+        sessions_to: Option<&str>,
+        reason: AutoSwitchReason,
+    ) -> AutoSwitchEventView {
+        AutoSwitchEventView {
+            from_account_id: "a".into(),
+            to_account_id: "b".into(),
+            reason,
+            at: 0,
+            resumed_session_count,
+            default_rotated,
+            sessions_to_account_id: sessions_to.map(str::to_owned),
+        }
+    }
+
+    /// 알림은 기록된 이벤트 하나로 말한다. 세션이 기본 계정과 다른 곳으로 갔으면 그 행방을,
+    /// 기본 계정이 그대로면 그 사실을 함께 말한다.
+    #[test]
+    fn the_attention_text_names_where_sessions_went_when_it_differs() {
+        let name = |id: &str| id.to_uppercase();
+        assert_eq!(
+            auto_switch_attention_text(
+                &attention_event(2, true, None, AutoSwitchReason::AgentLimited),
+                name
+            ),
+            format!(
+                "A → B · {} · 세션 2개 복원",
+                AutoSwitchReason::AgentLimited.label()
+            )
+        );
+        assert_eq!(
+            auto_switch_attention_text(
+                &attention_event(2, true, Some("x"), AutoSwitchReason::AgentLimited),
+                name
+            ),
+            format!(
+                "A → B · {} · 세션 2개는 X로 복원",
+                AutoSwitchReason::AgentLimited.label()
+            )
+        );
+        assert_eq!(
+            auto_switch_attention_text(
+                &attention_event(0, true, Some("x"), AutoSwitchReason::UsageExhausted),
+                name
+            ),
+            format!("A → B · {}", AutoSwitchReason::UsageExhausted.label())
+        );
+        // 기본 계정이 그대로면 화면 요약과 같은 자리에서 그렇다고 말한다.
+        assert_eq!(
+            auto_switch_attention_text(
+                &attention_event(2, false, None, AutoSwitchReason::UsageExhausted),
+                name
+            ),
+            format!(
+                "A → B · {} · 기본 계정 유지 · 세션 2개 복원",
+                AutoSwitchReason::UsageExhausted.label()
+            )
+        );
     }
 
     #[test]
@@ -2588,6 +2770,19 @@ mod tests {
         let truncated = truncate_text(&text, MAX_TRANSCRIPT_BLOCK_BYTES);
         assert!(truncated.len() <= MAX_TRANSCRIPT_BLOCK_BYTES);
         assert!(truncated.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn optional_text_returns_the_text_and_its_truncation_state_together() {
+        assert_eq!(truncate_optional_text(None, 3), (None, false));
+        assert_eq!(
+            truncate_optional_text(Some("abc"), 3),
+            (Some("abc".to_owned()), false)
+        );
+
+        let (text, truncated) = truncate_optional_text(Some(&"가".repeat(8)), 16);
+        assert!(truncated);
+        assert!(text.expect("truncated text").ends_with("…[truncated]"));
     }
 
     #[test]
@@ -2619,6 +2814,37 @@ mod tests {
     }
 
     #[test]
+    fn idempotent_execution_replays_receipt_without_running_again() {
+        let data = tempfile::tempdir().expect("app data");
+        let mut executions = 0;
+        let first = execute_idempotent(
+            data.path(),
+            "test_operation",
+            "same-key",
+            "same-request",
+            || {
+                executions += 1;
+                Ok(json!({"delivery":"first"}))
+            },
+        )
+        .expect("first execution");
+        let replay = execute_idempotent(
+            data.path(),
+            "test_operation",
+            "same-key",
+            "same-request",
+            || {
+                executions += 1;
+                Ok(json!({"delivery":"second"}))
+            },
+        )
+        .expect("replay");
+
+        assert_eq!(executions, 1);
+        assert_eq!(replay, first);
+    }
+
+    #[test]
     fn audit_records_hash_but_not_original_arguments() {
         let data = tempfile::tempdir().expect("app data");
         append_system_audit(
@@ -2627,10 +2853,15 @@ mod tests {
             &json!({"message":"private-message"}),
             SystemAuditPhase::Completed,
             Some(true),
+            None,
+            Some("chat-1"),
         )
         .expect("audit");
         let stored = fs::read_to_string(data.path().join(AUDIT_FILE)).expect("audit file");
         assert!(!stored.contains("private-message"));
+        // 호출자는 남는다 — 무인 반복 실행이 시스템 도구를 쥐면서 사람이 시킨 것과
+        // 예약 실행을 사후에 갈라야 한다(2026-09-27).
+        assert!(stored.contains("chat-1"), "{stored}");
         let page =
             list_system_audit(data.path(), SystemAuditListRequest::default()).expect("audit page");
         assert_eq!(page.total, 1);
@@ -2681,6 +2912,54 @@ mod tests {
             classify_transcript(&item),
             TranscriptCategory::IncompleteItem
         ));
+    }
+
+    // 2026-09-27: 반복 요청이 "미분류 세션" 을 고르려면 목록에서 폴더 유무가 보여야 한다.
+    #[test]
+    fn list_request_without_unfiled_defaults_to_false_and_accepts_true() {
+        let request: SessionListRequest =
+            serde_json::from_value(serde_json::json!({"source": "codex", "limit": 5})).unwrap();
+        assert!(!request.unfiled);
+        let request: SessionListRequest =
+            serde_json::from_value(serde_json::json!({"unfiled": true})).unwrap();
+        assert!(request.unfiled);
+        // 적용 필터에도 그대로 실린다 — 호출자가 무엇이 걸러졌는지 응답만 보고 안다.
+        let applied = SessionAppliedFilters {
+            unfiled: request.unfiled,
+            ..SessionAppliedFilters::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&applied).unwrap()["unfiled"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn unfiled_filter_keeps_only_sessions_without_a_folder() {
+        let summary = |id: &str, folders: &[&str]| ManagedSessionSummary {
+            session_id: id.to_owned(),
+            chat_id: None,
+            source: ProviderId::Local,
+            cwd: None,
+            project: None,
+            title: id.to_owned(),
+            created_at: None,
+            updated_at: None,
+            turn_count: 0,
+            status: SessionManagementStatus::Completed,
+            last_turn_status: None,
+            folder_ids: folders.iter().map(|f| (*f).to_owned()).collect(),
+        };
+        let mut items = vec![
+            summary("filed", &["folder-a"]),
+            summary("bare", &[]),
+            summary("twice", &["folder-a", "folder-b"]),
+        ];
+        retain_unfiled(&mut items);
+        let ids: Vec<&str> = items.iter().map(|item| item.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["bare"]);
+        let json = serde_json::to_value(summary("x", &["folder-a"])).unwrap();
+        assert_eq!(json["folderIds"], serde_json::json!(["folder-a"]));
     }
 
     #[test]
@@ -2754,12 +3033,6 @@ mod tests {
             TranscriptCategory::IncompleteItem
         );
         assert!(TranscriptCategory::from_str("unknown").is_err());
-
-        assert!(TranscriptCategory::SessionSummary.is_session_summary());
-        assert!(TranscriptCategory::UserRequest.is_user_request());
-        assert!(TranscriptCategory::WorkPerformed.is_work_performed());
-        assert!(TranscriptCategory::VerificationResult.is_verification_result());
-        assert!(TranscriptCategory::IncompleteItem.is_incomplete_item());
     }
 
     #[test]
@@ -2771,10 +3044,5 @@ mod tests {
             assert_eq!(SystemAuditPhase::from_str(&s).unwrap(), phase);
         }
         assert!(SystemAuditPhase::from_str("unknown").is_err());
-
-        assert!(SystemAuditPhase::Attempted.is_attempted());
-        assert!(!SystemAuditPhase::Attempted.is_completed());
-        assert!(SystemAuditPhase::Completed.is_completed());
-        assert!(!SystemAuditPhase::Completed.is_attempted());
     }
 }

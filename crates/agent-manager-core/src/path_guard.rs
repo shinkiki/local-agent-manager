@@ -12,6 +12,27 @@ use std::path::{Component, Path, PathBuf};
 use crate::domain::wire_enum;
 use crate::CoreError;
 
+/// 자식 프로세스에게 넘길 모양의 경로. Windows에서 `fs::canonicalize`가 돌려주는
+/// `\\?\C:\…` 확장 경로에서 접두어만 벗긴다. 벗길 수 없는 경로(예약 이름 등)와 다른
+/// 플랫폼에서는 그대로다.
+///
+/// 확장 경로를 이해하지 못하는 자식이 계속 나와 같은 고장을 세 번 따로 고쳤다. Cypress
+/// 설정 로더(tsx)는 접두어를 모듈 경로로 풀지 못해 설정을 읽는 단계에서 끝났고
+/// (`Cannot find module '\\'`), Windows OpenSSH는 역슬래시를 먹어 엉뚱한 이름에 키를
+/// 쓰려다 `Saving key "\\?C:Users…" failed`로 끝났으며, `cmd.exe`는 작업 경로로 받으면
+/// `UNC 경로는 지원되지 않습니다`를 찍고 Windows 디렉터리로 물러나 배치 셈(`codex.cmd`)이
+/// `지정된 경로를 찾을 수 없습니다`로 죽었다. 경계 검사(G10)는 정규화한 경로끼리 하고,
+/// 자식에게는 접두어만 벗긴 같은 경로를 준다.
+pub(crate) fn child_facing(path: &Path) -> PathBuf {
+    dunce::simplified(path).to_path_buf()
+}
+
+/// 정규화한 뒤 [`child_facing`] 모양으로 돌려준다. 자식에게 넘길 경로는 대부분 정규화가
+/// 먼저라 두 단계를 한 자리에 묶는다.
+pub(crate) fn canonical_child_facing(path: impl AsRef<Path>) -> Result<PathBuf, CoreError> {
+    Ok(child_facing(&fs::canonicalize(path)?))
+}
+
 /// 경로에 상위 경로(`..`) 구성요소가 있는지.
 ///
 /// 절대 경로를 받는 자리(`store`·`resource_repository`·`project_instructions`·`user_path`)가

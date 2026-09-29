@@ -37,6 +37,11 @@ const MAX_NOTE_CHARS: usize = 300;
 const MAX_NOTES: usize = 512;
 const MAX_FINGERPRINT_CHARS: usize = 80;
 const KEYGEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// 실패한 `ssh-keygen`에서 받아 둘 진단 문구의 한도. 메시지 한 줄이면 충분하다.
+const MAX_KEYGEN_STDERR_BYTES: u64 = 4 * 1024;
+/// 자식 콘솔 창을 띄우지 않는 Windows 생성 플래그.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// 지운 키 쌍을 옮겨 두는 `~/.ssh` 직접 하위 폴더. 앱 데이터로 옮기면 개인키가
 /// 앱 소유 저장소에 남으므로(G4·G7) 같은 파일시스템 안에서만 이름을 바꾼다.
 const TRASH_DIR_NAME: &str = ".agent-manager-trash";
@@ -222,17 +227,17 @@ fn set_ssh_key_note_with(
             "메모를 붙일 공개키를 ~/.ssh에서 찾지 못했습니다".to_owned(),
         ));
     }
-    NOTES_STORE.with_lock(app_data_dir, || {
-        let mut store: SshKeyNoteStore = NOTES_STORE.load_unlocked(app_data_dir)?;
+    edit_notes(app_data_dir, |notes| {
         if note.is_empty() {
-            store.notes.remove(&fingerprint);
+            notes.remove(&fingerprint);
         } else {
-            if !store.notes.contains_key(&fingerprint) && store.notes.len() >= MAX_NOTES {
+            if !notes.contains_key(&fingerprint) && notes.len() >= MAX_NOTES {
                 return Err(CoreError::TooLarge(MAX_NOTES as u64));
             }
-            store.notes.insert(fingerprint.clone(), note.clone());
+            notes.insert(fingerprint.clone(), note.clone());
         }
-        NOTES_STORE.save_unlocked(app_data_dir, &store)
+        // 지울 메모가 없어도 저장한다. 화면 저장은 저장본이 남는 것 자체가 결과다.
+        Ok(true)
     })?;
     attach_notes(&mut snapshot, app_data_dir);
     Ok(snapshot)
@@ -301,7 +306,15 @@ fn canonicalize_plain_directory(
     if !metadata.is_dir() {
         return Err(CoreError::InvalidInput(not_dir_message.to_owned()));
     }
-    Ok(fs::canonicalize(path)?)
+    canonical_plain_path(path)
+}
+
+/// 정규화한 경로. 화면에 그대로 보이고 `ssh`·`ssh-keygen`에 인자로도 넘어가므로 Windows
+/// 확장 경로 접두어는 벗긴다 — 이유와 방식은 [`crate::path_guard::child_facing`]에 모여
+/// 있다. 경계 검사(C9-1·C9-4)는 모두 이 함수를 거친 경로끼리 비교하므로 접두어를 벗겨도
+/// 같은 판정이 유지된다.
+fn canonical_plain_path(path: &Path) -> Result<PathBuf, CoreError> {
+    crate::path_guard::canonical_child_facing(path)
 }
 
 fn existing_ssh_root(home: &Path, requested: &Path) -> Result<Option<PathBuf>, CoreError> {
@@ -500,6 +513,101 @@ fn parse_public_key(text: &str) -> Result<ParsedPublicKey, CoreError> {
     })
 }
 
+/// blob 본체가 실어야 하는 것. OpenSSH 공개키는 알고리즘 이름 뒤에 알고리즘마다 정해진
+/// 문자열 묶음이 이어지고, 그 묶음의 모양은 세 갈래뿐이다.
+#[derive(Debug, Clone, Copy)]
+enum PublicKeyBody {
+    /// 길이가 정해진 문자열 하나(Ed25519 키처럼).
+    Fixed { label: &'static str, size: usize },
+    /// 비어 있으면 안 되는 문자열들(RSA·DSA의 정수들).
+    NonEmpty(&'static [&'static str]),
+    /// curve 이름과 그 curve의 point.
+    Ecdsa {
+        curve: &'static str,
+        point_size: usize,
+    },
+}
+
+/// 지원하는 OpenSSH 공개키 알고리즘 하나의 사양.
+#[derive(Debug, Clone, Copy)]
+struct PublicKeyAlgorithm {
+    name: &'static str,
+    body: PublicKeyBody,
+    /// FIDO(`sk-`) 키는 본체 뒤에 application 문자열이 하나 더 붙는다.
+    fido_application: bool,
+}
+
+/// 지원 알고리즘의 단일 원천. 예전에는 "받아들일 이름"과 "그 blob을 어떻게 읽는지"가
+/// 서로 다른 두 목록에 적혀 있어, 새 알고리즘을 한쪽에만 더하면 이름은 통과하는데 blob
+/// 검증이 "아직 검증할 수 없는 알고리즘"으로 떨어지거나 그 반대가 된다. 두 판정을 모두
+/// 이 표에서 파생해 그 갈라짐을 없앤다.
+const PUBLIC_KEY_ALGORITHMS: [PublicKeyAlgorithm; 8] = [
+    PublicKeyAlgorithm {
+        name: "ssh-ed25519",
+        body: PublicKeyBody::Fixed {
+            label: "Ed25519 키",
+            size: 32,
+        },
+        fido_application: false,
+    },
+    PublicKeyAlgorithm {
+        name: "ssh-rsa",
+        body: PublicKeyBody::NonEmpty(&["RSA 지수", "RSA modulus"]),
+        fido_application: false,
+    },
+    PublicKeyAlgorithm {
+        name: "ssh-dss",
+        body: PublicKeyBody::NonEmpty(&["DSA p", "DSA q", "DSA g", "DSA y"]),
+        fido_application: false,
+    },
+    PublicKeyAlgorithm {
+        name: "ecdsa-sha2-nistp256",
+        body: PublicKeyBody::Ecdsa {
+            curve: "nistp256",
+            point_size: 65,
+        },
+        fido_application: false,
+    },
+    PublicKeyAlgorithm {
+        name: "ecdsa-sha2-nistp384",
+        body: PublicKeyBody::Ecdsa {
+            curve: "nistp384",
+            point_size: 97,
+        },
+        fido_application: false,
+    },
+    PublicKeyAlgorithm {
+        name: "ecdsa-sha2-nistp521",
+        body: PublicKeyBody::Ecdsa {
+            curve: "nistp521",
+            point_size: 133,
+        },
+        fido_application: false,
+    },
+    PublicKeyAlgorithm {
+        name: "sk-ssh-ed25519@openssh.com",
+        body: PublicKeyBody::Fixed {
+            label: "FIDO Ed25519 키",
+            size: 32,
+        },
+        fido_application: true,
+    },
+    PublicKeyAlgorithm {
+        name: "sk-ecdsa-sha2-nistp256@openssh.com",
+        body: PublicKeyBody::Ecdsa {
+            curve: "nistp256",
+            point_size: 65,
+        },
+        fido_application: true,
+    },
+];
+
+fn public_key_algorithm(value: &str) -> Option<&'static PublicKeyAlgorithm> {
+    PUBLIC_KEY_ALGORITHMS
+        .iter()
+        .find(|algorithm| algorithm.name == value)
+}
+
 fn validate_public_blob(blob: &[u8], expected: &str) -> Result<(), CoreError> {
     let mut reader = BlobReader::new(blob);
     let algorithm = reader.read_utf8("알고리즘")?;
@@ -508,49 +616,28 @@ fn validate_public_blob(blob: &[u8], expected: &str) -> Result<(), CoreError> {
             "공개키 표기 알고리즘과 blob 알고리즘이 다릅니다".to_owned(),
         ));
     }
-    match expected {
-        "ssh-ed25519" => reader.read_exact_string(32, "Ed25519 키")?,
-        "ssh-rsa" => {
-            reader.read_non_empty_string("RSA 지수")?;
-            reader.read_non_empty_string("RSA modulus")?;
-        }
-        "ssh-dss" => {
-            for label in ["DSA p", "DSA q", "DSA g", "DSA y"] {
+    let Some(spec) = public_key_algorithm(expected) else {
+        return Err(CoreError::InvalidInput(
+            "아직 검증할 수 없는 OpenSSH 공개키 알고리즘입니다".to_owned(),
+        ));
+    };
+    match spec.body {
+        PublicKeyBody::Fixed { label, size } => reader.read_exact_string(size, label)?,
+        PublicKeyBody::NonEmpty(labels) => {
+            for label in labels {
                 reader.read_non_empty_string(label)?;
             }
         }
-        "ecdsa-sha2-nistp256" => reader.read_ecdsa("nistp256", 65)?,
-        "ecdsa-sha2-nistp384" => reader.read_ecdsa("nistp384", 97)?,
-        "ecdsa-sha2-nistp521" => reader.read_ecdsa("nistp521", 133)?,
-        "sk-ssh-ed25519@openssh.com" => {
-            reader.read_exact_string(32, "FIDO Ed25519 키")?;
-            reader.read_non_empty_string("FIDO application")?;
-        }
-        "sk-ecdsa-sha2-nistp256@openssh.com" => {
-            reader.read_ecdsa("nistp256", 65)?;
-            reader.read_non_empty_string("FIDO application")?;
-        }
-        _ => {
-            return Err(CoreError::InvalidInput(
-                "아직 검증할 수 없는 OpenSSH 공개키 알고리즘입니다".to_owned(),
-            ))
-        }
+        PublicKeyBody::Ecdsa { curve, point_size } => reader.read_ecdsa(curve, point_size)?,
+    }
+    if spec.fido_application {
+        reader.read_non_empty_string("FIDO application")?;
     }
     reader.finish()
 }
 
 fn valid_key_type(value: &str) -> bool {
-    matches!(
-        value,
-        "ssh-ed25519"
-            | "ssh-rsa"
-            | "ssh-dss"
-            | "ecdsa-sha2-nistp256"
-            | "ecdsa-sha2-nistp384"
-            | "ecdsa-sha2-nistp521"
-            | "sk-ssh-ed25519@openssh.com"
-            | "sk-ecdsa-sha2-nistp256@openssh.com"
-    )
+    public_key_algorithm(value).is_some()
 }
 
 struct BlobReader<'a> {
@@ -643,6 +730,167 @@ fn display_algorithm(value: &str) -> String {
     }
 }
 
+/// 지정한 상위 폴더 아래에 0700 권한의 격리 하위 폴더를 만들고, 정규화한 경로가
+/// 상위 폴더 바로 아래인지 확인해 돌려준다. 중간에 실패하거나 경계를 벗어나면
+/// 만들던 폴더를 지우고 나간다(C9-4·C9-7).
+fn create_secure_subdir(
+    parent: &Path,
+    name: &str,
+    boundary_error_message: &str,
+) -> Result<PathBuf, CoreError> {
+    let requested = parent.join(name);
+    fs::create_dir(&requested)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = fs::set_permissions(&requested, fs::Permissions::from_mode(0o700)) {
+            let _ = fs::remove_dir(&requested);
+            return Err(error.into());
+        }
+    }
+    let subdir = match canonical_plain_path(&requested) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = fs::remove_dir(&requested);
+            return Err(error);
+        }
+    };
+    if subdir.parent() != Some(parent) {
+        let _ = fs::remove_dir(&subdir);
+        return Err(CoreError::InvalidInput(boundary_error_message.to_owned()));
+    }
+    Ok(subdir)
+}
+
+/// `~/.ssh` 안에 0700 staging 폴더를 새로 만들고, 정규화한 경로가 `~/.ssh` 바로 아래인지
+/// 확인해 돌려준다. 중간에 실패하면 만들던 폴더를 지우고 나간다(C9-4).
+fn open_stage_dir(root: &Path) -> Result<PathBuf, CoreError> {
+    let name = format!(".agent-manager-key-{}", Uuid::new_v4());
+    create_secure_subdir(
+        root,
+        &name,
+        "SSH 키 staging 폴더가 ~/.ssh를 벗어났습니다 (C9-4)",
+    )
+}
+
+/// staging 경로에 암호 없는 Ed25519 키 한 쌍을 만든다.
+///
+/// 환경을 통째로 비우지 않는다. Windows에 딸려 오는 `System32\OpenSSH`의 `ssh-keygen.exe`는
+/// 빈 환경으로 띄우면 `SystemRoot`를 잃어 기동 자체가 실패하고, 아무 진단도 내지 않은 채
+/// 255로 끝난다. 대신 이 실행에서 실제로 위험한 것만 떼어 낸다 — 패스프레이즈는 `-N ""`로
+/// 비우므로 물어볼 일이 없고, 그래도 묻는다면 그것은 우리가 부르지 않은 외부 프롬프트다.
+fn run_keygen(executable: &Path, comment: &str, stage_private: &Path) -> Result<(), CoreError> {
+    let mut command = Command::new(executable);
+    command
+        .args(["-q", "-t", "ed25519", "-a", "64", "-N", "", "-C"])
+        .arg(comment)
+        .arg("-f")
+        .arg(stage_private)
+        .env_remove("SSH_ASKPASS")
+        .env_remove("SSH_ASKPASS_REQUIRE")
+        .env_remove("DISPLAY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        // 실패 사유를 사용자에게 그대로 전하려고 받는다. 버리면 어느 단계에서 막혔는지
+        // 화면에서 알 길이 없다.
+        .stderr(Stdio::piped());
+    // 콘솔 창이 깜빡이지 않게 한다. 다른 외부 명령 실행 경로와 같은 플래그다.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| CoreError::Runtime("ssh-keygen을 시작하지 못했습니다".to_owned()))?;
+    // 종료를 기다리는 동안 따로 읽는다. 파이프가 차서 자식이 멈추면 제한 시간까지 붙잡힌다.
+    let stderr = child.stderr.take();
+    let reader = thread::spawn(move || read_capped_stderr(stderr));
+    let waited = wait_for_child(&mut child, KEYGEN_TIMEOUT);
+    let detail = reader.join().unwrap_or_default();
+    let status = waited?;
+    if !status.success() {
+        return Err(CoreError::Runtime(keygen_failure_message(
+            status.code(),
+            &detail,
+        )));
+    }
+    Ok(())
+}
+
+/// 자식의 표준 오류를 한도까지만 읽어 한 줄로 만든다. 진단용이라 읽지 못하면 비운다.
+fn read_capped_stderr(stderr: Option<std::process::ChildStderr>) -> String {
+    let Some(stderr) = stderr else {
+        return String::new();
+    };
+    let mut raw = Vec::new();
+    if stderr
+        .take(MAX_KEYGEN_STDERR_BYTES)
+        .read_to_end(&mut raw)
+        .is_err()
+    {
+        return String::new();
+    }
+    String::from_utf8_lossy(&raw)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 키 생성 실패 메시지. `ssh-keygen`이 아무 말도 없이 끝나는 경우가 있어 종료 코드를 항상
+/// 함께 적는다.
+fn keygen_failure_message(code: Option<i32>, detail: &str) -> String {
+    let base = "ssh-keygen이 새 Ed25519 키를 만들지 못했습니다";
+    let code = code.map_or_else(
+        || "종료 코드 없음".to_owned(),
+        |code| format!("종료 코드 {code}"),
+    );
+    if detail.is_empty() {
+        format!("{base} ({code})")
+    } else {
+        format!("{base} ({code}): {detail}")
+    }
+}
+
+/// staging의 키 쌍을 검사한 뒤 `~/.ssh`의 최종 이름으로 하드링크하고, 읽어낸 공개키
+/// 정보를 돌려준다. 개인키를 거는 데 실패하면 먼저 건 공개키 링크를 되돌린다.
+fn publish_key_pair(
+    stage_dir: &Path,
+    stage_private: &Path,
+    stage_public: &Path,
+    private_target: &Path,
+    public_target: &Path,
+) -> Result<SshKeyView, CoreError> {
+    validate_generated_file(stage_private)?;
+    validate_generated_file(stage_public)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(stage_private, fs::Permissions::from_mode(0o600))?;
+    }
+    let parsed = inspect_public_key(stage_dir, stage_public)?;
+    let public_identity = FileIdentity::from_path(stage_public)?;
+
+    ensure_absent(public_target)?;
+    ensure_absent(private_target)?;
+    fs::hard_link(stage_public, public_target).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            CoreError::Conflict("같은 이름의 SSH 공개키가 이미 있습니다".to_owned())
+        } else {
+            error.into()
+        }
+    })?;
+    if let Err(error) = fs::hard_link(stage_private, private_target) {
+        rollback_public_link(public_target, Some(&public_identity))?;
+        return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+            CoreError::Conflict("같은 이름의 SSH 개인키가 이미 있습니다".to_owned())
+        } else {
+            error.into()
+        });
+    }
+    Ok(parsed)
+}
+
 fn generate_ssh_key_with(
     home: &Path,
     executable: &Path,
@@ -656,84 +904,21 @@ fn generate_ssh_key_with(
     ensure_absent(&private_target)?;
     ensure_absent(&public_target)?;
 
-    let requested_stage_dir = root.join(format!(".agent-manager-key-{}", Uuid::new_v4()));
-    fs::create_dir(&requested_stage_dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(error) =
-            fs::set_permissions(&requested_stage_dir, fs::Permissions::from_mode(0o700))
-        {
-            let _ = fs::remove_dir(&requested_stage_dir);
-            return Err(error.into());
-        }
-    }
-    let stage_dir = match fs::canonicalize(&requested_stage_dir) {
-        Ok(path) => path,
-        Err(error) => {
-            let _ = fs::remove_dir(&requested_stage_dir);
-            return Err(error.into());
-        }
-    };
-    if stage_dir.parent() != Some(root.as_path()) {
-        let _ = fs::remove_dir(&stage_dir);
-        return Err(CoreError::InvalidInput(
-            "SSH 키 staging 폴더가 ~/.ssh를 벗어났습니다 (C9-4)".to_owned(),
-        ));
-    }
+    let stage_dir = open_stage_dir(&root)?;
     let stage_private = stage_dir.join("key");
     let stage_public = stage_dir.join("key.pub");
-    let mut published_public_identity = None;
 
-    let result = (|| {
-        let mut child = Command::new(executable)
-            .args(["-q", "-t", "ed25519", "-a", "64", "-N", "", "-C"])
-            .arg(comment)
-            .arg("-f")
-            .arg(&stage_private)
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| CoreError::Runtime("ssh-keygen을 시작하지 못했습니다".to_owned()))?;
-        let status = wait_for_child(&mut child, KEYGEN_TIMEOUT)?;
-        if !status.success() {
-            return Err(CoreError::Runtime(
-                "ssh-keygen이 새 Ed25519 키를 만들지 못했습니다".to_owned(),
-            ));
-        }
-
-        validate_generated_file(&stage_private)?;
-        validate_generated_file(&stage_public)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&stage_private, fs::Permissions::from_mode(0o600))?;
-        }
-        let parsed = inspect_public_key(&stage_dir, &stage_public)?;
-        let public_identity = FileIdentity::from_path(&stage_public)?;
-
-        ensure_absent(&public_target)?;
-        ensure_absent(&private_target)?;
-        fs::hard_link(&stage_public, &public_target).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                CoreError::Conflict("같은 이름의 SSH 공개키가 이미 있습니다".to_owned())
-            } else {
-                error.into()
-            }
-        })?;
-        published_public_identity = Some(public_identity);
-        if let Err(error) = fs::hard_link(&stage_private, &private_target) {
-            rollback_public_link(&public_target, published_public_identity.as_ref())?;
-            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
-                CoreError::Conflict("같은 이름의 SSH 개인키가 이미 있습니다".to_owned())
-            } else {
-                error.into()
-            });
-        }
-
-        Ok(SshKeyView {
+    let result = run_keygen(executable, comment, &stage_private)
+        .and_then(|()| {
+            publish_key_pair(
+                &stage_dir,
+                &stage_private,
+                &stage_public,
+                &private_target,
+                &public_target,
+            )
+        })
+        .map(|parsed| SshKeyView {
             file_name: format!("{file_name}.pub"),
             path: public_target.to_string_lossy().into_owned(),
             algorithm: parsed.algorithm,
@@ -742,8 +927,7 @@ fn generate_ssh_key_with(
             has_private_key: true,
             note: None,
             endpoint: None,
-        })
-    })();
+        });
 
     let cleanup = cleanup_stage(&stage_private, &stage_public, &stage_dir);
     match (result, cleanup) {
@@ -802,6 +986,46 @@ fn read_ssh_public_key_with_home(
     })
 }
 
+/// C9-20. 원격 `authorized_keys`에 한 줄로 적어 넣을 수 있는 모양의 공개키.
+///
+/// 이 값은 원격 셸이 해석하는 명령 안에 작은따옴표로 묶여 들어간다. 그래서 파일에 있던
+/// 줄을 그대로 쓰지 않고 검증을 통과한 알고리즘·본문만 다시 조립한다. 주석은 사용자가
+/// 무엇이든 적을 수 있는 자유 입력이라 따옴표를 깨뜨릴 수 있는 글자를 지우고, 남는 게
+/// 없으면 통째로 뺀다 — 주석은 `authorized_keys`에서 선택 항목이다.
+pub(crate) fn authorized_key_line(home: &Path, request: &SshKeyRef) -> Result<String, CoreError> {
+    let view = read_ssh_public_key_with_home(home, request)?;
+    let mut fields = view.public_key.split_whitespace();
+    let (Some(key_type), Some(encoded)) = (fields.next(), fields.next()) else {
+        return Err(CoreError::InvalidInput(
+            "공개키 한 줄에서 알고리즘과 본문을 찾지 못했습니다".to_owned(),
+        ));
+    };
+    let comment = sanitize_key_comment(&fields.collect::<Vec<_>>().join(" "));
+    Ok(if comment.is_empty() {
+        format!("{key_type} {encoded}")
+    } else {
+        format!("{key_type} {encoded} {comment}")
+    })
+}
+
+/// 원격 명령 안에 그대로 실어도 안전한 글자만 남긴 주석.
+fn sanitize_key_comment(comment: &str) -> String {
+    comment
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '@' | '.' | '_' | '-' | '+')
+            {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn delete_ssh_key_with_home(
     home: &Path,
     app_data_dir: &Path,
@@ -826,19 +1050,15 @@ fn delete_ssh_key_with_home(
 
     let entry = create_trash_entry(&root)?;
     let public_target = entry.join(&public_name);
-    if let Err(error) = fs::rename(&public_path, &public_target) {
-        let _ = fs::remove_dir(&entry);
-        return Err(error.into());
-    }
-    if private_state == PrivateKeyState::Present {
-        let private_target = entry.join(&private_name);
-        if let Err(error) = fs::rename(&private_path, &private_target) {
-            // 반쪽만 옮긴 상태로 두지 않는다. 공개키를 제자리로 되돌리고 접는다.
-            let _ = fs::rename(&public_target, &public_path);
-            let _ = fs::remove_dir(&entry);
-            return Err(error.into());
-        }
-    }
+    let private_target = entry.join(&private_name);
+    move_key_pair_to_trash(
+        &entry,
+        &public_path,
+        &public_target,
+        &private_path,
+        &private_target,
+        private_state == PrivateKeyState::Present,
+    )?;
 
     // 키가 사라진 뒤의 메모는 가리킬 대상이 없다. 이미 파일은 옮겨졌으므로 메모를
     // 지우지 못한 것으로 삭제 자체를 실패로 만들지는 않는다.
@@ -856,33 +1076,39 @@ fn delete_ssh_key_with_home(
     })
 }
 
+/// 공개키와 개인키를 휴지통 항목 폴더로 옮긴다. 개인키 이동이 실패하면 이미 옮긴
+/// 공개키를 제자리로 되돌리고 폴더를 정리해 반쪽만 옮겨진 상태를 남기지 않는다.
+fn move_key_pair_to_trash(
+    entry: &Path,
+    public_path: &Path,
+    public_target: &Path,
+    private_path: &Path,
+    private_target: &Path,
+    has_private_key: bool,
+) -> Result<(), CoreError> {
+    if let Err(error) = fs::rename(public_path, public_target) {
+        let _ = fs::remove_dir(entry);
+        return Err(error.into());
+    }
+    if has_private_key {
+        if let Err(error) = fs::rename(private_path, private_target) {
+            let _ = fs::rename(public_target, public_path);
+            let _ = fs::remove_dir(entry);
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
 /// `~/.ssh/.agent-manager-trash/<삭제시각>-<uuid>/`를 소유자 전용으로 만든다.
 fn create_trash_entry(root: &Path) -> Result<PathBuf, CoreError> {
     let trash_root = ensure_trash_root(root)?;
-    let requested = trash_root.join(format!("{}-{}", now_ms(), Uuid::new_v4().simple()));
-    fs::create_dir(&requested)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(error) = fs::set_permissions(&requested, fs::Permissions::from_mode(0o700)) {
-            let _ = fs::remove_dir(&requested);
-            return Err(error.into());
-        }
-    }
-    let entry = match fs::canonicalize(&requested) {
-        Ok(path) => path,
-        Err(error) => {
-            let _ = fs::remove_dir(&requested);
-            return Err(error.into());
-        }
-    };
-    if entry.parent() != Some(trash_root.as_path()) {
-        let _ = fs::remove_dir(&entry);
-        return Err(CoreError::InvalidInput(
-            "SSH 휴지통 항목이 휴지통 폴더를 벗어났습니다 (C9-7)".to_owned(),
-        ));
-    }
-    Ok(entry)
+    let name = format!("{}-{}", now_ms(), Uuid::new_v4().simple());
+    create_secure_subdir(
+        &trash_root,
+        &name,
+        "SSH 휴지통 항목이 휴지통 폴더를 벗어났습니다 (C9-7)",
+    )
 }
 
 fn ensure_trash_root(root: &Path) -> Result<PathBuf, CoreError> {
@@ -905,7 +1131,7 @@ fn ensure_trash_root(root: &Path) -> Result<PathBuf, CoreError> {
         }
         Err(error) => return Err(error.into()),
     }
-    let trash_root = fs::canonicalize(&requested)?;
+    let trash_root = canonical_plain_path(&requested)?;
     if trash_root.parent() != Some(root) {
         return Err(CoreError::InvalidInput(
             "SSH 휴지통이 ~/.ssh 직접 하위가 아닙니다 (C9-7)".to_owned(),
@@ -914,41 +1140,107 @@ fn ensure_trash_root(root: &Path) -> Result<PathBuf, CoreError> {
     Ok(trash_root)
 }
 
-/// 앱 데이터의 메모를 지문으로 이어 붙인다. 메모를 읽지 못해도 키 목록 자체는
-/// 보여 줘야 하므로 실패는 issues로만 알린다.
-fn attach_notes(snapshot: &mut SshKeysSnapshot, app_data_dir: &Path) {
-    match load_notes(app_data_dir) {
-        Ok(mut notes) => {
+/// 지문 하나에 값 하나를 매다는 앱 데이터 저장본(메모·엔드포인트)이 공유하는 계약.
+///
+/// 두 저장본은 담는 값만 다르고 배선은 같다 — 잠금을 쥔 채 읽어 표를 고치고, 바뀐 때만
+/// 쓰고, 키 목록에 이어 붙일 때 읽기 실패를 오류로 올리지 않고 issues로만 알린다. 그
+/// 배선을 저장본마다 복사해 두면 한쪽만 "안 바뀌어도 쓴다"거나 "실패를 오류로 올린다"로
+/// 어긋나도 컴파일은 통과하므로, 계약을 이 트레이트와 아래 네 함수 한 자리에 모아 둔다.
+pub(crate) trait FingerprintSidecar:
+    Default + SchemaVersioned + Serialize + serde::de::DeserializeOwned
+{
+    /// 지문에 매달리는 값.
+    type Value;
+    /// 이 표를 담는 앱 데이터 저장소.
+    const STORE: JsonStore;
+    /// 이어 붙이기가 실패했을 때 issues에 적는 사유. 뒤에 원인이 붙는다.
+    const ATTACH_FAILURE: &'static str;
+
+    fn table_mut(&mut self) -> &mut BTreeMap<String, Self::Value>;
+    fn into_table(self) -> BTreeMap<String, Self::Value>;
+}
+
+/// 저장본을 잠근 채 표를 고친다. `edit`가 `true`를 돌려주면 저장하고, `false`면
+/// 아무것도 쓰지 않는다 — 바뀐 것이 없을 때의 쓰기를 부르는 쪽마다 판단하지 않게 한다.
+pub(crate) fn edit_sidecar<S: FingerprintSidecar>(
+    app_data_dir: &Path,
+    edit: impl FnOnce(&mut BTreeMap<String, S::Value>) -> Result<bool, CoreError>,
+) -> Result<bool, CoreError> {
+    S::STORE.with_lock(app_data_dir, || {
+        let mut store: S = S::STORE.load_unlocked(app_data_dir)?;
+        let changed = edit(store.table_mut())?;
+        if changed {
+            S::STORE.save_unlocked(app_data_dir, &store)?;
+        }
+        Ok(changed)
+    })
+}
+
+pub(crate) fn load_sidecar<S: FingerprintSidecar>(
+    app_data_dir: &Path,
+) -> Result<BTreeMap<String, S::Value>, CoreError> {
+    S::STORE.with_lock(app_data_dir, || {
+        Ok(S::STORE.load_unlocked::<S>(app_data_dir)?.into_table())
+    })
+}
+
+pub(crate) fn remove_from_sidecar<S: FingerprintSidecar>(
+    app_data_dir: &Path,
+    fingerprint: &str,
+) -> Result<bool, CoreError> {
+    edit_sidecar::<S>(app_data_dir, |table| {
+        Ok(table.remove(fingerprint).is_some())
+    })
+}
+
+/// 저장본의 값을 지문으로 키 목록에 이어 붙인다. 읽지 못해도 키 목록 자체는 보여 줘야
+/// 하므로 실패는 issues로만 알린다.
+pub(crate) fn attach_sidecar<S: FingerprintSidecar>(
+    snapshot: &mut SshKeysSnapshot,
+    app_data_dir: &Path,
+    mut assign: impl FnMut(&mut SshKeyView, Option<S::Value>),
+) {
+    match load_sidecar::<S>(app_data_dir) {
+        Ok(mut table) => {
             for key in &mut snapshot.keys {
-                key.note = notes.remove(&key.fingerprint);
+                let value = table.remove(&key.fingerprint);
+                assign(key, value);
             }
         }
         Err(error) => snapshot.issues.push(SshKeyIssue {
-            path: NOTES_STORE
-                .path(app_data_dir)
-                .to_string_lossy()
-                .into_owned(),
-            message: format!("SSH 키 메모를 읽지 못해 메모 없이 표시합니다: {error}"),
+            path: S::STORE.path(app_data_dir).to_string_lossy().into_owned(),
+            message: format!("{}: {error}", S::ATTACH_FAILURE),
         }),
     }
 }
 
-fn load_notes(app_data_dir: &Path) -> Result<BTreeMap<String, String>, CoreError> {
-    NOTES_STORE.with_lock(app_data_dir, || {
-        let store: SshKeyNoteStore = NOTES_STORE.load_unlocked(app_data_dir)?;
-        Ok(store.notes)
-    })
+impl FingerprintSidecar for SshKeyNoteStore {
+    type Value = String;
+    const STORE: JsonStore = NOTES_STORE;
+    const ATTACH_FAILURE: &'static str = "SSH 키 메모를 읽지 못해 메모 없이 표시합니다";
+
+    fn table_mut(&mut self) -> &mut BTreeMap<String, String> {
+        &mut self.notes
+    }
+
+    fn into_table(self) -> BTreeMap<String, String> {
+        self.notes
+    }
+}
+
+fn attach_notes(snapshot: &mut SshKeysSnapshot, app_data_dir: &Path) {
+    attach_sidecar::<SshKeyNoteStore>(snapshot, app_data_dir, |key, note| key.note = note);
+}
+
+fn edit_notes(
+    app_data_dir: &Path,
+    edit: impl FnOnce(&mut BTreeMap<String, String>) -> Result<bool, CoreError>,
+) -> Result<bool, CoreError> {
+    edit_sidecar::<SshKeyNoteStore>(app_data_dir, edit)
 }
 
 fn remove_note(app_data_dir: &Path, fingerprint: &str) -> Result<bool, CoreError> {
-    NOTES_STORE.with_lock(app_data_dir, || {
-        let mut store: SshKeyNoteStore = NOTES_STORE.load_unlocked(app_data_dir)?;
-        if store.notes.remove(fingerprint).is_none() {
-            return Ok(false);
-        }
-        NOTES_STORE.save_unlocked(app_data_dir, &store)?;
-        Ok(true)
-    })
+    remove_from_sidecar::<SshKeyNoteStore>(app_data_dir, fingerprint)
 }
 
 /// 키 파일 이름 본체(확장자를 뗀 부분)가 `~/.ssh` 직접 하위에서 허용된 모양인지 본다.
@@ -1347,6 +1639,60 @@ mod tests {
         .is_err());
     }
 
+    /// C9-2/C9-3. 설치된 진짜 `ssh-keygen`으로 끝까지 돌려 본다. 이 경로는 가짜로 대신할
+    /// 수 없다 — 실행 환경을 통째로 비우면 Windows의 `System32\OpenSSH\ssh-keygen.exe`가
+    /// 아무 진단도 없이 255로 끝나는데, 그 회귀는 실제 실행으로만 드러난다.
+    #[test]
+    fn c9_generation_runs_the_real_keygen_with_a_usable_environment() {
+        let Ok(executable) = crate::providers::resolve_named_executable(&["ssh-keygen"]) else {
+            // 이 기기에 ssh-keygen이 없으면 검증할 대상이 없다.
+            return;
+        };
+        let home = tempfile::tempdir().expect("home");
+
+        let view = generate_ssh_key_with(
+            home.path(),
+            &executable,
+            GenerateSshKeyRequest {
+                file_name: "id_example".to_owned(),
+                comment: "agent-manager".to_owned(),
+            },
+        )
+        .expect("real ssh-keygen must produce a key pair");
+
+        assert_eq!(view.file_name, "id_example.pub");
+        assert_eq!(view.algorithm, "ED25519");
+        assert!(view.has_private_key);
+        assert!(home.path().join(".ssh/id_example").is_file());
+        assert!(home.path().join(".ssh/id_example.pub").is_file());
+        // staging 폴더는 성공 경로에서도 남지 않는다.
+        assert!(!fs::read_dir(home.path().join(".ssh"))
+            .expect("ssh root")
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".agent-manager-key-")));
+    }
+
+    /// 실패 사유는 종료 코드를 항상 달고 나간다. Windows의 `ssh-keygen`은 환경이 망가지면
+    /// 아무 말 없이 255로 끝나기 때문에, 코드가 유일한 단서일 때가 있다.
+    #[test]
+    fn c9_generation_failure_message_always_carries_the_exit_code() {
+        let quiet = keygen_failure_message(Some(255), "");
+        assert!(quiet.contains("종료 코드 255"), "{quiet}");
+
+        let detailed = keygen_failure_message(Some(1), "Saving key failed: Permission denied");
+        assert!(detailed.contains("종료 코드 1"), "{detailed}");
+        assert!(
+            detailed.ends_with("Saving key failed: Permission denied"),
+            "{detailed}"
+        );
+
+        // 신호로 죽어 종료 코드가 없는 경우에도 문구는 남는다.
+        assert!(keygen_failure_message(None, "").contains("종료 코드 없음"));
+    }
+
     /// C9-7. 삭제는 지우는 것이 아니라 옮기는 것이다. 개인키는 열지 않은 채 이름만
     /// 바뀌므로 내용이 그대로 남아 사용자가 되돌릴 수 있다.
     #[test]
@@ -1466,6 +1812,8 @@ mod tests {
         )
         .expect("delete");
         assert!(receipt.note_removed);
-        assert!(load_notes(app_data.path()).expect("notes").is_empty());
+        assert!(load_sidecar::<SshKeyNoteStore>(app_data.path())
+            .expect("notes")
+            .is_empty());
     }
 }

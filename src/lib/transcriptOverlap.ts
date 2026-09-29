@@ -7,13 +7,26 @@
  */
 
 /** 라이브 스트림이 이미 보여 주는 구간의 시작 시각(epoch ms). 스트림이 비면 null. */
-export function liveStreamBoundaryMs(turns: { startedAt: number }[]): number | null {
+export function liveStreamBoundaryMs(turns: readonly { startedAt: number }[]): number | null {
   let boundary: number | null = null;
   for (const turn of turns) {
-    if (!Number.isFinite(turn.startedAt)) continue;
-    if (boundary === null || turn.startedAt < boundary) boundary = turn.startedAt;
+    boundary = earlierFiniteTime(boundary, turn.startedAt);
   }
   return boundary;
+}
+
+/** 현재 경계보다 이른 유효 시각. 아직 경계가 없으면 첫 유효 시각을 경계로 삼는다. */
+function earlierFiniteTime(current: number | null, candidate: number): number | null {
+  if (!Number.isFinite(candidate)) return current;
+  return current === null || candidate < current ? candidate : current;
+}
+
+/** 라이브 스트림 경계와 처음 겹치는 트랜스크립트 항목의 위치. */
+function firstLiveItemIndex<Item extends { timestamp: number | null }>(
+  items: readonly Item[],
+  boundaryMs: number,
+): number {
+  return items.findIndex((item) => item.timestamp !== null && item.timestamp >= boundaryMs);
 }
 
 /**
@@ -26,6 +39,6 @@ export function transcriptBeforeLiveStream<Item extends { timestamp: number | nu
   boundaryMs: number | null,
 ): Item[] {
   if (boundaryMs === null) return items;
-  const cut = items.findIndex((item) => item.timestamp !== null && item.timestamp >= boundaryMs);
+  const cut = firstLiveItemIndex(items, boundaryMs);
   return cut < 0 ? items : items.slice(0, cut);
 }

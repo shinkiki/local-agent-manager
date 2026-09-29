@@ -10,7 +10,7 @@ export interface UiCursorState {
 }
 
 /**
- * 아이아 커서. 요소를 눌러 달라는 요청이 오면 마지막 위치에서 대상까지 미끄러져 가서 누른다.
+ * AIA 커서. 요소를 눌러 달라는 요청이 오면 마지막 위치에서 대상까지 미끄러져 가서 누른다.
  * 화면 조작을 막지 않도록 포인터 이벤트를 받지 않고, 이동은 CSS transition에 맡긴다.
  */
 export function UiCursor({ state }: { state: UiCursorState }) {

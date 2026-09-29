@@ -1,139 +1,39 @@
-import type {
-  ChatModelCatalogOption,
-  ProviderId,
-  ScheduleWorkflowBinding,
-  SystemWorkflowSummary,
-  WorkflowInputField,
-} from "../types";
-
-export type WorkflowInputEntries = [string, WorkflowInputField][];
-
-export type WorkflowInputChoice = { value: string; label: string };
-
-export type WorkflowModelCatalogs = Partial<Record<ProviderId, readonly ChatModelCatalogOption[]>>;
-
-/** 예약 워크플로 계약이 모델 선택으로 해석하는 입력 이름과 공급자. */
-const WORKFLOW_MODEL_INPUT_PROVIDERS = {
-  claudeModel: "claude",
-  codexModel: "codex",
-  antigravityModel: "antigravity",
-} as const satisfies Record<string, ProviderId>;
-
-/** 페이싱 계약에서 공급자 모델 ID를 받는 예약 입력 이름. */
-export function workflowModelInputProvider(name: string): ProviderId | null {
-  return Object.prototype.hasOwnProperty.call(WORKFLOW_MODEL_INPUT_PROVIDERS, name)
-    ? WORKFLOW_MODEL_INPUT_PROVIDERS[name as keyof typeof WORKFLOW_MODEL_INPUT_PROVIDERS]
-    : null;
-}
+import type { ScheduleWorkflowBinding, SystemWorkflowSummary } from "../types";
+import { joinSummary } from "./sequence.ts";
+import { missingRequiredInputNames, workflowInputEntries } from "./scheduleWorkflowInputs.ts";
 
 /**
- * 이 입력 이름이 고르게 하는 모델 목록. 모델 입력이 아니면 null이고, 아직 못 읽은
- * 공급자는 빈 목록이다 — 선택지 만들기와 저장 전 검사가 같은 목록을 봐야 "목록에
- * 없는 값"이라는 판정이 화면과 어긋나지 않는다.
+ * 예약에 묶인 워크플로를 다루는 규칙 — 지금 그대로 실행할 수 있는지, 그리고 카드 한 줄에
+ * 어떻게 적는지.
+ *
+ * 계약이 선언한 입력 자체를 다루는 규칙(모델 입력 어휘·선택지, 폼 문자열과 인자 사이의
+ * 왕복, 필수 입력 찾기)은 `scheduleWorkflowInputs.ts`가 맡는다. 화면 네 곳이 두 무리를
+ * 섞어 이 이름으로 가져다 쓰고 있으므로, 입력 쪽 API는 여기서 다시 내보낸다 — 다만
+ * 그 화면들이 실제로 이 이름으로 가져다 쓰는 것만 내보낸다. 창구에 이름을 더 열어 두면
+ * 같은 규칙을 두 경로로 가져올 수 있게 되어, 나중에 입력 쪽으로 옮겨야 할 코드가
+ * 어느 파일의 계약인지 import 문만 보고는 갈리지 않는다.
  */
-function workflowModelCatalog(
-  name: string,
-  catalogs: WorkflowModelCatalogs,
-): readonly ChatModelCatalogOption[] | null {
-  const provider = workflowModelInputProvider(name);
-  return provider ? catalogs[provider] ?? [] : null;
-}
 
-/** 모델 표시명과 실제 저장 ID를 함께 보여 주는 select 선택지. */
-export function workflowModelInputChoices(
-  name: string,
-  catalogs: WorkflowModelCatalogs,
-): WorkflowInputChoice[] | null {
-  const catalog = workflowModelCatalog(name, catalogs);
-  if (!catalog) return null;
-  return catalog.map((option) => ({
-    value: option.model,
-    label: option.displayName === option.model
-      ? option.model
-      : `${option.displayName} · ${option.model}`,
-  }));
-}
+export {
+  buildWorkflowArguments,
+  validateWorkflowModelInputs,
+  workflowInputDefaults,
+  workflowInputEntries,
+  workflowInputsFromArguments,
+  workflowModelInputChoices,
+  workflowModelInputIsMultiple,
+} from "./scheduleWorkflowInputs.ts";
 
-/** 표시명·공백·폐기된 ID가 모델 인자로 저장되기 전에 목록 선택을 강제한다. */
-export function validateWorkflowModelInputs(
-  schema: WorkflowInputEntries,
-  inputs: Record<string, string>,
-  catalogs: WorkflowModelCatalogs,
-): string[] {
+/** 워크플로 등록 승인 버전과 카탈로그 호환성에 문제가 있는지 판정한다. */
+function validateWorkflowEligibility(workflow: SystemWorkflowSummary): string[] {
   const problems: string[] = [];
-  for (const [name, field] of schema) {
-    const catalog = workflowModelCatalog(name, catalogs);
-    const value = inputs[name] ?? "";
-    if (!catalog || !value.trim()) continue;
-    if (!catalog.some((option) => option.model === value)) {
-      problems.push(`모델 목록에서 다시 선택하세요: ${field.label?.trim() || name}.`);
-    }
+  if (typeof workflow.version !== "number" || workflow.version <= 0) {
+    problems.push("워크플로 승인 버전을 확인할 수 없습니다.");
+  }
+  if (!workflow.compatible) {
+    problems.push("현재 카탈로그와 호환되지 않는 워크플로입니다. AIA가 다시 등록해야 합니다.");
   }
   return problems;
-}
-
-/** 계약이 선언한 입력 필드. 없거나 아직 못 읽은 워크플로는 빈 목록이다. */
-export function workflowInputEntries(
-  workflow: SystemWorkflowSummary | null | undefined,
-): WorkflowInputEntries {
-  return Object.entries(workflow?.inputSchema ?? {});
-}
-
-/**
- * 폼은 값을 문자열로 들고 있으므로 계약이 선언한 형으로 되돌린다. 필수가 아닌 빈 값은
- * 보내지 않아 워크플로가 선언한 기본 동작을 그대로 쓰게 한다.
- */
-export function buildWorkflowArguments(
-  schema: WorkflowInputEntries,
-  inputs: Record<string, string>,
-): Record<string, unknown> {
-  const args: Record<string, unknown> = {};
-  for (const [name, field] of schema) {
-    const raw = inputs[name] ?? "";
-    if (field.type === "boolean") {
-      if (raw === "" && !field.required) continue;
-      args[name] = raw === "true";
-      continue;
-    }
-    if (raw.trim() === "") {
-      if (!field.required) continue;
-      args[name] = raw;
-      continue;
-    }
-    args[name] = field.type === "number" ? Number(raw) : raw;
-  }
-  return args;
-}
-
-/**
- * 저장된 인자를 폼이 쓰는 문자열 값으로 되돌린다. 계약에서 사라진 이름은 버려서, 수정
- * 화면이 지금 계약에 없는 입력을 다시 저장하지 않게 한다.
- */
-export function workflowInputsFromArguments(
-  schema: WorkflowInputEntries,
-  args: Record<string, unknown> | null | undefined,
-): Record<string, string> {
-  const inputs: Record<string, string> = {};
-  for (const [name, field] of schema) {
-    const value = args?.[name];
-    if (value === undefined || value === null) continue;
-    inputs[name] = field.type === "boolean" ? String(value === true) : String(value);
-  }
-  return inputs;
-}
-
-/**
- * 계약이 선언한 기본값을 폼 값으로 되돌린다. 값이 매번 같은 워크플로는 상세를 열자마자
- * 실행할 수 있어야 하므로, 화면은 빈 폼이 아니라 이 값에서 시작한다. 기본값이 없는
- * 입력은 빈 칸으로 남겨 무엇을 채워야 하는지 그대로 보이게 한다.
- */
-export function workflowInputDefaults(schema: WorkflowInputEntries): Record<string, string> {
-  const defaults: Record<string, unknown> = {};
-  for (const [name, field] of schema) {
-    if (field.defaultValue === undefined || field.defaultValue === null) continue;
-    defaults[name] = field.defaultValue;
-  }
-  return workflowInputsFromArguments(schema, defaults);
 }
 
 /**
@@ -145,18 +45,11 @@ export function validateScheduleWorkflowDraft(draft: {
   workflow: SystemWorkflowSummary | null | undefined;
   inputs: Record<string, string>;
 }): string[] {
-  const problems: string[] = [];
   const workflow = draft.workflow;
   if (!workflow) return ["실행할 워크플로를 선택하세요."];
-  if (typeof workflow.version !== "number" || workflow.version <= 0) {
-    problems.push("워크플로 승인 버전을 확인할 수 없습니다.");
-  }
-  if (!workflow.compatible) {
-    problems.push("현재 카탈로그와 호환되지 않는 워크플로입니다. AIA가 다시 등록해야 합니다.");
-  }
-  const missing = workflowInputEntries(workflow)
-    .filter(([name, field]) => field.required && field.type !== "boolean" && !(draft.inputs[name] ?? "").trim())
-    .map(([name]) => name);
+
+  const problems = validateWorkflowEligibility(workflow);
+  const missing = missingRequiredInputNames(workflowInputEntries(workflow), draft.inputs);
   if (missing.length > 0) problems.push(`필수 입력이 비어 있습니다: ${missing.join(", ")}`);
   return problems;
 }
@@ -171,8 +64,7 @@ export function describeScheduleWorkflow(
 ): string {
   const known = workflows.find((workflow) => workflow.id === binding.workflowId);
   const head = `워크플로 ${known?.displayName ?? binding.workflowId} v${binding.approvedVersion}`;
-  const blocker = scheduleWorkflowBlocker(binding, known);
-  return blocker ? `${head} · ${blocker}` : head;
+  return joinSummary([head, scheduleWorkflowBlocker(binding, known)]);
 }
 
 /**

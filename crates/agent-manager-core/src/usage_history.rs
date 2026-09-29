@@ -17,7 +17,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::accounts::{AccountUsageStatus, AccountUsageView};
+use crate::accounts::{AccountUsageStatus, AccountUsageView, AccountUsageWindow};
 use crate::app_data_file::write_private_json;
 use crate::clock::now_ms;
 use crate::store_lock;
@@ -100,6 +100,74 @@ impl Default for HistoryStore {
     }
 }
 
+impl UsageCycleRecord {
+    /// 관측된 초기화 시각이 이 레코드의 허용 오차 내 같은 주기를 가리키는지 확인한다.
+    fn matches_cycle(&self, window_label: &str, resets_at: i64, tolerance: i64) -> bool {
+        self.window_label == window_label && (self.resets_at - resets_at).abs() <= tolerance
+    }
+
+    /// 동일 주기의 새 관측값으로 최대 소진율과 관측 시각을 갱신한다.
+    fn record_observation(&mut self, used_percent: f64, resets_at: i64, at: i64) {
+        self.peak_used_percent = self.peak_used_percent.max(used_percent);
+        self.resets_at = resets_at;
+        self.first_observed_at = self.first_observed_at.min(at);
+        self.last_observed_at = self.last_observed_at.max(at);
+    }
+}
+
+/// 이력에 남길 수 있는 창이면 주기 길이와 초기화 시각을 돌려준다.
+fn tracked_cycle_timing(window: &AccountUsageWindow) -> Option<(i64, i64)> {
+    let window_length_ms = window_label_length_ms(&window.label)?;
+    if window_length_ms < MIN_TRACKED_WINDOW_MS {
+        return None;
+    }
+    // 초기화 시각이 없는 창은 아직 시작되지 않은 창이다(소비 0). 남길 주기가 없다.
+    Some((window_length_ms, window.resets_at?))
+}
+
+impl AccountSeries {
+    /// 단일 사용량 창 관측을 계정 이력에 반영한다.
+    fn apply_window(&mut self, window: &AccountUsageWindow, at: i64) {
+        let Some((window_length_ms, resets_at)) = tracked_cycle_timing(window) else {
+            return;
+        };
+        let tolerance = SAME_CYCLE_TOLERANCE_MS.min(window_length_ms / 4);
+        if let Some(existing) = self
+            .cycles
+            .iter_mut()
+            .find(|cycle| cycle.matches_cycle(&window.label, resets_at, tolerance))
+        {
+            existing.record_observation(window.used_percent, resets_at, at);
+            return;
+        }
+        self.cycles.push(UsageCycleRecord {
+            window_label: window.label.clone(),
+            window_length_ms,
+            resets_at,
+            peak_used_percent: window.used_percent.clamp(0.0, 100.0),
+            first_observed_at: at,
+            last_observed_at: at,
+        });
+    }
+
+    /// 보관 한도를 초과한 오래된 주기 레코드를 정리한다.
+    fn trim_excess_cycles(&mut self) {
+        self.cycles.sort_by_key(|cycle| cycle.resets_at);
+        if self.cycles.len() > MAX_RECORDS_PER_ACCOUNT {
+            let excess = self.cycles.len() - MAX_RECORDS_PER_ACCOUNT;
+            self.cycles.drain(..excess);
+        }
+    }
+
+    fn to_account_history(&self, account_id: &str) -> AccountUsageHistory {
+        AccountUsageHistory {
+            account_id: account_id.to_owned(),
+            observed_since: self.observed_since,
+            cycles: self.cycles.clone(),
+        }
+    }
+}
+
 fn with_store_lock<T>(
     app_data_dir: &Path,
     action: impl FnOnce() -> Result<T, CoreError>,
@@ -108,35 +176,36 @@ fn with_store_lock<T>(
     action()
 }
 
-/// 저장소를 읽는다. 파일이 없으면 페이싱 표본으로 첫 이력을 만든다 — 이 저장소가
-/// 생기기 전에도 표본은 며칠치 남아 있어, 진행 중인 주기의 관측을 이어받을 수 있다.
-/// 이력은 파생 데이터라 읽기 실패는 새 저장소로 대신하고 갱신을 막지 않는다.
-fn load_store(app_data_dir: &Path) -> HistoryStore {
-    let path = app_data_dir.join(STORE_FILE);
-    if !path.is_file() {
-        let mut store = HistoryStore::default();
-        for sample in crate::usage_pacing::export_samples(app_data_dir) {
-            let usage = AccountUsageView {
-                status: AccountUsageStatus::Ok,
-                windows: vec![crate::accounts::AccountUsageWindow {
-                    label: sample.window_label,
-                    used_percent: sample.used_percent,
-                    resets_at: sample.resets_at,
-                    ..Default::default()
-                }],
-                updated_at: Some(sample.at),
-                error: None,
-                retry_at: None,
-                rate_limited: false,
-                token_refresh_limited: false,
-                token_refresh_throttle_streak: 0,
-                reset_credits: None,
-            };
-            apply_usage(&mut store, &sample.account_id, &usage, sample.at);
-        }
-        return store;
+fn sample_to_usage_view(sample: &crate::usage_pacing::ExportedSample) -> AccountUsageView {
+    AccountUsageView {
+        status: AccountUsageStatus::Ok,
+        windows: vec![crate::accounts::AccountUsageWindow {
+            label: sample.window_label.clone(),
+            used_percent: sample.used_percent,
+            resets_at: sample.resets_at,
+            ..Default::default()
+        }],
+        updated_at: Some(sample.at),
+        error: None,
+        retry_at: None,
+        rate_limited: false,
+        token_refresh_limited: false,
+        token_refresh_throttle_streak: 0,
+        reset_credits: None,
     }
-    let bytes = match fs::read(&path) {
+}
+
+fn seed_store_from_pacing(app_data_dir: &Path) -> HistoryStore {
+    let mut store = HistoryStore::default();
+    for sample in crate::usage_pacing::export_samples(app_data_dir) {
+        let usage = sample_to_usage_view(&sample);
+        apply_usage(&mut store, &sample.account_id, &usage, sample.at);
+    }
+    store
+}
+
+fn read_store_file(path: &Path) -> HistoryStore {
+    let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!("[usage-history] 이력 저장소를 읽지 못해 새로 시작합니다: {error}");
@@ -153,8 +222,40 @@ fn load_store(app_data_dir: &Path) -> HistoryStore {
     }
 }
 
+/// 저장소를 읽는다. 파일이 없으면 페이싱 표본으로 첫 이력을 만든다 — 이 저장소가
+/// 생기기 전에도 표본은 며칠치 남아 있어, 진행 중인 주기의 관측을 이어받을 수 있다.
+/// 이력은 파생 데이터라 읽기 실패는 새 저장소로 대신하고 갱신을 막지 않는다.
+fn load_store(app_data_dir: &Path) -> HistoryStore {
+    let path = app_data_dir.join(STORE_FILE);
+    if !path.is_file() {
+        return seed_store_from_pacing(app_data_dir);
+    }
+    read_store_file(&path)
+}
+
 fn save_store(app_data_dir: &Path, store: &HistoryStore) -> Result<(), CoreError> {
     write_private_json(&app_data_dir.join(STORE_FILE), store)
+}
+
+/// 이력을 고치는 갈래는 모두 같은 모양이다 — 잠금을 쥐고 읽어 고친 뒤, 바뀐 것이 있을
+/// 때만 다시 쓰고, 실패는 호출한 갱신을 실패시키지 않고 경고만 남긴다(이력은 파생
+/// 데이터다). `change`가 `false`를 돌려주면 파일을 다시 쓰지 않는다. 실패 문구는
+/// 성공하는 대부분의 호출에서 만들지 않도록 클로저로 받는다.
+fn update_store(
+    app_data_dir: &Path,
+    failure: impl FnOnce() -> String,
+    change: impl FnOnce(&mut HistoryStore) -> bool,
+) {
+    let result = with_store_lock(app_data_dir, || {
+        let mut store = load_store(app_data_dir);
+        if !change(&mut store) {
+            return Ok(());
+        }
+        save_store(app_data_dir, &store)
+    });
+    if let Err(error) = result {
+        eprintln!("[usage-history] {}: {error}", failure());
+    }
 }
 
 /// 성공한 사용량 조회 하나를 이력에 반영한다. 순수 함수라 시험이 시각을 직접 준다.
@@ -171,40 +272,9 @@ fn apply_usage(store: &mut HistoryStore, account_id: &str, usage: &AccountUsageV
         });
     series.observed_since = series.observed_since.min(at);
     for window in &usage.windows {
-        let Some(window_length_ms) = window_label_length_ms(&window.label) else {
-            continue;
-        };
-        if window_length_ms < MIN_TRACKED_WINDOW_MS {
-            continue;
-        }
-        // 초기화 시각이 없는 창은 아직 시작되지 않은 창이다(소비 0). 남길 주기가 없다.
-        let Some(resets_at) = window.resets_at else {
-            continue;
-        };
-        let tolerance = SAME_CYCLE_TOLERANCE_MS.min(window_length_ms / 4);
-        if let Some(existing) = series.cycles.iter_mut().find(|cycle| {
-            cycle.window_label == window.label && (cycle.resets_at - resets_at).abs() <= tolerance
-        }) {
-            existing.peak_used_percent = existing.peak_used_percent.max(window.used_percent);
-            existing.resets_at = resets_at;
-            existing.first_observed_at = existing.first_observed_at.min(at);
-            existing.last_observed_at = existing.last_observed_at.max(at);
-        } else {
-            series.cycles.push(UsageCycleRecord {
-                window_label: window.label.clone(),
-                window_length_ms,
-                resets_at,
-                peak_used_percent: window.used_percent.clamp(0.0, 100.0),
-                first_observed_at: at,
-                last_observed_at: at,
-            });
-        }
+        series.apply_window(window, at);
     }
-    series.cycles.sort_by_key(|cycle| cycle.resets_at);
-    if series.cycles.len() > MAX_RECORDS_PER_ACCOUNT {
-        let excess = series.cycles.len() - MAX_RECORDS_PER_ACCOUNT;
-        series.cycles.drain(..excess);
-    }
+    series.trim_excess_cycles();
 }
 
 /// 사용량 갱신이 계정 레코드에 반영된 직후 호출한다. 실패는 갱신을 실패시키지 않고
@@ -214,28 +284,23 @@ pub(crate) fn record_usage(app_data_dir: &Path, account_id: &str, usage: &Accoun
         return;
     }
     let at = usage.updated_at.unwrap_or_else(now_ms);
-    let result = with_store_lock(app_data_dir, || {
-        let mut store = load_store(app_data_dir);
-        apply_usage(&mut store, account_id, usage, at);
-        save_store(app_data_dir, &store)
-    });
-    if let Err(error) = result {
-        eprintln!("[usage-history] 계정 {account_id} 사용량 이력을 남기지 못했습니다: {error}");
-    }
+    update_store(
+        app_data_dir,
+        || format!("계정 {account_id} 사용량 이력을 남기지 못했습니다"),
+        |store| {
+            apply_usage(store, account_id, usage, at);
+            true
+        },
+    );
 }
 
 /// 계정 등록을 지울 때 그 계정의 이력도 함께 지운다.
 pub(crate) fn remove_account(app_data_dir: &Path, account_id: &str) {
-    let result = with_store_lock(app_data_dir, || {
-        let mut store = load_store(app_data_dir);
-        if store.accounts.remove(account_id).is_none() {
-            return Ok(());
-        }
-        save_store(app_data_dir, &store)
-    });
-    if let Err(error) = result {
-        eprintln!("[usage-history] 계정 {account_id} 사용량 이력을 지우지 못했습니다: {error}");
-    }
+    update_store(
+        app_data_dir,
+        || format!("계정 {account_id} 사용량 이력을 지우지 못했습니다"),
+        |store| store.accounts.remove(account_id).is_some(),
+    );
 }
 
 /// 등록된 계정들의 이력. `account_ids`에 없는 계정(지워졌거나 아직 정리되지 않은
@@ -252,11 +317,7 @@ pub(crate) fn snapshot(
                 store
                     .accounts
                     .get(account_id)
-                    .map(|series| AccountUsageHistory {
-                        account_id: account_id.clone(),
-                        observed_since: series.observed_since,
-                        cycles: series.cycles.clone(),
-                    })
+                    .map(|series| series.to_account_history(account_id))
             })
             .collect(),
     })

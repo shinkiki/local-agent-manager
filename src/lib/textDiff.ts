@@ -4,7 +4,7 @@
  * 상한 있는 비용을 우선한다.
  */
 
-export type DiffLineKind = "same" | "add" | "remove";
+type DiffLineKind = "same" | "add" | "remove";
 
 export interface DiffLine {
   kind: DiffLineKind;
@@ -15,7 +15,7 @@ export interface DiffLine {
   after?: number;
 }
 
-export type DiffRow = DiffLine | { kind: "skip"; count: number };
+type DiffRow = DiffLine | { kind: "skip"; count: number };
 
 /** LCS 표를 채울 최대 셀 수. 넘으면 공통 접두·접미만 접고 가운데는 통째로 바꾼다. */
 const MAX_LCS_CELLS = 4_000_000;
@@ -142,18 +142,20 @@ export function collapseUnchanged(lines: DiffLine[], context = 3): DiffRow[] {
   });
   const out: DiffRow[] = [];
   let skipped = 0;
+  const flushSkipped = () => {
+    if (skipped === 0) return;
+    out.push({ kind: "skip", count: skipped });
+    skipped = 0;
+  };
   lines.forEach((line, index) => {
     if (keep[index]) {
-      if (skipped > 0) {
-        out.push({ kind: "skip", count: skipped });
-        skipped = 0;
-      }
+      flushSkipped();
       out.push(line);
     } else {
       skipped += 1;
     }
   });
-  if (skipped > 0) out.push({ kind: "skip", count: skipped });
+  flushSkipped();
   return out;
 }
 

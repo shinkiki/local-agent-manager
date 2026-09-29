@@ -1,4 +1,5 @@
-import { ChevronDown, ChevronUp, RefreshCw } from "lucide-react";
+import type { KeyboardEvent } from "react";
+import { RefreshCw } from "lucide-react";
 import { useI18n } from "../lib/i18n";
 import { nearestUsageReset, sidebarUsageError, sidebarUsageMeters } from "../lib/sidebarUsage";
 import type { SidebarUsageDensity, SidebarUsageMeter, SidebarUsageSource, SidebarUsageWindowMeter } from "../lib/sidebarUsage";
@@ -66,8 +67,12 @@ function StatusbarUsageWindow({ window }: { window: SidebarUsageWindowMeter }) {
 }
 
 /**
- * 화면 하단 상태바. 사이드바 폭을 늘리지 않도록 셸 전체 폭의 한 줄로 두고, 접기·펴기는
- * 맨 왼쪽, 새로고침은 맨 오른쪽에 고정한다. 펼치면 줄 위로 계정별 진행바 카드가 열린다.
+ * 화면 하단 상태바. 사이드바 폭을 늘리지 않도록 셸 전체 폭의 한 줄로 두고, 새로고침만
+ * 맨 오른쪽에 고정한다. 펼치면 줄 위로 계정별 진행바 카드가 열린다.
+ *
+ * 접기·펴기는 전용 버튼 대신 상태바 어느 자리를 눌러도 뒤집힌다. 좁은 폭에서 한 줄이 꽉
+ * 차도 누를 자리를 찾지 않아도 되고, 줄 안에 남는 버튼은 새로고침 하나뿐이라 클릭 목표가
+ * 겹치지 않는다. 새로고침만 전파를 끊어, 그 버튼을 눌렀을 때 밀도까지 바뀌지 않게 한다.
  *
  * 미터·초기화 시각·오류 판정은 모두 같은 사용량 출처 한 벌에서 나오므로, App 셸이 그 셋을
  * 따로 계산해 넘기는 대신 출처만 받아 여기서 파생한다. 상태바가 무엇을 읽는지가 한 파일에
@@ -95,6 +100,7 @@ export function AppStatusbar({ sources, providers, platform, architecture, densi
     error: text("오류", "Error"),
     windowUnavailable: text("확인 불가", "Unknown"),
     resetsIn: (countdown) => text(`${countdown} 뒤 초기화`, `resets in ${countdown}`),
+    unlimited: text("무제한 · 로컬", "Unlimited · local"),
   }, density);
   const nearestReset = nearestUsageReset(sources, now);
   const usageError = sidebarUsageError(sources);
@@ -102,13 +108,30 @@ export function AppStatusbar({ sources, providers, platform, architecture, densi
     ? text("사용량 상세정보 접기", "Collapse usage details")
     : text("사용량 상세정보 펴기", "Expand usage details");
   const refreshLabel = text("CLI 연결과 사용량 새로고침", "Refresh CLI connections and usage");
+  const toggleable = meters.length > 0;
+  const toggleDensity = () => onDensityChange(detailed ? "compact" : "detailed");
 
   return (
-    <footer className={`app-statusbar ${density}`} aria-label={text("CLI 연결과 사용량 상태바", "CLI connection and usage status bar")}>
+    <footer
+      className={`app-statusbar ${density}${toggleable ? " toggleable" : ""}`}
+      aria-label={text("CLI 연결과 사용량 상태바", "CLI connection and usage status bar")}
+      {...(toggleable ? {
+        tabIndex: 0,
+        title: densityLabel,
+        "aria-expanded": detailed,
+        "aria-controls": "statusbar-usage-details",
+        onClick: toggleDensity,
+        onKeyDown: (event: KeyboardEvent<HTMLElement>) => {
+          if (event.key !== "Enter" && event.key !== " ") return;
+          event.preventDefault();
+          toggleDensity();
+        },
+      } : {})}
+    >
       {detailed && meters.length > 0 && <div
         className="statusbar-details"
         id="statusbar-usage-details"
-        aria-label={text("기본 또는 홈 계정별 사용량 상세", "Usage details by default or home account")}
+        aria-label={text("활성 또는 홈 계정별 사용량 상세", "Usage details by active or home account")}
       >
         {meters.map((meter) => (
           <div className="statusbar-usage-card" key={meter.key} title={meter.title}>
@@ -118,18 +141,9 @@ export function AppStatusbar({ sources, providers, platform, architecture, densi
         ))}
       </div>}
       <div className="statusbar-line">
-        {meters.length > 0 && <button
-          className="icon-button compact statusbar-density"
-          type="button"
-          aria-expanded={detailed}
-          aria-controls="statusbar-usage-details"
-          aria-label={densityLabel}
-          title={densityLabel}
-          onClick={() => onDensityChange(detailed ? "compact" : "detailed")}
-        >{detailed ? <ChevronDown size={13} aria-hidden="true" /> : <ChevronUp size={13} aria-hidden="true" />}</button>}
         {!detailed && meters.length > 0 && <div
           className="statusbar-usages"
-          aria-label={text("기본 또는 홈 계정별 사용량", "Usage by default or home account")}
+          aria-label={text("활성 또는 홈 계정별 사용량", "Usage by active or home account")}
         >
           {meters.map((meter) => (
             <span className="statusbar-usage" key={meter.key} title={meter.title}>
@@ -149,7 +163,7 @@ export function AppStatusbar({ sources, providers, platform, architecture, densi
           disabled={refreshing}
           aria-label={refreshLabel}
           title={refreshLabel}
-          onClick={onRefresh}
+          onClick={(event) => { event.stopPropagation(); onRefresh(); }}
         ><RefreshCw size={13} aria-hidden="true" /></button>
       </div>
     </footer>

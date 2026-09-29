@@ -40,16 +40,23 @@ pub(crate) fn truncate_chars_at_boundary(value: &str, max_chars: usize) -> Strin
         return value.to_owned();
     }
     let floor = max_chars * BOUNDARY_MIN_RATIO_PERCENT / 100;
-    let window = floor..max_chars;
-    let cut = window
-        .clone()
-        .rev()
-        .find(|index| is_sentence_break(&chars, *index))
-        .map(|index| index + 1)
-        .or_else(|| window.rev().find(|index| chars[*index].is_whitespace()))
-        .unwrap_or(max_chars);
+    let cut = find_boundary_cut(&chars, floor, max_chars);
     let kept = chars[..cut].iter().collect::<String>();
     format!("{}{ELLIPSIS}", kept.trim_end())
+}
+
+/// 상한 안에서 문장 끝을 먼저 찾고, 없으면 낱말 사이 공백을 찾는다.
+fn find_boundary_cut(chars: &[char], floor: usize, ceiling: usize) -> usize {
+    (floor..ceiling)
+        .rev()
+        .find(|index| is_sentence_break(chars, *index))
+        .map(|index| index + 1)
+        .or_else(|| {
+            (floor..ceiling)
+                .rev()
+                .find(|index| chars[*index].is_whitespace())
+        })
+        .unwrap_or(ceiling)
 }
 
 /// 문장을 닫는 부호이고 그 뒤가 공백(또는 글자 끝)인 자리인지. 뒤를 함께 보지 않으면

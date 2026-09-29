@@ -3,7 +3,7 @@
 // 올라오면 입력창이 화면 밖이 아니라 "키보드 뒤"에 남아 손댈 수 없게 된다. 여기서는 키보드가 가린
 // 높이만 순수 계산으로 뽑아, 화면 쪽에서 그만큼 바닥 여백으로 돌려놓을 수 있게 한다.
 
-export interface ViewportMetrics {
+interface ViewportMetrics {
   /** 레이아웃 뷰포트 높이(window.innerHeight). */
   layoutHeight: number;
   /** 키보드·브라우저 크롬을 뺀 실제로 보이는 높이(visualViewport.height). */
@@ -14,7 +14,7 @@ export interface ViewportMetrics {
   scale?: number;
 }
 
-export interface KeyboardInsetOptions {
+interface KeyboardInsetOptions {
   /** 이 높이 아래는 키보드가 아니라 주소창·툴바가 먹은 높이로 본다. */
   minimum?: number;
 }
@@ -54,17 +54,17 @@ export function watchKeyboardInset(view: Window = window): () => void {
     applied = next;
     target.style.setProperty("--keyboard-inset", `${next}px`);
   };
+  const listeners: ReadonlyArray<readonly [EventTarget, string]> = [
+    [viewport, "resize"],
+    [viewport, "scroll"],
+    [view, "resize"],
+    [view, "orientationchange"],
+  ];
 
   apply();
-  viewport.addEventListener("resize", apply);
-  viewport.addEventListener("scroll", apply);
-  view.addEventListener("resize", apply);
-  view.addEventListener("orientationchange", apply);
+  for (const [source, event] of listeners) source.addEventListener(event, apply);
   return () => {
-    viewport.removeEventListener("resize", apply);
-    viewport.removeEventListener("scroll", apply);
-    view.removeEventListener("resize", apply);
-    view.removeEventListener("orientationchange", apply);
+    for (const [source, event] of listeners) source.removeEventListener(event, apply);
     target.style.removeProperty("--keyboard-inset");
   };
 }

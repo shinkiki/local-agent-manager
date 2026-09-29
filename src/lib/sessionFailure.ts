@@ -17,6 +17,7 @@ const FAILURE_HEADS: Record<SessionFailureKind, string> = {
 export function sessionFailureTitle(failure: SessionLastFailure): string {
   const head = FAILURE_HEADS[failure.kind];
   const when = failure.occurredAt ? ` (${formatDate(failure.occurredAt)})` : "";
+  const summary = `${head}${when}`;
   const message = failure.message.trim();
-  return message ? `${head}${when}\n${message}` : `${head}${when}`;
+  return message ? `${summary}\n${message}` : summary;
 }

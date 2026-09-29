@@ -100,6 +100,10 @@ is_server_executable() {
 
 is_tauri_executable() {
   case "$1" in
+    "$REPO_ROOT/target/debug/agent-manager"|"$REPO_ROOT/target/release/agent-manager"|"$REPO_ROOT/target/release/bundle/macos/Agent Manager.app/Contents/MacOS/agent-manager"|"/Applications/Agent Manager.app/Contents/MacOS/agent-manager")
+      return 0
+      ;;
+    # 실행파일 이름을 바꾸기 전에 설치한 빌드도 이 저장소가 띄운 것이므로 같이 인정한다.
     "$REPO_ROOT/target/debug/agent-manager-tauri"|"$REPO_ROOT/target/release/agent-manager-tauri"|"$REPO_ROOT/target/release/bundle/macos/Agent Manager.app/Contents/MacOS/agent-manager-tauri"|"/Applications/Agent Manager.app/Contents/MacOS/agent-manager-tauri")
       return 0
       ;;
@@ -172,6 +176,9 @@ frontend_candidate_pids() {
   {
     lsof -nP -iTCP:"$FRONTEND_PORT" -sTCP:LISTEN -t 2>/dev/null || true
     for pattern in \
+      'target/debug/agent-manager' \
+      "$REPO_ROOT/target/release/bundle/macos/Agent Manager.app/Contents/MacOS/agent-manager" \
+      '/Applications/Agent Manager.app/Contents/MacOS/agent-manager' \
       'target/debug/agent-manager-tauri' \
       "$REPO_ROOT/target/release/bundle/macos/Agent Manager.app/Contents/MacOS/agent-manager-tauri" \
       '/Applications/Agent Manager.app/Contents/MacOS/agent-manager-tauri' \

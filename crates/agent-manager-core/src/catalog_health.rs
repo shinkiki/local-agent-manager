@@ -16,6 +16,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 use crate::clock::now_ms;
+use crate::domain::wire_enum;
 
 /// 마지막 성공 갱신이 이 시간을 넘기면 화면에 "오래된 목록"으로 알린다.
 pub const STALE_AFTER_MS: i64 = 5 * 60 * 1000;
@@ -29,55 +30,47 @@ pub enum ScanKind {
     Artifacts,
 }
 
+wire_enum!(trimmed ScanKind, "알 수 없는 스캔 종류입니다. skills|agents|artifacts 중 하나를 쓰세요", {
+    Skills => "skills",
+    Agents => "agents",
+    Artifacts => "artifacts",
+});
+
+/// 통신 문자열(`as_str`) 밖에서 종류마다 달라지는 값들.
+struct ScanKindMeta {
+    label: &'static str,
+    thread_name: &'static str,
+}
+
 impl ScanKind {
     #[cfg(test)]
     pub const ALL: [Self; 3] = [Self::Skills, Self::Agents, Self::Artifacts];
 
-    pub fn as_str(self) -> &'static str {
+    const fn meta(self) -> &'static ScanKindMeta {
         match self {
-            Self::Skills => "skills",
-            Self::Agents => "agents",
-            Self::Artifacts => "artifacts",
+            Self::Skills => &ScanKindMeta {
+                label: "스킬",
+                thread_name: "skill",
+            },
+            Self::Agents => &ScanKindMeta {
+                label: "에이전트",
+                thread_name: "agent",
+            },
+            Self::Artifacts => &ScanKindMeta {
+                label: "아티팩트",
+                thread_name: "artifact",
+            },
         }
     }
 
     /// 화면에 그대로 쓰는 이름.
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Skills => "스킬",
-            Self::Agents => "에이전트",
-            Self::Artifacts => "아티팩트",
-        }
+        self.meta().label
     }
 
     /// 스캔 스레드 이름에 쓰는 식별자.
     pub fn thread_name(self) -> &'static str {
-        match self {
-            Self::Skills => "skill",
-            Self::Agents => "agent",
-            Self::Artifacts => "artifact",
-        }
-    }
-}
-
-impl std::fmt::Display for ScanKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for ScanKind {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "skills" => Ok(Self::Skills),
-            "agents" => Ok(Self::Agents),
-            "artifacts" => Ok(Self::Artifacts),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 스캔 종류입니다: {s}. skills|agents|artifacts 중 하나를 쓰세요"
-            ))),
-        }
+        self.meta().thread_name
     }
 }
 
@@ -201,46 +194,46 @@ fn state() -> &'static Mutex<HealthState> {
     STATE.get_or_init(|| Mutex::new(HealthState::new(now_ms())))
 }
 
-/// 잠금이 깨져도 기록은 포기하고 본 작업을 계속한다. 상태 기록이 기능을 막으면 안 된다.
-fn with_state(update: impl FnOnce(&mut HealthState)) {
-    if let Ok(mut state) = state().lock() {
-        update(&mut state);
-    }
+/// 잠금이 깨져도 상태 접근은 포기하고 본 작업을 계속한다. 상태 기록이 기능을 막으면 안 된다.
+fn try_with_state<T>(access: impl FnOnce(&mut HealthState) -> T) -> Option<T> {
+    state().lock().ok().map(|mut state| access(&mut state))
+}
+
+/// 상태 기록은 보조 관측 기능이므로 잠금 실패를 호출부마다 처리하지 않고 여기서 버린다.
+fn update_state(update: impl FnOnce(&mut HealthState)) {
+    let _ = try_with_state(update);
 }
 
 pub(crate) fn begin_reconcile() {
-    with_state(HealthState::begin_reconcile);
+    update_state(HealthState::begin_reconcile);
 }
 
 pub(crate) fn finish_reconcile(outcome: Result<u64, String>) {
     let now = now_ms();
-    with_state(|state| state.finish_reconcile(now, outcome));
+    update_state(|state| state.finish_reconcile(now, outcome));
 }
 
 pub(crate) fn note_resource_scan(revision: u64) {
     let now = now_ms();
-    with_state(|state| state.note_resource_scan(now, revision));
+    update_state(|state| state.note_resource_scan(now, revision));
 }
 
 pub(crate) fn note_scan_timeout(kind: ScanKind, retry_after_ms: u128, message: String) {
     let retry_at = now_ms().saturating_add(i64::try_from(retry_after_ms).unwrap_or(i64::MAX));
-    with_state(|state| state.note_scan_timeout(kind, Some(retry_at), message));
+    update_state(|state| state.note_scan_timeout(kind, Some(retry_at), message));
 }
 
 pub(crate) fn note_scan_ok(kind: ScanKind) {
-    with_state(|state| state.note_scan_ok(kind));
+    update_state(|state| state.note_scan_ok(kind));
 }
 
 /// 화면이 읽는 현재 상태. 잠금이 깨진 경우에도 빈 값 대신 "확인 시각"은 채워 보낸다.
 pub fn health() -> CatalogHealth {
     let now = now_ms();
-    match state().lock() {
-        Ok(state) => state.view(now),
-        Err(_) => CatalogHealth {
-            checked_at: now,
-            ..CatalogHealth::default()
-        },
-    }
+    try_with_state(|state| state.view(now)).unwrap_or_else(|| CatalogHealth {
+        checked_at: now,
+        ..CatalogHealth::default()
+    })
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@ use crate::CoreError;
 /// 그보다 긴 구간의 나머지는 열린 것으로 본다.
 const MAX_SCAN_DAYS: usize = 400;
 /// 다음 제한 시작을 찾을 때 보는 일수. 요일이 하나만 켜져 있어도 8일 안에는 반드시 있다.
-const NEXT_BLOCK_SCAN_DAYS: i64 = 8;
+const NEXT_BLOCK_SCAN_DAYS: usize = 8;
 /// 월~일 표시 순서에 맞춘 요일 정본 표: `(저장 번호 0=일…6=토, 한글 이름)`.
 const DISPLAY_WEEKDAYS: [(usize, &str); 7] = [
     (1, "월"),
@@ -50,13 +50,7 @@ impl QuietSchedule {
                 "제한 시간대의 시간대(timezone)를 확인할 수 없습니다".to_owned(),
             )
         })?;
-        let mut weekdays = [false; 7];
-        for day in &hours.weekdays {
-            let slot = weekdays.get_mut(usize::from(*day)).ok_or_else(|| {
-                CoreError::InvalidInput("요일은 0(일)~6(토) 사이여야 합니다".to_owned())
-            })?;
-            *slot = true;
-        }
+        let weekdays = parse_weekdays(hours.weekdays.iter().copied())?;
         if !hours.enabled {
             return Ok(None);
         }
@@ -117,13 +111,22 @@ impl QuietSchedule {
         (end > start).then_some((start, end))
     }
 
+    /// 시작일부터 날짜·탐색 상한 안에서 실제로 존재하는 제한 구간만 순서대로 돌려준다.
+    fn segments_between(
+        &self,
+        start: Option<NaiveDate>,
+        last: Option<NaiveDate>,
+        limit: usize,
+    ) -> impl Iterator<Item = (i64, i64)> + '_ {
+        bounded_days(start, limit)
+            .take_while(move |day| last.is_none_or(|last| *day <= last))
+            .filter_map(|day| self.segment(day))
+    }
+
     /// `at`을 덮을 수 있는 구간은 전날 시작(자정 넘김)과 당일 시작 둘뿐이다.
     fn segment_covering(&self, at_ms: i64) -> Option<(i64, i64)> {
         let day = self.local_date(at_ms);
-        [day.pred_opt(), Some(day)]
-            .into_iter()
-            .flatten()
-            .filter_map(|day| self.segment(day))
+        self.segments_between(day.pred_opt().or(Some(day)), Some(day), 2)
             .find(|(start, end)| *start <= at_ms && at_ms < *end)
     }
 
@@ -149,9 +152,7 @@ impl QuietSchedule {
     /// `at` 이후 처음 시작하는 제한 구간의 시작. 화면의 "HH:MM에 멈춤" 표시용.
     pub(crate) fn next_block_start_after(&self, at_ms: i64) -> Option<i64> {
         let day = self.local_date(at_ms);
-        (0..NEXT_BLOCK_SCAN_DAYS)
-            .filter_map(|offset| day.checked_add_signed(Duration::days(offset)))
-            .filter_map(|day| self.segment(day))
+        self.segments_between(Some(day), None, NEXT_BLOCK_SCAN_DAYS)
             .map(|(start, _)| start)
             .find(|start| *start > at_ms)
     }
@@ -163,19 +164,14 @@ impl QuietSchedule {
         }
         let last = self.local_date(to_ms);
         // 전날 시작해 자정을 넘긴 구간이 `from`을 덮을 수 있어 하루 앞에서 시작한다.
-        let mut day = self.local_date(from_ms).pred_opt();
-        let mut blocked = 0i64;
-        let mut scanned = 0usize;
-        while let Some(current) = day {
-            if current > last || scanned >= MAX_SCAN_DAYS {
-                break;
-            }
-            if let Some((start, end)) = self.segment(current) {
-                blocked += overlap_ms(start, end, from_ms, to_ms);
-            }
-            day = current.succ_opt();
-            scanned += 1;
-        }
+        let blocked = self
+            .segments_between(
+                self.local_date(from_ms).pred_opt(),
+                Some(last),
+                MAX_SCAN_DAYS,
+            )
+            .map(|(start, end)| overlap_ms(start, end, from_ms, to_ms))
+            .sum::<i64>();
         (to_ms - from_ms - blocked).max(0)
     }
 
@@ -198,6 +194,11 @@ impl QuietSchedule {
     }
 }
 
+/// 시작일부터 하루씩 나아가되 날짜 표현 범위와 호출자가 정한 탐색 상한을 넘지 않는다.
+fn bounded_days(start: Option<NaiveDate>, limit: usize) -> impl Iterator<Item = NaiveDate> {
+    std::iter::successors(start, |day| day.succ_opt()).take(limit)
+}
+
 /// `HH:MM`을 하루 안의 분으로.
 fn parse_clock(value: &str) -> Result<u16, CoreError> {
     let invalid = || CoreError::InvalidInput("제한 시간대는 HH:MM 형식이어야 합니다".to_owned());
@@ -208,6 +209,18 @@ fn parse_clock(value: &str) -> Result<u16, CoreError> {
         return Err(invalid());
     }
     Ok(hours * 60 + minutes)
+}
+
+/// 저장된 요일 번호를 계산에서 바로 쓸 수 있는 일요일 시작 마스크로 바꾼다.
+fn parse_weekdays(days: impl IntoIterator<Item = u8>) -> Result<[bool; 7], CoreError> {
+    let mut weekdays = [false; 7];
+    for day in days {
+        let slot = weekdays.get_mut(usize::from(day)).ok_or_else(|| {
+            CoreError::InvalidInput("요일은 0(일)~6(토) 사이여야 합니다".to_owned())
+        })?;
+        *slot = true;
+    }
+    Ok(weekdays)
 }
 
 /// 요일 마스크를 월~일 순서로 요약한다. 전부면 "매일", 연속 구간이면 "월~금", 그 밖은 "월·수·금".

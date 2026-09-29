@@ -17,4 +17,4 @@ done
 cd "$repo_dir"
 export APPLE_SIGNING_IDENTITY="$identity"
 npx tauri build "$@"
-"$script_dir/sign-local-binary.sh" "$repo_dir/target/$profile/agent-manager-tauri"
+"$script_dir/sign-local-binary.sh" "$repo_dir/target/$profile/agent-manager"

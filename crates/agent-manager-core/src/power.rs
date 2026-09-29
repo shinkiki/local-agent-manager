@@ -16,7 +16,7 @@
 //! 억제 자원은 프로세스에 하나만 있으면 되고 OS 자원 자체가 프로세스 단위라, 상태는
 //! 이 모듈의 프로세스 전역 하나로 둔다.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -56,16 +56,70 @@ struct Held {
     error: Option<String>,
 }
 
-static HELD: Mutex<Held> = Mutex::new(Held {
-    guard: None,
-    mechanism: None,
-    error: None,
-});
+impl Held {
+    const fn empty() -> Self {
+        Self {
+            guard: None,
+            mechanism: None,
+            error: None,
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            platform::release(guard);
+        }
+        self.mechanism = None;
+        self.error = None;
+    }
+
+    fn engage(&mut self) {
+        if self.guard.is_none() {
+            match platform::engage() {
+                Ok(guard) => {
+                    self.guard = Some(guard);
+                    self.mechanism = Some(platform::MECHANISM);
+                    self.error = None;
+                }
+                Err(error) => {
+                    self.mechanism = None;
+                    self.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    fn apply(&mut self, enabled: bool) -> SleepPreventionStatus {
+        if enabled {
+            self.engage();
+        } else {
+            self.release();
+        }
+        self.snapshot(enabled)
+    }
+
+    fn record_error(&mut self, error: String) -> SleepPreventionStatus {
+        self.error = Some(error);
+        self.snapshot(false)
+    }
+
+    fn snapshot(&self, enabled: bool) -> SleepPreventionStatus {
+        SleepPreventionStatus {
+            supported: platform::supported(),
+            enabled,
+            active: self.guard.is_some(),
+            mechanism: self.mechanism.map(str::to_owned),
+            error: self.error.clone(),
+        }
+    }
+}
+
+static HELD: Mutex<Held> = Mutex::new(Held::empty());
 
 /// 저장된 설정과 지금 걸려 있는 상태를 함께 읽는다.
 pub fn sleep_prevention_status(app_data_dir: &Path) -> Result<SleepPreventionStatus, CoreError> {
     let enabled = load_prevent_sleep(app_data_dir)?;
-    Ok(with_held(|held| snapshot(held, enabled)))
+    Ok(with_held(|held| held.snapshot(enabled)))
 }
 
 /// 설정을 저장하고 즉시 적용한다. 저장이 실패하면 억제 상태는 건드리지 않는다 —
@@ -75,68 +129,21 @@ pub fn set_sleep_prevention(
     enabled: bool,
 ) -> Result<SleepPreventionStatus, CoreError> {
     save_prevent_sleep(app_data_dir, enabled)?;
-    Ok(apply(enabled))
+    Ok(with_held(|held| held.apply(enabled)))
 }
 
 /// 백엔드 기동 시 저장된 설정을 적용한다. 설정을 읽지 못해도 기동을 막지 않는다 —
 /// 절전이 걸리는 것과 앱이 뜨지 않는 것은 무게가 다르다.
 pub fn apply_saved_sleep_prevention(app_data_dir: &Path) -> SleepPreventionStatus {
     match load_prevent_sleep(app_data_dir) {
-        Ok(enabled) => apply(enabled),
-        Err(error) => {
-            let message = error.to_string();
-            with_held(|held| {
-                held.error = Some(message.clone());
-                snapshot(held, false)
-            })
-        }
+        Ok(enabled) => with_held(|held| held.apply(enabled)),
+        Err(error) => with_held(|held| held.record_error(error.to_string())),
     }
 }
 
 /// 백엔드 종료 시 억제를 되돌린다. 저장된 설정은 그대로 두므로 다음 기동에서 다시 걸린다.
 pub fn release_sleep_prevention() {
-    with_held(|held| {
-        release_held(held);
-    });
-}
-
-fn apply(enabled: bool) -> SleepPreventionStatus {
-    with_held(|held| {
-        if !enabled {
-            release_held(held);
-        } else if held.guard.is_none() {
-            match platform::engage() {
-                Ok(guard) => {
-                    held.guard = Some(guard);
-                    held.mechanism = Some(platform::MECHANISM);
-                    held.error = None;
-                }
-                Err(error) => {
-                    held.mechanism = None;
-                    held.error = Some(error.to_string());
-                }
-            }
-        }
-        snapshot(held, enabled)
-    })
-}
-
-fn release_held(held: &mut Held) {
-    if let Some(guard) = held.guard.take() {
-        platform::release(guard);
-    }
-    held.mechanism = None;
-    held.error = None;
-}
-
-fn snapshot(held: &Held, enabled: bool) -> SleepPreventionStatus {
-    SleepPreventionStatus {
-        supported: platform::supported(),
-        enabled,
-        active: held.guard.is_some(),
-        mechanism: held.mechanism.map(str::to_owned),
-        error: held.error.clone(),
-    }
+    with_held(Held::release);
 }
 
 /// 잠금이 poison돼도 절전 억제는 계속 다뤄야 한다. 여기 담긴 것은 OS 자원 손잡이뿐이라
@@ -146,8 +153,12 @@ fn with_held<T>(action: impl FnOnce(&mut Held) -> T) -> T {
     action(&mut held)
 }
 
+fn settings_path(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join(SETTINGS_FILE_NAME)
+}
+
 fn load_prevent_sleep(app_data_dir: &Path) -> Result<bool, CoreError> {
-    let path = app_data_dir.join(SETTINGS_FILE_NAME);
+    let path = settings_path(app_data_dir);
     let Some(stored) = read_private_json::<StoredPowerSettings>(&path)? else {
         return Ok(false);
     };
@@ -157,7 +168,7 @@ fn load_prevent_sleep(app_data_dir: &Path) -> Result<bool, CoreError> {
 
 fn save_prevent_sleep(app_data_dir: &Path, prevent_sleep: bool) -> Result<(), CoreError> {
     write_private_json(
-        &app_data_dir.join(SETTINGS_FILE_NAME),
+        &settings_path(app_data_dir),
         &StoredPowerSettings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             prevent_sleep,
@@ -165,14 +176,17 @@ fn save_prevent_sleep(app_data_dir: &Path, prevent_sleep: bool) -> Result<(), Co
     )
 }
 
-#[cfg(target_os = "macos")]
+/// 유닉스 두 수단은 모양이 같다 — 자식 프로세스 하나가 사는 동안만 절전이 막히고, 그
+/// 자식을 끝내는 것이 해제다. 그래서 손잡이·탐색·기동·해제는 여기 한 벌로 두고, OS마다
+/// 다른 것(실행 파일 이름, 인자, stdin을 잡는지)만 아래 `spec`이 정한다.
+#[cfg(unix)]
 mod platform {
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
 
     use crate::CoreError;
 
-    pub(super) const MECHANISM: &str = "caffeinate";
+    pub(super) const MECHANISM: &str = spec::EXECUTABLE;
 
     pub(super) struct Guard(Child);
 
@@ -181,75 +195,79 @@ mod platform {
     }
 
     fn locate() -> Result<PathBuf, CoreError> {
-        crate::providers::resolve_named_executable(&["caffeinate"])
+        crate::providers::resolve_named_executable(&[spec::EXECUTABLE])
     }
 
-    /// `-i` 유휴 절전, `-m` 디스크 절전, `-s` 시스템 절전을 막는다. 화면 절전(`-d`)은
-    /// 막지 않는다 — 화면이 켜져 있어야 도달되는 것이 아니고 배터리만 축낸다.
-    ///
-    /// `-w`로 이 프로세스를 지켜보게 해, 백엔드가 SIGKILL로 죽어도 caffeinate가 남아
-    /// 아무도 쓰지 않는 절전 억제를 계속 잡고 있는 일이 없게 한다.
     pub(super) fn engage() -> Result<Guard, CoreError> {
         let child = Command::new(locate()?)
-            .args(["-i", "-m", "-s", "-w"])
-            .arg(std::process::id().to_string())
-            .stdin(Stdio::null())
+            .args(spec::args())
+            .stdin(spec::stdin())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
         Ok(Guard(child))
     }
 
+    /// stdin을 잡고 있었다면 먼저 닫아 정상 종료를 시키고, 그래도 남으면 강제로 끝낸다.
+    /// stdin을 잡지 않는 수단에서는 `take()`가 `None`이라 곧바로 종료로 넘어간다.
     pub(super) fn release(mut guard: Guard) {
+        drop(guard.0.stdin.take());
         let _ = guard.0.kill();
         let _ = guard.0.wait();
     }
-}
 
-#[cfg(all(unix, not(target_os = "macos")))]
-mod platform {
-    use std::path::PathBuf;
-    use std::process::{Child, Command, Stdio};
+    #[cfg(target_os = "macos")]
+    mod spec {
+        use std::process::Stdio;
 
-    use crate::CoreError;
+        pub(super) const EXECUTABLE: &str = "caffeinate";
 
-    pub(super) const MECHANISM: &str = "systemd-inhibit";
+        /// `-i` 유휴 절전, `-m` 디스크 절전, `-s` 시스템 절전을 막는다. 화면 절전(`-d`)은
+        /// 막지 않는다 — 화면이 켜져 있어야 도달되는 것이 아니고 배터리만 축낸다.
+        ///
+        /// `-w`로 이 프로세스를 지켜보게 해, 백엔드가 SIGKILL로 죽어도 caffeinate가 남아
+        /// 아무도 쓰지 않는 절전 억제를 계속 잡고 있는 일이 없게 한다.
+        pub(super) fn args() -> Vec<String> {
+            ["-i", "-m", "-s", "-w"]
+                .into_iter()
+                .map(str::to_owned)
+                .chain(std::iter::once(std::process::id().to_string()))
+                .collect()
+        }
 
-    pub(super) struct Guard(Child);
-
-    pub(super) fn supported() -> bool {
-        locate().is_ok()
+        /// pid를 지켜보는 쪽이라 파이프로 수명을 잡을 필요가 없다.
+        pub(super) fn stdin() -> Stdio {
+            Stdio::null()
+        }
     }
 
-    fn locate() -> Result<PathBuf, CoreError> {
-        crate::providers::resolve_named_executable(&["systemd-inhibit"])
-    }
+    #[cfg(not(target_os = "macos"))]
+    mod spec {
+        use std::process::Stdio;
 
-    /// `systemd-inhibit`는 자기가 실행한 명령이 사는 동안만 락을 잡는다. 그 명령으로
-    /// `cat`을 쓰고 stdin을 파이프로 잡아 두면, 우리가 파이프를 닫는 것만으로 `cat`이
-    /// EOF로 끝나고 `systemd-inhibit`도 따라 끝난다. 부모를 SIGKILL해도 파이프가 닫히므로
-    /// 손자 프로세스가 락 없이 남지 않는다.
-    pub(super) fn engage() -> Result<Guard, CoreError> {
-        let child = Command::new(locate()?)
-            .args([
+        pub(super) const EXECUTABLE: &str = "systemd-inhibit";
+
+        /// `systemd-inhibit`는 자기가 실행한 명령이 사는 동안만 락을 잡는다. 그 명령으로
+        /// `cat`을 쓴다.
+        pub(super) fn args() -> Vec<String> {
+            [
                 "--what=idle:sleep",
                 "--mode=block",
                 "--who=Agent Manager",
                 "--why=원격 접속을 유지하기 위해 자동 절전을 막습니다",
                 "cat",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        Ok(Guard(child))
-    }
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        }
 
-    pub(super) fn release(mut guard: Guard) {
-        // stdin을 먼저 닫아 정상 종료를 시키고, 그래도 남으면 강제로 끝낸다.
-        drop(guard.0.stdin.take());
-        let _ = guard.0.kill();
-        let _ = guard.0.wait();
+        /// stdin을 파이프로 잡아 두면 우리가 파이프를 닫는 것만으로 `cat`이 EOF로 끝나고
+        /// `systemd-inhibit`도 따라 끝난다. 부모를 SIGKILL해도 파이프가 닫히므로 손자
+        /// 프로세스가 락 없이 남지 않는다.
+        pub(super) fn stdin() -> Stdio {
+            Stdio::piped()
+        }
     }
 }
 

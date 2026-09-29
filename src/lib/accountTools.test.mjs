@@ -5,6 +5,7 @@ import {
   accountToolIcon,
   accountToolsFor,
   DEFAULT_ACCOUNT_TOOL_BADGE_LIMIT,
+  homeToolsFor,
 } from "./accountTools.ts";
 
 const tool = (overrides = {}) => ({
@@ -101,4 +102,18 @@ test("계정 요약이 없으면 빈 배지 목록을 돌려준다", () => {
   assert.equal(accountToolsFor(null, "a"), null);
   assert.equal(accountToolsFor({ accounts: [view([])] }, "b"), null);
   assert.equal(accountToolsFor({ accounts: [view([])] }, "a")?.accountId, "a");
+});
+
+test("계정과 공급자 홈 요약은 같은 방식으로 일치 항목 하나를 찾는다", () => {
+  const account = view([], { accountId: "account-b" });
+  const home = { provider: "codex", accountId: "home-b", attributionResolved: true, tools: [] };
+  const snapshot = {
+    accounts: [view([]), account],
+    homes: [{ ...home, provider: "claude" }, home],
+  };
+
+  assert.equal(accountToolsFor(snapshot, "account-b"), account);
+  assert.equal(homeToolsFor(snapshot, "codex"), home);
+  assert.equal(homeToolsFor(snapshot, "antigravity"), null);
+  assert.equal(homeToolsFor(null, "codex"), null);
 });

@@ -185,32 +185,36 @@ pub(crate) fn purge(root: &Path, id: Option<&str>) -> Result<usize, CoreError> {
     if !root.is_dir() {
         return Ok(0);
     }
-    let mut removed = 0;
     match id {
-        Some(id) => {
-            // 항목 ID는 단일 디렉터리 이름이어야 한다. 경로 구분자를 막아 휴지통
-            // 밖 삭제를 차단한다.
-            if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
-                return Err(CoreError::InvalidInput(
-                    "휴지통 항목 ID가 올바르지 않습니다".to_owned(),
-                ));
-            }
-            let entry_dir = root.join(id);
-            if !entry_dir.is_dir() {
-                return Err(CoreError::NotFound(
-                    "휴지통에서 항목을 찾지 못했습니다".to_owned(),
-                ));
-            }
-            fs::remove_dir_all(&entry_dir)?;
-            removed = 1;
-        }
-        None => {
-            for entry in fs::read_dir(root)?.flatten() {
-                if entry.path().is_dir() {
-                    fs::remove_dir_all(entry.path())?;
-                    removed += 1;
-                }
-            }
+        Some(id) => purge_entry(root, id),
+        None => purge_all_entries(root),
+    }
+}
+
+/// 검증한 항목 ID 하나만 지운다. 경로 구분자를 막아 휴지통 밖 삭제를 차단한다.
+fn purge_entry(root: &Path, id: &str) -> Result<usize, CoreError> {
+    if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
+        return Err(CoreError::InvalidInput(
+            "휴지통 항목 ID가 올바르지 않습니다".to_owned(),
+        ));
+    }
+    let entry_dir = root.join(id);
+    if !entry_dir.is_dir() {
+        return Err(CoreError::NotFound(
+            "휴지통에서 항목을 찾지 못했습니다".to_owned(),
+        ));
+    }
+    fs::remove_dir_all(entry_dir)?;
+    Ok(1)
+}
+
+/// 휴지통 루트 바로 아래의 디렉터리를 모두 지운다.
+fn purge_all_entries(root: &Path) -> Result<usize, CoreError> {
+    let mut removed = 0;
+    for entry in fs::read_dir(root)?.flatten() {
+        if entry.path().is_dir() {
+            fs::remove_dir_all(entry.path())?;
+            removed += 1;
         }
     }
     Ok(removed)
@@ -223,19 +227,25 @@ pub(crate) fn move_path(source: &Path, destination: &Path) -> Result<(), CoreErr
         return Ok(());
     }
     let metadata = fs::symlink_metadata(source)?;
-    if metadata.file_type().is_symlink() {
-        let target = fs::read_link(source)?;
-        create_symlink(&target, destination)?;
-        fs::remove_file(source)?;
-        return Ok(());
-    }
+    copy_entry(source, destination, &metadata)?;
     if metadata.is_dir() {
-        copy_directory_recursive(source, destination)?;
         fs::remove_dir_all(source)?;
-        return Ok(());
+    } else {
+        fs::remove_file(source)?;
     }
-    fs::copy(source, destination)?;
-    fs::remove_file(source)?;
+    Ok(())
+}
+
+/// 항목 종류(심볼릭 링크·디렉터리·일반 파일)에 맞춰 대상을 복제한다.
+fn copy_entry(from: &Path, to: &Path, metadata: &fs::Metadata) -> Result<(), CoreError> {
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(from)?;
+        create_symlink(&target, to)?;
+    } else if metadata.is_dir() {
+        copy_directory_recursive(from, to)?;
+    } else {
+        fs::copy(from, to)?;
+    }
     Ok(())
 }
 
@@ -245,14 +255,7 @@ fn copy_directory_recursive(source: &Path, destination: &Path) -> Result<(), Cor
         let from = entry.path();
         let to = destination.join(entry.file_name());
         let metadata = fs::symlink_metadata(&from)?;
-        if metadata.file_type().is_symlink() {
-            let target = fs::read_link(&from)?;
-            create_symlink(&target, &to)?;
-        } else if metadata.is_dir() {
-            copy_directory_recursive(&from, &to)?;
-        } else {
-            fs::copy(&from, &to)?;
-        }
+        copy_entry(&from, &to, &metadata)?;
     }
     Ok(())
 }

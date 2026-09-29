@@ -20,6 +20,25 @@ export function initialScheduleEditorModelSelection(
 }
 
 /**
+ * 스케줄 목록에서 ID로 대상을 찾아 불변 갱신한다.
+ * 대상을 찾지 못했거나 갱신기가 같은 객체를 돌려주면 스냅샷 참조를 그대로 보존한다.
+ */
+function updateSchedule(
+  snapshot: SchedulerSnapshot,
+  id: string,
+  updater: (current: ScheduledRequest) => ScheduledRequest,
+): SchedulerSnapshot {
+  const index = snapshot.schedules.findIndex((schedule) => schedule.id === id);
+  if (index < 0) return snapshot;
+  const current = snapshot.schedules[index];
+  const updated = updater(current);
+  if (updated === current) return snapshot;
+  const schedules = [...snapshot.schedules];
+  schedules[index] = updated;
+  return { ...snapshot, schedules };
+}
+
+/**
  * 반복 요청 하나를 서버가 돌려준 값으로 갈아 끼운다. 목록 전체를 다시 받지 않아도
  * `nextRunAt`처럼 서버가 계산하는 값까지 반영된다. 모르는 ID면 스냅샷을 그대로 둔다.
  */
@@ -27,11 +46,7 @@ export function withSchedule(
   snapshot: SchedulerSnapshot,
   schedule: ScheduledRequest,
 ): SchedulerSnapshot {
-  if (!snapshot.schedules.some((current) => current.id === schedule.id)) return snapshot;
-  return {
-    ...snapshot,
-    schedules: snapshot.schedules.map((current) => current.id === schedule.id ? schedule : current),
-  };
+  return updateSchedule(snapshot, schedule.id, () => schedule);
 }
 
 /**
@@ -43,9 +58,9 @@ export function withScheduleEnabled(
   id: string,
   enabled: boolean,
 ): SchedulerSnapshot {
-  const target = snapshot.schedules.find((schedule) => schedule.id === id);
-  if (!target || target.enabled === enabled) return snapshot;
-  return withSchedule(snapshot, { ...target, enabled });
+  return updateSchedule(snapshot, id, (target) => (
+    target.enabled === enabled ? target : { ...target, enabled }
+  ));
 }
 
 /**

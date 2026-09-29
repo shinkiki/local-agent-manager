@@ -2,18 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   instructionBulkMigrationPrompt,
-  isUserSkillCandidate,
   repositoryTransferPrompt,
   skillBulkMigrationPrompt,
 } from "./skillTransfer.ts";
-
-test("only personal and project skills are user skill candidates", () => {
-  assert.equal(isUserSkillCandidate("personal"), true);
-  assert.equal(isUserSkillCandidate("project"), true);
-  assert.equal(isUserSkillCandidate("plugin"), false);
-  assert.equal(isUserSkillCandidate("system"), false);
-  assert.equal(isUserSkillCandidate("builtin"), false);
-});
 
 test("backup prompt targets the whole repository and asks before writing", () => {
   const prompt = repositoryTransferPrompt("backup");

@@ -1,7 +1,8 @@
+import { collapseWhitespace } from "./boundedText.ts";
 import {
-  accountTextDraftState,
-  accountTextLength,
-  submitAccountText,
+  accountTextEditor,
+  type AccountTextDraftStateAs,
+  type AccountTextSave,
   type AccountTextSubmitResult,
 } from "./accountTextDraft.ts";
 
@@ -17,38 +18,29 @@ export const ACCOUNT_LABEL_MAX_CHARS = 60;
  * Core의 `normalize_account_label`과 같은 규칙이어야 한다.
  */
 export function normalizeAccountLabel(draft: string): string | null {
-  const collapsed = draft.split(/\s+/u).filter(Boolean).join(" ");
+  const collapsed = collapseWhitespace(draft);
   return collapsed === "" ? null : collapsed;
 }
 
-/** 서로게이트 쌍이나 이모지를 한 글자로 세어 Rust의 문자 수 기준과 맞춘다. */
-export function accountLabelLength(draft: string): number {
-  return accountTextLength(draft, normalizeAccountLabel);
-}
+/** 표시 이름 편집기의 규격. 이 편집기가 뼈대와 다른 것은 이 세 줄뿐이다. */
+const LABEL_EDITOR = accountTextEditor({
+  normalize: normalizeAccountLabel,
+  maxChars: ACCOUNT_LABEL_MAX_CHARS,
+  clearsAs: "restores",
+});
 
-export interface AccountLabelDraftState {
-  /** 저장 요청으로 보낼 값. 사용자 지정 해제는 null. */
-  value: string | null;
-  length: number;
-  changed: boolean;
-  tooLong: boolean;
-  /** 저장하면 사용자 지정이 풀려 공급자 이름으로 돌아가는 상태. */
-  restores: boolean;
-  canSave: boolean;
-}
+/**
+ * 이 편집기의 초안 상태. `clears`는 `restores`라는 이름으로 선다 — 저장하면 사용자
+ * 지정이 풀려 공급자 이름으로 돌아간다는 뜻이다. 모양은 공용 뼈대가 짓는다.
+ */
+export type AccountLabelDraftState = AccountTextDraftStateAs<"restores">;
 
 /**
  * 편집 중인 표시 이름과 저장된 값을 비교해 저장 버튼 상태를 정한다. 값이 그대로면
  * 요청을 보내지 않고, 길이 제한을 넘으면 저장을 막아 백엔드 오류 전에 알린다.
  */
 export function accountLabelDraftState(draft: string, saved: string | null): AccountLabelDraftState {
-  const { clears, ...state } = accountTextDraftState(
-    draft,
-    saved,
-    normalizeAccountLabel,
-    ACCOUNT_LABEL_MAX_CHARS,
-  );
-  return { ...state, restores: clears };
+  return LABEL_EDITOR.draftState(draft, saved);
 }
 
 export type AccountLabelSubmitResult = AccountTextSubmitResult;
@@ -60,7 +52,7 @@ export type AccountLabelSubmitResult = AccountTextSubmitResult;
 export function submitAccountLabel(
   draft: string,
   saved: string | null,
-  save: (label: string | null) => Promise<string | null>,
+  save: AccountTextSave,
 ): Promise<AccountLabelSubmitResult> {
-  return submitAccountText(draft, saved, save, normalizeAccountLabel, ACCOUNT_LABEL_MAX_CHARS);
+  return LABEL_EDITOR.submit(draft, saved, save);
 }

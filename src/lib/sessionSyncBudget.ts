@@ -1,4 +1,5 @@
 import type { ProviderId } from "../types";
+import { dedupeByKey } from "./sequence.ts";
 import { sessionKey } from "./sessionKey.ts";
 
 /**
@@ -11,7 +12,7 @@ import { sessionKey } from "./sessionKey.ts";
  */
 export const SESSION_SYNC_DELAYS_MS: readonly number[] = [0, 200, 600, 1_200, 2_400];
 
-export interface SessionSyncTarget {
+interface SessionSyncTarget {
   source: ProviderId;
   id: string;
 }
@@ -21,9 +22,31 @@ export interface SessionSyncTarget {
  */
 export { sessionKey as sessionSyncKey };
 
-export interface CompletedRunRef {
+interface CompletedRunRef {
   scheduleId: string;
   providerSessionId: string | null;
+}
+
+/**
+ * 완료 실행 한 건이 아직 색인해야 하는 대상이면 그 대상을 만든다. 제외 대상(알 수 없는
+ * 공급자, 빈 세션 ID, 이미 색인됨, 포기됨)이면 null이다.
+ *
+ * 키를 함께 실어 내보내지 않는다 — 키는 대상에서 온전히 정해지므로, 중복을 걷어내는 쪽이
+ * 같은 규칙으로 다시 만들면 된다. 키를 나르던 동안에는 이 함수의 반환이 [키, 대상] 짝이라
+ * 대상을 모으는 쪽이 자리마다 짝을 풀어야 했고, 중복 제거가 무슨 열쇠를 보는지가 여기와
+ * 그쪽 두 곳에 나뉘어 있었다.
+ */
+function pendingSyncTarget(
+  run: CompletedRunRef,
+  sourceByScheduleId: ReadonlyMap<string, ProviderId>,
+  isIndexed: (source: ProviderId, id: string) => boolean,
+  abandoned: ReadonlySet<string>,
+): SessionSyncTarget | null {
+  const id = run.providerSessionId;
+  const source = sourceByScheduleId.get(run.scheduleId);
+  if (!id || !source) return null;
+  if (abandoned.has(sessionKey(source, id)) || isIndexed(source, id)) return null;
+  return { source, id };
 }
 
 /**
@@ -37,16 +60,11 @@ export function unindexedRunTargets(
   isIndexed: (source: ProviderId, id: string) => boolean,
   abandoned: ReadonlySet<string>,
 ): SessionSyncTarget[] {
-  const targets = new Map<string, SessionSyncTarget>();
-  for (const run of runs) {
-    const id = run.providerSessionId;
-    const source = sourceByScheduleId.get(run.scheduleId);
-    if (!id || !source) continue;
-    const key = sessionKey(source, id);
-    if (abandoned.has(key) || isIndexed(source, id)) continue;
-    targets.set(key, { source, id });
-  }
-  return [...targets.values()];
+  const targets = runs.flatMap((run) => (
+    pendingSyncTarget(run, sourceByScheduleId, isIndexed, abandoned) ?? []
+  ));
+  // 열쇠가 같으면 대상도 같은 값이므로 어느 쪽을 남길지 고를 것이 없다.
+  return dedupeByKey(targets, (target) => sessionKey(target.source, target.id));
 }
 
 /**

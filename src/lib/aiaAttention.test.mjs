@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { aiaAttentionBubble, aiaAttentionTargetAction, selectAiaAttention, shouldShowAiaAttentionBubble, withoutAiaAttention } from "./aiaAttention.ts";
+import { aiaAttentionBubble, aiaAttentionForChat, aiaAttentionTargetAction, selectAiaAttention, shouldShowAiaAttentionBubble, withoutAiaAttention } from "./aiaAttention.ts";
 
 const attention = (id, profile, kind, read = false) => ({ id, profile, kind, read });
 
@@ -28,10 +28,22 @@ test("AIA attention is removed from the general notification snapshot", () => {
 test("pending AIA approval takes priority over a completed response", () => {
   const selected = selectAiaAttention([
     attention("completed", "aia", "completed"),
+    attention("failed", "aia", "failed"),
+    attention("standard-approval", "standard", "approval"),
     attention("approval", "aia", "approval"),
   ]);
 
   assert.equal(selected?.id, "approval");
+});
+
+test("AIA approval이 없으면 첫 미확인 완료·실패 항목을 유지한다", () => {
+  const selected = selectAiaAttention([
+    attention("read", "aia", "completed", true),
+    attention("first-unread", "aia", "failed"),
+    attention("second-unread", "aia", "completed"),
+  ]);
+
+  assert.equal(selected?.id, "first-unread");
 });
 
 test("AIA label ignores running and already read terminal items", () => {
@@ -103,4 +115,16 @@ test("팝업이 닫혀 있거나 전환 중이면 대상을 유지하고 기다�
   assert.equal(aiaAttentionTargetAction(false, true, false), "wait");
   assert.equal(aiaAttentionTargetAction(false, false, false), "wait");
   assert.equal(aiaAttentionTargetAction(true, true, true), "wait");
+});
+
+test("버린 대화의 알림만 걷는다 — 다른 대화와 일반 프로필은 남긴다", () => {
+  const items = [
+    { id: "old-completed", profile: "aia", kind: "completed", read: false, chatId: "old" },
+    { id: "old-approval", profile: "aia", kind: "approval", read: true, chatId: "old" },
+    { id: "new-completed", profile: "aia", kind: "completed", read: false, chatId: "new" },
+    { id: "standard-old", profile: "standard", kind: "completed", read: false, chatId: "old" },
+  ];
+
+  assert.deepEqual(aiaAttentionForChat(items, "old").map((item) => item.id), ["old-completed", "old-approval"]);
+  assert.deepEqual(aiaAttentionForChat(items, "missing"), []);
 });

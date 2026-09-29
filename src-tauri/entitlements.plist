@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Developer ID 배포용 하드닝 런타임 예외입니다. 최소한만 둡니다.
+
+    - audio-input: 눌러서 말하기 음성 입력이 WKWebView 안에서 마이크를 직접 엽니다.
+      사용 목적 문구는 src-tauri/Info.plist에 있습니다.
+
+    앱 샌드박스는 켜지 않습니다. Agent Manager는 사용자가 지정한 작업 폴더와
+    임의의 CLI 실행 파일을 다루므로 샌드박스에서는 동작할 수 없습니다.
+    자식 프로세스 실행과 /usr/bin/security를 통한 Keychain 접근에는
+    별도 예외가 필요하지 않습니다.
+  -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+</dict>
+</plist>

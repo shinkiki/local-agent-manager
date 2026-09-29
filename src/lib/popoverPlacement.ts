@@ -3,11 +3,18 @@
 // document.body로 옮겨 화면 좌표에 직접 놓으면 조상의 overflow와 무관해지므로,
 // 이 파일은 그 좌표 계산만 순수 함수로 담당한다.
 
-/** 팝오버를 붙일 트리거의 화면 좌표. DOMRect를 그대로 넘길 수 있다. */
+/**
+ * 팝오버를 붙일 트리거의 화면 좌표. DOMRect를 그대로 넘길 수 있다.
+ *
+ * 배치가 실제로 읽는 네 값만 둔다. 팝오버는 트리거의 **오른쪽 끝**에 맞춰 열리므로
+ * 왼쪽 좌표는 계산에 들어가지 않는데, DOMRect를 그대로 받는다는 이유로 `left`까지 적혀
+ * 있었다. 읽지 않는 값이 요구사항으로 적혀 있으면 화면 좌표가 아닌 자리에서 이 타입을
+ * 만들 때 뜻 없는 값을 채워 넣게 되고, 배치 규칙을 읽는 사람은 그 값이 어디서 쓰이는지
+ * 를 본문에서 되짚어야 한다.
+ */
 export interface PopoverAnchor {
   top: number;
   bottom: number;
-  left: number;
   right: number;
   width: number;
 }
@@ -41,6 +48,22 @@ export interface PopoverPlacement {
   maxHeight: number;
   direction: "down" | "up";
 }
+
+/**
+ * 배치가 같은지 볼 필드의 정본. 비교식이 인터페이스 필드를 양쪽에 한 번씩 풀어 쓰면
+ * 필드가 늘 때 한 자리만 빠져도 리렌더 억제가 잘못 작동한다. `Record`로 인터페이스와
+ * 맞물려 두면 필드를 추가하거나 없앨 때 이 목록도 함께 고치도록 타입 검사가 잡아 준다.
+ */
+const POPOVER_PLACEMENT_FIELDS = {
+  left: true,
+  top: true,
+  bottom: true,
+  width: true,
+  maxHeight: true,
+  direction: true,
+} satisfies Record<keyof PopoverPlacement, true>;
+
+const POPOVER_PLACEMENT_KEYS = Object.keys(POPOVER_PLACEMENT_FIELDS) as (keyof PopoverPlacement)[];
 
 /** 기본 수치를 채운 배치 지표. 계산 함수들은 옵션이 아니라 이 완성된 값만 본다. */
 type PopoverMetrics = Required<PopoverPlacementOptions>;
@@ -133,5 +156,5 @@ export function anchoredPopoverPlacement(
 export function samePopoverPlacement(a: PopoverPlacement | null, b: PopoverPlacement | null): boolean {
   if (a === b) return true;
   if (!a || !b) return false;
-  return a.left === b.left && a.top === b.top && a.bottom === b.bottom && a.width === b.width && a.maxHeight === b.maxHeight && a.direction === b.direction;
+  return POPOVER_PLACEMENT_KEYS.every((key) => a[key] === b[key]);
 }

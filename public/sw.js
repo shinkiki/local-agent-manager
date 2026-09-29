@@ -29,15 +29,50 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+/* 알림 클릭이 창에 보내는 메시지와 새 창 주소 쿼리. `src/lib/notificationOpen.ts`와 같은 값이어야 한다. */
+const OPEN_ATTENTION_MESSAGE = "agent-manager.open-attention";
+const OPEN_ATTENTION_PARAM = "open-attention";
+const OPEN_CHAT_PARAM = "open-chat";
+
+/* 알림의 data에 실린 열 대상. 모양이 어긋나면 열 대상 없이 앱만 앞으로 가져온다. */
+function notificationOpenTarget(notification) {
+  const data = notification.data;
+  if (!data || typeof data !== "object") return null;
+  const { attentionId, chatId } = data;
+  if (typeof attentionId !== "string" || typeof chatId !== "string") return null;
+  return { attentionId, chatId };
+}
+
+/* 팝아웃 창(채팅·세션·AIA·다이어그램)은 대상을 열 앱 셸이 아니다. 본 창만 고른다. */
+function isMainAppWindow(client) {
+  if (!("focus" in client)) return false;
+  try {
+    return !new URL(client.url).searchParams.has("popout");
+  } catch {
+    return false;
+  }
+}
+
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
+  const target = notificationOpenTarget(event.notification);
   event.waitUntil(
     self.clients
       .matchAll({ type: "window", includeUncontrolled: true })
       .then((windows) => {
-        const existing = windows.find((client) => "focus" in client);
-        if (existing) return existing.focus();
-        return self.clients.openWindow("/");
+        const existing = windows.find(isMainAppWindow) ?? windows.find((client) => "focus" in client);
+        if (existing) {
+          // 떠 있는 창은 새로고침 없이 메시지로 대상을 옮긴다. 창이 메시지를 받기 전에
+          // 사라지지 않도록 focus를 먼저 기다린다.
+          return existing.focus().then((focused) => {
+            if (target) (focused ?? existing).postMessage({ type: OPEN_ATTENTION_MESSAGE, target });
+          });
+        }
+        if (!target) return self.clients.openWindow("/");
+        const params = new URLSearchParams();
+        params.set(OPEN_ATTENTION_PARAM, target.attentionId);
+        params.set(OPEN_CHAT_PARAM, target.chatId);
+        return self.clients.openWindow(`/?${params.toString()}`);
       }),
   );
 });

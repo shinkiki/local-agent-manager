@@ -1,30 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createChatEventBatch } from "./chatEventBatch.ts";
+import { createHandleRegistry } from "./cancelableHandleFixtures.mjs";
 
 function fixture() {
-  const callbacks = new Map();
-  const cancelled = [];
-  let nextHandle = 1;
+  const registry = createHandleRegistry();
   return {
-    callbacks,
-    cancelled,
-    scheduler: {
-      request(callback) {
-        const handle = nextHandle++;
-        callbacks.set(handle, callback);
-        return handle;
-      },
-      cancel(handle) {
-        cancelled.push(handle);
-        callbacks.delete(handle);
-      },
-    },
-    runFrame(handle = callbacks.keys().next().value) {
-      const callback = callbacks.get(handle);
-      callbacks.delete(handle);
-      callback?.();
-    },
+    callbacks: registry.handles,
+    cancelled: registry.stopped,
+    // 프레임 예약도 손잡이 하나를 잡고 놓는 일이라 대장을 이름만 바꿔 쓴다.
+    scheduler: { request: registry.start, cancel: registry.stop },
+    runFrame: registry.fire,
   };
 }
 

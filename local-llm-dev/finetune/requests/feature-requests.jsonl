@@ -1,0 +1,219 @@
+{"operation": "get_app_status", "requests": ["지금 이 컴퓨터에 어떤 CLI가 깔려 있는지 확인해줘", "앱이 클로드랑 코덱스 명령줄 도구를 제대로 찾았는지, 예전 대화 기록까지 읽히고 있는지 한번 봐줘", "내 PC 환경이랑 공급자 CLI 인식 상태가 지금 어떤가요?"]}
+{"operation": "get_provider_accounts", "requests": ["등록된 계정 다 보여줘", "내가 붙여둔 공급자 계정이 몇 개고 각각 지금 얼마나 썼는지, 어느 게 기본으로 잡혀 있는지 알려줘", "지금 활성으로 잡힌 계정이 뭐고 공유 CLI 홈에 로그인된 계정은 누구인가요?"]}
+{"operation": "refresh_provider_account_usage", "requests": ["acc_9fK2sQ 이 계정 사용량 다시 읽어와", "방금 좀 많이 쓴 것 같은데 지금 쓰고 있는 계정 하나만 공급자 쪽에 다시 물어봐서 최신 수치로 갱신해줘", "이 계정 사용량 숫자가 오래된 것 같은데 새로 조회해 주실 수 있나요?"]}
+{"operation": "refresh_provider_account_usages", "requests": ["클로드 계정들 사용량 전부 한꺼번에 새로고침", "등록된 계정 하나씩 말고 전체를 동시에 다시 조회해서 사용량 싹 갱신해줘", "클로드 쪽 계정 전부 다 사용량 다시 받아올 수 있어요?"]}
+{"operation": "get_account_usage_history", "requests": ["계정별 지난 주기 소진율 보여줘", "이번 주 말고 예전 7일 주기들에서 내가 한도를 얼마나 썼는지 흐름을 좀 보고 싶어", "계정마다 주기가 언제 초기화됐고 그때그때 최대로 얼마나 썼는지 기록 남아 있나요?"]}
+{"operation": "get_account_tools", "requests": ["도구들이 어느 계정에 붙어 있는지 정리해줘", "공유 홈 쓰다 보니 헷갈리는데 기기 단위로 잡힌 도구랑 계정에 딸린 도구를 나눠서 보여줘", "어느 계정 소속인지 아직 확정 안 된 도구도 있나요?"]}
+{"operation": "get_agent_builtin_tools", "requests": ["기본도구 켜져 있는 거 뭐뭐야", "AIA랑 클로드, 코덱스, 안티그래비티에서 각각 앱 기본도구가 켜졌는지 실제로 쓸 수 있는 상태인지 구분해서 알려줘", "기본도구 하나 켰는데 새 채팅을 열어야 반영되는 건가요? 지금 상태 좀 보여주세요"]}
+{"operation": "get_external_plugins", "requests": ["붙여둔 외부 플러그인 목록 보여줘", "MCP 서버로 연결해 놓은 것들이 인증까지 끝났는지, 마지막 연결 확인은 잘 됐는지 정리해줘", "외부 플러그인 중에 지금 토글이 꺼져 있는 게 있나요?"]}
+{"operation": "get_claude_settings_states", "requests": ["클로드 코드 플러그인이랑 스킬 켜짐 상태 보여줘", "설치한 클로드 코드 플러그인이랑 개인 스킬이 전역·프로젝트·로컬 어디서 켜지고 최종적으로 적용되는 값이 뭔지 알려줘", "관리 정책 때문에 막힌 스킬이 있는지 설정 상태 좀 확인해 줄래요?"]}
+{"operation": "get_external_plugin_tools", "requests": ["노션 플러그인이 지금 제공하는 도구 뭐뭐 있어", "노션 쪽으로 뭘 시킬 수 있는지 알아야 하니까 그 플러그인의 도구 계약을 지금 기준으로 다시 읽어줘", "노션 도구 중에 읽기 전용인 게 어떤 건가요?"]}
+{"operation": "read_external_plugin_tool", "requests": ["노션에서 검색 도구로 회의록 좀 찾아줘", "노션 플러그인의 search 도구를 써서 자료를 조회해 줘, 읽기만 하는 거니까 그대로 돌려도 돼", "노션 검색 도구 한번 돌려서 결과 보여주실 수 있어요?"]}
+{"operation": "get_claude_plugin_branch_rules", "requests": ["브랜치별 플러그인 규칙 보여줘", "프로젝트마다 어떤 브랜치일 때 어떤 플러그인을 켜고 끄기로 해놨는지, 지금 체크아웃된 브랜치는 뭔지 같이 알려줘", "이 저장소에 로컬 브랜치가 뭐뭐 있고 거기 걸린 플러그인 규칙이 있나요?"]}
+{"operation": "get_provider_telemetry", "requests": ["CLI가 사용정보 보내는 설정 지금 어떻게 돼 있어", "클로드랑 코덱스, 제미나이 명령줄 도구가 자기네 서버로 오류보고나 사용정보를 올리는지 현재 설정값을 확인해줘", "텔레메트리 차단이 안 걸려 있어서 공급자 기본값 따라가는 항목이 있나요?"]}
+{"operation": "get_chat_provider_options", "requests": ["코덱스에서 고를 수 있는 모델 뭐 있어", "코덱스로 채팅 만들 때 지정할 수 있는 모델이랑 추론 강도, 실행설정 항목들을 쭉 보여줘", "코덱스 실행설정에 어떤 값을 넣을 수 있는지 알 수 있을까요?"]}
+{"operation": "get_detached_chat_for_session", "requests": ["ses_f1d138d25ffeoAu3sP0ofQteTy 이 세션 지금 어느 채팅이 붙잡고 있어?", "코덱스 세션 하나가 계속 돌아가는 것 같은데 그걸 실제로 물고 있는 라이브 채팅이 있는지 찾아줘", "이 세션을 관리 중인 실행 채팅이 아직 살아 있나요?"]}
+{"operation": "get_live_chats", "requests": ["지금 돌아가는 채팅 몇 개야", "일반 프로필로 띄워둔 라이브 채팅이 지금 몇 개나 실행 중인지 목록으로 보여줘", "실행 중인 채팅 목록 좀 볼 수 있을까요?"]}
+{"operation": "show_ui_guide", "requests": ["CLI 연결하는 데 어디야, 화면에서 짚어줘", "설정 화면의 연결 항목 위치를 화살표로 가리키면서 여기서 연결하면 된다고 말풍선으로 알려줘", "그 버튼이 화면 어디 있는지 직접 가리켜 주실 수 있나요?"]}
+{"operation": "open_ui_element", "requests": ["그 드로워 좀 열어줘", "커서 움직여서 CLI 연결 패널 여는 버튼을 눌러줘", "자동화 탭 좀 대신 눌러서 열어 주실래요?"]}
+{"operation": "list_cypress_workspaces", "requests": ["등록된 테스트 작업공간 목록 보여줘", "사이프러스 자동화 작업공간이 뭐뭐 등록돼 있고 각각 켜져 있는지, 격리 실행인지 아닌지 알려줘", "작업공간 중에 사이프러스 모듈이 아직 설치 안 된 게 있나요?"]}
+{"operation": "list_cypress_workspace_files", "requests": ["ws_am_main 작업공간에 파일 뭐 있어", "이 테스트 작업공간 안에 들어 있는 스펙 파일들 경로를 쭉 뽑아줘", "그 작업공간 파일 목록 좀 보여줄 수 있어요? 다 나온 건지도 알려주세요"]}
+{"operation": "read_cypress_workspace_file", "requests": ["e2e/example.cy.js 내용 열어줘", "이 작업공간에 있는 예제 스펙 파일 원문을 그대로 읽어서 보여줘", "해당 작업공간의 e2e 스펙 파일 안에 뭐라고 쓰여 있는지 볼 수 있을까요?"]}
+{"operation": "get_cypress_run_status", "requests": ["job_7c31ab 이거 끝났어?", "아까 돌린 스펙 실행이 지금 어디까지 갔는지, 통과랑 실패 몇 개인지 확인해줘", "그 실행 건 결과랑 남은 산출물 파일 좀 확인해 주실 수 있나요?"]}
+{"operation": "list_cypress_runs", "requests": ["최근에 돌린 테스트 실행 목록 보여줘", "오늘 사이프러스로 돌린 것들이 뭐뭐 있는지 최신 순으로 쭉 뽑아줘", "그동안 실행한 테스트 이력이 어떻게 되나요?"]}
+{"operation": "find_ui_elements", "requests": ["설정 화면 저장소 탭에 저장 버튼 있나 찾아봐", "설정에서 저장소 탭 열고 거기 '저장'이라고 적힌 버튼이나 입력칸이 지금 보이는지 훑어줘", "지금 화면에 저장 관련 요소가 뭐뭐 떠 있는지 찾아 주실래요?"]}
+{"operation": "list_sessions", "requests": ["코덱스 세션 목록 뽑아줘", "최근에 수정된 순서로 코덱스 세션 50개만 목록으로 보여줘, 폴더에 안 넣은 것도 같이", "세션 목록에서 특정 프로젝트 것만 걸러서 볼 수 있나요?"]}
+{"operation": "get_session_statistics", "requests": ["세션 통계 보여줘", "이번 달에 세션이랑 턴이 몇 개였고 완료·실패·중단이 각각 얼마나 되는지 집계해줘", "프로젝트별로 세션이 얼마나 돌았는지 수치로 볼 수 있을까요?"]}
+{"operation": "get_chat_delivery_status", "requests": ["req-2f8a1c 이 키로 보낸 거 전달됐는지 확인해줘", "아까 채팅 보낼 때 쓴 멱등 키로 그 전송이 실제로 처리됐는지 저장된 결과를 다시 조회해줘", "같은 키로 두 번 보낸 것 같은데 결과가 어떻게 남아 있나요?"]}
+{"operation": "get_chat_attention_snapshot", "requests": ["내가 봐야 할 거 있어?", "지금 승인 기다리는 작업이나 방금 끝난 알림이 있으면 모아서 알려줘", "진행 중인 것 중에 손봐야 할 게 남아 있나요?"]}
+{"operation": "get_manager_snapshot", "requests": ["전체 현황 한번에 보여줘", "대시보드랑 세션, 스킬, 에이전트, 산출물까지 앱 전반 상태를 통째로 스냅샷 떠줘", "앱 전체가 지금 어떤 상태인지 한 방에 볼 수 있나요?"]}
+{"operation": "get_system_automation_snapshot", "requests": ["언어랑 번역 설정 지금 어떻게 돼 있어", "시스템 공급자 설정이랑 번역 기능이 지금 어떤 값으로 잡혀 있는지 상태를 보여줘", "자동 번역이 켜져 있는지, 기본 언어는 뭘로 돼 있나요?"]}
+{"operation": "get_aia_suggestion_catalog", "requests": ["선제 제안 팩 뭐뭐 있어", "AIA가 먼저 띄워주는 제안들이 어떤 팩에서 오는지, 내장 말고 저장소에 있는 것까지 보여줘", "공통 스킬 저장소에 등록된 제안 정의가 있나요?"]}
+{"operation": "get_aia_onboarding_catalog", "requests": ["자동화 탭 온보딩 카드 목록 보여줘", "애드온 자동화 화면에 뜨는 시작 카드들이 어떤 단계랑 입력을 요구하는지 정리해줘, 문제 있는 카드도 같이", "설치된 온보딩 팩 카드 중에 검증에서 걸린 게 있나요?"]}
+{"operation": "list_agent_db_connections", "requests": ["네가 쓸 수 있는 DB 연결 뭐야", "에이전트 사용을 켜둔 데이터베이스 연결만 골라서 쓰기 모드랑 행 상한이 어떻게 걸려 있는지 알려줘", "지금 너한테 열어준 DB 중에 쓸 수 없는 상태인 게 있나요?"]}
+{"operation": "get_db_connections", "requests": ["등록한 DB 연결 전부 보여줘", "에이전트한테 안 열어준 것까지 포함해서 지금 앱에 등록된 데이터베이스 연결 전체랑 화면 기본값을 보여줘", "DB 연결을 몇 개나 등록해 뒀는지 다 볼 수 있을까요?"]}
+{"operation": "list_agent_ssh_endpoints", "requests": ["접속 가능한 서버 목록 보여줘", "에이전트 사용 켜둔 SSH 서버들이 뭐뭐고 각각 어떤 명령까지 허용돼 있는지, 파일 올릴 수 있는지 알려줘", "내가 열어둔 원격 서버 중에 지금 못 쓰는 게 있나요?"]}
+{"operation": "get_tailscale_service_status", "requests": ["원격 접속 켜져 있어?", "테일스케일로 밖에서 들어오는 통로가 지금 돌아가는지랑 공개 주소가 뭔지 알려줘", "외부에서 접속할 수 있는 URL이 지금 살아 있나요?"]}
+{"operation": "get_sleep_prevention", "requests": ["절전 막아둔 상태야?", "컴퓨터가 자동으로 잠들지 않게 해놨는지, 설정만 켜진 건지 실제로 먹히고 있는지 확인해줘", "이 OS에서는 절전 억제를 무슨 방식으로 하고 있나요?"]}
+{"operation": "get_local_llm_connection", "requests": ["지금 기본으로 잡혀 있는 로컬 모델 서버 주소랑 모델 뭔지 보여줘", "로컬 LLM 기본 연결이 어떻게 설정돼 있는지 알고 싶어요. 서버 주소하고 기본 모델, 컨텍스트 길이, 켜져 있는지까지 한 번에 정리해 주세요", "기본으로 쓰는 로컬 모델 연결에 API 키는 넣어둔 상태야?"]}
+{"operation": "get_local_llm_connections", "requests": ["등록해 둔 로컬 모델 서버 전부 목록으로 뽑아줘", "이 기계 ollama 말고 원격 것도 등록해 놨는데, 지금 등록된 서빙 연결이 몇 개고 그중 어떤 게 기본으로 지정돼 있는지 쭉 보여주세요", "로컬 LLM 연결 목록에서 각각 기본 모델이랑 켜짐 여부는 어떻게 돼 있어?"]}
+{"operation": "get_antigravity_usage", "requests": ["Antigravity 남은 쿼터 알려줘", "Antigravity 를 모델별로 얼마나 썼고 언제 초기화되는지 계정 사용량 보던 것처럼 정리해 주세요", "안티그래비티 서버 지금 떠 있어? 사용량 확인되는 상태인가?"]}
+{"operation": "get_menu_translations", "requests": ["스킬 쪽 번역해 둔 항목 목록 보여줘", "skills 메뉴에 번역이 걸려 있는 항목이 뭐뭐인지 전체 목록으로 정리해 주세요", "에이전트 메뉴도 번역된 게 있나? 어떤 것들이 번역 목록에 올라와 있는지 궁금해"]}
+{"operation": "get_translated_detail", "requests": ["스킬 중에 code-review 번역문 열어줘", "번역 목록에서 round-designer 항목 하나만 골라서 번역된 내용이 실제로 어떻게 적혀 있는지 상세로 보여 주세요", "이 스킬 번역본 안에 뭐라고 들어가 있는지 볼 수 있어?"]}
+{"operation": "reconcile_session_catalog", "requests": ["세션 목록 최신 상태로 싹 맞춰줘", "새로 생긴 세션들이 목록에 안 잡히는 것 같은데, 바뀐 것만 훑어서 세션 카탈로그 전체를 한 번 맞춰 주세요", "세션 카탈로그 밀린 게 있으면 지금 따라잡게 해 줄래?"]}
+{"operation": "refresh_session_catalog", "requests": ["ses_f1d138d25ffeoAu3sP0ofQteTy 이 세션 하나만 다시 읽어줘", "코덱스 세션 ses_9a2c41b0e7d2ffQq3 하나가 옛날 내용으로 남아 있는데 전체 말고 그 세션만 카탈로그에 다시 반영해 주세요", "이 세션 한 건만 최신 내용으로 갱신할 수 있어?"]}
+{"operation": "get_storage_overview", "requests": ["저장소 용량 얼마나 쓰고 있어?", "앱이 쓰는 디스크가 어디에 얼마나 쌓여 있는지 한눈에 보게 정리해 주세요", "디스크가 부족한 것 같은데 지금 저장소 사용량이 어떻게 돼?"]}
+{"operation": "get_session_detail", "requests": ["ses_f1d138d25ffeoAu3sP0ofQteTy 대화 내용 열어줘", "그 코덱스 세션 안으로 들어가서 최근 대화를 50개씩 페이지로 끊어 보여 주세요", "이 세션에서 무슨 얘기가 오갔는지 내용을 볼 수 있을까?"]}
+{"operation": "get_session_linked_file", "requests": ["세션에 링크로 걸린 src/main.ts 미리보기 좀 띄워줘", "ses_f1d138d25ffeoAu3sP0ofQteTy 대화 기록에 파일 링크가 붙어 있던데 그 파일 내용을 미리보기로 열어 주세요", "이 세션 기록에 걸린 파일 링크, 안에 뭐가 들었는지 확인돼?"]}
+{"operation": "get_chat_linked_file", "requests": ["지금 돌고 있는 채팅에 뜬 README.md 링크 열어줘", "chat_8f31c2a 라이브 채팅 답변에 파일 경로가 링크로 나왔는데 그 파일을 미리보기로 보여 주세요", "라이브 채팅에서 나온 그 파일 링크 내용 확인할 수 있어?"]}
+{"operation": "get_chat_last_turn_output", "requests": ["chat_8f31c2a 무인 작업 마지막 출력 가져와", "백그라운드로 띄워둔 그 채팅이 마지막 턴에 뭐라고 내놨는지 결과만 회수해 주세요", "아까 무인으로 돌린 채팅 결과, 마지막 답변만 볼 수 있어?"]}
+{"operation": "get_session_folders", "requests": ["세션 폴더 목록 보여줘", "세션을 정리해 두려고 만든 폴더가 지금 어떤 것들이 있는지 전부 나열해 주세요", "세션 분류용 폴더 뭐뭐 만들어 놨었지?"]}
+{"operation": "get_round_goals", "requests": ["회차 목표 카드 전부 보여줘", "내가 적어둔 회차 목표들이랑 거기 붙은 스킬 키, 반복 요청, 지금 상태까지 같이 정리해 주세요", "지금 돌리고 있는 회차 목표가 몇 개나 잡혀 있어?"]}
+{"operation": "list_round_reports", "requests": ["회차 보고 최신순으로 목록 뽑아줘", "사람 결정을 기다리고 있는 회차 보고만 골라서 스무 개까지 최근 것부터 보여 주세요", "저 목표에 딸린 회차 보고들이 어떤 게 있는지 목록으로 볼 수 있을까?"]}
+{"operation": "get_round_report", "requests": ["rnd_20260921_03 보고서 열어줘", "그 회차 보고 하나만 펼쳐서 측정표랑 실패 종류, 고친 것, 커밋까지 자세히 보고 싶어요", "이 회차에서 뭘 고쳤고 되돌린 건 뭔지, 다음 회차로 뭘 넘겼는지 그 보고 내용 좀 볼래?"]}
+{"operation": "get_skill_detail", "requests": ["code-review 스킬 상세 열어줘", "설치된 스킬 중에 round-designer 하나만 골라서 안이 어떻게 구성돼 있는지 자세히 보여 주세요", "이 스킬 하나 설정이 어떻게 들어가 있어?"]}
+{"operation": "get_skill_library", "requests": ["스킬 라이브러리 전체 보여줘", "공통 원본이랑 공급자별 설치본이 개인이랑 프로젝트 중 어디에 깔려 있는지, 링크인지 사본인지, 원본이랑 동기화는 맞는지 한꺼번에 정리해 주세요", "지금 가지고 있는 스킬들이 다 어디에 설치돼 있는지 한 번에 볼 수 있어?"]}
+{"operation": "get_resource_repository", "requests": ["스킬이랑 지침 공통 저장소 경로 어디야?", "공통 저장소를 클라우드 드라이브 폴더로 돌려놨는지, 지금 어느 경로를 쓰고 있는지 OS까지 같이 알려 주세요", "공통 리소스가 저장되는 위치 확인돼?"]}
+{"operation": "get_project_registry", "requests": ["등록된 프로젝트 목록 보여줘", "이 장치에서 활성으로 잡힌 프로젝트가 뭐고 각각 세션이 몇 개인지, 아직 결정 안 난 것도 있는지 정리해 주세요", "비활성으로 빠져 있는 프로젝트도 있어?"]}
+{"operation": "get_project_instruction_library", "requests": ["AGENTS.md CLAUDE.md 공통 지침 목록 보여줘", "프로젝트 지침 원본들이 어디어디 배포됐는지, 배포 원장에 올라간 곳인지 그냥 같은 이름 파일만 있는 곳인지 구분해서 보여 주세요", "지침 배포 상태가 지금 어떻게 돼 있어?"]}
+{"operation": "get_project_instruction_migration_plan", "requests": ["이 지침 윈도우용 변형 만들 계획 뽑아줘", "development-rules 지침을 윈도우 대상으로 변환하려면 어떤 공급자에 뭐가 필요한지 계획이랑 작업 프롬프트만 보여 주세요. 생성은 돌리지 말고요", "그 지침 맥 대상 변형 생성 계획은 어떻게 나와?"]}
+{"operation": "read_project_instruction_file", "requests": ["codex 쪽 그 지침 원문 그대로 보여줘", "변환하기 전에 development-rules 지침의 코덱스 원본이 지금 뭐라고 적혀 있는지 원문으로 읽어 주세요", "이 지침 claude 버전 원본 내용은 어떻게 돼 있어?"]}
+{"operation": "preview_project_instruction_import", "requests": ["가져오기 전에 그 지침이 같이 끌어오는 문서들 먼저 훑어줘", "F:\\Project\\workspaces\\test 프로젝트의 코덱스 지침을 가져오려는데 @경로로 물려 있는 문서가 뭐뭐인지, 같이 담지 못하는 링크는 왜 그런지 미리 보여 주세요", "이 프로젝트 지침을 가져오면 딸려 오는 파일이 뭐가 있어?"]}
+{"operation": "check_project_instruction_delete", "requests": ["이 지침 지우기 전에 뭐가 같이 날아가는지 확인해줘", "development-rules 공통 원본을 지우려고 하는데 배포된 파일까지 몇 군데나 영향을 받는지 삭제 요청 전에 확인만 해 주세요", "그 프로젝트에 배포된 코덱스 지침 파일 하나만 지우면 영향 범위가 어디까지야?"]}
+{"operation": "list_instruction_trash", "requests": ["지침 휴지통에 뭐 남아 있어?", "실수로 지운 프로젝트 지침을 되살리려는데 휴지통에 남은 항목이랑 원래 위치, 누가 지웠는지 보여 주세요", "지침 휴지통 목록 좀 볼 수 있을까?"]}
+{"operation": "read_deployed_instruction_file", "requests": ["개인 홈 설정에 깔린 코덱스 지침 파일 내용 열어줘", "원본 말고 실제로 배포돼 있는 파일 기준으로, 홈 설정에 들어간 코덱스 지침이 지금 뭐라고 적혀 있는지 그대로 보여 주세요", "그 프로젝트에 실제로 배포된 CLAUDE.md 내용 확인돼?"]}
+{"operation": "get_deployed_instruction_linked_file", "requests": ["배포된 지침이 물고 있는 context/agent/development-rules.md 열어줘", "그 프로젝트에 깔린 코덱스 지침이 @경로로 끌어오는 문서가 있는데 그중 하나를 실제 내용까지 열어 주세요", "지침 안에서 링크한 하위 문서를 그 문서 기준 상대 경로로 볼 수 있어?"]}
+{"operation": "get_common_skill_digests", "requests": ["공통 스킬 원본들 내용 지문만 뽑아줘", "스킬 내용이 바뀐 게 있는지 비교하려고 하는데 원본별 이름이랑 지문값만 가볍게 목록으로 주세요", "공통 원본 다이제스트 값 전부 볼 수 있어?"]}
+{"operation": "get_common_skill_detail", "requests": ["round-designer 공통 원본 상세 보여줘", "그 공통 스킬 원본이 어느 디렉터리에 있고 파일이 뭐뭐 들었는지, 공급자별 게시 상태까지 알려 주세요", "이 공통 원본 하나 지문이랑 어디에 게시됐는지 어떻게 돼?"]}
+{"operation": "get_skill_migration_plan", "requests": ["이 스킬 윈도우용 변형 계획 뽑아줘", "code-review 스킬을 윈도우 대상으로 만들려면 뭐가 필요한지 계획이랑 작업 프롬프트만 보여 주세요. 생성 스크립트는 돌리지 말고요", "그 스킬 맥 대상 변형 계획은 어떻게 나와?"]}
+{"operation": "read_common_skill_file", "requests": ["round-designer 원본 안의 SKILL.md 열어줘", "고치기 전에 그 공통 스킬 원본에 들어 있는 SKILL.md 가 지금 어떤 내용인지 읽어 주세요", "공통 원본 폴더에 있는 references/palette.md 파일 내용 볼 수 있어?"]}
+{"operation": "check_skill_publish", "requests": ["claude 에 올리기 전에 충돌 나는지 확인해줘", "이 스킬을 공급자들한테 게시하려는데 기존 설치본이랑 겹쳐서 덮어써야 하는 상황인지 미리 확인만 해 주세요", "지금 게시 가능한 상태인지 먼저 볼 수 있어?"]}
+{"operation": "check_skill_delete", "requests": ["이 스킬 지우기 전에 영향 범위 확인해줘", "설치본 하나만 지우는 경우랑 공유 원본에 딸린 배포본까지 다 지우는 경우가 어떻게 다른지 삭제 확인 보내기 전에 봐 주세요", "skl_7c19ab3 이거 삭제하면 어디까지 없어져?"]}
+{"operation": "list_skill_trash", "requests": ["스킬 휴지통 목록 보여줘", "지워버린 스킬을 되살리려는데 휴지통에 뭐가 남아 있고 원래 어디에 있던 건지 알려 주세요", "스킬 휴지통에 걸려 있는 항목 있어?"]}
+{"operation": "get_agent_detail", "requests": ["Explore 에이전트 정의 보여줘", "code-reviewer 라는 에이전트가 어떤 도구를 쓰고 프롬프트가 어떻게 잡혀 있는지 정의 상세를 열어 주세요", "이 에이전트 설정이 어떻게 돼 있는지 확인돼?"]}
+{"operation": "get_artifact_detail", "requests": ["그 대화에서 나온 report.html 산출물 상세 열어줘", "conv_7a21f8 대화에 붙은 산출물 하나가 어떤 내용인지 자세히 보여 주세요", "이 산출물 안에 뭐가 들어 있는지 볼 수 있어?"]}
+{"operation": "get_doc_roots", "requests": ["등록해 둔 폴더 목록 좀 띄워줘", "파일 쪽에 루트로 붙여놓은 폴더가 지금 어떤 것들인지 한 번에 쭉 정리해서 보여주세요", "지금 문서 루트로 잡혀 있는 폴더가 뭐뭐 있지?"]}
+{"operation": "preview_directory_creation", "requests": ["F:/Project/workspaces/test/report/2026/09 만들면 뭐가 새로 생기는지 먼저 보여줘", "폴더를 실제로 만들지는 말고, 그 경로 중에 이미 있는 데가 어디까지고 그 아래로 새로 생길 폴더가 뭔지 계획만 먼저 알려주세요", "이 경로 이미 있는 거야? 없으면 몇 단계나 새로 파야 하는지 확인만 돼?"]}
+{"operation": "get_doc_tree", "requests": ["manuals 루트 안쪽 폴더 구조 트리로 펼쳐줘", "등록 폴더 중에 매뉴얼 쪽 루트 하나만 골라서 그 밑의 디렉터리랑 파일이 어떻게 들어가 있는지 트리 모양으로 보여주면 좋겠어요", "root_docs01 루트 밑에 하위 폴더가 어떤 식으로 갈라져 있어?"]}
+{"operation": "get_doc", "requests": ["manuals 루트에 있는 guide/intro.md 열어서 내용 보여줘", "등록 폴더에 들어있는 notes/2026-09-28.md 문서 하나 열어서 안에 뭐라고 적혀 있는지 읽어주세요", "root_docs01 쪽 README.md 본문 좀 확인해줄 수 있어?"]}
+{"operation": "get_doc_linked_file", "requests": ["지금 보는 intro.md 안에 ./spec/api.md 로 걸린 링크, 그 파일 미리 보여줘", "README.md 본문에 ../design/flow.md 로 연결된 링크가 하나 있던데 거기 따라가서 어떤 내용인지 미리보기로 띄워주세요", "이 문서에서 참조하는 링크 파일이 실제로 뭘 담고 있는지 따로 열지 않고 볼 수 있어?"]}
+{"operation": "list_document_entries", "requests": ["그 등록 폴더에 있는 파일들 페이지로 끊어서 목록 뽑아줘", "문서 루트 root_docs01 의 최상위부터 시작해서 일반 파일 전부를 200개씩 페이지 단위로 넘겨가며 나열해 주세요", "등록 폴더 안에 파일이 너무 많은데 한 번에 다 말고 나눠서 목록으로 받아볼 수 있나?"]}
+{"operation": "search_document_entries", "requests": ["등록 폴더에서 이름에 계약서 들어간 파일 찾아줘", "root_docs01 안에 있는 파일 중에 tuning 이라는 말이 걸리는 걸 전부 검색해서 알려주세요", "그 폴더 전체에서 회의록 이라는 말로 파일 검색되나?"]}
+{"operation": "get_document_file", "requests": ["reports/summary.md 파일 내용 그대로 뽑아줘", "등록 폴더에 있는 assets/logo.png 는 텍스트가 아니니까 내용 대신 형식이랑 크기 같은 메타 정보라도 읽어주세요", "root_docs01 의 data/notes.txt 는 안에 뭐가 들어있는지 꺼내올 수 있어?"]}
+{"operation": "get_document_automation_snapshot", "requests": ["파일 바뀌면 자동으로 도는 거 지금 상태 보여줘", "앱이 꺼져 있는 동안 바뀐 파일 보고랑 그동안의 실행 이력, 지금 고를 수 있는 액션까지 같이 정리해서 보여주세요", "파일 변경 트리거가 최근에 몇 번이나 돌았는지 볼 수 있어?"]}
+{"operation": "get_scheduler_snapshot", "requests": ["반복 요청 현황 한눈에 보여줘", "예약해 둔 반복 요청이랑 최근 실행 이력을 같이 묶어서 지금 어떻게 돌아가고 있는지 요약해 주세요", "스케줄 쪽 전체 상황이 지금 어떤 상태야?"]}
+{"operation": "list_scheduled_requests", "requests": ["켜져 있는 반복 요청만 목록으로 뽑아줘", "다음 실행 시각이 이번 주 안에 잡힌 반복 요청들만 프롬프트는 빼고 요약 형태로 50개까지 나열해 주세요", "튜닝 이라는 말 들어간 반복 요청만 골라서 목록으로 볼 수 있어?"]}
+{"operation": "get_scheduled_request_detail", "requests": ["sch_f1d138d25ffe 반복 요청 프롬프트까지 전부 보여줘", "아까 목록에 있던 반복 요청 하나만 골라서 거기 적어둔 프롬프트 원문이랑 설정 전체를 자세히 펼쳐주세요", "그 반복 요청이 실제로 무슨 지시문으로 돌고 있는지 상세로 확인돼?"]}
+{"operation": "list_scheduled_runs", "requests": ["반복 요청 실행 이력 목록 좀 보여줘", "최근에 실패로 끝난 실행들만 골라서 결과 본문 말고 언제 돌았는지 목록으로만 쭉 보여주세요", "sch_f1d138d25ffe 이 반복 요청이 지금까지 몇 번이나 돌았는지 이력 나열돼?"]}
+{"operation": "get_scheduled_run_detail", "requests": ["run_3b7c9a2e 실행 건 상세 열어줘", "어제 실패했던 그 실행 하나만 들어가서 요약이랑 오류 메시지 전문까지 보여주세요", "그 실행 기록에 남은 결과랑 에러 내용을 자세히 볼 수 있어?"]}
+{"operation": "list_system_audit", "requests": ["시스템 변경 감사 기록 보여줘", "AIA 가 시스템을 바꾸려고 시도한 건들, 성공한 것도 실패한 것도 같이 최근 50건 이력으로 정리해 주세요", "언제 무슨 시스템 작업이 실행됐는지 남은 기록 확인돼?"]}
+{"operation": "get_session_meta", "requests": ["ses_f1d138d25ffeoAu3sP0ofQteTy 세션에 즐겨찾기랑 메모 붙어 있는지 봐줘", "코덱스 세션 ses_f1d138d25ffeoAu3sP0ofQteTy 에 지금 어떤 폴더랑 고정 계정, 읽던 자리가 저장돼 있는지 알려주세요", "이 세션에 내가 달아둔 메모나 북마크가 아직 남아 있나?"]}
+{"operation": "list_external_provider_processes", "requests": ["앱 밖에서 따로 돌고 있는 claude CLI 있나 봐줘", "터미널이나 IDE 확장에서 독립으로 떠 있는 클로드 프로세스가 지금 몇 개인지 목록으로 보여주세요", "Agent Manager 가 안 띄운 클로드 실행이 따로 살아 있어?"]}
+{"operation": "list_provider_chats", "requests": ["클로드 런타임 전체 목록 보여줘", "Agent Manager 가 관리 중인 claude 채팅 런타임을 무인이든 연결 끊긴 것이든 전부 포함해서 나열해 주세요", "지금 클로드 쪽에 붙어 있는 관리 런타임이 몇 개나 돼?"]}
+{"operation": "preview_usage_paced_runs", "requests": ["지금 사용량으로 클로드 몇 건까지 띄울 수 있는지 예약은 걸지 말고 계산만 해봐", "F:/Project/workspaces/test 경로로 그 워크플로를 돌린다고 치고, 7일 창 92% 목표에 최대 6건 기준으로 실제 몇 건이 가능한지 기록 안 남기게 미리 계산해 주세요", "5시간 창 가드에 걸려서 잘리는 계정이 있는지 예약 흔적 없이 확인만 가능해?"]}
+{"operation": "get_usage_budget", "requests": ["사용량 예산 정책 지금 어떻게 잡혀 있어?", "페이싱에 참여하는 계정 풀이랑 계정별 목표, 남은 여유까지 예산 현황을 통째로 보여주세요", "소비자별로 회당 얼마나 쓰는지도 예산 쪽에 잡혀 있나?"]}
+{"operation": "get_system_workflows", "requests": ["등록된 워크플로 전부 보여줘", "시스템 워크플로 목록을 위험도랑 최근 실행 결과, 빠진 스킬 있는지까지 같이 정리해서 보여주세요", "지금 돌릴 수 있는 워크플로가 뭐뭐 있지?"]}
+{"operation": "get_system_workflow", "requests": ["wf_tuning_round 워크플로 상세 열어줘", "워크플로 하나만 골라서 버전 이력이랑 버전별 계약 본문까지 같이 봐야 차이를 낼 수 있을 것 같아요. 그것 좀 펼쳐주세요", "아까 목록에 있던 그 워크플로, 계약이 어떻게 생겼는지 자세히 볼 수 있어?"]}
+{"operation": "propose_system_workflow_schema", "requests": ["이 계약 초안 등록 전에 검증만 해줘", "워크플로로 만들 단계들을 짜봤는데 저장하지는 말고 형식이 맞는지 확인해서 승인 요약만 뽑아주세요", "등록 누르기 전에 초안이 통과될지 미리 점검 가능해?"]}
+{"operation": "execute_external_plugin_tool", "requests": ["노션 플러그인으로 페이지 하나 새로 만들어줘", "연결해 둔 노션에 회의록 페이지를 생성하는 도구를 호출해서 실제로 등록해 주세요", "외부 플러그인 도구 써서 노션에 문서 하나 추가해줄 수 있어?"]}
+{"operation": "set_external_plugin_enabled", "requests": ["노션 플러그인 꺼줘", "지금 노션은 안 쓸 거니까 그 외부 플러그인을 사용 안 함으로 바꿔주세요", "외부 플러그인 중에 노션만 다시 켜줄 수 있어?"]}
+{"operation": "set_claude_plugin_enabled", "requests": ["demo@official 플러그인 개인 설정에서 꺼줘", "이 프로젝트에서는 demo@official 클로드 코드 플러그인을 통째로 사용 안 함으로 바꿔주세요. 거기 딸린 스킬도 같이 꺼지는 걸로요", "아까 껐던 그 클로드 플러그인 설정을 다시 상속으로 되돌려 줄래?"]}
+{"operation": "set_claude_skill_override", "requests": ["code-review 스킬 이 프로젝트에선 꺼줘", "개인 스킬 중에 simplify 는 목록에 이름만 뜨게 설정을 바꿔주세요", "그 스킬에 걸어둔 설정 지우고 상속 상태로 돌려줄 수 있어?"]}
+{"operation": "set_claude_plugin_branch_rule", "requests": ["release/* 브랜치에서는 demo@official 플러그인 꺼지게 규칙 걸어줘", "F:/Project/workspaces/local-agent-manager-private 프로젝트에서 main 브랜치일 때만 그 플러그인이 켜지도록 브랜치 규칙을 하나 새로 넣어주세요", "브랜치마다 플러그인 사용 여부를 다르게 두는 규칙 등록해줄 수 있어?"]}
+{"operation": "remove_claude_plugin_branch_rule", "requests": ["release/* 에 걸어둔 그 플러그인 규칙 지워줘", "브랜치 규칙 중에 demo@official 쪽 한 줄만 삭제해서 그 브랜치에선 원래 프로젝트 설정 그대로 쓰게 해주세요", "등록 풀린 프로젝트에 남아 있는 브랜치 규칙도 없애줄 수 있어?"]}
+{"operation": "set_provider_telemetry_option", "requests": ["클로드 텔레메트리 막아줘", "코덱스 프롬프트 로깅은 수집 안 되게 값을 넣어주세요. 다음 실행부터 적용되는 거 알고 있어요", "아까 막아둔 제미나이 사용 통계 수집을 기본값으로 되돌릴 수 있어?"]}
+{"operation": "probe_local_llm_connection", "requests": ["http://127.0.0.1:11434/v1 한 번 찔러봐", "로컬 LLM 서버 주소를 등록하기 전에 거기서 모델 목록이 제대로 내려오는지 한 번만 확인해 주세요", "11434 포트로 띄워둔 서버에 지금 닿는지 테스트해볼 수 있어?"]}
+{"operation": "patch_session_meta", "requests": ["이 세션 즐겨찾기로 표시해줘", "ses_f1d138d25ffeoAu3sP0ofQteTy 세션의 실행 계정을 지금 쓰는 계정으로 고정해 주세요", "그 세션 메모 지우고 고정해 둔 계정도 풀어줄래?"]}
+{"operation": "create_session_folder", "requests": ["세션 폴더 튜닝 이라고 하나 만들어줘", "세션 정리하게 최상위에 새 폴더를 하나 파란색으로 추가해 주세요", "기존 폴더 밑에 하위 세션 폴더로 하나 더 만들어줄 수 있어?"]}
+{"operation": "update_round_goal", "requests": ["그 회차 목표 상태를 진행 중으로 바꿔줘", "설계 끝났으니 회차 목표에 방금 등록한 워크플로 id 랑 반복 요청 id 를 적고 상태도 active 로 갱신해 주세요", "회차 목표를 잠깐 멈춤으로 돌리고 설계 메모도 같이 남겨줄래?"]}
+{"operation": "record_round_report", "requests": ["이번 회차 결과 보고로 남겨줘", "실패 종류가 전후로 어떻게 바뀌었는지랑 커밋, 되돌린 부수효과까지 정리해서 회차 마감 보고를 기록해 주세요. 결과는 부분 성공으로요", "회차 끝났는데 사람이 정할 것까지 같이 적어서 보고 하나 남겨줄 수 있어?"]}
+{"operation": "update_session_folder", "requests": ["그 세션 폴더 이름 아카이브 로 바꿔줘", "세션 폴더 색을 바꾸고 상위 폴더도 최상위로 옮겨주세요", "이 세션 폴더 숨김으로 돌려서 전체 목록에는 안 보이게 해줄 수 있어?"]}
+{"operation": "reorder_session_folder", "requests": ["이 세션 폴더 한 칸 위로 올려줘", "세션 폴더 목록에서 그게 형제들 중에 너무 위에 있으니까 한 칸 아래로 순서를 내려주세요", "폴더 순서 바꿔서 위쪽으로 올릴 수 있어?"]}
+{"operation": "delete_session_folder", "requests": ["세션 목록에서 '2분기 정리' 폴더 없애줘.", "fld_9c2a1b에 묶어둔 폴더가 이제 안 쓰이는데, 그 밑에 만들어 둔 하위 폴더까지 한꺼번에 정리해 주세요. 안에 있던 대화는 그대로 남는다고 알고 있어요.", "이 폴더 아예 지우고 싶은데, 안에 있던 세션은 안 사라지는 거 맞죠? 맞으면 지워줘"]}
+{"operation": "create_directory", "requests": ["D:\\work\\reports 폴더 하나 만들어줘.", "F:\\Project\\alpha 밑에 docs/milestones 이런 식으로 두 칸 더 파 주세요. 지금 alpha까지만 있고 그 아래는 비어 있어요.", "C:\\Users\\refre\\Documents\\초안 경로가 아직 없던데 그 자리에 디렉터리 새로 만들어 줄 수 있어?"]}
+{"operation": "create_doc_root", "requests": ["D:\\work\\manuals 파일 화면에 등록해줘.", "회사 자료 모아둔 F:\\Project\\manuals 경로를 '업무 매뉴얼'이라는 이름으로 앱 파일 목록에 추가해 주세요.", "아직 안 만든 D:\\notes\\2026 경로인데, 없으면 만들어서 같이 등록해 줄 수 있나요?"]}
+{"operation": "delete_doc_root", "requests": ["'업무 매뉴얼' 등록 빼줘.", "파일 화면에 올려둔 폴더 중에 root_7f3a2c 이건 이제 안 봐요. 목록에서 내려 주세요. 실제 폴더는 그대로 두고요.", "여기 등록해 둔 이 폴더, 목록에서만 빼는 거 되나요? 그렇게 해줘"]}
+{"operation": "put_doc", "requests": ["등록 폴더 root_7f3a2c 안의 docs/README.md에 이 내용으로 저장해줘.", "방금 정리한 회의 내용을 '업무 매뉴얼' 폴더 아래 notes/2026-09-28.md 파일로 써 주세요. 없으면 새로 만들고요.", "이 텍스트를 파일 화면 폴더의 spec/api.md에 그대로 넣어줄래?"]}
+{"operation": "create_document_trigger", "requests": ["root_7f3a2c 폴더 파일 바뀌면 sch_3b91ee 반복 요청 돌아가게 걸어줘.", "등록 폴더 안에서 파일이 생기거나 수정될 때마다 지정한 반복 요청이 자동 실행되도록 감시 규칙을 하나 새로 만들어 주세요. 이름은 '문서 변경 감시'로 하고 잠깐 사이에 여러 번 안 터지게 여유도 좀 두고요.", "특정 폴더 파일이 바뀌면 새 채팅이 자동으로 열리게 하는 거 등록할 수 있어? 된다면 하나 만들어줘"]}
+{"operation": "update_document_trigger", "requests": ["trg_5d0c88 감시 규칙 대상 폴더를 root_9a1b44로 바꿔줘.", "'문서 변경 감시'로 걸어둔 규칙에서 삭제 이벤트는 빼고 생성·수정만 보도록 조건을 고쳐 주세요. 연달아 실행되는 간격도 좀 늘리고요.", "전에 만들어 둔 파일 감시 규칙 있잖아, 거기서 실행할 반복 요청을 sch_77c210으로 교체해 줄 수 있나요?"]}
+{"operation": "delete_document_trigger", "requests": ["trg_5d0c88 감시 규칙 삭제해줘.", "예전에 걸어둔 '문서 변경 감시' 규칙은 이제 필요 없어졌어요. 목록에서 완전히 지워 주세요.", "이 파일 변경 감시 규칙 아예 없애버려도 될까? 없애줘"]}
+{"operation": "set_document_trigger_enabled", "requests": ["trg_5d0c88 잠깐 꺼줘.", "작업하는 동안 자꾸 자동 실행이 걸려서요. 파일 감시 규칙을 지우지는 말고 일단 일시중지 상태로만 돌려 주세요.", "아까 멈춰둔 그 파일 변경 감시, 이제 다시 켜도 되겠지? 켜줘"]}
+{"operation": "run_document_trigger_test", "requests": ["trg_5d0c88 테스트로 한 번 돌려봐.", "파일을 실제로 건드리지 않고 이 감시 규칙에 걸어둔 동작이 제대로 실행되는지만 시험해 보고 싶어요.", "등록한 감시 규칙이 진짜 작동하는지 가짜 이벤트로 확인해 볼 수 있나요? 해줘"]}
+{"operation": "acknowledge_document_offline_report", "requests": ["rpt_21af09 보고 확인 처리해줘.", "앱 꺼져 있는 동안 파일이 바뀐 게 모아져서 알림으로 떠 있는데, 내용 봤으니까 확인한 걸로 표시해 주세요.", "백엔드 멈춰 있을 때 감지된 변경 보고 말이야, 그거 읽음 처리하면 목록에서 내려가지? 그렇게 해줘"]}
+{"operation": "create_common_skill", "requests": ["'회의록 정리'라는 공통 스킬 하나 새로 만들어줘. 키는 meeting-notes로.", "팀에서 같이 쓸 스킬 원본을 새로 하나 추가하고 싶어요. 표시 이름은 '릴리스 점검', 키는 release-check, 설명은 배포 전 확인 항목을 훑는 스킬이라고 넣어 주세요.", "아직 아무 것도 없는 빈 스킬 원본부터 만들 수 있나요? 이름은 'PR 리뷰 도우미'로 해줘"]}
+{"operation": "set_resource_repository", "requests": ["스킬이랑 지침 공통 저장소를 D:\\cloud\\AgentManager로 옮겨줘.", "공통 원본들이 쌓이는 폴더를 클라우드 동기화 경로로 바꾸고, 지금 있는 원본들 중에 충돌 안 나는 건 같이 복사해 주세요.", "공용 저장 위치를 앱 기본 자리로 되돌리고 싶은데 경로 비워서 원래대로 돌릴 수 있어?"]}
+{"operation": "set_project_active", "requests": ["F:\\Project\\alpha 프로젝트 비활성으로 돌려줘.", "이 장치에서는 그 프로젝트 세션이랑 대시보드 집계가 안 잡혔으면 좋겠어요. 파일은 그대로 두고 목록에서만 빠지게 꺼 주세요.", "전에 꺼둔 C:\\work\\beta 프로젝트, 다시 쓸 건데 활성 상태로 켜 주실래요?"]}
+{"operation": "create_project_instruction", "requests": ["'팀 지침'이라는 공통 지침 원본 새로 만들어줘. 키는 team-instruction.", "코덱스용 AGENTS.md 내용을 담은 공통 개발 지침 원본을 하나 새로 등록하고 싶어요. 표시 이름은 '팀 지침'으로 해 주세요.", "프로젝트마다 복붙하지 말고 지침 원본을 한 군데 만들어 두는 거 되나요? 그럼 하나 만들어줘"]}
+{"operation": "import_project_instruction", "requests": ["F:\\Project\\alpha에 있는 AGENTS.md 공통 원본으로 가져와줘.", "이미 프로젝트 안에 손으로 써 둔 CLAUDE.md가 있는데, 그걸 그대로 공통 지침 원본으로 끌어와서 관리하고 싶어요. 지침이 참조하는 문서들도 같이 들어오면 좋겠고요.", "홈에 있는 개인 지침 파일도 공통 원본으로 가져올 수 있나요? 있으면 team-instruction 키로 가져와줘"]}
+{"operation": "publish_project_instruction", "requests": ["team-instruction 지침 F:\\Project\\alpha에 코덱스용으로 깔아줘.", "공통으로 만들어 둔 팀 지침을 이 프로젝트 폴더에 실제 파일로 내려 주세요. 기존 파일이 있으면 덮어쓰지 말고 실패로 알려 주고요.", "그 지침을 개인 위치에도 배포할 수 있어? 거기도 같이 뿌려줘"]}
+{"operation": "save_project_instruction_platform_variant", "requests": ["team-instruction 지침 윈도우용 버전 만들어서 저장해줘.", "맥 기준으로 쓴 이 지침을 윈도우 환경에 맞게 고친 별도 버전으로 보관해 주세요. 생성 스크립트는 실행하지 말고 파일만 저장하고요.", "같은 지침인데 OS별로 다른 내용을 따로 들고 갈 수 있나요? 리눅스용으로 하나 만들어서 넣어줘"]}
+{"operation": "set_project_instruction_platforms", "requests": ["team-instruction 지침은 맥에서만 쓰는 걸로 표시해줘.", "이 지침 원본이 어떤 운영체제를 지원하는지 정보를 맥과 윈도우 둘 다로 지정해 주세요. 내용은 건드리지 말고 표시만요.", "지금 OS 제한 걸려 있는 거 풀고 아무 데서나 쓰는 걸로 바꿔줄래? 빈 값으로 두면 된다던데"]}
+{"operation": "update_project_instruction", "requests": ["team-instruction 지침 본문 이 내용으로 고쳐줘.", "공통 지침 원본 내용을 수정하고, 이미 뿌려 둔 위치들에도 바로 반영되게 해 주세요. 표시 이름도 '팀 공통 지침'으로 같이 바꾸고요.", "지침에서 필요 없어진 파일 하나 빼고 나머지는 새 내용으로 다시 저장해 줄 수 있나요?"]}
+{"operation": "sync_project_instruction_from_deployment", "requests": ["F:\\Project\\alpha의 AGENTS.md가 바뀌었는데 그걸 원본으로 삼아줘.", "팀원이 프로젝트에 배포된 지침 파일을 직접 고쳐 놨어요. 그 버전을 공통 원본으로 채택하고 다른 위치에도 다시 뿌려 주세요.", "밖에서 수정된 개인 위치 지침 파일 내용을 거꾸로 원본에 반영하는 것도 되나요? 그렇게 해줘"]}
+{"operation": "attach_project_instruction_deployment", "requests": ["F:\\Project\\alpha에 이미 있는 AGENTS.md를 team-instruction 배포로 잡아줘.", "프로젝트 폴더에 원래부터 있던 지침 파일이 있는데, 내용은 그대로 두고 이 공통 원본이 관리하는 위치로만 등록해 주세요. 다음 수정부터 여기도 같이 갱신되게요.", "여기 있는 CLAUDE.md도 공통 원본 배포 목록에 끼워 넣을 수 있어? 넣어줘"]}
+{"operation": "detach_project_instruction_deployment", "requests": ["F:\\Project\\alpha는 team-instruction 배포 목록에서 빼줘.", "이 프로젝트는 이제 따로 관리할 거라서, 파일은 그 자리에 두되 공통 원본이 갱신될 때 같이 덮이지 않도록 연결만 끊어 주세요.", "지침 파일은 남기고 관리 대상에서만 제외하는 것도 되나요? 그렇게 풀어줘"]}
+{"operation": "set_project_instruction_auto_sync", "requests": ["team-instruction 자동 반영 켜줘.", "밖에서 지침 파일이 수정된 게 감지되면 매번 물어보지 말고 그 버전을 원본에 자동으로 반영하고 다시 배포하게 설정해 주세요.", "이 지침은 자동으로 따라가지 말고 내가 직접 확인하고 싶은데 자동 동기화 꺼 줄 수 있나요?"]}
+{"operation": "delete_project_instruction_deployment", "requests": ["F:\\Project\\alpha에 깔린 코덱스 지침 파일 휴지통으로 보내줘.", "이 프로젝트 폴더에 배포돼 있는 지침 파일 하나만 치우고 싶어요. 공통 원본은 그대로 두고 그 위치 파일만 휴지통으로 옮겨 주세요.", "개인 위치에 뿌려진 지침 파일도 지울 수 있나요? 영향 확인됐으면 그거 삭제 진행해줘"]}
+{"operation": "delete_shared_project_instruction", "requests": ["team-instruction 원본이랑 배포된 파일 다 지워줘.", "이 공통 지침은 아예 안 쓰기로 했어요. 원본이랑 배포 목록에 올라 있는 파일들까지 한 묶음으로 휴지통에 보내 주세요. 밖에서 고쳐진 건 남겨 두고요.", "공통 지침 하나를 통째로 정리하면 배포본까지 같이 사라지는 거죠? 그러면 그렇게 삭제해줘"]}
+{"operation": "unarchive_shared_project_instruction", "requests": ["team-instruction 보관만 취소해줘.", "이 지침은 더 이상 앱에서 들고 있지 않으려고요. 프로젝트에 깔린 파일들은 그대로 두고 공통 원본 쪽만 정리해서 미보관 상태로 되돌려 주세요.", "나중에 다시 가져올 수 있게 배포 파일은 남기고 보관에서만 빼는 거 되나요? 그렇게 해줘"]}
+{"operation": "restore_instruction_trash", "requests": ["휴지통에 있는 trash_4e12bb 지침 되살려줘.", "아까 지운 팀 지침을 원래 자리로 복구해 주세요. 같이 묶여서 삭제된 배포 파일들도 한꺼번에 돌아왔으면 좋겠어요.", "지침 휴지통에 들어간 항목 원위치로 돌릴 수 있죠? 그거 하나 복구해줘"]}
+{"operation": "purge_instruction_trash", "requests": ["지침 휴지통 싹 비워줘.", "휴지통에 있는 trash_4e12bb 항목은 복구할 일 없으니 영구히 지워 주세요. 나머지는 그대로 두고요.", "지침 휴지통에 쌓인 거 완전 삭제하면 다시 못 살리는 거 맞지? 그래도 비워줘"]}
+{"operation": "import_skill_to_common", "requests": ["클로드에 깔린 code-review 스킬 공통 원본으로 가져와줘.", "공급자 쪽에 설치돼 있는 스킬이 하나 있는데, 설치본은 건드리지 말고 공통 저장소에 사본을 만들어서 관리하고 싶어요.", "이 설치된 스킬을 공통으로 끌어오는 것도 되나요? skl_88c0d1 이거 가져와줘"]}
+{"operation": "publish_common_skill", "requests": ["release-check 스킬 클로드 개인 쪽에 깔아줘.", "공통으로 만들어 둔 스킬을 F:\\Project\\alpha 프로젝트 위치에 설치해 주세요. 이미 같은 게 있으면 덮어써도 됩니다.", "이 공통 스킬을 코덱스랑 클로드 양쪽에 같이 배포할 수 있나요? 둘 다 깔아줘"]}
+{"operation": "update_common_skill", "requests": ["release-check 스킬 SKILL.md 이 내용으로 고쳐줘.", "공통 스킬 원본 본문을 수정하고 지금 설치돼 있는 위치들에도 바로 다시 반영되게 해 주세요.", "스킬 안에 안 쓰는 스크립트 파일 하나 빼고 나머지 내용 갱신해 줄 수 있어?"]}
+{"operation": "save_skill_platform_variant", "requests": ["release-check 스킬 윈도우용으로 run.ps1 넣고 run.sh는 빼줘.", "맥 기준으로 짜둔 이 스킬을 윈도우에서도 돌아가게 고친 버전으로 원본에 넣어 주세요. 스크립트를 실제로 실행하지는 말고 파일만 저장하고요.", "같은 스킬을 OS별로 다른 스크립트 쓰게 나눠 둘 수 있나요? 리눅스용 버전 하나 만들어서 저장해줘"]}
+{"operation": "set_skill_platforms", "requests": ["release-check 스킬은 맥 전용으로 표시해줘.", "이 스킬이 어느 운영체제에서 쓸 수 있는지 정보만 윈도우와 리눅스로 지정해 주세요. 파일 내용은 그대로 두고요.", "지금 OS 지정돼 있는 스킬을 아무 데서나 쓰는 걸로 풀 수 있나요? 빈 값으로 바꿔줘"]}
+{"operation": "sync_skill_from_install", "requests": ["skl_88c0d1 설치본 내용을 공통 원본으로 삼아줘.", "설치된 쪽 스킬을 직접 고쳐서 써 왔는데, 그게 최신이라 그 버전을 새 원본으로 채택하고 다른 설치 위치에도 다시 뿌려 주세요.", "밖에서 바뀐 설치본을 거꾸로 원본에 반영하는 것도 되죠? 그럼 그렇게 맞춰줘"]}
+{"operation": "set_skill_auto_sync", "requests": ["release-check 스킬 자동 재배포 켜줘.", "공통 스킬 원본을 고칠 때마다 설치된 위치들에 자동으로 다시 깔리도록 설정해 주세요.", "이 스킬은 자동으로 퍼지지 않게 하고 싶은데 자동 반영 꺼 줄 수 있나요?"]}
+{"operation": "delete_skill", "requests": ["skl_88c0d1 설치본 휴지통으로 보내줘.", "클로드 개인 위치에 깔려 있는 이 스킬 설치본 하나만 치우고 싶어요. 영향 확인했으니 휴지통으로 옮겨 주세요.", "프로젝트에 설치된 스킬 하나만 지우는 것도 되나요? 공통 원본은 두고 그 설치본만 삭제해줘"]}
+{"operation": "delete_shared_skill", "requests": ["공유 스킬 code-reviewer 원본이랑 배포본까지 전부 휴지통으로 보내줘.", "여러 에이전트에 뿌려둔 daily-report 스킬을 영향 범위 먼저 확인하고 원본까지 통째로 삭제 처리해 주세요.", "release-notes 스킬은 공유본이랑 각 에이전트에 깔린 사본까지 한 번에 지울 수 있나? 그렇게 지워줘."]}
+{"operation": "unarchive_shared_skill", "requests": ["onboarding-guide 스킬 공용 보관만 풀어줘. 에이전트에 있는 건 그대로 두고.", "market-watch 스킬을 공용 목록에서만 내리고 싶습니다. 각 에이전트가 쓰던 사본은 살려 두고 보관 상태만 취소해 주세요.", "pr-triage 스킬을 에이전트 사본은 남긴 채로 공유 원본만 정리할 수 있어? 보관 해제해 줘."]}
+{"operation": "restore_skill_trash", "requests": ["휴지통에 있는 trs_9f2c1ab7de 항목 원래 자리로 되돌려줘.", "어제 잘못 지운 스킬이 휴지통에 남아 있는데, 같이 지워진 배포본까지 묶어서 원래 위치로 복구해 주세요.", "휴지통에서 이 항목 다시 살릴 수 있나요? 원본이랑 사본이 같이 돌아왔으면 좋겠어요."]}
+{"operation": "purge_skill_trash", "requests": ["휴지통 항목 trs_9f2c1ab7de 영구 삭제해.", "스킬 휴지통이 용량만 잡아먹으니 전체를 비워 주세요. 복구가 안 된다는 점은 알고 요청합니다.", "휴지통에 남은 저 항목 하나만 완전히 없애버릴 수 있어?"]}
+{"operation": "create_scheduled_request", "requests": ["매일 아침 9시에 빌드 상태 정리하는 반복 요청 하나 만들어줘.", "월요일 오전마다 지난주 커밋을 요약하는 반복 작업을 새로 등록하고 싶습니다. 작업 폴더는 기본 작업공간 그대로 쓰면 돼요.", "정해진 시간에 자동으로 도는 요청을 새로 추가할 수 있어? 여섯 시간마다 로그 점검하는 걸로 하나 만들어 줘."]}
+{"operation": "update_scheduled_request", "requests": ["sch_2f81aa 반복 요청 실행 시각을 저녁 7시로 바꿔줘.", "등록해 둔 주간 리포트 반복 요청의 프롬프트랑 주기를 수정하고, 종료 기한도 다음 달 말까지로 미뤄서 다시 저장해 주세요.", "이 반복 요청 내용만 고칠 수 있나요? 모델이랑 작업 경로만 바꾸면 되는데."]}
+{"operation": "delete_scheduled_request", "requests": ["sch_2f81aa 반복 요청 지워.", "이제 안 쓰는 야간 배치 반복 요청이 목록에 계속 남아 있는데 아예 삭제해 주세요.", "이 반복 요청 목록에서 없앨 수 있어?"]}
+{"operation": "set_schedule_enabled", "requests": ["sch_2f81aa 반복 요청 잠깐 꺼줘.", "삭제까지는 말고 주간 점검 반복 요청만 비활성으로 돌려놨다가 나중에 다시 켜려고 합니다.", "이 반복 요청 지금 꺼져 있는 것 같은데 다시 켜줄래?"]}
+{"operation": "run_scheduled_request_now", "requests": ["sch_2f81aa 지금 바로 한 번 돌려줘.", "다음 예정 시각까지 기다리기 애매하니 이 반복 요청을 지금 즉시 한 회차 실행해 주세요.", "예약을 전체로 멈춰뒀는데도 이건 지금 돌릴 수 있나? 바로 실행해 줘."]}
+{"operation": "cancel_scheduled_run", "requests": ["지금 돌고 있는 실행 run_7c3d19 중단시켜.", "반복 요청 실행이 한 시간째 안 끝나는데, 그 실행 건을 사유 남기고 취소 처리해 주세요.", "실행 중인 이 회차 강제로 멈출 수 있어? 사유는 입력 데이터 오류로 달아줘."]}
+{"operation": "set_schedules_paused", "requests": ["예약 실행 전부 잠깐 멈춰.", "점검에 들어가니 예약된 반복 실행이 하나도 나가지 않게 전체를 일시정지해 주세요.", "작업 다 끝났는데 멈춰둔 예약 실행 전체 다시 돌려줄래?"]}
+{"operation": "set_system_automation_settings", "requests": ["시스템 에이전트 공급자를 클로드로 바꿔줘.", "시스템 자동화 쪽에서 기본 언어랑 공급자별 실행 설정, 자동 번역 켜짐 여부를 한 번에 조정하고 싶습니다.", "시스템 에이전트가 쓰는 실행 설정 좀 바꿀 수 있나? 모델이랑 자동 번역 옵션까지 같이."]}
+{"operation": "set_tailscale_service_enabled", "requests": ["테일스케일 원격 접근 켜줘.", "밖에서 접속해야 해서 Tailscale Serve를 활성화하고 싶은데, 다른 프로세스가 잡고 있으면 그 설정을 대체하고 올려 주세요.", "원격 접속 기능 이제 꺼도 될까? 꺼줘."]}
+{"operation": "set_sleep_prevention", "requests": ["이 컴퓨터 자동 절전 안 걸리게 막아줘.", "원격으로 붙어 있는 동안 호스트가 잠들면 연결이 끊기니 절전으로 넘어가지 않도록 잡아 두고 싶습니다.", "노트북 배터리가 빨리 닳아서 그런데 절전 막아둔 거 다시 풀어줄래?"]}
+{"operation": "request_system_language", "requests": ["앱 표시 언어 영어로 바꿔줘.", "화면에 나오는 시스템 언어를 한국어에서 일본어로 전환해 주시겠어요?", "언어 설정을 그냥 한국어로 되돌릴 수 있나?"]}
+{"operation": "retry_ui_translation", "requests": ["UI 번역 실패했네, 다시 시도해줘.", "화면 문구 번역이 중간에 끊긴 것 같은데 실패한 부분부터 한 번 더 돌려 주세요.", "인터페이스 번역 재시도 되나요? 아까 오류가 났었는데."]}
+{"operation": "cancel_ui_translation", "requests": ["지금 돌고 있는 UI 번역 그만해.", "화면 번역 작업이 너무 오래 걸려서 중간에 멈추려고 합니다. 진행 중인 것 취소해 주세요.", "진행 중인 인터페이스 번역 취소할 수 있어?"]}
+{"operation": "retry_menu_translation", "requests": ["스킬 메뉴 번역 다시 돌려줘.", "다른 메뉴는 멀쩡한데 스킬 화면 항목 번역만 실패한 것 같습니다. 그 메뉴만 다시 시도해 주세요.", "메뉴 중에 스킬 쪽 번역만 재시도할 수 있나요?"]}
+{"operation": "reset_menu_translation", "requests": ["스킬 메뉴에 저장된 번역 다 지우고 새로 번역해줘.", "스킬 메뉴 번역 결과가 엉망이라 기존에 저장된 걸 초기화하고 처음부터 다시 번역했으면 합니다.", "저장돼 있는 스킬 메뉴 번역을 싹 밀고 재번역할 수 있어?"]}
+{"operation": "translate_resource", "requests": ["스킬 메뉴에서 res_daily_report 이 항목 하나만 지금 번역해줘.", "자동 번역이 꺼져 있는 건 아는데, 스킬 목록의 이 항목 하나는 저장된 번역 무시하고 지금 바로 번역해 주세요.", "스킬 쪽 특정 항목 하나만 필드까지 전부 번역시킬 수 있나?"]}
+{"operation": "mark_chat_attention_read", "requests": ["이 채팅 알림 읽음으로 처리해.", "알림함에 떠 있는 atn_5b2137 항목 하나를 읽은 걸로 바꿔 주세요.", "이 알림 하나만 읽음 표시할 수 있어?"]}
+{"operation": "mark_all_chat_attention_read", "requests": ["종료 알림 전부 읽음 처리해줘.", "쌓인 채팅 종료 알림을 한꺼번에 읽음으로 넘기고 싶은데, 야간 배치 프로필 것만 빼고 처리해 주세요.", "알림 하나씩 누르기 귀찮은데 전부 읽음으로 바꿔줄래?"]}
+{"operation": "clear_read_chat_attention", "requests": ["이미 읽은 종료 알림들 정리해.", "읽음 처리된 알림만 목록에서 치우고 안 읽은 것만 남겨 주세요.", "읽은 알림은 이제 안 봐도 되는데 그것만 비울 수 있나?"]}
+{"operation": "dismiss_chat_attention", "requests": ["알림 atn_5b2137 삭제해.", "이 채팅 알림 하나는 필요 없으니 목록에서 아예 지워 주세요.", "이 알림 하나만 없앨 수 있어? 읽음 말고 삭제로."]}
+{"operation": "raise_pacing_suggestion", "requests": ["페이싱 제안 알림 하나 종에 올려줘. 키는 cache-regression 으로.", "이번 관측에서 캐시 적중률이 떨어진 게 보이는데, 설정은 내가 직접 조정할 테니 제안 알림만 하나 띄워 주세요.", "누르면 워크플로 페이싱 탭으로 가는 제안 알림 하나 만들 수 있나? 제목이랑 상세 내용 붙여서."]}
+{"operation": "revalidate_provider_account_credential", "requests": ["acc_91xk4b 계정 자격증명 다시 검증해줘.", "이 계정이 인증 오류로 떠 있는데 실제로는 살아 있는 것 같습니다. 활성 계정은 건드리지 말고 신원만 다시 확인해 주세요.", "계정 인증 상태가 옛날 정보 같은데 재검증해서 정상으로 돌릴 수 있어?"]}
+{"operation": "consume_account_reset_credit", "requests": ["acc_91xk4b 계정에 한도 리셋 크레딧 한 장 써줘.", "Codex 계정 사용량 창이 꽉 찼는데 남은 리셋 크레딧을 한 장 소모해서 되돌려 주세요. 되돌릴 수 없다는 점 알고 요청합니다.", "리셋 크레딧 한 장 써서 지금 막힌 한도 풀 수 있나? 이 계정에 적용해 줘."]}
+{"operation": "set_default_provider_account", "requests": ["acc_91xk4b 를 기본 실행 계정으로 잡아줘.", "앞으로 새로 여는 채팅이랑 터미널이 이 계정으로 돌아가게 기본값으로 지정해 주세요.", "헤더 사용량에 표시되는 기준 계정을 이걸로 정할 수 있나요?"]}
+{"operation": "set_active_provider_account", "requests": ["활성 계정 acc_2m7tqz 로 전환해.", "지금 쓰고 있는 계정을 다른 걸로 옮기려는데, 실행 중인 세션은 끊지 말고 활성만 바꿔 주세요.", "계정 갈아타고 이어서 작업할까? 지금 활성인 걸 저쪽 계정으로 돌려줘."]}
+{"operation": "set_provider_account_disabled", "requests": ["acc_2m7tqz 계정 당분간 사용 중지해.", "한도 초과가 잦은 계정이 있어서 한동안 쓰이지 않게 막아 두고 싶습니다. 나중에 다시 풀 거예요.", "중지해 뒀던 그 계정 다시 쓸 수 있게 풀어줄래?"]}
+{"operation": "set_provider_account_auto_switch", "requests": ["acc_2m7tqz 자동전환 순환 대상에 넣어줘.", "한도를 다 쓰면 넘어가는 계정 순환 목록에 이 계정도 포함되게 지정해 주세요.", "이 계정은 자동으로 넘어가는 거 싫은데 순환 대상에서 빼줄 수 있어?"]}
+{"operation": "set_provider_account_auto_switch_priority", "requests": ["acc_2m7tqz 페일오버 순서 1번으로 해줘.", "한도가 넘어갈 때 이 계정이 제일 먼저 잡히도록 우선순위 값을 가장 낮게 지정하고 싶습니다.", "이 계정에 걸어둔 전환 우선순위 지정을 해제할 수 있나요?"]}
+{"operation": "set_provider_account_note", "requests": ["acc_2m7tqz 에 팀 공용이고 야간만 쓴다고 메모 달아줘.", "계정이 여러 개라 헷갈리는데 이 계정에 용도 설명을 메모로 남겨 두고 싶습니다.", "계정에 적어둔 메모 지울 수 있어? 그냥 비워줘."]}
+{"operation": "set_provider_account_label", "requests": ["acc_2m7tqz 표시 이름을 사내 개발용으로 바꿔줘.", "계정 목록에 이메일 그대로 떠서 알아보기 힘든데 보기 좋은 이름으로 바꿔 주세요.", "직접 지정해 둔 표시 이름을 원래 공급자가 주는 이름으로 되돌릴 수 있나요?"]}
+{"operation": "set_auto_switch_resume", "requests": ["자동전환으로 끊긴 채팅은 새 계정에서 이어서 돌게 켜줘.", "한도 때문에 계정이 바뀌면 진행 중이던 대화를 새 계정에서 자동으로 이어받아 다시 시작하도록 설정하고 싶습니다.", "계정 넘어간 뒤 채팅 자동 재시작은 안 하는 게 낫겠는데 꺼줄래?"]}
+{"operation": "set_auto_switch_policy", "requests": ["다음 계정 고르는 방식 사용량 여유 많은 순으로 바꿔.", "한도 페일오버가 계정을 고를 때 내가 지정해 둔 우선순위를 따르도록 방식을 변경해 주세요.", "등록한 순서대로 돌아가면서 쓰게 설정할 수 있나요?"]}
+{"operation": "set_auto_switch_usage_gap", "requests": ["사용량 분산 교체 폭 10%로 설정해.", "활성 계정이 제일 덜 쓴 계정보다 15%p 넘게 앞서면 그쪽으로 옮겨가도록 교체 폭을 잡아 주세요.", "사용량 균등 맞추려고 계정 옮기는 건 안 쓰고 싶은데 꺼줄래?"]}
+{"operation": "set_resume_account_policy", "requests": ["세션 이어갈 때는 지금 활성인 계정으로 돌게 바꿔줘", "이어서 하기를 누르면 예전에 쓰던 계정으로 붙어서 헷갈리는데, 앞으로는 재개할 때 현재 활성 계정을 쓰도록 규칙을 바꿔주세요", "세션 재개할 때 어느 계정으로 실행할지 정하는 설정, 활성 계정 쪽으로 돌려놓을 수 있어?"]}
+{"operation": "delete_provider_account", "requests": ["이 계정 등록 지워줘", "acc_7b2c9d41ffe0Au3 계정은 이제 안 쓰니까 관리 계정 목록에서 빼주세요", "안 쓰는 클로드 계정 하나 등록 해제할 수 있을까?"]}
+{"operation": "click_ui_element", "requests": ["화면에 보이는 저장 버튼 눌러줘", "방금 찾아준 요소들 중에 '저장합니다' 버튼 있잖아, 그거 네가 직접 클릭해줘", "아까 나온 ref로 잡힌 그 버튼, 대신 눌러줄 수 있어?"]}
+{"operation": "write_cypress_workspace_file", "requests": ["사내 포털 QA 작업공간에 e2e/collect-notices.cy.js 스펙 새로 만들어줘", "공지사항 긁어오는 테스트 코드를 짜서 그 Cypress 작업공간의 e2e 폴더 밑에 파일로 저장해주세요. 로그인 값은 본문에 박지 말고 env에서 읽게 해주시고요", "작업공간에 스펙 파일 하나 써 넣어줄래? 경로는 e2e/collect-notices.cy.js로."]}
+{"operation": "delete_cypress_workspace_file", "requests": ["그 작업공간에서 e2e/old.cy.js 지워줘", "이제 안 쓰는 낡은 스펙 파일이 작업공간에 남아 있는데 e2e/old.cy.js 경로 그거 삭제해주세요", "작업공간 안에 있는 옛날 테스트 파일 하나 빼줄 수 있어?"]}
+{"operation": "run_cypress_spec", "requests": ["e2e/collect-notices.cy.js 지금 돌려줘", "사내 포털 QA 작업공간에서 공지 수집 스펙을 cypress.lane.config.js 설정으로 한 번 실행해주세요", "그 작업공간 테스트 실행해서 결과 받아볼 수 있을까?"]}
+{"operation": "add_cypress_workspace", "requests": ["이 폴더 Cypress 작업공간으로 등록해줘", "D:/work/portal-qa 폴더를 '사내 포털 QA'라는 이름으로 작업공간에 추가해주세요. 모듈 폴더는 같은 경로에 있어요", "테스트 돌릴 폴더를 새 작업공간으로 잡아줄 수 있어?"]}
+{"operation": "install_cypress_module", "requests": ["그 작업공간에 Cypress 15.21.1 설치해줘", "작업공간이 모듈이 없다고 실행이 안 되는데 거기다 Cypress 모듈 좀 깔아주세요", "여기 Cypress가 아직 안 깔린 것 같은데 설치해줄래?"]}
+{"operation": "propose_chat_settings_schema", "requests": ["claude CLI 조사한 내용으로 실행설정 스키마 갱신해줘", "도움말 보니까 Fable 5 모델이랑 high 추론 수준이 새로 생겼던데, 클로드 쪽 모델·추론 카탈로그에 그 차이만 제안으로 올려주세요", "지금 깔린 CLI 기준으로 실행 모드 선택지랑 모델 목록 다시 제안해줄 수 있어?"]}
+{"operation": "send_chat_message", "requests": ["그 채팅에 이 메시지 보내줘", "chat_9f31c0d8에 지금까지 진행 상황 정리해 달라고 메시지 하나 전달해주세요. 돌고 있으면 대기열에는 넣지 말고요", "열려 있는 채팅에 내 말 대신 전해줄래?"]}
+{"operation": "remove_chat_input_file", "requests": ["채팅 입력창에 붙여둔 첨부 파일 빼줘", "아직 안 보낸 채로 그 채팅에 달려 있는 업로드 파일이 하나 있는데, 그 첨부만 떼어내 주세요", "그 채팅에 올려둔 파일, 전송하기 전에 취소할 수 있어?"]}
+{"operation": "start_chat", "requests": ["codex로 새 채팅 하나 열고 이 요청 던져줘", "D:/work/portal 경로를 작업 폴더로 잡아서 새 대화를 시작하고 첫 메시지까지 넣어주세요. 승인은 수동으로 두고요", "이 프로젝트에서 새 세션 만들어서 바로 시작해줄래?"]}
+{"operation": "detach_chat", "requests": ["이 채팅 화면 연결만 끊어줘, 프로세스는 살려두고", "chat_9f31c0d8은 계속 돌게 두고 화면에서만 떼어내 주세요", "실행은 그대로 두고 채팅 연결만 분리할 수 있어?"]}
+{"operation": "stop_chat", "requests": ["이 채팅 완전히 종료해줘", "chat_9f31c0d8이 계속 돌고 있는데 프로세스까지 끝내고 대기열이랑 승인도 정리해주세요", "지금 이 대화 실행 중단시켜줄 수 있어?"]}
+{"operation": "stop_provider_chats", "requests": ["클로드로 돌아가는 채팅 전부 종료해줘", "claude 공급자로 떠 있는 Agent Manager 관리 런타임을 프로필이나 연결 여부 상관없이 싹 다 끝내주세요", "클로드 쪽에서 실행 중인 채팅들 한꺼번에 내릴 수 있을까?"]}
+{"operation": "stop_provider_terminals", "requests": ["클로드 터미널 다 닫아줘", "claude 관련해서 열려 있는 일반·설정·로그인 터미널까지 전부 종료해주세요", "공급자 터미널 창들이 계속 남아 있는데 정리해줄래?"]}
+{"operation": "terminate_external_provider_processes", "requests": ["앱 밖에서 따로 돌고 있는 claude CLI 프로세스 죽여줘", "Agent Manager가 띄운 게 아니라 제가 직접 실행해둔 클로드 CLI가 백그라운드에 남아 있는데 그 외부 프로세스를 종료해주세요", "앱과 상관없이 독립으로 떠 있는 공급자 프로세스도 끌 수 있어?"]}
+{"operation": "switch_active_provider_account", "requests": ["활성 계정 이걸로 바꿔줘", "acc_7b2c9d41ffe0Au3 계정을 지금 쓰는 활성 계정으로 전환하고 그 계정 사용량도 다시 읽어주세요", "메인으로 쓰는 계정 다른 걸로 갈아탈 수 있어?"]}
+{"operation": "set_usage_budget_policy", "requests": ["예산 기본값 7일 92%, 가드 5시간 85%로 바꿔줘", "사용량 페이싱 기본 목표랑 가드를 통째로 다시 잡아주세요. 계획 창은 7일 92%, 가드 창은 5시간 85%로요", "전체 기본 예산 목표치를 조정할 수 있어?"]}
+{"operation": "acknowledge_drain_notice", "requests": ["이 소진 안내 확인했다고 처리해줘", "크레딧 다 쓰기 전에 쓰라는 안내가 계속 뜨는데, 그 계정 그 크레딧 건은 봤다고 기록해서 다시 안 뜨게 해주세요", "소진 마감 알림 읽음 처리해줄래?"]}
+{"operation": "set_usage_budget_account", "requests": ["이 계정 페이싱에 참여시켜줘", "acc_7b2c9d41ffe0Au3 계정 하나만 예산 배분 대상으로 켜고 목표랑 가드는 기본값 그대로 두세요", "계정별로 페이싱 켜고 끄는 거, 이 계정만 켤 수 있어?"]}
+{"operation": "set_usage_budget_consumer", "requests": ["이 반복 요청 우선순위 50으로 켜줘", "sch_4a0b7e12 반복 요청을 페이싱 소비자로 등록하고, 클로드 레인은 high 고정, 코덱스는 자동으로 올라가도 high까지만 되게 설정해주세요", "반복 요청 하나만 예산 배분에 넣고 우선순위 매길 수 있어?"]}
+{"operation": "set_usage_budget_savings", "requests": ["절감 목표 20%로 잡아줘", "기준선은 처음 5회 관측으로 잡고 회당 소비를 거기서 20% 줄이는 걸 기본 절감 목표로 저장해주세요", "토큰 아끼는 목표치 설정 바꿀 수 있어?"]}
+{"operation": "register_system_workflow", "requests": ["이 워크플로 계약 등록해줘", "아까 승인 요약으로 확인한 그대로 워크플로를 새 버전으로 저장하고, 어떤 회차가 같이 올라갔는지도 알려주세요", "검토 다 끝났는데 이 워크플로 정식으로 등록해줄래?"]}
+{"operation": "execute_system_workflow", "requests": ["등록된 그 워크플로 지금 돌려줘", "wf_daily_report 워크플로를 이 인자로 한 번 실행하고 단계별 성공·실패까지 보여주세요", "그 워크플로 실행해서 결과 볼 수 있을까?"]}
+{"operation": "check_db_connection", "requests": ["이 DB 연결 살아 있는지 한 번 붙어봐", "쿼리 날리기 전에 저장해둔 그 데이터베이스 연결이 지금 접속되는지 먼저 확인해주세요", "그 DB 접속만 테스트해볼 수 있어?"]}
+{"operation": "run_db_query", "requests": ["tb_member에서 쓰는 회원 id랑 name 뽑아줘", "그 연결로 use_yn이 Y인 회원 목록을 200건까지만 조회해서 보여주세요", "DB에서 조회 쿼리 하나 돌려볼 수 있어?"]}
+{"operation": "run_db_statement", "requests": ["tb_member 7번 회원 use_yn을 N으로 바꿔줘", "그 연결에서 회원 7번을 사용 안 함으로 바꾸는 업데이트 문장을 실행해주세요. 승인이 필요하면 카드 올려주시고요", "DB 값 하나 수정해야 하는데 그 변경 문장 실행해줄 수 있어?"]}
+{"operation": "check_ssh_endpoint", "requests": ["그 서버 SSH 붙는지 확인해줘", "명령 돌리기 전에 id_deploy.pub로 등록해둔 서버에 접속만 한 번 해보고 되는지 알려주세요", "저장해둔 SSH 연결 지금 살아 있나?"]}
+{"operation": "execute_ssh_command", "requests": ["서버에서 app 로그 최근 200줄 중 error만 뽑아줘", "그 SSH 서버에 붙어서 journalctl로 앱 로그 200줄 받아 에러만 걸러 보여주는 명령을 실행해주세요", "원격 서버에 명령 한 줄 돌려볼 수 있어?"]}
+{"operation": "allow_ssh_command_permanently", "requests": ["docker ps는 앞으로 승인 없이 되게 허용 목록에 넣어줘", "그 서버에서 docker ps 칠 때마다 승인 카드 뜨는 게 번거로우니 아예 허용 명령으로 영구 등록해주세요", "이 명령 매번 묻지 말고 계속 쓸 수 있게 등록해줄래?"]}
+{"operation": "upload_ssh_file", "requests": ["app.tgz 서버 releases 밑으로 올려줘", "로컬에 빌드해둔 산출물을 그 SSH 서버 전송 폴더의 releases/app.tgz 자리로 보내주세요. 같은 이름 있으면 덮지 말고요", "이 파일 원격 서버로 업로드할 수 있어?"]}
+{"operation": "download_ssh_file", "requests": ["서버에서 logs/app.log 받아줘", "그 SSH 서버 전송 폴더에 있는 앱 로그 파일을 제 로컬 경로로 내려받아주세요", "원격에 있는 로그 파일 여기로 가져올 수 있을까?"]}
+{"operation": "delete_system_workflow", "requests": ["이 워크플로 등록 지워줘", "wf_daily_report는 이제 안 쓰니까 등록된 워크플로랑 실행 권한까지 제거해주세요", "등록된 워크플로 하나 삭제할 수 있어? 감사 이력은 남아도 돼"]}

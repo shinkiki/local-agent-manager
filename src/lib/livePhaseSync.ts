@@ -1,6 +1,6 @@
 import type { ChatPhase } from "../types";
 
-export interface LivePhaseSnapshotDecision {
+interface LivePhaseSnapshotDecision {
   /** 폴링 스냅숏을 조회하기 시작한 시각. */
   requestedAt: number;
   /** 마지막으로 반영한 라이브 state 이벤트 시각. 아직 없으면 0. */

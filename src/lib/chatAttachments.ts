@@ -1,6 +1,6 @@
 import type { ChatInputFile } from "../types";
-import { backendHttpUrl, hasNativeShell } from "./backend";
-import { assertRemoteChatAccess } from "./chatAccess";
+import { backendHttpUrl, hasNativeShell } from "./backend.ts";
+import { assertRemoteChatAccess } from "./chatAccess.ts";
 
 export async function uploadChatInputFile(chatId: string, file: File): Promise<ChatInputFile> {
   await assertRemoteChatAccess();
@@ -13,7 +13,7 @@ export async function uploadChatInputFile(chatId: string, file: File): Promise<C
     },
     body: file,
   });
-  const payload = await response.json().catch(() => null) as ChatInputFile | null;
+  const payload = await responseJsonOrNull<ChatInputFile>(response);
   if (!payload?.id) throw new Error("첨부 파일 응답이 올바르지 않습니다");
   return payload;
 }
@@ -46,6 +46,15 @@ function chatAttachmentPath(chatId: string, attachmentId: string): string {
   return `/api/chat-attachment/${encodeURIComponent(chatId)}/${encodeURIComponent(attachmentId)}`;
 }
 
+/** JSON 본문이 없거나 올바르지 않으면 null로 맞춘다. 성공·실패 응답이 같은 파싱 규칙을 쓴다. */
+async function responseJsonOrNull<Value>(response: Response): Promise<Value | null> {
+  try {
+    return await response.json() as Value;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * 첨부 파일 API를 호출하고 실패 응답을 한 가지 방식으로 알린다. 실패 본문 JSON의 `error`를
  * 우선 쓰고, 본문이 없거나 JSON이 아니면 상태 코드를 덧붙인 기본 문구로 대신한다. 본문은
@@ -58,6 +67,6 @@ async function chatAttachmentRequest(
 ): Promise<Response> {
   const response = await fetch(backendHttpUrl(path), init);
   if (response.ok) return response;
-  const body = await response.json().catch(() => null) as { error?: string } | null;
+  const body = await responseJsonOrNull<{ error?: string }>(response);
   throw new Error(body?.error || `${fallback} (${response.status})`);
 }

@@ -6,6 +6,11 @@ export interface TranscriptImageRef {
   sourcePointer: string;
 }
 
+/** 백엔드 경로에 들어갈 값을 서로 섞이지 않는 URL 조각 한 벌로 직렬화한다. */
+function encodePathSegments(segments: readonly (string | number)[]): string {
+  return segments.map((segment) => encodeURIComponent(String(segment))).join("/");
+}
+
 /**
  * 기록 이미지를 내려주는 백엔드 경로입니다.
  *
@@ -19,11 +24,10 @@ export function sessionTranscriptImagePath(
   image: TranscriptImageRef,
 ): string {
   const offset = Math.max(0, Math.trunc(image.sourceOffset));
-  return [
-    "/api/session-image",
-    encodeURIComponent(source),
-    encodeURIComponent(sessionId),
-    String(offset),
-    encodeURIComponent(image.sourcePointer),
-  ].join("/");
+  return `/api/session-image/${encodePathSegments([
+    source,
+    sessionId,
+    offset,
+    image.sourcePointer,
+  ])}`;
 }

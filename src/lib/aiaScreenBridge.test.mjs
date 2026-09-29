@@ -25,3 +25,30 @@ test("a missing main window does not execute a request inside the popout", async
   try { assert.equal(await popup.request({ kind: "guide" }), false); }
   finally { popup.close(); }
 });
+
+test("closing a popout settles discovery immediately", async () => {
+  const popup = createAiaScreenBridge(false, async () => true, new BroadcastChannel(crypto.randomUUID()));
+  const request = popup.request({ kind: "guide" });
+  popup.close();
+  assert.equal(await request, false);
+});
+
+test("closing a popout settles a request waiting for its main window", async () => {
+  const name = `aia-test-${crypto.randomUUID()}`;
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const main = createAiaScreenBridge(true, () => {
+    markStarted();
+    return new Promise(() => {});
+  }, new BroadcastChannel(name));
+  const popup = createAiaScreenBridge(false, async () => true, new BroadcastChannel(name));
+  try {
+    const request = popup.request({ kind: "click" });
+    await started;
+    popup.close();
+    assert.equal(await request, false);
+  } finally {
+    popup.close();
+    main.close();
+  }
+});

@@ -5,7 +5,7 @@
  */
 
 /** keydown에서 판단에 쓰는 값만 추린 형태. 테스트에서 DOM 없이 만들 수 있다. */
-export type EscapeKeyState = {
+type EscapeKeyState = {
   key: string;
   isComposing?: boolean;
   defaultPrevented?: boolean;
@@ -20,7 +20,7 @@ export function closesTopEscapeLayer(event: EscapeKeyState): boolean {
   return event.key === "Escape" && !event.isComposing && !event.defaultPrevented;
 }
 
-export type EscapeLayerStack = {
+type EscapeLayerStack = {
   /** 새 겹을 맨 위에 올리고, 내릴 때 쓸 함수를 돌려준다. 두 번 불러도 한 번만 내려간다. */
   push: (close: () => void) => () => void;
   /** 가장 위 겹의 닫기 함수. 떠 있는 겹이 없으면 null. */

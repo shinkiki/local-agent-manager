@@ -35,18 +35,7 @@ impl BackendOwnershipLease {
         fs::create_dir_all(app_data_dir.as_ref())?;
         let app_data_dir = fs::canonicalize(app_data_dir.as_ref())?;
         let lock = open_lock_file(&app_data_dir.join(BACKEND_OWNERSHIP_LOCK_FILE))?;
-        FileExt::try_lock(&lock).map_err(|error| {
-            if matches!(error, fs4::TryLockError::WouldBlock) {
-                CoreError::Conflict(
-                    "동일한 앱 데이터 저장소를 사용하는 Agent Manager 백엔드가 이미 실행 중입니다. 기존 백엔드를 종료한 뒤 다시 시도하세요"
-                        .to_owned(),
-                )
-            } else {
-                CoreError::Runtime(format!(
-                    "Agent Manager 백엔드 소유권 잠금을 얻지 못했습니다: {error}"
-                ))
-            }
-        })?;
+        acquire_lock(&lock)?;
         Ok(Self {
             inner: Arc::new(BackendOwnershipInner {
                 app_data_dir,
@@ -78,6 +67,21 @@ impl BackendOwnershipLease {
     pub fn app_data_dir(&self) -> &Path {
         &self.inner.app_data_dir
     }
+}
+
+fn acquire_lock(lock: &File) -> Result<(), CoreError> {
+    FileExt::try_lock(lock).map_err(|error| {
+        if matches!(error, fs4::TryLockError::WouldBlock) {
+            CoreError::Conflict(
+                "동일한 앱 데이터 저장소를 사용하는 Agent Manager 백엔드가 이미 실행 중입니다. 기존 백엔드를 종료한 뒤 다시 시도하세요"
+                    .to_owned(),
+            )
+        } else {
+            CoreError::Runtime(format!(
+                "Agent Manager 백엔드 소유권 잠금을 얻지 못했습니다: {error}"
+            ))
+        }
+    })
 }
 
 fn open_lock_file(path: &Path) -> Result<File, CoreError> {

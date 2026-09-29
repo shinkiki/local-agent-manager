@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { dedupeSessionSummaries, normalizeManagerSnapshot } from "./sessionCatalog.ts";
+import { dedupeSessionSummaries, dedupeManagerSnapshot } from "./sessionCatalog.ts";
 
 function session(overrides) {
   return {
@@ -31,12 +31,14 @@ function session(overrides) {
 test("the same source and session ID collapses to the newest, fullest entry", () => {
   const deduped = dedupeSessionSummaries([
     session({ updatedAt: 100, messageCount: 97, filePath: "/nfd.jsonl" }),
+    session({ id: "session-2", filePath: "/other.jsonl" }),
     session({ updatedAt: 200, messageCount: 102, filePath: "/nfc.jsonl" }),
   ]);
 
-  assert.equal(deduped.length, 1);
+  assert.equal(deduped.length, 2);
   assert.equal(deduped[0].messageCount, 102);
   assert.equal(deduped[0].filePath, "/nfc.jsonl");
+  assert.equal(deduped[1].id, "session-2");
 });
 
 test("different sessions and different sources are kept apart", () => {
@@ -68,7 +70,7 @@ test("a snapshot without duplicates is returned unchanged", () => {
     dashboard: { recent: [session({ id: "session-1" })] },
   };
 
-  assert.equal(normalizeManagerSnapshot(snapshot), snapshot);
+  assert.equal(dedupeManagerSnapshot(snapshot), snapshot);
 });
 
 test("snapshot normalization also cleans the dashboard recent list", () => {
@@ -85,7 +87,7 @@ test("snapshot normalization also cleans the dashboard recent list", () => {
     },
   };
 
-  const normalized = normalizeManagerSnapshot(snapshot);
+  const normalized = dedupeManagerSnapshot(snapshot);
 
   assert.equal(normalized.sessions.length, 1);
   assert.equal(normalized.dashboard.recent.length, 1);

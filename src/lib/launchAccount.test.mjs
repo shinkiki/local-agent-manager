@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { accountName, activeAccountId, launchAccountChoices, resolveLaunchAccountId } from "./launchAccount.ts";
+import { accountDisplayName, accountName, activeAccountId, launchAccountChoices, resolveLaunchAccountId } from "./launchAccount.ts";
 
 function account(overrides = {}) {
   return {
@@ -88,7 +88,7 @@ test("the new chat account picker offers usable accounts and blocks the ones iso
 
   const choices = launchAccountChoices(snapshot, "codex");
   assert.deepEqual(choices.map((choice) => choice.id), ["codex-a", "codex-b", "codex-c", "codex-d"]);
-  assert.equal(choices[0].label, "A · 기본");
+  assert.equal(choices[0].label, "A · 활성");
   assert.deepEqual(choices.map((choice) => choice.blocked), [false, false, true, false]);
   assert.equal(choices[2].blockedReason, "프로필을 읽지 못했습니다");
   assert.deepEqual(launchAccountChoices(null, "codex"), []);
@@ -106,4 +106,10 @@ test("a launch account that disappeared or became unusable falls back to the act
   assert.equal(resolveLaunchAccountId("codex-c", choices), "");
   assert.equal(resolveLaunchAccountId("codex-gone", choices), "");
   assert.equal(resolveLaunchAccountId("codex-b", []), "");
+});
+
+test("accountDisplayName은 displayName, email, id 순으로 우선순위를 적용한다", () => {
+  assert.equal(accountDisplayName({ id: "acc-1", displayName: "홍길동", email: "hong@example.com" }), "홍길동");
+  assert.equal(accountDisplayName({ id: "acc-2", displayName: "", email: "hong@example.com" }), "hong@example.com");
+  assert.equal(accountDisplayName({ id: "acc-3", displayName: null, email: null }), "acc-3");
 });

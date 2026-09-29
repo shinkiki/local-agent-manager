@@ -1,20 +1,39 @@
 /**
- * 제안 숨김 기록. "지금 무엇이 후보인가"와 "그중 무엇을 다시 보여줄 때가 됐는가"는
- * 다른 규칙인데, 저장 형식·재무장 조건·숨김 키를 만드는 지문이 한 덩어리로 움직인다.
- * 후보를 만드는 `aiaSuggestions.ts`가 이 규칙까지 안고 있으면 저장 형식을 손볼 때마다
- * 제안 생성 코드를 헤집게 되므로 여기 따로 둔다.
+ * 제안 숨김 정책. "지금 무엇이 후보인가"와 "그중 무엇을 다시 보여줄 때가 됐는가"는
+ * 다른 규칙이다. 후보를 만드는 `aiaSuggestions.ts`가 재무장 조건까지 안고 있으면 제안
+ * 생성 코드를 헤집게 되므로 여기 따로 둔다.
+ *
+ * 저장 형식(이력이 어떤 칸으로 이루어지고 저장 문자열과 어떻게 오가는가)은
+ * `aiaSuggestionHistoryFormat.ts`가 갖는다 — 칸은 저장 형식을 바꿀 때만 늘고 갈래와
+ * 재무장 조건은 제안 종류가 늘 때마다 손보는데, 둘이 한 파일에 있는 동안 한쪽을 고치려면
+ * 늘 다른 쪽을 지나쳐 읽어야 했다. 기존 호출부가 경로를 바꾸지 않도록 저장 형식 쪽
+ * 이름은 여기서 그대로 다시 내보낸다.
+ *
+ * 숨김 키를 짓는 지문 자체는 `aiaFingerprint.ts`가 갖는다 — 그 규칙은 숨김을 모르는데
+ * 여기 있어서, 제안을 조립하기만 하는 쪽이 지문 하나 때문에 이 모듈을 가져왔다.
  *
  * 의존 방향은 한쪽뿐이다 — 이 모듈은 제안이 어떻게 만들어지는지 모르고, 숨김 판정에
  * 필요한 최소 모양(`DismissableSuggestion`)만 본다.
  */
-import {
-  MINUTE,
-  finiteNumber,
-  numericRecord,
-  parsePersisted,
-  uniqueStrings,
-  validatedRecord,
-} from "./aiaPrimitives.ts";
+import { suggestionFingerprint } from "./aiaFingerprint.ts";
+import { MINUTE } from "./aiaPrimitives.ts";
+import type { AiaSuggestionHistory } from "./aiaSuggestionHistoryFormat.ts";
+import { cloneAiaSuggestionHistory } from "./aiaSuggestionHistoryFormat.ts";
+import type { SuggestionMetadata } from "./aiaSuggestionOrder.ts";
+import { numberMetadata } from "./aiaSuggestionOrder.ts";
+
+/** 저장 형식은 갈라 두었지만 호출부가 보는 자리는 그대로다. */
+export type {
+  AiaSuggestionHistory,
+  IncidentDismissal,
+  ProjectDismissal,
+} from "./aiaSuggestionHistoryFormat.ts";
+export {
+  cloneAiaSuggestionHistory,
+  emptyAiaSuggestionHistory,
+  parseAiaSuggestionHistory,
+  serializeAiaSuggestionHistory,
+} from "./aiaSuggestionHistoryFormat.ts";
 
 /** 숨김 판정이 보는 제안의 최소 모양. `AiaSuggestion`이 그대로 들어맞는다. */
 export interface DismissableSuggestion {
@@ -23,7 +42,14 @@ export interface DismissableSuggestion {
   packId: string;
   definitionId: string;
   targetId: string;
-  metadata: Record<string, string | number | boolean | null>;
+  metadata: SuggestionMetadata;
+}
+
+/** 프로젝트 정리 제안의 임계 통과 여부. 숨김 기록의 재무장 판단에 쓴다. */
+export interface ProjectDismissalState {
+  key: string;
+  qualifies: boolean;
+  unfiledCount: number;
 }
 
 /**
@@ -40,101 +66,36 @@ function dismissalBucket(kind: string): DismissalBucket {
   return "incident";
 }
 
-export interface ProjectDismissal {
-  dismissedAt: number;
-  unfiledBaseline: number;
-  rearmDelta: number;
-  resolved: boolean;
-}
-
-export interface IncidentDismissal {
-  dismissedAt: number;
-  resolved: boolean;
-  afterResolved: boolean;
-  cooldownMinutes: number;
-}
-
-export interface AiaSuggestionHistory {
-  schemaVersion: 1;
-  dismissed: Record<string, number>;
-  incidentDismissals: Record<string, IncidentDismissal>;
-  projectDismissals: Record<string, ProjectDismissal>;
-  featureTips: string[];
-}
-
-/** 프로젝트 정리 제안의 임계 통과 여부. 숨김 기록의 재무장 판단에 쓴다. */
-export interface ProjectDismissalState {
-  key: string;
-  qualifies: boolean;
-  unfiledCount: number;
+/**
+ * 갈래 하나가 스스로 아는 것 — 제안을 어떤 키로 알아보고, 숨길 때 어디에 무엇을 적고,
+ * 다시 보일 때가 됐는지 어떻게 보는가.
+ *
+ * 분류는 한 벌로 모여 있었지만 그 뒤가 갈래마다 흩어져 있었다. 숨기는 쪽과 보일지 보는
+ * 쪽이 각자 `switch`를 펼쳐 두고, 키를 만드는 세 함수는 파일 맨 끝에 따로 떨어져 있어
+ * 갈래 하나를 더하려면 네 자리를 찾아다녀야 했다. 그중 한 자리를 빠뜨려도 형식 오류가
+ * 나지 않는다 — 숨기기만 하고 판정을 더하지 않으면 그 갈래는 숨겨도 계속 보이고, 판정만
+ * 더하면 영영 숨지 않는다. 갈래가 자기 네 가지를 한 줄로 갖게 두면 그 갈림이 생기지 않는다.
+ */
+interface DismissalRules {
+  /** 숨김 기록에서 이 제안을 가리키는 키. */
+  key(suggestion: DismissableSuggestion): string;
+  /** 숨김 기록에 이 제안을 남긴다. 이미 복제된 기록을 그 자리에서 고친다. */
+  dismiss(history: AiaSuggestionHistory, key: string, suggestion: DismissableSuggestion, now: number): void;
+  /** 지금 보여줄지. 재무장된 기록은 그 자리에서 지운다. */
+  visible(history: AiaSuggestionHistory, key: string, suggestion: DismissableSuggestion, now: number): boolean;
 }
 
 /**
- * 제안을 숨김 기록에서 알아보는 지문. 팩·정의·대상·상태를 길이 접두사로 이어 붙여
- * 구분자 충돌을 없앤 뒤 두 방향으로 해싱한다. 제안의 `fingerprint` 필드와 프로젝트·사건
- * 숨김 키가 모두 이 함수 하나로 만들어진다.
+ * 이 제안을 맡을 갈래와, 그 갈래가 이 제안을 알아보는 키. 키를 여기서 한 번만 짓는 것이
+ * 요점이다 — 갈래마다 `key`를 두고도 숨기는 쪽과 보일지 보는 쪽이 같은 키 함수를 이름으로
+ * 다시 불러, 갈래 하나가 자기 키를 세 자리에서 네 자리까지 되풀이해 적고 있었다. 갈래의
+ * 키를 바꾸면서 그중 한 자리를 놓쳐도 형식 오류가 나지 않는다 — 두 자리가 서로 다른 키를
+ * 보게 되어, 숨긴 제안이 다음 판정에서 기록을 찾지 못해 그대로 다시 뜬다(또는 재무장된
+ * 기록을 지우지 못해 영영 남는다). 키를 짓는 자리를 갈래마다 한 줄로 되돌린다.
  */
-export function suggestionFingerprint(packId: string, definitionId: string, targetId: string, stateKey: string): string {
-  const source = [packId, definitionId, targetId, stateKey].map(encodeFingerprintPart).join(":");
-  return `aia1-${hash32(source)}${hash32([...source].reverse().join(""))}`;
-}
-
-function encodeFingerprintPart(value: string): string {
-  return `${value.length}.${value}`;
-}
-
-function hash32(value: string): string {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(16).padStart(8, "0");
-}
-
-export function emptyAiaSuggestionHistory(): AiaSuggestionHistory {
-  return { schemaVersion: 1, dismissed: {}, incidentDismissals: {}, projectDismissals: {}, featureTips: [] };
-}
-
-export function parseAiaSuggestionHistory(value: string | null | undefined): AiaSuggestionHistory {
-  return parsePersisted(value, emptyAiaSuggestionHistory, 1, (parsed) => ({
-    schemaVersion: 1,
-    dismissed: numericRecord(parsed.dismissed),
-    incidentDismissals: validatedRecord<IncidentDismissal>(parsed.incidentDismissals, (entry) => {
-      const dismissedAt = finiteNumber(entry.dismissedAt);
-      const cooldownMinutes = finiteNumber(entry.cooldownMinutes);
-      if (dismissedAt === null || cooldownMinutes === null) return null;
-      return {
-        dismissedAt,
-        resolved: entry.resolved === true,
-        afterResolved: entry.afterResolved === true,
-        cooldownMinutes: Math.max(0, cooldownMinutes),
-      };
-    }),
-    projectDismissals: validatedRecord<ProjectDismissal>(parsed.projectDismissals, (entry) => {
-      const dismissedAt = finiteNumber(entry.dismissedAt);
-      const unfiledBaseline = finiteNumber(entry.unfiledBaseline);
-      const rearmDelta = finiteNumber(entry.rearmDelta);
-      if (dismissedAt === null || unfiledBaseline === null || rearmDelta === null) return null;
-      return {
-        dismissedAt,
-        unfiledBaseline,
-        rearmDelta: Math.max(1, rearmDelta),
-        resolved: entry.resolved === true,
-      };
-    }),
-    featureTips: uniqueStrings(parsed.featureTips),
-  }));
-}
-
-export function serializeAiaSuggestionHistory(history: AiaSuggestionHistory): string {
-  return JSON.stringify({
-    schemaVersion: 1,
-    dismissed: numericRecord(history.dismissed),
-    incidentDismissals: history.incidentDismissals,
-    projectDismissals: history.projectDismissals,
-    featureTips: [...new Set(history.featureTips)].sort(),
-  });
+function dismissalFor(suggestion: DismissableSuggestion): { rules: DismissalRules; key: string } {
+  const rules = DISMISSAL_RULES[dismissalBucket(suggestion.kind)];
+  return { rules, key: rules.key(suggestion) };
 }
 
 export function dismissAiaSuggestion(
@@ -143,47 +104,9 @@ export function dismissAiaSuggestion(
   now: number,
 ): AiaSuggestionHistory {
   const next = cloneAiaSuggestionHistory(history);
-  switch (dismissalBucket(suggestion.kind)) {
-    case "project": {
-      const unfiledBaseline = numberMetadata(suggestion, "unfiledCount", 0);
-      const rearmDelta = numberMetadata(suggestion, "rearmDelta", 3);
-      next.projectDismissals[projectDismissalKey(suggestion)] = {
-        dismissedAt: now,
-        unfiledBaseline,
-        rearmDelta: Math.max(1, rearmDelta),
-        resolved: false,
-      };
-      break;
-    }
-    case "featureTip": {
-      const key = featureTipKey(suggestion);
-      if (!next.featureTips.includes(key)) next.featureTips.push(key);
-      break;
-    }
-    case "incident":
-      next.incidentDismissals[incidentDismissalKey(suggestion)] = {
-        dismissedAt: now,
-        resolved: false,
-        afterResolved: suggestion.metadata.afterResolved === true,
-        cooldownMinutes: numberMetadata(suggestion, "cooldownMinutes", 0),
-      };
-      break;
-  }
+  const { rules, key } = dismissalFor(suggestion);
+  rules.dismiss(next, key, suggestion, now);
   return next;
-}
-
-export function cloneAiaSuggestionHistory(history: AiaSuggestionHistory): AiaSuggestionHistory {
-  return {
-    schemaVersion: 1,
-    dismissed: { ...history.dismissed },
-    incidentDismissals: Object.fromEntries(
-      Object.entries(history.incidentDismissals ?? {}).map(([key, value]) => [key, { ...value }]),
-    ),
-    projectDismissals: Object.fromEntries(
-      Object.entries(history.projectDismissals).map(([key, value]) => [key, { ...value }]),
-    ),
-    featureTips: [...history.featureTips],
-  };
 }
 
 /**
@@ -195,18 +118,14 @@ export function resolveStaleDismissals(
   allCandidates: DismissableSuggestion[],
   projectStates: Map<string, ProjectDismissalState>,
 ): void {
-  for (const [key, dismissal] of Object.entries(history.projectDismissals)) {
-    if (!projectStates.get(key)?.qualifies) dismissal.resolved = true;
-  }
+  markResolvedWhenGone(history.projectDismissals, (key) => projectStates.get(key)?.qualifies === true);
 
   const activeIncidentKeys = new Set(
     allCandidates
       .filter((suggestion) => dismissalBucket(suggestion.kind) === "incident")
-      .map(incidentDismissalKey),
+      .map(DISMISSAL_RULES.incident.key),
   );
-  for (const [key, dismissal] of Object.entries(history.incidentDismissals)) {
-    if (!activeIncidentKeys.has(key)) dismissal.resolved = true;
-  }
+  markResolvedWhenGone(history.incidentDismissals, (key) => activeIncidentKeys.has(key));
 
   const activeFingerprints = new Set(allCandidates.map((suggestion) => suggestion.fingerprint));
   for (const fingerprint of Object.keys(history.dismissed)) {
@@ -214,54 +133,87 @@ export function resolveStaleDismissals(
   }
 }
 
+/**
+ * 근거가 사라진 숨김 기록에 `resolved` 표시를 남긴다. 지우지 않는 것은 재무장 조건이
+ * "해소된 뒤 다시 나타났는가"를 보기 때문이다(`afterResolved`·프로젝트 임계 재통과).
+ * 프로젝트·사건 두 갈래가 살아 있는지 보는 기준만 다르고 표시는 같아 판정만 받는다.
+ */
+function markResolvedWhenGone(
+  dismissals: Record<string, { resolved: boolean }>,
+  isActive: (key: string) => boolean,
+): void {
+  for (const [key, dismissal] of Object.entries(dismissals)) {
+    if (!isActive(key)) dismissal.resolved = true;
+  }
+}
+
 /** 숨김 기록에 비춰 이 제안을 지금 보여줄지 정한다. 재무장된 기록은 그 자리에서 지운다. */
 export function isSuggestionVisible(suggestion: DismissableSuggestion, history: AiaSuggestionHistory, now: number): boolean {
-  switch (dismissalBucket(suggestion.kind)) {
-    case "featureTip":
-      return !history.featureTips.includes(featureTipKey(suggestion));
-    case "project":
-      return isProjectSuggestionVisible(suggestion, history);
-    case "incident":
-      return isIncidentSuggestionVisible(suggestion, history, now);
-  }
+  const { rules, key } = dismissalFor(suggestion);
+  return rules.visible(history, key, suggestion, now);
+}
+
+/**
+ * 숨김 기록 한 건의 재무장 판정. 기록이 없으면 판정할 것이 없어 `undefined`를 주고, 조건을
+ * 넘긴 기록은 그 자리에서 지운 뒤 `true`를 준다.
+ *
+ * "찾고 / 없으면 보이고 / 재무장이면 지우고 보인다"는 같은 세 걸음을 갈래 셋(프로젝트 숨김·
+ * 사건 숨김·지문 숨김)이 각자 펼쳐 놓고 있었다. 세 걸음 중 지우는 걸음이 갈래마다 따로
+ * 적혀 있으면 한 갈래에서 그것을 빠뜨렸을 때 오류 없이 조용히 갈린다 — 기록이 영영 남아
+ * 재무장 조건을 이미 넘긴 제안이 매번 다시 판정만 받고 화면에는 뜨지 않는다. 순회는 여기
+ * 한 벌만 두고, 갈래마다 다른 것은 재무장 조건뿐이다.
+ *
+ * `undefined`로 "기록 없음"을 따로 알리는 것은 사건 갈래가 그때 지문 숨김으로 넘어가야
+ * 하기 때문이다. 불리언 하나로 뭉개면 그 갈림을 호출부가 다시 조회해 확인해야 한다.
+ */
+function rearmedDismissal<T>(
+  records: Record<string, T>,
+  key: string,
+  rearmed: (record: T) => boolean,
+): boolean | undefined {
+  const record = records[key];
+  if (record === undefined) return undefined;
+  if (!rearmed(record)) return false;
+  delete records[key];
+  return true;
+}
+
+/** 숨김 시각으로부터 설정된 냉각 시간이 지났는지 판정한다. */
+function isCooldownElapsed(dismissedAt: number, cooldownMinutes: number, now: number): boolean {
+  return cooldownMinutes > 0 && now - dismissedAt >= cooldownMinutes * MINUTE;
 }
 
 /** 사건 숨김이 먼저고, 없으면 지문 숨김의 냉각 시간을 본다. */
-function isIncidentSuggestionVisible(suggestion: DismissableSuggestion, history: AiaSuggestionHistory, now: number): boolean {
-  const incidentKey = incidentDismissalKey(suggestion);
-  const incident = history.incidentDismissals[incidentKey];
-  if (incident) {
-    const rearmed = (incident.cooldownMinutes > 0 && now - incident.dismissedAt >= incident.cooldownMinutes * MINUTE)
-      || (incident.resolved && incident.afterResolved);
-    if (rearmed) delete history.incidentDismissals[incidentKey];
-    return rearmed;
-  }
+function isIncidentSuggestionVisible(
+  history: AiaSuggestionHistory,
+  key: string,
+  suggestion: DismissableSuggestion,
+  now: number,
+): boolean {
+  const incident = rearmedDismissal(
+    history.incidentDismissals,
+    key,
+    (dismissal) => isCooldownElapsed(dismissal.dismissedAt, dismissal.cooldownMinutes, now)
+      || (dismissal.resolved && dismissal.afterResolved),
+  );
+  if (incident !== undefined) return incident;
 
-  const dismissedAt = history.dismissed[suggestion.fingerprint];
-  if (dismissedAt === undefined) return true;
-  const cooldownMinutes = numberMetadata(suggestion, "cooldownMinutes", 0);
-  if (cooldownMinutes > 0 && now - dismissedAt >= cooldownMinutes * MINUTE) {
-    delete history.dismissed[suggestion.fingerprint];
-    return true;
-  }
-  return false;
+  return rearmedDismissal(history.dismissed, suggestion.fingerprint, (dismissedAt) => {
+    const cooldownMinutes = numberMetadata(suggestion, "cooldownMinutes", 0);
+    return isCooldownElapsed(dismissedAt, cooldownMinutes, now);
+  }) ?? true;
 }
 
 /** 프로젝트 정리 제안은 임계가 풀렸거나 미정리 수가 재무장 폭만큼 늘면 다시 보인다. */
-function isProjectSuggestionVisible(suggestion: DismissableSuggestion, history: AiaSuggestionHistory): boolean {
-  const key = projectDismissalKey(suggestion);
-  const dismissal = history.projectDismissals[key];
-  if (!dismissal) return true;
-  const unfiled = numberMetadata(suggestion, "unfiledCount", 0);
-  if (dismissal.resolved || unfiled >= dismissal.unfiledBaseline + dismissal.rearmDelta) {
-    delete history.projectDismissals[key];
-    return true;
-  }
-  return false;
-}
-
-export function numberMetadata(suggestion: DismissableSuggestion, key: string, fallback: number): number {
-  return finiteNumber(suggestion.metadata[key]) ?? fallback;
+function isProjectSuggestionVisible(
+  history: AiaSuggestionHistory,
+  key: string,
+  suggestion: DismissableSuggestion,
+): boolean {
+  return rearmedDismissal(history.projectDismissals, key, (dismissal) => {
+    const unfiled = numberMetadata(suggestion, "unfiledCount", 0);
+    return dismissal.resolved || unfiled >= dismissal.unfiledBaseline + dismissal.rearmDelta;
+  }) ?? true;
 }
 
 function projectDismissalKey(suggestion: DismissableSuggestion): string {
@@ -275,6 +227,47 @@ function featureTipKey(suggestion: DismissableSuggestion): string {
 function incidentDismissalKey(suggestion: DismissableSuggestion): string {
   return suggestionFingerprint(suggestion.packId, suggestion.definitionId, suggestion.targetId, "incident-dismissal");
 }
+
+/**
+ * 갈래별 규칙 한 벌. 갈래를 더하는 일은 `dismissalBucket`에 한 줄, 여기에 한 줄이다.
+ *
+ * 기능 소개(`featureTip`)만 저장 자리가 레코드가 아니라 문자열 배열이다 — 남길 것이
+ * "봤다"뿐이라 재무장할 것이 없어 시각도 상태도 담지 않는다. 그래서 이 갈래만
+ * `rearmedDismissal`을 지나지 않는다.
+ */
+const DISMISSAL_RULES: Record<DismissalBucket, DismissalRules> = {
+  project: {
+    key: projectDismissalKey,
+    dismiss: (history, key, suggestion, now) => {
+      history.projectDismissals[key] = {
+        dismissedAt: now,
+        unfiledBaseline: numberMetadata(suggestion, "unfiledCount", 0),
+        rearmDelta: Math.max(1, numberMetadata(suggestion, "rearmDelta", 3)),
+        resolved: false,
+      };
+    },
+    visible: isProjectSuggestionVisible,
+  },
+  featureTip: {
+    key: featureTipKey,
+    dismiss: (history, key) => {
+      if (!history.featureTips.includes(key)) history.featureTips.push(key);
+    },
+    visible: (history, key) => !history.featureTips.includes(key),
+  },
+  incident: {
+    key: incidentDismissalKey,
+    dismiss: (history, key, suggestion, now) => {
+      history.incidentDismissals[key] = {
+        dismissedAt: now,
+        resolved: false,
+        afterResolved: suggestion.metadata.afterResolved === true,
+        cooldownMinutes: numberMetadata(suggestion, "cooldownMinutes", 0),
+      };
+    },
+    visible: isIncidentSuggestionVisible,
+  },
+};
 
 export function projectHistoryKey(packId: string, definitionId: string, targetId: string): string {
   return suggestionFingerprint(packId, definitionId, targetId, "project-dismissal");

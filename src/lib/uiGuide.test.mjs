@@ -6,7 +6,6 @@ import {
   normalizeUiGuideTargets,
   resolveUiGuideTarget,
   uiGuideAnchorSelector,
-  uiGuidePointerPlacement,
   uiGuideTargetProblems,
 } from "./uiGuide.ts";
 
@@ -19,6 +18,21 @@ test("the shared target catalog is valid and every entry is resolvable", () => {
     assert.equal(resolved.anchor, target.anchor);
   }
   assert.equal(resolveUiGuideTarget("settings.nowhere"), null);
+});
+
+test("projects view tabs resolve to the projects view with their tab", () => {
+  // 프로젝트 화면의 세 탭은 `UI_GUIDE_VIEW_TABS.projects`에 있어야 안내 요청이 그 탭을 연다.
+  // 한쪽(JSON)만 고치면 `uiGuideTargetProblems`가 잡지만, 탭 목록을 빼먹은 채 JSON만 남으면
+  // 카탈로그가 통째로 비므로 여기서 해석 결과까지 본다.
+  const git = resolveUiGuideTarget("projects.tab.git");
+  assert.ok(git);
+  assert.equal(git.view, "projects");
+  assert.equal(git.tab, "git");
+  assert.equal(git.anchor, "projects.tab.git");
+  const selector = resolveUiGuideTarget("projects.selector");
+  assert.ok(selector);
+  assert.equal(selector.view, "projects");
+  assert.equal(selector.tab, "files");
 });
 
 test("targets with an unknown view, tab, or duplicate id are rejected", () => {
@@ -38,61 +52,20 @@ test("targets with an unknown view, tab, or duplicate id are rejected", () => {
   assert.equal(normalizeUiGuideTargets([{ ...raw[0], tab: undefined }])[0].tab, null);
 });
 
+test("duplicate ids are judged only among entries that declare one", () => {
+  const nameless = [
+    { view: null, anchor: "a", description: "id가 없다" },
+    { view: null, anchor: "b", description: "id가 없다" },
+    { id: "undefined", view: null, anchor: "c", description: "이름이 하필 undefined" },
+  ];
+  const problems = uiGuideTargetProblems(nameless);
+  assert.equal(problems.filter((problem) => problem.includes("중복")).length, 0);
+  // 이름을 못 얻은 항목도 순번으로는 서로 구분된다.
+  assert.ok(problems.includes("#0: id가 없습니다"));
+  assert.ok(problems.includes("#1: id가 없습니다"));
+});
+
 test("anchor selectors escape quotes", () => {
   assert.equal(uiGuideAnchorSelector("nav.settings"), '[data-ui-anchor="nav.settings"]');
   assert.equal(uiGuideAnchorSelector('a"b'), '[data-ui-anchor="a\\"b"]');
-});
-
-const viewport = { width: 1200, height: 800 };
-
-test("the pointer sits above the anchor and points down when there is room", () => {
-  const placement = uiGuidePointerPlacement({ top: 400, left: 500, width: 100, height: 40 }, viewport);
-  assert.equal(placement.arrow.direction, "down");
-  assert.deepEqual(placement.ring, { top: 394, left: 494, width: 112, height: 52 });
-  assert.equal(placement.arrow.top, 394 - 6 - 34);
-  assert.equal(placement.arrow.left, 550 - 17);
-  assert.equal(placement.note.top, null);
-  assert.equal(placement.note.bottom, 800 - placement.arrow.top + 6);
-  assert.equal(placement.note.left, 550 - 160);
-  assert.equal(placement.note.width, 320);
-});
-
-test("near the top the pointer flips below the anchor and points up", () => {
-  const placement = uiGuidePointerPlacement({ top: 20, left: 500, width: 100, height: 40 }, viewport);
-  assert.equal(placement.arrow.direction, "up");
-  assert.equal(placement.arrow.top, 20 + 40 + 6 + 6);
-  assert.equal(placement.note.bottom, null);
-  assert.equal(placement.note.top, placement.arrow.top + 34 + 6);
-});
-
-test("an anchor that runs past the fold is ringed only where it is visible", () => {
-  const placement = uiGuidePointerPlacement({ top: 300, left: 400, width: 500, height: 900 }, viewport);
-  assert.equal(placement.ring.top, 294);
-  assert.equal(placement.ring.top + placement.ring.height, 800 - 12, "링 아래쪽은 화면 안에서 끝난다");
-  assert.equal(placement.arrow.direction, "down", "위에 자리가 있으면 그대로 위에서 가리킨다");
-  assert.equal(placement.arrow.top, 294 - 6 - 34);
-});
-
-test("an anchor taller than the viewport keeps the arrow and note on screen", () => {
-  // 화면보다 긴 대상(설정 화면의 시스템 에이전트 블록)을 가운데로 맞춘 뒤의 사각형.
-  const placement = uiGuidePointerPlacement({ top: -200, left: 400, width: 500, height: 1200 }, viewport);
-  assert.equal(placement.ring.top, 12);
-  assert.equal(placement.ring.height, 800 - 24, "링이 화면 안으로 잘린다");
-  assert.equal(placement.arrow.direction, "down");
-  assert.equal(placement.arrow.top, 12 + 6, "화살표는 링 안쪽 위에 얹힌다");
-  assert.equal(placement.note.top, 12 + 6 + 34 + 6);
-  assert.equal(placement.note.bottom, null);
-  assert.ok(placement.note.top + 64 < viewport.height, "말풍선이 화면 밖으로 나가지 않는다");
-});
-
-test("the arrow and note stay inside the viewport for anchors at the edges", () => {
-  const left = uiGuidePointerPlacement({ top: 400, left: 0, width: 30, height: 30 }, viewport);
-  assert.equal(left.arrow.left, 12);
-  assert.equal(left.note.left, 12);
-  const right = uiGuidePointerPlacement({ top: 400, left: 1180, width: 30, height: 30 }, viewport);
-  assert.equal(right.arrow.left, 1200 - 12 - 34);
-  assert.equal(right.note.left, 1200 - 12 - 320);
-  const narrow = uiGuidePointerPlacement({ top: 400, left: 100, width: 30, height: 30 }, { width: 320, height: 600 });
-  assert.equal(narrow.note.width, 320 - 24);
-  assert.equal(narrow.note.left, 12);
 });

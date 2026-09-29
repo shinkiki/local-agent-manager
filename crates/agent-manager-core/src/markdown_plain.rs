@@ -7,6 +7,7 @@
 //!
 //! 미리보기 전용이라 구조는 버린다. 제목·목록·표는 본문만 남겨 줄로 이어 두고, 그
 //! 줄들을 어떻게 합치고 어디서 끊을지는 글자 수 상한을 아는 호출부가 정한다.
+use std::borrow::Cow;
 
 /// 마크다운 표기를 걷어 낸 줄을 `\n`으로 이어 돌려준다. 빈 줄과 구분선은 버린다.
 pub(crate) fn markdown_plain_text(source: &str) -> String {
@@ -14,30 +15,33 @@ pub(crate) fn markdown_plain_text(source: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut fenced = false;
     for raw in normalized.split('\n') {
-        let trimmed = raw.trim();
-        if is_fence(trimmed) {
-            fenced = !fenced;
-            continue;
-        }
-        if fenced {
-            // 코드 안에서는 표기를 걷지 않는다. 별표·백틱·부등호가 코드의 일부다.
-            // 버리지 않고 남기는 이유는, 코드만으로 된 답변에서 미리보기가 통째로
-            // 비어 말풍선이 사라지는 것을 막기 위해서다.
-            if !trimmed.is_empty() {
-                lines.push(trimmed.to_owned());
-            }
-            continue;
-        }
-        if trimmed.is_empty() || is_rule_line(trimmed) || is_table_separator(trimmed) {
-            continue;
-        }
-        let text = strip_inline_markup(&strip_block_markers(trimmed));
-        let text = text.trim();
-        if !text.is_empty() {
-            lines.push(text.to_owned());
+        if let Some(line) = plain_line(raw, &mut fenced) {
+            lines.push(line);
         }
     }
     lines.join("\n")
+}
+
+/// 원문 한 줄을 미리보기에 남길 글자로 바꾼다. 코드 펜스 상태까지 이 함수가 맡아,
+/// 본문 순회는 줄의 순서와 결합만 다룬다.
+fn plain_line(raw: &str, fenced: &mut bool) -> Option<String> {
+    let trimmed = raw.trim();
+    if is_fence(trimmed) {
+        *fenced = !*fenced;
+        return None;
+    }
+    if *fenced {
+        // 코드 안에서는 표기를 걷지 않는다. 별표·백틱·부등호가 코드의 일부다.
+        // 버리지 않고 남기는 이유는, 코드만으로 된 답변에서 미리보기가 통째로
+        // 비어 말풍선이 사라지는 것을 막기 위해서다.
+        return (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    }
+    if trimmed.is_empty() || is_rule_line(trimmed) || is_table_separator(trimmed) {
+        return None;
+    }
+    let text = strip_inline_markup(&strip_block_markers(trimmed));
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 /// 코드 펜스 경계. 여는 줄의 언어 표기까지 함께 버리므로 여닫이를 구분하지 않는다.
@@ -47,12 +51,24 @@ fn is_fence(line: &str) -> bool {
 
 /// 구분선(`---`)과 setext 제목 밑줄(`===`). 글자가 없으므로 미리보기에서 버린다.
 fn is_rule_line(line: &str) -> bool {
-    ['-', '*', '_', '='].into_iter().any(|marker| {
-        line.chars().filter(|value| *value == marker).count() >= 3
-            && line
-                .chars()
-                .all(|value| value == marker || value.is_whitespace())
-    })
+    let mut marker = None;
+    let mut count = 0;
+    for ch in line.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        match marker {
+            None if matches!(ch, '-' | '*' | '_' | '=') => {
+                marker = Some(ch);
+                count = 1;
+            }
+            Some(m) if m == ch => {
+                count += 1;
+            }
+            _ => return false,
+        }
+    }
+    count >= 3
 }
 
 /// 표 정렬 줄(`|---|:--:|`). 셀에 글자가 없으므로 행으로 옮기지 않고 버린다.
@@ -63,24 +79,27 @@ fn is_table_separator(line: &str) -> bool {
     line.trim_matches('|').split('|').all(|cell| {
         let cell = cell.trim();
         let core = cell.trim_start_matches(':').trim_end_matches(':');
-        core.chars().count() >= 3 && core.chars().all(|value| value == '-')
+        core.len() >= 3 && core.bytes().all(|value| value == b'-')
     })
 }
 
 /// 줄 앞의 블록 마커(인용·제목·목록·체크박스)를 벗기고, 표 행이면 셀만 남긴다.
-fn strip_block_markers(line: &str) -> String {
-    let mut text = line.trim().to_owned();
+fn strip_block_markers(line: &str) -> Cow<'_, str> {
+    let mut text = line.trim();
     // `> - 항목`처럼 겹친 마커는 한 번에 하나씩 벗긴다. 모든 갈래가 최소 한 글자를
     // 소비하므로, 더 벗길 것이 없으면 반드시 멈춘다.
-    while let Some(rest) = strip_one_block_marker(&text) {
-        text = rest.trim_start().to_owned();
+    while let Some(rest) = strip_one_block_marker(text) {
+        text = rest.trim_start();
     }
-    table_row_cells(&text).unwrap_or(text)
+    match table_row_cells(text) {
+        Some(table_cells) => Cow::Owned(table_cells),
+        None => Cow::Borrowed(text),
+    }
 }
 
-fn strip_one_block_marker(text: &str) -> Option<String> {
+fn strip_one_block_marker(text: &str) -> Option<&str> {
     if let Some(rest) = text.strip_prefix('>') {
-        return Some(rest.to_owned());
+        return Some(rest);
     }
     strip_heading(text)
         .or_else(|| strip_bullet(text))
@@ -88,7 +107,7 @@ fn strip_one_block_marker(text: &str) -> Option<String> {
         .or_else(|| strip_task(text))
 }
 
-fn strip_heading(text: &str) -> Option<String> {
+fn strip_heading(text: &str) -> Option<&str> {
     let hashes = text.chars().take_while(|value| *value == '#').count();
     if hashes == 0 || hashes > 6 {
         return None;
@@ -98,10 +117,10 @@ fn strip_heading(text: &str) -> Option<String> {
         return None;
     }
     // 닫는 `###`까지 적은 제목은 뒤쪽 표기도 함께 걷는다.
-    Some(rest.trim().trim_end_matches('#').trim_end().to_owned())
+    Some(rest.trim().trim_end_matches('#').trim_end())
 }
 
-fn strip_bullet(text: &str) -> Option<String> {
+fn strip_bullet(text: &str) -> Option<&str> {
     let mut chars = text.chars();
     if !matches!(chars.next()?, '-' | '*' | '+') {
         return None;
@@ -110,7 +129,7 @@ fn strip_bullet(text: &str) -> Option<String> {
     marker_body(chars.as_str())
 }
 
-fn strip_ordered(text: &str) -> Option<String> {
+fn strip_ordered(text: &str) -> Option<&str> {
     let digits = text
         .chars()
         .take_while(|value| value.is_ascii_digit())
@@ -125,7 +144,7 @@ fn strip_ordered(text: &str) -> Option<String> {
     marker_body(chars.as_str())
 }
 
-fn strip_task(text: &str) -> Option<String> {
+fn strip_task(text: &str) -> Option<&str> {
     let rest = ["[ ]", "[x]", "[X]"]
         .into_iter()
         .find_map(|marker| text.strip_prefix(marker))?;
@@ -133,8 +152,8 @@ fn strip_task(text: &str) -> Option<String> {
 }
 
 /// 마커 뒤가 공백이거나 줄 끝일 때만 본문으로 인정한다.
-fn marker_body(rest: &str) -> Option<String> {
-    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim_start().to_owned())
+fn marker_body(rest: &str) -> Option<&str> {
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim_start())
 }
 
 /// 표 행의 셀만 공백으로 이어 붙인다. 파이프로 시작하는 줄만 행으로 본다.
@@ -186,26 +205,12 @@ fn strip_inline_markup(text: &str) -> String {
                 }
             }
             // 이미지는 대체 텍스트만, 링크는 라벨만 남기고 주소는 버린다.
-            '!' if chars.get(index + 1) == Some(&'[') => match inline_link(&chars, index + 1) {
-                Some((label, next)) => {
-                    out.push_str(&strip_inline_markup(&label));
-                    index = next;
-                }
-                None => {
-                    out.push('!');
-                    index += 1;
-                }
-            },
-            '[' => match inline_link(&chars, index) {
-                Some((label, next)) => {
-                    out.push_str(&strip_inline_markup(&label));
-                    index = next;
-                }
-                None => {
-                    out.push('[');
-                    index += 1;
-                }
-            },
+            '!' if chars.get(index + 1) == Some(&'[') => {
+                consume_inline_link(&chars, index + 1, '!', &mut out, &mut index);
+            }
+            '[' => {
+                consume_inline_link(&chars, index, '[', &mut out, &mut index);
+            }
             '<' => match angle_span(&chars, index) {
                 Some((kept, next)) => {
                     out.push_str(&kept);
@@ -257,6 +262,26 @@ fn inline_link(chars: &[char], open: usize) -> Option<(String, usize)> {
     }
     let end = (close + 2..chars.len()).find(|index| chars[*index] == ')')?;
     Some((chars[open + 1..close].iter().collect(), end + 1))
+}
+
+/// 인라인 링크·이미지 표기를 본문에 반영하거나, 실패 시 fallback 문자를 남긴다.
+fn consume_inline_link(
+    chars: &[char],
+    open: usize,
+    fallback: char,
+    out: &mut String,
+    index: &mut usize,
+) {
+    match inline_link(chars, open) {
+        Some((label, next)) => {
+            out.push_str(&strip_inline_markup(&label));
+            *index = next;
+        }
+        None => {
+            out.push(fallback);
+            *index += 1;
+        }
+    }
 }
 
 /// 자동 링크는 주소를 글자로 남기고 HTML 태그는 통째로 버린다. 둘 다 아니면 None을

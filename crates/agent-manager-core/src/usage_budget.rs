@@ -59,6 +59,29 @@ pub(crate) struct Claim {
     pub active: bool,
 }
 
+impl Claim {
+    /// 기동 수나 기대 소비가 유효한지 확인한다. 0인 기록은 존재 표시일 뿐이라 예약이 아니다.
+    fn has_budget_impact(&self) -> bool {
+        self.count > 0 && self.expected_cost_percent > 0.0
+    }
+
+    /// 현재 시각 기준으로 발행자 간격(cadence)이 만료되었는지 확인한다.
+    /// 실행이 아직 돌고 있는(active) 예약은 소비가 표본에 아직 다 잡히지 않았으므로 만료되지 않는다.
+    fn is_expired_at(&self, now: i64) -> bool {
+        !self.active && now >= self.at.saturating_add(self.cadence_ms.max(0))
+    }
+
+    /// 주어진 사용량 창에 비추어 예약이 아직 유효한지 확인한다.
+    /// 창이 리셋되었거나(리셋 시각 변경) 현재 사용률이 예약 시점 기준선 아래로 내려갔으면 무효다.
+    fn is_valid_for_window(&self, window: &AccountUsageWindow) -> bool {
+        same_window(
+            self.used_percent_at_claim,
+            self.resets_at_at_claim,
+            window.resets_at,
+        ) && window.used_percent >= self.used_percent_at_claim
+    }
+}
+
 /// 아직 정산되지 않은 예약만 남긴다. 실행이 돌고 있는 예약은 모두 열려 있고, 실행이 없는
 /// 예약은 소비자마다 가장 새 것 하나만 열려 있다. 결과는 시각 오름차순이다.
 ///
@@ -80,17 +103,9 @@ pub(crate) fn open_claims(claims: &[Claim], now: i64, window: &AccountUsageWindo
     let mut newest_idle: BTreeMap<&str, &Claim> = BTreeMap::new();
     let mut active: Vec<&Claim> = Vec::new();
     for claim in claims {
-        if claim.count == 0 || claim.expected_cost_percent <= 0.0 {
-            continue;
-        }
-        if !claim.active && now >= claim.at.saturating_add(claim.cadence_ms.max(0)) {
-            continue;
-        }
-        if !same_window(
-            claim.used_percent_at_claim,
-            claim.resets_at_at_claim,
-            window.resets_at,
-        ) || window.used_percent < claim.used_percent_at_claim
+        if !claim.has_budget_impact()
+            || claim.is_expired_at(now)
+            || !claim.is_valid_for_window(window)
         {
             continue;
         }
@@ -163,6 +178,45 @@ pub(crate) struct ConsumerDemand {
     pub priority: u8,
 }
 
+fn compare_consumer_demand(left: &ConsumerDemand, right: &ConsumerDemand) -> Ordering {
+    left.priority.cmp(&right.priority).then_with(|| {
+        match (left.last_served_at, right.last_served_at) {
+            (None, None) => left.consumer_id.cmp(&right.consumer_id),
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some(left_at), Some(right_at)) => left_at
+                .cmp(&right_at)
+                .then_with(|| left.consumer_id.cmp(&right.consumer_id)),
+        }
+    })
+}
+
+/// 같은 우선순위 그룹의 수요자들에게 남은 기동 수를 1건씩 라운드로빈 방식으로 배분한다.
+fn allocate_priority_group_round_robin<'a>(
+    group: &[&'a ConsumerDemand],
+    given: &mut BTreeMap<&'a str, usize>,
+    remaining: &mut usize,
+) {
+    while *remaining > 0 {
+        let mut placed = false;
+        for demand in group {
+            if *remaining == 0 {
+                break;
+            }
+            let taken = given.entry(demand.consumer_id.as_str()).or_default();
+            if *taken >= demand.demand_runs {
+                continue;
+            }
+            *taken += 1;
+            *remaining -= 1;
+            placed = true;
+        }
+        if !placed {
+            break;
+        }
+    }
+}
+
 /// 기동 수를 우선순위 순으로(숫자가 낮은 쪽이 먼저, 0이 가장 높음), 같은 우선순위 안에서는
 /// 라운드로빈으로 나눈다. 높은 우선순위 그룹이 자기 수요를 다 채운 뒤 남은 건수가 다음
 /// 그룹으로 흐르고, 그룹 안에서는 가장 오래 못 받은 소비자부터 한 건씩 돌아가며 받는다.
@@ -185,18 +239,7 @@ pub(crate) fn allocate_runs(
         .iter()
         .filter(|demand| demand.demand_runs > 0)
         .collect();
-    order.sort_by(|left, right| {
-        left.priority.cmp(&right.priority).then_with(|| {
-            match (left.last_served_at, right.last_served_at) {
-                (None, None) => left.consumer_id.cmp(&right.consumer_id),
-                (None, Some(_)) => Ordering::Less,
-                (Some(_), None) => Ordering::Greater,
-                (Some(a), Some(b)) => a
-                    .cmp(&b)
-                    .then_with(|| left.consumer_id.cmp(&right.consumer_id)),
-            }
-        })
-    });
+    order.sort_by(|left, right| compare_consumer_demand(left, right));
     let mut given: BTreeMap<&str, usize> = BTreeMap::new();
     let mut remaining = budget_runs;
     let mut index = 0;
@@ -208,24 +251,7 @@ pub(crate) fn allocate_runs(
             .copied()
             .collect();
         index += group.len();
-        loop {
-            let mut placed = false;
-            for demand in &group {
-                if remaining == 0 {
-                    break;
-                }
-                let taken = given.entry(demand.consumer_id.as_str()).or_default();
-                if *taken >= demand.demand_runs {
-                    continue;
-                }
-                *taken += 1;
-                remaining -= 1;
-                placed = true;
-            }
-            if !placed || remaining == 0 {
-                break;
-            }
-        }
+        allocate_priority_group_round_robin(&group, &mut given, &mut remaining);
     }
     given.get(current).copied().unwrap_or(0)
 }
@@ -248,6 +274,38 @@ pub(crate) struct MeasurementGroup {
     pub runs: BTreeMap<String, usize>,
 }
 
+struct OpenGroup {
+    start: i64,
+    min_cadence: i64,
+    max_cadence: i64,
+    runs: BTreeMap<String, usize>,
+}
+
+impl OpenGroup {
+    fn new(start: i64, cadence: i64) -> Self {
+        Self {
+            start,
+            min_cadence: cadence,
+            max_cadence: cadence,
+            runs: BTreeMap::new(),
+        }
+    }
+
+    /// 이 계획 기록이 현재 그룹의 허용 시간 간격 안에 들어 함께 묶일 수 있는지 확인한다.
+    fn should_join(&self, at: i64, cadence: i64) -> bool {
+        at.saturating_sub(self.start) < self.min_cadence.min(cadence) / 2
+    }
+
+    /// 계획 기록의 실행 건수와 간격을 그룹에 누적한다.
+    fn record_point(&mut self, cadence: i64, runs: &[(String, usize)]) {
+        self.min_cadence = self.min_cadence.min(cadence);
+        self.max_cadence = self.max_cadence.max(cadence);
+        for (account_id, count) in runs {
+            *self.runs.entry(account_id.clone()).or_default() += *count;
+        }
+    }
+}
+
 /// 계획 기록을 회차 그룹으로 묶는다. 그룹의 첫 기록에서 간격의 절반 안에 든 기록은
 /// 같은 회차다(:00 QA와 :30 리팩토링은 한 그룹). 구간의 끝은 다음 그룹의 시작이고,
 /// 다음 그룹이 없거나 너무 멀면 `가장 긴 간격 × span_factor`에서 닫는다 — 멈춰 있던
@@ -255,32 +313,17 @@ pub(crate) struct MeasurementGroup {
 pub(crate) fn measurement_groups(points: &[PlanPoint], span_factor: i64) -> Vec<MeasurementGroup> {
     let mut sorted: Vec<&PlanPoint> = points.iter().collect();
     sorted.sort_by_key(|point| point.at);
-    struct Open {
-        start: i64,
-        min_cadence: i64,
-        max_cadence: i64,
-        runs: BTreeMap<String, usize>,
-    }
-    let mut groups: Vec<Open> = Vec::new();
+    let mut groups: Vec<OpenGroup> = Vec::new();
     for point in sorted {
         let cadence = point.cadence_ms.max(1);
-        let joins = groups.last().is_some_and(|group| {
-            point.at.saturating_sub(group.start) < group.min_cadence.min(cadence) / 2
-        });
+        let joins = groups
+            .last()
+            .is_some_and(|group| group.should_join(point.at, cadence));
         if !joins {
-            groups.push(Open {
-                start: point.at,
-                min_cadence: cadence,
-                max_cadence: cadence,
-                runs: BTreeMap::new(),
-            });
+            groups.push(OpenGroup::new(point.at, cadence));
         }
         let group = groups.last_mut().expect("group just ensured");
-        group.min_cadence = group.min_cadence.min(cadence);
-        group.max_cadence = group.max_cadence.max(cadence);
-        for (account_id, count) in &point.runs {
-            *group.runs.entry(account_id.clone()).or_default() += *count;
-        }
+        group.record_point(cadence, &point.runs);
     }
     let starts: Vec<i64> = groups.iter().map(|group| group.start).collect();
     groups

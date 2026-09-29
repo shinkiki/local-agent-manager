@@ -1,0 +1,417 @@
+{
+  "answerDraftError": "Steps that use tools have already been recorded. Add the remaining steps with add_step and confirm with finish_plan. If the request cannot be carried out, give the reason with cannot_do",
+  "continuations": [
+    {
+      "nudge": "No plan has been made yet. Write the steps one at a time with add_step, then call finish_plan when done. If the request needs no tools, answer directly with answer_now; if it cannot be done with the given tools, call cannot_do.",
+      "receipt": {
+        "next": "Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step",
+        "step": 0
+      }
+    },
+    {
+      "nudge": "1 step(s) have been written so far, but the plan is not confirmed yet. Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step.",
+      "receipt": {
+        "next": "Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step",
+        "step": 1
+      }
+    },
+    {
+      "nudge": "2 step(s) have been written so far, but the plan is not confirmed yet. Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step.",
+      "receipt": {
+        "next": "Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step",
+        "step": 2
+      }
+    },
+    {
+      "nudge": "3 step(s) have been written so far, but the plan is not confirmed yet. Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step.",
+      "receipt": {
+        "next": "Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step",
+        "step": 3
+      }
+    },
+    {
+      "nudge": "4 step(s) have been written so far, but the plan is not confirmed yet. Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step.",
+      "receipt": {
+        "next": "Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step",
+        "step": 4
+      }
+    },
+    {
+      "nudge": "5 step(s) have been written so far, but the plan is not confirmed yet. Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step.",
+      "receipt": {
+        "next": "Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step",
+        "step": 5
+      }
+    },
+    {
+      "nudge": "6 step(s) have been written so far, but the plan is not confirmed yet. Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step.",
+      "receipt": {
+        "next": "Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step",
+        "step": 6
+      }
+    },
+    {
+      "nudge": "7 step(s) have been written so far, but the plan is not confirmed yet. Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step.",
+      "receipt": {
+        "next": "Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step",
+        "step": 7
+      }
+    },
+    {
+      "nudge": "8 step(s) have been written so far, but the plan is not confirmed yet. Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step.",
+      "receipt": {
+        "next": "Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step",
+        "step": 8
+      }
+    },
+    {
+      "nudge": "9 step(s) have been written so far, but the plan is not confirmed yet. Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step.",
+      "receipt": {
+        "next": "Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step",
+        "step": 9
+      }
+    },
+    {
+      "nudge": "10 step(s) have been written so far, but the plan is not confirmed yet. Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step.",
+      "receipt": {
+        "next": "Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step",
+        "step": 10
+      }
+    },
+    {
+      "nudge": "11 step(s) have been written so far, but the plan is not confirmed yet. Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step.",
+      "receipt": {
+        "next": "Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step",
+        "step": 11
+      }
+    },
+    {
+      "nudge": "12 step(s) have been written so far, but the plan is not confirmed yet. Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step.",
+      "receipt": {
+        "next": "Call finish_plan only when every step of the plan is written. Otherwise, write the next step with add_step",
+        "step": 12
+      }
+    }
+  ],
+  "directIndexCallError": "You just called '<TOOL>' directly and it was rejected, but that does not mean the tool is missing. While planning, only the control tools are open; '<TOOL>' opens when that step runs. To do that work, write \"<TOOL>\" into add_step's tools. If it still cannot be done, call cannot_do once more and it will be accepted",
+  "draftSchemas": [
+    {
+      "description": "Adds one step to the plan. The order of calls is the order of steps.",
+      "name": "add_step",
+      "parameters": {
+        "properties": {
+          "title": {
+            "description": "One sentence on what this step does",
+            "type": "string"
+          },
+          "tools": {
+            "description": "The tool name this step will call. Only names from the given list.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 1,
+            "type": "array"
+          },
+          "uses": {
+            "description": "Number of an earlier step whose full result this step needs. Leave empty if a one-line summary is enough.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 2,
+            "type": "array"
+          }
+        },
+        "required": [
+          "title",
+          "tools"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Call when no more steps are needed. The plan is confirmed here.",
+      "name": "finish_plan",
+      "parameters": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "description": "Call when the request needs no tools - greetings, small talk, questions you already know the answer to. No plan is made; the text written here is the answer.",
+      "name": "answer_now",
+      "parameters": {
+        "properties": {
+          "answer": {
+            "description": "The answer shown to the user as is",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Call when the request cannot be done with the given tools. Do not invent a plan.",
+      "name": "cannot_do",
+      "parameters": {
+        "properties": {
+          "reason": {
+            "description": "One or two sentences on why it cannot be done",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      }
+    }
+  ],
+  "index": "- bash: Runs a shell command.\n- read: Reads one file.\n- write: Writes content to one file.\n- edit: Finds and replaces part of a file.\n- webfetch: Fetches the content of a URL.\n- notion-ai-search (notion-team · 노션 | notion-personal · 노션): Use this tool for every content search when access discovery reports current_tool_access.ai_search.status=\"available\".\n- notion-check-mcp-next-steps (notion-team · 노션 | notion-personal · 노션): When to call: Only when a Notion fetch result instructs you to.\n- notion-convert-page-to-skill (notion-team · 노션 | notion-personal · 노션): Mark an existing Notion page as a skill without changing its content.\n- notion-create-attachment (notion-team · 노션 | notion-personal · 노션): Create an attachment and upload it to Notion.\n- notion-create-comment (notion-team · 노션 | notion-personal · 노션): Add a comment to a page or specific content.\n- notion-create-database (notion-team · 노션 | notion-personal · 노션): Creates a new Notion database using SQL DDL syntax, or a canonical typed database for tasks, projects, or skills.\n- notion-create-file-upload (notion-team · 노션 | notion-personal · 노션): Create a short-lived URL for uploading one local file directly to Notion.\n- notion-create-folder (notion-team · 노션 | notion-personal · 노션): Creates an empty Notion Folder.\n- notion-create-pages (notion-team · 노션 | notion-personal · 노션): Creates one or more Notion pages, with the specified properties and content.\n- notion-create-view (notion-team · 노션 | notion-personal · 노션): Create a new view on a Notion database.\n- notion-download-attachment (notion-team · 노션 | notion-personal · 노션): Download the contents of a small UTF-8 text attachment created by the Notion MCP `create-attachment` tool.\n- notion-download-skill (notion-team · 노션 | notion-personal · 노션): Download a spec-compliant Notion Skill as a complete tar.gz archive containing SKILL.md and its supporting files and nested folders.\n- notion-duplicate-page (notion-team · 노션 | notion-personal · 노션): Duplicate a Notion page.\n- notion-fetch (notion-team · 노션 | notion-personal · 노션): Retrieves details about a Notion entity (page, database, data source, or saved database view) by URL or ID.\n- notion-get-async-task (notion-team · 노션 | notion-personal · 노션): Retrieves the current status of an async task that was started by another tool (for example, \"create_pages\" called with \"allow_async\": true).\n- notion-get-comments (notion-team · 노션 | notion-personal · 노션): Get comments and discussions from a Notion page.\n- notion-get-session-status (notion-team · 노션 | notion-personal · 노션): Get the latest turn's status for a Custom Agent session without waiting.\n- notion-get-teams (notion-team · 노션 | notion-personal · 노션): Retrieves a list of teams (teamspaces) in the current workspace.\n- notion-get-tool-access (notion-team · 노션 | notion-personal · 노션): Get current tool availability, parameter restrictions, and available upgrade links for this Notion connection.\n- notion-get-users (notion-team · 노션 | notion-personal · 노션): Retrieves a list of users in the current workspace.\n- notion-list-favorite-pages (notion-team · 노션 | notion-personal · 노션): List the current user's favorite pages and databases in sidebar order.\n- notion-list-private-pages (notion-team · 노션 | notion-personal · 노션): List the current user's top-level pages and databases in their Private sidebar section.\n- notion-list-recent-pages (notion-team · 노션 | notion-personal · 노션): List pages and databases the current user recently viewed, ranked by recency and visit frequency.\n- notion-list-session-events (notion-team · 노션 | notion-personal · 노션): List short summaries of saved events in a Custom Agent session.\n- notion-list-shared-pages (notion-team · 노션 | notion-personal · 노션): List pages and databases in the current user's Shared sidebar section.\n- notion-move-pages (notion-team · 노션 | notion-personal · 노션): Move one or more Notion pages or databases to a new parent.\n- notion-query-data-sources (notion-team · 노션 | notion-personal · 노션): Query Notion data sources using faithful structured rows, SQL, or a view.\n- notion-query-meeting-notes (notion-team · 노션 | notion-personal · 노션): Query the current user's meeting notes data source.\n- notion-query-multiple-data-sources (notion-team · 노션 | notion-personal · 노션): Query data across multiple Notion data sources using read-only SQLite SQL.\n- notion-query-sessions (notion-team · 노션 | notion-personal · 노션): List agent sessions available to the integration.\n- notion-read-session-event (notion-team · 노션 | notion-personal · 노션): Read the full visible content of one saved Custom Agent session event.\n- notion-search (notion-team · 노션 | notion-personal · 노션): Before the first content search for this connection, call get_tool_access with {} unless its current access result is already in context.\n- notion-search-agents (notion-team · 노션 | notion-personal · 노션): Search agents by name or description, or browse the current user's favorite agents and the workspace's newest agents.\n- notion-search-sessions (notion-team · 노션 | notion-personal · 노션): Search past agent sessions by topic in a periodically refreshed index and return matching session URLs and excerpts.\n- notion-search-skills (notion-team · 노션 | notion-personal · 노션): Find active Notion Skills the authenticated user can access.\n- notion-send-message-to-session (notion-team · 노션 | notion-personal · 노션): Send a follow-up message to a Custom Agent session you can access.\n- notion-show-advanced-analysis-next-steps (notion-team · 노션 | notion-personal · 노션): Use this exactly once at the end of a turn when query_multiple_data_sources requires the full version of Notion MCP.\n- notion-spawn-session (notion-team · 노션 | notion-personal · 노션): Start a session with a published Custom Agent.\n- notion-stop-session (notion-team · 노션 | notion-personal · 노션): Stop a running Custom Agent session you can access.\n- notion-update-data-source (notion-team · 노션 | notion-personal · 노션): Update a Notion data source's schema, title, or attributes using SQL DDL statements.\n- notion-update-folder (notion-team · 노션 | notion-personal · 노션): Update an existing Notion Folder with an explicit Folder operation.\n- notion-update-page (notion-team · 노션 | notion-personal · 노션): Update a Notion page's properties or content.\n- notion-update-view (notion-team · 노션 | notion-personal · 노션): Update a view's name, filters, sorts, or display configuration.\n- notion-upload-skill (notion-team · 노션 | notion-personal · 노션): Import a spec-compliant Agent Skills directory into a page in a Skills database.\n- notion-wait-session (notion-team · 노션 | notion-personal · 노션): Wait for the latest turn in a Custom Agent session to stop running.",
+  "indexReadOnly": "- read: Reads one file.\n- webfetch: Fetches the content of a URL.\n- notion-ai-search (notion-team · 노션 | notion-personal · 노션): Use this tool for every content search when access discovery reports current_tool_access.ai_search.status=\"available\".\n- notion-check-mcp-next-steps (notion-team · 노션 | notion-personal · 노션): When to call: Only when a Notion fetch result instructs you to.\n- notion-download-attachment (notion-team · 노션 | notion-personal · 노션): Download the contents of a small UTF-8 text attachment created by the Notion MCP `create-attachment` tool.\n- notion-download-skill (notion-team · 노션 | notion-personal · 노션): Download a spec-compliant Notion Skill as a complete tar.gz archive containing SKILL.md and its supporting files and nested folders.\n- notion-fetch (notion-team · 노션 | notion-personal · 노션): Retrieves details about a Notion entity (page, database, data source, or saved database view) by URL or ID.\n- notion-get-async-task (notion-team · 노션 | notion-personal · 노션): Retrieves the current status of an async task that was started by another tool (for example, \"create_pages\" called with \"allow_async\": true).\n- notion-get-comments (notion-team · 노션 | notion-personal · 노션): Get comments and discussions from a Notion page.\n- notion-get-session-status (notion-team · 노션 | notion-personal · 노션): Get the latest turn's status for a Custom Agent session without waiting.\n- notion-get-teams (notion-team · 노션 | notion-personal · 노션): Retrieves a list of teams (teamspaces) in the current workspace.\n- notion-get-tool-access (notion-team · 노션 | notion-personal · 노션): Get current tool availability, parameter restrictions, and available upgrade links for this Notion connection.\n- notion-get-users (notion-team · 노션 | notion-personal · 노션): Retrieves a list of users in the current workspace.\n- notion-list-favorite-pages (notion-team · 노션 | notion-personal · 노션): List the current user's favorite pages and databases in sidebar order.\n- notion-list-private-pages (notion-team · 노션 | notion-personal · 노션): List the current user's top-level pages and databases in their Private sidebar section.\n- notion-list-recent-pages (notion-team · 노션 | notion-personal · 노션): List pages and databases the current user recently viewed, ranked by recency and visit frequency.\n- notion-list-session-events (notion-team · 노션 | notion-personal · 노션): List short summaries of saved events in a Custom Agent session.\n- notion-list-shared-pages (notion-team · 노션 | notion-personal · 노션): List pages and databases in the current user's Shared sidebar section.\n- notion-query-data-sources (notion-team · 노션 | notion-personal · 노션): Query Notion data sources using faithful structured rows, SQL, or a view.\n- notion-query-meeting-notes (notion-team · 노션 | notion-personal · 노션): Query the current user's meeting notes data source.\n- notion-query-multiple-data-sources (notion-team · 노션 | notion-personal · 노션): Query data across multiple Notion data sources using read-only SQLite SQL.\n- notion-query-sessions (notion-team · 노션 | notion-personal · 노션): List agent sessions available to the integration.\n- notion-read-session-event (notion-team · 노션 | notion-personal · 노션): Read the full visible content of one saved Custom Agent session event.\n- notion-search (notion-team · 노션 | notion-personal · 노션): Before the first content search for this connection, call get_tool_access with {} unless its current access result is already in context.\n- notion-search-agents (notion-team · 노션 | notion-personal · 노션): Search agents by name or description, or browse the current user's favorite agents and the workspace's newest agents.\n- notion-search-sessions (notion-team · 노션 | notion-personal · 노션): Search past agent sessions by topic in a periodically refreshed index and return matching session URLs and excerpts.\n- notion-search-skills (notion-team · 노션 | notion-personal · 노션): Find active Notion Skills the authenticated user can access.\n- notion-show-advanced-analysis-next-steps (notion-team · 노션 | notion-personal · 노션): Use this exactly once at the end of a turn when query_multiple_data_sources requires the full version of Notion MCP.\n- notion-wait-session (notion-team · 노션 | notion-personal · 노션): Wait for the latest turn in a Custom Agent session to stop running.",
+  "maxNudges": 2,
+  "maxRefusal": 400,
+  "maxSteps": 12,
+  "maxTitle": 120,
+  "maxTools": 1,
+  "maxUses": 2,
+  "pluginGroups": [
+    {
+      "aliases": [
+        "노션"
+      ],
+      "tools": [
+        "notion-ai-search",
+        "notion-check-mcp-next-steps",
+        "notion-convert-page-to-skill",
+        "notion-create-attachment",
+        "notion-create-comment",
+        "notion-create-database",
+        "notion-create-file-upload",
+        "notion-create-folder",
+        "notion-create-pages",
+        "notion-create-view",
+        "notion-download-attachment",
+        "notion-download-skill",
+        "notion-duplicate-page",
+        "notion-fetch",
+        "notion-get-async-task",
+        "notion-get-comments",
+        "notion-get-session-status",
+        "notion-get-teams",
+        "notion-get-tool-access",
+        "notion-get-users",
+        "notion-list-favorite-pages",
+        "notion-list-private-pages",
+        "notion-list-recent-pages",
+        "notion-list-session-events",
+        "notion-list-shared-pages",
+        "notion-move-pages",
+        "notion-query-data-sources",
+        "notion-query-meeting-notes",
+        "notion-query-multiple-data-sources",
+        "notion-query-sessions",
+        "notion-read-session-event",
+        "notion-search",
+        "notion-search-agents",
+        "notion-search-sessions",
+        "notion-search-skills",
+        "notion-send-message-to-session",
+        "notion-show-advanced-analysis-next-steps",
+        "notion-spawn-session",
+        "notion-stop-session",
+        "notion-update-data-source",
+        "notion-update-folder",
+        "notion-update-page",
+        "notion-update-view",
+        "notion-upload-skill",
+        "notion-wait-session"
+      ]
+    },
+    {
+      "aliases": [
+        "노션"
+      ],
+      "tools": [
+        "notion-ai-search",
+        "notion-check-mcp-next-steps",
+        "notion-convert-page-to-skill",
+        "notion-create-attachment",
+        "notion-create-comment",
+        "notion-create-database",
+        "notion-create-file-upload",
+        "notion-create-folder",
+        "notion-create-pages",
+        "notion-create-view",
+        "notion-download-attachment",
+        "notion-download-skill",
+        "notion-duplicate-page",
+        "notion-fetch",
+        "notion-get-async-task",
+        "notion-get-comments",
+        "notion-get-session-status",
+        "notion-get-teams",
+        "notion-get-tool-access",
+        "notion-get-users",
+        "notion-list-favorite-pages",
+        "notion-list-private-pages",
+        "notion-list-recent-pages",
+        "notion-list-session-events",
+        "notion-list-shared-pages",
+        "notion-move-pages",
+        "notion-query-data-sources",
+        "notion-query-meeting-notes",
+        "notion-query-multiple-data-sources",
+        "notion-query-sessions",
+        "notion-read-session-event",
+        "notion-search",
+        "notion-search-agents",
+        "notion-search-sessions",
+        "notion-search-skills",
+        "notion-send-message-to-session",
+        "notion-show-advanced-analysis-next-steps",
+        "notion-spawn-session",
+        "notion-stop-session",
+        "notion-update-data-source",
+        "notion-update-folder",
+        "notion-update-page",
+        "notion-update-view",
+        "notion-upload-skill",
+        "notion-wait-session"
+      ]
+    }
+  ],
+  "pluginMismatchError": "The step title mentions '<ALIAS>' but none of its tools belong to that plugin. That plugin's tools: <TOOLS>. Pick one of them, or reword the title if this step does not use that plugin",
+  "prompt": "<REQUEST>",
+  "refusalDraftError": "1 step(s) are already written. If those steps cover the request, call finish_plan; if part of it is not covered, add the rest with add_step. If it still cannot be done, call cannot_do once more and it will be accepted",
+  "schemas": [
+    {
+      "description": "Adds one step to the plan. The order of calls is the order of steps.",
+      "name": "add_step",
+      "parameters": {
+        "properties": {
+          "title": {
+            "description": "One sentence on what this step does",
+            "type": "string"
+          },
+          "tools": {
+            "description": "The tool name this step will call. Only names from the given list.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 1,
+            "type": "array"
+          },
+          "uses": {
+            "description": "Number of an earlier step whose full result this step needs. Leave empty if a one-line summary is enough.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 2,
+            "type": "array"
+          }
+        },
+        "required": [
+          "title",
+          "tools"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Call when no more steps are needed. The plan is confirmed here.",
+      "name": "finish_plan",
+      "parameters": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "description": "Call when the request needs no tools - greetings, small talk, questions you already know the answer to. No plan is made; the text written here is the answer.",
+      "name": "answer_now",
+      "parameters": {
+        "properties": {
+          "answer": {
+            "description": "The answer shown to the user as is",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Call when the request cannot be done with the given tools. Do not invent a plan.",
+      "name": "cannot_do",
+      "parameters": {
+        "properties": {
+          "reason": {
+            "description": "One or two sentences on why it cannot be done",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Inserts one step into the remaining plan. Say which step it follows; numbers are reassigned.",
+      "name": "insert_step",
+      "parameters": {
+        "properties": {
+          "after": {
+            "description": "Insert after this step. Write the step number as currently shown; leave empty for the very front.",
+            "type": "string"
+          },
+          "title": {
+            "description": "One sentence on what this step does",
+            "type": "string"
+          },
+          "tools": {
+            "description": "The tool name this step will call. Only names from the given list.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "title",
+          "tools"
+        ],
+        "type": "object"
+      }
+    }
+  ],
+  "systemPrompt": "You are an agent that plans how to handle the request. In this turn you only write the plan; nothing is executed. The only tools you may call now are add_step, finish_plan, answer_now, and cannot_do. Every other tool name is written into add_step's tools and is called later, when that step runs; calling it now is an error. Call add_step once per step, one at a time, each following the previous step. When no more steps are needed, call finish_plan. If the request cannot be done with the listed tools, do not invent a plan; call cannot_do. One tool per step. Use only tool names from the given list.\n\nThe tools a step can use are listed below. While planning, only pick names from this list and write them into add_step's tools — the actual call happens when that step runs.\n\n<INDEX>",
+  "systemPromptReadOnly": "You are an agent that plans how to handle the request. In this turn you only write the plan; nothing is executed. The only tools you may call now are add_step, finish_plan, answer_now, and cannot_do. Every other tool name is written into add_step's tools and is called later, when that step runs; calling it now is an error. Call add_step once per step, one at a time, each following the previous step. When no more steps are needed, call finish_plan. If the request cannot be done with the listed tools, do not invent a plan; call cannot_do. One tool per step. Use only tool names from the given list.\n\nThis session is READ-ONLY. First decide what the request asks for. If it only asks you to read, look up, fetch, search, count, or report something, plan it normally with the listed tools. If it asks to create, write, save, update, post, or organize something (a file, a page, a comment, a record), that part cannot be done here: call cannot_do saying the session is read-only, and do not plan a partial version with only read or search tools.\n\nThe tools a step can use are listed below. While planning, only pick names from this list and write them into add_step's tools — the actual call happens when that step runs.\n\n<INDEX>",
+  "toolErrors": [
+    {
+      "error": "Each step must name at least one tool. Available tools: bash, edit, notion-ai-search, notion-check-mcp-next-steps, notion-convert-page-to-skill, notion-create-attachment, notion-create-comment, notion-create-database, notion-create-file-upload, notion-create-folder, notion-create-pages, notion-create-view, notion-download-attachment, notion-download-skill, notion-duplicate-page, notion-fetch, notion-get-async-task, notion-get-comments, notion-get-session-status, notion-get-teams and 30 more",
+      "tools": []
+    },
+    {
+      "error": "There is no tool named 'notion-create-page'. Available tools: bash, edit, notion-ai-search, notion-check-mcp-next-steps, notion-convert-page-to-skill, notion-create-attachment, notion-create-comment, notion-create-database, notion-create-file-upload, notion-create-folder, notion-create-pages, notion-create-view, notion-download-attachment, notion-download-skill, notion-duplicate-page, notion-fetch, notion-get-async-task, notion-get-comments, notion-get-session-status, notion-get-teams and 30 more",
+      "tools": [
+        "notion-create-page"
+      ]
+    },
+    {
+      "error": "A step may use at most 1 tool(s). Split the step",
+      "tools": [
+        "read",
+        "write",
+        "edit",
+        "webfetch",
+        "bash"
+      ]
+    }
+  ]
+}

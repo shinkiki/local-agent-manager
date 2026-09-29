@@ -3,9 +3,14 @@
  */
 
 /**
- * 즐겨찾기를 먼저 올린다. 그 안의 순서는 백엔드가 준 최신순 그대로 남기므로, 정렬 기준을
- * 한 곳에 두 번 적지 않는다(JS의 sort는 안정 정렬이다).
+ * 즐겨찾기를 먼저 올린다. 두 묶음에 들어온 순서대로 담아 백엔드가 준 최신순을 그대로
+ * 남기고, 즐겨찾기 여부만으로 전체 목록을 비교 정렬하지 않는다.
  */
 export function orderSessionsForList<T extends { meta: { favorite: boolean } }>(sessions: readonly T[]): T[] {
-  return [...sessions].sort((left, right) => Number(right.meta.favorite) - Number(left.meta.favorite));
+  const favorites: T[] = [];
+  const others: T[] = [];
+  for (const session of sessions) {
+    (session.meta.favorite ? favorites : others).push(session);
+  }
+  return favorites.concat(others);
 }

@@ -65,17 +65,26 @@ fn save_skill_meta(app_data_dir: &Path, store: &SkillMetaStore) -> Result<(), Co
     write_private_json(&app_data_dir.join(META_FILE), &next)
 }
 
-fn update_skill_meta<F>(app_data_dir: &Path, mutate: F) -> Result<bool, CoreError>
+fn update_skill_meta<F>(app_data_dir: &Path, mutate: F) -> Result<(), CoreError>
 where
     F: FnOnce(&mut SkillMetaStore) -> bool,
 {
     let mut store = load_skill_meta(app_data_dir);
     if mutate(&mut store) {
         save_skill_meta(app_data_dir, &store)?;
-        Ok(true)
-    } else {
-        Ok(false)
     }
+    Ok(())
+}
+
+fn update_skill_entry(
+    app_data_dir: &Path,
+    key: &str,
+    mutate: impl FnOnce(&mut SkillMetaEntry),
+) -> Result<(), CoreError> {
+    update_skill_meta(app_data_dir, |store| {
+        mutate(store.skills.entry(key.to_owned()).or_default());
+        true
+    })
 }
 
 /// 보관 시 출처를 기록한다. 기존 자동 동기화 설정은 유지한다.
@@ -84,11 +93,7 @@ pub(crate) fn record_skill_origin(
     key: &str,
     origin: SkillOriginMeta,
 ) -> Result<(), CoreError> {
-    update_skill_meta(app_data_dir, |store| {
-        store.skills.entry(key.to_owned()).or_default().origin = Some(origin);
-        true
-    })
-    .map(|_| ())
+    update_skill_entry(app_data_dir, key, |entry| entry.origin = Some(origin))
 }
 
 pub fn set_skill_auto_sync(
@@ -96,16 +101,12 @@ pub fn set_skill_auto_sync(
     key: &str,
     auto_sync: bool,
 ) -> Result<(), CoreError> {
-    update_skill_meta(app_data_dir, |store| {
-        store.skills.entry(key.to_owned()).or_default().auto_sync = auto_sync;
-        true
-    })
-    .map(|_| ())
+    update_skill_entry(app_data_dir, key, |entry| entry.auto_sync = auto_sync)
 }
 
 /// 보관 스킬 삭제 시 메타도 함께 정리한다.
 pub(crate) fn remove_skill_meta(app_data_dir: &Path, key: &str) -> Result<(), CoreError> {
-    update_skill_meta(app_data_dir, |store| store.skills.remove(key).is_some()).map(|_| ())
+    update_skill_meta(app_data_dir, |store| store.skills.remove(key).is_some())
 }
 
 #[cfg(test)]

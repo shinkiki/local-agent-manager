@@ -1,6 +1,6 @@
-export type ProviderId = "claude" | "codex" | "antigravity";
+export type ProviderId = "claude" | "codex" | "antigravity" | "local";
 export type HostPlatform = "macos" | "windows" | "linux";
-export type ViewId = "dashboard" | "chat" | "sessions" | "docs" | "instructions" | "skills" | "agents" | "artifacts" | "workflows" | "addons" | "storage" | "settings";
+export type ViewId = "dashboard" | "chat" | "sessions" | "docs" | "projects" | "instructions" | "skills" | "agents" | "artifacts" | "workflows" | "addons" | "storage" | "settings";
 export type MessageDisplayMode = "lastUser" | "start" | "latest";
 export type ThemeMode = "auto" | "light" | "dark";
 export type AccentColor = "brass" | "green" | "blue" | "cyan" | "violet";
@@ -103,6 +103,8 @@ export interface ProviderRuntimeStopSummary {
   externalTerminatedCount: number;
   externalForcedCount: number;
   externalFailedCount: number;
+  /** 외부 프로세스를 조회하지 못해 정리를 건너뛴 사유. 건너뛰어도 작업은 계속된다. */
+  externalSkippedReason?: string | null;
 }
 
 export type CliUpdateOutcome = "updated" | "alreadyLatest" | "failed" | "verificationFailed";
@@ -141,6 +143,84 @@ export interface ModelCacheCleanupReceipt {
   status: ProviderCliUpdateStatus;
 }
 
+export type SessionCleanupReason =
+  | "hiddenAged"
+  | "emptySession"
+  | "retention"
+  | "providerCap"
+  | "automationCap"
+  | "orphanAttachment";
+
+export interface SessionCleanupPolicy {
+  enabled: boolean;
+  retentionDays: number | null;
+  maxMessageCount: number | null;
+  perProviderCap: number | null;
+  perAutomationCap: number | null;
+  hiddenAfterDays: number | null;
+  trashRetentionDays: number;
+  intervalHours: number;
+}
+
+export interface SessionCleanupReasonCount {
+  reason: SessionCleanupReason;
+  label: string;
+  count: number;
+}
+
+export interface SessionCleanupPreview {
+  targetCount: number;
+  removableCount: number;
+  removableBytes: number;
+  protectedCount: number;
+  remainingCount: number;
+  byReason: SessionCleanupReasonCount[];
+  orphanAttachmentCount: number;
+  orphanAttachmentBytes: number;
+}
+
+export interface SessionCleanupEntry {
+  sessionKey: string;
+  source: ProviderId | null;
+  title: string;
+  reason: SessionCleanupReason;
+  bytesFreed: number;
+  tombstoned: boolean;
+  removed: boolean;
+  skippedReason?: string | null;
+  error?: string | null;
+}
+
+export interface SessionCleanupSkipCount {
+  reason: string;
+  count: number;
+}
+
+export interface SessionCleanupReceipt {
+  startedAt: number;
+  finishedAt: number;
+  manual: boolean;
+  tombstonedCount: number;
+  removedCount: number;
+  skippedCount: number;
+  skippedReasons: SessionCleanupSkipCount[];
+  failedCount: number;
+  bytesFreed: number;
+  trashPurgedCount: number;
+  entriesTruncated: boolean;
+  entries: SessionCleanupEntry[];
+}
+
+export interface SessionCleanupStatus {
+  policy: SessionCleanupPolicy;
+  lastRunAt: number | null;
+  nextRunAt: number | null;
+  sessionCount: number;
+  tombstoneCount: number;
+  preview: SessionCleanupPreview;
+  receipts: SessionCleanupReceipt[];
+}
+
 export type AccountAuthStatus = "ready" | "missing" | "error";
 export type AccountUsageStatus = "idle" | "ok" | "unavailable" | "error";
 
@@ -153,6 +233,11 @@ export interface AccountUsageWindow {
    * 안 되므로 목록에는 보여 주되 계정 대표 소진율 계산에서는 뺀다.
    */
   modelScoped?: boolean;
+  /**
+   * 모델군 창들을 합쳐 만든 계정 대표 창(Antigravity의 "5시간"·"7일"). 가장 빡빡한
+   * 모델군의 복사본이라 대표 소진율에는 쓰고 소진 판정에서는 뺀다.
+   */
+  aggregate?: boolean;
 }
 
 export interface AccountUsageView {
@@ -195,7 +280,7 @@ export interface ProviderAccountView {
   /** 공급자가 알려 준 원래 이름. 같은 사람의 계정이 여럿이면 이 값이 겹친다. */
   providerDisplayName: string;
   /**
-   * 기본 계정인지. 새 채팅·터미널의 기본 실행 계정이고 헤더의 사용량 표시 대상이다.
+   * 활성 계정인지. 새 채팅·터미널의 활성 실행 계정이고 헤더의 사용량 표시 대상이다.
    * 자격증명과는 무관하다 — 모든 계정은 자기 격리 프로필로 실행된다.
    */
   isActive: boolean;
@@ -215,6 +300,12 @@ export interface ProviderAccountView {
   /** 프로필 격리를 쓰지 못한 이유. 격리가 살아 있으면 null. */
   credentialIsolationNote: string | null;
   /**
+   * 자격증명 사슬이 절대 만료되는 시각(ms). 토큰이 회전해도 늘어나지 않으므로 이 시각을
+   * 넘기면 재인증 외에 살릴 길이 없다. 공급자가 만료를 밝히지 않으면 null이고, 그때는
+   * 만료를 예고하지 않는다.
+   */
+  credentialExpiresAt: number | null;
+  /**
    * 이 계정에 묶인 관리 런타임 수. 0이면 이 계정으로는 아무것도 돌지 않으므로
    * 사용량이 올라갈 수 없고, 사용량 갱신을 더 뜸하게 해도 된다.
    */
@@ -232,7 +323,7 @@ export type AutoSwitchPolicy = "priority" | "maxHeadroom" | "registration";
 /**
  * 세션을 이어갈 때 실행 계정을 고르는 방식. 어느 쪽이든 세션에 고정된 계정
  * (`SessionMeta.pinnedAccountId`)이 있으면 그 계정이 먼저다.
- * - `activeAccount`: 기본 계정으로 이어간다. 기본 계정을 바꾸면 이어가는 세션도 함께 옮겨진다.
+ * - `activeAccount`: 활성 계정으로 이어간다. 활성 계정을 바꾸면 이어가는 세션도 함께 옮겨진다.
  * - `lastUsedAccount`: 그 세션이 마지막으로 쓴 계정으로 이어간다.
  */
 export type ResumeAccountPolicy = "activeAccount" | "lastUsedAccount";
@@ -252,11 +343,18 @@ export interface AutoSwitchEventView {
   at: number;
   /** 전환 직후 resume으로 재시작한 채팅 세션 수 */
   resumedSessionCount: number;
+  /**
+   * 기본 계정이 `toAccountId`로 바뀌었는지. 거짓이면 세션만 옮겨졌고 새 대화가 열리는 자리는
+   * 그대로다. 옛 기록에는 없어 참으로 읽는다.
+   */
+  defaultRotated?: boolean;
+  /** 세션들이 옮겨 간 계정이 `toAccountId`와 다를 때만 온다(백엔드가 그 규칙을 소유한다). */
+  sessionsToAccountId?: string | null;
 }
 
 export interface ProviderAccountStateView {
   provider: ProviderId;
-  /** 기본 계정 id. 이름은 이 계정이 공유 CLI 홈에 적용되던 시절의 것이다. */
+  /** 활성 계정 id. 이름은 이 계정이 공유 CLI 홈에 적용되던 시절의 것이다. */
   activeAccountId: string | null;
   /** 공유 CLI 홈의 자격증명이 등록 계정 중 하나로 확인되면 그 id(홈 관측에서 온다). */
   observedActiveAccountId: string | null;
@@ -382,6 +480,164 @@ export interface AccountToolsSnapshot {
 }
 
 /** ~/.ssh의 공개키에서 파생한 비밀 없는 표시 정보. 개인키 내용은 백엔드도 읽지 않는다. */
+/** 등록된 데이터베이스 연결 하나. 비밀번호는 어느 필드에도 담기지 않는다. */
+export interface DbConnectionView {
+  id: string;
+  displayName: string;
+  engine: DbEngineKind;
+  environment: DbEnvironment;
+  host: string;
+  port: number;
+  user: string;
+  /** 접속할 스키마. SQLite에서는 파일 경로다. */
+  database: string;
+  credentialSource: DbCredentialSource;
+  /** ~/.mylogin.cnf의 로그인 경로 이름 같은 참조. 비밀값이 아니다. */
+  credentialRef: string;
+  /** 앱 보관 비밀번호를 저장한 시각. 값 자체는 OS 보안 저장소에만 있다. */
+  credentialStoredAt: number | null;
+  agentEnabled: boolean;
+  writeMode: DbWriteMode;
+  /** 에이전트가 닿을 수 있는 스키마·테이블 접두사. 비면 제한하지 않는다. */
+  schemaScope: string[];
+  /** 조회 결과에서 값을 가릴 컬럼. 대소문자를 가리지 않고 부분 일치로 본다. */
+  maskedColumns: string[];
+  maxRows: number;
+  note: string;
+  updatedAt: number;
+}
+
+export type DbEngineKind = "mysql" | "mariadb" | "postgres" | "sqlite";
+export type DbEnvironment = "local" | "dev" | "staging" | "production";
+export type DbCredentialSource = "appKeychain" | "clientFile" | "none";
+export type DbWriteMode = "readOnly" | "dmlWithApproval" | "ddlWithApproval";
+
+/**
+ * 새 연결에 채워 넣는 기본값. 백엔드가 소유한다.
+ *
+ * 네 목록은 모두 백엔드가 같은 열거형을 늘어놓아 만들므로, 화면이 그대로 선택지로 쓰는
+ * 값도 아래 이름 있는 타입 안에 있다. 넓은 `string[]`으로 받으면 그 사실이 화면까지
+ * 오지 않아 선택지를 읽는 쪽이 매번 표를 `Record<string, ...>`으로 열어 둬야 했다.
+ */
+export interface DbConnectionDefaults {
+  engines: DbEngineKind[];
+  environments: DbEnvironment[];
+  writeModes: DbWriteMode[];
+  credentialSources: DbCredentialSource[];
+  maxRows: number;
+  maxRowsCeiling: number;
+  maskedColumns: string[];
+}
+
+export interface DbConnectionsSnapshot {
+  schemaVersion: number;
+  connections: DbConnectionView[];
+  issues: string[];
+  defaults: DbConnectionDefaults;
+}
+
+/**
+ * 로컬 LLM 서빙 서버 연결 한 벌. 계정 개념이 없다. M7 부터는 이런 연결이 여러 개이며
+ * 이 모양은 그중 기본 연결을 읽는 옛 명령이 그대로 쓴다.
+ * 백엔드 `local_llm::LocalLlmConnection`과 같은 모양이다.
+ */
+export interface LocalLlmConnection {
+  /** OpenAI 호환 API의 기준 주소. 끝의 `/`는 떨어진 값이 온다. */
+  baseUrl: string;
+  /** 새 채팅이 모델을 고르지 않았을 때 쓸 값. */
+  defaultModel: string;
+  /** 서버가 알려 주지 않는 컨텍스트 크기를 사람이 적어 둔 값. 없으면 null. */
+  contextWindow: number | null;
+  /** 키가 저장돼 있는지만 알린다. 값은 어느 응답에도 실리지 않는다. */
+  apiKeyConfigured: boolean;
+  enabled: boolean;
+}
+
+/** 저장 요청. `apiKey`를 생략하면 저장된 키를 그대로 두고, 빈 문자열이면 지운다. */
+export interface SetLocalLlmConnectionRequest {
+  baseUrl: string;
+  defaultModel: string;
+  contextWindow: number | null;
+  enabled: boolean;
+  apiKey?: string;
+}
+
+/** 목록에 든 연결 하나(M7 7.1). 연결 칸들이 그대로 펼쳐져 있고 id·label·모델별 창 크기가 더 있다. */
+export interface LocalLlmConnectionEntry extends LocalLlmConnection {
+  /** 영소문자·숫자·하이픈 1~32자. 옛 단일 연결은 `default`. */
+  id: string;
+  /** 사람이 알아보는 이름("이 기계 ollama", "맥북 ollama"). */
+  label: string;
+  /** 모델별 컨텍스트 크기. 없는 모델은 contextWindow 를 쓴다. */
+  modelWindows?: Record<string, number>;
+}
+
+/** 연결 목록과 기본 연결 id. */
+export interface LocalLlmConnections {
+  defaultId: string;
+  connections: LocalLlmConnectionEntry[];
+}
+
+/** 연결 추가·편집. `id`가 없으면 새 연결이고 id 는 label 에서 만든다. `apiKey` 규칙은 SetLocalLlmConnectionRequest 와 같다. */
+export interface UpsertLocalLlmConnectionRequest {
+  id?: string;
+  label: string;
+  baseUrl: string;
+  defaultModel: string;
+  contextWindow: number | null;
+  modelWindows?: Record<string, number>;
+  enabled: boolean;
+  apiKey?: string;
+}
+
+/** 주소 하나를 찔러 본 결과. 닿지 않는 것도 오류가 아니라 값으로 온다. */
+export interface LocalLlmProbeResult {
+  reachable: boolean;
+  models: string[];
+  /** 응답의 `Server` 헤더. 어떤 서빙 소프트웨어인지 가늠하는 힌트다. */
+  server: string | null;
+  error: string | null;
+}
+
+/** id가 비어 있으면 새 연결을 만든다. secret은 앱 보관을 고른 경우에만 보낸다. */
+export interface SetDbConnectionRequest {
+  id: string;
+  displayName: string;
+  engine: string;
+  environment: string;
+  host: string;
+  port: number | null;
+  user: string;
+  database: string;
+  credentialSource: string;
+  credentialRef: string;
+  secret?: string | null;
+  agentEnabled: boolean;
+  writeMode: string;
+  schemaScope: string[];
+  maskedColumns: string[];
+  maxRows: number | null;
+  note: string;
+}
+
+export interface DbConnectionRef {
+  id: string;
+}
+
+export interface SetDbConnectionEnabledRequest {
+  id: string;
+  enabled: boolean;
+}
+
+/** 연결 확인 결과. 서버 버전만 읽고 끊으며 원격에서는 아무것도 바뀌지 않는다. */
+export interface DbConnectionCheckReceipt {
+  id: string;
+  destination: string;
+  reachable: boolean;
+  serverVersion: string;
+  message: string;
+}
+
 export interface SshKeyView {
   fileName: string;
   path: string;
@@ -405,6 +661,14 @@ export interface SshEndpointView {
   allowedCommands: string[];
   /** 어떤 경우에도 쓰지 않을 명령. 허용 목록보다 우선한다. */
   deniedCommands: string[];
+  /** 이 서버로 파일을 올리고 받아도 되는지. 명령 허용 목록과 별개의 권한이다. */
+  fileTransferEnabled: boolean;
+  /** 전송이 닿을 수 있는 원격 폴더. 올리고 받는 경로 모두 이 아래 상대 경로로만 정해진다. */
+  transferRoot: string;
+  /** 이 서버에서 실행되는 명령의 출력을 대화 화면에 실시간으로 흘릴지. 켜면 셸이 있는 에이전트도 앱을 거쳐 실행한다. */
+  terminalEnabled: boolean;
+  /** 무제한 명령 허용. 켜면 허용 목록 대조와 1회 승인이 빠지고 차단 목록·하드 거부만 남는다. */
+  unrestrictedCommands: boolean;
   updatedAt: number;
 }
 
@@ -417,6 +681,10 @@ export interface SetSshKeyEndpointRequest {
   agentEnabled: boolean;
   allowedCommands: string[];
   deniedCommands: string[];
+  fileTransferEnabled: boolean;
+  transferRoot: string;
+  terminalEnabled: boolean;
+  unrestrictedCommands: boolean;
 }
 
 /** 새 연결 서버에 채워 넣는 기본 명령 정책. 백엔드가 소유한다. */
@@ -494,6 +762,8 @@ export type PluginToolPolicy = "ask" | "allow" | "deny";
 export interface ExternalPluginView {
   id: string;
   displayName: string;
+  /** 이 플러그인을 부르는 다른 말들. 로컬 계획 색인과 라우터 힌트에 실린다. */
+  names: string[];
   /** 원격 MCP 주소. notionToken은 백엔드가 서버를 띄우므로 null. */
   url: string | null;
   auth: ExternalPluginAuthKind;
@@ -522,6 +792,8 @@ export interface ExternalPluginView {
 export interface HostedMcpPreset {
   id: string;
   displayName: string;
+  /** 등록 폼에 미리 채우는 다른 이름들. */
+  names: string[];
   url: string;
   auth: ExternalPluginAuthKind;
   /** 아이콘·안내 문구를 고르는 브랜드 키(atlassian·github·figma·google). */
@@ -554,6 +826,8 @@ export interface ExternalPluginOAuthStart {
 export interface RegisterExternalPluginRequest {
   id: string;
   displayName: string;
+  /** 다른 이름들. 비우면 백엔드가 프리셋 씨앗으로 채운다. */
+  names?: string[];
   url?: string | null;
   auth: ExternalPluginAuthKind;
   token?: string | null;
@@ -568,6 +842,8 @@ export interface RegisterExternalPluginRequest {
 export interface UpdateExternalPluginRequest {
   id: string;
   displayName: string;
+  /** 다른 이름들. 생략하면 기존 목록을 지킨다. */
+  names?: string[];
   url?: string | null;
   auth: ExternalPluginAuthKind;
   /** 주소·인증 방식이 바뀔 때만 필수. 비우면 호환되는 기존 토큰을 유지한다. */
@@ -578,45 +854,6 @@ export interface UpdateExternalPluginRequest {
   clientSecret?: string | null;
   /** authorize scope. 값이 바뀌면 기존 인증을 버리고 새 동의를 받는다. */
   scope?: string | null;
-}
-
-export interface StopChatFailure {
-  chatId: string;
-  error: string;
-}
-
-export interface StopTerminalFailure {
-  terminalId: string;
-  sessionId: string;
-  error: string;
-}
-
-/** Agent Manager 밖에서 독립 실행 중인 공급자 CLI 프로세스 */
-export interface ExternalProviderProcess {
-  pid: number;
-  command: string;
-}
-
-export interface ExternalProcessFailure {
-  pid: number;
-  command: string;
-  error: string;
-}
-
-export interface StopProviderChatsReport {
-  provider: ProviderId;
-  requestedCount: number;
-  stoppedCount: number;
-  /** 정상 종료가 실패해 강제 종료로 승격된 세션 수(stoppedCount에 포함) */
-  forcedCount: number;
-  failed: StopChatFailure[];
-  terminalRequestedCount: number;
-  terminalStoppedCount: number;
-  /** 정상 종료가 실패해 강제 종료로 승격된 터미널 수(terminalStoppedCount에 포함) */
-  terminalForcedCount: number;
-  terminalFailed: StopTerminalFailure[];
-  remainingTerminalCount: number;
-  remainingRuntimeCount: number;
 }
 
 export interface SwitchActiveProviderAccountReceipt {
@@ -644,6 +881,28 @@ export interface TokenUsage {
   cacheWrite: number;
 }
 
+/**
+ * 긴 답변 본문 안의 한 지점. 스크롤 픽셀이 아니라 "어느 메시지의 어느 원문 줄"로
+ * 적는다 — 규칙과 까닭은 `lib/readingAnchor.ts`에 있다.
+ */
+export interface ReadingAnchor {
+  /** `live:<엔트리 id>:<kind>`(라이브 채팅) 또는 `item:<index>`(세션 원문). */
+  messageKey: string;
+  /** 마크다운 블록의 원문 줄 번호. 블록을 짚지 못했으면 null. */
+  markdownLine: number | null;
+}
+
+/** 사용자가 남긴 읽던 자리 한 건. */
+export interface SessionBookmark {
+  id: string;
+  /** 사용자가 붙인 이름. 비어 있으면 화면이 `snippet`을 대신 보여준다. */
+  label: string;
+  /** 앵커 블록 앞머리. 이름이 없을 때의 표시이자 자리를 되찾는 마지막 단서다. */
+  snippet: string;
+  anchor: ReadingAnchor;
+  createdAt: number;
+}
+
 export interface SessionMeta {
   favorite: boolean;
   hidden: boolean;
@@ -658,12 +917,16 @@ export interface SessionMeta {
   boundAccountId: string | null;
   /** 사용자가 이 세션의 실행 계정으로 고정한 값. 이어가기 정책보다 우선한다. */
   pinnedAccountId: string | null;
+  /** 이 세션이 마지막으로 쓴 로컬 LLM 연결 id(M7). 로컬 공급자 세션에만 있다. */
+  localConnectionId?: string | null;
   /** 다른 공급자에서 이 세션으로 인계한 원본. */
   handoffOrigin?: SessionLink | null;
   /** 이 세션에서 다른 공급자로 인계해 만든 세션들. */
   handoffTargets?: SessionLink[];
   /** 이 세션을 시작한 출처(워크플로 실행·반복 요청·AIA·사용자). 최초 한 번만 기록된다. */
   origin?: ChatOrigin | null;
+  /** 이 대화에 남긴 읽던 자리. 만든 순서 그대로 온다. */
+  bookmarks?: SessionBookmark[];
 }
 
 export type ChatOriginKind = "workflow" | "schedule" | "aia" | "user";
@@ -692,6 +955,8 @@ export interface SessionMetaPatch {
   folderIds?: string[];
   /** 실행 계정 고정. null이면 고정을 해제해 이어가기 정책을 따른다. */
   pinnedAccountId?: string | null;
+  /** 읽던 자리 목록 통째 교체. 추가·이름변경·삭제 모두 새 목록을 보낸다. */
+  bookmarks?: SessionBookmark[];
 }
 
 /**
@@ -737,6 +1002,8 @@ export interface SessionSummary {
   isSubagent: boolean;
   /** AIA 전용 작업공간에서 오간 대화. 목록에서는 배지·필터로 구분한다. */
   aiaWorkspace: boolean;
+  /** 작업 경로 없이 시작해 앱의 기본 작업공간에서 오간 대화. 새 채팅의 프로젝트 후보에서 뺀다. */
+  defaultWorkspace?: boolean;
   archived: boolean;
   readable: boolean;
   sizeBytes: number | null;
@@ -789,9 +1056,347 @@ export interface ProjectRegistryEntry {
   exists: boolean;
 }
 
+/**
+ * 폴더를 만들기 전에 무엇이 생기는지(C6-4b). 확인 대화는 `creates`를 그대로 나열한다 —
+ * 승인한 목록과 실제로 생기는 것이 어긋나지 않게 만들기와 같은 함수가 계산한다.
+ */
+export interface DirectoryCreationPlan {
+  /** 이미 있는 가장 깊은 조상. 새 칸은 모두 이 아래에 생긴다. */
+  anchor: string;
+  /** 위에서부터 차례로 생길 절대 경로. 이미 있으면 빈 배열. */
+  creates: string[];
+  /** 만들기가 끝난 뒤의 최종 경로. */
+  target: string;
+  /** 이미 그 폴더가 있어 만들 것이 없는 상태. */
+  exists: boolean;
+}
+
 export interface SetProjectActiveRequest {
   path: string;
   active: boolean;
+}
+
+/**
+ * 프로젝트 화면(C17). 파일 탭은 등록 폴더의 `DocumentEntryPage`를 그대로 쓰고, 형상관리 탭은
+ * 아래 git 계약을 쓴다. 모든 요청의 `projectPath`는 활성·존재하는 등록 프로젝트여야 한다.
+ */
+export interface ProjectFileView {
+  projectPath: string;
+  relativePath: string;
+  kind: DocumentPreviewKind;
+  content: string | null;
+  sizeBytes: number;
+  modifiedAt: number;
+}
+
+export type GitUnavailableReason =
+  | "gitMissing"
+  | "gitTooOld"
+  | "notRepository"
+  | "bareRepository"
+  | "restrictedRepository";
+
+export interface GitHead {
+  branch: string | null;
+  detached: boolean;
+  /** 아직 커밋이 없는 저장소. */
+  unborn: boolean;
+  sha: string | null;
+  shortSha: string | null;
+}
+
+export interface GitUpstream {
+  name: string;
+  ahead: number;
+  behind: number;
+  /** 업스트림 브랜치가 원격에서 사라졌다. */
+  gone: boolean;
+}
+
+export interface GitBranch {
+  /** 로컬은 `main`, 원격은 `origin/main` 꼴. */
+  name: string;
+  sha: string;
+  isHead: boolean;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  gone: boolean;
+  committedAt: number;
+  subject: string;
+}
+
+export interface GitRemote {
+  name: string;
+  /** 사용자 정보(`user:token@`)는 가려져 온다. */
+  url: string | null;
+}
+
+export interface GitWorktree {
+  path: string;
+  head: string | null;
+  branch: string | null;
+  detached: boolean;
+  bare: boolean;
+  locked: boolean;
+  prunable: boolean;
+  isCurrent: boolean;
+}
+
+export type GitInProgressKind =
+  | "rebase"
+  | "rebaseInteractive"
+  | "am"
+  | "merge"
+  | "cherryPick"
+  | "revert"
+  | "bisect";
+
+export interface GitInProgress {
+  kind: GitInProgressKind;
+  headName: string | null;
+  onto: string | null;
+  step: number | null;
+  total: number | null;
+}
+
+export interface GitStash {
+  index: number;
+  sha: string;
+  message: string;
+  createdAt: number;
+}
+
+export interface GitRepositoryInfo {
+  /** 저장소 최상위. 프로젝트가 하위 폴더면 프로젝트 경로와 다르다. */
+  repositoryRoot: string;
+  gitDir: string;
+  isLinkedWorktree: boolean;
+  head: GitHead;
+  upstream: GitUpstream | null;
+  localBranches: GitBranch[];
+  remoteBranches: GitBranch[];
+  branchesTruncated: boolean;
+  remotes: GitRemote[];
+  worktrees: GitWorktree[];
+  inProgress: GitInProgress | null;
+  stashes: GitStash[];
+  stashesTruncated: boolean;
+  gitVersion: string;
+}
+
+export interface GitOverview {
+  projectPath: string;
+  repository: GitRepositoryInfo | null;
+  unavailableReason: GitUnavailableReason | null;
+  unavailableDetail: string | null;
+}
+
+export type GitChangeKind =
+  | "unmodified"
+  | "modified"
+  | "typeChanged"
+  | "added"
+  | "deleted"
+  | "renamed"
+  | "copied"
+  | "untracked"
+  | "ignored"
+  | "unmerged";
+
+export interface GitStatusEntry {
+  /** 저장소 루트 기준 경로. */
+  path: string;
+  originalPath: string | null;
+  indexStatus: GitChangeKind;
+  worktreeStatus: GitChangeKind;
+  isSubmodule: boolean;
+  /** 충돌 항목의 porcelain XY(`UU` 등). 충돌이 아니면 null. */
+  unmerged: string | null;
+  renameScore: number | null;
+}
+
+export interface GitStatus {
+  projectPath: string;
+  head: GitHead;
+  upstream: GitUpstream | null;
+  entries: GitStatusEntry[];
+  truncated: boolean;
+  conflictedCount: number;
+  stagedCount: number;
+  unstagedCount: number;
+  untrackedCount: number;
+}
+
+export type GitDiffKind = "text" | "binary" | "untracked" | "empty";
+
+export interface GitDiff {
+  projectPath: string;
+  path: string;
+  staged: boolean;
+  kind: GitDiffKind;
+  /** unified diff 원문. binary·untracked·empty면 빈 문자열. */
+  patch: string;
+  truncated: boolean;
+}
+
+export interface GitCommit {
+  sha: string;
+  shortSha: string;
+  parents: string[];
+  authorName: string;
+  authorEmail: string;
+  authoredAt: number;
+  committerName: string;
+  committedAt: number;
+  /** `HEAD -> main`, `origin/main`, `tag: v1` 같은 장식. */
+  refs: string[];
+  subject: string;
+  body: string;
+}
+
+export interface GitLog {
+  projectPath: string;
+  reference: string;
+  commits: GitCommit[];
+  hasMore: boolean;
+}
+
+export type GitOutcome =
+  | "completed"
+  | "nothingToCommit"
+  | "conflict"
+  | "blockedByLocalChanges"
+  | "notFastForward"
+  | "noUpstream"
+  | "rejectedNonFastForward"
+  | "authFailed"
+  | "identityMissing"
+  | "repositoryLocked"
+  | "busy"
+  | "timedOut"
+  | "failed";
+
+/** git 변경 한 건의 영수증. 충돌·거절은 오류가 아니라 `outcome`으로 온다(C17-6). */
+export interface GitActionReceipt {
+  action: string;
+  succeeded: boolean;
+  outcome: GitOutcome;
+  message: string;
+  headBefore: string | null;
+  headAfter: string | null;
+  conflictedFiles: string[];
+  blockedFiles: string[];
+  /** stash drop이 뺀 항목의 SHA. `git stash apply <sha>`로 복구한다. */
+  droppedStashSha: string | null;
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+  timedOut: boolean;
+}
+
+export interface ListProjectEntriesRequest {
+  projectPath: string;
+  parentPath?: string;
+  cursor?: string | null;
+  limit?: number;
+}
+
+export interface ReadProjectFileRequest {
+  projectPath: string;
+  relativePath: string;
+}
+
+export interface ProjectGitDiffRequest {
+  projectPath: string;
+  path: string;
+  originalPath?: string | null;
+  staged?: boolean;
+  /** 지정하면 그 커밋이 부모 대비 바꾼 내용. staged는 무시된다. */
+  commit?: string | null;
+}
+
+export interface ProjectGitCommitFilesRequest {
+  projectPath: string;
+  sha: string;
+}
+
+export interface GitCommitFile {
+  path: string;
+  originalPath: string | null;
+  status: GitChangeKind;
+}
+
+/** 커밋 하나가 바꾼 파일 목록. 병합 커밋은 모든 부모와 다른 파일만 나온다. */
+export interface GitCommitFiles {
+  projectPath: string;
+  sha: string;
+  files: GitCommitFile[];
+  truncated: boolean;
+}
+
+export interface ProjectGitLogRequest {
+  projectPath: string;
+  reference?: string | null;
+  limit?: number;
+  skip?: number;
+}
+
+export interface ProjectGitPathsRequest {
+  projectPath: string;
+  paths: string[];
+}
+
+export interface ProjectGitCommitRequest {
+  projectPath: string;
+  message: string;
+}
+
+export interface ProjectGitSwitchRequest {
+  projectPath: string;
+  branch: string;
+  create?: boolean;
+  startPoint?: string | null;
+}
+
+export type GitStashAction = "push" | "pop" | "apply" | "drop";
+
+export interface ProjectGitStashRequest {
+  projectPath: string;
+  action: GitStashAction;
+  message?: string | null;
+  includeUntracked?: boolean;
+  index?: number | null;
+  /** 개요에서 본 SHA. 목록이 밀려 다른 항목을 가리키면 백엔드가 거절한다. */
+  expectedSha?: string | null;
+}
+
+export type GitRebaseAction = "start" | "continue" | "skip" | "abort";
+
+export interface ProjectGitRebaseRequest {
+  projectPath: string;
+  action: GitRebaseAction;
+  onto?: string | null;
+}
+
+export interface ProjectGitFetchRequest {
+  projectPath: string;
+  remote?: string | null;
+  prune?: boolean;
+}
+
+export type GitPullMode = "ffOnly" | "rebase";
+
+export interface ProjectGitPullRequest {
+  projectPath: string;
+  mode?: GitPullMode;
+  remote?: string | null;
+}
+
+export interface ProjectGitPushRequest {
+  projectPath: string;
+  remote?: string | null;
+  setUpstream?: boolean;
 }
 
 export interface ModelOption {
@@ -805,6 +1410,7 @@ export interface SourceCounts {
   claude: number;
   codex: number;
   antigravity: number;
+  local: number;
 }
 
 export interface SourceTotals extends SourceCounts {
@@ -820,7 +1426,7 @@ export interface DashboardStats {
   agentCount: number;
   models: { model: string; count: number }[];
   topProjects: { name: string; path: string; count: number }[];
-  weekly: { weekStart: number; claude: number; codex: number; antigravity: number }[];
+  weekly: { weekStart: number; claude: number; codex: number; antigravity: number; local: number }[];
   recent: SessionSummary[];
 }
 
@@ -907,6 +1513,78 @@ export interface ClaudeSettingsSnapshot {
   skills: ClaudeSkillOverrideState[];
 }
 
+/**
+ * 공급자 CLI가 자기 서버로 보내는 사용정보 수집 스위치 하나(C13).
+ *
+ * 공급자마다 극성이 달라(Claude는 `DISABLE_*`를 켜야 꺼지고 Gemini는
+ * `usageStatisticsEnabled`를 꺼야 꺼진다) 계약은 "차단" 한 방향으로만 말한다.
+ */
+export interface TelemetryOptionState {
+  key: string;
+  /** 수집을 막고 있는지. null이면 설정 파일에 값이 없어 공급자 기본값을 따른다. */
+  blocked: boolean | null;
+  /** 토글을 움직여도 되는지. 해석하지 못하는 값이 이미 있으면 false다. */
+  editable: boolean;
+  /** 파일에 적혀 있는 값의 표기. */
+  current: string | null;
+  /** 편집을 막은 이유. editable이 false일 때만 채워진다. */
+  note: string | null;
+}
+
+export interface ProviderTelemetryFile {
+  provider: string;
+  path: string;
+  exists: boolean;
+  /** 파일을 안전하게 읽지 못한 이유. 있으면 그 공급자의 항목은 모두 잠긴다. */
+  parseError: string | null;
+  options: TelemetryOptionState[];
+}
+
+export interface ProviderTelemetrySnapshot {
+  files: ProviderTelemetryFile[];
+}
+
+export interface SetProviderTelemetryOptionRequest {
+  key: string;
+  /** true면 수집을 막는 값을 적고, false면 그 키를 지워 공급자 기본값으로 되돌린다. */
+  blocked: boolean;
+}
+
+/** 브랜치별 플러그인 사용 규칙 한 줄. branch는 정확한 이름이거나 `*`를 포함한 패턴이다. */
+export interface ClaudePluginBranchRule {
+  projectPath: string;
+  branch: string;
+  pluginId: string;
+  enabled: boolean;
+}
+
+export interface ClaudePluginBranchProject {
+  path: string;
+  /** detached HEAD이거나 git 저장소가 아니면 null. */
+  currentBranch: string | null;
+  /** 그 저장소의 로컬 브랜치 이름(사전순). git 저장소가 아니면 빈 배열이다. */
+  branches: string[];
+}
+
+export interface ClaudePluginBranchRulesSnapshot {
+  schemaVersion: number;
+  rules: ClaudePluginBranchRule[];
+  projects: ClaudePluginBranchProject[];
+}
+
+export interface SetClaudePluginBranchRuleRequest {
+  projectPath: string;
+  branch: string;
+  pluginId: string;
+  enabled: boolean;
+}
+
+export interface RemoveClaudePluginBranchRuleRequest {
+  projectPath: string;
+  branch: string;
+  pluginId: string;
+}
+
 export interface SetClaudePluginEnabledRequest {
   pluginId: string;
   scope: ClaudeSettingsWriteScope;
@@ -934,6 +1612,8 @@ export interface CommonSkillSource {
   contentDigest: string;
   fileCount: number;
   totalBytes: number;
+  /** 원본 내용을 마지막으로 고친 시각. 갈라진 사본의 방향을 가리는 기준이다. */
+  modifiedAtMs: number | null;
 }
 
 export interface CommonSkillDetail {
@@ -958,6 +1638,14 @@ export interface CommonSkillDigest {
  */
 export type SkillProviderStatus = "linked" | "copy" | "missing" | "unsupported";
 
+/**
+ * 갈라진 사본이 원본의 어느 쪽에 있는지.
+ * - `behind`: 사본이 원본보다 오래됐다. 원본을 다시 배포하면 맞는다.
+ * - `edited`: 사본이 원본보다 나중에 고쳐졌다. 채택할지 버릴지 정해야 한다.
+ * - `unknown`: 한쪽 수정 시각을 읽지 못해 방향을 가릴 수 없다.
+ */
+export type SkillDivergence = "behind" | "edited" | "unknown";
+
 /** 한 에이전트의 위치별 설치본. 개인 루트와 각 프로젝트를 구분한다. */
 export interface SkillInstallView {
   scope: string;
@@ -967,6 +1655,9 @@ export interface SkillInstallView {
   directory: string;
   contentDigest: string | null;
   divergent: boolean;
+  /** 갈라졌다면 어느 방향인지. 원본과 같으면 null. */
+  divergence: SkillDivergence | null;
+  modifiedAtMs: number | null;
   readOnly: boolean;
 }
 
@@ -1002,6 +1693,9 @@ export interface SkillProviderState {
   readOnly: boolean;
   contentDigest: string | null;
   divergent: boolean;
+  /** 갈라졌다면 어느 방향인지. 원본과 같으면 null. */
+  divergence: SkillDivergence | null;
+  modifiedAtMs: number | null;
   note: string | null;
   installs: SkillInstallView[];
 }
@@ -1160,21 +1854,6 @@ export interface SkillTrashRestoreReceipt {
   results: SkillTrashRestoreResult[];
 }
 
-export interface SkillDeleteImpactItem {
-  path: string;
-  kind: SkillTrashItemKind;
-  provider: ProviderId | null;
-  scope: string | null;
-}
-
-export interface SkillDeleteImpact {
-  key: string;
-  /** 공유 저장소에 같은 키가 있는지. 설치본만 지우면 원본과 다른 배포본은 남는다. */
-  shared: boolean;
-  items: SkillDeleteImpactItem[];
-  warnings: string[];
-}
-
 export interface SkillDeleteReceipt {
   key: string;
   groupId: string;
@@ -1239,16 +1918,6 @@ export interface SkillMigrationPlan {
   aiaPrompt: string;
 }
 
-export interface SaveSkillPlatformVariantRequest {
-  key: string;
-  targetPlatform: HostPlatform;
-  sourcePlatform?: HostPlatform | null;
-  files: SkillFileWrite[];
-  /** 대상 OS에서 base 원본으로부터 제외할 파일 또는 디렉터리 경로. */
-  deletes?: string[];
-  expectedDigest: string;
-}
-
 export interface SetSkillPlatformsRequest {
   key: string;
   /** 빈 배열이면 모든 OS에서 사용하는 portable base다. */
@@ -1269,13 +1938,6 @@ export interface SetResourceRepositoryRequest {
   /** null 또는 빈 문자열이면 앱 데이터 내부 기본 저장소로 되돌린다. */
   rootPath?: string | null;
   migrateExisting?: boolean;
-}
-
-export interface ResourcePlatformManifest {
-  schemaVersion: number;
-  platforms: HostPlatform[];
-  variants: Partial<Record<HostPlatform, string>>;
-  variantDeletes: Partial<Record<HostPlatform, string[]>>;
 }
 
 export type InstructionPublishOutcome = "published" | "replaced" | "unchanged" | "skipped" | "failed";
@@ -1449,14 +2111,6 @@ export interface ProjectInstructionFileContent {
   provider: ProviderId;
   sourceVariant: HostPlatform | null;
   content: string;
-}
-
-export interface SaveProjectInstructionPlatformVariantRequest {
-  key: string;
-  targetPlatform: HostPlatform;
-  sourcePlatform?: HostPlatform | null;
-  files: InstructionProviderFileWrite[];
-  expectedDigest: string;
 }
 
 export interface SetProjectInstructionPlatformsRequest {
@@ -1700,9 +2354,22 @@ export interface TerminalAccountLoginRequest {
   rows: number;
 }
 
+/** 저장된 SSH 연결 서버로 사용자가 직접 붙는 대화형 터미널. 호스트 화면에서만 열린다. */
+/** C9-20. 같은 서버로 여는 대화형 창의 두 갈래. */
+export type TerminalSshMode = "shell" | "installKey";
+
+export interface TerminalSshRequest {
+  fingerprint: string;
+  cols: number;
+  rows: number;
+  /** 적지 않으면 지금까지처럼 원격 셸이다. */
+  mode?: TerminalSshMode;
+}
+
 export interface TerminalSessionInfo {
   terminalId: string;
-  source: ProviderId;
+  /** 공급자 CLI 터미널의 공급자. SSH 대화형 터미널은 공급자가 없어 null이다. */
+  source: ProviderId | null;
   sessionId: string;
   state: TerminalPhase;
   reconnectDeadline: number | null;
@@ -1720,7 +2387,7 @@ export type ChatMode = "plan" | "workspace" | "fullAccess" | "auto" | "dontAsk" 
 export type ChatApprovalMode = "manual" | "autoReview" | "granular" | "onFailure" | "never";
 export type ChatProfile = "standard" | "aia";
 export type ChatPhase = "ready" | "running" | "waitingApproval" | "stopped" | "failed";
-export type ChatApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
+export type ChatApprovalDecision = "accept" | "acceptForSession" | "acceptAll" | "decline" | "cancel";
 /** 내장 추론 수준 이름. 표시 문구를 붙일 때만 쓴다. */
 export type KnownReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 /**
@@ -1762,9 +2429,24 @@ export interface ChatSettingField {
   defaultValue?: string | null;
 }
 
+/** 로컬 LLM 연결 하나의 모델 선택지(M7). 모델 고르기에서 연결이 먼저 선택된다. */
+export interface LocalConnectionOptions {
+  id: string;
+  label: string;
+  isDefault: boolean;
+  enabled: boolean;
+  baseUrl: string;
+  defaultModel: string;
+  models: ChatModelCatalogOption[];
+  /** 서버에 닿지 못했거나 목록이 비었을 때의 사유. 꺼진 연결은 묻지 않아 null. */
+  catalogError: string | null;
+}
+
 export interface ChatProviderOptions {
   source: ProviderId;
   models: ChatModelCatalogOption[];
+  /** 로컬 공급자의 연결별 모델 목록. `models`는 기본 연결의 것. 다른 공급자는 생략된다. */
+  localConnections?: LocalConnectionOptions[];
   supportedReasoningEfforts: ChatReasoningOption[];
   defaultReasoningEffort: ReasoningEffort | null;
   catalogError: string | null;
@@ -1783,6 +2465,8 @@ export interface ChatStartRequest {
   accountId?: string | null;
   cwd: string;
   model: string | null;
+  /** 로컬 공급자가 쓸 서빙 연결 id(M7). 없으면 기본 연결. 다른 공급자는 무시한다. */
+  localConnectionId?: string | null;
   reasoningEffort?: ReasoningEffort | null;
   mode: ChatMode;
   approvalMode: ChatApprovalMode;
@@ -1799,6 +2483,16 @@ export interface ChatStartRequest {
   settings?: Record<string, string>;
 }
 
+/**
+ * 지금 앱을 끄면 무엇이 끊기는지. 종료 확인 창이 이 수치로 묻는다. 화면 목록과 달리
+ * 무인 실행까지 포함하므로, 보이지 않는 곳에서 도는 회차가 있는지도 여기서만 보인다.
+ */
+export interface ShutdownImpact {
+  liveRuntimeCount: number;
+  unattendedCount: number;
+  activeTurnCount: number;
+}
+
 export interface ChatSessionInfo {
   chatId: string;
   startedAt: number;
@@ -1808,9 +2502,16 @@ export interface ChatSessionInfo {
   providerSessionId: string | null;
   cwd: string;
   model: string | null;
+  /** 로컬 공급자 실행이 쓰는 서빙 연결 id. 다른 공급자는 null. */
+  localConnectionId: string | null;
   reasoningEffort: ReasoningEffort | null;
   mode: ChatMode;
   approvalMode: ChatApprovalMode;
+  /**
+   * 계획 검토 카드에서 "전체 허용(정책 제외)"을 골라, 계획 변경·되묻기 외의 권한 요청을
+   * 앱이 자동 승인하는 실행인지. 옛 백엔드 스냅숏에는 없을 수 있다.
+   */
+  planAutoApproval?: boolean;
   state: ChatPhase;
   turnCount: number;
   lastTurnStatus: string | null;
@@ -1828,7 +2529,7 @@ export interface ChatSessionInfo {
   /**
    * 이 AIA 대화가 시작할 때 적용한 시스템 에이전트 실행설정. AIA 프로필에서만 오고,
    * 실행설정을 실을 줄 모르는 이전 버전 백엔드에서는 없다. 저장본과 달라졌으면 화면이
-   * 대화를 정지하고 새 설정으로 다시 시작한다.
+   * 다음 요청을 보낼 때 대화를 정지하고 새 설정으로 다시 시작한다.
    */
   aiaRuntime?: AiaRuntimeSettings | null;
   /** 마지막 턴 요청 기준 컨텍스트 사용량 추정(토큰). 공급자 압축 직후에는 null. */
@@ -1883,9 +2584,13 @@ export type ChatEvent =
   | { type: "messageDelta"; id: string; role: string; kind: string; delta: string }
   | { type: "userInput"; id: string; text: string; attachments: ChatInputFile[] }
   | { type: "tool"; id: string; name: string; status: string; detail: string | null; output: string | null; append: boolean }
-  | { type: "approval"; id: string; kind: string; title: string; detail: string | null; options: ChatApprovalDecision[]; interactive: boolean; questions?: ChatApprovalQuestion[] }
-  /** `answers`는 질문 카드에 실제로 실어 보낸 답(질문 원문 -> 답). 답이 없으면 오지 않는다. */
-  | { type: "approvalResolved"; id: string; decision: ChatApprovalDecision; answers?: Record<string, string> }
+  | { type: "approval"; id: string; kind: string; title: string; detail: string | null; options: ChatApprovalDecision[]; interactive: boolean; questions?: ChatApprovalQuestion[]; needsSecret?: boolean }
+  /**
+   * `answers`는 질문 카드에 실제로 실어 보낸 답(질문 원문 -> 답). 답이 없으면 오지 않는다.
+   * `note`는 사용자가 고른 결정이 아니라 앱이 카드를 닫았을 때(승인 시간 초과) 그 사정이며,
+   * 화면은 결정 문구 대신 이 줄을 남긴다.
+   */
+  | { type: "approvalResolved"; id: string; decision: ChatApprovalDecision; answers?: Record<string, string>; note?: string }
   /**
    * AIA가 show_ui_guide로 요청한 화면 안내. 이 대화를 보고 있는 화면이 대상 화면·탭을 열고
    * 요소를 화살표로 가리킨다. 표시용 일회성 이벤트라 백엔드가 리플레이하지 않는다.
@@ -1897,7 +2602,7 @@ export type ChatEvent =
    */
   | { type: "uiQuery"; id: string; query: string; view: string | null; tab: string | null }
   /**
-   * AIA가 open_ui_element·click_ui_element로 요소를 눌러 달라고 한다. 화면은 아이아 커서를
+   * AIA가 open_ui_element·click_ui_element로 요소를 눌러 달라고 한다. 화면은 AIA 커서를
    * 움직여 클릭하고 answer_ui_query로 `{clicked, reason?}`를 답한다. `mode`가 open이면 화면을
    * 여는 버튼(탭·메뉴·드로워/패널)만 누른다.
    */
@@ -1923,8 +2628,11 @@ export type ChatEvent =
  */
 export type ChatRejectionCode = "chatMissing" | "invalid" | "unavailable" | "sessionBusy";
 
-/** accountSwitch는 채팅에 묶이지 않은 유일한 종류다. chatId·cwd가 비어 있고 설정의 계정 탭으로 연다. */
-export type ChatAttentionKind = "running" | "approval" | "completed" | "failed" | "accountSwitch";
+/**
+ * accountSwitch와 pacingSuggestion은 채팅에 묶이지 않는 두 종류다. chatId·cwd가 비어 있고,
+ * 각각 설정의 연결 탭과 워크플로 페이싱 탭으로 연다.
+ */
+export type ChatAttentionKind = "running" | "approval" | "completed" | "failed" | "accountSwitch" | "pacingSuggestion";
 
 /** 알림을 말풍선으로 띄울 때 쓰는 대화 미리보기. 앞부분만 담기며 뒤는 잘려 있다. */
 export interface ChatAttentionPreview {
@@ -2069,6 +2777,8 @@ export interface ScheduledRequestInput {
   useActiveAccount: boolean;
   cwd: string;
   model: string | null;
+  /** 로컬 공급자가 쓸 서빙 연결 id(M7). 없으면 기본 연결. */
+  localConnectionId?: string | null;
   reasoningEffort: ReasoningEffort | null;
   mode: ChatMode;
   approvalMode: ChatApprovalMode;
@@ -2182,35 +2892,6 @@ export interface BackgroundSettings {
   loginStart: boolean;
 }
 
-export type RemoteAccessPhase =
-  | "disabled"
-  | "starting"
-  | "running"
-  | "tailscaleUnavailable"
-  | "conflict"
-  | "error";
-
-export interface RemoteAccessStatus {
-  phase: RemoteAccessPhase;
-  enabled: boolean;
-  configuredPort: number;
-  activePort: number | null;
-  url: string | null;
-  login: string | null;
-  listenerActive: boolean;
-  serveConfigured: boolean;
-  serveTarget: string | null;
-  conflictTarget: string | null;
-  error: string | null;
-}
-
-export interface RemoteAccessSettingsInput {
-  enabled: boolean;
-  port: number;
-  fullAccessAcknowledged: boolean;
-  replaceExistingServe: boolean;
-}
-
 export interface ManagerSnapshot {
   schemaVersion: number;
   sessionCatalogRevision: number;
@@ -2226,6 +2907,32 @@ export interface ManagerSnapshot {
   pendingProjects: ProjectRegistryEntry[];
 }
 
+/** 세션 하나를 가리키는 키. 델타가 목록에서 빠진 세션을 알릴 때 쓴다. */
+export interface SessionRef {
+  source: ProviderId;
+  id: string;
+}
+
+/**
+ * 관리 스냅숏의 변경분. 세션 목록만 바뀐 것으로 줄이고 나머지는 전체와 같다.
+ * 세션 2,500건 규모에서 전체는 3.4MB이고 그중 3.1MB가 세션 목록인데, 조정 한 회차에서
+ * 실제로 달라지는 세션은 대개 한두 건이다.
+ */
+export type ManagerSnapshotDelta = Omit<ManagerSnapshot, "sessions"> & {
+  /** 요청한 개정 이후 새로 생기거나 내용이 달라진 세션. */
+  changedSessions: SessionSummary[];
+  /** 요청한 개정 이후 목록에서 사라진 세션. */
+  removedSessions: SessionRef[];
+};
+
+/**
+ * 화면이 스냅숏을 따라잡는 두 가지 방법. 백엔드 변경 이력이 화면이 들고 있는 개정을 덮지
+ * 못하면(첫 기동, 오래 끊겼던 창) 델타 대신 전체가 온다.
+ */
+export type ManagerSnapshotSync =
+  | ({ kind: "full" } & ManagerSnapshot)
+  | ({ kind: "delta" } & ManagerSnapshotDelta);
+
 export interface TranslationMenuSettings {
   skills: boolean;
   agents: boolean;
@@ -2240,6 +2947,8 @@ export interface TranslationMenuSettings {
  */
 export interface SystemAgentRuntime {
   model?: string | null;
+  /** 로컬 공급자일 때 쓸 서빙 연결 id(M7). 없으면 기본 연결. */
+  localConnectionId?: string | null;
   reasoningEffort?: ReasoningEffort | null;
   mode?: ChatMode | null;
   approvalMode?: ChatApprovalMode | null;
@@ -2249,24 +2958,186 @@ export interface SystemAgentRuntime {
 }
 
 /**
+ * 애드온 → 자동화 탭의 온보딩 카드 한 벌(W6). 백엔드 `aia_onboarding.rs`가 번들 기본
+ * 팩과 공통 스킬 저장소의 팩을 검증해 내주는 구조를 그대로 받는다. 화면은 이 데이터만
+ * 보고 카드를 그리므로, 카드를 더하는 일이 화면 코드를 고치는 일이 아니다.
+ */
+export interface LocalizedText {
+  ko: string;
+  /** 없으면 한국어 문구를 그대로 쓴다. */
+  en: string | null;
+}
+
+export type AiaOnboardingIcon =
+  | "building2" | "calendarClock" | "flaskConical" | "folderTree" | "gitBranch"
+  | "listChecks" | "notebookPen" | "route" | "sparkles" | "target" | "workflow";
+
+/** 뒤 네 가지는 앱이 목록을 채우는 칸이다(W6-3). */
+export type AiaOnboardingFieldKind =
+  | "text" | "textarea" | "number" | "select" | "multiSelect" | "toggle"
+  | "projectPicker" | "docRootPicker" | "recordTargetPicker" | "cypressWorkspacePicker"
+  | "cypressEnvKeyPicker" | "branchPicker";
+
+export interface AiaOnboardingCondition {
+  field: string;
+  equals: string;
+}
+
+export interface AiaOnboardingOption {
+  value: string;
+  label: LocalizedText;
+}
+
+export interface AiaOnboardingField {
+  key: string;
+  label: LocalizedText;
+  kind: AiaOnboardingFieldKind;
+  required: boolean;
+  wide: boolean;
+  placeholder: LocalizedText | null;
+  help: LocalizedText | null;
+  defaultValue: string | null;
+  options: AiaOnboardingOption[];
+  min: number | null;
+  max: number | null;
+  visibleWhen: AiaOnboardingCondition | null;
+  /** 목록에 없는 값을 직접 적을 수 있는지. 고르는 칸에만 쓴다. */
+  allowOther: boolean;
+}
+
+export interface AiaOnboardingStep {
+  id: string;
+  title: LocalizedText;
+  hint: LocalizedText | null;
+  fields: AiaOnboardingField[];
+}
+
+/** 카드가 본뜨는 절차를 보여 주는 참고 상자. 값을 받지 않는다. */
+export interface AiaOnboardingTemplate {
+  key: string;
+  title: LocalizedText;
+  meta: LocalizedText | null;
+  steps: LocalizedText[];
+}
+
+export interface AiaOnboardingWorkflowTemplate {
+  id: string;
+  displayName: string;
+  description: string;
+  message: string;
+  projectPathField: string;
+  requiredSkills: string[];
+  /**
+   * 이 회차가 따를 절차의 원본(번들 절차 스킬 키). 만들기 때 그 본문이 **이 워크플로
+   * 전용 공통 스킬**로 복사되고 계약이 그것을 requiredSkills로 건다. 온보딩은 프로젝트마다
+   * 다시 도므로 절차도 프로젝트마다 따로 있어야 한다.
+   */
+  procedure: string | null;
+  /**
+   * 이 회차가 여러 건 동시에 돌 수 있는지(W6-8). 팩은 이 한 줄만 적고, 병렬 실행 입력
+   * 묶음과 지시문의 레인 서문은 앱이 만든다.
+   */
+  parallel: boolean;
+}
+
+export interface AiaOnboardingScheduleTemplate {
+  name: string;
+  enabled: boolean;
+}
+
+/** 산출물 종류는 닫힌 목록이고, 각각 이미 등록된 변경 작업 하나로 내려간다(W6-1). */
+export type AiaOnboardingAction =
+  | { kind: "createDirectory"; label: LocalizedText; path: string; when: AiaOnboardingCondition | null }
+  | { kind: "registerWorkflow"; label: LocalizedText; workflow: AiaOnboardingWorkflowTemplate; when: AiaOnboardingCondition | null }
+  | { kind: "createScheduledRequest"; label: LocalizedText; schedule: AiaOnboardingScheduleTemplate; when: AiaOnboardingCondition | null };
+
+export interface AiaOnboardingCard {
+  id: string;
+  icon: AiaOnboardingIcon;
+  title: LocalizedText;
+  /** 접힌 카드에 보이는 한 줄. 시작하기 전에는 제목과 이것, 시작 버튼만 보인다. */
+  summary: LocalizedText;
+  description: LocalizedText | null;
+  badge: LocalizedText | null;
+  enabled: boolean;
+  templates: AiaOnboardingTemplate[];
+  steps: AiaOnboardingStep[];
+  actions: AiaOnboardingAction[];
+  previewOnly: boolean;
+}
+
+export type AiaOnboardingPackSource = "bundled" | "commonSkill";
+
+export interface AiaOnboardingCardView extends AiaOnboardingCard {
+  source: AiaOnboardingPackSource;
+  packId: string;
+  /** 공통 스킬 팩이면 그 스킬 키. 삭제는 이 스킬을 휴지통으로 옮기는 것이다. */
+  skillKey: string | null;
+  /** 같은 팩의 카드 수. 1보다 크면 삭제가 이웃 카드까지 가져간다. */
+  packCardCount: number;
+}
+
+export interface AiaOnboardingPackSummary {
+  packId: string;
+  version: string;
+  displayName: string;
+  source: AiaOnboardingPackSource;
+  skillKey: string | null;
+  cardCount: number;
+}
+
+export interface AiaOnboardingCatalogIssue {
+  skillKey: string;
+  message: string;
+}
+
+export interface AiaOnboardingTemplateFile {
+  path: string;
+  content: string;
+}
+
+/** 온보딩이 등록한 회차가 따르는 절차 스킬. 앱이 들고 있다가 공통 스킬로 설치한다. */
+export interface AiaOnboardingSkillTemplate {
+  key: string;
+  name: string;
+  description: string;
+  files: AiaOnboardingTemplateFile[];
+  installed: boolean;
+}
+
+export interface AiaOnboardingCatalog {
+  packs: AiaOnboardingPackSummary[];
+  cards: AiaOnboardingCardView[];
+  issues: AiaOnboardingCatalogIssue[];
+  /** 회차 절차 스킬. 계약이 requiredSkills로 거는 키가 여기 있으면 만들기 전에 설치한다. */
+  skills: AiaOnboardingSkillTemplate[];
+  /** 팩 파일이 있어야 할 스킬 안의 자리. 화면 안내와 AIA 설명이 어긋나지 않게 쓴다. */
+  manifestRelative: string;
+  /** 공통 스킬 저장소의 스킬 루트. 회차 지시문이 절차 스킬의 절대 경로를 싣는 데 쓴다. */
+  skillsRoot: string;
+}
+
+/**
  * AIA 시작에 실제로 쓰이는 실행설정. 비워 둔 항목이 AIA 기본값으로 채워진 뒤의 값이며,
  * `model`·`reasoningEffort`의 `null`은 "공급자 기본값"이라는 뜻이다.
  * 백엔드 `AiaRuntimeSettings`와 같은 구조다.
  */
 export interface AiaRuntimeSettings {
   model: string | null;
+  /** 로컬 공급자일 때 쓸 서빙 연결 id(M7). null 은 기본 연결. */
+  localConnectionId: string | null;
   reasoningEffort: ReasoningEffort | null;
   mode: ChatMode;
   approvalMode: ChatApprovalMode;
   /** 권한 승인 밖의 선택을 사용자에게 물을지, 추천안으로 자동 진행할지. */
   decisionPolicy: AiaDecisionPolicy;
-  /** 아이아 커서가 승인 없이 누를 수 있는 범위. */
+  /** AIA 커서가 승인 없이 누를 수 있는 범위. */
   uiClickPolicy: AiaUiClickPolicy;
   settings: Record<string, string>;
 }
 
 /**
- * 아이아 커서 클릭(open_ui_element)이 승인 없이 누를 수 있는 범위. `openers`는 탭·주 메뉴·
+ * AIA 커서 클릭(open_ui_element)이 승인 없이 누를 수 있는 범위. `openers`는 탭·주 메뉴·
  * 드로워/패널 여닫기처럼 화면을 여는 버튼만, `all`은 확인 모달 안을 뺀 어떤 버튼이든.
  * 백엔드 `AiaUiClickPolicy`와 같은 값이어야 한다.
  */
@@ -2288,6 +3159,22 @@ export interface SystemAutomationSettings {
   systemAgentRuntimes: Partial<Record<ProviderId, SystemAgentRuntime>>;
   /** CLI 업데이트로 모델·추론 카탈로그가 오래되면 AIA에게 재조사를 자동 요청할지. */
   catalogAutoDiscovery: boolean;
+  /**
+   * AIA와 나눈 대화를 공급자 기록으로 남길지. 끄면 Codex AIA 세션이 ephemeral로 떠서
+   * rollout도 세션 색인도 남지 않아 세션 목록에서 볼 수 없다. CLI를 띄울 때 정해지므로
+   * 바꿔도 돌던 대화는 그대로고 다음 대화부터 적용된다.
+   */
+  aiaSessionRecording: boolean;
+  /**
+   * AIA 선제 제안 팩을 쓸지. 끄면 제안 팩이 만들어 내는 제안 카드와 트리거 말풍선이 뜨지
+   * 않는다. 공통 스킬에 설치한 팩과 스킬 보관함의 관리 화면은 그대로 남는다.
+   */
+  aiaSuggestions: boolean;
+  /**
+   * 사용자가 끈 온보딩 카드의 id(W6-7). 번들 기본 팩의 카드는 지울 파일이 없어 여기에
+   * 담아 감추고, 공통 스킬로 설치한 팩은 그 스킬을 휴지통으로 옮겨 지운다.
+   */
+  hiddenOnboardingCards: string[];
 }
 
 export type SystemAutomationSettingsInput = SystemAutomationSettings;
@@ -2544,6 +3431,24 @@ export interface UsageBudgetConsumer {
   } | null;
   /** 이 회차와 같은 계정 범위를 공유하는 활성 회차 그룹의 처리량. 구형 백엔드는 필드 없음. */
   throughput?: UsageBudgetThroughput | null;
+  /**
+   * 스프린트. 켜면 참여 계정이 계획 창 목표·직선 페이싱을 무시하고 가드 창이 허락하는 만큼 몰아
+   * 돌며 리셋을 기다리지 않는다. 구형 백엔드는 필드 없음.
+   */
+  sprint?: boolean;
+  /** 완료조건 문구. 없으면 회차는 끝나지 않는다. */
+  completionCondition?: string | null;
+  /**
+   * 완료조건 사용 여부. 꺼져 있으면 문구가 남아 있어도 적용하지 않는다(기동 메시지에 붙지 않고
+   * 완료 판정도 하지 않는다). 구형 백엔드는 필드 없음 — 그때는 문구가 있으면 곧 적용이었다.
+   */
+  completionConditionEnabled?: boolean;
+  /** 이 회차로 정상 완료한 무인 실행의 누적 건수("다시 시작"이 0으로 되돌림). */
+  completedRuns?: number;
+  /** 완료조건이 충족된 시각. 있으면 회차는 완료 상태라 예약 기동을 받지 않는다. */
+  completedAt?: number | null;
+  /** 실행 에이전트가 표식 뒤에 적은 완료 근거. */
+  completionNote?: string | null;
 }
 
 /**
@@ -2627,6 +3532,111 @@ export interface SetUsageBudgetConsumerRequest {
    * 널을 넣지 않는다.
    */
   spendProfile?: SpendProfile | null;
+  /** 스프린트 on/off. 생략하면 유지. */
+  sprint?: boolean | null;
+  /**
+   * 완료조건 문구. 칸을 빼면 유지, `null`이나 빈 문자열이면 해제(완료 상태도 함께 지워진다).
+   * 스프린트와 마찬가지로 "그대로"를 뜻할 때 널을 넣지 않는다.
+   */
+  completionCondition?: string | null;
+  /**
+   * 완료조건 사용 on/off. 칸을 빼면 유지. 끄면 문구는 남기고 적용만 멈추며, 적용하지 않는
+   * 조건이 회차를 멈춰 두지 않도록 완료 상태도 함께 지워진다.
+   */
+  completionConditionEnabled?: boolean | null;
+  /** 참이면 완료 상태와 누적 건수를 지우고 다시 진행중으로 돌린다(조건 문구는 유지). */
+  resetCompletion?: boolean | null;
+}
+
+/** 회차 목표의 상태(M10). 설계는 AIA 가, 나머지 전이는 사용자와 회차가 옮긴다. */
+export type RoundGoalStatus = "draft" | "designing" | "active" | "paused" | "done";
+
+/** 사용자가 적는 회차 목표. 설계 산출물(스킬·워크플로·반복 요청)은 AIA 가 등록한 뒤 붙는다. */
+export interface RoundGoal {
+  id: string;
+  title: string;
+  goal: string;
+  targetPath: string;
+  verification: string;
+  cadence: string;
+  status: RoundGoalStatus;
+  skillKey?: string | null;
+  workflowId?: string | null;
+  scheduleId?: string | null;
+  notes: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface RoundGoalInput {
+  title: string;
+  goal: string;
+  targetPath: string;
+  verification: string;
+  cadence: string;
+}
+
+/** 부분 갱신. 없는 칸은 그대로, null 은 지운다. */
+export interface RoundGoalPatch {
+  title?: string;
+  goal?: string;
+  targetPath?: string;
+  verification?: string;
+  cadence?: string;
+  status?: RoundGoalStatus;
+  skillKey?: string | null;
+  workflowId?: string | null;
+  scheduleId?: string | null;
+  notes?: string;
+}
+
+export interface RoundMeasure {
+  label: string;
+  before: string;
+  after: string;
+}
+
+export interface RoundFailureKind {
+  kind: string;
+  before: number;
+  after: number;
+}
+
+export interface RoundDecision {
+  question: string;
+  options: string[];
+  recommendation?: string | null;
+  /** 사용자가 적은 답. 없으면 대기 중. */
+  resolved?: string | null;
+}
+
+export type RoundOutcome = "pass" | "partial" | "fail";
+
+/** 회차가 끝날 때 남기는 구조화된 보고. 화면의 회차 이력과 결정 대기가 이것으로 선다. */
+export interface RoundReport {
+  id: string;
+  goalId?: string | null;
+  scheduleId?: string | null;
+  runId?: string | null;
+  sessionId?: string | null;
+  source?: string | null;
+  title: string;
+  outcome: RoundOutcome;
+  summary: string;
+  measures: RoundMeasure[];
+  failureKinds: RoundFailureKind[];
+  fixes: string[];
+  commits: string[];
+  reverted: string[];
+  decisions: RoundDecision[];
+  next: string[];
+  recordedAt: number;
+}
+
+export interface RoundReportQuery {
+  goalId?: string | null;
+  pendingDecisions?: boolean;
+  limit?: number;
 }
 
 export interface SystemAutomationSnapshot {
@@ -2796,9 +3806,32 @@ export interface SystemWorkflowStep {
   id: string;
   operation: string;
   arguments: unknown;
-  forEach: { step: string; path?: string; maxIterations: number } | null;
+  /** 앞 단계 결과를 도는 `step`과 계약이 적은 목록을 도는 `items` 중 하나만 쓴다. */
+  forEach: { step?: string | null; path?: string; items?: unknown[] | null; maxIterations: number } | null;
   condition: unknown | null;
   expect: unknown | null;
+}
+
+/** 세 공급자에 공통으로 적용. 미지정 항목은 단계의 원래 실행설정을 유지한다. */
+export interface WorkflowChatRuntime {
+  mode?: "plan" | "workspace" | "fullAccess" | null;
+  approvalMode?: "manual" | "never" | null;
+  decisionPolicy?: AiaDecisionPolicy | null;
+}
+
+export interface SystemWorkflowProposal {
+  valid: boolean;
+  contract: SystemWorkflowContract;
+  computedRisk: WorkflowRisk;
+  requiredOperations: string[];
+  approvalSummary: {
+    name: string;
+    purpose: string;
+    mutatingOperations: string[];
+    hardToRecoverEffects: string[];
+    grantsAfterRegistration: string;
+    chatRuntime?: WorkflowChatRuntime | null;
+  };
 }
 
 export interface SystemWorkflowContract {
@@ -2811,6 +3844,13 @@ export interface SystemWorkflowContract {
   version: number | null;
   /** 페이싱 회차 계약. 스케줄러가 회차 봉투를 두르고 계약은 한 건의 작업만 기술한다. */
   paced?: boolean;
+  chatRuntime?: WorkflowChatRuntime | null;
+  /**
+   * 이 계약이 따르게 하는 보관 스킬의 키. 실제 호출은 단계가 아니라 무인 런타임에 보내는
+   * 지시문이 하므로 계약 단위로 선언한다. 계약과 스킬을 함께 옮길 수 있게 하는 의존성
+   * 표시이지 실행 경로가 아니다.
+   */
+  requiredSkills?: string[];
 }
 
 /**
@@ -2834,6 +3874,8 @@ export interface SystemWorkflowVersion {
   registeredAt: number;
   computedRisk: WorkflowRisk;
   requiredOperations: string[];
+  /** 그 버전의 계약 본문. 버전 사이의 차이를 화면이 직접 낸다. 구형 백엔드 응답에는 없다. */
+  contract?: SystemWorkflowContract | null;
 }
 
 /** `get_system_workflows`의 목록 항목. 계약 본문은 상세 조회에서만 온다. */
@@ -2859,6 +3901,10 @@ export interface SystemWorkflowSummary {
   pacingMode?: WorkflowPacingMode | null;
   /** 최신 버전이 페이싱 회차 계약인지. */
   paced?: boolean;
+  /** 계약이 선언한 보관 스킬. 구형 백엔드 응답에는 없다. */
+  requiredSkills?: string[];
+  /** 선언한 스킬 가운데 이 장치의 공통 저장소에 없는 것. 계약만 오고 절차가 오지 않은 상태다. */
+  missingSkills?: string[];
 }
 
 /** 워크플로 하나의 페이싱 설정(참여 계정)을 바꾼다. 응답은 갱신된 워크플로 목록. */
@@ -2990,7 +4036,9 @@ export interface CatalogHealth {
 
 // ---- Cypress 자동화 작업공간 (설정 → 자동화) ----
 
-export type CypressRunState = "running" | "passed" | "failed" | "timedOut" | "error";
+/** `closed`는 런처를 띄운 수동 실행이 사람 손으로 닫혀 끝난 상태다(통과·실패 판정이 없다). */
+export type CypressRunState = "running" | "passed" | "failed" | "timedOut" | "error" | "closed";
+export type CypressExecutionType = "standard" | "agentManagerIsolated";
 
 export interface CypressWorkspace {
   id: string;
@@ -2998,8 +4046,12 @@ export interface CypressWorkspace {
   path: string;
   /** 사용자가 따로 지정한 Cypress 모듈 위치. null이면 작업공간 안에 설치한다. */
   moduleDir: string | null;
-  /** 앱이 만든 기본 작업공간. 제거할 수 없다. */
-  builtin: boolean;
+  /** 일반 Cypress 또는 Agent Manager 전용 격리 E2E 생명주기. */
+  executionType: CypressExecutionType;
+  /** 실행 장면을 영상으로 남긴다. 산출물이 커지고 실행도 느려져 기본은 꺼져 있다. */
+  recordVideo: boolean;
+  /** 브라우저 창을 띄운 채 실행한다. 화면이 있는 호스트에서만 보인다. */
+  headed: boolean;
   createdAt: number;
   moduleReady: boolean;
   cypressVersion: string | null;
@@ -3016,6 +4068,16 @@ export interface CypressWorkspaceFile {
   sizeBytes: number;
   /** cypress.env.json처럼 비밀정보를 담는 파일. */
   sensitive: boolean;
+}
+
+/**
+ * 파일 목록과 그것이 온전한지. `truncated`면 `limit`에서 끊긴 것이고, 목록 밖 파일도 경로를
+ * 직접 대면 읽고 쓸 수 있다. 예전에는 상한을 넘으면 오류였고 목록이 통째로 사라졌다.
+ */
+export interface CypressWorkspaceFileList {
+  files: CypressWorkspaceFile[];
+  truncated: boolean;
+  limit: number;
 }
 
 export interface CypressWorkspaceFileContent {
@@ -3054,9 +4116,13 @@ export interface CypressRunArtifact {
   content: string | null;
 }
 
+/** 실행 갈래. `open`은 사람이 런처에서 스펙을 고르고 단계별로 진행하는 수동 실행이다. */
+export type CypressRunMode = "run" | "open";
+
 export interface CypressRunStatus {
   jobId: string;
   workspaceId: string;
+  mode: CypressRunMode;
   spec: string | null;
   state: CypressRunState;
   startedAt: number;
@@ -3070,4 +4136,118 @@ export interface CypressRunStatus {
 export interface CypressInstallReceipt {
   workspace: CypressWorkspace;
   output: string;
+}
+
+/** 앱이 에이전트에 붙여 주는 기본도구 하나. 도구 정의는 상태와 무관한 고정 계약이다. */
+export interface AgentBuiltinToolDefinition {
+  id: string;
+  displayName: string;
+  routes: { accessMethod: string; operations: string[] }[];
+}
+
+/** 한 에이전트가 그 도구를 지금 어떻게 쓰는지. 같은 도구도 에이전트마다 경로가 다르다. */
+export interface AgentBuiltinToolView {
+  id: string;
+  enabled: boolean;
+  available: boolean;
+  /** `aiaSystem` · `directMcp` · `externalMcpConfig` · `systemSkillCli` · `systemSkillHttp` · `appRender` · `none`. */
+  accessMethod: string;
+  /** 켠 뒤 이미 실행 중인 채팅에 붙이려면 새 채팅이 필요한지. */
+  enablementRequiresNewChat: boolean;
+  /** 화면이 제 언어로 조립하는 상태 설명. 백엔드는 갈래와 수치만 내린다. */
+  note: AgentBuiltinToolNote;
+}
+
+/** 기본도구 상태 한 줄의 갈래. 문구가 아니라 값이라 ko·en 어느 쪽으로도 조립된다. */
+export type AgentBuiltinToolNote =
+  | { kind: "sshEndpoints"; available: number; unusable: number }
+  | { kind: "dbConnections"; available: number; unusable: number }
+  | { kind: "cypressEnabled" }
+  | { kind: "cypressDisabled" }
+  | { kind: "mcpExternalConfig"; registered: string[]; missing: string[]; pending: number }
+  | { kind: "mcpNone"; pending: number }
+  | { kind: "mcpAttached"; names: string[]; pending: number }
+  | { kind: "mermaid" };
+
+export interface AgentBuiltinToolsView {
+  /** `aia` 또는 일반 채팅 공급자 id. */
+  agent: string;
+  tools: AgentBuiltinToolView[];
+}
+
+export interface AgentBuiltinToolsCatalog {
+  schemaVersion: number;
+  tools: AgentBuiltinToolDefinition[];
+  agents: AgentBuiltinToolsView[];
+  issues: string[];
+}
+
+/** 채팅 비밀값 한 건의 겉모습. 값은 백엔드 메모리에만 있고 어느 응답에도 실리지 않는다. */
+export interface ChatSecretSummary {
+  /** `^[A-Z][A-Z0-9_]{0,63}$`. 에이전트는 이 이름으로만 값을 가리킨다. */
+  name: string;
+  purpose: string;
+  /** 만료 시각(Unix ms). */
+  expiresAt: number;
+  /**
+   * 사용자가 직접 등록했는지(`user`), 에이전트의 요청(승인 카드)에 답해 들어왔는지
+   * (`agent`), 저장해 둔 값을 앱이 자동으로 실어 왔는지(`saved`, C17).
+   */
+  source: "user" | "agent" | "saved";
+}
+
+export interface ChatSecretsSnapshot {
+  chatId: string;
+  secrets: ChatSecretSummary[];
+  /** 등록 뒤 값이 살아 있는 시간(초). */
+  ttlSeconds: number;
+}
+
+/** 대화 하나에 묶인 비밀값 묶음. 저장소 → 비밀정보 탭이 모든 대화를 한눈에 볼 때 쓴다. */
+export interface ChatSecretsGroup {
+  chatId: string;
+  source: ProviderId;
+  profile: ChatProfile;
+  cwd: string;
+  /** 대화 시작 시각(Unix ms). */
+  startedAt: number;
+  secrets: ChatSecretSummary[];
+}
+
+export interface ChatSecretsOverview {
+  chats: ChatSecretsGroup[];
+  /** 등록 뒤 값이 살아 있는 시간(초). */
+  ttlSeconds: number;
+}
+
+/** 눈 아이콘으로 확인한 값 한 건. 호스트 화면 전용 응답이다. */
+export interface ChatSecretValueView {
+  chatId: string;
+  name: string;
+  value: string;
+}
+
+/**
+ * C17. 기기에 저장해 둔 비밀값 하나. 값은 OS 보안 저장소에만 있고 이 구조체에는 없다.
+ * 대화 비밀값(`ChatSecretSummary`)과 달리 만료가 없고 모든 대화가 같은 이름으로 쓴다.
+ */
+export interface SavedSecretView {
+  name: string;
+  purpose: string;
+  createdAt: number;
+  updatedAt: number;
+  /** 마지막으로 어느 대화에 실려 나간 시각. 한 번도 쓰이지 않았으면 null이다. */
+  lastUsedAt: number | null;
+  /** 에이전트가 이름을 요청할 때 카드 없이 자동으로 실어 줄지. 새 값은 켜진 채로 만들어진다. */
+  agentEnabled: boolean;
+}
+
+export interface SavedSecretsSnapshot {
+  secrets: SavedSecretView[];
+}
+
+/** 저장된 값 하나의 실제 값. 호스트 화면의 눈 아이콘 전용 응답이다. */
+export interface SavedSecretValueView {
+  name: string;
+  value: string;
 }

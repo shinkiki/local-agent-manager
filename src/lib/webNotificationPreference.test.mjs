@@ -5,6 +5,7 @@ import {
   deviceNotificationsOn,
   setDeviceNotifications,
 } from "./webNotificationPreference.ts";
+import { useBlockedStorageWindow, useStorageWindow } from "./storedTextFixtures.mjs";
 
 test("an existing browser grant restores notifications without a saved preference", () => {
   assert.equal(deviceNotificationsEnabled(null, "granted"), true);
@@ -22,20 +23,9 @@ test("a browser denial overrides an explicit on preference", () => {
   assert.equal(deviceNotificationsEnabled("on", "denied"), false);
 });
 
-/** 저장소를 흉내 낸 window. 저장 키를 아는 자리가 이 모듈뿐인지 여기서 확인한다. */
-function withStorage(initial) {
-  const store = new Map(Object.entries(initial));
-  globalThis.window = {
-    localStorage: {
-      getItem: (key) => (store.has(key) ? store.get(key) : null),
-      setItem: (key, value) => { store.set(key, value); },
-    },
-  };
-  return store;
-}
-
+/** 저장 키를 아는 자리가 이 모듈뿐인지, 저장된 원문을 그대로 보아 확인한다. */
 test("saving turns the preference into the stored value the reader uses", () => {
-  const store = withStorage({});
+  const store = useStorageWindow();
   setDeviceNotifications(true);
   assert.equal(store.get("agentManager.deviceNotifications"), "on");
   assert.equal(deviceNotificationsOn("default"), true);
@@ -45,28 +35,19 @@ test("saving turns the preference into the stored value the reader uses", () => 
 });
 
 test("a missing stored preference falls back to the browser permission", () => {
-  withStorage({});
+  useStorageWindow();
   assert.equal(deviceNotificationsOn("granted"), true);
   assert.equal(deviceNotificationsOn("default"), false);
 });
 
-/** 쿠키를 전면 차단한 브라우저처럼 `window.localStorage`를 읽는 것만으로 예외가 나는 window. */
-function withBlockedStorage() {
-  globalThis.window = {
-    get localStorage() {
-      throw new Error("SecurityError: The operation is insecure.");
-    },
-  };
-}
-
 test("a blocked storage reads as no saved preference instead of throwing (QA #23)", () => {
-  withBlockedStorage();
+  useBlockedStorageWindow();
   assert.equal(deviceNotificationsOn("granted"), true);
   assert.equal(deviceNotificationsOn("default"), false);
 });
 
 test("a blocked storage turns saving into a no-op instead of throwing (QA #23)", () => {
-  withBlockedStorage();
+  useBlockedStorageWindow();
   assert.doesNotThrow(() => setDeviceNotifications(true));
   assert.doesNotThrow(() => setDeviceNotifications(false));
 });

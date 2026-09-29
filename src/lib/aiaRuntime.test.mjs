@@ -6,6 +6,7 @@ import {
   aiaRuntimeNeedsRestart,
   aiaRuntimeProvider,
   aiaRuntimeSettings,
+  aiaStaleSendAction,
   canRunSystemAgent,
   sameAiaRuntimeSettings,
   supportsAiaSystemTools,
@@ -13,6 +14,20 @@ import {
 } from "./aiaRuntime.ts";
 
 const automation = (systemProvider) => ({ settings: { systemProvider } });
+
+/**
+ * 실행설정 한 벌. 일곱 칸을 모두 갖춘 객체를 시험 여섯 자리가 각자 손으로 적고 있었다.
+ * 그중 다섯 자리는 한두 칸만 달랐는데도 나머지를 함께 베껴 두어, 무엇을 보려는
+ * 시험인지가 같은 줄 일곱 개에 묻혔다. 칸이 하나 늘면 여섯 자리를 함께 고쳐야 하고,
+ * 그중 하나를 빠뜨리면 `deepEqual`이 그 시험에서만 깨져 새 칸과 무관한 자리가 붉어진다.
+ *
+ * 기본값에서 시작해 이 시험이 실제로 보는 칸만 덮어쓴다. 동적 설정은 매번 새로 떠서
+ * 기본값 객체가 시험 사이로 새지 않게 한다 — `aiaRuntimeSettings`가 지키는 규칙과 같다.
+ *
+ * 기본값 자체를 못박는 시험(아래 "a provider without stored run settings...")만은 일곱
+ * 칸을 그대로 적어 둔다. 그 자리가 이 도우미를 쓰면 기본값이 바뀌어도 늘 통과한다.
+ */
+const runtime = (overrides = {}) => ({ ...AIA_RUNTIME_DEFAULTS, settings: {}, ...overrides });
 
 test("the AIA runtime follows the selected system agent", () => {
   assert.equal(aiaRuntimeProvider(automation("claude")), "claude");
@@ -98,6 +113,7 @@ test("restoring skips AIA chats started with stale run settings", () => {
 test("a provider without stored run settings keeps the previous AIA defaults", () => {
   assert.deepEqual(aiaRuntimeSettings(undefined, "claude"), {
     model: null,
+    localConnectionId: null,
     reasoningEffort: "medium",
     mode: "workspace",
     approvalMode: "manual",
@@ -114,60 +130,39 @@ test("stored run settings are read per provider and may fall back to provider de
   const runtimes = {
     claude: { model: "claude-opus-5", reasoningEffort: null, mode: "plan", approvalMode: "never", decisionPolicy: "recommended", settings: { fallbackModel: "claude-sonnet-5" } },
   };
-  assert.deepEqual(aiaRuntimeSettings(runtimes, "claude"), {
+  assert.deepEqual(aiaRuntimeSettings(runtimes, "claude"), runtime({
     model: "claude-opus-5",
     reasoningEffort: null,
     mode: "plan",
     approvalMode: "never",
     decisionPolicy: "recommended",
-    uiClickPolicy: "openers",
     settings: { fallbackModel: "claude-sonnet-5" },
-  });
+  }));
   // 저장하지 않은 공급자는 다른 공급자의 모델·동적 설정을 물려받지 않는다.
-  assert.deepEqual(aiaRuntimeSettings(runtimes, "codex"), {
-    model: null,
-    reasoningEffort: "medium",
-    mode: "workspace",
-    approvalMode: "manual",
-    decisionPolicy: "ask",
-    uiClickPolicy: "openers",
-    settings: {},
-  });
+  assert.deepEqual(aiaRuntimeSettings(runtimes, "codex"), runtime());
 });
 
 test("saving one provider keeps the other provider's run settings", () => {
   const runtimes = { codex: { mode: "workspace", approvalMode: "autoReview", model: null, reasoningEffort: "high", decisionPolicy: "ask", settings: {} } };
-  const next = systemAgentRuntimePatch(runtimes, "claude", {
+  const next = systemAgentRuntimePatch(runtimes, "claude", runtime({
     model: "  claude-opus-5  ",
     reasoningEffort: null,
     mode: "plan",
-    approvalMode: "manual",
     decisionPolicy: "recommended",
-    uiClickPolicy: "openers",
     settings: { fallbackModel: " claude-sonnet-5 ", blank: "   " },
-  });
+  }));
   assert.deepEqual(next.codex, runtimes.codex);
-  assert.deepEqual(next.claude, {
+  assert.deepEqual(next.claude, runtime({
     model: "claude-opus-5",
     reasoningEffort: null,
     mode: "plan",
-    approvalMode: "manual",
     decisionPolicy: "recommended",
-    uiClickPolicy: "openers",
     settings: { fallbackModel: "claude-sonnet-5" },
-  });
+  }));
 });
 
 test("an empty model or dynamic value means the provider default", () => {
-  const next = systemAgentRuntimePatch({}, "claude", {
-    model: "   ",
-    reasoningEffort: "medium",
-    mode: "workspace",
-    approvalMode: "manual",
-    decisionPolicy: "ask",
-    uiClickPolicy: "openers",
-    settings: {},
-  });
+  const next = systemAgentRuntimePatch({}, "claude", runtime({ model: "   " }));
   assert.equal(next.claude.model, null);
   assert.deepEqual(next.claude.settings, {});
 });
@@ -186,4 +181,19 @@ test("only a real change enables saving the run settings", () => {
 test("a saved runtime from before the decision option keeps asking the user", () => {
   const runtimes = { claude: { model: null, reasoningEffort: "high", mode: "fullAccess", approvalMode: "never", settings: {} } };
   assert.equal(aiaRuntimeSettings(runtimes, "claude").decisionPolicy, "ask");
+});
+
+test("a request never goes into a runtime started with other settings", () => {
+  assert.equal(aiaStaleSendAction(false, "ready"), "send");
+  assert.equal(aiaStaleSendAction(false, "running"), "send");
+  // 어긋난 대화는 보내는 그 자리에서 정지하고 새 설정으로 다시 시작한다.
+  assert.equal(aiaStaleSendAction(true, "ready"), "restart");
+  assert.equal(aiaStaleSendAction(true, "connecting"), "restart");
+  assert.equal(aiaStaleSendAction(true, "stopped"), "restart");
+  assert.equal(aiaStaleSendAction(true, "failed"), "restart");
+});
+
+test("an in-flight turn or a pending approval is neither cut off nor written into", () => {
+  assert.equal(aiaStaleSendAction(true, "running"), "blocked");
+  assert.equal(aiaStaleSendAction(true, "waitingApproval"), "blocked");
 });

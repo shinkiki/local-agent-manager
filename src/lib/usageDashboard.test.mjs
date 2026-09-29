@@ -8,20 +8,15 @@ import {
   usageWindowLengthMs,
   weeklyUsageOverview,
 } from "./usageDashboard.ts";
+import {
+  accountSnapshot,
+  accountUsageView as usage,
+  usageWindow as win,
+} from "./usageViewFixtures.mjs";
 
 const NOW = 1_000_000;
 const DAY = 86_400_000;
 const WEEK = 7 * DAY;
-
-/** 창 하나. 초기화 시각이 없는 창이 대부분이라 기본값을 둔다. */
-function win(label, usedPercent, resetsAt = null, extra = {}) {
-  return { label, usedPercent, resetsAt, ...extra };
-}
-
-/** 계정 사용량 뷰. 시험마다 실제로 다른 것은 창 목록과 조회 상태뿐이다. */
-function usage(windows, overrides = {}) {
-  return { status: "ok", windows, updatedAt: 123, error: null, retryAt: null, rateLimited: false, ...overrides };
-}
 
 /** 이력의 주기 레코드 하나. 관측 시각은 이 모듈이 보지 않아 0으로 둔다. */
 function cycle(label, windowLengthMs, resetsAt, peakUsedPercent) {
@@ -66,7 +61,7 @@ test("weekly windows are recognised by their day-length label, not a fixed strin
 });
 
 function weeklySnapshot(accounts) {
-  return { accounts, providers: [], autoSwitchResume: false, autoSwitchPolicy: "roundRobin", autoSwitchUsageGapPercent: null, resumeAccountPolicy: "lastUsed" };
+  return accountSnapshot({ accounts });
 }
 
 test("weekly overview keeps only day-length windows and takes the max as the headline", () => {
@@ -218,6 +213,48 @@ test("cumulative usage follows the cycle length the provider actually gave", () 
   assert.ok(Math.abs(result.consumedPercent - 50) < 1e-9);
 });
 
+// AM-428 — 월 열이 세는 창은 "현재 창 라벨"과 "이력에 남은 창"의 합집합이다. 어느 쪽에서
+// 왔는지에 따라 주기 길이와 대표 소비율이 달라지는 자리라, 셋을 함께 붙잡는다.
+test("cumulative usage keeps a window the history knows about even when the account no longer reports it", () => {
+  const to = 100 * WEEK;
+  const observed = history(0, [
+    cycle("7일", WEEK, to, 20),
+    // 계정이 지금은 내주지 않는 모델별 창. 이력에만 남아 있어도 제 열로 서야, 그 달에
+    // 실제로 쓴 제공량이 표에서 사라지지 않는다.
+    cycle("Fable 7일", WEEK, to, 90),
+  ]);
+  const result = cumulativeUsage(observed, ["7일"], { from: to - WEEK, to });
+  assert.deepEqual(result.windows.map((window) => window.label).sort(), ["7일", "Fable 7일"]);
+  // 대표 소비율은 창들 중 최대라, 이력에만 있는 창도 그 달의 대표값이 될 수 있다.
+  assert.ok(Math.abs(result.consumedPercent - 90) < 1e-9);
+});
+
+test("cumulative usage prefers the cycle length the history recorded over the one read from the label", () => {
+  const to = 100 * WEEK;
+  // 라벨은 7일인데 공급자가 실제로 준 주기는 14일이었다. 분모는 이력 쪽을 따른다.
+  const observed = history(0, [cycle("7일", 2 * WEEK, to, 50)]);
+  const result = cumulativeUsage(observed, ["7일"], { from: to - 2 * WEEK, to });
+  assert.equal(result.windows[0].windowLengthMs, 2 * WEEK);
+  assert.equal(result.windows[0].budgetCycles, 1);
+  assert.ok(Math.abs(result.consumedPercent - 50) < 1e-9);
+});
+
+test("cumulative usage counts a cycle that only touches the period boundary as outside it", () => {
+  const to = 100 * WEEK;
+  const from = to - 2 * WEEK;
+  const observed = history(0, [
+    // 기간이 시작하는 순간 끝난 주기: 겹친 길이가 0이라 들어오지 않는다.
+    cycle("7일", WEEK, from, 100),
+    // 기간이 끝나는 순간 시작한 주기도 마찬가지다.
+    cycle("7일", WEEK, to + WEEK, 100),
+  ]);
+  const result = cumulativeUsage(observed, ["7일"], { from, to });
+  assert.equal(result.windows[0].cycleCount, 0);
+  assert.equal(result.windows[0].consumedCycles, 0);
+  assert.equal(result.windows[0].budgetCycles, 2);
+  assert.equal(result.consumedPercent, 0);
+});
+
 test("cumulative usage without history or without observed span is explicit", () => {
   assert.equal(cumulativeUsage(null, ["7일"], { from: 0, to: WEEK }), null);
   const future = cumulativeUsage(history(2 * WEEK, []), ["7일"], { from: 0, to: WEEK });
@@ -227,4 +264,26 @@ test("cumulative usage without history or without observed span is explicit", ()
   const idle = cumulativeUsage(history(0, []), ["7일"], { from: 0, to: 2 * WEEK });
   assert.equal(idle.consumedPercent, 0);
   assert.equal(idle.windows[0].budgetCycles, 2);
+});
+
+// AM: 창 라벨 문법이 백엔드(`usage_budget_policy::window_label_minutes`)와 같은 말을 하는지.
+// 예산 창 라벨은 사용자가 손으로 적는 자유 입력이고(UsageBudgetPanel), 백엔드는 `주`와
+// 숫자·단위 사이의 공백을 모두 받는다. 프런트가 그 둘을 못 읽으면 백엔드가 주기로 세는 창을
+// 화면만 통째로 떨어뜨린다 — 주간 행에서 사라지고 월 누적 소비율의 현재 창에서도 빠진다.
+test("주 단위 창 라벨을 백엔드와 같게 읽는다", () => {
+  assert.equal(usageWindowLengthMs("1주"), WEEK);
+  assert.equal(usageWindowLengthMs("Fable 2주"), 2 * WEEK);
+  assert.equal(isWeeklyUsageWindow("1주"), true);
+});
+
+test("숫자와 단위 사이의 공백은 백엔드처럼 무시한다", () => {
+  assert.equal(usageWindowLengthMs("7 일"), WEEK);
+  assert.equal(usageWindowLengthMs("5 시간"), 5 * 3_600_000);
+  assert.equal(isWeeklyUsageWindow("7 일"), true);
+});
+
+test("길이가 0인 창은 주기로 쓸 수 없으므로 주간 창도 아니다", () => {
+  // `usageWindowLengthMs("0일")`는 이미 null이다. 두 판정이 갈리면 주간 행에는 서는데
+  // 누적 소비율에서는 빠지는 창이 생긴다.
+  assert.equal(isWeeklyUsageWindow("0일"), false);
 });

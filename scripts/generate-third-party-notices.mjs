@@ -74,6 +74,8 @@ function readCargoManifestLicense(dir) {
   return file ? `see ${file[1]}` : null
 }
 
+const comparePackage = (a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version)
+
 function cargoPackages() {
   const lock = readFileSync(join(ROOT, 'Cargo.lock'), 'utf8')
   const index = cargoRegistryIndex()
@@ -92,7 +94,7 @@ function cargoPackages() {
       resolved: Boolean(dir),
     })
   }
-  return packages.sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version))
+  return packages.sort(comparePackage)
 }
 
 function readNpmLicense(dir, declaredLicense) {
@@ -125,13 +127,13 @@ function npmPackages() {
       resolved: existsSync(dir),
     })
   }
-  return packages.sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version))
+  return packages.sort(comparePackage)
 }
 
-function summarize(packages) {
+function countLicenses(packages) {
   const counts = new Map()
   for (const pkg of packages) counts.set(pkg.license, (counts.get(pkg.license) || 0) + 1)
-  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+  return counts
 }
 
 function renderTable(packages) {
@@ -145,16 +147,20 @@ function groupLicenseTexts(packages) {
   for (const pkg of packages) {
     for (const { file, text } of pkg.texts) {
       const key = sha(canonical(text))
-      if (!texts.has(key)) texts.set(key, { text, users: [] })
-      texts.get(key).users.push(`${pkg.name} ${pkg.version} (${file})`)
+      let group = texts.get(key)
+      if (!group) {
+        group = { text, users: [] }
+        texts.set(key, group)
+      }
+      group.users.push(`${pkg.name} ${pkg.version} (${file})`)
     }
   }
   return [...texts.values()].sort((a, b) => b.users.length - a.users.length)
 }
 
 function renderLicenseMatrix(cargo, npm) {
-  const cargoCounts = new Map(summarize(cargo))
-  const npmCounts = new Map(summarize(npm))
+  const cargoCounts = countLicenses(cargo)
+  const npmCounts = countLicenses(npm)
   const total = (key) => (cargoCounts.get(key) || 0) + (npmCounts.get(key) || 0)
   const keys = [...new Set([...cargoCounts.keys(), ...npmCounts.keys()])].sort(
     (a, b) => total(b) - total(a) || a.localeCompare(b),
@@ -179,12 +185,13 @@ function renderMissingSection(missing) {
 }
 
 function renderNoticeGroup(group, index) {
+  const users = [...group.users].sort()
   return [
-    `### 고지 ${index + 1} — 적용 패키지 ${group.users.length}개`,
+    `### 고지 ${index + 1} — 적용 패키지 ${users.length}개`,
     '',
     '<details><summary>적용 패키지 보기</summary>',
     '',
-    ...group.users.sort().map((user) => `- ${user}`),
+    ...users.map((user) => `- ${user}`),
     '',
     '</details>',
     '',

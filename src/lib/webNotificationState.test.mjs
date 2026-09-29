@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { attentionStateKey, freshItems, snapshotKeys } from "./webNotificationState.ts";
+import { attentionStateKey, freshItems, projectStateKey, snapshotKeys } from "./webNotificationState.ts";
 
 const attentionKeys = (items) => snapshotKeys(items, attentionStateKey);
 const freshAttention = (items, previous) => freshItems(items, previous, attentionStateKey);
@@ -59,11 +59,10 @@ test("attention keys separate ID from kind so neighbouring values cannot collide
 });
 
 test("a pending project is fresh only until its path is in the baseline", () => {
-  const path = (project) => project.path;
-  const previous = snapshotKeys([{ path: "/a" }], path);
+  const previous = snapshotKeys([{ path: "/a" }], projectStateKey);
 
   assert.deepEqual(
-    freshItems([{ path: "/a" }, { path: "/b" }], previous, path),
+    freshItems([{ path: "/a" }, { path: "/b" }], previous, projectStateKey),
     [{ path: "/b" }],
   );
 });

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::ProviderId;
+use crate::domain::{wire_enum, ProviderId};
 use crate::trash_store::{self, RestoreTarget};
 use crate::CoreError;
 
@@ -32,44 +32,18 @@ pub enum SkillTrashItemKind {
     Link,
 }
 
+wire_enum!(trimmed SkillTrashItemKind, "알 수 없는 스킬 휴지통 항목 종류입니다", {
+    Directory => "directory",
+    Link => "link",
+});
+
 impl SkillTrashItemKind {
-    pub const ALL: [Self; 2] = [Self::Directory, Self::Link];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Directory => "directory",
-            Self::Link => "link",
-        }
-    }
-
-    /// 디렉터리 실체인지 여부.
-    pub fn is_directory(self) -> bool {
-        matches!(self, Self::Directory)
-    }
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 2] = [Self::Directory, Self::Link];
 
     /// 심볼릭 링크인지 여부.
     pub fn is_link(self) -> bool {
         matches!(self, Self::Link)
-    }
-}
-
-impl std::fmt::Display for SkillTrashItemKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SkillTrashItemKind {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "directory" => Ok(Self::Directory),
-            "link" => Ok(Self::Link),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 스킬 휴지통 항목 종류입니다: {s}"
-            ))),
-        }
     }
 }
 
@@ -124,52 +98,15 @@ pub enum SkillTrashRestoreOutcome {
     Failed,
 }
 
+wire_enum!(trimmed SkillTrashRestoreOutcome, "알 수 없는 스킬 휴지통 복구 결과입니다", {
+    Restored => "restored",
+    Skipped => "skipped",
+    Failed => "failed",
+});
+
 impl SkillTrashRestoreOutcome {
-    pub const ALL: [Self; 3] = [Self::Restored, Self::Skipped, Self::Failed];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Restored => "restored",
-            Self::Skipped => "skipped",
-            Self::Failed => "failed",
-        }
-    }
-
-    /// 성공적으로 복구되었는지 여부.
-    pub fn is_restored(self) -> bool {
-        matches!(self, Self::Restored)
-    }
-
-    /// 대상 경로 충돌 등으로 건너뛰었는지 여부.
-    pub fn is_skipped(self) -> bool {
-        matches!(self, Self::Skipped)
-    }
-
-    /// 복구에 실패했는지 여부.
-    pub fn is_failed(self) -> bool {
-        matches!(self, Self::Failed)
-    }
-}
-
-impl std::fmt::Display for SkillTrashRestoreOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SkillTrashRestoreOutcome {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "restored" => Ok(Self::Restored),
-            "skipped" => Ok(Self::Skipped),
-            "failed" => Ok(Self::Failed),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 스킬 휴지통 복구 결과입니다: {s}"
-            ))),
-        }
-    }
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 3] = [Self::Restored, Self::Skipped, Self::Failed];
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -180,6 +117,22 @@ pub struct SkillTrashRestoreResult {
     pub original_path: String,
     pub outcome: SkillTrashRestoreOutcome,
     pub message: Option<String>,
+}
+
+impl SkillTrashRestoreResult {
+    fn from_item(
+        item: &SkillTrashItem,
+        outcome: SkillTrashRestoreOutcome,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            id: item.id.clone(),
+            key: item.key.clone(),
+            original_path: item.original_path.clone(),
+            outcome,
+            message,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -298,24 +251,22 @@ pub fn restore_skill_trash(
 
 fn restore_single_item(trash_root: &Path, item: &SkillTrashItem) -> SkillTrashRestoreResult {
     let original = PathBuf::from(&item.original_path);
-    let result = |outcome, message: Option<String>| SkillTrashRestoreResult {
-        id: item.id.clone(),
-        key: item.key.clone(),
-        original_path: item.original_path.clone(),
-        outcome,
-        message,
-    };
 
     match trash_store::prepare_restore_target(&original) {
         RestoreTarget::Ready => {}
         RestoreTarget::Occupied => {
-            return result(
+            return SkillTrashRestoreResult::from_item(
+                item,
                 SkillTrashRestoreOutcome::Skipped,
                 Some("원래 경로에 이미 항목이 있어 덮어쓰지 않았습니다".to_owned()),
             )
         }
         RestoreTarget::ParentFailed(message) => {
-            return result(SkillTrashRestoreOutcome::Failed, Some(message))
+            return SkillTrashRestoreResult::from_item(
+                item,
+                SkillTrashRestoreOutcome::Failed,
+                Some(message),
+            )
         }
     }
 
@@ -339,9 +290,13 @@ fn restore_single_item(trash_root: &Path, item: &SkillTrashItem) -> SkillTrashRe
     match restored {
         Ok(()) => {
             let _ = fs::remove_dir_all(&entry_dir);
-            result(SkillTrashRestoreOutcome::Restored, None)
+            SkillTrashRestoreResult::from_item(item, SkillTrashRestoreOutcome::Restored, None)
         }
-        Err(error) => result(SkillTrashRestoreOutcome::Failed, Some(error.to_string())),
+        Err(error) => SkillTrashRestoreResult::from_item(
+            item,
+            SkillTrashRestoreOutcome::Failed,
+            Some(error.to_string()),
+        ),
     }
 }
 
@@ -383,10 +338,8 @@ mod tests {
             "invalid".parse::<SkillTrashItemKind>(),
             Err(CoreError::InvalidInput(_))
         ));
-        assert!(SkillTrashItemKind::Directory.is_directory());
         assert!(!SkillTrashItemKind::Directory.is_link());
         assert!(SkillTrashItemKind::Link.is_link());
-        assert!(!SkillTrashItemKind::Link.is_directory());
     }
 
     #[test]
@@ -430,15 +383,6 @@ mod tests {
             "invalid".parse::<SkillTrashRestoreOutcome>(),
             Err(CoreError::InvalidInput(_))
         ));
-        assert!(SkillTrashRestoreOutcome::Restored.is_restored());
-        assert!(!SkillTrashRestoreOutcome::Restored.is_skipped());
-        assert!(!SkillTrashRestoreOutcome::Restored.is_failed());
-        assert!(SkillTrashRestoreOutcome::Skipped.is_skipped());
-        assert!(!SkillTrashRestoreOutcome::Skipped.is_restored());
-        assert!(!SkillTrashRestoreOutcome::Skipped.is_failed());
-        assert!(SkillTrashRestoreOutcome::Failed.is_failed());
-        assert!(!SkillTrashRestoreOutcome::Failed.is_restored());
-        assert!(!SkillTrashRestoreOutcome::Failed.is_skipped());
     }
 
     #[test]
@@ -468,7 +412,6 @@ mod tests {
 
         let item = store_trash_item(&app_data, &skill_dir, draft).expect("휴지통 보관");
         assert_eq!(item.kind, SkillTrashItemKind::Directory);
-        assert!(item.kind.is_directory());
         assert!(!skill_dir.exists());
 
         let list = list_skill_trash(&app_data).expect("휴지통 목록");
@@ -477,7 +420,10 @@ mod tests {
 
         let receipt = restore_skill_trash(&app_data, &item.id).expect("복구");
         assert_eq!(receipt.results.len(), 1);
-        assert!(receipt.results[0].outcome.is_restored());
+        assert_eq!(
+            receipt.results[0].outcome,
+            SkillTrashRestoreOutcome::Restored
+        );
         assert!(skill_dir.join("SKILL.md").exists());
 
         // 이미 복구되어 휴지통에 없는 항목 복구 시도 시 에러
@@ -506,7 +452,10 @@ mod tests {
 
         let receipt_conflict = restore_skill_trash(&app_data, &item2.id).expect("복구 시도");
         assert_eq!(receipt_conflict.results.len(), 1);
-        assert!(receipt_conflict.results[0].outcome.is_skipped());
+        assert_eq!(
+            receipt_conflict.results[0].outcome,
+            SkillTrashRestoreOutcome::Skipped
+        );
 
         // 휴지통 비우기
         let purged = purge_skill_trash(&app_data, None).expect("휴지통 비우기");

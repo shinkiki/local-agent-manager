@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::app_data_file::{read_private_json_or_default, write_private_json};
 use crate::clock::now_ms;
-use crate::domain::{ChatOrigin, ChatOriginKind};
+use crate::domain::{wire_enum, ChatOrigin, ChatOriginKind};
 use crate::quiet_hours::QuietSchedule;
 use crate::session_context::{
     reconcile_settings, resolve_run_session_read, ScheduleRunSessionRead, SessionReadActor,
@@ -42,6 +42,15 @@ const WAKE_GAP_MS: i64 = 90_000;
 const MAX_PROVIDER_STARTUP_DURATION: Duration = Duration::from_secs(5 * 60);
 const MAX_RUN_DURATION: Duration = Duration::from_secs(6 * 60 * 60);
 const RUN_LEASE_EXPIRY: Duration = Duration::from_secs(90);
+
+/// lease 만료 기준을 저장본과 같은 단위(epoch ms)로 옮긴 값. 만료 판정과 진단 문구가 각자
+/// `try_from`을 적으면 넘침 처리가 어긋나는 순간 두 자리가 다른 기준으로 갈린다.
+fn run_lease_expiry_ms() -> i64 {
+    i64::try_from(RUN_LEASE_EXPIRY.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// 실행 결과에 실을 요약의 상한(문자). 쌓는 쪽과 다듬는 쪽이 같은 값을 봐야 한다.
+const MAX_RUN_SUMMARY_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,42 +76,16 @@ impl ScheduleFrequency {
         Self::Cron,
         Self::Auto,
     ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Hourly => "hourly",
-            Self::Daily => "daily",
-            Self::Weekdays => "weekdays",
-            Self::Weekly => "weekly",
-            Self::Cron => "cron",
-            Self::Auto => "auto",
-        }
-    }
 }
 
-impl std::fmt::Display for ScheduleFrequency {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for ScheduleFrequency {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "hourly" => Ok(Self::Hourly),
-            "daily" => Ok(Self::Daily),
-            "weekdays" => Ok(Self::Weekdays),
-            "weekly" => Ok(Self::Weekly),
-            "cron" => Ok(Self::Cron),
-            "auto" => Ok(Self::Auto),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 스케줄 주기입니다: {s}"
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed ScheduleFrequency, "알 수 없는 스케줄 주기입니다", {
+    Hourly => "hourly",
+    Daily => "daily",
+    Weekdays => "weekdays",
+    Weekly => "weekly",
+    Cron => "cron",
+    Auto => "auto",
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,34 +114,12 @@ pub enum ScheduleSessionStrategy {
 impl ScheduleSessionStrategy {
     #[cfg(test)]
     pub const ALL: [Self; 2] = [Self::NewChat, Self::Continue];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::NewChat => "newChat",
-            Self::Continue => "continue",
-        }
-    }
 }
 
-impl std::fmt::Display for ScheduleSessionStrategy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for ScheduleSessionStrategy {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "newChat" => Ok(Self::NewChat),
-            "continue" => Ok(Self::Continue),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 스케줄 세션 방식입니다: {s}"
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed ScheduleSessionStrategy, "알 수 없는 스케줄 세션 방식입니다", {
+    NewChat => "newChat",
+    Continue => "continue",
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -171,36 +132,13 @@ pub enum ResumeFailurePolicy {
 impl ResumeFailurePolicy {
     #[cfg(test)]
     pub const ALL: [Self; 3] = [Self::Pause, Self::NewChat, Self::RetryThenNewChat];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pause => "pause",
-            Self::NewChat => "newChat",
-            Self::RetryThenNewChat => "retryThenNewChat",
-        }
-    }
 }
 
-impl std::fmt::Display for ResumeFailurePolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for ResumeFailurePolicy {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "pause" => Ok(Self::Pause),
-            "newChat" => Ok(Self::NewChat),
-            "retryThenNewChat" => Ok(Self::RetryThenNewChat),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 세션 재개 실패 정책입니다: {s}"
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed ResumeFailurePolicy, "알 수 없는 세션 재개 실패 정책입니다", {
+    Pause => "pause",
+    NewChat => "newChat",
+    RetryThenNewChat => "retryThenNewChat",
+});
 
 /// 반복 실행이 공급자 채팅 대신 등록된 시스템 워크플로를 돌릴 때의 대상. 문서 트리거와
 /// 같은 규칙으로 승인 버전을 함께 고정해, 워크플로가 바뀌면 다시 승인받기 전까지
@@ -278,8 +216,14 @@ pub struct ScheduledRequestInput {
     /// 비어 있고, 매 실행마다 그때의 활성 계정을 다시 읽는다.
     #[serde(default)]
     pub use_active_account: bool,
+    /// 작업 경로. 비우면 회차가 앱의 기본 작업공간(`chat::DEFAULT_WORKSPACE_DIR`)에서 돈다.
+    #[serde(default)]
     pub cwd: String,
     pub model: Option<String>,
+    /// 로컬 공급자가 쓸 서빙 연결 id(M7 7.3). 없으면 기본 연결. 값이 없는 저장본은 이
+    /// 필드가 없던 때와 바이트까지 같다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_connection_id: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
     pub mode: ChatMode,
@@ -335,6 +279,20 @@ pub struct ScheduledRequest {
     pub last_run_at: Option<i64>,
     #[serde(default)]
     pub manual_run_requested_at: Option<i64>,
+    /// 스케줄러가 스스로 멈춘 사유. 사용자가 일부러 끈 회차와 갈라야 하는 값이다 — 자동
+    /// 재승인은 자기가 멈춘 회차만 되살릴 수 있어야 하고, 그 판정을 `enabled`만 보고는
+    /// 할 수 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_reason: Option<SchedulePauseReason>,
+}
+
+/// 스케줄러가 반복 요청을 스스로 멈춘 사유.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SchedulePauseReason {
+    /// 승인 버전이 등록된 계약 버전과 어긋나 멈춘 회차. 계약이 다시 등록될 때
+    /// `adopt_workflow_version`이 이 사유로 멈춘 회차만 되살린다.
+    WorkflowVersion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,18 +322,6 @@ impl ScheduleRunStatus {
         Self::Cancelled,
     ];
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::WaitingForAccount => "waitingForAccount",
-            Self::WaitingForUsage => "waitingForUsage",
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Skipped => "skipped",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
     /// 다음 틱에서 같은 회차를 이어서 다시 시도하는 상태인지. 대기 사유가 늘어날 때
     /// 재개 경로를 한 군데에서만 고치도록 여기에 모아 둔다.
     pub fn is_waiting(self) -> bool {
@@ -391,30 +337,15 @@ impl ScheduleRunStatus {
     }
 }
 
-impl std::fmt::Display for ScheduleRunStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for ScheduleRunStatus {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "waitingForAccount" => Ok(Self::WaitingForAccount),
-            "waitingForUsage" => Ok(Self::WaitingForUsage),
-            "running" => Ok(Self::Running),
-            "completed" => Ok(Self::Completed),
-            "failed" => Ok(Self::Failed),
-            "skipped" => Ok(Self::Skipped),
-            "cancelled" => Ok(Self::Cancelled),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 스케줄 실행 상태입니다: {s}"
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed ScheduleRunStatus, "알 수 없는 스케줄 실행 상태입니다", {
+    WaitingForAccount => "waitingForAccount",
+    WaitingForUsage => "waitingForUsage",
+    Running => "running",
+    Completed => "completed",
+    Failed => "failed",
+    Skipped => "skipped",
+    Cancelled => "cancelled",
+});
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -453,6 +384,57 @@ pub struct ScheduleRun {
     /// 성공이므로 `status`만으로는 일한 회차와 쉰 회차를 가릴 수 없다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub round: Option<ScheduleRunRound>,
+}
+
+impl ScheduleRun {
+    /// 회차를 종료 상태로 굳힌다.
+    ///
+    /// 종료는 늘 상태·종료 시각·사유 세 값을 함께 옮기는 일인데 호출부마다 손으로 적혀
+    /// 있었다. 한 자리에서 `finished_at`을 빠뜨리면 화면은 그 회차를 끝없이 도는 중으로
+    /// 읽고, 다음 틱의 "이전 실행이 끝나지 않았다" 판정까지 함께 어긋난다.
+    fn finish(&mut self, status: ScheduleRunStatus, now: i64, error: Option<String>) {
+        self.status = status;
+        self.finished_at = Some(now);
+        self.error = error;
+    }
+
+    /// 아직 끝나지 않은 회차를 대기 상태로 되돌린다. 시작·종료 시각을 지워 다음 틱이 같은
+    /// 회차를 처음부터 다시 시도하게 한다.
+    fn wait(&mut self, status: ScheduleRunStatus, error: Option<String>) {
+        self.status = status;
+        self.started_at = None;
+        self.finished_at = None;
+        self.error = error;
+    }
+
+    /// 실행 lease가 마지막으로 갱신된 시각. heartbeat가 아직 없으면 시작 시각이 대신한다 —
+    /// 기동 직후라 heartbeat를 한 번도 못 찍은 회차를 만료로 몰지 않기 위해서다.
+    fn lease_heartbeat_at(&self) -> Option<i64> {
+        self.last_heartbeat_at.or(self.started_at)
+    }
+
+    /// lease가 갱신되지 않은 채 지난 시간(ms). 갱신 근거가 하나도 없으면 `None`.
+    fn lease_age_ms(&self, now: i64) -> Option<i64> {
+        self.lease_heartbeat_at()
+            .map(|heartbeat| now.saturating_sub(heartbeat))
+    }
+
+    /// lease 만료 여부. 갱신 근거가 하나도 없는 실행도 만료로 본다 — 소유가 사라진 회차는
+    /// heartbeat도 시작 시각도 남기지 못한 채 끊길 수 있다.
+    fn lease_expired(&self, now: i64) -> bool {
+        self.lease_age_ms(now)
+            .is_none_or(|age_ms| age_ms > run_lease_expiry_ms())
+    }
+
+    /// 소유가 사라진 `Running` 회차만 실패로 굳히고 heartbeat까지 지금으로 맞춘다. 이미
+    /// terminal로 저장된 회차는 건드리지 않는다.
+    fn expire_running(&mut self, now: i64, error: String) {
+        if self.status != ScheduleRunStatus::Running {
+            return;
+        }
+        self.finish(ScheduleRunStatus::Failed, now, Some(error));
+        self.last_heartbeat_at = Some(now);
+    }
 }
 
 /// 페이싱 회차 한 번의 집계. 봉투 접수증의 `round`를 그대로 옮긴다.
@@ -535,6 +517,51 @@ struct SchedulerStore {
     pending_document_runs: Vec<PendingDocumentRun>,
 }
 
+/// 저장본에서 id로 항목을 집는 네 갈래. 호출부마다 `iter().find(...)`를 다시 적으면
+/// 같은 조회가 열 군데 넘게 흩어지고, 없을 때의 문구도 함께 흩어진다.
+impl SchedulerStore {
+    fn schedule(&self, id: &str) -> Option<&ScheduledRequest> {
+        self.schedules.iter().find(|schedule| schedule.id == id)
+    }
+
+    fn schedule_mut(&mut self, id: &str) -> Option<&mut ScheduledRequest> {
+        self.schedules.iter_mut().find(|schedule| schedule.id == id)
+    }
+
+    fn run(&self, run_id: &str) -> Option<&ScheduleRun> {
+        self.runs.iter().find(|run| run.id == run_id)
+    }
+
+    fn run_mut(&mut self, run_id: &str) -> Option<&mut ScheduleRun> {
+        self.runs.iter_mut().find(|run| run.id == run_id)
+    }
+
+    /// 아직 돌지 않은 반복 요청의 이어가기 대상과 실행 전후 세션을 한 벌로 모은다.
+    fn referenced_session_ids(&self) -> BTreeSet<String> {
+        self.schedules
+            .iter()
+            .filter_map(|schedule| schedule.input.provider_session_id.as_ref())
+            .chain(self.runs.iter().flat_map(|run| {
+                [
+                    run.provider_session_id.as_ref(),
+                    run.previous_provider_session_id.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+            }))
+            .cloned()
+            .collect()
+    }
+}
+
+fn missing_schedule() -> CoreError {
+    CoreError::NotFound("반복 요청을 찾을 수 없습니다".to_owned())
+}
+
+fn missing_run() -> CoreError {
+    CoreError::NotFound("반복 요청 실행을 찾을 수 없습니다".to_owned())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingDocumentRun {
@@ -586,6 +613,50 @@ impl SchedulerInner {
     fn workflow_executor(&self) -> Option<Arc<dyn ScheduleWorkflowExecutor>> {
         self.workflows.lock().ok()?.clone()
     }
+
+    /// 실행 소유권 맵에서 run의 제어권을 집는다. 이 프로세스가 소유하지 않는 run이면
+    /// `None`이고, 맵 잠금이 손상됐으면 오류다. 무시해도 되는 호출부는 `.ok().flatten()`으로
+    /// 둘을 같게 본다.
+    fn execution_control(&self, run_id: &str) -> Result<Option<Arc<ActiveRunControl>>, CoreError> {
+        Ok(self
+            .executions
+            .lock()
+            .map_err(|_| CoreError::Runtime("반복 실행 소유권 잠금이 손상되었습니다".to_owned()))?
+            .get(run_id)
+            .cloned())
+    }
+
+    /// 제어권을 쥔 실행에 취소를 알리고, 채팅이 이미 떠 있으면 런타임까지 멈춘다. 채팅 id가
+    /// 아직 없는 구간(provider startup 이전)에는 멈출 대상이 없으므로 깃발만 올린다.
+    fn signal_cancellation(
+        &self,
+        control: &ActiveRunControl,
+    ) -> Result<RuntimeStopOutcome, CoreError> {
+        control.cancelled.store(true, Ordering::Release);
+        let chat_id = control
+            .chat_id
+            .lock()
+            .map_err(|_| CoreError::Runtime("반복 실행 채팅 잠금이 손상되었습니다".to_owned()))?
+            .clone();
+        let Some(chat_id) = chat_id else {
+            return Ok(RuntimeStopOutcome::default());
+        };
+        Ok(RuntimeStopOutcome {
+            stop_attempted: true,
+            stop_error: self
+                .chats
+                .stop_managed(&chat_id)
+                .err()
+                .map(|error| error.to_string()),
+        })
+    }
+}
+
+/// 취소 신호가 런타임까지 닿았는지.
+#[derive(Default)]
+struct RuntimeStopOutcome {
+    stop_attempted: bool,
+    stop_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -676,48 +747,40 @@ impl SchedulerSupervisor {
         })
     }
 
+    /// 다음 실행 시각을 다시 잡는 저장 경로의 공통 문지방. 자동 주기 해석기는 스케줄러
+    /// 락 **밖에서** 읽고(ABBA 교착 방지), 간격은 락 안에서 일시정지 목록을 보며 정한다.
+    ///
+    /// 이 두 걸음은 언제나 붙어 다니는데, 생성·수정·켜기·정책 갱신 네 자리가 각자
+    /// "해석기 읽기 → 경로 복제 → 저장소 열기"를 적어 내려가고 있었다. 한 자리만 순서를
+    /// 뒤집어도 락 순서가 어긋나 교착이 되는데, 그 사실은 주석으로만 지켜지고 있었다.
+    /// 순서를 여기 한 벌만 둔다.
+    fn with_cadence_store<T>(
+        &self,
+        action: impl FnOnce(
+            &mut SchedulerStore,
+            &Path,
+            &crate::usage_pacing::AutoCadence,
+        ) -> Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
+        let app_data_dir = self.inner.app_data_dir.clone();
+        let auto = auto_cadence(&app_data_dir);
+        with_store(&self.inner.app_data_dir, |store| {
+            action(store, &app_data_dir, &auto)
+        })
+    }
+
     pub fn create(
         &self,
         input: ScheduledRequestInput,
         actor: SessionReadActor,
     ) -> Result<ScheduledRequest, CoreError> {
-        let mut input = validate_input(input)?;
-        self.validate_account(&input)?;
-        self.validate_workflow(&input)?;
-        input.session_reference = reconcile_settings(
-            None,
-            input.session_reference.take(),
-            actor,
-            input.session_reference_replace_manual,
-        )?;
-        self.validate_session_reference(&input)?;
-        drop_unused_session_reference(&mut input);
+        let input = self.accept_input(input, actor, None)?;
         let now = now_ms();
-        // 해석기는 락 밖에서 읽고(ABBA 교착 방지), 간격은 락 안에서 일시정지 목록을 보며 정한다.
-        let auto = auto_cadence(&self.inner.app_data_dir);
-        let app_data_dir = self.inner.app_data_dir.clone();
-        with_store(&self.inner.app_data_dir, |store| {
-            if input.enabled {
-                if let Some(action) = input.workflow.as_ref() {
-                    ensure_single_active_paced_round(
-                        &app_data_dir,
-                        &store.schedules,
-                        &action.workflow_id,
-                        None,
-                    )?;
-                }
-            }
+        self.with_cadence_store(|store, app_data_dir, auto| {
             // 창을 나눠 쓸 회차 수에 이 새 회차 자신도 든다. id를 먼저 정해 그 사실을
             // 간격 계산에 알린다 — 저장본에는 아직 없어 목록만 봐서는 셀 수 없다.
             let id = format!("schedule-{}", Uuid::new_v4());
-            let auto_minutes = auto.minutes_for(
-                auto_workflow_id(&input),
-                &store.schedules,
-                Some((&id, &input)),
-                now,
-            );
-            let next_run_at =
-                next_run_in_window(&input, now, auto_minutes, auto.round_quiet(&input))?;
+            let next_run_at = plan_saved_run(app_data_dir, store, auto, &id, &input, now)?;
             let schedule = ScheduledRequest {
                 id,
                 input,
@@ -726,6 +789,7 @@ impl SchedulerSupervisor {
                 next_run_at,
                 last_run_at: None,
                 manual_run_requested_at: None,
+                paused_reason: None,
             };
             store.schedules.push(schedule.clone());
             Ok(schedule)
@@ -738,10 +802,38 @@ impl SchedulerSupervisor {
         input: ScheduledRequestInput,
         actor: SessionReadActor,
     ) -> Result<ScheduledRequest, CoreError> {
+        let input = self.accept_input(input, actor, Some(id))?;
+        let now = now_ms();
+        self.with_cadence_store(|store, app_data_dir, auto| {
+            let next_run_at = plan_saved_run(app_data_dir, store, auto, id, &input, now)?;
+            let schedule = store.schedule_mut(id).ok_or_else(missing_schedule)?;
+            schedule.input = input;
+            schedule.updated_at = now;
+            schedule.next_run_at = next_run_at;
+            Ok(schedule.clone())
+        })
+    }
+
+    /// 저장 전에 입력을 받아들이는 공통 관문. 생성과 수정이 같은 순서로 보지 않으면 같은
+    /// 입력에 화면 경로마다 다른 오류가 나온다: 형식 → 계정 → 워크플로 → 세션 참조 조정 →
+    /// 참조 프로젝트 확인 → 쓰지 않는 참조 버리기.
+    ///
+    /// `existing_id`는 수정 대상의 id다. 있으면 저장본의 세션 참조를 조정 기준으로 읽는다
+    /// (생성에는 기준이 없다). 저장본 읽기를 앞당기지 않는 이유도 순서다 — 형식 오류가
+    /// 저장소 읽기 실패보다 먼저 드러나야 한다.
+    fn accept_input(
+        &self,
+        input: ScheduledRequestInput,
+        actor: SessionReadActor,
+        existing_id: Option<&str>,
+    ) -> Result<ScheduledRequestInput, CoreError> {
         let mut input = validate_input(input)?;
         self.validate_account(&input)?;
         self.validate_workflow(&input)?;
-        let stored = self.stored_session_reference(id)?;
+        let stored = match existing_id {
+            Some(id) => self.stored_session_reference(id)?,
+            None => None,
+        };
         input.session_reference = reconcile_settings(
             stored.as_ref(),
             input.session_reference.take(),
@@ -750,48 +842,13 @@ impl SchedulerSupervisor {
         )?;
         self.validate_session_reference(&input)?;
         drop_unused_session_reference(&mut input);
-        let now = now_ms();
-        // 해석기는 락 밖에서 읽고(ABBA 교착 방지), 간격은 락 안에서 일시정지 목록을 보며 정한다.
-        let auto = auto_cadence(&self.inner.app_data_dir);
-        let app_data_dir = self.inner.app_data_dir.clone();
-        with_store(&self.inner.app_data_dir, |store| {
-            if input.enabled {
-                if let Some(action) = input.workflow.as_ref() {
-                    ensure_single_active_paced_round(
-                        &app_data_dir,
-                        &store.schedules,
-                        &action.workflow_id,
-                        Some(id),
-                    )?;
-                }
-            }
-            // 이 요청 자신은 저장본이 아니라 저장되는 상태(input.enabled)로 센다.
-            let auto_minutes = auto.minutes_for(
-                auto_workflow_id(&input),
-                &store.schedules,
-                Some((id, &input)),
-                now,
-            );
-            let next_run_at =
-                next_run_in_window(&input, now, auto_minutes, auto.round_quiet(&input))?;
-            let schedule = store
-                .schedules
-                .iter_mut()
-                .find(|schedule| schedule.id == id)
-                .ok_or_else(|| CoreError::NotFound("반복 요청을 찾을 수 없습니다".to_owned()))?;
-            schedule.input = input;
-            schedule.updated_at = now;
-            schedule.next_run_at = next_run_at;
-            Ok(schedule.clone())
-        })
+        Ok(input)
     }
 
     fn stored_session_reference(&self, id: &str) -> Result<Option<SessionReadSettings>, CoreError> {
         let store = read_store(&self.inner.app_data_dir)?;
         Ok(store
-            .schedules
-            .iter()
-            .find(|schedule| schedule.id == id)
+            .schedule(id)
             .and_then(|schedule| schedule.input.session_reference.clone()))
     }
 
@@ -838,60 +895,25 @@ impl SchedulerSupervisor {
     }
 
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<ScheduledRequest, CoreError> {
-        let auto = auto_cadence(&self.inner.app_data_dir);
-        let app_data_dir = self.inner.app_data_dir.clone();
-        with_store(&self.inner.app_data_dir, |store| {
+        self.with_cadence_store(|store, app_data_dir, auto| {
             let now = now_ms();
-            if enabled {
-                let workflow_id = store
-                    .schedules
-                    .iter()
-                    .find(|schedule| schedule.id == id)
-                    .and_then(|schedule| schedule.input.workflow.as_ref())
-                    .map(|action| action.workflow_id.clone());
-                if let Some(workflow_id) = workflow_id {
-                    ensure_single_active_paced_round(
-                        &app_data_dir,
-                        &store.schedules,
-                        &workflow_id,
-                        Some(id),
-                    )?;
-                }
-            }
             // 켜고 끄는 요청 자신은 저장본이 아직 옛 상태다. 활성 창·계정 범위까지 새 입력으로
             // 계산해야 다른 회차의 몫과 이 회차의 다음 실행이 같은 설정을 본다.
             let mut pending_input = store
-                .schedules
-                .iter()
-                .find(|schedule| schedule.id == id)
+                .schedule(id)
                 .map(|schedule| schedule.input.clone())
-                .ok_or_else(|| CoreError::NotFound("반복 요청을 찾을 수 없습니다".to_owned()))?;
+                .ok_or_else(missing_schedule)?;
             pending_input.enabled = enabled;
-            let enabled_auto_minutes = enabled.then(|| {
-                auto.minutes_for(
-                    auto_workflow_id(&pending_input),
-                    &store.schedules,
-                    Some((id, &pending_input)),
-                    now,
-                )
-            });
+            // 끄는 요청은 다음 시각을 잡지 않는다 — 아래에서 수동 실행 예약까지 지운다.
+            let enabled_next_run_at = enabled
+                .then(|| plan_saved_run(app_data_dir, store, auto, id, &pending_input, now))
+                .transpose()?;
             let updated = {
-                let schedule = store
-                    .schedules
-                    .iter_mut()
-                    .find(|schedule| schedule.id == id)
-                    .ok_or_else(|| {
-                        CoreError::NotFound("반복 요청을 찾을 수 없습니다".to_owned())
-                    })?;
+                let schedule = store.schedule_mut(id).ok_or_else(missing_schedule)?;
                 schedule.input.enabled = enabled;
                 schedule.updated_at = now;
-                if let Some(auto_minutes) = enabled_auto_minutes {
-                    schedule.next_run_at = next_run_in_window(
-                        &schedule.input,
-                        now,
-                        auto_minutes,
-                        auto.round_quiet(&schedule.input),
-                    )?;
+                if let Some(next_run_at) = enabled_next_run_at {
+                    schedule.next_run_at = next_run_at;
                 } else {
                     schedule.manual_run_requested_at = None;
                 }
@@ -906,10 +928,11 @@ impl SchedulerSupervisor {
                     .iter_mut()
                     .filter(|run| run.schedule_id == id && run.status.is_waiting())
                 {
-                    run.status = ScheduleRunStatus::Skipped;
-                    run.finished_at = Some(now);
-                    run.error =
-                        Some("반복 요청이 비활성화되어 대기 실행을 취소했습니다".to_owned());
+                    run.finish(
+                        ScheduleRunStatus::Skipped,
+                        now,
+                        Some("반복 요청이 비활성화되어 대기 실행을 취소했습니다".to_owned()),
+                    );
                 }
             }
             Ok(updated)
@@ -929,10 +952,8 @@ impl SchedulerSupervisor {
     /// 워크플로 전체를 본다. 다음 만기 때까지 옛 간격을 유지하면 화면은 10분이라면서 실제
     /// 첫 회차는 몇 시간 뒤에 도는 불일치가 생긴다.
     pub(crate) fn refresh_paced_auto_cadence(&self) -> Result<usize, CoreError> {
-        // 정책과 페이싱 저장소는 스케줄러 락 밖에서 읽어 락 순서를 지킨다.
-        let auto = auto_cadence(&self.inner.app_data_dir);
         let now = now_ms();
-        with_store(&self.inner.app_data_dir, |store| {
+        self.with_cadence_store(|store, _app_data_dir, auto| {
             let snapshot = store.schedules.clone();
             let updates: Result<Vec<(String, i64)>, CoreError> = snapshot
                 .iter()
@@ -942,14 +963,8 @@ impl SchedulerSupervisor {
                         && schedule.input.workflow.is_some()
                 })
                 .map(|schedule| {
-                    let minutes =
-                        auto.minutes_for(auto_workflow_id(&schedule.input), &snapshot, None, now);
-                    let recalculated = next_run_in_window(
-                        &schedule.input,
-                        now,
-                        minutes,
-                        auto.round_quiet(&schedule.input),
-                    )?;
+                    let recalculated =
+                        next_run_with_cadence(&schedule.input, &snapshot, auto, None, now)?;
                     // 이미 기다린 시간은 버리지 않는다. 새 간격이 짧아졌을 때만 앞당기고,
                     // 길어졌다면 현재 한 회차를 그대로 둔 뒤 다음 claim부터 새 간격을 쓴다.
                     // 다만 새 활성 시작·제한 시간대는 즉시 지켜야 하므로 기존 시각도 그 경계
@@ -968,7 +983,7 @@ impl SchedulerSupervisor {
                 .collect();
             let updates = updates?;
             for (id, next_run_at) in &updates {
-                if let Some(schedule) = store.schedules.iter_mut().find(|item| item.id == *id) {
+                if let Some(schedule) = store.schedule_mut(id) {
                     schedule.next_run_at = *next_run_at;
                 }
             }
@@ -978,11 +993,7 @@ impl SchedulerSupervisor {
 
     pub fn run_now(&self, id: &str) -> Result<ScheduledRequest, CoreError> {
         with_store(&self.inner.app_data_dir, |store| {
-            let schedule = store
-                .schedules
-                .iter_mut()
-                .find(|schedule| schedule.id == id)
-                .ok_or_else(|| CoreError::NotFound("반복 요청을 찾을 수 없습니다".to_owned()))?;
+            let schedule = store.schedule_mut(id).ok_or_else(missing_schedule)?;
             schedule.manual_run_requested_at = Some(now_ms());
             Ok(schedule.clone())
         })
@@ -994,12 +1005,7 @@ impl SchedulerSupervisor {
         context: ScheduledDocumentTriggerContext,
     ) -> Result<ScheduledRequest, CoreError> {
         with_store(&self.inner.app_data_dir, |store| {
-            let schedule = store
-                .schedules
-                .iter()
-                .find(|schedule| schedule.id == id)
-                .cloned()
-                .ok_or_else(|| CoreError::NotFound("반복 요청을 찾을 수 없습니다".to_owned()))?;
+            let schedule = store.schedule(id).cloned().ok_or_else(missing_schedule)?;
             if !schedule.input.enabled {
                 return Err(CoreError::Conflict(
                     "비활성 반복 요청은 문서 트리거로 실행할 수 없습니다".to_owned(),
@@ -1034,12 +1040,7 @@ impl SchedulerSupervisor {
     ) -> Result<ScheduledRunCancellationReceipt, CoreError> {
         let reason = normalize_cancel_reason(reason);
         let snapshot = read_store(&self.inner.app_data_dir)?;
-        let current = snapshot
-            .runs
-            .iter()
-            .find(|run| run.id == run_id)
-            .cloned()
-            .ok_or_else(|| CoreError::NotFound("반복 요청 실행을 찾을 수 없습니다".to_owned()))?;
+        let current = snapshot.run(run_id).cloned().ok_or_else(missing_run)?;
         if current.status.is_terminal() {
             return Ok(ScheduledRunCancellationReceipt {
                 run: current,
@@ -1051,35 +1052,19 @@ impl SchedulerSupervisor {
             });
         }
         let schedule = snapshot
-            .schedules
-            .iter()
-            .find(|schedule| schedule.id == current.schedule_id)
+            .schedule(&current.schedule_id)
             .cloned()
-            .ok_or_else(|| CoreError::NotFound("반복 요청을 찾을 수 없습니다".to_owned()))?;
-        let control = self
-            .inner
-            .executions
-            .lock()
-            .map_err(|_| CoreError::Runtime("반복 실행 소유권 잠금이 손상되었습니다".to_owned()))?
-            .get(run_id)
-            .cloned();
+            .ok_or_else(missing_schedule)?;
+        let control = self.inner.execution_control(run_id)?;
         let owner_was_active = control.is_some();
         let mut stop_attempted = false;
         let mut stop_error = None;
         let mut stale_reasons = stale_run_reasons(&current, now_ms());
         if let Some(control) = control {
-            control.cancelled.store(true, Ordering::Release);
-            if let Some(chat_id) = control
-                .chat_id
-                .lock()
-                .map_err(|_| CoreError::Runtime("반복 실행 채팅 잠금이 손상되었습니다".to_owned()))?
-                .clone()
-            {
-                stop_attempted = true;
-                if let Err(error) = self.inner.chats.stop_managed(&chat_id) {
-                    stop_error = Some(error.to_string());
-                }
-            } else {
+            let outcome = self.inner.signal_cancellation(&control)?;
+            stop_attempted = outcome.stop_attempted;
+            stop_error = outcome.stop_error;
+            if !stop_attempted {
                 stale_reasons.push("provider startup 이전 구간에서 취소를 요청했습니다".to_owned());
             }
         } else {
@@ -1100,19 +1085,11 @@ impl SchedulerSupervisor {
         }
         let now = now_ms();
         let saved = with_store(&self.inner.app_data_dir, |store| {
-            let run = store
-                .runs
-                .iter_mut()
-                .find(|run| run.id == run_id)
-                .ok_or_else(|| {
-                    CoreError::NotFound("반복 요청 실행을 찾을 수 없습니다".to_owned())
-                })?;
+            let run = store.run_mut(run_id).ok_or_else(missing_run)?;
             if !run.status.is_terminal() {
-                run.status = ScheduleRunStatus::Cancelled;
-                run.finished_at = Some(now);
+                run.finish(ScheduleRunStatus::Cancelled, now, Some(reason.clone()));
                 run.cancellation_requested_at = Some(now);
                 run.last_heartbeat_at = Some(now);
-                run.error = Some(reason.clone());
                 if let Some(error) = stop_error.as_ref() {
                     run.recovery_error = Some(format!("런타임 종료 확인 실패: {error}"));
                 }
@@ -1150,6 +1127,14 @@ impl SchedulerSupervisor {
                 !schedule.input.use_active_account && schedule.input.account_id == account_id
             })
             .count())
+    }
+
+    /// 반복 요청이 붙잡고 있는 공급자 세션 ID. 자동정리(`C11-6`)가 이어가기 대상을
+    /// 지우지 않도록 확인하는 데 쓴다. 다음 회차가 이어붙일 세션(`input`)과 이미 돈
+    /// 회차가 남긴 세션(`runs`)을 함께 본다 — 회차 목록만 보면 아직 한 번도 돌지 않은
+    /// 이어가기 대상이 빠지고, 입력만 보면 직전 회차가 만든 세션이 빠진다.
+    pub fn referenced_session_ids(&self) -> Result<BTreeSet<String>, CoreError> {
+        Ok(read_store(&self.inner.app_data_dir)?.referenced_session_ids())
     }
 
     pub fn handle(&self) -> SchedulerHandle {
@@ -1202,7 +1187,11 @@ impl SchedulerSupervisor {
             return Ok(());
         }
         if let Some(accounts) = &self.inner.accounts {
-            if !accounts.account_is_enabled_for_provider(input.source, &input.account_id)? {
+            if !accounts.account_is_enabled_for_provider(
+                input.source,
+                &input.account_id,
+                input.model.as_deref(),
+            )? {
                 return Err(CoreError::Conflict(
                     "반복 요청의 실행 계정을 사용할 수 없습니다".to_owned(),
                 ));
@@ -1257,10 +1246,11 @@ fn reconcile_interrupted_runs(app_data_dir: &Path) -> Result<(), CoreError> {
             if run.status != ScheduleRunStatus::Running {
                 continue;
             }
-            run.status = ScheduleRunStatus::Failed;
-            run.finished_at = Some(now);
-            run.error =
-                Some("이전 Agent Manager 실행이 종료되어 반복 요청이 중단되었습니다".to_owned());
+            run.finish(
+                ScheduleRunStatus::Failed,
+                now,
+                Some("이전 Agent Manager 실행이 종료되어 반복 요청이 중단되었습니다".to_owned()),
+            );
             interrupted_schedule_ids.insert(run.schedule_id.clone());
         }
         for schedule in &mut store.schedules {
@@ -1313,22 +1303,14 @@ fn skip_missed(app_data_dir: &Path, now: i64) -> Result<(), CoreError> {
             // 꺼진 페이싱 회차는 건너뛴 발화를 정리하지도 않는다. 여기서 다음 실행을 미래로
             // 밀면 스위치를 다시 켰을 때 만기가 사라져, 껐다 켠 것만으로 한 주기를 통째로
             // 건너뛴다.
-            if auto.round_paused(&schedule.input) {
+            if auto.round_paused(&schedule.input)
+                || auto.round_completed(&schedule.id, &schedule.input)
+            {
                 continue;
             }
             if schedule.input.enabled && schedule.next_run_at <= now {
-                let auto_minutes = auto.minutes_for(
-                    auto_workflow_id(&schedule.input),
-                    &schedule_snapshot,
-                    None,
-                    now,
-                );
-                schedule.next_run_at = next_run_in_window(
-                    &schedule.input,
-                    now,
-                    auto_minutes,
-                    auto.round_quiet(&schedule.input),
-                )?;
+                schedule.next_run_at =
+                    next_run_with_cadence(&schedule.input, &schedule_snapshot, &auto, None, now)?;
             }
         }
         Ok(())
@@ -1386,9 +1368,11 @@ fn claim_due(inner: &Arc<SchedulerInner>, now: i64) -> Result<Vec<ClaimedRun>, C
             let mut run =
                 new_scheduled_run(schedule, manual, document.as_ref(), regular_scheduled_for);
             if running.contains(&schedule.id) {
-                run.status = ScheduleRunStatus::Skipped;
-                run.finished_at = Some(now);
-                run.error = Some("이전 실행이 끝나지 않아 건너뛰었습니다".to_owned());
+                run.finish(
+                    ScheduleRunStatus::Skipped,
+                    now,
+                    Some("이전 실행이 끝나지 않아 건너뛰었습니다".to_owned()),
+                );
             } else {
                 claimed.push(ClaimedRun {
                     schedule: schedule_for_document_trigger(schedule, document.as_ref()),
@@ -1423,14 +1407,18 @@ fn advance_next_run_at(
     if auto.round_paused(&schedule.input) {
         return Ok(false);
     }
+    // 완료조건을 채운 회차도 같다 — 발화하지 않고 다음 실행 시각을 그대로 둬, "다시 시작"이
+    // 완료를 지우는 순간 밀린 한 건이 곧바로 잡힌다.
+    if auto.round_completed(&schedule.id, &schedule.input) {
+        return Ok(false);
+    }
     let window_open = active_window_open(&schedule.input, now);
     let quiet = auto.round_quiet(&schedule.input);
     let quiet_open = quiet.is_none_or(|quiet| !quiet.blocked_at(now));
     let regular_elapsed = schedule.input.enabled && schedule.next_run_at <= now;
     let regular_due = !paused && window_open && quiet_open && regular_elapsed;
     if regular_due || (regular_elapsed && !window_open) {
-        let auto_minutes = auto.minutes_for(auto_workflow_id(&schedule.input), snapshot, None, now);
-        schedule.next_run_at = next_run_in_window(&schedule.input, now, auto_minutes, quiet)?;
+        schedule.next_run_at = next_run_with_cadence(&schedule.input, snapshot, auto, None, now)?;
     } else if regular_elapsed && !quiet_open {
         schedule.next_run_at = quiet.map_or(now, |quiet| quiet.resume_at(now));
     } else if let Some(quiet) = quiet {
@@ -1512,6 +1500,33 @@ fn schedule_for_document_trigger(
     schedule
 }
 
+/// 회차를 Running으로 확정해 저장한다. 공급자 대화 회차와 워크플로 회차가 같은 절차를
+/// 밟으므로 한 군데로 모아, 시작 시각·heartbeat·저장 실패 문구가 두 경로에서 갈라지지
+/// 않게 한다.
+///
+/// 저장본이 Running이 아니면 그 사이에 취소 등으로 terminal이 확정된 것이므로 덮어쓰지
+/// 않고 멈춘다. 실행중 표시와 소유 실행 등록은 호출부의 `RunExecutionRegistration`이
+/// 드롭될 때 함께 정리된다. 진행할 수 없으면 `None`을 돌려준다.
+fn start_run(inner: &Arc<SchedulerInner>, mut claimed: ClaimedRun) -> Option<ClaimedRun> {
+    claimed.run.status = ScheduleRunStatus::Running;
+    claimed.run.started_at = Some(now_ms());
+    claimed.run.last_heartbeat_at = claimed.run.started_at;
+    claimed.run.error = None;
+    match finish_run(&inner.app_data_dir, &claimed) {
+        Ok(saved) if saved.run.status == ScheduleRunStatus::Running => Some(saved),
+        Ok(_) => None,
+        Err(error) => {
+            claimed.run.finish(
+                ScheduleRunStatus::Failed,
+                now_ms(),
+                Some(format!("반복 실행 상태를 저장하지 못했습니다: {error}")),
+            );
+            emit_result(inner, &claimed);
+            None
+        }
+    }
+}
+
 fn execute_claim(inner: Arc<SchedulerInner>, mut claimed: ClaimedRun) {
     let control = Arc::new(ActiveRunControl::default());
     if let Ok(mut executions) = inner.executions.lock() {
@@ -1528,86 +1543,75 @@ fn execute_claim(inner: Arc<SchedulerInner>, mut claimed: ClaimedRun) {
         execute_workflow_claim(&inner, claimed, &control);
         return;
     }
-    match prepare_run_account(&inner, &mut claimed) {
-        Ok(()) => {}
-        Err(PrepareRunError::Waiting(status, message)) => {
-            claimed.run.status = status;
-            claimed.run.started_at = None;
-            claimed.run.finished_at = None;
-            claimed.run.error = Some(message);
-            let _ = finish_run(&inner.app_data_dir, &claimed);
-            if let Ok(mut running) = inner.running.lock() {
-                running.remove(&claimed.schedule.id);
-            }
-            return;
-        }
-        Err(PrepareRunError::Failed(message)) => {
-            claimed.run.status = ScheduleRunStatus::Failed;
-            claimed.run.finished_at = Some(now_ms());
-            claimed.run.error = Some(message);
-            claimed.schedule.last_run_at = claimed.run.finished_at;
-            let saved =
-                finish_run(&inner.app_data_dir, &claimed).unwrap_or_else(|_| claimed.clone());
-            emit_result(&inner, &saved);
-            if let Ok(mut running) = inner.running.lock() {
-                running.remove(&claimed.schedule.id);
-            }
-            return;
-        }
-    };
-    claimed.run.status = ScheduleRunStatus::Running;
-    claimed.run.started_at = Some(now_ms());
-    claimed.run.last_heartbeat_at = claimed.run.started_at;
-    claimed.run.error = None;
-    match finish_run(&inner.app_data_dir, &claimed) {
-        Ok(saved) if saved.run.status == ScheduleRunStatus::Running => claimed = saved,
-        Ok(_) => {
-            if let Ok(mut running) = inner.running.lock() {
-                running.remove(&claimed.schedule.id);
-            }
-            return;
-        }
-        Err(error) => {
-            claimed.run.status = ScheduleRunStatus::Failed;
-            claimed.run.finished_at = Some(now_ms());
-            claimed.run.error = Some(format!("반복 실행 상태를 저장하지 못했습니다: {error}"));
-            emit_result(&inner, &claimed);
-            if let Ok(mut running) = inner.running.lock() {
-                running.remove(&claimed.schedule.id);
-            }
-            return;
-        }
+    if let Err(error) = prepare_run_account(&inner, &mut claimed) {
+        record_prepare_failure(&inner, &mut claimed, error);
+        return;
     }
+    let Some(started) = start_run(&inner, claimed) else {
+        return;
+    };
+    claimed = started;
     // 세션 참조는 실행 시작에 한 번 확정한다. 저장된 정책만 쓰고, 상대 날짜가 절대 구간이
     // 되는 것은 여기 한 번뿐이다. 확정된 정책은 프롬프트 앞에 붙어 전달된다.
     let (session_preamble, session_record) = resolve_run_session_read_for_run(&inner, &claimed);
     claimed.run.session_reference = Some(session_record);
     let _ = finish_run(&inner.app_data_dir, &claimed);
+    let use_resume = claimed.schedule.input.session_strategy == ScheduleSessionStrategy::Continue;
+    let result = run_chat_attempts(&inner, &mut claimed, &control, session_preamble.as_deref());
+    record_run_outcome(&mut claimed, result, &control, use_resume);
+    finish_and_emit(&inner, &claimed);
+}
+
+/// 계정 준비 단계에서 걸린 회차를 확정한다. 대기는 다음 틱이 같은 회차를 처음부터 다시
+/// 시도하도록 시작·종료 시각을 지우고 저장만 하고, 실패는 마지막 실행 시각까지 옮긴 뒤
+/// 결과를 알린다.
+fn record_prepare_failure(
+    inner: &SchedulerInner,
+    claimed: &mut ClaimedRun,
+    error: PrepareRunError,
+) {
+    match error {
+        PrepareRunError::Waiting(status, message) => {
+            claimed.run.wait(status, Some(message));
+            let _ = finish_run(&inner.app_data_dir, claimed);
+        }
+        PrepareRunError::Failed(message) => {
+            claimed
+                .run
+                .finish(ScheduleRunStatus::Failed, now_ms(), Some(message));
+            claimed.schedule.last_run_at = claimed.run.finished_at;
+            finish_and_emit(inner, claimed);
+        }
+    }
+}
+
+/// 예약된 대화를 띄워 실행 결과를 받는다. 재개가 거절되면 정책에 따라 새 대화로 한 번 더
+/// 시도하므로, 한 회차가 대화를 여는 횟수는 여기서만 늘어난다.
+fn run_chat_attempts(
+    inner: &Arc<SchedulerInner>,
+    claimed: &mut ClaimedRun,
+    control: &Arc<ActiveRunControl>,
+    session_preamble: Option<&str>,
+) -> Result<RunOutcome, String> {
     let previous = claimed.schedule.input.provider_session_id.clone();
     let use_resume = claimed.schedule.input.session_strategy == ScheduleSessionStrategy::Continue;
-    let first = execute_once(
-        &inner.chats,
-        &claimed.schedule,
-        claimed.run.actual_account_id.as_deref(),
-        &claimed.run.id,
-        use_resume.then_some(previous.as_deref()).flatten(),
-        &control,
-        &inner.app_data_dir,
-        session_preamble.as_deref(),
-    );
-    let result = match first {
+    let first = RunAttempt::new(inner, claimed, control, session_preamble)
+        .run(use_resume.then_some(previous.as_deref()).flatten());
+    match first {
         Err(error) if error.resume_failed && use_resume && previous.is_some() => {
-            handle_resume_failure(
-                &inner,
-                &mut claimed,
-                error.message,
-                &control,
-                &inner.app_data_dir,
-                session_preamble.as_deref(),
-            )
+            handle_resume_failure(inner, claimed, error.message, control, session_preamble)
         }
         result => result.map_err(|error| error.message),
-    };
+    }
+}
+
+/// 실행 결과를 회차·반복 요청 기록에 옮긴다. 저장은 하지 않는다 — 부르는 쪽이 확정한다.
+fn record_run_outcome(
+    claimed: &mut ClaimedRun,
+    result: Result<RunOutcome, String>,
+    control: &ActiveRunControl,
+    use_resume: bool,
+) {
     let now = now_ms();
     match result {
         Ok(outcome) => {
@@ -1620,7 +1624,7 @@ fn execute_claim(inner: Arc<SchedulerInner>, mut claimed: ClaimedRun) {
             }
         }
         Err(error) => {
-            claimed.run.status = if control.cancelled.load(Ordering::Acquire) {
+            let status = if control.cancelled.load(Ordering::Acquire) {
                 ScheduleRunStatus::Cancelled
             } else if crate::chat::is_usage_limit_message(&error) {
                 // 실행 도중 한도에 걸린 것은 이 회차의 잘못이 아니다. 세션이 한도 응답을
@@ -1630,14 +1634,12 @@ fn execute_claim(inner: Arc<SchedulerInner>, mut claimed: ClaimedRun) {
             } else {
                 ScheduleRunStatus::Failed
             };
-            claimed.run.error = Some(error);
             // 대기로 남긴 회차는 아직 끝나지 않았다. 시작·종료 시각을 지워 다음 틱이
             // 같은 회차를 처음부터 다시 시도하게 한다.
-            if claimed.run.status.is_waiting() {
-                claimed.run.started_at = None;
-                claimed.run.finished_at = None;
+            if status.is_waiting() {
+                claimed.run.wait(status, Some(error));
             } else {
-                claimed.run.finished_at = Some(now);
+                claimed.run.finish(status, now, Some(error));
             }
         }
     }
@@ -1647,11 +1649,13 @@ fn execute_claim(inner: Arc<SchedulerInner>, mut claimed: ClaimedRun) {
         claimed.schedule.last_run_at = Some(now);
     }
     claimed.schedule.updated_at = now;
-    let saved = finish_run(&inner.app_data_dir, &claimed).unwrap_or_else(|_| claimed.clone());
-    emit_result(&inner, &saved);
-    if let Ok(mut running) = inner.running.lock() {
-        running.remove(&claimed.schedule.id);
-    }
+}
+
+/// 회차 기록을 저장하고 결과를 알린다. 저장이 실패해도 알림은 가야 하므로 손에 든 기록을
+/// 그대로 쓴다.
+fn finish_and_emit(inner: &SchedulerInner, claimed: &ClaimedRun) {
+    let saved = finish_run(&inner.app_data_dir, claimed).unwrap_or_else(|_| claimed.clone());
+    emit_result(inner, &saved);
 }
 
 /// 워크플로 반복 실행 한 회차. 공급자 CLI를 띄우지 않으므로 계정 준비·대화 재개·세션
@@ -1661,22 +1665,10 @@ fn execute_workflow_claim(
     mut claimed: ClaimedRun,
     control: &Arc<ActiveRunControl>,
 ) {
-    claimed.run.status = ScheduleRunStatus::Running;
-    claimed.run.started_at = Some(now_ms());
-    claimed.run.last_heartbeat_at = claimed.run.started_at;
-    claimed.run.error = None;
-    match finish_run(&inner.app_data_dir, &claimed) {
-        Ok(saved) if saved.run.status == ScheduleRunStatus::Running => claimed = saved,
-        // 이미 terminal로 확정된 회차(취소 등)는 여기서 다시 쓰지 않는다.
-        Ok(_) => return,
-        Err(error) => {
-            claimed.run.status = ScheduleRunStatus::Failed;
-            claimed.run.finished_at = Some(now_ms());
-            claimed.run.error = Some(format!("반복 실행 상태를 저장하지 못했습니다: {error}"));
-            emit_result(inner, &claimed);
-            return;
-        }
-    }
+    let Some(started) = start_run(inner, claimed) else {
+        return;
+    };
+    claimed = started;
     let Some(action) = claimed.schedule.input.workflow.clone() else {
         return;
     };
@@ -1707,9 +1699,12 @@ fn execute_workflow_claim(
             claimed.run.status = ScheduleRunStatus::Failed;
             claimed.run.error = Some(failure.message);
             // 승인 버전이 어긋난 워크플로는 다음 회차도 같은 이유로 실패한다. 주기마다
-            // 실패만 쌓지 않고 멈춰 세워, 수정 화면에서 다시 승인하도록 남긴다.
+            // 실패만 쌓지 않고 멈춰 세운다. 사유를 함께 남기는 것은 계약이 다시 등록될 때
+            // `adopt_workflow_version`이 이 회차를 되살려도 되는지 가리기 위해서다 — 사용자가
+            // 일부러 끈 회차를 등록 한 번으로 켜 버리면 안 된다.
             if failure.pause_schedule {
                 claimed.schedule.input.enabled = false;
+                claimed.schedule.paused_reason = Some(SchedulePauseReason::WorkflowVersion);
             }
         }
     }
@@ -1717,14 +1712,31 @@ fn execute_workflow_claim(
     claimed.run.last_heartbeat_at = Some(now);
     claimed.schedule.last_run_at = Some(now);
     claimed.schedule.updated_at = now;
-    let saved = finish_run(&inner.app_data_dir, &claimed).unwrap_or_else(|_| claimed.clone());
-    emit_result(inner, &saved);
+    finish_and_emit(inner, &claimed);
 }
 
 struct WorkflowRunFailure {
     message: String,
     /// 다시 승인받아야 하는 사유. 같은 이유로 매 주기 실패하지 않게 반복 요청을 멈춘다.
     pause_schedule: bool,
+}
+
+impl WorkflowRunFailure {
+    /// 이 회차만 실패로 접는다. 다음 주기는 그대로 다시 돈다.
+    fn this_run(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            pause_schedule: false,
+        }
+    }
+
+    /// 반복 요청까지 멈춘다. 승인 없이는 다음 주기도 같은 이유로 실패할 사유에만 쓴다.
+    fn pausing(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            pause_schedule: true,
+        }
+    }
 }
 
 /// 워크플로를 별도 스레드에서 돌리고, 기다리는 동안 회차 heartbeat를 갱신한다. 갱신하지
@@ -1739,17 +1751,15 @@ fn run_workflow_action(
     control: &Arc<ActiveRunControl>,
 ) -> Result<Value, WorkflowRunFailure> {
     let Some(executor) = inner.workflow_executor() else {
-        return Err(WorkflowRunFailure {
-            message: "워크플로 실행 계층을 사용할 수 없어 이 회차를 실행하지 않았습니다".to_owned(),
-            pause_schedule: false,
-        });
+        return Err(WorkflowRunFailure::this_run(
+            "워크플로 실행 계층을 사용할 수 없어 이 회차를 실행하지 않았습니다",
+        ));
     };
-    executor
-        .validate_workflow(action)
-        .map_err(|error| WorkflowRunFailure {
-            message: format!("워크플로를 실행할 수 없어 반복 요청을 일시정지했습니다: {error}"),
-            pause_schedule: true,
-        })?;
+    executor.validate_workflow(action).map_err(|error| {
+        WorkflowRunFailure::pausing(format!(
+            "워크플로를 실행할 수 없어 반복 요청을 일시정지했습니다: {error}"
+        ))
+    })?;
     let idempotency_key = format!("schedule-workflow-{run_id}");
     // 워크플로 단계가 띄우는 채팅에 실릴 출처. 어느 반복 요청의 회차인지가 사용량
     // 페이싱의 소비자 식별 근거다.
@@ -1771,28 +1781,21 @@ fn run_workflow_action(
     loop {
         match receiver.recv_timeout(TICK_INTERVAL) {
             Ok(result) => {
-                return result.map_err(|error| WorkflowRunFailure {
-                    message: error.to_string(),
-                    pause_schedule: false,
-                })
+                return result.map_err(|error| WorkflowRunFailure::this_run(error.to_string()))
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let _ = touch_run_heartbeat(&inner.app_data_dir, run_id, control);
                 if startup_deadline_exceeded(started, MAX_RUN_DURATION) {
-                    return Err(WorkflowRunFailure {
-                        message: format!(
-                            "워크플로가 {}시간 안에 끝나지 않아 이 회차를 실패로 확정했습니다",
-                            MAX_RUN_DURATION.as_secs() / 3600
-                        ),
-                        pause_schedule: false,
-                    });
+                    return Err(WorkflowRunFailure::this_run(format!(
+                        "워크플로가 {}시간 안에 끝나지 않아 이 회차를 실패로 확정했습니다",
+                        MAX_RUN_DURATION.as_secs() / 3600
+                    )));
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(WorkflowRunFailure {
-                    message: "워크플로 실행 작업이 결과 없이 종료되었습니다".to_owned(),
-                    pause_schedule: false,
-                })
+                return Err(WorkflowRunFailure::this_run(
+                    "워크플로 실행 작업이 결과 없이 종료되었습니다",
+                ))
             }
         }
     }
@@ -1897,16 +1900,11 @@ impl Drop for RunExecutionRegistration {
         }
         let now = now_ms();
         let _ = with_store(&self.inner.app_data_dir, |store| {
-            if let Some(run) = store.runs.iter_mut().find(|run| run.id == self.run_id) {
-                if matches!(run.status, ScheduleRunStatus::Running) {
-                    run.status = ScheduleRunStatus::Failed;
-                    run.finished_at = Some(now);
-                    run.last_heartbeat_at = Some(now);
-                    run.error = Some(
-                        "반복 실행 소유 작업이 terminal 상태를 저장하기 전에 종료되었습니다"
-                            .to_owned(),
-                    );
-                }
+            if let Some(run) = store.run_mut(&self.run_id) {
+                run.expire_running(
+                    now,
+                    "반복 실행 소유 작업이 terminal 상태를 저장하기 전에 종료되었습니다".to_owned(),
+                );
             }
             Ok(())
         });
@@ -1925,79 +1923,103 @@ enum PrepareRunError {
 /// 있으면 활성 계정이 아니어도 공유 CLI 홈을 읽지 않으므로, 반복 실행은 계정을
 /// 전환하지 않는다. 전환은 공유 홈의 로그인 계정을 바꿔 앱 밖의 CLI까지 영향을
 /// 주고, 되돌리는 동안 수동 전환과 다른 채팅을 모두 멈춰 세웠다.
+///
+/// 준비는 세 단계다: 어느 계정으로 돌지 고르고 → 그 계정이 지금 쓸 수 있는지 보고 →
+/// 자격증명 격리를 준비한다. 각 단계는 실패와 대기를 스스로 판별한다.
 fn prepare_run_account(
     inner: &SchedulerInner,
     claimed: &mut ClaimedRun,
 ) -> Result<(), PrepareRunError> {
     let source = claimed.schedule.input.source;
-    // 계정 레지스트리는 다중 계정을 관리하는 공급자만 담는다. Antigravity처럼 담기지
-    // 않는 공급자는 활성 계정 조회 자체가 "지원하지 않는 계정 공급자"로 거절되어, 준비
-    // 단계에서 회차가 통째로 실패했다. 채팅 시작 경로는 이미 이 공급자를 계정 미귀속으로
-    // 시작하므로(`chat::resolve_start_account_id`) 회차도 같은 규칙을 따른다.
+    // 계정 레지스트리는 다중 계정을 관리하는 공급자만 담는다. 담기지 않는 공급자는 활성
+    // 계정 조회 자체가 "지원하지 않는 계정 공급자"로 거절되어 준비 단계에서 회차가 통째로
+    // 실패한다. 채팅 시작 경로가 그런 공급자를 계정 미귀속으로 시작하므로
+    // (`chat::resolve_start_account_id`) 회차도 같은 규칙을 따른다. Antigravity는 이제
+    // 레지스트리에 담기므로 이 갈래를 타지 않는다.
     if !source.manages_accounts() {
         claimed.run.actual_account_id = None;
         return Ok(());
     }
-    let follow_active = claimed.schedule.input.use_active_account;
     let Some(accounts) = &inner.accounts else {
         claimed.run.actual_account_id = pinned_account_id(&claimed.schedule.input);
         return Ok(());
     };
-    let requested = if follow_active {
-        // 기본 계정이 아직 없으면 실패로 확정하지 않는다. 사용자가 기본 계정을 고르면
-        // 다음 틱에서 그대로 이어 실행된다.
-        accounts
-            .active_account_id(source)
-            .map_err(|error| PrepareRunError::Failed(error.to_string()))?
-            .ok_or_else(|| {
-                PrepareRunError::Waiting(
-                    ScheduleRunStatus::WaitingForAccount,
-                    "실행 시점 기본 계정이 없어 대기합니다. 공급자의 기본 계정을 먼저 선택하세요"
-                        .to_owned(),
-                )
-            })?
-    } else {
-        claimed.schedule.input.account_id.clone()
-    };
-    let requested = requested.as_str();
-    let subject = if follow_active {
-        "실행 시점 기본 계정"
-    } else {
-        "반복 요청의 실행 계정"
-    };
+    let (requested, subject) = requested_run_account(accounts, &claimed.schedule.input)?;
+    ensure_account_ready(
+        accounts,
+        source,
+        &requested,
+        claimed.schedule.input.model.as_deref(),
+        subject,
+        &claimed.schedule.input.recurrence,
+    )?;
+    ensure_credential_isolation(accounts, source, &requested)?;
+    claimed.run.actual_account_id = Some(requested);
+    Ok(())
+}
+
+/// 이 회차가 쓸 계정과, 대기·실패 문구에서 그 계정을 부를 이름. 실행 시점 기본 계정을
+/// 따르는 요청은 지금 기본 계정을 읽고, 고정 계정을 쓰는 요청은 저장된 값을 그대로 쓴다.
+fn requested_run_account(
+    accounts: &AccountSupervisor,
+    input: &ScheduledRequestInput,
+) -> Result<(String, &'static str), PrepareRunError> {
+    if !input.use_active_account {
+        return Ok((input.account_id.clone(), "반복 요청의 실행 계정"));
+    }
+    // 기본 계정이 아직 없으면 실패로 확정하지 않는다. 사용자가 기본 계정을 고르면
+    // 다음 틱에서 그대로 이어 실행된다.
+    let active = accounts
+        .active_account_id(input.source)
+        .map_err(|error| PrepareRunError::Failed(error.to_string()))?
+        .ok_or_else(|| {
+            PrepareRunError::Waiting(
+                ScheduleRunStatus::WaitingForAccount,
+                "실행 시점 활성 계정이 없어 대기합니다. 공급자의 활성 계정을 먼저 선택하세요"
+                    .to_owned(),
+            )
+        })?;
+    Ok((active, "실행 시점 활성 계정"))
+}
+
+/// 계정의 준비 상태를 회차의 처분으로 옮긴다. 사용자가 손대야 풀리는 상태만 실패로
+/// 확정하고, 시간이 지나면 저절로 풀리는 상태는 대기로 남긴다.
+fn ensure_account_ready(
+    accounts: &AccountSupervisor,
+    source: ProviderId,
+    requested: &str,
+    model: Option<&str>,
+    subject: &'static str,
+    recurrence: &ScheduleRecurrence,
+) -> Result<(), PrepareRunError> {
     match accounts
-        .run_readiness(source, requested)
+        .run_readiness(source, requested, model)
         .map_err(|error| PrepareRunError::Failed(error.to_string()))?
     {
-        RunReadiness::Ready => {}
+        RunReadiness::Ready => Ok(()),
         // 사용자가 끈 계정은 저절로 돌아오지 않으므로 이 회차를 실패로 확정한다.
-        RunReadiness::Disabled => {
-            return Err(PrepareRunError::Failed(format!(
-                "{subject}이 비활성화되었습니다"
-            )));
-        }
+        RunReadiness::Disabled => Err(PrepareRunError::Failed(format!(
+            "{subject}이 비활성화되었습니다"
+        ))),
         // 인증 상태를 잃은 것은 일시 상태일 수 있다. 공유 홈 자격증명 확인이 401이나
         // 중간에 끊긴 기록을 만나면 붙었다가 다음 조회가 성공하면 풀린다. 실패로
         // 확정하면 몇 분 뒤면 회복될 상태 때문에 예약된 회차가 통째로 날아가므로
         // 대기로 남겨 다음 틱에서 다시 확인한다.
-        RunReadiness::NeedsReauthentication => {
-            return Err(PrepareRunError::Waiting(
-                ScheduleRunStatus::WaitingForAccount,
-                format!(
-                    "{subject}의 인증이 확인되지 않아 대기합니다. 상태가 계속되면 이 계정을 다시 인증하세요"
-                ),
-            ));
-        }
+        RunReadiness::NeedsReauthentication => Err(PrepareRunError::Waiting(
+            ScheduleRunStatus::WaitingForAccount,
+            format!(
+                "{subject}의 인증이 확인되지 않아 대기합니다. 상태가 계속되면 이 계정을 다시 인증하세요"
+            ),
+        )),
         // 확인하지 못한 인증은 대기 시각이 지나면 그냥 실행해 본다. 실행되면 CLI가
         // 토큰을 회전시켜 계정이 스스로 낫고, 정말 거부된 자격증명이면 그 실행이
         // 실패하며 정확한 상태를 다시 만든다. 무한정 대기시키는 쪽이 오히려
         // 회복 경로를 닫는다.
         RunReadiness::AuthUnverified { retry_after } => {
-            if let Some(retry_after) = retry_after.filter(|retry_after| *retry_after > now_ms()) {
-                return Err(PrepareRunError::Waiting(
+            match retry_after.filter(|retry_after| *retry_after > now_ms()) {
+                Some(retry_after) => Err(PrepareRunError::Waiting(
                     ScheduleRunStatus::WaitingForAccount,
-                    match format_local_time(retry_after, &claimed.schedule.input.recurrence.timezone)
-                    {
+                    match format_local_time(retry_after, &recurrence.timezone) {
                         Some(when) => format!(
                             "{subject}의 인증을 확인하지 못해 대기합니다 · {when} 이후 재시도"
                         ),
@@ -2005,36 +2027,41 @@ fn prepare_run_account(
                             "{subject}의 인증을 확인하지 못해 대기합니다. 갱신 제한이 풀리면 이 회차를 이어서 실행합니다"
                         ),
                     },
-                ));
+                )),
+                None => Ok(()),
             }
         }
         // 한도는 시간이 지나면 저절로 풀린다. 여기서 실패로 확정하면 사용자가 손댈 수
         // 없는 이유로 예약된 회차가 사라지므로, 복구될 때까지 이 회차를 그대로 멈춰 둔다.
-        RunReadiness::UsageExhausted { resume_at } => {
-            return Err(PrepareRunError::Waiting(
-                ScheduleRunStatus::WaitingForUsage,
-                usage_wait_message(subject, resume_at, &claimed.schedule.input.recurrence),
-            ));
-        }
+        RunReadiness::UsageExhausted { resume_at } => Err(PrepareRunError::Waiting(
+            ScheduleRunStatus::WaitingForUsage,
+            usage_wait_message(subject, resume_at, recurrence),
+        )),
     }
-    // 모든 계정은 자기 격리 프로필로 실행된다. 프로브는 공급자 CLI를 실제로 띄우므로
-    // 실행 직전에 한 번만 돌린다.
-    if !accounts.ensure_credential_isolation(source, requested) {
-        // 격리 준비 실패는 CLI 탐색 실패나 일시적 입출력으로도 생긴다. 실행을
-        // 실패로 확정하지 않고 대기로 남긴다. 실패 판정은 재시도 시각까지만
-        // 캐시되므로, 원인을 고치면 이후 틱에서 프로브가 다시 돌아 회복된다.
-        return Err(PrepareRunError::Waiting(
-            ScheduleRunStatus::WaitingForAccount,
-            match accounts.credential_profile_fallback_reason(requested) {
-                Some(reason) => {
-                    format!("실행 계정의 자격증명 격리를 준비하지 못해 대기합니다: {reason}")
-                }
-                None => "실행 계정의 자격증명 격리를 준비하지 못해 대기합니다".to_owned(),
-            },
-        ));
+}
+
+/// 모든 계정은 자기 격리 프로필로 실행된다. 프로브는 공급자 CLI를 실제로 띄우므로
+/// 실행 직전에 한 번만 돌린다.
+fn ensure_credential_isolation(
+    accounts: &AccountSupervisor,
+    source: ProviderId,
+    requested: &str,
+) -> Result<(), PrepareRunError> {
+    if accounts.ensure_credential_isolation(source, requested) {
+        return Ok(());
     }
-    claimed.run.actual_account_id = Some(requested.to_owned());
-    Ok(())
+    // 격리 준비 실패는 CLI 탐색 실패나 일시적 입출력으로도 생긴다. 실행을
+    // 실패로 확정하지 않고 대기로 남긴다. 실패 판정은 재시도 시각까지만
+    // 캐시되므로, 원인을 고치면 이후 틱에서 프로브가 다시 돌아 회복된다.
+    Err(PrepareRunError::Waiting(
+        ScheduleRunStatus::WaitingForAccount,
+        match accounts.credential_profile_fallback_reason(requested) {
+            Some(reason) => {
+                format!("실행 계정의 자격증명 격리를 준비하지 못해 대기합니다: {reason}")
+            }
+            None => "실행 계정의 자격증명 격리를 준비하지 못해 대기합니다".to_owned(),
+        },
+    ))
 }
 
 /// 사용량 복구를 기다리는 회차에 남길 문구. 언제 다시 도는지가 이 상태에서 사용자가
@@ -2077,12 +2104,10 @@ fn handle_resume_failure(
     claimed: &mut ClaimedRun,
     first_error: String,
     control: &Arc<ActiveRunControl>,
-    app_data_dir: &Path,
     session_preamble: Option<&str>,
 ) -> Result<RunOutcome, String> {
-    // 재개 실패로 새 대화를 열어도 처음 실행이 고른 계정을 그대로 쓴다. 실행 도중
-    // 활성 계정이 바뀌어도 한 실행 안에서 계정이 갈리지 않는다.
-    let account_id = claimed.run.actual_account_id.clone();
+    // 재개 실패로 새 대화를 열어도 처음 실행이 고른 계정을 그대로 쓴다(`RunAttempt`가
+    // 회차에 적힌 계정을 읽는다). 실행 도중 활성 계정이 바뀌어도 계정이 갈리지 않는다.
     match claimed.schedule.input.resume_failure_policy {
         ResumeFailurePolicy::Pause => {
             claimed.schedule.input.enabled = false;
@@ -2092,44 +2117,22 @@ fn handle_resume_failure(
         }
         ResumeFailurePolicy::NewChat => {
             claimed.run.session_replaced = true;
-            execute_once(
-                &inner.chats,
-                &claimed.schedule,
-                account_id.as_deref(),
-                &claimed.run.id,
-                None,
-                control,
-                app_data_dir,
-                session_preamble,
-            )
-            .map_err(|error| error.message)
+            RunAttempt::new(inner, claimed, control, session_preamble)
+                .fresh()
+                .map_err(|error| error.message)
         }
         ResumeFailurePolicy::RetryThenNewChat => {
             claimed.run.retry_count = 1;
-            match execute_once(
-                &inner.chats,
-                &claimed.schedule,
-                account_id.as_deref(),
-                &claimed.run.id,
-                claimed.schedule.input.provider_session_id.as_deref(),
-                control,
-                app_data_dir,
-                session_preamble,
-            ) {
+            let previous = claimed.schedule.input.provider_session_id.clone();
+            let retried =
+                RunAttempt::new(inner, claimed, control, session_preamble).run(previous.as_deref());
+            match retried {
                 Ok(outcome) => Ok(outcome),
                 Err(error) if error.resume_failed => {
                     claimed.run.session_replaced = true;
-                    execute_once(
-                        &inner.chats,
-                        &claimed.schedule,
-                        account_id.as_deref(),
-                        &claimed.run.id,
-                        None,
-                        control,
-                        app_data_dir,
-                        session_preamble,
-                    )
-                    .map_err(|error| error.message)
+                    RunAttempt::new(inner, claimed, control, session_preamble)
+                        .fresh()
+                        .map_err(|error| error.message)
                 }
                 Err(error) => Err(error.message),
             }
@@ -2168,6 +2171,24 @@ fn registered_project_paths(app_data_dir: &Path) -> Result<Vec<PathBuf>, CoreErr
     ))
 }
 
+/// 세션 참조 없이 회차를 돌릴 때의 기록. 창을 잡지 못했으므로 `window_*`는 비고, 프롬프트
+/// 앞에 붙일 안내도 없다. 사유(`summary`)와 부가 설명(`notes`)만 갈린다.
+fn session_read_denied(
+    summary: impl Into<String>,
+    notes: Vec<String>,
+) -> (Option<String>, ScheduleRunSessionRead) {
+    (
+        None,
+        ScheduleRunSessionRead {
+            granted: false,
+            summary: summary.into(),
+            window_from: None,
+            window_to: None,
+            notes,
+        },
+    )
+}
+
 /// 이 회차가 다른 에이전트 세션을 읽을 범위를 확정한다. 확정된 정책은 실행 프롬프트 앞에
 /// 붙어 에이전트가 `session-context` 스킬에 그대로 넘길 수 있는 형태로 전달된다.
 fn resolve_run_session_read_for_run(
@@ -2175,44 +2196,20 @@ fn resolve_run_session_read_for_run(
     claimed: &ClaimedRun,
 ) -> (Option<String>, ScheduleRunSessionRead) {
     let Some(settings) = claimed.schedule.input.session_reference.as_ref() else {
-        return (
-            None,
-            ScheduleRunSessionRead {
-                granted: false,
-                summary: "세션 참조 사용 안 함".to_owned(),
-                window_from: None,
-                window_to: None,
-                notes: Vec::new(),
-            },
-        );
+        return session_read_denied("세션 참조 사용 안 함", Vec::new());
     };
     let summary = crate::session_context::describe_policy(&settings.policy);
     if !settings.policy.enabled {
-        return (
-            None,
-            ScheduleRunSessionRead {
-                granted: false,
-                summary,
-                window_from: None,
-                window_to: None,
-                notes: Vec::new(),
-            },
-        );
+        return session_read_denied(summary, Vec::new());
     }
     let registered = match registered_project_paths(&inner.app_data_dir) {
         Ok(registered) => registered,
         Err(error) => {
-            return (
-                None,
-                ScheduleRunSessionRead {
-                    granted: false,
-                    summary,
-                    window_from: None,
-                    window_to: None,
-                    notes: vec![format!(
-                        "등록 프로젝트를 확인하지 못해 세션 참조를 안내하지 않았습니다: {error}"
-                    )],
-                },
+            return session_read_denied(
+                summary,
+                vec![format!(
+                    "등록 프로젝트를 확인하지 못해 세션 참조를 안내하지 않았습니다: {error}"
+                )],
             )
         }
     };
@@ -2226,47 +2223,86 @@ fn resolve_run_session_read_for_run(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_once(
-    chats: &ChatSupervisor,
-    schedule: &ScheduledRequest,
-    account_id: Option<&str>,
-    capture_id: &str,
-    resume_session_id: Option<&str>,
-    control: &Arc<ActiveRunControl>,
-    app_data_dir: &Path,
-    session_preamble: Option<&str>,
-) -> Result<RunOutcome, RunAttemptError> {
-    let request = run_start_request(schedule, account_id, capture_id, resume_session_id, control);
-    let attachment = await_run_startup(chats, request, control, app_data_dir, capture_id)?;
-    let chat_id = attachment.info.chat_id.clone();
-    if let Ok(mut active_chat_id) = control.chat_id.lock() {
-        *active_chat_id = Some(chat_id.clone());
+/// 회차 한 번을 띄우는 데 필요한 고정 항목 묶음. 한 회차 안에서 대화를 여러 번 열어도
+/// 계정·회차 id·머리말은 그대로여야 하므로, 갈래마다 달라지는 것은 이어 붙일 세션 id
+/// 하나뿐이다. 그 하나만 인자로 남기고 나머지는 회차가 확정한 값을 그대로 읽는다.
+#[derive(Clone, Copy)]
+struct RunAttempt<'a> {
+    claimed: &'a ClaimedRun,
+    chats: &'a ChatSupervisor,
+    control: &'a Arc<ActiveRunControl>,
+    app_data_dir: &'a Path,
+    session_preamble: Option<&'a str>,
+}
+
+impl<'a> RunAttempt<'a> {
+    fn new(
+        inner: &'a Arc<SchedulerInner>,
+        claimed: &'a ClaimedRun,
+        control: &'a Arc<ActiveRunControl>,
+        session_preamble: Option<&'a str>,
+    ) -> Self {
+        Self {
+            claimed,
+            chats: &inner.chats,
+            control,
+            app_data_dir: &inner.app_data_dir,
+            session_preamble,
+        }
     }
-    if control.cancelled.load(Ordering::Acquire) {
-        let _ = chats.stop(&chat_id);
-        return Err(RunAttemptError::plain("반복 요청 실행이 취소되었습니다"));
+
+    /// 새 대화로 연다. 재개가 거절돼 갈아타는 자리에서 쓴다.
+    fn fresh(&self) -> Result<RunOutcome, RunAttemptError> {
+        self.run(None)
     }
-    let prompt = match session_preamble {
-        Some(preamble) => format!("{preamble}\n{}", schedule.input.prompt),
-        None => schedule.input.prompt.clone(),
-    };
-    if let Err(error) = chats.send(&chat_id, &prompt) {
-        let _ = chats.stop(&chat_id);
-        return Err(RunAttemptError {
-            message: error.to_string(),
-            resume_failed: resume_session_id.is_some(),
-        });
+
+    fn run(&self, resume_session_id: Option<&str>) -> Result<RunOutcome, RunAttemptError> {
+        let RunAttempt {
+            claimed,
+            chats,
+            control,
+            app_data_dir,
+            session_preamble,
+        } = *self;
+        let schedule = &claimed.schedule;
+        let capture_id = claimed.run.id.as_str();
+        let request = run_start_request(
+            schedule,
+            claimed.run.actual_account_id.as_deref(),
+            capture_id,
+            resume_session_id,
+            control,
+        );
+        let attachment = await_run_startup(chats, request, control, app_data_dir, capture_id)?;
+        let chat_id = attachment.info.chat_id.clone();
+        if let Ok(mut active_chat_id) = control.chat_id.lock() {
+            *active_chat_id = Some(chat_id.clone());
+        }
+        if control.cancelled.load(Ordering::Acquire) {
+            let _ = chats.stop(&chat_id);
+            return Err(RunAttemptError::plain("반복 요청 실행이 취소되었습니다"));
+        }
+        let prompt = match session_preamble {
+            Some(preamble) => format!("{preamble}\n{}", schedule.input.prompt),
+            None => schedule.input.prompt.clone(),
+        };
+        if let Err(error) = chats.send(&chat_id, &prompt) {
+            let _ = chats.stop(&chat_id);
+            return Err(RunAttemptError {
+                message: error.to_string(),
+                resume_failed: resume_session_id.is_some(),
+            });
+        }
+        drain_run_events(
+            chats,
+            attachment,
+            &chat_id,
+            control,
+            app_data_dir,
+            capture_id,
+            resume_session_id,
+        )
     }
-    drain_run_events(
-        chats,
-        attachment,
-        &chat_id,
-        control,
-        app_data_dir,
-        capture_id,
-        resume_session_id,
-    )
 }
 
 /// 회차 한 번을 띄우는 채팅 시작 요청. 반복 요청은 언제나 unattended 실행이고 회차마다
@@ -2283,6 +2319,7 @@ fn run_start_request(
         account_id: account_id.map(str::to_owned),
         cwd: schedule.input.cwd.clone(),
         model: schedule.input.model.clone(),
+        local_connection_id: schedule.input.local_connection_id.clone(),
         reasoning_effort: schedule.input.reasoning_effort.clone(),
         mode: schedule.input.mode,
         approval_mode: schedule.input.approval_mode,
@@ -2302,8 +2339,14 @@ fn run_start_request(
         // 사용자가 세션 메타에서 따로 건다. 회차마다 자동으로 고정하지 않는다.
         pin_account: false,
         profile: ChatProfile::Standard,
+        // 반복 요청은 **등록 자체가 허용**이다(2026-09-27 사용자 결정). 사람이 이 요청을
+        // 만들 때 무엇을 시킬지 적었으므로, 그 실행이 Agent Manager 자신을 다루는 도구를
+        // 쥐는 것까지 그 승인에 든다. 프로필은 그대로 Standard 다 — AIA 페르소나·작업
+        // 경로·세션 휘발성까지 바꾸면 지금 도는 회차들이 기대는 것이 달라진다.
+        system_tools: true,
         decision_policy: Default::default(),
         aia_runtime: None,
+        record_session: false,
         settings: Default::default(),
         startup_cancel: Some(Arc::clone(&control.cancelled)),
     }
@@ -2368,81 +2411,165 @@ fn drain_run_events(
     capture_id: &str,
     resume_session_id: Option<&str>,
 ) -> Result<RunOutcome, RunAttemptError> {
-    let mut provider_session_id = attachment.info.provider_session_id.clone();
     let started = SystemTime::now();
-    let mut summary = String::new();
-    let mut last_error = None;
-    let mut provider_activity = false;
-    // provider가 한 번이라도 반응한 뒤의 실패는 재개 자체가 깨진 것이 아니다.
-    let resume_broken = |provider_activity: bool| resume_session_id.is_some() && !provider_activity;
+    let mut progress = RunProgress::new(
+        attachment.info.provider_session_id.clone(),
+        resume_session_id.is_some(),
+    );
     loop {
         let _ = touch_run_heartbeat(app_data_dir, capture_id, control);
-        if control.cancelled.load(Ordering::Acquire) {
+        if let Some(reason) = run_abort_reason(control, started, progress.provider_activity) {
             let _ = chats.stop(chat_id);
-            return Err(RunAttemptError::plain("반복 요청 실행이 취소되었습니다"));
+            return Err(RunAttemptError::plain(reason));
         }
-        let elapsed = started.elapsed().unwrap_or_default();
-        if elapsed > MAX_RUN_DURATION {
-            let _ = chats.stop(chat_id);
-            return Err(RunAttemptError::plain(
-                "반복 요청 실행 시간이 6시간을 초과했습니다",
-            ));
-        }
-        if !provider_activity && elapsed > MAX_PROVIDER_STARTUP_DURATION {
-            let _ = chats.stop(chat_id);
-            return Err(RunAttemptError::plain(
-                "에이전트가 5분 안에 응답을 시작하지 않았습니다. 작업 경로 접근 권한을 확인하세요",
-            ));
-        }
-        match attachment.events.recv_timeout(Duration::from_secs(1)) {
-            Ok(ChatEvent::State { session }) => {
-                provider_session_id = session.provider_session_id;
-                if matches!(session.state, ChatPhase::Stopped | ChatPhase::Failed) {
-                    return Err(RunAttemptError {
-                        message: "scheduler 소유 unattended runtime이 종료되어 반복 실행을 finalize했습니다".to_owned(),
-                        resume_failed: resume_broken(provider_activity),
-                    });
-                }
-            }
-            Ok(ChatEvent::MessageDelta {
-                role, kind, delta, ..
-            }) if role == "assistant" && kind == "message" => {
-                provider_activity = true;
-                summary.push_str(&delta);
-                if summary.chars().count() > 2_000 {
-                    summary = summary.chars().take(2_000).collect();
-                }
-            }
-            Ok(ChatEvent::MessageDelta { role, .. }) if role == "assistant" => {
-                provider_activity = true;
-            }
-            Ok(ChatEvent::Tool { status, .. }) if status != "log" => {
-                provider_activity = true;
-            }
-            Ok(ChatEvent::Approval { .. }) | Ok(ChatEvent::ApprovalResolved { .. }) => {
-                provider_activity = true;
-            }
-            Ok(ChatEvent::Error { message }) => last_error = Some(message),
-            Ok(ChatEvent::Turn { status, .. }) if status != "started" => {
-                let _ = chats.stop(chat_id);
-                if status == "completed" {
-                    return Ok(RunOutcome {
-                        provider_session_id,
-                        summary: clean_summary(summary),
-                    });
-                }
-                return Err(RunAttemptError {
-                    message: last_error.unwrap_or_else(|| format!("에이전트 실행 상태: {status}")),
-                    resume_failed: resume_broken(provider_activity),
-                });
-            }
-            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+        let event = match attachment.events.recv_timeout(Duration::from_secs(1)) {
+            Ok(event) => event,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = chats.stop(chat_id);
-                return Err(RunAttemptError {
-                    message: "반복 요청 채팅 연결이 종료되었습니다".to_owned(),
-                    resume_failed: resume_broken(provider_activity),
-                });
+                return Err(progress.failure("반복 요청 채팅 연결이 종료되었습니다".to_owned()));
+            }
+        };
+        let Some(termination) = progress.apply(event) else {
+            continue;
+        };
+        if termination.stops_chat() {
+            let _ = chats.stop(chat_id);
+        }
+        return progress.finish(termination);
+    }
+}
+
+/// 이벤트와 무관하게 훑기를 끊어야 하는 사유. 취소 → 총 실행 시한 → provider 무응답 순으로
+/// 보고, 끊을 이유가 없으면 `None`.
+fn run_abort_reason(
+    control: &ActiveRunControl,
+    started: SystemTime,
+    provider_activity: bool,
+) -> Option<&'static str> {
+    if control.cancelled.load(Ordering::Acquire) {
+        return Some("반복 요청 실행이 취소되었습니다");
+    }
+    if startup_deadline_exceeded(started, MAX_RUN_DURATION) {
+        return Some("반복 요청 실행 시간이 6시간을 초과했습니다");
+    }
+    if !provider_activity && startup_deadline_exceeded(started, MAX_PROVIDER_STARTUP_DURATION) {
+        return Some(
+            "에이전트가 5분 안에 응답을 시작하지 않았습니다. 작업 경로 접근 권한을 확인하세요",
+        );
+    }
+    None
+}
+
+/// 훑기가 끝난 사유. `stops_chat`이 이 자리에 있는 것은 "런타임이 이미 끝났다고 알려 온
+/// 경우에는 다시 내리지 않는다"가 사유에 딸린 규칙이기 때문이다.
+enum RunTermination {
+    /// 턴이 정상으로 끝났다.
+    Completed,
+    /// 런타임은 아직 살아 있고 실행만 실패했다.
+    Failed(String),
+    /// 런타임이 스스로 종료를 알려 왔다.
+    RuntimeGone(String),
+}
+
+impl RunTermination {
+    fn stops_chat(&self) -> bool {
+        !matches!(self, Self::RuntimeGone(_))
+    }
+}
+
+/// 이벤트를 훑으며 쌓이는 것. 로그와 달리 여기 남는 값만 실행 결과에 실린다.
+struct RunProgress {
+    provider_session_id: Option<String>,
+    summary: String,
+    last_error: Option<String>,
+    provider_activity: bool,
+    resuming: bool,
+}
+
+impl RunProgress {
+    fn new(provider_session_id: Option<String>, resuming: bool) -> Self {
+        Self {
+            provider_session_id,
+            summary: String::new(),
+            last_error: None,
+            provider_activity: false,
+            resuming,
+        }
+    }
+
+    /// 이벤트 하나를 반영하고, 그 이벤트가 훑기를 끝내면 사유를 돌려준다.
+    fn apply(&mut self, event: ChatEvent) -> Option<RunTermination> {
+        match event {
+            ChatEvent::State { session } => {
+                self.provider_session_id = session.provider_session_id;
+                matches!(session.state, ChatPhase::Stopped | ChatPhase::Failed).then(|| {
+                    RunTermination::RuntimeGone(
+                        "scheduler 소유 unattended runtime이 종료되어 반복 실행을 finalize했습니다"
+                            .to_owned(),
+                    )
+                })
+            }
+            ChatEvent::MessageDelta {
+                role, kind, delta, ..
+            } if role == "assistant" => {
+                self.provider_activity = true;
+                if kind == "message" {
+                    self.push_summary(&delta);
+                }
+                None
+            }
+            ChatEvent::Tool { status, .. } if status != "log" => {
+                self.provider_activity = true;
+                None
+            }
+            ChatEvent::Approval { .. } | ChatEvent::ApprovalResolved { .. } => {
+                self.provider_activity = true;
+                None
+            }
+            ChatEvent::Error { message } => {
+                self.last_error = Some(message);
+                None
+            }
+            ChatEvent::Turn { status, .. } if status != "started" => {
+                Some(if status == "completed" {
+                    RunTermination::Completed
+                } else {
+                    RunTermination::Failed(
+                        self.last_error
+                            .clone()
+                            .unwrap_or_else(|| format!("에이전트 실행 상태: {status}")),
+                    )
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// 요약은 앞에서부터 상한까지만 남긴다. 긴 실행에서 무한히 붙지 않게 조각마다 자른다.
+    fn push_summary(&mut self, delta: &str) {
+        self.summary.push_str(delta);
+        if self.summary.chars().count() > MAX_RUN_SUMMARY_CHARS {
+            self.summary = self.summary.chars().take(MAX_RUN_SUMMARY_CHARS).collect();
+        }
+    }
+
+    /// provider가 한 번이라도 반응한 뒤의 실패는 재개 자체가 깨진 것이 아니다.
+    fn failure(&self, message: String) -> RunAttemptError {
+        RunAttemptError {
+            message,
+            resume_failed: self.resuming && !self.provider_activity,
+        }
+    }
+
+    fn finish(self, termination: RunTermination) -> Result<RunOutcome, RunAttemptError> {
+        match termination {
+            RunTermination::Completed => Ok(RunOutcome {
+                provider_session_id: self.provider_session_id,
+                summary: clean_summary(self.summary),
+            }),
+            RunTermination::Failed(message) | RunTermination::RuntimeGone(message) => {
+                Err(self.failure(message))
             }
         }
     }
@@ -2451,11 +2578,7 @@ fn drain_run_events(
 fn finish_run(app_data_dir: &Path, claimed: &ClaimedRun) -> Result<ClaimedRun, CoreError> {
     with_store(app_data_dir, |store| {
         let mut saved = claimed.clone();
-        if let Some(schedule) = store
-            .schedules
-            .iter_mut()
-            .find(|schedule| schedule.id == claimed.schedule.id)
-        {
+        if let Some(schedule) = store.schedule_mut(&claimed.schedule.id) {
             if !claimed.schedule.input.enabled {
                 schedule.input.enabled = false;
             }
@@ -2464,7 +2587,7 @@ fn finish_run(app_data_dir: &Path, claimed: &ClaimedRun) -> Result<ClaimedRun, C
             schedule.updated_at = claimed.schedule.updated_at;
             saved.schedule = schedule.clone();
         }
-        if let Some(run) = store.runs.iter_mut().find(|run| run.id == claimed.run.id) {
+        if let Some(run) = store.run_mut(&claimed.run.id) {
             if !run.status.is_terminal() {
                 *run = claimed.run.clone();
             }
@@ -2487,7 +2610,7 @@ fn touch_run_heartbeat(
     }
     control.last_heartbeat_at.store(now, Ordering::Relaxed);
     with_store(app_data_dir, |store| {
-        if let Some(run) = store.runs.iter_mut().find(|run| run.id == run_id) {
+        if let Some(run) = store.run_mut(run_id) {
             if matches!(run.status, ScheduleRunStatus::Running) {
                 run.last_heartbeat_at = Some(now);
             }
@@ -2497,48 +2620,26 @@ fn touch_run_heartbeat(
 }
 
 fn reconcile_expired_runs(inner: &Arc<SchedulerInner>, now: i64) -> Result<(), CoreError> {
-    let expired_before =
-        now.saturating_sub(i64::try_from(RUN_LEASE_EXPIRY.as_millis()).unwrap_or(i64::MAX));
     let persisted = read_store(&inner.app_data_dir)?;
     let expired = persisted
         .runs
         .into_iter()
-        .filter(|run| {
-            run.status == ScheduleRunStatus::Running
-                && run
-                    .last_heartbeat_at
-                    .or(run.started_at)
-                    .is_none_or(|heartbeat| heartbeat < expired_before)
-        })
+        .filter(|run| run.status == ScheduleRunStatus::Running && run.lease_expired(now))
         .collect::<Vec<_>>();
     for run in expired {
-        let control = inner
-            .executions
-            .lock()
-            .ok()
-            .and_then(|executions| executions.get(&run.id).cloned());
-        if let Some(control) = control {
-            control.cancelled.store(true, Ordering::Release);
-            if let Some(chat_id) = control
-                .chat_id
-                .lock()
-                .ok()
-                .and_then(|chat_id| chat_id.clone())
-            {
-                let _ = inner.chats.stop_managed(&chat_id);
-            }
+        // 만기 정리는 잠금 손상도 정지 실패도 되돌릴 수 없으므로 결과를 버리고 저장만 이어간다.
+        if let Some(control) = inner.execution_control(&run.id).ok().flatten() {
+            let _ = inner.signal_cancellation(&control);
         }
         with_store(&inner.app_data_dir, |store| {
-            if let Some(saved) = store.runs.iter_mut().find(|saved| saved.id == run.id) {
-                if saved.status == ScheduleRunStatus::Running {
-                    saved.status = ScheduleRunStatus::Failed;
-                    saved.finished_at = Some(now);
-                    saved.last_heartbeat_at = Some(now);
-                    saved.error = Some(format!(
+            if let Some(saved) = store.run_mut(&run.id) {
+                saved.expire_running(
+                    now,
+                    format!(
                         "scheduler heartbeat가 {}초 동안 갱신되지 않아 실행 lease를 만료했습니다",
                         RUN_LEASE_EXPIRY.as_secs()
-                    ));
-                }
+                    ),
+                );
             }
             Ok(())
         })?;
@@ -2561,10 +2662,9 @@ fn stale_run_reasons(run: &ScheduleRun, now: i64) -> Vec<String> {
     if run.provider_session_id.is_none() {
         reasons.push("providerSessionId가 아직 없습니다".to_owned());
     }
-    if let Some(heartbeat) = run.last_heartbeat_at.or(run.started_at) {
-        let age_ms = now.saturating_sub(heartbeat);
+    if let Some(age_ms) = run.lease_age_ms(now) {
         reasons.push(format!("마지막 heartbeat {}초 전", age_ms / 1_000));
-        if age_ms > i64::try_from(RUN_LEASE_EXPIRY.as_millis()).unwrap_or(i64::MAX) {
+        if age_ms > run_lease_expiry_ms() {
             reasons.push("scheduler lease 만료 기준을 초과했습니다".to_owned());
         }
     } else {
@@ -2620,6 +2720,31 @@ fn emit_result(inner: &SchedulerInner, claimed: &ClaimedRun) {
 /// 뭉개진다 — 두 번째 트리거는 통합이 아니라 같은 작업을 두 소비자로 갈라 서로 예산을
 /// 경쟁하게 만들 뿐이다. 페이싱 밖 워크플로는 시각이 다른 트리거 여러 개가 정당하므로
 /// 검사하지 않는다.
+/// 저장 락 안에서 생성·수정이 함께 하는 계산: 페이싱 회차 단독 보장 → 자동 간격 →
+/// 다음 실행 시각. 자기 자신은 저장본이 아니라 저장될 상태(`input`)로 세므로 단독 보장의
+/// 제외 대상도, 간격 계산에 끼워 넣는 회차도 같은 `id`다 — 생성 경로의 `id`는 방금 만든
+/// UUID라 저장본에 없고, 수정 경로에서는 갱신 전 자기 행을 가린다.
+fn plan_saved_run(
+    app_data_dir: &Path,
+    store: &SchedulerStore,
+    auto: &crate::usage_pacing::AutoCadence,
+    id: &str,
+    input: &ScheduledRequestInput,
+    now: i64,
+) -> Result<i64, CoreError> {
+    if input.enabled {
+        if let Some(action) = input.workflow.as_ref() {
+            ensure_single_active_paced_round(
+                app_data_dir,
+                &store.schedules,
+                &action.workflow_id,
+                Some(id),
+            )?;
+        }
+    }
+    next_run_with_cadence(input, &store.schedules, auto, Some((id, input)), now)
+}
+
 fn ensure_single_active_paced_round(
     app_data_dir: &Path,
     schedules: &[ScheduledRequest],
@@ -2647,6 +2772,10 @@ fn ensure_single_active_paced_round(
     )))
 }
 
+/// 반복 요청 입력을 저장 가능한 모양으로 다듬는다. 이름·반복 규칙·활성 창·세션 전략은
+/// 두 실행 모양이 함께 지키고, 요청 본문에 해당하는 값(프롬프트·계정·작업 경로·모델)은
+/// 워크플로 회차와 채팅 요청이 배타적으로 다룬다 — 한쪽은 쓰지 않는 값을 비우고 다른
+/// 한쪽은 같은 값을 검증한다. 두 갈래를 한 몸에 두면 공통 규칙이 갈래 사이에 묻힌다.
 fn validate_input(mut input: ScheduledRequestInput) -> Result<ScheduledRequestInput, CoreError> {
     input.name = input.name.trim().chars().take(120).collect();
     if input.name.is_empty() {
@@ -2654,57 +2783,93 @@ fn validate_input(mut input: ScheduledRequestInput) -> Result<ScheduledRequestIn
             "반복 요청 이름을 입력하세요".to_owned(),
         ));
     }
-    let workflow_run = validate_workflow_action(input.workflow.as_mut())?;
-    input.prompt = input.prompt.trim().to_owned();
-    if workflow_run {
-        // 워크플로 회차는 등록된 작업 호출만 돌린다. 프롬프트·계정·작업 경로·모델은
-        // 실행에 쓰이지 않으므로 저장본에서 비운다.
-        input.prompt = String::new();
-        input.account_id = String::new();
-        input.use_active_account = false;
-        input.cwd = String::new();
-        input.model = None;
-        input.reasoning_effort = None;
-        input.session_strategy = ScheduleSessionStrategy::NewChat;
+    if validate_workflow_action(input.workflow.as_mut())? {
+        clear_chat_request_fields(&mut input);
     } else {
-        if input.prompt.is_empty() {
-            return Err(CoreError::InvalidInput(
-                "반복할 요청을 입력하세요".to_owned(),
-            ));
-        }
-        if input.prompt.len() > MAX_PROMPT_BYTES {
-            return Err(CoreError::TooLarge(MAX_PROMPT_BYTES as u64));
-        }
-        input.account_id = input.account_id.trim().to_owned();
-        if !input.source.manages_accounts() {
-            // 계정 레지스트리가 담지 않는 공급자(Antigravity)에는 고정할 계정도 활성
-            // 계정도 없다. 채팅 시작 경로가 계정 미귀속으로 실행하므로 저장본에서도
-            // 비워 둔다 — 값이 남아 있으면 화면이 쓰이지도 않는 계정을 보여 준다.
-            input.account_id = String::new();
-            input.use_active_account = false;
-        } else if input.use_active_account {
-            // 고정 계정과 실행 시점 조회가 동시에 남으면 어느 쪽이 쓰였는지 화면에서
-            // 알 수 없다. 고정 값은 지우고 실행 시점에만 활성 계정을 읽는다.
-            input.account_id = String::new();
-        } else if input.account_id.is_empty() {
-            return Err(CoreError::InvalidInput(
-                "반복 요청의 실행 계정을 선택하세요".to_owned(),
-            ));
-        }
-        let cwd = fs::canonicalize(input.cwd.trim())?;
-        if !cwd.is_dir() {
-            return Err(CoreError::InvalidInput(
-                "작업 경로가 폴더가 아닙니다".to_owned(),
-            ));
-        }
-        input.cwd = cwd.to_string_lossy().into_owned();
-        input.model = input
-            .model
-            .map(|model| model.trim().to_owned())
-            .filter(|model| !model.is_empty());
+        validate_chat_request_fields(&mut input)?;
     }
     validate_recurrence(&input.recurrence)?;
-    // 이미 지난 창을 저장하는 것은 막지 않는다. 뒤집힌 창만 거절한다.
+    validate_active_window(&input)?;
+    if input.session_strategy == ScheduleSessionStrategy::NewChat {
+        input.provider_session_id = None;
+    }
+    Ok(input)
+}
+
+/// 워크플로 회차는 등록된 작업 호출만 돌린다. 프롬프트·계정·작업 경로·모델은 실행에
+/// 쓰이지 않으므로 저장본에서 비운다.
+fn clear_chat_request_fields(input: &mut ScheduledRequestInput) {
+    input.prompt = String::new();
+    input.account_id = String::new();
+    input.use_active_account = false;
+    input.cwd = String::new();
+    input.model = None;
+    input.local_connection_id = None;
+    input.reasoning_effort = None;
+    input.session_strategy = ScheduleSessionStrategy::NewChat;
+}
+
+/// 채팅 요청으로 도는 반복 요청이 실행 시점에 필요로 하는 값들을 확인하고 다듬는다.
+fn validate_chat_request_fields(input: &mut ScheduledRequestInput) -> Result<(), CoreError> {
+    input.prompt = input.prompt.trim().to_owned();
+    if input.prompt.is_empty() {
+        return Err(CoreError::InvalidInput(
+            "반복할 요청을 입력하세요".to_owned(),
+        ));
+    }
+    if input.prompt.len() > MAX_PROMPT_BYTES {
+        return Err(CoreError::TooLarge(MAX_PROMPT_BYTES as u64));
+    }
+    input.account_id = input.account_id.trim().to_owned();
+    if !input.source.manages_accounts() {
+        // 계정 레지스트리가 담지 않는 공급자(Antigravity)에는 고정할 계정도 활성
+        // 계정도 없다. 채팅 시작 경로가 계정 미귀속으로 실행하므로 저장본에서도
+        // 비워 둔다 — 값이 남아 있으면 화면이 쓰이지도 않는 계정을 보여 준다.
+        input.account_id = String::new();
+        input.use_active_account = false;
+    } else if input.use_active_account {
+        // 고정 계정과 실행 시점 조회가 동시에 남으면 어느 쪽이 쓰였는지 화면에서
+        // 알 수 없다. 고정 값은 지우고 실행 시점에만 활성 계정을 읽는다.
+        input.account_id = String::new();
+    } else if input.account_id.is_empty() {
+        return Err(CoreError::InvalidInput(
+            "반복 요청의 실행 계정을 선택하세요".to_owned(),
+        ));
+    }
+    // 작업 경로는 손으로 적는 칸이라 `user_path`가 해석한다(C6-1, C6-2). `fs::canonicalize`를
+    // 직접 부르면 없는 폴더가 원시 `os error 2`로 흘러 화면이 `APP_NOT_FOUND`로만 보이고,
+    // 채팅 시작과 달리 "폴더를 만들고 저장할까요"를 물을 수 없었다 — 로컬 세션에서 이어
+    // 받은 옛 경로가 사라진 뒤 저장이 그렇게 막혔다.
+    // 비운 경로는 그대로 비워 둔다 — 회차는 앱의 기본 작업공간에서 돈다(`resolve_start_cwd`).
+    // 여기서 그 경로를 채워 넣으면 저장본이 장치별 앱 데이터 경로에 묶인다.
+    input.cwd = if input.cwd.trim().is_empty() {
+        String::new()
+    } else {
+        crate::user_path::resolve_existing_directory(&input.cwd)?
+            .to_string_lossy()
+            .into_owned()
+    };
+    input.model = input
+        .model
+        .take()
+        .map(|model| model.trim().to_owned())
+        .filter(|model| !model.is_empty());
+    // 연결 id 는 로컬 공급자에서만 뜻이 있다. 비었으면 기본 연결이라 저장하지 않는다.
+    input.local_connection_id = match input.source {
+        ProviderId::Local => input
+            .local_connection_id
+            .take()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .map(|id| crate::local_llm::normalize_connection_id(&id))
+            .transpose()?,
+        _ => None,
+    };
+    Ok(())
+}
+
+/// 이미 지난 창을 저장하는 것은 막지 않는다. 뒤집힌 창만 거절한다.
+fn validate_active_window(input: &ScheduledRequestInput) -> Result<(), CoreError> {
     if let (Some(from), Some(until)) = (input.active_from, input.active_until) {
         if until <= from {
             return Err(CoreError::InvalidInput(
@@ -2712,10 +2877,7 @@ fn validate_input(mut input: ScheduledRequestInput) -> Result<ScheduledRequestIn
             ));
         }
     }
-    if input.session_strategy == ScheduleSessionStrategy::NewChat {
-        input.provider_session_id = None;
-    }
-    Ok(input)
+    Ok(())
 }
 
 /// 워크플로 대상을 정리하고, 이 반복 요청이 워크플로 회차인지 알려준다. 승인 버전과
@@ -2777,10 +2939,7 @@ fn validate_recurrence(recurrence: &ScheduleRecurrence) -> Result<(), CoreError>
             "반복 시각이 올바르지 않습니다".to_owned(),
         ));
     }
-    recurrence
-        .timezone
-        .parse::<Tz>()
-        .map_err(|_| CoreError::InvalidInput("시간대를 확인할 수 없습니다".to_owned()))?;
+    recurrence_timezone(recurrence)?;
     // Auto는 벽시계 정렬이 없는 간격 기반이라 Cron 표현식을 만들지 않는다.
     if recurrence.frequency != ScheduleFrequency::Auto {
         schedule_expression(recurrence)?;
@@ -2814,6 +2973,27 @@ fn active_window_open(input: &ScheduledRequestInput, now: i64) -> bool {
         return false;
     }
     !input.active_until.is_some_and(|until| now > until)
+}
+
+/// 이 반복 요청의 다음 실행 시각을, 자동 주기 해석까지 끝내고 정한다.
+///
+/// 간격 해석(`minutes_for`)과 시각 계산(`next_run_in_window`)은 언제나 붙어 다니는데, 그
+/// 사이에 세 가지 인자(자동 주기 워크플로 id, 세는 데 끼울 저장 전 회차, 회차의 제한
+/// 시간대)를 자리마다 다시 조립해야 했다. 생성·수정·켜기·놓친 발화 정리·정책 갱신·훑기가
+/// 각자 조립하다 보니 한 자리만 `round_quiet`을 빠뜨려도 그 경로에서만 제한 시간대가
+/// 무시되는, 화면으로는 보이지 않는 어긋남이 생긴다. 조립을 여기 한 벌만 둔다.
+///
+/// `pending`은 아직 저장본에 없는(또는 저장본이 옛 상태인) 회차를 간격 계산에 끼워 넣는
+/// 자리다 — 창을 나눠 쓸 회차 수에 자기 자신을 넣어야 하는 생성·수정·켜기 경로가 쓴다.
+fn next_run_with_cadence(
+    input: &ScheduledRequestInput,
+    schedules: &[ScheduledRequest],
+    auto: &crate::usage_pacing::AutoCadence,
+    pending: Option<(&str, &ScheduledRequestInput)>,
+    now: i64,
+) -> Result<i64, CoreError> {
+    let auto_minutes = auto.minutes_for(auto_workflow_id(input), schedules, pending, now);
+    next_run_in_window(input, now, auto_minutes, auto.round_quiet(input))
 }
 
 /// 활성 창과 페이싱 스케줄을 반영한 다음 실행 시각. 활성 시작 이전의 발화는 건너뛰고 시작
@@ -2858,22 +3038,51 @@ fn next_run_after(
     if recurrence.frequency == ScheduleFrequency::Auto {
         return Ok(after_ms.saturating_add(i64::from(auto_minutes.max(1)) * 60_000));
     }
-    let timezone = recurrence
+    CronOccurrences::prepare(recurrence, after_ms)?
+        .iter()
+        .next()
+        .ok_or_else(|| CoreError::InvalidInput("다음 실행 시각을 계산할 수 없습니다".to_owned()))
+}
+
+/// 저장된 반복 규칙의 시간대. 검증·다음 실행 계산·평균 간격 계산이 같은 문구로 거절해야
+/// 사용자가 어느 화면에서 보든 같은 원인을 읽는다.
+fn recurrence_timezone(recurrence: &ScheduleRecurrence) -> Result<Tz, CoreError> {
+    recurrence
         .timezone
         .parse::<Tz>()
-        .map_err(|_| CoreError::InvalidInput("시간대를 확인할 수 없습니다".to_owned()))?;
-    let expression = schedule_expression(recurrence)?;
-    let schedule = Schedule::from_str(&expression).map_err(|error| {
-        CoreError::InvalidInput(format!("Cron 표현식이 올바르지 않습니다: {error}"))
-    })?;
-    let after = DateTime::<Utc>::from_timestamp_millis(after_ms)
-        .ok_or_else(|| CoreError::InvalidInput("기준 시각이 올바르지 않습니다".to_owned()))?
-        .with_timezone(&timezone);
-    schedule
-        .after(&after)
-        .next()
-        .map(|next| next.timestamp_millis())
-        .ok_or_else(|| CoreError::InvalidInput("다음 실행 시각을 계산할 수 없습니다".to_owned()))
+        .map_err(|_| CoreError::InvalidInput("시간대를 확인할 수 없습니다".to_owned()))
+}
+
+/// Cron 규칙 한 벌을 실제 발화 시각으로 펼칠 준비.
+///
+/// 다음 실행 시각과 평균 간격은 쓰는 개수만 다를 뿐, 그 앞에 필요한 네 걸음(시간대 파싱 →
+/// 표현식 조립 → Cron 파싱 → 기준 시각을 그 시간대로 옮기기)이 완전히 같다. 두 자리가 각자
+/// 적으면 순서가 어긋나는 순간 같은 손상된 저장본이 자리마다 다른 오류를 낸다 — 검사 순서가
+/// 곧 오류 우선순위이기 때문이다. 그 순서를 여기 한 벌만 둔다.
+struct CronOccurrences {
+    schedule: Schedule,
+    after: DateTime<Tz>,
+}
+
+impl CronOccurrences {
+    fn prepare(recurrence: &ScheduleRecurrence, after_ms: i64) -> Result<Self, CoreError> {
+        let timezone = recurrence_timezone(recurrence)?;
+        let expression = schedule_expression(recurrence)?;
+        let schedule = Schedule::from_str(&expression).map_err(|error| {
+            CoreError::InvalidInput(format!("Cron 표현식이 올바르지 않습니다: {error}"))
+        })?;
+        let after = DateTime::<Utc>::from_timestamp_millis(after_ms)
+            .ok_or_else(|| CoreError::InvalidInput("기준 시각이 올바르지 않습니다".to_owned()))?
+            .with_timezone(&timezone);
+        Ok(Self { schedule, after })
+    }
+
+    /// 기준 시각 이후의 발화를 epoch ms로 차례대로 돌려준다.
+    fn iter(&self) -> impl Iterator<Item = i64> + '_ {
+        self.schedule
+            .after(&self.after)
+            .map(|next| next.timestamp_millis())
+    }
 }
 
 /// 반복 규칙의 평균 간격(분). 고정 규칙은 달력상의 평균을 바로 쓰고, 임의 Cron은
@@ -2895,15 +3104,8 @@ pub(crate) fn recurrence_average_minutes(
         ScheduleFrequency::Auto => Some(auto_minutes.max(1)),
         ScheduleFrequency::Cron => {
             const GAPS: usize = 64;
-            let timezone = recurrence.timezone.parse::<Tz>().ok()?;
-            let expression = schedule_expression(recurrence).ok()?;
-            let schedule = Schedule::from_str(&expression).ok()?;
-            let after = DateTime::<Utc>::from_timestamp_millis(after_ms)?.with_timezone(&timezone);
-            let occurrences: Vec<i64> = schedule
-                .after(&after)
-                .take(GAPS + 1)
-                .map(|next| next.timestamp_millis())
-                .collect();
+            let occurrences = CronOccurrences::prepare(recurrence, after_ms).ok()?;
+            let occurrences: Vec<i64> = occurrences.iter().take(GAPS + 1).collect();
             if occurrences.len() < 2 {
                 return None;
             }
@@ -3007,6 +3209,73 @@ pub fn migrate_paced_bindings(
     })
 }
 
+/// 워크플로가 새 버전으로 등록됐을 때 그 워크플로를 도는 회차 하나에 일어난 일.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowVersionAdoption {
+    pub schedule_id: String,
+    pub name: String,
+    /// 승인 버전을 새 버전으로 올렸는가.
+    pub adopted: bool,
+    /// 버전이 어긋나 멈춰 있던 회차를 함께 되살렸는가.
+    pub resumed: bool,
+    /// 올리지 못한 사유. 올린 회차에는 없다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// 새 버전이 등록된 워크플로에 묶인 회차의 승인 버전을 함께 올린다.
+///
+/// 승인 버전은 실행할 계약을 고정하지 않는다 — `preflight`는 언제나 최신판을 집고 번호만
+/// 대조한다. 그래서 어긋난 번호가 막는 것은 "바뀐 계약"이 아니라 "사람이 한 번 누를 때까지의
+/// 시간"이고, 그동안 회차는 주기마다 실패하다 멈춰 섰다. 재승인 화면이 계약 변경 내용을
+/// 보여 주지도 않으므로 그 클릭은 정보를 주지도 받지도 않는다. 등록 자체가 승인을 거친
+/// 조작이고 그 자리에서는 변경 요약을 보여 주므로, 동의는 거기서 받고 회차는 여기서 맞춘다.
+///
+/// 올리지 않는 경우는 동의가 아니라 정합성 문제 하나뿐이다: 저장된 인자가 새 입력 스키마를
+/// 만족하지 못하면 올려 봐야 첫 기동에서 거절되므로, 사유를 남기고 편집기에서 채우게 한다.
+pub fn adopt_workflow_version(
+    app_data_dir: &Path,
+    workflow_id: &str,
+    version: u32,
+    mut accept: impl FnMut(&Value) -> Result<(), String>,
+) -> Result<Vec<WorkflowVersionAdoption>, CoreError> {
+    let now = now_ms();
+    with_store(app_data_dir, |store| {
+        let mut report = Vec::new();
+        for schedule in store.schedules.iter_mut() {
+            let Some(action) = schedule.input.workflow.as_mut() else {
+                continue;
+            };
+            if action.workflow_id != workflow_id || action.approved_version == version {
+                continue;
+            }
+            let mut entry = WorkflowVersionAdoption {
+                schedule_id: schedule.id.clone(),
+                name: schedule.input.name.clone(),
+                adopted: false,
+                resumed: false,
+                reason: None,
+            };
+            match accept(&action.arguments) {
+                Ok(()) => {
+                    action.approved_version = version;
+                    entry.adopted = true;
+                    // 이 사유로 멈춘 회차만 되살린다. 사용자가 끈 회차는 꺼진 채로 둔다.
+                    if schedule.paused_reason == Some(SchedulePauseReason::WorkflowVersion) {
+                        schedule.input.enabled = true;
+                        entry.resumed = true;
+                    }
+                    schedule.updated_at = now;
+                }
+                Err(reason) => entry.reason = Some(reason),
+            }
+            report.push(entry);
+        }
+        Ok(report)
+    })
+}
+
 fn with_store<T>(
     app_data_dir: &Path,
     action: impl FnOnce(&mut SchedulerStore) -> Result<T, CoreError>,
@@ -3016,6 +3285,14 @@ fn with_store<T>(
     FileExt::lock(&lock)?;
     let mut store = load_store_unlocked(app_data_dir)?;
     let result = action(&mut store)?;
+    // 켜져 있는 회차에는 멈춤 사유가 남지 않는다. 사유를 지우는 일을 조작마다 적으면 한
+    // 자리만 빠져도 "자동 재승인이 되살리지 못하는 회차"나 "켜져 있는데 멈춤 사유가 붙은
+    // 회차"가 생기므로, 저장 직전에 한 번에 맞춘다.
+    for schedule in store.schedules.iter_mut() {
+        if schedule.input.enabled {
+            schedule.paused_reason = None;
+        }
+    }
     save_store_unlocked(app_data_dir, &store)?;
     Ok(result)
 }
@@ -3028,7 +3305,28 @@ fn read_store(app_data_dir: &Path) -> Result<SchedulerStore, CoreError> {
 }
 
 fn load_store_unlocked(app_data_dir: &Path) -> Result<SchedulerStore, CoreError> {
-    read_private_json_or_default(&app_data_dir.join(STORE_FILE_NAME))
+    let mut store: SchedulerStore =
+        read_private_json_or_default(&app_data_dir.join(STORE_FILE_NAME))?;
+    migrate_accountless_inputs(&mut store);
+    Ok(store)
+}
+
+/// 계정 없이 저장된 반복 요청을 활성 계정 실행으로 올린다.
+///
+/// 계정 레지스트리가 담지 않던 공급자는 저장 시점에 실행 계정이 통째로 비워졌다. 그
+/// 공급자가 계정 관리를 지원하게 되면 그 저장본은 "계정도 없고 활성 계정도 쓰지 않는"
+/// 값이 되어, 다음 실행이 계정을 찾지 못해 멈춘다. 지금까지의 동작이 곧 기계에 로그인된
+/// 계정으로 도는 것이었으므로 활성 계정 실행으로 읽는다. 저장은 하지 않는다 — 사용자가
+/// 편집할 때 그 자리에서 함께 굳는다.
+fn migrate_accountless_inputs(store: &mut SchedulerStore) {
+    for schedule in &mut store.schedules {
+        if !schedule.input.source.manages_accounts() {
+            continue;
+        }
+        if schedule.input.account_id.trim().is_empty() && !schedule.input.use_active_account {
+            schedule.input.use_active_account = true;
+        }
+    }
 }
 
 /// 반복 요청이 가리킨 작업 경로를 세션 출처의 schedule id와 연결한다. 워크플로 회차는
@@ -3093,7 +3391,11 @@ fn sorted_runs(mut runs: Vec<ScheduleRun>) -> Vec<ScheduleRun> {
 }
 
 fn clean_summary(summary: String) -> Option<String> {
-    let summary = summary.trim().chars().take(2_000).collect::<String>();
+    let summary = summary
+        .trim()
+        .chars()
+        .take(MAX_RUN_SUMMARY_CHARS)
+        .collect::<String>();
     (!summary.is_empty()).then_some(summary)
 }
 
@@ -3138,6 +3440,7 @@ mod tests {
             use_active_account: false,
             cwd: cwd.to_string_lossy().into_owned(),
             model: None,
+            local_connection_id: None,
             reasoning_effort: None,
             mode: ChatMode::Workspace,
             approval_mode: ChatApprovalMode::AutoReview,
@@ -3152,6 +3455,69 @@ mod tests {
             active_from: None,
             active_until: None,
         }
+    }
+
+    #[test]
+    fn referenced_session_ids_collects_each_schedule_and_run_session_once() {
+        let schedule = stored_schedule("schedule-1", input(Path::new("/tmp")), 1);
+        let mut first_run = run_seed("run-1", &schedule.id, "account-1");
+        first_run.provider_session_id = Some("thread-current".to_owned());
+        first_run.previous_provider_session_id = Some("thread-123".to_owned());
+        let mut second_run = run_seed("run-2", &schedule.id, "account-1");
+        second_run.provider_session_id = Some("thread-second".to_owned());
+
+        let store = SchedulerStore {
+            schedules: vec![schedule],
+            runs: vec![first_run, second_run],
+            ..SchedulerStore::default()
+        };
+
+        assert_eq!(
+            store.referenced_session_ids(),
+            BTreeSet::from([
+                "thread-123".to_owned(),
+                "thread-current".to_owned(),
+                "thread-second".to_owned(),
+            ])
+        );
+    }
+
+    /// C6-2: 없는 작업 경로는 화면이 "폴더를 만들까요"로 알아보는 접두사를 단 `NotFound`다.
+    /// 원시 `os error 2`가 흘러가면 `APP_NOT_FOUND`로만 보여 사용자가 고칠 길이 없다.
+    #[test]
+    fn missing_cwd_is_reported_as_creatable_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("not-yet");
+        let error = validate_input(input(&missing)).expect_err("missing cwd must fail");
+        match error {
+            CoreError::NotFound(message) => {
+                assert!(
+                    message.starts_with(crate::user_path::MISSING_DIRECTORY_PREFIX),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// 작업 경로는 선택이다. 프로젝트가 없는 반복 요청(질문 하나를 매일 던지는 식)은 경로를
+    /// 비워 저장하고, 회차는 앱의 기본 작업공간에서 돈다. 저장본에 그 경로를 채워 넣지 않아야
+    /// 다른 장치의 앱 데이터 경로에 묶이지 않는다.
+    #[test]
+    fn empty_cwd_is_saved_empty_and_runs_in_the_default_workspace() {
+        let mut request = input(Path::new("/unused"));
+        request.cwd = "   ".to_owned();
+        let saved = validate_input(request).expect("empty cwd is allowed");
+        assert!(saved.cwd.is_empty());
+    }
+
+    #[test]
+    fn cwd_that_is_a_file_is_invalid_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("plain.txt");
+        fs::write(&file, b"x").unwrap();
+        let error = validate_input(input(&file)).expect_err("file cwd must fail");
+        assert!(matches!(error, CoreError::InvalidInput(_)), "{error:?}");
     }
 
     fn test_supervisor(app_data_dir: &Path, chats: ChatSupervisor) -> SchedulerSupervisor {
@@ -3177,13 +3543,8 @@ mod tests {
             &app_data_dir,
             &SchedulerStore {
                 schedules: vec![ScheduledRequest {
-                    id: "schedule-123".to_owned(),
-                    input: request,
-                    created_at: 1,
-                    updated_at: 1,
                     next_run_at: i64::MAX,
-                    last_run_at: None,
-                    manual_run_requested_at: None,
+                    ..stored_schedule("schedule-123", request, 1)
                 }],
                 ..SchedulerStore::default()
             },
@@ -3311,15 +3672,11 @@ mod tests {
     /// 실행 이력도 세션 참조 기록을 모르던 저장본을 그대로 읽는다.
     #[test]
     fn runs_saved_before_session_reference_still_load() {
-        let mut value = serde_json::to_value(schedule_run(&ScheduledRequest {
-            id: "schedule-1".to_owned(),
-            input: input(Path::new("/tmp")),
-            created_at: 0,
-            updated_at: 0,
-            next_run_at: 0,
-            last_run_at: None,
-            manual_run_requested_at: None,
-        }))
+        let mut value = serde_json::to_value(schedule_run(&stored_schedule(
+            "schedule-1",
+            input(Path::new("/tmp")),
+            0,
+        )))
         .unwrap();
         value.as_object_mut().unwrap().remove("sessionReference");
         let parsed: ScheduleRun = serde_json::from_value(value).unwrap();
@@ -3416,18 +3773,20 @@ mod tests {
         assert_eq!(parsed.account_id, "codex-account-1");
     }
 
-    fn schedule_run(schedule: &ScheduledRequest) -> ScheduleRun {
+    /// 아직 아무 일도 일어나지 않은 회차 기록. 시각·상태·계정만 자리를 잡고 나머지 열넷은
+    /// 비어 있다. 시험은 여기에 자기가 보려는 칸만 덮어 쓴다.
+    fn run_seed(id: &str, schedule_id: &str, account_id: &str) -> ScheduleRun {
         ScheduleRun {
-            id: "run-test".to_owned(),
-            schedule_id: schedule.id.clone(),
+            id: id.to_owned(),
+            schedule_id: schedule_id.to_owned(),
             scheduled_for: now_ms(),
             started_at: None,
             finished_at: None,
             status: ScheduleRunStatus::WaitingForAccount,
-            requested_account_id: schedule.input.account_id.clone(),
+            requested_account_id: account_id.to_owned(),
             actual_account_id: None,
             provider_session_id: None,
-            previous_provider_session_id: schedule.input.provider_session_id.clone(),
+            previous_provider_session_id: None,
             session_replaced: false,
             retry_count: 0,
             summary: None,
@@ -3439,6 +3798,30 @@ mod tests {
             document_trigger: None,
             session_reference: None,
             round: None,
+        }
+    }
+
+    /// 반복 요청이 방금 만들어 낸 대기 회차.
+    fn schedule_run(schedule: &ScheduledRequest) -> ScheduleRun {
+        ScheduleRun {
+            previous_provider_session_id: schedule.input.provider_session_id.clone(),
+            ..run_seed("run-test", &schedule.id, &schedule.input.account_id)
+        }
+    }
+
+    /// 저장본에 바로 넣을 반복 요청 하나. 한 번도 돌지 않은 상태가 기본이고(`last_run_at`·
+    /// `manual_run_requested_at`가 비어 있다), 만든·고친·다음 실행 시각은 모두 `at`이다.
+    /// 시험은 자기가 보려는 시각만 덮어 쓴다.
+    fn stored_schedule(id: &str, input: ScheduledRequestInput, at: i64) -> ScheduledRequest {
+        ScheduledRequest {
+            id: id.to_owned(),
+            input,
+            created_at: at,
+            updated_at: at,
+            next_run_at: at,
+            last_run_at: None,
+            manual_run_requested_at: None,
+            paused_reason: None,
         }
     }
 
@@ -3509,6 +3892,140 @@ mod tests {
         request
     }
 
+    /// 계약이 새 버전으로 등록되면 그 워크플로를 도는 회차가 승인 버전을 이어받는다.
+    /// 되살리는 대상은 "이 사유로 멈춘 회차"뿐이다 — 사용자가 끈 회차를 등록 한 번으로
+    /// 켜 버리면 자동 적용이 사용자 결정을 덮는다.
+    #[test]
+    fn adopt_workflow_version_raises_bound_rounds_and_resumes_only_its_own_pauses() {
+        let temp = tempfile::tempdir().unwrap();
+        let at = 1_000;
+        let bound = |id: &str, enabled: bool, reason: Option<SchedulePauseReason>| {
+            let mut request = workflow_input(temp.path());
+            request.enabled = enabled;
+            let mut schedule = stored_schedule(id, request, at);
+            schedule.paused_reason = reason;
+            schedule
+        };
+        with_store(temp.path(), |store| {
+            // 버전 어긋남으로 스케줄러가 멈춘 회차.
+            store.schedules.push(bound(
+                "s-paused",
+                false,
+                Some(SchedulePauseReason::WorkflowVersion),
+            ));
+            // 사용자가 직접 끈 회차.
+            store.schedules.push(bound("s-user-off", false, None));
+            // 돌고 있는 회차.
+            store.schedules.push(bound("s-live", true, None));
+            // 다른 워크플로에 묶인 회차는 건드리지 않는다.
+            let mut other = bound("s-other", true, None);
+            other.input.workflow.as_mut().unwrap().workflow_id = "wf-other".to_owned();
+            store.schedules.push(other);
+            Ok(())
+        })
+        .unwrap();
+
+        let report = adopt_workflow_version(temp.path(), " wf-usage ", 4, |_| Ok(())).unwrap();
+        let seen: Vec<(&str, bool, bool)> = report
+            .iter()
+            .map(|entry| (entry.schedule_id.as_str(), entry.adopted, entry.resumed))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("s-paused", true, true),
+                ("s-user-off", true, false),
+                ("s-live", true, false),
+            ]
+        );
+
+        let store = read_store(temp.path()).unwrap();
+        let of = |id: &str| {
+            store
+                .schedules
+                .iter()
+                .find(|schedule| schedule.id == id)
+                .expect("schedule")
+        };
+        assert_eq!(
+            of("s-paused")
+                .input
+                .workflow
+                .as_ref()
+                .unwrap()
+                .approved_version,
+            4
+        );
+        assert!(
+            of("s-paused").input.enabled,
+            "멈춘 사유가 풀렸으면 다시 켠다"
+        );
+        assert_eq!(of("s-paused").paused_reason, None);
+        assert!(
+            !of("s-user-off").input.enabled,
+            "사용자가 끈 회차는 꺼진 채로 둔다"
+        );
+        assert_eq!(
+            of("s-user-off")
+                .input
+                .workflow
+                .as_ref()
+                .unwrap()
+                .approved_version,
+            4
+        );
+        // 다른 워크플로의 회차는 승인 버전도 그대로다.
+        assert_eq!(
+            of("s-other")
+                .input
+                .workflow
+                .as_ref()
+                .unwrap()
+                .approved_version,
+            3
+        );
+    }
+
+    /// 저장된 인자가 새 입력 스키마를 못 채우면 올리지 않는다. 올려 두면 첫 기동에서
+    /// 거절되어, 멈춘 회차를 켜 놓고 실패만 쌓는 지금보다 나쁜 상태가 된다.
+    #[test]
+    fn adopt_workflow_version_leaves_rounds_whose_arguments_no_longer_fit() {
+        let temp = tempfile::tempdir().unwrap();
+        with_store(temp.path(), |store| {
+            let mut schedule = stored_schedule("s-stale", workflow_input(temp.path()), 1_000);
+            schedule.input.enabled = false;
+            schedule.paused_reason = Some(SchedulePauseReason::WorkflowVersion);
+            store.schedules.push(schedule);
+            Ok(())
+        })
+        .unwrap();
+
+        let report = adopt_workflow_version(temp.path(), " wf-usage ", 4, |_| {
+            Err("필수 입력 projectPath가 비어 있습니다".to_owned())
+        })
+        .unwrap();
+        assert_eq!(report.len(), 1);
+        assert!(!report[0].adopted);
+        assert!(!report[0].resumed);
+        assert_eq!(
+            report[0].reason.as_deref(),
+            Some("필수 입력 projectPath가 비어 있습니다")
+        );
+
+        let store = read_store(temp.path()).unwrap();
+        let schedule = &store.schedules[0];
+        assert_eq!(
+            schedule.input.workflow.as_ref().unwrap().approved_version,
+            3
+        );
+        assert!(!schedule.input.enabled, "올리지 못한 회차는 멈춘 채로 둔다");
+        assert_eq!(
+            schedule.paused_reason,
+            Some(SchedulePauseReason::WorkflowVersion),
+            "사유가 남아야 다음 등록에서 다시 되살릴 수 있다"
+        );
+    }
+
     fn workflow_inner(
         app_data_dir: &Path,
         executor: Arc<dyn ScheduleWorkflowExecutor>,
@@ -3531,13 +4048,12 @@ mod tests {
     fn stored_workflow_claim(app_data_dir: &Path) -> ClaimedRun {
         let now = now_ms();
         let schedule = ScheduledRequest {
-            id: "schedule-workflow".to_owned(),
-            input: validate_input(workflow_input(app_data_dir)).expect("워크플로 입력"),
-            created_at: now,
-            updated_at: now,
             next_run_at: now + 60_000,
-            last_run_at: None,
-            manual_run_requested_at: None,
+            ..stored_schedule(
+                "schedule-workflow",
+                validate_input(workflow_input(app_data_dir)).expect("워크플로 입력"),
+                now,
+            )
         };
         let run = schedule_run(&schedule);
         with_store(app_data_dir, |store| {
@@ -4008,27 +4524,9 @@ mod tests {
         let mut store = SchedulerStore::default();
         for index in 0..55 {
             store.runs.push(ScheduleRun {
-                id: format!("run-{index}"),
-                schedule_id: "schedule-1".to_owned(),
                 scheduled_for: index,
-                started_at: None,
-                finished_at: None,
                 status: ScheduleRunStatus::Skipped,
-                requested_account_id: "codex-account-1".to_owned(),
-                actual_account_id: None,
-                provider_session_id: None,
-                previous_provider_session_id: None,
-                session_replaced: false,
-                retry_count: 0,
-                summary: None,
-                error: None,
-                last_heartbeat_at: None,
-                cancellation_requested_at: None,
-                recovery_error: None,
-                manual: false,
-                document_trigger: None,
-                session_reference: None,
-                round: None,
+                ..run_seed(&format!("run-{index}"), "schedule-1", "codex-account-1")
             });
         }
         trim_runs(&mut store);
@@ -4039,22 +4537,12 @@ mod tests {
     #[test]
     fn schedules_are_sorted_by_creation_time() {
         let older = ScheduledRequest {
-            id: "schedule-older".to_owned(),
-            input: input(Path::new("/tmp")),
             created_at: 100,
-            updated_at: 900,
-            next_run_at: 900,
-            last_run_at: None,
-            manual_run_requested_at: None,
+            ..stored_schedule("schedule-older", input(Path::new("/tmp")), 900)
         };
         let newer = ScheduledRequest {
-            id: "schedule-newer".to_owned(),
-            input: input(Path::new("/tmp")),
             created_at: 200,
-            updated_at: 100,
-            next_run_at: 100,
-            last_run_at: None,
-            manual_run_requested_at: None,
+            ..stored_schedule("schedule-newer", input(Path::new("/tmp")), 100)
         };
 
         let sorted = sorted_schedules(vec![newer, older]);
@@ -4182,11 +4670,11 @@ mod tests {
         );
     }
 
-    /// 계정 레지스트리가 담지 않는 공급자(Antigravity)는 계정 준비 단계를 건너뛴다.
-    /// 건너뛰지 않으면 활성 계정 조회가 "지원하지 않는 계정 공급자"로 거절되어 회차가
-    /// 매번 실패한다 — 채팅 화면에서는 같은 공급자가 계정 미귀속으로 잘 돈다.
+    /// Antigravity가 계정 공급자가 되면서 반복 요청도 실행 계정을 갖는다. 기본 계정을
+    /// 고르지 않았으면 실패가 아니라 대기다 — 계정을 고르는 순간 그대로 이어져야 하고,
+    /// 회차를 날려 버리면 사용자가 원인을 화면에서 찾을 수 없다.
     #[test]
-    fn a_provider_without_an_account_registry_runs_unattributed() {
+    fn an_antigravity_schedule_waits_until_a_default_account_is_chosen() {
         let data = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let (accounts, _a, _b) = two_accounts_with_probe(data.path(), home.path(), || {
@@ -4203,15 +4691,21 @@ mod tests {
         let schedule = supervisor
             .create(schedule_input, SessionReadActor::User)
             .expect("계정 없이도 저장된다");
-        // 쓰이지 않는 값은 저장본에서 비운다. 남겨 두면 화면이 없는 계정을 보여 준다.
+        // Antigravity도 계정 공급자가 되면서 실행 시점에 활성 계정을 읽는다. 고정 계정과
+        // 실행 시점 조회가 동시에 남지 않도록 고정 값만 비운다.
         assert_eq!(schedule.input.account_id, "");
-        assert!(!schedule.input.use_active_account);
+        assert!(schedule.input.use_active_account);
 
         let mut claimed = ClaimedRun {
             run: schedule_run(&schedule),
             schedule,
         };
-        prepare_run_account(&supervisor.inner, &mut claimed).expect("계정 준비를 건너뛴다");
+        let waiting = prepare_run_account(&supervisor.inner, &mut claimed)
+            .expect_err("활성 계정이 없으면 대기한다");
+        assert!(matches!(
+            waiting,
+            PrepareRunError::Waiting(ScheduleRunStatus::WaitingForAccount, _)
+        ));
         assert!(claimed.run.actual_account_id.is_none());
     }
 
@@ -4301,13 +4795,8 @@ mod tests {
         let now = now_ms();
         with_store(data.path(), |store| {
             store.schedules.push(ScheduledRequest {
-                id: "schedule-waiting".to_owned(),
-                input: input(data.path()),
-                created_at: now,
-                updated_at: now,
                 next_run_at: 1,
-                last_run_at: None,
-                manual_run_requested_at: None,
+                ..stored_schedule("schedule-waiting", input(data.path()), now)
             });
             Ok(())
         })
@@ -4848,36 +5337,17 @@ mod tests {
         let now = now_ms();
         with_store(temp.path(), |store| {
             store.schedules.push(ScheduledRequest {
-                id: "schedule-interrupted".to_owned(),
-                input: input(temp.path()),
-                created_at: now - 2_000,
-                updated_at: now - 2_000,
                 next_run_at: now + 60_000,
-                last_run_at: None,
-                manual_run_requested_at: None,
+                ..stored_schedule("schedule-interrupted", input(temp.path()), now - 2_000)
             });
             store.runs.push(ScheduleRun {
-                id: "run-interrupted".to_owned(),
-                schedule_id: "schedule-interrupted".to_owned(),
                 scheduled_for: now - 1_000,
                 started_at: Some(now - 1_000),
-                finished_at: None,
                 status: ScheduleRunStatus::Running,
-                requested_account_id: "codex-account-1".to_owned(),
                 actual_account_id: Some("codex-account-1".to_owned()),
-                provider_session_id: None,
                 previous_provider_session_id: Some("thread-123".to_owned()),
-                session_replaced: false,
-                retry_count: 0,
-                summary: None,
-                error: None,
                 last_heartbeat_at: Some(now - 1_000),
-                cancellation_requested_at: None,
-                recovery_error: None,
-                manual: false,
-                document_trigger: None,
-                session_reference: None,
-                round: None,
+                ..run_seed("run-interrupted", "schedule-interrupted", "codex-account-1")
             });
             Ok(())
         })

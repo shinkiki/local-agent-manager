@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { catalogHealthNotice, degradedScanMessages, formatCatalogAge } from "./catalogHealth.ts";
+import { catalogHealthNotice, catalogRefreshNeeded, degradedScanMessages } from "./catalogHealth.ts";
 
 const healthy = {
   sessionRevision: 12,
@@ -55,11 +55,16 @@ test("a degraded scan on a fresh list is informational, not a warning", () => {
   assert.equal(notice?.headline, "일부 갱신이 지연되고 있습니다");
 });
 
-test("ages read as 방금, 분, 시간", () => {
-  assert.equal(formatCatalogAge(5_000), "방금");
-  assert.equal(formatCatalogAge(7 * 60_000), "7분");
-  assert.equal(formatCatalogAge(60 * 60_000), "1시간");
-  assert.equal(formatCatalogAge(185 * 60_000), "3시간 5분");
+test("stale catalog ages read as 방금, 분, 시간", () => {
+  const staleHeadline = (ageMs) => catalogHealthNotice(
+    { ...healthy, stale: true },
+    healthy.lastReconciledAt + ageMs,
+  )?.headline;
+
+  assert.equal(staleHeadline(5_000), "세션 목록이 방금 전 기준입니다");
+  assert.equal(staleHeadline(7 * 60_000), "세션 목록이 7분 전 기준입니다");
+  assert.equal(staleHeadline(60 * 60_000), "세션 목록이 1시간 전 기준입니다");
+  assert.equal(staleHeadline(185 * 60_000), "세션 목록이 3시간 5분 전 기준입니다");
 });
 
 test("skipped-path messages are picked per scan kind", () => {
@@ -79,4 +84,22 @@ test("skipped-path messages are picked per scan kind", () => {
 test("a healthy or missing catalog reports no skipped paths", () => {
   assert.deepEqual(degradedScanMessages(healthy, "skills"), []);
   assert.deepEqual(degradedScanMessages(null, "skills"), []);
+});
+
+// 목록을 다시 받을지는 세션 개정만으로 정할 수 없다. AIA가 스킬을 게시하거나 산출물이
+// 늘어도 대화가 오가지 않으면 세션 개정은 그대로라, 그 축만 보면 화면이 옛 목록에 굳는다.
+const held = { sessionCatalogRevision: 12, resourceCatalogRevision: 3 };
+
+test("두 개정이 모두 같으면 다시 받지 않는다", () => {
+  assert.equal(catalogRefreshNeeded(held, healthy), false);
+  assert.equal(catalogRefreshNeeded(null, healthy), false);
+  assert.equal(catalogRefreshNeeded(held, null), false);
+});
+
+test("세션 개정이 달라지면 다시 받는다", () => {
+  assert.equal(catalogRefreshNeeded(held, { ...healthy, sessionRevision: 13 }), true);
+});
+
+test("리소스 개정만 달라져도 다시 받는다", () => {
+  assert.equal(catalogRefreshNeeded(held, { ...healthy, resourceRevision: 4 }), true);
 });

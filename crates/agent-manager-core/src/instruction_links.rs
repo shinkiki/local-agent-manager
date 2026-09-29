@@ -12,14 +12,9 @@ use std::collections::BTreeSet;
 pub(crate) fn local_document_links(source: &str) -> Vec<String> {
     let mut links = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut fenced = false;
-    for line in linkify_imports(source).split('\n') {
-        if is_fence_line(line) {
-            fenced = !fenced;
-            continue;
-        }
-        if fenced {
-            continue;
+    for_each_line(&linkify_imports(source), |line, in_code| {
+        if in_code {
+            return;
         }
         for (index, segment) in line.split('`').enumerate() {
             if index % 2 == 1 {
@@ -27,7 +22,7 @@ pub(crate) fn local_document_links(source: &str) -> Vec<String> {
             }
             collect_markdown_links(segment, &mut links, &mut seen);
         }
-    }
+    });
     links
 }
 
@@ -36,17 +31,11 @@ pub(crate) fn local_document_links(source: &str) -> Vec<String> {
 /// 인라인 코드는 원문 그대로 남긴다. 앞이 공백이어야 하므로 이메일은 걸리지 않는다.
 fn linkify_imports(source: &str) -> String {
     let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
-    let mut fenced = false;
     let mut lines = Vec::new();
-    for line in normalized.split('\n') {
-        if is_fence_line(line) {
-            fenced = !fenced;
+    for_each_line(&normalized, |line, in_code| {
+        if in_code || !line.contains('@') {
             lines.push(line.to_owned());
-            continue;
-        }
-        if fenced || !line.contains('@') {
-            lines.push(line.to_owned());
-            continue;
+            return;
         }
         let mut rebuilt = String::with_capacity(line.len());
         for (index, segment) in line.split('`').enumerate() {
@@ -60,8 +49,22 @@ fn linkify_imports(source: &str) -> String {
             }
         }
         lines.push(rebuilt);
-    }
+    });
     lines.join("\n")
+}
+
+/// 줄을 코드 펜스 상태와 함께 넘긴다. 펜스 줄 자체도 코드로 본다 — 링크를 모으는
+/// 쪽은 그 줄을 건너뛰고, 가져오기 표기를 바꾸는 쪽은 그대로 두므로 판정이 같다.
+/// 두 훑기가 펜스 상태를 따로 세다 어긋나면 한쪽에만 보이는 링크가 생긴다.
+fn for_each_line(source: &str, mut visit: impl FnMut(&str, bool)) {
+    let mut fenced = false;
+    for line in source.split('\n') {
+        let fence = is_fence_line(line);
+        if fence {
+            fenced = !fenced;
+        }
+        visit(line, fence || fenced);
+    }
 }
 
 fn is_fence_line(line: &str) -> bool {
@@ -173,11 +176,16 @@ fn collect_markdown_links(segment: &str, links: &mut Vec<String>, seen: &mut BTr
 
 /// 로컬 파일을 가리키는 주소. 웹 주소와 메일, 앵커는 문서가 아니다.
 fn is_local_file_href(href: &str) -> bool {
-    let lowered = href.to_ascii_lowercase();
-    !(lowered.starts_with("https:")
+    !is_remote_or_anchor_href(&href.to_ascii_lowercase())
+}
+
+/// 로컬 문서가 아닌 주소 스킴. 문서 선별과 링크 렌더 판정이 같은 목록을 봐야 한다.
+/// 인자는 이미 소문자로 내린 주소다.
+fn is_remote_or_anchor_href(lowered: &str) -> bool {
+    lowered.starts_with("https:")
         || lowered.starts_with("http:")
         || lowered.starts_with("mailto:")
-        || lowered.starts_with('#'))
+        || lowered.starts_with('#')
 }
 
 /// 화면이 링크로 그리는 주소. 판단할 수 없는 스킴은 링크로 만들지 않으므로 보관
@@ -187,13 +195,7 @@ fn is_safe_href(href: &str) -> bool {
         return false;
     }
     let lowered = href.to_ascii_lowercase();
-    if lowered.starts_with("https:")
-        || lowered.starts_with("http:")
-        || lowered.starts_with("mailto:")
-        || lowered.starts_with('#')
-        || lowered.starts_with('/')
-        || lowered.starts_with('\\')
-    {
+    if is_remote_or_anchor_href(&lowered) || lowered.starts_with('/') || lowered.starts_with('\\') {
         return true;
     }
     for prefix in ["./", ".\\", "../", "..\\"] {

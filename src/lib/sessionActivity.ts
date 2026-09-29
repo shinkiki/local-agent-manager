@@ -1,10 +1,46 @@
 import type { ChatAttentionItem, SessionSummary } from "../types";
+import { maxByScore } from "./sequence.ts";
 
-export type RecentSessionStatus = "running" | "completed" | "cancelled" | "failed";
+/**
+ * 최근 세션 하나가 지금 어떤 상태인가를 알림 목록에서 읽어 내는 판정.
+ *
+ * 그 상태를 얼마나 오래 이어 왔는지 말해 주는 문구는 `sessionActivityText.ts`가 맡고,
+ * 대시보드 카드 하나가 둘을 함께 쓰므로 그 문구는 여기서 다시 내보낸다.
+ */
+
+export { formatRunningElapsed } from "./sessionActivityText.ts";
+
+type RecentSessionStatus = "running" | "completed" | "cancelled" | "failed";
 
 export interface RecentSessionActivity {
   status: RecentSessionStatus;
   occurredAt: number | null;
+}
+
+type SessionTarget = Pick<SessionSummary, "source" | "id">;
+
+/** 승인 요청을 제외하고 같은 세션을 가리키는 실행 알림인지 판정한다. */
+function isSessionAttentionItem(item: ChatAttentionItem, session: SessionTarget): boolean {
+  return item.source === session.source
+    && item.providerSessionId === session.id
+    && item.kind !== "approval";
+}
+
+/** 알림 목록에서 세션에 해당하는 가장 최신 실행 이벤트를 단일 순회로 찾는다. */
+function findLatestAttentionItem(
+  session: SessionTarget,
+  items: readonly ChatAttentionItem[],
+): ChatAttentionItem | null {
+  return maxByScore(items, (item) => (
+    isSessionAttentionItem(item, session) ? item.createdAt : null
+  ));
+}
+
+/** 실행 알림의 종류와 세부 사유를 최근 세션 상태로 바꾼다. */
+function statusFromAttentionItem(item: ChatAttentionItem): RecentSessionStatus {
+  if (item.kind === "running") return "running";
+  if (item.kind === "completed") return "completed";
+  return item.detail === "interrupted" ? "cancelled" : "failed";
 }
 
 /**
@@ -15,39 +51,12 @@ export function recentSessionActivity(
   session: Pick<SessionSummary, "source" | "id" | "startedAt" | "updatedAt">,
   items: ChatAttentionItem[],
 ): RecentSessionActivity {
-  const latest = items
-    .filter((item) => item.source === session.source
-      && item.providerSessionId === session.id
-      && item.kind !== "approval")
-    .reduce<ChatAttentionItem | null>((current, item) => (
-      current === null || item.createdAt > current.createdAt ? item : current
-    ), null);
-
+  const latest = findLatestAttentionItem(session, items);
   if (!latest) {
     return { status: "completed", occurredAt: session.updatedAt ?? session.startedAt };
   }
-  if (latest.kind === "running") {
-    return { status: "running", occurredAt: latest.createdAt };
-  }
-  if (latest.kind === "completed") {
-    return { status: "completed", occurredAt: latest.createdAt };
-  }
   return {
-    status: latest.detail === "interrupted" ? "cancelled" : "failed",
+    status: statusFromAttentionItem(latest),
     occurredAt: latest.createdAt,
   };
-}
-
-/** 진행 중 배지에 표시할 경과 시간. 초 단위 흔들림 없이 분 단위로 갱신한다. */
-export function formatRunningElapsed(startedAt: number | null, nowMs: number): string {
-  if (startedAt === null || !Number.isFinite(startedAt)) return "시간 확인 중";
-  const minutes = Math.floor(Math.max(0, nowMs - startedAt) / 60_000);
-  if (minutes < 1) return "1분 미만";
-  if (minutes < 60) return `${minutes}분째`;
-  const hours = Math.floor(minutes / 60);
-  const rest = minutes % 60;
-  if (hours < 24) return rest === 0 ? `${hours}시간째` : `${hours}시간 ${rest}분째`;
-  const days = Math.floor(hours / 24);
-  const hourRest = hours % 24;
-  return hourRest === 0 ? `${days}일째` : `${days}일 ${hourRest}시간째`;
 }

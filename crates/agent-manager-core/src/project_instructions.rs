@@ -30,10 +30,11 @@ use crate::instruction_trash::{
 use crate::linked_file::{self, LinkedFile, LinkedFileDownload};
 use crate::path_guard::{self, CurDirPolicy, RootLabels};
 use crate::resource_repository::{
-    load_resource_manifest, repository_instructions_root, resource_manifest_path,
-    validate_platform_variant_path, validate_variant_relative_path, HostPlatform,
-    ResourcePlatformManifest,
+    is_windows_reserved_stem, load_resource_manifest, publish_nonce, repository_instructions_root,
+    resource_manifest_path, validate_platform_variant_path, validate_variant_relative_path,
+    HostPlatform, ResourcePlatformManifest,
 };
+use crate::session_management::session_string_enum;
 use crate::skill_library::SkillOverwritePolicy;
 use crate::staged_replace::{StagedKind, StagedReplace};
 use crate::trash_store::new_trash_group_id;
@@ -49,7 +50,13 @@ const MAX_INSTRUCTION_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_INSTRUCTION_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 const STAGE_PREFIX: &str = ".agent-manager-instruction-stage-";
 const BACKUP_PREFIX: &str = ".agent-manager-instruction-backup-";
-const PROVIDERS: [ProviderId; 3] = ProviderId::ALL;
+/// 자기 지침 파일을 따로 갖는 공급자. 로컬 공급자는 Codex 하네스를 빌려 쓰므로 Codex의
+/// `AGENTS.md` 행을 그대로 함께 쓰고, 배포 대상으로 따로 오르지 않는다.
+const PROVIDERS: [ProviderId; 3] = [
+    ProviderId::Claude,
+    ProviderId::Codex,
+    ProviderId::Antigravity,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,76 +109,18 @@ pub enum InstructionPublishOutcome {
     Failed,
 }
 
+session_string_enum!(InstructionPublishOutcome, "알 수 없는 지침 게시 결과입니다", {
+    Published => "published",
+    Replaced => "replaced",
+    Unchanged => "unchanged",
+    Skipped => "skipped",
+    Failed => "failed",
+});
+
 impl InstructionPublishOutcome {
-    pub const ALL: [Self; 5] = [
-        Self::Published,
-        Self::Replaced,
-        Self::Unchanged,
-        Self::Skipped,
-        Self::Failed,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Published => "published",
-            Self::Replaced => "replaced",
-            Self::Unchanged => "unchanged",
-            Self::Skipped => "skipped",
-            Self::Failed => "failed",
-        }
-    }
-
-    /// 신규 게시 결과인지 여부.
-    pub fn is_published(self) -> bool {
-        matches!(self, Self::Published)
-    }
-
-    /// 기존 교체 게시 결과인지 여부.
-    pub fn is_replaced(self) -> bool {
-        matches!(self, Self::Replaced)
-    }
-
-    /// 내용 불변 유지 결과인지 여부.
-    pub fn is_unchanged(self) -> bool {
-        matches!(self, Self::Unchanged)
-    }
-
     /// 건너뜀 결과인지 여부.
     pub fn is_skipped(self) -> bool {
         matches!(self, Self::Skipped)
-    }
-
-    /// 실패 결과인지 여부.
-    pub fn is_failed(self) -> bool {
-        matches!(self, Self::Failed)
-    }
-
-    /// 배포가 정상적으로 완료되거나 유지된 성공 상태인지 여부.
-    pub fn is_successful(self) -> bool {
-        matches!(self, Self::Published | Self::Replaced | Self::Unchanged)
-    }
-}
-
-impl std::fmt::Display for InstructionPublishOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for InstructionPublishOutcome {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "published" => Ok(Self::Published),
-            "replaced" => Ok(Self::Replaced),
-            "unchanged" => Ok(Self::Unchanged),
-            "skipped" => Ok(Self::Skipped),
-            "failed" => Ok(Self::Failed),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 지침 게시 결과입니다: {s}. published|replaced|unchanged|skipped|failed 중 하나를 쓰세요"
-            ))),
-        }
     }
 }
 
@@ -277,16 +226,49 @@ pub struct CreateProjectInstructionRequest {
     pub platforms: Vec<HostPlatform>,
 }
 
+/// 배포 지침 하나를 가리키는 위치 한 벌. 가져오기·미리보기·읽기·연결 문서 읽기·
+/// 원장 손질·배포 삭제·원본 채택이 모두 같은 세 칸(`scope`·`projectPath`·`provider`)으로
+/// 대상을 고르는데, 일곱 요청이 그 세 칸과 기본값을 각자 적고 있었다. 한쪽에만 축을
+/// 늘리거나 기본값을 바꾸면 같은 위치를 가리켜야 할 요청들이 조용히 갈라진다.
+/// 평평하게 펼쳐 받으므로 바깥에서 보는 JSON 모양은 그대로다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstructionDeploymentTarget {
+    /// "personal"이면 projectPath 없이 공급자 홈 설정 파일을 가리킨다.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// 프로젝트 위치일 때 대상 프로젝트. "personal"에는 필요 없다.
+    #[serde(default)]
+    pub project_path: Option<String>,
+    pub provider: ProviderId,
+}
+
+impl InstructionDeploymentTarget {
+    /// 요청이 가리키는 배포 디렉터리와 확정된 위치 구분을 푼다. 허용 위치 집합까지
+    /// 함께 받는 자리라, 호출부가 인자 셋을 각자 펼쳐 넘기면 한쪽만 낡기 쉬웠다.
+    fn resolve(
+        &self,
+        home: Option<&Path>,
+        projects: &[RegisteredProject],
+        allowed: &BTreeSet<PathBuf>,
+    ) -> Result<(PathBuf, &'static str), CoreError> {
+        resolve_deployment_dir(
+            home,
+            projects,
+            allowed,
+            self.scope.as_deref(),
+            self.project_path.as_deref(),
+            self.provider,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportProjectInstructionRequest {
     pub key: String,
-    /// "personal"이면 projectPath 없이 공급자 홈 설정 파일을 가져온다.
-    #[serde(default)]
-    pub scope: Option<String>,
-    #[serde(default)]
-    pub project_path: Option<String>,
-    pub provider: ProviderId,
+    #[serde(flatten)]
+    pub target: InstructionDeploymentTarget,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -302,12 +284,8 @@ pub struct ImportProjectInstructionRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstructionImportPreviewRequest {
-    /// "personal"이면 projectPath 없이 공급자 홈 설정 파일을 본다.
-    #[serde(default)]
-    pub scope: Option<String>,
-    #[serde(default)]
-    pub project_path: Option<String>,
-    pub provider: ProviderId,
+    #[serde(flatten)]
+    pub target: InstructionDeploymentTarget,
 }
 
 /// 미리보기에서 본 연결 문서 하나.
@@ -444,17 +422,39 @@ struct InstructionLinkedDoc {
     bytes: Vec<u8>,
 }
 
+/// 공개 지침 작업이 시작할 때 늘 함께 갖춰야 하는 바탕 값들. 공통 지침 저장소 루트,
+/// 사용자 홈, 세션 목록에서 뽑은 등록 프로젝트는 열한 곳이 같은 세 줄로 준비해 왔다.
+struct InstructionSites {
+    root: PathBuf,
+    home: PathBuf,
+    projects: Vec<RegisteredProject>,
+}
+
+impl InstructionSites {
+    fn open(app_data_dir: &Path, sessions: &[SessionSummary]) -> Result<Self, CoreError> {
+        Ok(Self {
+            root: repository_instructions_root(app_data_dir),
+            home: home_dir()?,
+            projects: project_paths_from_sessions(sessions),
+        })
+    }
+
+    /// 배포 위치 해석기는 홈을 확인하지 못한 경우까지 다루므로 `Option`으로 받는다.
+    fn home(&self) -> Option<&Path> {
+        Some(&self.home)
+    }
+}
+
 pub fn load_project_instruction_library(
     app_data_dir: &Path,
     sessions: &[SessionSummary],
 ) -> Result<ProjectInstructionLibrary, CoreError> {
-    let projects = project_paths_from_sessions(sessions);
-    let home = home_dir()?;
+    let sites = InstructionSites::open(app_data_dir, sessions)?;
     let mut library = load_project_instruction_library_from_paths(
-        &repository_instructions_root(app_data_dir),
+        &sites.root,
         app_data_dir,
-        Some(&home),
-        &projects,
+        sites.home(),
+        &sites.projects,
     )?;
     let meta = load_instruction_meta_store(app_data_dir);
     for entry in &mut library.entries {
@@ -473,59 +473,95 @@ fn load_project_instruction_library_from_paths(
     home: Option<&Path>,
     projects: &[RegisteredProject],
 ) -> Result<ProjectInstructionLibrary, CoreError> {
+    let (entries, mut issues) = read_common_sources(root, app_data_dir, home, projects)?;
+    let deployments = installed_deployments(home, projects);
+    issues.extend(deployment_issues(&deployments));
+    Ok(ProjectInstructionLibrary {
+        schema_version: LIBRARY_SCHEMA_VERSION,
+        common_root: root.to_string_lossy().into_owned(),
+        common_root_present: root.is_dir(),
+        current_platform: HostPlatform::current(),
+        projects: projects
+            .iter()
+            .map(|project| project.path.to_string_lossy().into_owned())
+            .collect(),
+        entries,
+        deployments,
+        issues,
+    })
+}
+
+/// 공통 원본 루트를 훑어 항목과 읽기 실패를 함께 모은다. 한 원본을 읽지 못해도
+/// 나머지는 그대로 실어야 해서, 실패는 오류로 올리지 않고 `issues`에 쌓는다.
+/// 루트가 아직 없으면 빈 목록이다(첫 실행).
+fn read_common_sources(
+    root: &Path,
+    app_data_dir: &Path,
+    home: Option<&Path>,
+    projects: &[RegisteredProject],
+) -> Result<(Vec<ProjectInstructionEntry>, Vec<ProjectInstructionIssue>), CoreError> {
     let mut entries = Vec::new();
     let mut issues = Vec::new();
-    if root.is_dir() {
-        let mut directories = fs::read_dir(root)?
-            .flatten()
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
-        directories.sort();
-        for directory in directories {
-            if directory
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with('.'))
-            {
-                continue;
-            }
-            let metadata = match fs::symlink_metadata(&directory) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    issues.push(ProjectInstructionIssue {
-                        provider: None,
-                        path: directory.to_string_lossy().into_owned(),
-                        message: format!("공통 지침 원본 상태를 읽지 못했습니다: {error}"),
-                    });
-                    continue;
-                }
-            };
-            if metadata.file_type().is_symlink() {
+    if !root.is_dir() {
+        return Ok((entries, issues));
+    }
+    let mut directories = fs::read_dir(root)?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    directories.sort();
+    for directory in directories {
+        if directory
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+        {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) => {
                 issues.push(ProjectInstructionIssue {
                     provider: None,
                     path: directory.to_string_lossy().into_owned(),
-                    message: "심볼릭 링크 공통 지침은 관리하지 않습니다".to_owned(),
+                    message: format!("공통 지침 원본 상태를 읽지 못했습니다: {error}"),
                 });
                 continue;
             }
-            if !metadata.is_dir() {
-                continue;
-            }
-            let key = directory
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let ledger = instruction_ledger(app_data_dir, root, &key, home, projects);
-            match read_entry(&directory, home, projects, &ledger) {
-                Ok(entry) => entries.push(entry),
-                Err(error) => issues.push(ProjectInstructionIssue {
-                    provider: None,
-                    path: directory.to_string_lossy().into_owned(),
-                    message: format!("공통 지침 원본을 읽지 못했습니다: {error}"),
-                }),
-            }
+        };
+        if metadata.file_type().is_symlink() {
+            issues.push(ProjectInstructionIssue {
+                provider: None,
+                path: directory.to_string_lossy().into_owned(),
+                message: "심볼릭 링크 공통 지침은 관리하지 않습니다".to_owned(),
+            });
+            continue;
+        }
+        if !metadata.is_dir() {
+            continue;
+        }
+        let key = directory
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ledger = instruction_ledger(app_data_dir, root, &key, home, projects);
+        match read_entry(&directory, home, projects, &ledger) {
+            Ok(entry) => entries.push(entry),
+            Err(error) => issues.push(ProjectInstructionIssue {
+                provider: None,
+                path: directory.to_string_lossy().into_owned(),
+                message: format!("공통 지침 원본을 읽지 못했습니다: {error}"),
+            }),
         }
     }
-    // 개인(공급자 홈) 위치를 먼저, 그 다음 등록 프로젝트 순으로 나열한다.
+    Ok((entries, issues))
+}
+
+/// 화면이 고르는 배포 위치 전체의 현재 상태. 개인(공급자 홈) 위치를 먼저, 그 다음
+/// 등록 프로젝트 순으로 나열한다.
+fn installed_deployments(
+    home: Option<&Path>,
+    projects: &[RegisteredProject],
+) -> Vec<ProjectInstructionDeployment> {
     let mut deployments = home
         .map(|home| {
             PROVIDERS
@@ -545,7 +581,14 @@ fn load_project_instruction_library_from_paths(
             .into_iter()
             .map(|provider| installed_deployment_status(provider, &project.path, SCOPE_PROJECT))
     }));
-    issues.extend(deployments.iter().filter_map(|deployment| {
+    deployments
+}
+
+/// 배포 위치가 달아 둔 문구를 라이브러리 차원의 문제 목록으로 옮긴다.
+fn deployment_issues(
+    deployments: &[ProjectInstructionDeployment],
+) -> impl Iterator<Item = ProjectInstructionIssue> + '_ {
+    deployments.iter().filter_map(|deployment| {
         deployment
             .message
             .as_ref()
@@ -554,19 +597,6 @@ fn load_project_instruction_library_from_paths(
                 path: deployment.file_path.clone(),
                 message: message.clone(),
             })
-    }));
-    Ok(ProjectInstructionLibrary {
-        schema_version: LIBRARY_SCHEMA_VERSION,
-        common_root: root.to_string_lossy().into_owned(),
-        common_root_present: root.is_dir(),
-        current_platform: HostPlatform::current(),
-        projects: projects
-            .iter()
-            .map(|project| project.path.to_string_lossy().into_owned())
-            .collect(),
-        entries,
-        deployments,
-        issues,
     })
 }
 
@@ -593,11 +623,7 @@ fn read_entry_with_key(
 ) -> Result<ProjectInstructionEntry, CoreError> {
     let content = validated_instruction_content(directory)?;
     let manifest = validate_manifest(directory)?;
-    let meta = load_instruction_meta(directory).unwrap_or_else(|| StoredInstructionMeta {
-        schema_version: 1,
-        name: key.clone(),
-        description: String::new(),
-    });
+    let meta = instruction_meta_or_key(directory, &key);
     let providers = PROVIDERS
         .iter()
         .copied()
@@ -624,13 +650,15 @@ fn read_entry_with_key(
         }
         for (location, scope) in locations {
             deployments.push(deployment_status(
-                directory,
-                &manifest,
-                provider,
-                source_digest.as_deref(),
+                InstructionSourceView {
+                    directory,
+                    manifest: &manifest,
+                    provider,
+                    digest: source_digest.as_deref(),
+                    linked: &linked_files,
+                },
                 &location,
                 scope,
-                &linked_files,
                 ledger.contains(provider, &location),
             ));
         }
@@ -670,58 +698,41 @@ fn create_project_instruction_in_root(
             "하나 이상의 공급자 지침 파일이 필요합니다".to_owned(),
         ));
     }
-    let mut providers = BTreeSet::new();
-    for file in &request.files {
-        if !providers.insert(file.provider) {
-            return Err(CoreError::InvalidInput(format!(
-                "{} 지침 파일이 중복되었습니다",
-                file.provider
-            )));
-        }
-        validate_instruction_text(&file.content)?;
-    }
+    validate_provider_file_writes(&request.files)?;
 
-    fs::create_dir_all(root)?;
-    let target = root.join(&key);
-    assert_within_root(root, &target)?;
-    if fs::symlink_metadata(&target).is_ok() {
-        return Err(CoreError::Conflict(format!(
-            "'{key}' 공통 프로젝트 지침이 이미 있습니다"
-        )));
-    }
-    let staging = SourceStage::create(root, &key)?;
-    let stage = staging.stage.clone();
-    let result = (|| {
-        for file in &request.files {
-            fs::write(
-                stage.join(instruction_file_name(file.provider)),
-                &file.content,
-            )?;
-        }
-        write_instruction_meta(&stage, &name, &description)?;
-        if !request.platforms.is_empty() {
-            let platforms = request
-                .platforms
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            write_manifest(
-                &stage,
-                &ResourcePlatformManifest {
-                    schema_version: 1,
-                    platforms,
-                    variants: BTreeMap::new(),
-                    variant_deletes: BTreeMap::new(),
-                },
-            )?;
-        }
-        validated_instruction_content(&stage)?;
-        fs::rename(&stage, &target)?;
-        read_entry(&target, None, &[], &InstructionLedger::default())
-    })();
-    staging.finish(&target, result)
+    create_new_source(
+        root,
+        &key,
+        |stage| {
+            for file in &request.files {
+                fs::write(
+                    stage.join(instruction_file_name(file.provider)),
+                    &file.content,
+                )?;
+            }
+            write_instruction_meta(stage, &name, &description)?;
+            if !request.platforms.is_empty() {
+                let platforms = request
+                    .platforms
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                write_manifest(
+                    stage,
+                    &ResourcePlatformManifest {
+                        schema_version: 1,
+                        platforms,
+                        variants: BTreeMap::new(),
+                        variant_deletes: BTreeMap::new(),
+                    },
+                )?;
+            }
+            Ok(())
+        },
+        |target| read_entry(target, None, &[], &InstructionLedger::default()),
+    )
 }
 
 /// 배포 위치의 지침 파일을 읽고 링크를 따라가 연결 문서를 모은다. 미리보기와 실제
@@ -748,8 +759,7 @@ fn read_importable_deployment(
         "심볼릭 링크나 일반 파일이 아닌 지침은 가져올 수 없습니다",
     )?;
     ensure_within_limit(&metadata, MAX_INSTRUCTION_FILE_BYTES)?;
-    let text = String::from_utf8(fs::read(&source)?)
-        .map_err(|_| CoreError::InvalidInput("지침 파일은 UTF-8 텍스트여야 합니다".to_owned()))?;
+    let text = read_deployed_instruction_text(&source)?;
     validate_instruction_text(&text)?;
     // 지침은 연결 문서까지 읽으라는 것이므로 링크를 따라가 한 세트로 본다.
     let (docs, issues) =
@@ -800,16 +810,9 @@ fn preview_project_instruction_import_from_paths(
     projects: &[RegisteredProject],
     request: &InstructionImportPreviewRequest,
 ) -> Result<InstructionImportPreview, CoreError> {
-    let (directory, scope) = resolve_deployment_dir(
-        home,
-        projects,
-        &BTreeSet::new(),
-        request.scope.as_deref(),
-        request.project_path.as_deref(),
-        request.provider,
-    )?;
+    let (directory, scope) = request.target.resolve(home, projects, &BTreeSet::new())?;
     let (source, text, docs, link_issues) =
-        read_importable_deployment(&directory, request.provider)?;
+        read_importable_deployment(&directory, request.target.provider)?;
     let total_bytes = docs
         .iter()
         .map(|doc| doc.bytes.len() as u64)
@@ -818,7 +821,7 @@ fn preview_project_instruction_import_from_paths(
     Ok(InstructionImportPreview {
         scope: scope.to_owned(),
         project_path: directory.to_string_lossy().into_owned(),
-        provider: request.provider,
+        provider: request.target.provider,
         file_path: source.to_string_lossy().into_owned(),
         size_bytes: text.len() as u64,
         linked_docs: docs
@@ -840,13 +843,12 @@ pub fn import_project_instruction(
     sessions: &[SessionSummary],
     request: &ImportProjectInstructionRequest,
 ) -> Result<ProjectInstructionEntry, CoreError> {
-    let projects = project_paths_from_sessions(sessions);
-    let home = home_dir()?;
+    let sites = InstructionSites::open(app_data_dir, sessions)?;
     import_project_instruction_from_paths(
-        &repository_instructions_root(app_data_dir),
+        &sites.root,
         app_data_dir,
-        Some(&home),
-        &projects,
+        sites.home(),
+        &sites.projects,
         request,
     )
 }
@@ -859,54 +861,43 @@ fn import_project_instruction_from_paths(
     request: &ImportProjectInstructionRequest,
 ) -> Result<ProjectInstructionEntry, CoreError> {
     let key = validate_instruction_key(&request.key)?;
-    let (directory, scope) = resolve_deployment_dir(
-        home,
-        projects,
-        &BTreeSet::new(),
-        request.scope.as_deref(),
-        request.project_path.as_deref(),
-        request.provider,
-    )?;
+    let (directory, scope) = request.target.resolve(home, projects, &BTreeSet::new())?;
     let (_source, text, linked_docs, _issues) =
-        read_importable_deployment(&directory, request.provider)?;
+        read_importable_deployment(&directory, request.target.provider)?;
     // 화면에서 트리로 고른 문서만 담는다. 고르지 않았으면 링크로 찾은 전부를 담는다.
     let linked_docs = select_linked_docs(linked_docs, request.linked_files.as_deref())?;
     ensure_archive_capacity(text.len() as u64, &linked_docs)?;
     let name = validate_name(request.name.as_deref().unwrap_or(&key), &key)?;
     let description = validate_description(request.description.as_deref().unwrap_or(""))?;
 
-    fs::create_dir_all(root)?;
-    let target = root.join(&key);
-    assert_within_root(root, &target)?;
-    if fs::symlink_metadata(&target).is_ok() {
-        return Err(CoreError::Conflict(format!(
-            "'{key}' 공통 프로젝트 지침이 이미 있습니다"
-        )));
-    }
-    let staging = SourceStage::create(root, &key)?;
-    let stage = staging.stage.clone();
-    let result = (|| {
-        fs::write(stage.join(instruction_file_name(request.provider)), text)?;
-        write_linked_docs(&stage, &linked_docs)?;
-        write_instruction_meta(&stage, &name, &description)?;
-        validated_instruction_content(&stage)?;
-        fs::rename(&stage, &target)?;
-        // 가져온 그 위치가 이 원본의 첫 배포다. 내용이 같으니 그대로 원장에 올린다.
-        let manifest = validate_manifest(&target)?;
-        let linked = archived_linked_docs(&target, &manifest);
-        record_instruction_deployment(
-            app_data_dir,
-            &key,
-            request.provider,
-            scope,
-            &directory,
-            digest_file(&directory.join(instruction_file_name(request.provider))).ok(),
-            deployed_linked_digests(&directory, &linked),
-        );
-        let ledger = instruction_ledger(app_data_dir, root, &key, home, projects);
-        read_entry(&target, home, projects, &ledger)
-    })();
-    staging.finish(&target, result)
+    create_new_source(
+        root,
+        &key,
+        |stage| {
+            fs::write(
+                stage.join(instruction_file_name(request.target.provider)),
+                text,
+            )?;
+            write_linked_docs(stage, &linked_docs)?;
+            write_instruction_meta(stage, &name, &description)
+        },
+        |target| {
+            // 가져온 그 위치가 이 원본의 첫 배포다. 내용이 같으니 그대로 원장에 올린다.
+            let manifest = validate_manifest(target)?;
+            let linked = archived_linked_docs(target, &manifest);
+            record_instruction_deployment(
+                app_data_dir,
+                &key,
+                request.target.provider,
+                scope,
+                &directory,
+                digest_file(&directory.join(instruction_file_name(request.target.provider))).ok(),
+                deployed_linked_digests(&directory, &linked),
+            );
+            let ledger = instruction_ledger(app_data_dir, root, &key, home, projects);
+            read_entry(target, home, projects, &ledger)
+        },
+    )
 }
 
 pub fn publish_project_instruction(
@@ -914,13 +905,12 @@ pub fn publish_project_instruction(
     sessions: &[SessionSummary],
     request: &PublishProjectInstructionRequest,
 ) -> Result<InstructionPublishReceipt, CoreError> {
-    let projects = project_paths_from_sessions(sessions);
-    let home = home_dir()?;
+    let sites = InstructionSites::open(app_data_dir, sessions)?;
     publish_project_instruction_from_paths(
-        &repository_instructions_root(app_data_dir),
+        &sites.root,
         app_data_dir,
-        Some(&home),
-        &projects,
+        sites.home(),
+        &sites.projects,
         request,
     )
 }
@@ -930,15 +920,13 @@ pub fn get_project_instruction_migration_plan(
     key: &str,
     target_platform: HostPlatform,
 ) -> Result<ProjectInstructionMigrationPlan, CoreError> {
-    let key = validate_instruction_key(key)?;
-    let root = repository_instructions_root(app_data_dir);
-    let directory = root.join(&key);
-    assert_within_root(&root, &directory)?;
-    let content = validated_instruction_content(&directory)?;
-    let manifest = validate_manifest(&directory)?;
+    let source = ArchivedSource::open(app_data_dir, key)?;
+    let key = source.key.clone();
+    let content = source.content()?;
+    let manifest = source.manifest()?;
     let providers = PROVIDERS
         .into_iter()
-        .filter(|provider| instruction_provider_present(&directory, &manifest, *provider))
+        .filter(|provider| instruction_provider_present(&source.directory, &manifest, *provider))
         .collect::<Vec<_>>();
     if providers.is_empty() {
         return Err(CoreError::NotFound(
@@ -971,14 +959,12 @@ pub fn read_project_instruction_file(
     key: &str,
     provider: ProviderId,
 ) -> Result<ProjectInstructionFileContent, CoreError> {
-    let key = validate_instruction_key(key)?;
-    let root = repository_instructions_root(app_data_dir);
-    let directory = root.join(&key);
-    assert_within_root(&root, &directory)?;
-    validated_instruction_content(&directory)?;
-    let manifest = validate_manifest(&directory)?;
+    let source = ArchivedSource::open(app_data_dir, key)?;
+    let key = source.key.clone();
+    source.content()?;
+    let manifest = source.manifest()?;
     let (path, source_variant) =
-        migration_source_instruction_file(&directory, &manifest, provider)?;
+        migration_source_instruction_file(&source.directory, &manifest, provider)?;
     let bytes = fs::read(path)?;
     let content = String::from_utf8(bytes).map_err(|_| {
         CoreError::InvalidInput("프로젝트 지침은 UTF-8 텍스트여야 합니다".to_owned())
@@ -1027,16 +1013,7 @@ pub fn save_project_instruction_platform_variant(
         ));
     }
     let key = validate_instruction_key(&request.key)?;
-    let mut seen = BTreeSet::new();
-    for file in &request.files {
-        if !seen.insert(file.provider) {
-            return Err(CoreError::InvalidInput(format!(
-                "{} 지침 파일이 중복되었습니다",
-                file.provider
-            )));
-        }
-        validate_instruction_text(&file.content)?;
-    }
+    validate_provider_file_writes(&request.files)?;
 
     let mut edit = ManifestSource::open(app_data_dir, &key, &request.expected_digest)?;
     if edit.manifest.platforms.is_empty() {
@@ -1103,13 +1080,7 @@ fn publish_project_instruction_from_paths(
     request: &PublishProjectInstructionRequest,
 ) -> Result<InstructionPublishReceipt, CoreError> {
     let key = validate_instruction_key(&request.key)?;
-    let source_directory = root.join(&key);
-    assert_within_root(root, &source_directory)?;
-    if !source_directory.is_dir() {
-        return Err(CoreError::NotFound(format!(
-            "'{key}' 공통 프로젝트 지침을 찾지 못했습니다"
-        )));
-    }
+    let source_directory = open_instruction_source(root, &key, missing_common_instruction)?;
     let ledger_dirs = ledger_project_dirs(app_data_dir);
     let content = validated_instruction_content(&source_directory)?;
     let manifest = validate_manifest(&source_directory)?;
@@ -1162,7 +1133,7 @@ fn publish_project_instruction_from_paths(
             fs::create_dir_all(&directory)?;
         }
         let target = directory.join(instruction_file_name(provider));
-        let mut deployment = empty_deployment(provider, &directory, &target, scope);
+        let deployment = empty_deployment(provider, &directory, &target, scope);
         if validated_instruction_content(&source_directory)?.digest != content.digest {
             results.push(deployment.concluded(
                 InstructionPublishOutcome::Failed,
@@ -1170,66 +1141,22 @@ fn publish_project_instruction_from_paths(
             ));
             continue;
         }
-        let source = match projected_instruction_file(&source_directory, &manifest, provider) {
-            Ok(path) => path,
-            Err(error) => {
-                results.push(
-                    deployment.concluded(InstructionPublishOutcome::Skipped, error.to_string()),
-                );
-                continue;
-            }
-        };
-        let linked_results = match publish_linked_docs(
-            &source_directory,
-            &linked,
-            &directory,
-            request.overwrite,
-            None,
-        ) {
-            Ok(linked) => linked,
-            Err(error) => {
-                results.push(deployment.concluded(
-                    InstructionPublishOutcome::Failed,
-                    format!("연결 문서를 게시하지 못했습니다: {error}"),
-                ));
-                continue;
-            }
-        };
-        match publish_instruction_file(&directory, &source, &target, request.overwrite) {
-            Ok(outcome) => {
-                // 실제로 놓인(또는 이미 같은 내용인) 위치만 원장에 올린다. 건너뛴
-                // 위치는 남의 파일이 있는 곳이라 이 원본의 배포가 아니다.
-                if !outcome.is_skipped() {
-                    record_instruction_deployment(
-                        app_data_dir,
-                        &key,
-                        provider,
-                        scope,
-                        &directory,
-                        digest_file(&target).ok(),
-                        published_linked_digests(&directory, &linked_results),
-                    );
-                }
-                deployment = deployment_status(
-                    &source_directory,
-                    &manifest,
-                    provider,
-                    projected_source_digest(&source_directory, &manifest, provider).as_deref(),
-                    &directory,
-                    scope,
-                    &linked,
-                    !outcome.is_skipped(),
-                );
-                deployment.outcome = Some(outcome);
-                deployment.message = publish_message(outcome, &linked_results);
-            }
-            Err(error) => {
-                deployment =
-                    deployment.concluded(InstructionPublishOutcome::Failed, error.to_string());
-            }
-        }
-        deployment.linked_results = linked_results;
-        results.push(deployment);
+        results.push(write_deployment(
+            DeploymentWrite {
+                source_directory: &source_directory,
+                manifest: &manifest,
+                provider,
+                directory: &directory,
+                scope,
+                linked: &linked,
+                overwrite: request.overwrite,
+                linked_guard: None,
+                app_data_dir,
+                key: &key,
+                with_message: true,
+            },
+            deployment,
+        ));
     }
     Ok(InstructionPublishReceipt {
         key,
@@ -1239,27 +1166,144 @@ fn publish_project_instruction_from_paths(
     })
 }
 
-fn publish_instruction_file(
-    project_root: &Path,
+/// 한 배포 위치에 지침 파일과 연결 문서를 실제로 써 넣는 한 벌. 최초 게시와 재게시가
+/// 같은 순서(원본 투영 → 연결 문서 → 지침 파일 → 원장 기록 → 상태 재계산)를 쓰므로
+/// 인자만 다른 두 벌을 여기 모았다.
+struct DeploymentWrite<'a> {
+    source_directory: &'a Path,
+    manifest: &'a ResourcePlatformManifest,
+    provider: ProviderId,
+    directory: &'a Path,
+    scope: &'a str,
+    linked: &'a [String],
+    overwrite: SkillOverwritePolicy,
+    /// 우리가 마지막으로 써 넣은 그대로인 연결 문서만 덮어쓰게 하는 보호값(C5-4).
+    /// 사람이 위치를 고른 최초 게시에는 없다.
+    linked_guard: Option<&'a BTreeMap<String, String>>,
+    app_data_dir: &'a Path,
+    key: &'a str,
+    /// 게시 결과 문구를 배포 행에 실을지. 재게시는 화면에 문구를 띄우지 않는다.
+    with_message: bool,
+}
+
+/// 준비된 배포 행(`deployment`)에 이번 쓰기의 결과를 채워 돌려준다. 실패·건너뜀은
+/// 그 자리에서 결론지어 반환하므로 호출부는 결과를 모으기만 하면 된다.
+fn write_deployment(
+    write: DeploymentWrite<'_>,
+    deployment: ProjectInstructionDeployment,
+) -> ProjectInstructionDeployment {
+    let source =
+        match projected_instruction_file(write.source_directory, write.manifest, write.provider) {
+            Ok(path) => path,
+            Err(error) => {
+                return deployment.concluded(InstructionPublishOutcome::Skipped, error.to_string())
+            }
+        };
+    let linked_results = match publish_linked_docs(
+        write.source_directory,
+        write.linked,
+        write.directory,
+        write.overwrite,
+        write.linked_guard,
+    ) {
+        Ok(linked) => linked,
+        Err(error) => {
+            return deployment.concluded(
+                InstructionPublishOutcome::Failed,
+                format!("연결 문서를 게시하지 못했습니다: {error}"),
+            )
+        }
+    };
+    let target = write.directory.join(instruction_file_name(write.provider));
+    let mut deployment =
+        match publish_instruction_file(write.directory, &source, &target, write.overwrite) {
+            Ok(outcome) => {
+                // 실제로 놓인(또는 이미 같은 내용인) 위치만 원장에 올린다. 건너뛴
+                // 위치는 남의 파일이 있는 곳이라 이 원본의 배포가 아니다.
+                if !outcome.is_skipped() {
+                    record_instruction_deployment(
+                        write.app_data_dir,
+                        write.key,
+                        write.provider,
+                        write.scope,
+                        write.directory,
+                        digest_file(&target).ok(),
+                        published_linked_digests(write.directory, &linked_results),
+                    );
+                }
+                let digest =
+                    projected_source_digest(write.source_directory, write.manifest, write.provider);
+                let mut deployment = deployment_status(
+                    InstructionSourceView {
+                        directory: write.source_directory,
+                        manifest: write.manifest,
+                        provider: write.provider,
+                        digest: digest.as_deref(),
+                        linked: write.linked,
+                    },
+                    write.directory,
+                    write.scope,
+                    !outcome.is_skipped(),
+                );
+                deployment.outcome = Some(outcome);
+                if write.with_message {
+                    deployment.message = publish_message(outcome, &linked_results);
+                }
+                deployment
+            }
+            Err(error) => {
+                deployment.concluded(InstructionPublishOutcome::Failed, error.to_string())
+            }
+        };
+    deployment.linked_results = linked_results;
+    deployment
+}
+
+/// 지침 파일과 연결 문서는 같은 순서로 배포된다 — 원본을 검사하고, 대상의 현재 상태로
+/// 바꿀 일이 있는지 가른 뒤, 스테이지 사본을 지문으로 검증하고 백업과 함께 원자적으로
+/// 바꾼다. 두 자리가 달랐던 것은 화면에 나갈 문구와 스테이지를 놓을 디렉터리뿐이다.
+struct PublishFileLabels {
+    source_kind: &'static str,
+    target_symlink: &'static str,
+    target_not_file: &'static str,
+    stage_mismatch: &'static str,
+}
+
+const INSTRUCTION_PUBLISH_LABELS: PublishFileLabels = PublishFileLabels {
+    source_kind: "공통 원본 지침은 일반 파일이어야 합니다",
+    target_symlink: "프로젝트 지침 심볼릭 링크는 교체하지 않습니다",
+    target_not_file: "프로젝트 지침 경로가 일반 파일이 아닙니다",
+    stage_mismatch: "지침 스테이징 사본 검증에 실패했습니다",
+};
+
+const LINKED_DOC_PUBLISH_LABELS: PublishFileLabels = PublishFileLabels {
+    source_kind: "보관한 연결 문서는 일반 파일이어야 합니다",
+    target_symlink: "연결 문서 심볼릭 링크는 교체하지 않습니다",
+    target_not_file: "연결 문서 경로가 일반 파일이 아닙니다",
+    stage_mismatch: "연결 문서 스테이징 사본 검증에 실패했습니다",
+};
+
+/// `stage_dir`는 Unchanged·Skipped로 끝나지 않을 때만 불린다. 연결 문서는 이 자리에서
+/// 하위 디렉터리를 만들어야 해서, 바꿀 일이 없는 배포가 폴더를 남기지 않게 한다.
+fn publish_replaceable_file(
+    root: &Path,
     source: &Path,
     target: &Path,
     overwrite: SkillOverwritePolicy,
+    labels: PublishFileLabels,
+    stage_dir: impl FnOnce() -> Result<PathBuf, CoreError>,
 ) -> Result<InstructionPublishOutcome, CoreError> {
-    assert_within_root(project_root, target)?;
+    assert_within_root(root, target)?;
     let source_meta = fs::symlink_metadata(source)?;
-    ensure_regular_file(&source_meta, "공통 원본 지침은 일반 파일이어야 합니다")?;
+    ensure_regular_file(&source_meta, labels.source_kind)?;
     ensure_within_limit(&source_meta, MAX_INSTRUCTION_FILE_BYTES)?;
     let source_digest = digest_file(source)?;
     let existed = match fs::symlink_metadata(target) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(CoreError::InvalidInput(
-                "프로젝트 지침 심볼릭 링크는 교체하지 않습니다".to_owned(),
-            ));
+            return Err(CoreError::InvalidInput(labels.target_symlink.to_owned()));
         }
         Ok(metadata) if !metadata.is_file() => {
-            return Err(CoreError::Conflict(
-                "프로젝트 지침 경로가 일반 파일이 아닙니다".to_owned(),
-            ));
+            return Err(CoreError::Conflict(labels.target_not_file.to_owned()));
         }
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -1272,23 +1316,17 @@ fn publish_instruction_file(
         return Ok(InstructionPublishOutcome::Skipped);
     }
 
+    let stage_dir = stage_dir()?;
+    let name = instruction_file_name_from_path(target)?;
     let nonce = publish_nonce();
-    let stage = project_root.join(format!(
-        "{STAGE_PREFIX}{}-{nonce}",
-        instruction_file_name_from_path(target)?
-    ));
-    let backup = project_root.join(format!(
-        "{BACKUP_PREFIX}{}-{nonce}",
-        instruction_file_name_from_path(target)?
-    ));
-    assert_within_root(project_root, &stage)?;
-    assert_within_root(project_root, &backup)?;
+    let stage = stage_dir.join(format!("{STAGE_PREFIX}{name}-{nonce}"));
+    let backup = stage_dir.join(format!("{BACKUP_PREFIX}{name}-{nonce}"));
+    assert_within_root(root, &stage)?;
+    assert_within_root(root, &backup)?;
     fs::copy(source, &stage)?;
     if digest_file(&stage)? != source_digest {
         let _ = fs::remove_file(&stage);
-        return Err(CoreError::Conflict(
-            "지침 스테이징 사본 검증에 실패했습니다".to_owned(),
-        ));
+        return Err(CoreError::Conflict(labels.stage_mismatch.to_owned()));
     }
     StagedReplace {
         kind: StagedKind::File,
@@ -1303,6 +1341,22 @@ fn publish_instruction_file(
     } else {
         Ok(InstructionPublishOutcome::Published)
     }
+}
+
+fn publish_instruction_file(
+    project_root: &Path,
+    source: &Path,
+    target: &Path,
+    overwrite: SkillOverwritePolicy,
+) -> Result<InstructionPublishOutcome, CoreError> {
+    publish_replaceable_file(
+        project_root,
+        source,
+        target,
+        overwrite,
+        INSTRUCTION_PUBLISH_LABELS,
+        || Ok(project_root.to_path_buf()),
+    )
 }
 
 /// 보관한 연결 문서를 배포 위치의 같은 상대 경로에 쓴다. 지침 파일보다 먼저 써서
@@ -1343,26 +1397,41 @@ fn publish_linked_docs(
     Ok(results)
 }
 
+/// 배포 위치의 상대 경로들을 원장에 적을 지문 표로 만든다. 위치 밖으로 벗어나는
+/// 경로와 읽지 못한 파일은 건너뛴다 — 원장에는 우리가 실제로 확인한 내용만 남긴다.
+///
+/// 어떤 경로를 넘길지는 부르는 쪽이 정한다. 배포 직후에는 실제로 써 넣은 문서만,
+/// 나중에 위치 상태를 다시 읽을 때는 세트에 속한 문서 전부가 대상이다.
+fn linked_digests<'a>(
+    directory: &Path,
+    relatives: impl IntoIterator<Item = &'a str>,
+) -> BTreeMap<String, String> {
+    let mut digests = BTreeMap::new();
+    for relative in relatives {
+        let path = directory.join(relative);
+        if assert_within_root(directory, &path).is_err() {
+            continue;
+        }
+        if let Ok(digest) = digest_file(&path) {
+            digests.insert(relative.to_owned(), digest);
+        }
+    }
+    digests
+}
+
 /// 원장에 남길 연결 문서 지문. 건너뛴 문서는 우리가 쓴 내용이 아니므로 기록하지 않아,
 /// 다음 재배포에서도 계속 보호된다.
 fn published_linked_digests(
     directory: &Path,
     results: &[InstructionLinkedFileResult],
 ) -> BTreeMap<String, String> {
-    let mut digests = BTreeMap::new();
-    for result in results {
-        if result.outcome.is_skipped() {
-            continue;
-        }
-        let path = directory.join(&result.relative);
-        if assert_within_root(directory, &path).is_err() {
-            continue;
-        }
-        if let Ok(digest) = digest_file(&path) {
-            digests.insert(result.relative.clone(), digest);
-        }
-    }
-    digests
+    linked_digests(
+        directory,
+        results
+            .iter()
+            .filter(|result| !result.outcome.is_skipped())
+            .map(|result| result.relative.as_str()),
+    )
 }
 
 /// 연결 문서 하나를 원자적으로 배포한다. 지침 파일과 같은 스테이지·백업 교체를
@@ -1373,63 +1442,20 @@ fn publish_linked_doc_file(
     target: &Path,
     overwrite: SkillOverwritePolicy,
 ) -> Result<InstructionPublishOutcome, CoreError> {
-    assert_within_root(root, target)?;
-    let source_meta = fs::symlink_metadata(source)?;
-    ensure_regular_file(&source_meta, "보관한 연결 문서는 일반 파일이어야 합니다")?;
-    ensure_within_limit(&source_meta, MAX_INSTRUCTION_FILE_BYTES)?;
-    let source_digest = digest_file(source)?;
     let parent = target
         .parent()
         .ok_or_else(|| CoreError::InvalidInput("연결 문서 폴더를 알 수 없습니다".to_owned()))?;
-    let existed = match fs::symlink_metadata(target) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(CoreError::InvalidInput(
-                "연결 문서 심볼릭 링크는 교체하지 않습니다".to_owned(),
-            ));
-        }
-        Ok(metadata) if !metadata.is_file() => {
-            return Err(CoreError::Conflict(
-                "연결 문서 경로가 일반 파일이 아닙니다".to_owned(),
-            ));
-        }
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(CoreError::Io(error)),
-    };
-    if existed && digest_file(target)? == source_digest {
-        return Ok(InstructionPublishOutcome::Unchanged);
-    }
-    if existed && matches!(overwrite, SkillOverwritePolicy::Fail) {
-        return Ok(InstructionPublishOutcome::Skipped);
-    }
-    prepare_linked_doc_dir(root, parent)?;
-
-    let name = instruction_file_name_from_path(target)?;
-    let nonce = publish_nonce();
-    let stage = parent.join(format!("{STAGE_PREFIX}{name}-{nonce}"));
-    let backup = parent.join(format!("{BACKUP_PREFIX}{name}-{nonce}"));
-    assert_within_root(root, &stage)?;
-    assert_within_root(root, &backup)?;
-    fs::copy(source, &stage)?;
-    if digest_file(&stage)? != source_digest {
-        let _ = fs::remove_file(&stage);
-        return Err(CoreError::Conflict(
-            "연결 문서 스테이징 사본 검증에 실패했습니다".to_owned(),
-        ));
-    }
-    StagedReplace {
-        kind: StagedKind::File,
-        stage: &stage,
+    publish_replaceable_file(
+        root,
+        source,
         target,
-        backup: existed.then_some(backup.as_path()),
-    }
-    .commit()?;
-    if existed {
-        let _ = fs::remove_file(backup);
-        Ok(InstructionPublishOutcome::Replaced)
-    } else {
-        Ok(InstructionPublishOutcome::Published)
-    }
+        overwrite,
+        LINKED_DOC_PUBLISH_LABELS,
+        || {
+            prepare_linked_doc_dir(root, parent)?;
+            Ok(parent.to_path_buf())
+        },
+    )
 }
 
 /// 연결 문서가 놓일 하위 디렉터리를 만든다. 도중에 심볼릭 링크가 있으면 배포 위치
@@ -1511,6 +1537,9 @@ fn personal_instruction_dir(home: &Path, provider: ProviderId) -> PathBuf {
         ProviderId::Claude => home.join(".claude"),
         ProviderId::Codex => home.join(".codex"),
         ProviderId::Antigravity => home.join(".gemini"),
+        // ACP 하네스는 설정 디렉터리에서 개인 지침을 읽는다. Codex 홈을 빌려 쓰면
+        // 게시해도 하네스가 읽지 않는다.
+        ProviderId::Local => home.join(".config/opencode"),
     }
 }
 
@@ -1771,55 +1800,58 @@ fn same_file_content(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// 배포 상태를 계산할 때 원본 쪽에서 오는 값 한 벌. 원본 디렉터리·매니페스트·공급자·
+/// 투사 지문·연결 문서 목록은 늘 붙어 다니는데도 자리마다 따로 날라 인자만 불려 왔다.
+#[derive(Clone, Copy)]
+struct InstructionSourceView<'a> {
+    directory: &'a Path,
+    manifest: &'a ResourcePlatformManifest,
+    provider: ProviderId,
+    /// 이 공급자에게 투사했을 때 나올 원본 지문. 원본에 해당 파일이 없으면 비어 있다.
+    digest: Option<&'a str>,
+    linked: &'a [String],
+}
+
 /// 배포 위치 한 곳의 상태. `managed`가 거짓이면 존재 여부만 싣고 비교는 하지 않는다.
 /// 지침 파일 이름은 공급자당 고정이라, 원장에 없는 위치의 파일은 이 원본과 아무 관계가
 /// 없을 수 있고 비교했다면 그 전부가 "외부 수정"으로 잡힌다.
-#[allow(clippy::too_many_arguments)]
 fn deployment_status(
-    source_directory: &Path,
-    manifest: &ResourcePlatformManifest,
-    provider: ProviderId,
-    source_digest: Option<&str>,
+    source: InstructionSourceView<'_>,
     directory: &Path,
     scope: &str,
-    linked: &[String],
     managed: bool,
 ) -> ProjectInstructionDeployment {
-    let mut deployment = installed_deployment_status(provider, directory, scope);
+    let mut deployment = installed_deployment_status(source.provider, directory, scope);
     deployment.managed = managed;
-    deployment.source_digest = source_digest.map(str::to_owned);
+    deployment.source_digest = source.digest.map(str::to_owned);
     if !managed {
         return deployment;
     }
     deployment.divergent = deployment.present
-        && match (&deployment.content_digest, source_digest) {
-            (Some(installed), Some(source)) => installed != source,
+        && match (&deployment.content_digest, source.digest) {
+            (Some(installed), Some(digest)) => installed != digest,
             _ => false,
         };
     if deployment.present && deployment.message.is_none() {
-        fill_linked_status(
-            &mut deployment,
-            source_directory,
-            manifest,
-            provider,
-            directory,
-            linked,
-        );
+        fill_linked_status(&mut deployment, source, directory);
     }
     deployment
 }
 
 /// 배포 위치의 연결 문서를 원본과 맞춰 본다. 지침은 연결 문서까지 읽으라는 것이므로
 /// 문서가 없거나 달라지면 지침 파일이 같아도 세트로는 다른 상태다.
-#[allow(clippy::too_many_arguments)]
 fn fill_linked_status(
     deployment: &mut ProjectInstructionDeployment,
-    source_directory: &Path,
-    manifest: &ResourcePlatformManifest,
-    provider: ProviderId,
+    source: InstructionSourceView<'_>,
     directory: &Path,
-    linked: &[String],
 ) {
+    let InstructionSourceView {
+        directory: source_directory,
+        manifest,
+        provider,
+        linked,
+        ..
+    } = source;
     for relative in linked {
         let deployed = directory.join(relative);
         if assert_within_root(directory, &deployed).is_err() {
@@ -2154,6 +2186,43 @@ fn load_instruction_meta(directory: &Path) -> Option<StoredInstructionMeta> {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
+/// 보관 원본의 표시 메타. 메타 파일이 없거나 읽히지 않으면 보관 키를 이름으로 삼고
+/// 설명은 비운다. 원본을 훑는 자리마다 같은 대체값을 쓰기 위한 도우미다.
+fn instruction_meta_or_key(directory: &Path, key: &str) -> StoredInstructionMeta {
+    load_instruction_meta(directory).unwrap_or_else(|| StoredInstructionMeta {
+        schema_version: 1,
+        name: key.to_owned(),
+        description: String::new(),
+    })
+}
+
+/// 보관 원본 디렉터리 자체를 휴지통에 넣기 위한 항목 정보. 원본 삭제·보관 취소·
+/// 채택이 모두 같은 모양을 쓴다. 배포본 항목과 달리 공급자·범위가 없는 공유 원본이다.
+fn archived_source_trash_draft(
+    directory: &Path,
+    key: &str,
+    group_id: &str,
+    actor: &str,
+    content: &InstructionContent,
+) -> InstructionTrashItemDraft {
+    let meta = instruction_meta_or_key(directory, key);
+    InstructionTrashItemDraft {
+        group_id: group_id.to_owned(),
+        key: key.to_owned(),
+        kind: InstructionTrashItemKind::Directory,
+        provider: None,
+        scope: None,
+        project_path: None,
+        shared: true,
+        deleted_by: actor.to_owned(),
+        content_digest: Some(content.digest.clone()),
+        file_count: content.files.len(),
+        total_bytes: content.total_bytes,
+        name: meta.name,
+        description: meta.description,
+    }
+}
+
 fn write_instruction_meta(
     directory: &Path,
     name: &str,
@@ -2250,6 +2319,67 @@ fn assert_within_root(root: &Path, candidate: &Path) -> Result<(), CoreError> {
     path_guard::assert_within_root(root, candidate, INSTRUCTION_PATH_LABELS)
 }
 
+/// 검증된 키의 공통 원본 디렉터리를 연다. 루트 아래로 경로를 짓고 경계를 확인한 뒤
+/// 실제로 디렉터리인지 보는 세 걸음을 일곱 자리가 같은 순서로 반복하고 있었다.
+/// 없을 때의 문구만 부르는 쪽 화면 문맥에 따라 다르므로 인자로 받는다.
+fn open_instruction_source(
+    root: &Path,
+    key: &str,
+    missing: fn(&str) -> String,
+) -> Result<PathBuf, CoreError> {
+    let directory = root.join(key);
+    assert_within_root(root, &directory)?;
+    if !directory.is_dir() {
+        return Err(CoreError::NotFound(missing(key)));
+    }
+    Ok(directory)
+}
+
+/// 보관 루트를 이미 들고 있지 않은 진입점이 키 하나로 보관 원본을 여는 한 벌.
+/// 키 검증 → 보관 루트 잡기 → 경로 짓기 → 루트 이탈 검사의 네 걸음을 네 자리가 같은
+/// 순서로 되풀이하고 있었고, 그중 한 자리는 이탈 검사를 빠뜨린 채였다. 루트까지 함께
+/// 들고 있는 이유는 원본을 교체하는 편집 경로가 스테이지를 루트 옆에 두기 때문이다.
+struct ArchivedSource {
+    key: String,
+    root: PathBuf,
+    directory: PathBuf,
+}
+
+impl ArchivedSource {
+    fn open(app_data_dir: &Path, key: &str) -> Result<Self, CoreError> {
+        let key = validate_instruction_key(key)?;
+        let root = repository_instructions_root(app_data_dir);
+        let directory = root.join(&key);
+        assert_within_root(&root, &directory)?;
+        Ok(Self {
+            key,
+            root,
+            directory,
+        })
+    }
+
+    fn content(&self) -> Result<InstructionContent, CoreError> {
+        validated_instruction_content(&self.directory)
+    }
+
+    fn manifest(&self) -> Result<ResourcePlatformManifest, CoreError> {
+        validate_manifest(&self.directory)
+    }
+}
+
+/// 공통 원본이 없을 때의 문구 세 가지. 화면마다 부르는 이름이 달라 그대로 둔다.
+fn missing_common_instruction(key: &str) -> String {
+    format!("'{key}' 공통 프로젝트 지침을 찾지 못했습니다")
+}
+
+fn missing_archived_source(key: &str) -> String {
+    format!("보관 원본이 없습니다: {key}")
+}
+
+fn missing_archived_source_for_update(key: &str) -> String {
+    format!("보관 원본을 찾지 못했습니다: {key}")
+}
+
 fn digest_file(path: &Path) -> Result<String, CoreError> {
     let metadata = regular_file_metadata(path, "지침은 심볼릭 링크가 아닌 일반 파일이어야 합니다")?;
     ensure_within_limit(&metadata, MAX_INSTRUCTION_FILE_BYTES)?;
@@ -2261,6 +2391,7 @@ fn instruction_file_name(provider: ProviderId) -> &'static str {
         ProviderId::Claude => "CLAUDE.md",
         ProviderId::Codex => "AGENTS.md",
         ProviderId::Antigravity => "GEMINI.md",
+        ProviderId::Local => "AGENTS.md",
     }
 }
 
@@ -2270,48 +2401,63 @@ fn instruction_file_name_from_path(path: &Path) -> Result<String, CoreError> {
         .ok_or_else(|| CoreError::InvalidInput("지침 파일 이름을 읽지 못했습니다".to_owned()))
 }
 
-fn is_windows_reserved_stem(value: &str) -> bool {
-    let stem = value
-        .split('.')
-        .next()
-        .unwrap_or(value)
-        .to_ascii_uppercase();
-    matches!(
-        stem.as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    )
-}
-
-fn publish_nonce() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
-}
-
 /// 보관 원본을 통째로 바꿀 때 쓰는 임시 스테이지와 백업 한 쌍. 두 경로가 같은 회차
 /// nonce를 나눠 가져야 되살리기가 어느 스테이지에서 나온 백업인지 헷갈리지 않는다.
 struct SourceStage {
     stage: PathBuf,
     backup: PathBuf,
+}
+
+/// 요청에 실린 공급자별 지침 파일을 훑어 같은 공급자가 두 번 오르지 않았는지와
+/// 본문이 제한을 지키는지 본다. 원본을 새로 만드는 경로와 OS 변형을 저장하는 경로가
+/// 같은 규칙을 쓰므로 한 자리에 둔다.
+///
+/// 편집(`validate_update_request`)은 중복 확인과 본문 확인 사이에 삭제 지정 충돌까지
+/// 보므로 이 함수를 쓰지 않는다. 끼워 넣으면 어떤 오류가 먼저 나는지가 바뀐다.
+fn validate_provider_file_writes(files: &[InstructionProviderFileWrite]) -> Result<(), CoreError> {
+    let mut seen = BTreeSet::new();
+    for file in files {
+        if !seen.insert(file.provider) {
+            return Err(CoreError::InvalidInput(format!(
+                "{} 지침 파일이 중복되었습니다",
+                file.provider
+            )));
+        }
+        validate_instruction_text(&file.content)?;
+    }
+    Ok(())
+}
+
+/// 아직 없는 키로 공통 원본 하나를 새로 만든다. 자리를 선점하고 스테이지를 열어
+/// `fill`에 넘긴 뒤, 내용 검증을 통과하면 스테이지를 원본 자리로 옮기고 `adopt`에
+/// 그 자리를 넘긴다. 도중에 실패하면 스테이지만 사라지고 원본 자리는 비어 있던
+/// 그대로 남는다.
+///
+/// 새로 만들기와 기존 배포 가져오기가 이 뼈대를 공유한다. 두 경로가 따로 쓰고 있으면
+/// 자리 선점 검사나 스테이지 정리 중 하나만 고쳐지기 쉽다.
+fn create_new_source<T>(
+    root: &Path,
+    key: &str,
+    fill: impl FnOnce(&Path) -> Result<(), CoreError>,
+    adopt: impl FnOnce(&Path) -> Result<T, CoreError>,
+) -> Result<T, CoreError> {
+    fs::create_dir_all(root)?;
+    let target = root.join(key);
+    assert_within_root(root, &target)?;
+    if fs::symlink_metadata(&target).is_ok() {
+        return Err(CoreError::Conflict(format!(
+            "'{key}' 공통 프로젝트 지침이 이미 있습니다"
+        )));
+    }
+    let staging = SourceStage::create(root, key)?;
+    let stage = staging.stage.clone();
+    let result = (|| {
+        fill(&stage)?;
+        validated_instruction_content(&stage)?;
+        fs::rename(&stage, &target)?;
+        adopt(&target)
+    })();
+    staging.finish(&target, result)
 }
 
 impl SourceStage {
@@ -2374,19 +2520,17 @@ struct ManifestSource {
 impl ManifestSource {
     /// 보관 원본을 열고 낙관적 잠금을 확인한다. 지문이 어긋나면 편집을 시작하지 않는다.
     fn open(app_data_dir: &Path, key: &str, expected_digest: &str) -> Result<Self, CoreError> {
-        let root = repository_instructions_root(app_data_dir);
-        let source = root.join(key);
-        assert_within_root(&root, &source)?;
-        let current = validated_instruction_content(&source)?;
+        let archived = ArchivedSource::open(app_data_dir, key)?;
+        let current = archived.content()?;
         if current.digest != expected_digest {
             return Err(CoreError::Conflict(
                 "지침 원본이 다른 장치에서 변경되었습니다. 새로고침 후 다시 시도하세요".to_owned(),
             ));
         }
-        let manifest = validate_manifest(&source)?;
+        let manifest = archived.manifest()?;
         Ok(Self {
-            root,
-            source,
+            root: archived.root,
+            source: archived.directory,
             current,
             manifest,
         })
@@ -2465,11 +2609,7 @@ pub(crate) fn list_instruction_translation_sources(
         if key.starts_with('.') || !directory.is_dir() {
             continue;
         }
-        let meta = load_instruction_meta(&directory).unwrap_or_else(|| StoredInstructionMeta {
-            schema_version: 1,
-            name: key.clone(),
-            description: String::new(),
-        });
+        let meta = instruction_meta_or_key(&directory, &key);
         sources.push(ProjectInstructionTranslationSource {
             id: key,
             name: meta.name,
@@ -2482,12 +2622,8 @@ pub(crate) fn list_instruction_translation_sources(
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadDeployedInstructionFileRequest {
-    /// "personal"이면 projectPath 없이 공급자 홈 설정 파일을 읽는다.
-    #[serde(default)]
-    pub scope: Option<String>,
-    #[serde(default)]
-    pub project_path: Option<String>,
-    pub provider: ProviderId,
+    #[serde(flatten)]
+    pub target: InstructionDeploymentTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2507,11 +2643,10 @@ pub fn read_deployed_instruction_file(
     sessions: &[SessionSummary],
     request: &ReadDeployedInstructionFileRequest,
 ) -> Result<DeployedInstructionFileContent, CoreError> {
-    let projects = project_paths_from_sessions(sessions);
-    let home = home_dir()?;
+    let sites = InstructionSites::open(app_data_dir, sessions)?;
     read_deployed_instruction_file_from_paths(
-        Some(&home),
-        &projects,
+        sites.home(),
+        &sites.projects,
         &ledger_project_dirs(app_data_dir),
         request,
     )
@@ -2523,22 +2658,14 @@ fn read_deployed_instruction_file_from_paths(
     allowed: &BTreeSet<PathBuf>,
     request: &ReadDeployedInstructionFileRequest,
 ) -> Result<DeployedInstructionFileContent, CoreError> {
-    let (directory, scope) = resolve_deployment_dir(
-        home,
-        projects,
-        allowed,
-        request.scope.as_deref(),
-        request.project_path.as_deref(),
-        request.provider,
-    )?;
-    let target = directory.join(instruction_file_name(request.provider));
+    let (directory, scope) = request.target.resolve(home, projects, allowed)?;
+    let target = directory.join(instruction_file_name(request.target.provider));
     managed_deployment_file(&target)?;
-    let content = String::from_utf8(fs::read(&target)?)
-        .map_err(|_| CoreError::InvalidInput("지침 파일은 UTF-8 텍스트여야 합니다".to_owned()))?;
+    let content = read_deployed_instruction_text(&target)?;
     Ok(DeployedInstructionFileContent {
         scope: scope.to_owned(),
         project_path: directory.to_string_lossy().into_owned(),
-        provider: request.provider,
+        provider: request.target.provider,
         file_path: target.to_string_lossy().into_owned(),
         content,
     })
@@ -2547,12 +2674,8 @@ fn read_deployed_instruction_file_from_paths(
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployedInstructionLinkedFileRequest {
-    /// "personal"이면 projectPath 없이 공급자 홈 설정 파일을 기준으로 삼는다.
-    #[serde(default)]
-    pub scope: Option<String>,
-    #[serde(default)]
-    pub project_path: Option<String>,
-    pub provider: ProviderId,
+    #[serde(flatten)]
+    pub target: InstructionDeploymentTarget,
     /// 링크를 발견한 문서의 배포 루트 기준 상대 경로. 비우면 지침 파일 자신이다.
     #[serde(default)]
     pub current_path: Option<String>,
@@ -2604,16 +2727,9 @@ fn read_deployed_instruction_link<T>(
     request: &DeployedInstructionLinkedFileRequest,
     read: impl Fn(&Path, &Path, &str) -> Result<T, CoreError>,
 ) -> Result<T, CoreError> {
-    let (directory, _) = resolve_deployment_dir(
-        home,
-        projects,
-        allowed,
-        request.scope.as_deref(),
-        request.project_path.as_deref(),
-        request.provider,
-    )?;
+    let (directory, _) = request.target.resolve(home, projects, allowed)?;
     // 관리 대상 지침 파일이 실제로 있는 위치에서만 링크를 연다.
-    managed_deployment_file(&directory.join(instruction_file_name(request.provider)))?;
+    managed_deployment_file(&directory.join(instruction_file_name(request.target.provider)))?;
 
     let href = expand_home_prefix(&request.href, home);
     let mut roots = vec![directory.clone()];
@@ -2622,7 +2738,7 @@ fn read_deployed_instruction_link<T>(
     // "폴더다", "없다" 같은 실제 실패 이유가 마지막 시도에 덮이지 않는다.
     if Path::new(&href).is_absolute() {
         if let Some(home) = home {
-            let personal = personal_instruction_dir(home, request.provider);
+            let personal = personal_instruction_dir(home, request.target.provider);
             if personal != directory && personal.is_dir() {
                 roots.push(personal);
             }
@@ -2751,15 +2867,53 @@ fn save_instruction_meta_store(
     Ok(())
 }
 
+/// 메타 저장소를 읽고, 고치고, **바뀌었을 때만** 다시 쓴다. 다섯 자리가 이 세 걸음을 각자
+/// 적으면서 "안 바뀌면 쓰지 않는다"를 지키는 곳과 무조건 쓰는 곳이 갈렸고, 쓰기 실패를
+/// 삼키는 자리와 올리는 자리가 호출부 문맥이 아니라 그때그때 적힌 코드로 정해졌다.
+/// 값과 쓰기 결과를 따로 돌려주어, 원장 읽기처럼 **쓰기가 실패해도 읽은 값은 그대로
+/// 돌려줘야 하는** 자리도 같은 문을 쓸 수 있다.
+fn update_instruction_meta_store<T>(
+    app_data_dir: &Path,
+    mutate: impl FnOnce(&mut InstructionMetaStore) -> (bool, T),
+) -> (T, Result<(), CoreError>) {
+    let mut store = load_instruction_meta_store(app_data_dir);
+    let (dirty, value) = mutate(&mut store);
+    let saved = if dirty {
+        save_instruction_meta_store(app_data_dir, &store)
+    } else {
+        Ok(())
+    };
+    (value, saved)
+}
+
+/// 돌려줄 값이 없는 갱신. 닫개가 돌려준 값이 "썼는가"를 정한다.
+fn update_instruction_meta(
+    app_data_dir: &Path,
+    mutate: impl FnOnce(&mut InstructionMetaStore) -> bool,
+) -> Result<(), CoreError> {
+    update_instruction_meta_store(app_data_dir, |store| (mutate(store), ())).1
+}
+
+/// 지침 하나의 메타 항목만 고치는 갱신. 없으면 만든다. `skill_meta`의 같은 이름 짝과
+/// 모양을 맞춰 둔다 — 두 저장소가 같은 규칙으로 움직인다는 것이 읽는 자리에서 보여야 한다.
+fn update_instruction_entry(
+    app_data_dir: &Path,
+    key: &str,
+    mutate: impl FnOnce(&mut InstructionMetaEntry),
+) -> Result<(), CoreError> {
+    update_instruction_meta(app_data_dir, |store| {
+        mutate(store.instructions.entry(key.to_owned()).or_default());
+        true
+    })
+}
+
 pub fn set_project_instruction_auto_sync(
     app_data_dir: &Path,
     key: &str,
     auto_sync: bool,
 ) -> Result<(), CoreError> {
     let key = validate_instruction_key(key)?;
-    let mut store = load_instruction_meta_store(app_data_dir);
-    store.instructions.entry(key).or_default().auto_sync = auto_sync;
-    save_instruction_meta_store(app_data_dir, &store)
+    update_instruction_entry(app_data_dir, &key, |entry| entry.auto_sync = auto_sync)
 }
 
 /// 배포 원장 손질 요청. 이미 그 위치에 있는 파일을 이 원본의 배포로 인정하거나, 잘못
@@ -2768,12 +2922,47 @@ pub fn set_project_instruction_auto_sync(
 #[serde(rename_all = "camelCase")]
 pub struct InstructionDeploymentLinkRequest {
     pub key: String,
-    /// "personal"이면 공급자 홈 설정 디렉터리, 그 외에는 projectPath가 필요하다.
-    #[serde(default)]
-    pub scope: Option<String>,
-    #[serde(default)]
-    pub project_path: Option<String>,
-    pub provider: ProviderId,
+    #[serde(flatten)]
+    pub target: InstructionDeploymentTarget,
+}
+
+/// 배포 등록·해제가 요청에서 대상 위치를 푸는 자리. 두 경로가 같은 인자 여섯 개를
+/// 각자 적고 있어, 허용 위치 집합(`ledger_project_dirs`)처럼 한쪽만 바꾸면 두 경로가
+/// 서로 다른 위치를 가리키게 되는 인자가 섞여 있었다.
+fn resolve_link_target(
+    app_data_dir: &Path,
+    sites: &InstructionSites,
+    request: &InstructionDeploymentLinkRequest,
+) -> Result<(PathBuf, &'static str), CoreError> {
+    request.target.resolve(
+        sites.home(),
+        &sites.projects,
+        &ledger_project_dirs(app_data_dir),
+    )
+}
+
+/// 원장을 고친 뒤 화면이 받을 항목 한 벌을 다시 읽는다. 등록·해제 모두 갱신된 원장으로
+/// 읽어야 배포 목록이 방금 바뀐 상태로 나오므로, 원장을 먼저 뜨는 순서까지 한곳에 둔다.
+fn reread_instruction_entry(
+    app_data_dir: &Path,
+    sites: &InstructionSites,
+    key: String,
+    source_directory: &Path,
+) -> Result<ProjectInstructionEntry, CoreError> {
+    let ledger = instruction_ledger(
+        app_data_dir,
+        &sites.root,
+        &key,
+        sites.home(),
+        &sites.projects,
+    );
+    read_entry_with_key(
+        source_directory,
+        key,
+        sites.home(),
+        &sites.projects,
+        &ledger,
+    )
 }
 
 /// 이미 그 위치에 있는 지침 파일을 이 원본의 배포로 등록한다. 원장 도입 전에 외부에서
@@ -2785,45 +2974,31 @@ pub fn attach_project_instruction_deployment(
     sessions: &[SessionSummary],
     request: &InstructionDeploymentLinkRequest,
 ) -> Result<ProjectInstructionEntry, CoreError> {
-    let projects = project_paths_from_sessions(sessions);
-    let home = home_dir()?;
-    let root = repository_instructions_root(app_data_dir);
+    let sites = InstructionSites::open(app_data_dir, sessions)?;
     let key = validate_instruction_key(&request.key)?;
-    let source_directory = root.join(&key);
-    assert_within_root(&root, &source_directory)?;
-    if !source_directory.is_dir() {
-        return Err(CoreError::NotFound(format!("보관 원본이 없습니다: {key}")));
-    }
+    let source_directory = open_instruction_source(&sites.root, &key, missing_archived_source)?;
     let manifest = validate_manifest(&source_directory)?;
-    if !instruction_provider_present(&source_directory, &manifest, request.provider) {
+    if !instruction_provider_present(&source_directory, &manifest, request.target.provider) {
         return Err(CoreError::InvalidInput(format!(
             "{} 공통 지침 파일이 없어 배포로 등록할 수 없습니다",
-            request.provider
+            request.target.provider
         )));
     }
-    let (directory, scope) = resolve_deployment_dir(
-        Some(&home),
-        &projects,
-        &ledger_project_dirs(app_data_dir),
-        request.scope.as_deref(),
-        request.project_path.as_deref(),
-        request.provider,
-    )?;
-    let target = directory.join(instruction_file_name(request.provider));
+    let (directory, scope) = resolve_link_target(app_data_dir, &sites, request)?;
+    let target = directory.join(instruction_file_name(request.target.provider));
     assert_within_root(&directory, &target)?;
     let (digest, _) = managed_deployment_file(&target)?;
     let linked = archived_linked_docs(&source_directory, &manifest);
     record_instruction_deployment(
         app_data_dir,
         &key,
-        request.provider,
+        request.target.provider,
         scope,
         &directory,
         Some(digest),
         deployed_linked_digests(&directory, &linked),
     );
-    let ledger = instruction_ledger(app_data_dir, &root, &key, Some(&home), &projects);
-    read_entry_with_key(&source_directory, key, Some(&home), &projects, &ledger)
+    reread_instruction_entry(app_data_dir, &sites, key, &source_directory)
 }
 
 /// 배포 등록만 해제한다. 파일은 그 자리에 그대로 남고, 다음 편집부터 갱신 대상에서 빠진다.
@@ -2832,32 +3007,18 @@ pub fn detach_project_instruction_deployment(
     sessions: &[SessionSummary],
     request: &InstructionDeploymentLinkRequest,
 ) -> Result<ProjectInstructionEntry, CoreError> {
-    let projects = project_paths_from_sessions(sessions);
-    let home = home_dir()?;
-    let root = repository_instructions_root(app_data_dir);
+    let sites = InstructionSites::open(app_data_dir, sessions)?;
     let key = validate_instruction_key(&request.key)?;
-    let source_directory = root.join(&key);
-    assert_within_root(&root, &source_directory)?;
-    if !source_directory.is_dir() {
-        return Err(CoreError::NotFound(format!("보관 원본이 없습니다: {key}")));
-    }
-    let (directory, scope) = resolve_deployment_dir(
-        Some(&home),
-        &projects,
-        &ledger_project_dirs(app_data_dir),
-        request.scope.as_deref(),
-        request.project_path.as_deref(),
-        request.provider,
-    )?;
+    let source_directory = open_instruction_source(&sites.root, &key, missing_archived_source)?;
+    let (directory, scope) = resolve_link_target(app_data_dir, &sites, request)?;
     forget_instruction_deployment(
         app_data_dir,
         Some(&key),
-        request.provider,
+        request.target.provider,
         scope,
         &directory,
     );
-    let ledger = instruction_ledger(app_data_dir, &root, &key, Some(&home), &projects);
-    read_entry_with_key(&source_directory, key, Some(&home), &projects, &ledger)
+    reread_instruction_entry(app_data_dir, &sites, key, &source_directory)
 }
 
 // ---------------------------------------------------------------------------
@@ -2958,7 +3119,6 @@ fn instruction_ledger(
     home: Option<&Path>,
     projects: &[RegisteredProject],
 ) -> InstructionLedger {
-    let mut store = load_instruction_meta_store(app_data_dir);
     let source_directory = root.join(key);
     // 원본이 없으면 manifest 기본값이 나오므로 디렉터리 존재를 먼저 본다. 보관취소로
     // 원본이 빠진 키를 "공급자 없는 원본"으로 읽어 기록을 지워 버리면 안 된다.
@@ -2966,66 +3126,70 @@ fn instruction_ledger(
         .is_dir()
         .then(|| validate_manifest(&source_directory).ok())
         .flatten();
-    let entry = store.instructions.entry(key.to_owned()).or_default();
-    let mut dirty = false;
+    // 원장 정리는 화면을 여는 것만으로도 일어난다. 쓰기가 실패해도 읽기를 막지 않으므로
+    // 쓰기 결과는 버리고 읽어 낸 원장만 돌려받는다.
+    let (ledger, _) = update_instruction_meta_store(app_data_dir, |store| {
+        let entry = store.instructions.entry(key.to_owned()).or_default();
+        let mut dirty = false;
 
-    // 실체가 사라진 기록과, 원본이 더는 갖지 않는 공급자의 기록을 원장에서 뺀다.
-    let before = entry.deployments.len();
-    entry.deployments.retain(|record| {
-        if archived.as_ref().is_some_and(|manifest| {
-            !instruction_provider_present(&source_directory, manifest, record.provider)
-        }) {
-            return false;
-        }
-        record_directory(record, home).is_some_and(|(directory, _)| {
-            directory
-                .join(instruction_file_name(record.provider))
-                .is_file()
-        })
-    });
-    dirty |= entry.deployments.len() != before;
+        // 실체가 사라진 기록과, 원본이 더는 갖지 않는 공급자의 기록을 원장에서 뺀다.
+        let before = entry.deployments.len();
+        entry.deployments.retain(|record| {
+            if archived.as_ref().is_some_and(|manifest| {
+                !instruction_provider_present(&source_directory, manifest, record.provider)
+            }) {
+                return false;
+            }
+            record_directory(record, home).is_some_and(|(directory, _)| {
+                directory
+                    .join(instruction_file_name(record.provider))
+                    .is_file()
+            })
+        });
+        dirty |= entry.deployments.len() != before;
 
-    // 보관 원본이 없는 동안에는 이관을 마쳤다고 표시하지 않는다. 보관취소 뒤
-    // 원본을 복구했을 때 내용이 같은 배포를 다시 찾아낼 기회가 남아야 한다.
-    if !entry.deployments_migrated {
-        if let Some(manifest) = archived.as_ref() {
-            entry.deployments_migrated = true;
-            dirty = true;
-            let linked = archived_linked_docs(&source_directory, manifest);
-            for provider in PROVIDERS {
-                if !instruction_provider_present(&source_directory, manifest, provider) {
-                    continue;
-                }
-                let Some(source_digest) =
-                    projected_source_digest(&source_directory, manifest, provider)
-                else {
-                    continue;
-                };
-                for (directory, scope) in deployment_dirs_for_provider(home, projects, provider) {
-                    let status = installed_deployment_status(provider, &directory, scope);
-                    if status.message.is_some()
-                        || status.content_digest.as_deref() != Some(source_digest.as_str())
-                    {
+        // 보관 원본이 없는 동안에는 이관을 마쳤다고 표시하지 않는다. 보관취소 뒤
+        // 원본을 복구했을 때 내용이 같은 배포를 다시 찾아낼 기회가 남아야 한다.
+        if !entry.deployments_migrated {
+            if let Some(manifest) = archived.as_ref() {
+                entry.deployments_migrated = true;
+                dirty = true;
+                let linked = archived_linked_docs(&source_directory, manifest);
+                for provider in PROVIDERS {
+                    if !instruction_provider_present(&source_directory, manifest, provider) {
                         continue;
                     }
-                    entry.deployments.push(deployment_record(
-                        provider,
-                        scope,
-                        &directory,
-                        Some(source_digest.clone()),
-                        deployed_linked_digests(&directory, &linked),
-                    ));
+                    let Some(source_digest) =
+                        projected_source_digest(&source_directory, manifest, provider)
+                    else {
+                        continue;
+                    };
+                    for (directory, scope) in deployment_dirs_for_provider(home, projects, provider)
+                    {
+                        let status = installed_deployment_status(provider, &directory, scope);
+                        if status.message.is_some()
+                            || status.content_digest.as_deref() != Some(source_digest.as_str())
+                        {
+                            continue;
+                        }
+                        entry.deployments.push(deployment_record(
+                            provider,
+                            scope,
+                            &directory,
+                            Some(source_digest.clone()),
+                            deployed_linked_digests(&directory, &linked),
+                        ));
+                    }
                 }
             }
         }
-    }
 
-    let excluded = crate::store::excluded_project_paths(app_data_dir).unwrap_or_default();
-    let ledger = ledger_from_records(&entry.deployments, home, &excluded);
-    if dirty {
-        // 원장 정리는 화면을 여는 것만으로도 일어난다. 실패해도 읽기를 막지 않는다.
-        let _ = save_instruction_meta_store(app_data_dir, &store);
-    }
+        let excluded = crate::store::excluded_project_paths(app_data_dir).unwrap_or_default();
+        (
+            dirty,
+            ledger_from_records(&entry.deployments, home, &excluded),
+        )
+    });
     ledger
 }
 
@@ -3093,17 +3257,7 @@ fn deployment_record(
 
 /// 배포 위치에 실제로 놓여 있는 연결 문서의 지문. 원장에 "우리가 써 넣은 내용"으로 남긴다.
 fn deployed_linked_digests(directory: &Path, linked: &[String]) -> BTreeMap<String, String> {
-    let mut digests = BTreeMap::new();
-    for relative in linked {
-        let path = directory.join(relative);
-        if assert_within_root(directory, &path).is_err() {
-            continue;
-        }
-        if let Ok(digest) = digest_file(&path) {
-            digests.insert(relative.clone(), digest);
-        }
-    }
-    digests
+    linked_digests(directory, linked.iter().map(String::as_str))
 }
 
 /// 배포 한 곳을 원장에 올린다(같은 위치가 이미 있으면 지문만 갱신).
@@ -3116,26 +3270,25 @@ fn record_instruction_deployment(
     instruction_digest: Option<String>,
     linked_digests: BTreeMap<String, String>,
 ) {
-    let mut store = load_instruction_meta_store(app_data_dir);
-    let entry = store.instructions.entry(key.to_owned()).or_default();
-    // 원장을 처음 쓰는 지침이면 이관 대상이 아니다(이 배포부터가 기록의 시작이다).
-    entry.deployments_migrated = true;
-    let next = deployment_record(
-        provider,
-        scope,
-        directory,
-        instruction_digest,
-        linked_digests,
-    );
-    match entry.deployments.iter_mut().find(|record| {
-        record.provider == provider
-            && record.scope == scope
-            && record.project_path == next.project_path
-    }) {
-        Some(existing) => *existing = next,
-        None => entry.deployments.push(next),
-    }
-    let _ = save_instruction_meta_store(app_data_dir, &store);
+    let _ = update_instruction_entry(app_data_dir, key, |entry| {
+        // 원장을 처음 쓰는 지침이면 이관 대상이 아니다(이 배포부터가 기록의 시작이다).
+        entry.deployments_migrated = true;
+        let next = deployment_record(
+            provider,
+            scope,
+            directory,
+            instruction_digest,
+            linked_digests,
+        );
+        match entry.deployments.iter_mut().find(|record| {
+            record.provider == provider
+                && record.scope == scope
+                && record.project_path == next.project_path
+        }) {
+            Some(existing) => *existing = next,
+            None => entry.deployments.push(next),
+        }
+    });
 }
 
 /// 휴지통에서 배포 지침 파일을 되살렸을 때 원장 기록도 되돌린다. 삭제로 지워진
@@ -3148,14 +3301,14 @@ pub(crate) fn readopt_restored_deployment(
     scope: &str,
     directory: &Path,
 ) {
-    let Ok(key) = validate_instruction_key(key) else {
+    let Ok(source) = ArchivedSource::open(app_data_dir, key) else {
         return;
     };
-    let source_directory = repository_instructions_root(app_data_dir).join(&key);
+    let (key, source_directory) = (source.key.clone(), source.directory.clone());
     if !source_directory.is_dir() {
         return;
     }
-    let Ok(manifest) = validate_manifest(&source_directory) else {
+    let Ok(manifest) = source.manifest() else {
         return;
     };
     if !instruction_provider_present(&source_directory, &manifest, provider) {
@@ -3185,24 +3338,23 @@ fn forget_instruction_deployment(
     scope: &str,
     directory: &Path,
 ) {
-    let mut store = load_instruction_meta_store(app_data_dir);
     let project_path = (scope != SCOPE_PERSONAL).then(|| directory.to_string_lossy().into_owned());
-    let mut dirty = false;
-    for (candidate, entry) in store.instructions.iter_mut() {
-        if key.is_some_and(|key| key != candidate.as_str()) {
-            continue;
+    let _ = update_instruction_meta(app_data_dir, |store| {
+        let mut dirty = false;
+        for (candidate, entry) in store.instructions.iter_mut() {
+            if key.is_some_and(|key| key != candidate.as_str()) {
+                continue;
+            }
+            let before = entry.deployments.len();
+            entry.deployments.retain(|record| {
+                !(record.provider == provider
+                    && record.scope == scope
+                    && record.project_path == project_path)
+            });
+            dirty |= entry.deployments.len() != before;
         }
-        let before = entry.deployments.len();
-        entry.deployments.retain(|record| {
-            !(record.provider == provider
-                && record.scope == scope
-                && record.project_path == project_path)
-        });
-        dirty |= entry.deployments.len() != before;
-    }
-    if dirty {
-        let _ = save_instruction_meta_store(app_data_dir, &store);
-    }
+        dirty
+    });
 }
 
 /// 원장에 남아 있는 프로젝트 디렉터리 전체. 세션 목록에서 빠진 프로젝트라도 이미
@@ -3222,11 +3374,9 @@ fn ledger_project_dirs(app_data_dir: &Path) -> BTreeSet<PathBuf> {
 
 /// 공통 원본 삭제 시 장치 메타도 함께 정리한다.
 fn remove_instruction_meta_entry(app_data_dir: &Path, key: &str) -> Result<(), CoreError> {
-    let mut store = load_instruction_meta_store(app_data_dir);
-    if store.instructions.remove(key).is_some() {
-        save_instruction_meta_store(app_data_dir, &store)?;
-    }
-    Ok(())
+    update_instruction_meta(app_data_dir, |store| {
+        store.instructions.remove(key).is_some()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3271,12 +3421,8 @@ pub struct InstructionDeleteImpact {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteProjectInstructionDeploymentRequest {
-    /// "personal"이면 projectPath 없이 공급자 홈 설정 파일을 지운다.
-    #[serde(default)]
-    pub scope: Option<String>,
-    #[serde(default)]
-    pub project_path: Option<String>,
-    pub provider: ProviderId,
+    #[serde(flatten)]
+    pub target: InstructionDeploymentTarget,
     /// 삭제 주체 표시용 값. `aia`만 별도 인정하고 나머지는 `user`로 기록한다.
     #[serde(default)]
     pub deleted_by: Option<String>,
@@ -3357,6 +3503,11 @@ fn managed_deployment_file(target: &Path) -> Result<(String, u64), CoreError> {
         "심볼릭 링크나 일반 파일이 아닌 지침은 관리하지 않습니다",
     )?;
     Ok((digest_file(target)?, metadata.len()))
+}
+
+fn read_deployed_instruction_text(target: &Path) -> Result<String, CoreError> {
+    String::from_utf8(fs::read(target)?)
+        .map_err(|_| CoreError::InvalidInput("지침 파일은 UTF-8 텍스트여야 합니다".to_owned()))
 }
 
 /// 배포 파일 내용이 어느 공통 원본에서 나왔는지 찾는다. 현재 OS 투영 기준으로
@@ -3446,37 +3597,62 @@ fn instruction_file_matches(deployment: &ProjectInstructionDeployment) -> bool {
     }
 }
 
-/// 연결 문서 하나를 휴지통에 넣기 위한 항목 정보.
-#[allow(clippy::too_many_arguments)]
-fn linked_doc_trash_draft(
-    key: &str,
-    directory: &Path,
-    scope: &str,
+/// 지침 배포 한 곳에 딸린 연결 문서를 휴지통으로 옮길 때 쓰는 자리 정보. 삭제 경로
+/// 둘이 문서마다 같은 값 묶음을 되풀이해 넘기던 것을 한 번만 만든다.
+struct LinkedDocTrashSite<'a> {
+    key: &'a str,
+    directory: &'a Path,
+    scope: &'a str,
     provider: ProviderId,
-    target: &Path,
-    group_id: &str,
-    actor: &str,
-) -> Result<InstructionTrashItemDraft, CoreError> {
-    let metadata = fs::symlink_metadata(target)?;
-    let name = target
-        .strip_prefix(directory)
-        .map(normalized_relative)
-        .unwrap_or_else(|_| instruction_file_name_from_path(target).unwrap_or_default());
-    Ok(InstructionTrashItemDraft {
-        group_id: group_id.to_owned(),
-        key: key.to_owned(),
-        kind: InstructionTrashItemKind::File,
-        provider: Some(provider),
-        scope: Some(scope.to_owned()),
-        project_path: Some(directory.to_string_lossy().into_owned()),
-        shared: true,
-        deleted_by: actor.to_owned(),
-        content_digest: digest_file(target).ok(),
-        file_count: 1,
-        total_bytes: metadata.len(),
-        name,
-        description: "지침이 함께 읽는 연결 문서".to_owned(),
-    })
+    group_id: &'a str,
+    actor: &'a str,
+}
+
+impl LinkedDocTrashSite<'_> {
+    /// 연결 문서 하나를 휴지통에 넣기 위한 항목 정보.
+    fn draft(&self, target: &Path) -> Result<InstructionTrashItemDraft, CoreError> {
+        let metadata = fs::symlink_metadata(target)?;
+        let name = target
+            .strip_prefix(self.directory)
+            .map(normalized_relative)
+            .unwrap_or_else(|_| instruction_file_name_from_path(target).unwrap_or_default());
+        Ok(InstructionTrashItemDraft {
+            group_id: self.group_id.to_owned(),
+            key: self.key.to_owned(),
+            kind: InstructionTrashItemKind::File,
+            provider: Some(self.provider),
+            scope: Some(self.scope.to_owned()),
+            project_path: Some(self.directory.to_string_lossy().into_owned()),
+            shared: true,
+            deleted_by: self.actor.to_owned(),
+            content_digest: digest_file(target).ok(),
+            file_count: 1,
+            total_bytes: metadata.len(),
+            name,
+            description: "지침이 함께 읽는 연결 문서".to_owned(),
+        })
+    }
+
+    /// 연결 문서를 하나씩 휴지통으로 옮긴다. 지침 파일은 이미 옮긴 뒤라 반쪽 세트를
+    /// 읽는 순간이 없고, 문서 하나가 옮겨지지 않아도 경고로만 남기고 나머지를 계속
+    /// 옮긴다.
+    fn trash_all<P: AsRef<Path>>(
+        &self,
+        app_data_dir: &Path,
+        linked: impl IntoIterator<Item = P>,
+        items: &mut Vec<InstructionTrashItem>,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), CoreError> {
+        for path in linked {
+            let path = path.as_ref();
+            let draft = self.draft(path)?;
+            match store_instruction_trash_item(app_data_dir, path, draft) {
+                Ok(item) => items.push(item),
+                Err(error) => warnings.push(format!("{}: {error}", path.display())),
+            }
+        }
+        Ok(())
+    }
 }
 
 fn collect_shared_instruction_delete_targets(
@@ -3487,13 +3663,7 @@ fn collect_shared_instruction_delete_targets(
     key: &str,
 ) -> Result<(PathBuf, Vec<SharedDeleteTarget>, Vec<String>), CoreError> {
     let key = validate_instruction_key(key)?;
-    let directory = root.join(&key);
-    assert_within_root(root, &directory)?;
-    if !directory.is_dir() {
-        return Err(CoreError::NotFound(format!(
-            "'{key}' 공통 프로젝트 지침을 찾지 못했습니다"
-        )));
-    }
+    let directory = open_instruction_source(root, &key, missing_common_instruction)?;
     let content = validated_instruction_content(&directory)?;
     let manifest = validate_manifest(&directory)?;
     let linked = archive_linked_doc_paths(&content, &manifest);
@@ -3512,13 +3682,15 @@ fn collect_shared_instruction_delete_targets(
         for recorded in ledger.for_provider(provider) {
             let (location, scope) = (recorded.directory.clone(), recorded.scope);
             let deployment = deployment_status(
-                &directory,
-                &manifest,
-                provider,
-                source_digest.as_deref(),
+                InstructionSourceView {
+                    directory: &directory,
+                    manifest: &manifest,
+                    provider,
+                    digest: source_digest.as_deref(),
+                    linked: &linked,
+                },
                 &location,
                 scope,
-                &linked,
                 true,
             );
             if !deployment.present {
@@ -3574,13 +3746,12 @@ pub fn check_project_instruction_delete(
     sessions: &[SessionSummary],
     request: &InstructionDeleteCheckRequest,
 ) -> Result<InstructionDeleteImpact, CoreError> {
-    let projects = project_paths_from_sessions(sessions);
-    let home = home_dir()?;
+    let sites = InstructionSites::open(app_data_dir, sessions)?;
     check_project_instruction_delete_from_paths(
-        &repository_instructions_root(app_data_dir),
+        &sites.root,
         app_data_dir,
-        Some(&home),
-        &projects,
+        sites.home(),
+        &sites.projects,
         request,
     )
 }
@@ -3702,12 +3873,11 @@ pub fn delete_project_instruction_deployment(
     sessions: &[SessionSummary],
     request: &DeleteProjectInstructionDeploymentRequest,
 ) -> Result<InstructionDeleteReceipt, CoreError> {
-    let projects = project_paths_from_sessions(sessions);
-    let home = home_dir()?;
+    let sites = InstructionSites::open(app_data_dir, sessions)?;
     delete_project_instruction_deployment_from_paths(
-        &repository_instructions_root(app_data_dir),
-        Some(&home),
-        &projects,
+        &sites.root,
+        sites.home(),
+        &sites.projects,
         app_data_dir,
         request,
     )
@@ -3721,15 +3891,11 @@ fn delete_project_instruction_deployment_from_paths(
     request: &DeleteProjectInstructionDeploymentRequest,
 ) -> Result<InstructionDeleteReceipt, CoreError> {
     require_instruction_delete_confirm(request.confirm)?;
-    let (directory, scope) = resolve_deployment_dir(
-        home,
-        projects,
-        &ledger_project_dirs(app_data_dir),
-        request.scope.as_deref(),
-        request.project_path.as_deref(),
-        request.provider,
-    )?;
-    let target = directory.join(instruction_file_name(request.provider));
+    let (directory, scope) =
+        request
+            .target
+            .resolve(home, projects, &ledger_project_dirs(app_data_dir))?;
+    let target = directory.join(instruction_file_name(request.target.provider));
     assert_within_root(&directory, &target)?;
     let actor = normalized_instruction_delete_actor(request.deleted_by.as_deref());
     let group_id = new_trash_group_id();
@@ -3737,7 +3903,7 @@ fn delete_project_instruction_deployment_from_paths(
         root,
         &directory,
         scope,
-        request.provider,
+        request.target.provider,
         &target,
         &group_id,
         &actor,
@@ -3753,22 +3919,22 @@ fn delete_project_instruction_deployment_from_paths(
     };
     let mut items = vec![store_instruction_trash_item(app_data_dir, &target, draft)?];
     // 파일이 사라졌으니 원장 기록도 남길 이유가 없다.
-    forget_instruction_deployment(app_data_dir, None, request.provider, scope, &directory);
-    for path in linked {
-        let draft = linked_doc_trash_draft(
-            &key,
-            &directory,
-            scope,
-            request.provider,
-            &path,
-            &group_id,
-            &actor,
-        )?;
-        match store_instruction_trash_item(app_data_dir, &path, draft) {
-            Ok(item) => items.push(item),
-            Err(error) => warnings.push(format!("{}: {error}", path.display())),
-        }
+    forget_instruction_deployment(
+        app_data_dir,
+        None,
+        request.target.provider,
+        scope,
+        &directory,
+    );
+    LinkedDocTrashSite {
+        key: &key,
+        directory: &directory,
+        scope,
+        provider: request.target.provider,
+        group_id: &group_id,
+        actor: &actor,
     }
+    .trash_all(app_data_dir, linked, &mut items, &mut warnings)?;
     Ok(InstructionDeleteReceipt {
         key,
         group_id,
@@ -3785,12 +3951,11 @@ pub fn delete_shared_project_instruction(
     sessions: &[SessionSummary],
     request: &DeleteSharedProjectInstructionRequest,
 ) -> Result<InstructionDeleteReceipt, CoreError> {
-    let projects = project_paths_from_sessions(sessions);
-    let home = home_dir()?;
+    let sites = InstructionSites::open(app_data_dir, sessions)?;
     delete_shared_project_instruction_from_paths(
-        &repository_instructions_root(app_data_dir),
-        Some(&home),
-        &projects,
+        &sites.root,
+        sites.home(),
+        &sites.projects,
         app_data_dir,
         request,
     )
@@ -3834,47 +3999,27 @@ fn delete_shared_project_instruction_from_paths(
         // 지침 파일을 먼저 옮긴다. 연결 문서만 남는 순간이 있어도 지침이 없으므로
         // 아무도 반쪽 세트를 읽지 않는다.
         items.push(store_instruction_trash_item(app_data_dir, &target, draft)?);
-        for path in &target_group.linked {
-            let draft = linked_doc_trash_draft(
-                &key,
-                &location,
-                &deployment.scope,
-                deployment.provider,
-                path,
-                &group_id,
-                &actor,
-            )?;
-            match store_instruction_trash_item(app_data_dir, path, draft) {
-                Ok(item) => items.push(item),
-                Err(error) => warnings.push(format!("{}: {error}", path.display())),
-            }
+        LinkedDocTrashSite {
+            key: &key,
+            directory: &location,
+            scope: &deployment.scope,
+            provider: deployment.provider,
+            group_id: &group_id,
+            actor: &actor,
         }
+        .trash_all(
+            app_data_dir,
+            &target_group.linked,
+            &mut items,
+            &mut warnings,
+        )?;
     }
 
-    let meta = load_instruction_meta(&directory).unwrap_or_else(|| StoredInstructionMeta {
-        schema_version: 1,
-        name: key.clone(),
-        description: String::new(),
-    });
     let content = validated_instruction_content(&directory)?;
     items.push(store_instruction_trash_item(
         app_data_dir,
         &directory,
-        InstructionTrashItemDraft {
-            group_id: group_id.clone(),
-            key: key.clone(),
-            kind: InstructionTrashItemKind::Directory,
-            provider: None,
-            scope: None,
-            project_path: None,
-            shared: true,
-            deleted_by: actor,
-            content_digest: Some(content.digest),
-            file_count: content.files.len(),
-            total_bytes: content.total_bytes,
-            name: meta.name,
-            description: meta.description,
-        },
+        archived_source_trash_draft(&directory, &key, &group_id, &actor, &content),
     )?);
 
     // 원본 자체를 지웠으므로 장치 메타도 함께 정리한다.
@@ -3909,37 +4054,14 @@ fn unarchive_shared_project_instruction_in(
 ) -> Result<InstructionDeleteReceipt, CoreError> {
     require_instruction_unarchive_confirm(request.confirm)?;
     let key = validate_instruction_key(&request.key)?;
-    let directory = root.join(&key);
-    assert_within_root(root, &directory)?;
-    if !directory.is_dir() {
-        return Err(CoreError::NotFound(format!("보관 원본이 없습니다: {key}")));
-    }
+    let directory = open_instruction_source(root, &key, missing_archived_source)?;
     let actor = normalized_instruction_delete_actor(request.deleted_by.as_deref());
     let group_id = new_trash_group_id();
-    let meta = load_instruction_meta(&directory).unwrap_or_else(|| StoredInstructionMeta {
-        schema_version: 1,
-        name: key.clone(),
-        description: String::new(),
-    });
     let content = validated_instruction_content(&directory)?;
     let item = store_instruction_trash_item(
         app_data_dir,
         &directory,
-        InstructionTrashItemDraft {
-            group_id: group_id.clone(),
-            key: key.clone(),
-            kind: InstructionTrashItemKind::Directory,
-            provider: None,
-            scope: None,
-            project_path: None,
-            shared: true,
-            deleted_by: actor,
-            content_digest: Some(content.digest),
-            file_count: content.files.len(),
-            total_bytes: content.total_bytes,
-            name: meta.name,
-            description: meta.description,
-        },
+        archived_source_trash_draft(&directory, &key, &group_id, &actor, &content),
     )?;
 
     // 원본이 사라졌으므로 배포 원장도 함께 비운다. 남겨 두면 없는 원본을 가리키는
@@ -3984,15 +4106,16 @@ fn republish_provider_to_locations(
         if !status.present {
             continue;
         }
-        let target = location.join(instruction_file_name(provider));
-        let mut deployment = deployment_status(
-            source_directory,
-            manifest,
-            provider,
-            source_digest.as_deref(),
+        let deployment = deployment_status(
+            InstructionSourceView {
+                directory: source_directory,
+                manifest,
+                provider,
+                digest: source_digest.as_deref(),
+                linked: &linked,
+            },
             &location,
             scope,
-            &linked,
             true,
         );
         if let Some(message) = deployment.message.clone() {
@@ -4009,61 +4132,22 @@ fn republish_provider_to_locations(
             ));
             continue;
         }
-        let source = match projected_instruction_file(source_directory, manifest, provider) {
-            Ok(path) => path,
-            Err(error) => {
-                results.push(
-                    deployment.concluded(InstructionPublishOutcome::Skipped, error.to_string()),
-                );
-                continue;
-            }
-        };
-        let linked_results = match publish_linked_docs(
-            source_directory,
-            &linked,
-            &location,
-            SkillOverwritePolicy::Replace,
-            Some(&recorded.linked_digests),
-        ) {
-            Ok(linked) => linked,
-            Err(error) => {
-                results.push(deployment.concluded(
-                    InstructionPublishOutcome::Failed,
-                    format!("연결 문서를 게시하지 못했습니다: {error}"),
-                ));
-                continue;
-            }
-        };
-        match publish_instruction_file(&location, &source, &target, SkillOverwritePolicy::Replace) {
-            Ok(outcome) => {
-                record_instruction_deployment(
-                    app_data_dir,
-                    key,
-                    provider,
-                    scope,
-                    &location,
-                    digest_file(&target).ok(),
-                    published_linked_digests(&location, &linked_results),
-                );
-                deployment = deployment_status(
-                    source_directory,
-                    manifest,
-                    provider,
-                    source_digest.as_deref(),
-                    &location,
-                    scope,
-                    &linked,
-                    true,
-                );
-                deployment.outcome = Some(outcome);
-            }
-            Err(error) => {
-                deployment =
-                    deployment.concluded(InstructionPublishOutcome::Failed, error.to_string());
-            }
-        }
-        deployment.linked_results = linked_results;
-        results.push(deployment);
+        results.push(write_deployment(
+            DeploymentWrite {
+                source_directory,
+                manifest,
+                provider,
+                directory: &location,
+                scope,
+                linked: &linked,
+                overwrite: SkillOverwritePolicy::Replace,
+                linked_guard: Some(&recorded.linked_digests),
+                app_data_dir,
+                key,
+                with_message: false,
+            },
+            deployment,
+        ));
     }
     results
 }
@@ -4072,13 +4156,9 @@ fn republish_provider_to_locations(
 #[serde(rename_all = "camelCase")]
 pub struct SyncProjectInstructionRequest {
     pub key: String,
-    /// 채택할 배포 파일의 위치. "personal"이면 projectPath가 필요 없다.
-    #[serde(default)]
-    pub scope: Option<String>,
-    /// 새 원본으로 채택할 배포 파일이 있는 프로젝트.
-    #[serde(default)]
-    pub project_path: Option<String>,
-    pub provider: ProviderId,
+    /// 새 원본으로 채택할 배포 파일이 있는 위치.
+    #[serde(flatten)]
+    pub target: InstructionDeploymentTarget,
     #[serde(default)]
     pub deleted_by: Option<String>,
 }
@@ -4105,15 +4185,76 @@ pub fn sync_project_instruction_from_deployment(
     sessions: &[SessionSummary],
     request: &SyncProjectInstructionRequest,
 ) -> Result<InstructionSyncReceipt, CoreError> {
-    let projects = project_paths_from_sessions(sessions);
-    let home = home_dir()?;
+    let sites = InstructionSites::open(app_data_dir, sessions)?;
     sync_project_instruction_from_deployment_from_paths(
-        &repository_instructions_root(app_data_dir),
-        Some(&home),
-        &projects,
+        &sites.root,
+        sites.home(),
+        &sites.projects,
         app_data_dir,
         request,
     )
+}
+
+/// 새 원본이 될 배포본. 자리와 본문을 원본 교체 전에 확정해 둔다.
+struct AdoptedDeployment {
+    path: PathBuf,
+    text: String,
+}
+
+/// 배포 자리에서 채택할 지침 파일을 읽는다. 관리 대상 배포본인지 보고, 본문이
+/// UTF-8이며 길이 제한을 지키는지까지 확인한 뒤에야 원본 교체로 넘어간다.
+fn read_adopted_deployment(
+    adopted_dir: &Path,
+    provider: ProviderId,
+) -> Result<AdoptedDeployment, CoreError> {
+    let path = adopted_dir.join(instruction_file_name(provider));
+    managed_deployment_file(&path)?;
+    let text = read_deployed_instruction_text(&path)?;
+    validate_instruction_text(&text)?;
+    Ok(AdoptedDeployment { path, text })
+}
+
+/// 채택본을 새 원본으로 삼은 스테이지를 만들고 그 경로와 내용 다이제스트를 돌려준다.
+/// 원본 구조(지침 파일·메타·플랫폼 변형)만 옮기고 연결 문서는 채택본이 참조하는
+/// 세트로 새로 쓴다. 스테이지를 원본 자리에 올리는 일은 호출부가 한다.
+fn stage_adopted_instruction_source(
+    root: &Path,
+    key: &str,
+    source_dir: &Path,
+    content: &InstructionContent,
+    provider: ProviderId,
+    adopted_dir: &Path,
+    adopted: &AdoptedDeployment,
+) -> Result<(PathBuf, String), CoreError> {
+    let manifest = validate_manifest(source_dir)?;
+    // 현재 OS 투영이 읽는 자리(변형이 있으면 변형 파일)에 채택본을 쓴다.
+    let projected = projected_instruction_file(source_dir, &manifest, provider)?;
+    let relative = projected
+        .strip_prefix(source_dir)
+        .map_err(|_| CoreError::InvalidInput("지침 투영 경로를 확인할 수 없습니다".to_owned()))?
+        .to_path_buf();
+
+    // 채택은 배포본을 그대로 원본으로 삼는 일이라 연결 문서도 그 위치가 기준이다.
+    // 더 이상 참조하지 않는 문서는 함께 사라진다.
+    let reserved = reserved_archive_paths(Some(&manifest));
+    let (adopted_docs, _issues) =
+        collect_deployed_linked_docs(adopted_dir, &adopted.text, &reserved);
+    ensure_archive_capacity(adopted.text.len() as u64, &adopted_docs)?;
+
+    let staging = SourceStage::create(root, key)?;
+    let stage = staging.stage.clone();
+    let staged = (|| -> Result<String, CoreError> {
+        copy_source_files(source_dir, &content.files, &stage, |relative| {
+            is_reserved_archive_path(&normalized_relative(relative), &reserved)
+        })?;
+        write_linked_docs(&stage, &adopted_docs)?;
+        let target = stage.join(&relative);
+        assert_within_root(&stage, &target)?;
+        fs::write(&target, &adopted.text)?;
+        Ok(validated_instruction_content(&stage)?.digest)
+    })();
+    let digest = staging.finish(source_dir, staged)?;
+    Ok((stage, digest))
 }
 
 fn sync_project_instruction_from_deployment_from_paths(
@@ -4124,83 +4265,30 @@ fn sync_project_instruction_from_deployment_from_paths(
     request: &SyncProjectInstructionRequest,
 ) -> Result<InstructionSyncReceipt, CoreError> {
     let key = validate_instruction_key(&request.key)?;
-    let (adopted_dir, adopted_scope) = resolve_deployment_dir(
-        home,
-        projects,
-        &ledger_project_dirs(app_data_dir),
-        request.scope.as_deref(),
-        request.project_path.as_deref(),
-        request.provider,
-    )?;
-    let source_dir = root.join(&key);
-    assert_within_root(root, &source_dir)?;
-    if !source_dir.is_dir() {
-        return Err(CoreError::NotFound(format!("보관 원본이 없습니다: {key}")));
-    }
-    let adopted_path = adopted_dir.join(instruction_file_name(request.provider));
-    managed_deployment_file(&adopted_path)?;
-    let adopted_bytes = fs::read(&adopted_path)?;
-    let adopted_text = String::from_utf8(adopted_bytes)
-        .map_err(|_| CoreError::InvalidInput("지침 파일은 UTF-8 텍스트여야 합니다".to_owned()))?;
-    validate_instruction_text(&adopted_text)?;
+    let (adopted_dir, adopted_scope) =
+        request
+            .target
+            .resolve(home, projects, &ledger_project_dirs(app_data_dir))?;
+    let source_dir = open_instruction_source(root, &key, missing_archived_source)?;
+    let adopted = read_adopted_deployment(&adopted_dir, request.target.provider)?;
 
     let content = validated_instruction_content(&source_dir)?;
-    let manifest = validate_manifest(&source_dir)?;
-    // 현재 OS 투영이 읽는 자리(변형이 있으면 변형 파일)에 채택본을 쓴다.
-    let projected = projected_instruction_file(&source_dir, &manifest, request.provider)?;
-    let relative = projected
-        .strip_prefix(&source_dir)
-        .map_err(|_| CoreError::InvalidInput("지침 투영 경로를 확인할 수 없습니다".to_owned()))?
-        .to_path_buf();
-
-    // 채택은 배포본을 그대로 원본으로 삼는 일이라 연결 문서도 그 위치가 기준이다.
-    // 더 이상 참조하지 않는 문서는 함께 사라진다.
-    let reserved = reserved_archive_paths(Some(&manifest));
-    let (adopted_docs, _issues) =
-        collect_deployed_linked_docs(&adopted_dir, &adopted_text, &reserved);
-    ensure_archive_capacity(adopted_text.len() as u64, &adopted_docs)?;
-
-    let staging = SourceStage::create(root, &key)?;
-    let stage = staging.stage.clone();
-    let staged = (|| -> Result<String, CoreError> {
-        // 원본 구조(공급자 지침 파일·메타·플랫폼 변형)만 옮기고, 연결 문서는
-        // 채택본이 참조하는 세트로 새로 쓴다.
-        copy_source_files(&source_dir, &content.files, &stage, |relative| {
-            is_reserved_archive_path(&normalized_relative(relative), &reserved)
-        })?;
-        write_linked_docs(&stage, &adopted_docs)?;
-        let target = stage.join(&relative);
-        assert_within_root(&stage, &target)?;
-        fs::write(&target, &adopted_text)?;
-        Ok(validated_instruction_content(&stage)?.digest)
-    })();
-    let new_digest = staging.finish(&source_dir, staged)?;
+    let (stage, new_digest) = stage_adopted_instruction_source(
+        root,
+        &key,
+        &source_dir,
+        &content,
+        request.target.provider,
+        &adopted_dir,
+        &adopted,
+    )?;
 
     // 이전 원본을 휴지통으로 옮긴다. 교체가 실패하면 되살린다.
     let actor = normalized_instruction_delete_actor(request.deleted_by.as_deref());
-    let meta = load_instruction_meta(&source_dir).unwrap_or_else(|| StoredInstructionMeta {
-        schema_version: 1,
-        name: key.clone(),
-        description: String::new(),
-    });
     let trash_item = store_instruction_trash_item(
         app_data_dir,
         &source_dir,
-        InstructionTrashItemDraft {
-            group_id: new_trash_group_id(),
-            key: key.clone(),
-            kind: InstructionTrashItemKind::Directory,
-            provider: None,
-            scope: None,
-            project_path: None,
-            shared: true,
-            deleted_by: actor,
-            content_digest: Some(content.digest.clone()),
-            file_count: content.files.len(),
-            total_bytes: content.total_bytes,
-            name: meta.name,
-            description: meta.description,
-        },
+        archived_source_trash_draft(&source_dir, &key, &new_trash_group_id(), &actor, &content),
     )?;
     let swapped = StagedReplace {
         kind: StagedKind::Directory,
@@ -4220,17 +4308,17 @@ fn sync_project_instruction_from_deployment_from_paths(
     record_instruction_deployment(
         app_data_dir,
         &key,
-        request.provider,
+        request.target.provider,
         adopted_scope,
         &adopted_dir,
-        digest_file(&adopted_path).ok(),
+        digest_file(&adopted.path).ok(),
         deployed_linked_digests(&adopted_dir, &adopted_linked),
     );
     let ledger = instruction_ledger(app_data_dir, root, &key, home, projects);
     let results = republish_provider_to_locations(
         &source_dir,
         &manifest,
-        request.provider,
+        request.target.provider,
         app_data_dir,
         &key,
         &ledger,
@@ -4239,8 +4327,8 @@ fn sync_project_instruction_from_deployment_from_paths(
 
     Ok(InstructionSyncReceipt {
         key,
-        provider: request.provider,
-        adopted_from: adopted_path.to_string_lossy().into_owned(),
+        provider: request.target.provider,
+        adopted_from: adopted.path.to_string_lossy().into_owned(),
         previous_source_trash_id: Some(trash_item.id),
         source_digest: new_digest,
         results,
@@ -4281,13 +4369,12 @@ pub fn update_project_instruction(
     sessions: &[SessionSummary],
     request: &UpdateProjectInstructionRequest,
 ) -> Result<InstructionUpdateReceipt, CoreError> {
-    let projects = project_paths_from_sessions(sessions);
-    let home = home_dir()?;
+    let sites = InstructionSites::open(app_data_dir, sessions)?;
     update_project_instruction_from_paths(
-        &repository_instructions_root(app_data_dir),
+        &sites.root,
         app_data_dir,
-        Some(&home),
-        &projects,
+        sites.home(),
+        &sites.projects,
         request,
     )
 }
@@ -4300,49 +4387,16 @@ fn update_project_instruction_from_paths(
     request: &UpdateProjectInstructionRequest,
 ) -> Result<InstructionUpdateReceipt, CoreError> {
     let key = validate_instruction_key(&request.key)?;
-    if request.files.is_empty()
-        && request.deletes.is_empty()
-        && request.name.is_none()
-        && request.description.is_none()
-    {
-        return Err(CoreError::InvalidInput("변경 내용이 없습니다".to_owned()));
-    }
-    let mut seen = BTreeSet::new();
-    for file in &request.files {
-        if !seen.insert(file.provider) {
-            return Err(CoreError::InvalidInput(format!(
-                "{} 지침 파일이 중복되었습니다",
-                file.provider
-            )));
-        }
-        if request.deletes.contains(&file.provider) {
-            return Err(CoreError::InvalidInput(format!(
-                "{} 지침을 쓰기와 삭제에 동시에 지정할 수 없습니다",
-                file.provider
-            )));
-        }
-        validate_instruction_text(&file.content)?;
-    }
+    validate_update_request(request)?;
 
-    let source_dir = root.join(&key);
-    assert_within_root(root, &source_dir)?;
-    if !source_dir.is_dir() {
-        return Err(CoreError::NotFound(format!(
-            "보관 원본을 찾지 못했습니다: {key}"
-        )));
-    }
+    let source_dir = open_instruction_source(root, &key, missing_archived_source_for_update)?;
     let current = validated_instruction_content(&source_dir)?;
     if current.digest != request.expected_digest {
         return Err(CoreError::Conflict(
             "원본이 다른 곳에서 수정되었습니다. 새로고침 후 다시 편집하세요".to_owned(),
         ));
     }
-    let current_meta =
-        load_instruction_meta(&source_dir).unwrap_or_else(|| StoredInstructionMeta {
-            schema_version: 1,
-            name: key.clone(),
-            description: String::new(),
-        });
+    let current_meta = instruction_meta_or_key(&source_dir, &key);
     let name = validate_name(request.name.as_deref().unwrap_or(&current_meta.name), &key)?;
     let description = validate_description(
         request
@@ -4351,53 +4405,15 @@ fn update_project_instruction_from_paths(
             .unwrap_or(&current_meta.description),
     )?;
 
-    let staging = SourceStage::create(root, &key)?;
-    let stage = staging.stage.clone();
-    let backup = staging.backup.clone();
-    let staged = (|| -> Result<String, CoreError> {
-        copy_source_files(&source_dir, &current.files, &stage, |_| true)?;
-        for provider in &request.deletes {
-            let target = stage.join(instruction_file_name(*provider));
-            if fs::symlink_metadata(&target).is_ok() {
-                fs::remove_file(&target)?;
-            }
-        }
-        for file in &request.files {
-            fs::write(
-                stage.join(instruction_file_name(file.provider)),
-                &file.content,
-            )?;
-        }
-        write_instruction_meta(&stage, &name, &description)?;
-        let result = validated_instruction_content(&stage)?;
-        let manifest = validate_manifest(&stage)?;
-        if !PROVIDERS
-            .into_iter()
-            .any(|provider| instruction_provider_present(&stage, &manifest, provider))
-        {
-            return Err(CoreError::InvalidInput(
-                "공급자 지침 파일이 하나도 남지 않아 저장할 수 없습니다".to_owned(),
-            ));
-        }
-        Ok(result.digest)
-    })();
-    let staged = staged.and_then(|digest| {
-        if validated_instruction_content(&source_dir)?.digest != request.expected_digest {
-            return Err(CoreError::Conflict(
-                "지침 원본이 편집 중 변경되었습니다. 다시 시도하세요".to_owned(),
-            ));
-        }
-        StagedReplace {
-            kind: StagedKind::Directory,
-            stage: &stage,
-            target: &source_dir,
-            backup: Some(&backup),
-        }
-        .commit()?;
-        Ok(digest)
-    });
-    let new_digest = staging.finish(&source_dir, staged)?;
-    let _ = fs::remove_dir_all(&backup);
+    let new_digest = commit_updated_source(
+        root,
+        &key,
+        &source_dir,
+        &current,
+        request,
+        &name,
+        &description,
+    )?;
 
     let manifest = validate_manifest(&source_dir)?;
     let ledger = instruction_ledger(app_data_dir, root, &key, home, projects);
@@ -4421,10 +4437,125 @@ fn update_project_instruction_from_paths(
     })
 }
 
+/// 편집 요청 자체의 모순을 원본을 열기 전에 걸러낸다. 같은 공급자를 두 번 쓰거나
+/// 쓰기와 삭제에 동시에 올리면 스테이징 결과가 요청 순서에 좌우되므로 거절한다.
+fn validate_update_request(request: &UpdateProjectInstructionRequest) -> Result<(), CoreError> {
+    if request.files.is_empty()
+        && request.deletes.is_empty()
+        && request.name.is_none()
+        && request.description.is_none()
+    {
+        return Err(CoreError::InvalidInput("변경 내용이 없습니다".to_owned()));
+    }
+    let mut seen = BTreeSet::new();
+    for file in &request.files {
+        if !seen.insert(file.provider) {
+            return Err(CoreError::InvalidInput(format!(
+                "{} 지침 파일이 중복되었습니다",
+                file.provider
+            )));
+        }
+        if request.deletes.contains(&file.provider) {
+            return Err(CoreError::InvalidInput(format!(
+                "{} 지침을 쓰기와 삭제에 동시에 지정할 수 없습니다",
+                file.provider
+            )));
+        }
+        validate_instruction_text(&file.content)?;
+    }
+    Ok(())
+}
+
+/// 편집 결과 전체를 스테이징 디렉터리에 먼저 만든 뒤 원본 자리와 바꾼다. 교체
+/// 직전에 원본 지문을 한 번 더 확인해, 검증 사이에 끼어든 다른 편집을 덮어쓰지
+/// 않는다. 새 원본의 내용 지문을 돌려준다.
+fn commit_updated_source(
+    root: &Path,
+    key: &str,
+    source_dir: &Path,
+    current: &InstructionContent,
+    request: &UpdateProjectInstructionRequest,
+    name: &str,
+    description: &str,
+) -> Result<String, CoreError> {
+    let staging = SourceStage::create(root, key)?;
+    let stage = staging.stage.clone();
+    let backup = staging.backup.clone();
+    let staged = (|| -> Result<String, CoreError> {
+        copy_source_files(source_dir, &current.files, &stage, |_| true)?;
+        for provider in &request.deletes {
+            let target = stage.join(instruction_file_name(*provider));
+            if fs::symlink_metadata(&target).is_ok() {
+                fs::remove_file(&target)?;
+            }
+        }
+        for file in &request.files {
+            fs::write(
+                stage.join(instruction_file_name(file.provider)),
+                &file.content,
+            )?;
+        }
+        write_instruction_meta(&stage, name, description)?;
+        let result = validated_instruction_content(&stage)?;
+        let manifest = validate_manifest(&stage)?;
+        if !PROVIDERS
+            .into_iter()
+            .any(|provider| instruction_provider_present(&stage, &manifest, provider))
+        {
+            return Err(CoreError::InvalidInput(
+                "공급자 지침 파일이 하나도 남지 않아 저장할 수 없습니다".to_owned(),
+            ));
+        }
+        Ok(result.digest)
+    })();
+    let staged = staged.and_then(|digest| {
+        if validated_instruction_content(source_dir)?.digest != request.expected_digest {
+            return Err(CoreError::Conflict(
+                "지침 원본이 편집 중 변경되었습니다. 다시 시도하세요".to_owned(),
+            ));
+        }
+        StagedReplace {
+            kind: StagedKind::Directory,
+            stage: &stage,
+            target: source_dir,
+            backup: Some(&backup),
+        }
+        .commit()?;
+        Ok(digest)
+    });
+    let new_digest = staging.finish(source_dir, staged)?;
+    let _ = fs::remove_dir_all(&backup);
+    Ok(new_digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{SessionMeta, TokenUsage};
+
+    /// 대상 세 칸을 한 벌로 모으면서도 화면이 보내는 본문 모양은 그대로여야 한다.
+    /// 평평하게 펼쳐 받는지, 생략 가능한 칸의 기본값이 살아 있는지를 못 박는다.
+    #[test]
+    fn deployment_target_reads_flat_request_body() {
+        let request: DeleteProjectInstructionDeploymentRequest = serde_json::from_str(
+            r#"{"scope":"project","projectPath":"/tmp/x","provider":"claude","confirm":true}"#,
+        )
+        .expect("평평한 본문");
+        assert_eq!(request.target.scope.as_deref(), Some("project"));
+        assert_eq!(request.target.project_path.as_deref(), Some("/tmp/x"));
+        assert_eq!(request.target.provider, ProviderId::Claude);
+        assert!(request.confirm);
+
+        let personal: ReadDeployedInstructionFileRequest =
+            serde_json::from_str(r#"{"scope":"personal","provider":"codex"}"#).expect("개인 본문");
+        assert_eq!(personal.target.project_path, None);
+        assert_eq!(personal.target.provider, ProviderId::Codex);
+
+        let bare: InstructionImportPreviewRequest =
+            serde_json::from_str(r#"{"provider":"claude"}"#).expect("위치 생략 본문");
+        assert_eq!(bare.target.scope, None);
+        assert_eq!(bare.target.project_path, None);
+    }
 
     fn registered(path: &Path, providers: &[ProviderId]) -> RegisteredProject {
         RegisteredProject {
@@ -4456,6 +4587,7 @@ mod tests {
             git_branch: None,
             is_subagent: false,
             aia_workspace,
+            default_workspace: false,
             archived: false,
             readable: true,
             size_bytes: None,
@@ -4525,9 +4657,11 @@ mod tests {
         let projects = vec![registered(&project, &[ProviderId::Claude])];
         let request = ImportProjectInstructionRequest {
             key: "imported".to_owned(),
-            scope: None,
-            project_path: Some(project.to_string_lossy().into_owned()),
-            provider: ProviderId::Claude,
+            target: InstructionDeploymentTarget {
+                scope: None,
+                project_path: Some(project.to_string_lossy().into_owned()),
+                provider: ProviderId::Claude,
+            },
             name: None,
             description: None,
             linked_files: None,
@@ -5029,9 +5163,11 @@ mod tests {
             &projects,
             &data,
             &DeleteProjectInstructionDeploymentRequest {
-                scope: None,
-                project_path: Some(project.to_string_lossy().into_owned()),
-                provider: ProviderId::Codex,
+                target: InstructionDeploymentTarget {
+                    scope: None,
+                    project_path: Some(project.to_string_lossy().into_owned()),
+                    provider: ProviderId::Codex,
+                },
                 deleted_by: Some("user".to_owned()),
                 confirm: true,
             },
@@ -5066,9 +5202,11 @@ mod tests {
         let sessions = vec![session("s1", ProviderId::Codex, &project, false, false)];
         let request = InstructionDeploymentLinkRequest {
             key: "attach-key".to_owned(),
-            scope: Some(SCOPE_PROJECT.to_owned()),
-            project_path: Some(project.to_string_lossy().into_owned()),
-            provider: ProviderId::Codex,
+            target: InstructionDeploymentTarget {
+                scope: Some(SCOPE_PROJECT.to_owned()),
+                project_path: Some(project.to_string_lossy().into_owned()),
+                provider: ProviderId::Codex,
+            },
         };
 
         let entry =
@@ -5192,9 +5330,11 @@ mod tests {
         assert!(deployed.is_file());
 
         let request = DeleteProjectInstructionDeploymentRequest {
-            scope: None,
-            project_path: Some(project.to_string_lossy().into_owned()),
-            provider: ProviderId::Codex,
+            target: InstructionDeploymentTarget {
+                scope: None,
+                project_path: Some(project.to_string_lossy().into_owned()),
+                provider: ProviderId::Codex,
+            },
             deleted_by: None,
             confirm: false,
         };
@@ -5371,9 +5511,11 @@ mod tests {
             &data,
             &SyncProjectInstructionRequest {
                 key: "sync-source".to_owned(),
-                scope: None,
-                project_path: Some(adopted.to_string_lossy().into_owned()),
-                provider: ProviderId::Codex,
+                target: InstructionDeploymentTarget {
+                    scope: None,
+                    project_path: Some(adopted.to_string_lossy().into_owned()),
+                    provider: ProviderId::Codex,
+                },
                 deleted_by: None,
             },
         )
@@ -5605,9 +5747,11 @@ mod tests {
         let projects = vec![registered(&project, &[ProviderId::Codex])];
         let request =
             |current_path: Option<&str>, href: &str| DeployedInstructionLinkedFileRequest {
-                scope: Some("project".to_owned()),
-                project_path: Some(project.to_string_lossy().into_owned()),
-                provider: ProviderId::Codex,
+                target: InstructionDeploymentTarget {
+                    scope: Some("project".to_owned()),
+                    project_path: Some(project.to_string_lossy().into_owned()),
+                    provider: ProviderId::Codex,
+                },
                 current_path: current_path.map(str::to_owned),
                 href: href.to_owned(),
             };
@@ -5725,9 +5869,11 @@ mod tests {
             Some(&home),
             &projects,
             &ReadDeployedInstructionFileRequest {
-                scope: Some("personal".to_owned()),
-                project_path: None,
-                provider: ProviderId::Codex,
+                target: InstructionDeploymentTarget {
+                    scope: Some("personal".to_owned()),
+                    project_path: None,
+                    provider: ProviderId::Codex,
+                },
             },
         )
         .expect("read personal");
@@ -5742,9 +5888,11 @@ mod tests {
             &data,
             &SyncProjectInstructionRequest {
                 key: "personal-scope".to_owned(),
-                scope: Some("personal".to_owned()),
-                project_path: None,
-                provider: ProviderId::Codex,
+                target: InstructionDeploymentTarget {
+                    scope: Some("personal".to_owned()),
+                    project_path: None,
+                    provider: ProviderId::Codex,
+                },
                 deleted_by: None,
             },
         )
@@ -5761,9 +5909,11 @@ mod tests {
             &projects,
             &data,
             &DeleteProjectInstructionDeploymentRequest {
-                scope: Some("personal".to_owned()),
-                project_path: None,
-                provider: ProviderId::Codex,
+                target: InstructionDeploymentTarget {
+                    scope: Some("personal".to_owned()),
+                    project_path: None,
+                    provider: ProviderId::Codex,
+                },
                 deleted_by: None,
                 confirm: true,
             },
@@ -5802,9 +5952,11 @@ mod tests {
             projects,
             &ImportProjectInstructionRequest {
                 key: key.to_owned(),
-                scope: None,
-                project_path: Some(origin.to_string_lossy().into_owned()),
-                provider: ProviderId::Codex,
+                target: InstructionDeploymentTarget {
+                    scope: None,
+                    project_path: Some(origin.to_string_lossy().into_owned()),
+                    provider: ProviderId::Codex,
+                },
                 name: None,
                 description: None,
                 linked_files: None,
@@ -5848,9 +6000,11 @@ mod tests {
             Some(&home),
             &projects,
             &InstructionImportPreviewRequest {
-                scope: None,
-                project_path: Some(origin.to_string_lossy().into_owned()),
-                provider: ProviderId::Codex,
+                target: InstructionDeploymentTarget {
+                    scope: None,
+                    project_path: Some(origin.to_string_lossy().into_owned()),
+                    provider: ProviderId::Codex,
+                },
             },
         )
         .expect("preview");
@@ -5880,9 +6034,11 @@ mod tests {
             &projects,
             &ImportProjectInstructionRequest {
                 key: "selected".to_owned(),
-                scope: None,
-                project_path: Some(origin.to_string_lossy().into_owned()),
-                provider: ProviderId::Codex,
+                target: InstructionDeploymentTarget {
+                    scope: None,
+                    project_path: Some(origin.to_string_lossy().into_owned()),
+                    provider: ProviderId::Codex,
+                },
                 name: None,
                 description: None,
                 linked_files: Some(vec!["context/agent/rules.md".to_owned()]),
@@ -5903,9 +6059,11 @@ mod tests {
                 &projects,
                 &ImportProjectInstructionRequest {
                     key: "unknown-doc".to_owned(),
-                    scope: None,
-                    project_path: Some(origin.to_string_lossy().into_owned()),
-                    provider: ProviderId::Codex,
+                    target: InstructionDeploymentTarget {
+                        scope: None,
+                        project_path: Some(origin.to_string_lossy().into_owned()),
+                        provider: ProviderId::Codex,
+                    },
                     name: None,
                     description: None,
                     linked_files: Some(vec!["context/agent/missing.md".to_owned()]),
@@ -5939,9 +6097,11 @@ mod tests {
             &projects,
             &ImportProjectInstructionRequest {
                 key: "many-docs".to_owned(),
-                scope: None,
-                project_path: Some(origin.to_string_lossy().into_owned()),
-                provider: ProviderId::Codex,
+                target: InstructionDeploymentTarget {
+                    scope: None,
+                    project_path: Some(origin.to_string_lossy().into_owned()),
+                    provider: ProviderId::Codex,
+                },
                 name: None,
                 description: None,
                 linked_files: None,
@@ -6056,9 +6216,11 @@ mod tests {
             &data,
             &SyncProjectInstructionRequest {
                 key: "linked-set".to_owned(),
-                scope: None,
-                project_path: Some(target.to_string_lossy().into_owned()),
-                provider: ProviderId::Codex,
+                target: InstructionDeploymentTarget {
+                    scope: None,
+                    project_path: Some(target.to_string_lossy().into_owned()),
+                    provider: ProviderId::Codex,
+                },
                 deleted_by: Some("aia".to_owned()),
             },
         )
@@ -6227,26 +6389,10 @@ mod tests {
             assert_eq!(back, outcome);
         }
 
-        // 상태 판별 헬퍼 검증
-        assert!(InstructionPublishOutcome::Published.is_published());
-        assert!(!InstructionPublishOutcome::Published.is_replaced());
-        assert!(InstructionPublishOutcome::Published.is_successful());
-
-        assert!(InstructionPublishOutcome::Replaced.is_replaced());
-        assert!(!InstructionPublishOutcome::Replaced.is_unchanged());
-        assert!(InstructionPublishOutcome::Replaced.is_successful());
-
-        assert!(InstructionPublishOutcome::Unchanged.is_unchanged());
-        assert!(!InstructionPublishOutcome::Unchanged.is_skipped());
-        assert!(InstructionPublishOutcome::Unchanged.is_successful());
-
+        // 연결 문서 배포가 건너뛴 결과만 걸러 내는 판별자(생산 코드가 쓰는 유일한 헬퍼)
         assert!(InstructionPublishOutcome::Skipped.is_skipped());
-        assert!(!InstructionPublishOutcome::Skipped.is_failed());
-        assert!(!InstructionPublishOutcome::Skipped.is_successful());
-
-        assert!(InstructionPublishOutcome::Failed.is_failed());
-        assert!(!InstructionPublishOutcome::Failed.is_published());
-        assert!(!InstructionPublishOutcome::Failed.is_successful());
+        assert!(!InstructionPublishOutcome::Unchanged.is_skipped());
+        assert!(!InstructionPublishOutcome::Failed.is_skipped());
 
         // 잘못된 문자열 파싱 실패 검증
         assert!("unknown".parse::<InstructionPublishOutcome>().is_err());

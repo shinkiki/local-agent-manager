@@ -1,60 +1,32 @@
-import { useEffect, useSyncExternalStore } from "react";
-import { getChatProviderOptions } from "./ipc";
+import { useCallback, useEffect, useSyncExternalStore } from "react";
+import { cachedProviderOptions, refreshProviderOptions, subscribeProviderOptions } from "./providerOptionsStore.ts";
 import type {
   ChatProviderOptions,
   ChatReasoningOption,
   ProviderId,
 } from "../types";
 
-const providerOptionsCache = new Map<ProviderId, ChatProviderOptions>();
-const providerOptionsRequests = new Map<ProviderId, Promise<ChatProviderOptions>>();
-const providerOptionsListeners = new Set<() => void>();
-
-function notifyProviderOptionsChanged() {
-  for (const listener of providerOptionsListeners) listener();
-}
-
-export async function refreshProviderOptions(source: ProviderId): Promise<ChatProviderOptions> {
-  const activeRequest = providerOptionsRequests.get(source);
-  if (activeRequest) return activeRequest;
-
-  const request = getChatProviderOptions(source)
-    .then((options) => {
-      providerOptionsCache.set(source, options);
-      notifyProviderOptionsChanged();
-      return options;
-    })
-    .finally(() => {
-      if (providerOptionsRequests.get(source) === request) {
-        providerOptionsRequests.delete(source);
-      }
-    });
-  providerOptionsRequests.set(source, request);
-  return request;
-}
-
-/** 이미 읽어 둔 실행설정 카탈로그. 새 요청을 만들지 않는다. */
-export function cachedProviderOptions(source: ProviderId): ChatProviderOptions | null {
-  return providerOptionsCache.get(source) ?? null;
-}
-
 /**
- * 실행설정 카탈로그가 갱신될 때마다 알림을 받는다. CLI 정보 갱신이 실행설정 스키마
- * 재조사를 유발하므로, 여러 공급자를 한꺼번에 보는 화면은 이 알림으로 표시를 맞춘다.
+ * 화면이 실행설정 카탈로그를 읽는 방법 — 구독해 다시 그리는 훅과, 고른 모델의 추론 강도
+ * 선택지를 꺼내는 규칙.
+ *
+ * 카탈로그를 들고 있는 싱글턴(공급자 한 칸·요청 합치기·갱신 알림)은
+ * `providerOptionsStore`에 있다. 화면은 저장소와 훅을 한 자리에서 가져오므로, 가져오는
+ * 자리를 흩지 않도록 저장소의 이름 셋은 여기서 그대로 다시 내보낸다.
  */
-export function subscribeProviderOptions(listener: () => void): () => void {
-  providerOptionsListeners.add(listener);
-  return () => { providerOptionsListeners.delete(listener); };
-}
+export {
+  refreshProviderOptions,
+  cachedProviderOptions,
+  subscribeProviderOptions,
+} from "./providerOptionsStore.ts";
 
 export function useProviderOptions(source: ProviderId): ChatProviderOptions | null {
   // 캐시가 돌려주는 객체는 갱신될 때만 새로 담기므로 스냅샷 신원이 안정적이다.
   // 손으로 짠 구독 상태 대신 스토어를 그대로 읽어, 캐시를 읽는 자리를 하나로 둔다.
-  const options = useSyncExternalStore(
-    subscribeProviderOptions,
-    () => cachedProviderOptions(source),
-    () => cachedProviderOptions(source),
-  );
+  // 클라이언트·서버 스냅샷에 같은 화살표 함수를 각각 적어 두면 한쪽만 다른 공급자를 읽는
+  // 갈래가 열리므로, 읽기는 한 번만 적고 두 자리에 같은 것을 넘긴다.
+  const readCachedOptions = useCallback(() => cachedProviderOptions(source), [source]);
+  const options = useSyncExternalStore(subscribeProviderOptions, readCachedOptions, readCachedOptions);
 
   useEffect(() => {
     // 화면이 처음 열리거나 공급자가 바뀌면 저장된 최신 실행설정 스키마를 읽는다.

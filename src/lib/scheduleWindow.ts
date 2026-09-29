@@ -1,9 +1,16 @@
 import { formatDate } from "./format.ts";
 
 /** 반복 요청이 예약 실행을 내보내는 절대 구간. 둘 다 비면 제한이 없다. */
-export interface ActiveWindow {
+interface ActiveWindow {
   activeFrom?: number | null;
   activeUntil?: number | null;
+}
+
+type ActiveWindowBounds = readonly [from: number | null, until: number | null];
+
+/** 선택적인 두 경계값을 활성 창 판정이 공통으로 쓰는 모양으로 맞춘다. */
+function activeWindowBounds(window: ActiveWindow): ActiveWindowBounds {
+  return [window.activeFrom ?? null, window.activeUntil ?? null];
 }
 
 /**
@@ -26,8 +33,7 @@ export function fromDatetimeLocalValue(value: string): number | null {
 
 /** 활성 창 한 줄 요약. 창을 쓰지 않는 반복 요청은 null이다. */
 export function describeActiveWindow(window: ActiveWindow): string | null {
-  const from = window.activeFrom ?? null;
-  const until = window.activeUntil ?? null;
+  const [from, until] = activeWindowBounds(window);
   if (from === null && until === null) return null;
   if (from !== null && until !== null) return `${formatDate(from)} ~ ${formatDate(until)}`;
   if (from !== null) return `${formatDate(from)}부터`;
@@ -39,6 +45,6 @@ export function describeActiveWindow(window: ActiveWindow): string | null {
  * enabled를 끄지는 않는다 — 사용자가 종료를 미루면 그대로 다시 돈다.
  */
 export function activeWindowEnded(window: ActiveWindow, now: number = Date.now()): boolean {
-  const until = window.activeUntil ?? null;
+  const [, until] = activeWindowBounds(window);
   return until !== null && now > until;
 }

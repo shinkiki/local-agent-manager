@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -139,6 +140,93 @@ fn with_settings_lock<T>(
     action(&canonical_app_data_dir)
 }
 
+trait StoredSettings: DeserializeOwned {
+    const SCHEMA_VERSION: u32;
+    const NEEDS_SAVE: bool;
+
+    fn schema_version(&self) -> u32;
+    fn into_settings(self) -> Result<BackendServiceSettings, CoreError>;
+}
+
+impl StoredSettings for StoredBackendServiceSettings {
+    const SCHEMA_VERSION: u32 = SETTINGS_SCHEMA_VERSION;
+    const NEEDS_SAVE: bool = false;
+
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    fn into_settings(self) -> Result<BackendServiceSettings, CoreError> {
+        validated_settings(self.port, &self.store_id, self.remote_write)
+    }
+}
+
+impl StoredSettings for IdentityStoredBackendServiceSettings {
+    const SCHEMA_VERSION: u32 = IDENTITY_SETTINGS_SCHEMA_VERSION;
+    const NEEDS_SAVE: bool = true;
+
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    fn into_settings(self) -> Result<BackendServiceSettings, CoreError> {
+        validated_settings(self.port, &self.store_id, DEFAULT_BACKEND_REMOTE_WRITE)
+    }
+}
+
+impl StoredSettings for LegacyStoredBackendServiceSettings {
+    const SCHEMA_VERSION: u32 = LEGACY_SETTINGS_SCHEMA_VERSION;
+    const NEEDS_SAVE: bool = true;
+
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    fn into_settings(self) -> Result<BackendServiceSettings, CoreError> {
+        validate_port(self.port)?;
+        Ok(new_settings(self.port))
+    }
+}
+
+fn decode_settings<T: StoredSettings>(
+    bytes: &[u8],
+) -> Result<(BackendServiceSettings, bool), CoreError> {
+    let stored: T = serde_json::from_slice(bytes)?;
+    debug_assert_eq!(stored.schema_version(), T::SCHEMA_VERSION);
+    Ok((stored.into_settings()?, T::NEEDS_SAVE))
+}
+
+fn validated_settings(
+    port: u16,
+    store_id: &str,
+    remote_write: bool,
+) -> Result<BackendServiceSettings, CoreError> {
+    validate_port(port)?;
+    Ok(BackendServiceSettings {
+        port,
+        store_id: validate_store_id(store_id)?,
+        remote_write,
+    })
+}
+
+/// 저장본 바이트열을 스키마 버전에 맞게 역직렬화하고 검증한다.
+/// 반환값의 둘째 요소는 최신 스키마로 이관 저장이 필요한지 여부다.
+fn parse_stored_settings(bytes: &[u8]) -> Result<(BackendServiceSettings, bool), CoreError> {
+    let envelope: SettingsEnvelope = serde_json::from_slice(bytes)?;
+    match envelope.schema_version {
+        SETTINGS_SCHEMA_VERSION => decode_settings::<StoredBackendServiceSettings>(bytes),
+        IDENTITY_SETTINGS_SCHEMA_VERSION => {
+            decode_settings::<IdentityStoredBackendServiceSettings>(bytes)
+        }
+        LEGACY_SETTINGS_SCHEMA_VERSION => {
+            decode_settings::<LegacyStoredBackendServiceSettings>(bytes)
+        }
+        schema_version => Err(CoreError::Conflict(format!(
+            "지원하지 않는 백엔드 서비스 설정 버전입니다: {schema_version}"
+        ))),
+    }
+}
+
 fn load_settings_unlocked(app_data_dir: &Path) -> Result<BackendServiceSettings, CoreError> {
     let path = app_data_dir.join(SETTINGS_FILE_NAME);
     if !path.exists() {
@@ -147,42 +235,11 @@ fn load_settings_unlocked(app_data_dir: &Path) -> Result<BackendServiceSettings,
         return Ok(settings);
     }
     let bytes = fs::read(path)?;
-    let envelope: SettingsEnvelope = serde_json::from_slice(&bytes)?;
-    match envelope.schema_version {
-        SETTINGS_SCHEMA_VERSION => {
-            let stored: StoredBackendServiceSettings = serde_json::from_slice(&bytes)?;
-            validate_port(stored.port)?;
-            let store_id = validate_store_id(&stored.store_id)?;
-            Ok(BackendServiceSettings {
-                port: stored.port,
-                store_id,
-                remote_write: stored.remote_write,
-            })
-        }
-        IDENTITY_SETTINGS_SCHEMA_VERSION => {
-            let stored: IdentityStoredBackendServiceSettings = serde_json::from_slice(&bytes)?;
-            debug_assert_eq!(stored.schema_version, IDENTITY_SETTINGS_SCHEMA_VERSION);
-            validate_port(stored.port)?;
-            let settings = BackendServiceSettings {
-                port: stored.port,
-                store_id: validate_store_id(&stored.store_id)?,
-                remote_write: DEFAULT_BACKEND_REMOTE_WRITE,
-            };
-            save_settings_unlocked(app_data_dir, &settings)?;
-            Ok(settings)
-        }
-        LEGACY_SETTINGS_SCHEMA_VERSION => {
-            let stored: LegacyStoredBackendServiceSettings = serde_json::from_slice(&bytes)?;
-            debug_assert_eq!(stored.schema_version, LEGACY_SETTINGS_SCHEMA_VERSION);
-            validate_port(stored.port)?;
-            let settings = new_settings(stored.port);
-            save_settings_unlocked(app_data_dir, &settings)?;
-            Ok(settings)
-        }
-        schema_version => Err(CoreError::Conflict(format!(
-            "지원하지 않는 백엔드 서비스 설정 버전입니다: {schema_version}"
-        ))),
+    let (settings, needs_save) = parse_stored_settings(&bytes)?;
+    if needs_save {
+        save_settings_unlocked(app_data_dir, &settings)?;
     }
+    Ok(settings)
 }
 
 fn new_settings(port: u16) -> BackendServiceSettings {
@@ -194,14 +251,12 @@ fn new_settings(port: u16) -> BackendServiceSettings {
 }
 
 fn validate_store_id(store_id: &str) -> Result<String, CoreError> {
-    let parsed = Uuid::parse_str(store_id).map_err(|_| {
-        CoreError::InvalidInput("백엔드 서비스 저장소 식별자가 올바르지 않습니다".to_owned())
-    })?;
+    let invalid_id =
+        || CoreError::InvalidInput("백엔드 서비스 저장소 식별자가 올바르지 않습니다".to_owned());
+    let parsed = Uuid::parse_str(store_id).map_err(|_| invalid_id())?;
     let canonical = parsed.to_string();
     if canonical != store_id {
-        return Err(CoreError::InvalidInput(
-            "백엔드 서비스 저장소 식별자가 올바르지 않습니다".to_owned(),
-        ));
+        return Err(invalid_id());
     }
     Ok(canonical)
 }

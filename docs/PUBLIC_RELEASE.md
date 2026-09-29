@@ -51,5 +51,7 @@ gitleaks detect --source . --redact --no-banner
 - [ ] 로그아웃 브라우저에서 코드, README, 보안 정책, 라이선스 표시를 확인합니다.
 - [ ] clone 후 `npm ci`와 문서의 개발 명령이 동작하는지 확인합니다.
 - [ ] 첫 Dependabot 및 secret scanning 결과를 확인합니다.
+- [ ] macOS 배포본을 `npm run tauri:build:release-signed`로 만들고, `spctl --assess`가 `source=Notarized Developer ID`를 내는지 확인합니다. 절차는 [scripts/macos/APPLE_RELEASE_SIGNING.md](../scripts/macos/APPLE_RELEASE_SIGNING.md)에 있습니다.
+- [ ] 그 배포본을 설치해 [MACOS_NOTARIZED_SMOKE.md](./MACOS_NOTARIZED_SMOKE.md)의 스모크를 통과하는지 확인합니다. 서명 성공은 실행 성공이 아닙니다.
 
 가시성 변경은 되돌릴 수 있지만, 공개된 커밋은 이미 복제되었을 수 있으므로 비밀정보·개인정보 검사는 공개 전에 끝내야 합니다.

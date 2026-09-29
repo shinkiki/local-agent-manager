@@ -35,7 +35,8 @@ target
 /.codex/
 /.cursor/
 /.windsurf/
-/AGENTS.md
+# AGENTS.md는 개발선(dev-history)에서 추적한다. 저장소의 보안 불변식과 직접 변경
+# 예외(C1~)를 담고 있어 코드 변경과 같은 커밋에 실려야 근거가 남는다.
 /AGENTS.md.bak-*
 /CLAUDE.md
 /GEMINI.md
@@ -63,3 +64,19 @@ target
 cypress/screenshots/
 cypress/videos/
 cypress/downloads/
+# Cypress 작업공간 실행이 프로젝트 루트에 남기는 회차 산출물(cypress_runs.rs의 artifacts/runs/<jobId>/)
+/artifacts/
+
+# 튜닝 회차가 띄우는 개발 백엔드의 임시 앱 데이터·로그·PID.
+.tuning/
+
+# 로컬 모델 파인튜닝 회차의 산출물(가상환경·학습본·표본). 표본은 추적본에서 다시 낸다.
+local-llm-dev/finetune/.venv/
+local-llm-dev/finetune/runs/
+local-llm-dev/finetune/data/
+
+# 파인튜닝 스크립트를 모듈로 불러올 때 생긴다
+local-llm-dev/finetune/__pycache__/
+
+# Windows 설치본 보관 자리. 로컬 빌드 산출물이며 공개 트리에 싣지 않는다 — 배포는 GitHub Release 첨부로 한다.
+/installers/

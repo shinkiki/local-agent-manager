@@ -250,6 +250,72 @@ pub struct ConsumerBudgetConfig {
     /// 성향을 물려받는다 — 회차를 새로 만들 때마다 같은 조합을 손으로 짜지 않게 한다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend_profile: Option<SpendProfile>,
+    /// 스프린트. 켜면 이 소비자의 참여 계정은 계획 창(7일)의 목표와 직선 페이싱을 무시하고
+    /// 리셋을 기다리지 않은 채 감당할 수 있는 건수를 전부 낸다 — 계산은 소진 모드와 같은
+    /// 몰아쓰기 분기를 쓰되, 가드 창(짧은 창) 상한은 그대로 지키고 리셋 크레딧은 쓰지 않는다.
+    /// 소진 모드가 계정 전체의 스위치라면 스프린트는 회차 하나의 스위치다.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sprint: bool,
+    /// 완료조건. 자유 문구("리팩토링 1000건 실행", "마일스톤 완료")로, 회차 봉투가 매 기동
+    /// 메시지 끝에 이 문구와 누적 성공 실행 건수를 덧붙이고 판정은 실행 에이전트가 한다.
+    /// 에이전트가 충족을 결론 내리면 마지막 응답 마지막 줄의 `PACING_COMPLETE:` 표식으로
+    /// 알리고, 그 순간 `completed_at`이 찍혀 회차는 완료 상태가 된다. 없으면 회차는 끝나지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_condition: Option<String>,
+    /// 완료조건 사용 여부. 꺼 두면 문구는 그대로 두고 조건만 적용하지 않는다 — 다시 켤 때
+    /// 적어 둔 문구를 되찾으려고 "지우기"와 갈라 둔 스위치다. 이 칸이 없는 옛 저장본은 켜짐으로
+    /// 읽는다(스위치가 생기기 전에는 문구가 있으면 곧 적용이었다).
+    ///
+    /// 새로 만든 회차는 꺼진 채로 시작한다(`Default`). 문구 없이 켜져 있는 상태는 화면에는
+    /// "사용 중"으로 보이면서 실제로는 기동 메시지에도 붙지 않고 표식도 세지 않아, 조건을 걸어
+    /// 둔 것으로 읽히는 켜짐이었다. 문구가 없으면 스위치도 꺼져 있는 것이 본 상태다.
+    #[serde(default = "default_completion_condition_enabled")]
+    pub completion_condition_enabled: bool,
+    /// 이 소비자로 돌아 정상 완료(턴 completed)한 무인 실행의 누적 건수. 실측용 링버퍼
+    /// (64·256건)와 달리 지워지지 않는 진짜 누적치라 완료조건의 "N건"을 세는 근거가 된다.
+    /// "다시 시작"이 0으로 되돌린다.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub completed_runs: u64,
+    /// 완료조건이 충족된 시각. 있으면 이 소비자는 예약 기동을 받지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<i64>,
+    /// 에이전트가 표식 뒤에 적은 완료 근거 한 줄.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_note: Option<String>,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+/// 이 칸이 없는 **옛 저장본**을 읽을 때만 쓰는 값이다. 스위치가 생기기 전 저장본은 문구가 있으면
+/// 곧 적용이었으니 켜짐으로 읽어야 한다. 새로 만드는 회차의 기본값은 이것이 아니라 `Default`이며,
+/// 거기서는 꺼져 있다.
+fn default_completion_condition_enabled() -> bool {
+    true
+}
+
+impl ConsumerBudgetConfig {
+    /// 지금 적용되는 완료조건. 스위치가 꺼져 있으면 문구가 남아 있어도 없는 것으로 본다 —
+    /// 기동 메시지에 붙이는 자리와 완료 판정이 같은 값을 보게 한 자리다.
+    pub fn active_completion_condition(&self) -> Option<&str> {
+        self.completion_condition
+            .as_deref()
+            .filter(|_| self.completion_condition_enabled)
+    }
+
+    /// 완료조건이 충족되어 더는 예약 기동을 받지 않는 상태인지. 스위치를 끄면 찍힌 시각과 근거는
+    /// 저장본에 그대로 두고 판정만 내린다 — 끄는 것이 "적용하지 않음"이지 "완료를 지움"이 아니라,
+    /// 다시 켜면 그 완료 상태가 근거와 함께 되살아난다. 조건 문구를 지운 경우는 다르다(저장할 때
+    /// 완료 상태도 함께 지운다) — 판정의 근거가 된 문구 자체가 없어졌기 때문이다.
+    pub fn completed(&self) -> bool {
+        self.completed_at.is_some() && self.completion_condition_enabled
+    }
+
+    /// 예약 기동을 받을 수 있는지 — 참여가 켜져 있고 완료되지 않았다.
+    pub fn accepts_runs(&self) -> bool {
+        self.enabled && !self.completed()
+    }
 }
 
 impl Default for ConsumerBudgetConfig {
@@ -264,6 +330,14 @@ impl Default for ConsumerBudgetConfig {
             enforce_ceiling: false,
             reasoning_efforts: BTreeMap::new(),
             spend_profile: None,
+            sprint: false,
+            completion_condition: None,
+            // 새 회차는 완료조건 없이 시작하니 스위치도 꺼져 있다. 문구가 빈 켜짐은 적용되는 것이
+            // 없는데도 "사용 중"으로 보이는 상태라, 화면과 실제가 어긋나는 쪽을 기본값에서 없앴다.
+            completion_condition_enabled: false,
+            completed_runs: 0,
+            completed_at: None,
+            completion_note: None,
         }
     }
 }
@@ -429,26 +503,38 @@ impl UsageBudgetPolicy {
         }
         self.consumers
             .get(consumer_id)
-            .is_some_and(|config| config.enabled)
+            .is_some_and(ConsumerBudgetConfig::accepts_runs)
     }
 
     /// 워크플로가 띄우는 무인 런타임을 허용할지. 소비자 선택이 꺼져 있으면 모두 허용.
-    /// 켜져 있으면 그 반복 요청이 등록·활성이거나, 같은 워크플로를 가리키는 등록·활성
-    /// 소비자가 하나라도 있으면 허용한다 — 수동 실행(트리거 없음)은 소비자 id가 워크플로
-    /// id로 오므로 워크플로 기준 확인이 없으면 등록된 회차의 수동 실행까지 막게 된다.
+    /// 켜져 있으면 그 반복 요청의 소비자 설정이 있을 때 그 enabled를 따르고, 없으면 같은
+    /// 워크플로를 가리키는 소비자 중 켜진 것이 하나라도 있으면 허용한다 — 수동 실행(트리거
+    /// 없음)은 소비자 id가 워크플로 id로 오므로 워크플로 기준 확인이 없으면 등록된 회차의
+    /// 수동 실행까지 막게 된다. 소비자도 워크플로도 정책이 모르면 예산이 통제하지 않는
+    /// 워크플로다(반복 요청 없이 직접 실행한 워크플로는 페이싱 탭에 오르지도 않아 켤 방법이
+    /// 없다) — 통과시킨다.
     pub fn launch_allowed(&self, consumer_id: Option<&str>, workflow_id: Option<&str>) -> bool {
         if !self.consumers_configured() {
             return true;
         }
-        if consumer_id.is_some_and(|id| self.consumers.get(id).is_some_and(|config| config.enabled))
-        {
+        if let Some(config) = consumer_id.and_then(|id| self.consumers.get(id)) {
+            // 완료된 회차는 참여가 켜져 있어도 기동을 받지 않는다 — 봉투가 뜨지 않으니 여기
+            // 오는 것은 완료 표식이 찍힌 뒤에도 살아 있던 병렬 실행이거나 수동 실행이다.
+            return config.accepts_runs();
+        }
+        // 워크플로 id조차 없으면 무엇을 띄우는지 알 수 없다 — 예산 밖으로 보지 않고 거절.
+        let Some(workflow) = workflow_id else {
+            return false;
+        };
+        let mut same_workflow = self
+            .consumers
+            .values()
+            .filter(|config| config.workflow_id.as_deref() == Some(workflow))
+            .peekable();
+        if same_workflow.peek().is_none() {
             return true;
         }
-        workflow_id.is_some_and(|workflow| {
-            self.consumers
-                .values()
-                .any(|config| config.enabled && config.workflow_id.as_deref() == Some(workflow))
-        })
+        same_workflow.any(ConsumerBudgetConfig::accepts_runs)
     }
 
     pub fn consumer_priority(&self, consumer_id: &str) -> u8 {
@@ -774,6 +860,66 @@ pub struct SetUsageBudgetConsumerRequest {
         deserialize_with = "crate::domain::deserialize_nullable_field"
     )]
     pub spend_profile: Option<Option<SpendProfile>>,
+    /// 스프린트 on/off. 생략하면 기존 값 유지.
+    #[serde(default)]
+    pub sprint: Option<bool>,
+    /// 완료조건 문구. 칸이 없으면 기존 값 유지, `null`이나 빈 문자열이면 해제한다 — 해제하면
+    /// 판정할 조건이 없어지므로 함께 완료 상태(시각·근거)도 지운다. 누적 건수는 남긴다.
+    #[serde(
+        default,
+        deserialize_with = "crate::domain::deserialize_nullable_field"
+    )]
+    pub completion_condition: Option<Option<String>>,
+    /// 완료조건 사용 on/off. 생략하면 기존 값 유지. 끄면 문구도 완료 상태(시각·근거)도 저장본에
+    /// 그대로 두고 적용만 멈춘다 — 완료였던 회차는 다시 돌고, 다시 켜면 그 완료 상태가 되살아난다.
+    #[serde(default)]
+    pub completion_condition_enabled: Option<bool>,
+    /// 참이면 완료 상태를 지우고 누적 건수를 0으로 되돌려 회차를 다시 진행중으로 만든다
+    /// (카드의 "다시 시작"). 조건 문구는 그대로다.
+    #[serde(default)]
+    pub reset_completion: Option<bool>,
+}
+
+/// 완료조건 문구의 길이 상한. 한두 문장이면 충분하고, 매 기동 메시지에 그대로 실리는 값이라
+/// 길면 지시문을 밀어낸다.
+pub(crate) const MAX_COMPLETION_CONDITION_CHARS: usize = 400;
+
+fn validate_completion_condition(condition: &Option<Option<String>>) -> Result<(), CoreError> {
+    if condition
+        .as_ref()
+        .and_then(|inner| inner.as_deref())
+        .is_some_and(|text| text.chars().count() > MAX_COMPLETION_CONDITION_CHARS)
+    {
+        return Err(CoreError::InvalidInput(format!(
+            "완료조건은 {MAX_COMPLETION_CONDITION_CHARS}자를 넘을 수 없습니다"
+        )));
+    }
+    Ok(())
+}
+
+/// 레인별 추론수준은 그 공급자 사다리 안의 값만 저장한다. 화면과 계획이 같은 선택지를
+/// 보도록 소비자 저장 절차와 별개로 검증 규칙을 한곳에 둔다.
+fn validate_reasoning_efforts(
+    lanes: &BTreeMap<ProviderId, LaneReasoningEffort>,
+) -> Result<(), CoreError> {
+    for (provider, lane) in lanes {
+        let ladder = crate::usage_pacing::reasoning_effort_ladder(*provider);
+        for (name, value) in [("고정값", &lane.fixed), ("자동 상한", &lane.max_auto)] {
+            if let Some(effort) = value.as_ref().filter(|effort| !ladder.contains(effort)) {
+                return Err(CoreError::InvalidInput(format!(
+                    "{} 레인의 추론수준 {name} {}은 지원하지 않습니다(가능: {})",
+                    provider.as_str(),
+                    effort.as_str(),
+                    ladder
+                        .iter()
+                        .map(ReasoningEffort::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn set_consumer(
@@ -787,26 +933,10 @@ pub(crate) fn set_consumer(
     }
     validate_label(&request.label)?;
     validate_percent(request.max_cost_percent_per_run, "회당 소비 상한")?;
-    // 레인별 추론수준은 그 공급자 사다리 안의 값만 저장한다 — 화면과 계획이 같은 선택지를 본다.
     if let Some(lanes) = &request.reasoning_efforts {
-        for (provider, lane) in lanes {
-            let ladder = crate::usage_pacing::reasoning_effort_ladder(*provider);
-            for (name, value) in [("고정값", &lane.fixed), ("자동 상한", &lane.max_auto)] {
-                if let Some(effort) = value.as_ref().filter(|effort| !ladder.contains(effort)) {
-                    return Err(CoreError::InvalidInput(format!(
-                        "{} 레인의 추론수준 {name} {}은 지원하지 않습니다(가능: {})",
-                        provider.as_str(),
-                        effort.as_str(),
-                        ladder
-                            .iter()
-                            .map(ReasoningEffort::as_str)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )));
-                }
-            }
-        }
+        validate_reasoning_efforts(lanes)?;
     }
+    validate_completion_condition(&request.completion_condition)?;
     modify(app_data_dir, seed, |policy| {
         let existing = policy
             .consumers
@@ -824,6 +954,7 @@ pub(crate) fn set_consumer(
             Some(value) => Some(value),
             None => existing.max_cost_percent_per_run,
         };
+        let completion = merge_completion(&existing, &request);
         policy.consumers.insert(
             request.schedule_id,
             ConsumerBudgetConfig {
@@ -838,9 +969,106 @@ pub(crate) fn set_consumer(
                     .reasoning_efforts
                     .unwrap_or(existing.reasoning_efforts),
                 spend_profile: request.spend_profile.unwrap_or(existing.spend_profile),
+                sprint: request.sprint.unwrap_or(existing.sprint),
+                completion_condition: completion.condition,
+                completion_condition_enabled: completion.enabled,
+                completed_runs: completion.completed_runs,
+                completed_at: completion.completed_at,
+                completion_note: completion.note,
             },
         );
         Ok(())
+    })
+}
+
+/// 완료조건 한 벌(문구·사용 여부·누적·완료 상태)의 병합 결과.
+struct MergedCompletion {
+    condition: Option<String>,
+    enabled: bool,
+    completed_runs: u64,
+    completed_at: Option<i64>,
+    note: Option<String>,
+}
+
+/// 완료조건·완료 상태의 병합. 조건을 지우는 것과 "다시 시작"은 서로 다른 조작이라 갈래를 한
+/// 자리에 모아 둔다 — 조건을 지우면 판정의 근거가 없어지니 완료 상태도 함께 지우고, 다시 시작은
+/// 조건은 두고 상태·누적만 되돌린다. 조건 문구만 바꾸는 것은 완료 상태를 건드리지 않는다(완료
+/// 뒤 문구를 다듬어도 회차가 저절로 되살아나면 안 된다).
+///
+/// 사용 스위치를 끄는 것은 여기서 아무것도 지우지 않는다. 끄면 `completed()`가 판정만 내려 회차가
+/// 다시 돌고, 다시 켜면 찍혀 있던 시각·근거가 그대로 살아난다 — 문구를 지우지 않고도 잠시 멈출 수
+/// 있게 하려고 둔 스위치라, 껐다는 이유로 완료 근거를 태우면 스위치가 "지우기"와 다를 것이 없다.
+fn merge_completion(
+    existing: &ConsumerBudgetConfig,
+    request: &SetUsageBudgetConsumerRequest,
+) -> MergedCompletion {
+    let condition = match &request.completion_condition {
+        None => existing.completion_condition.clone(),
+        Some(next) => next
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned),
+    };
+    // 없던 문구를 이번 저장으로 처음 적었는지. 새 회차의 스위치는 꺼진 채로 시작하니, 스위치를
+    // 말하지 않은 채 첫 문구만 온 요청은 켜 준다 — 적용하지 않을 조건을 적는 요청은 없고, 그러지
+    // 않으면 한 번의 호출로 조건을 거는 경로(AIA·원격)가 저장은 되고 아무 일도 하지 않는다.
+    // 스위치는 "이미 적어 둔 조건을 잠시 멈추는" 것이라, 문구가 이미 있던 회차에서는 건드리지 않는다.
+    let first_condition = existing.completion_condition.is_none() && condition.is_some();
+    let enabled = request
+        .completion_condition_enabled
+        .unwrap_or(first_condition || existing.completion_condition_enabled);
+    // 적어 둔 문구가 이번 저장으로 없어졌는지. 스위치는 보지 않는다 — 끄는 것은 판정을 멈출 뿐
+    // 근거를 태우지 않는다.
+    let cleared = existing.completion_condition.is_some() && condition.is_none();
+    let reset = request.reset_completion == Some(true);
+    let completed = if reset || cleared {
+        (None, None)
+    } else {
+        (existing.completed_at, existing.completion_note.clone())
+    };
+    MergedCompletion {
+        condition,
+        enabled,
+        completed_runs: if reset { 0 } else { existing.completed_runs },
+        completed_at: completed.0,
+        note: completed.1,
+    }
+}
+
+/// 무인 실행 한 건이 끝났다. 정상 완료(턴 completed)면 누적 건수를 하나 올리고, 완료조건이
+/// 설정된 소비자에 에이전트가 `PACING_COMPLETE:` 표식을 남겼으면 그 시각과 근거를 찍어 회차를
+/// 완료 상태로 만든다. 표식은 조건이 없는 소비자에서는 무시한다 — 에이전트가 조건을 본 적이
+/// 없으니 근거 없는 표식이다. 이미 완료된 회차는 다시 찍지 않는다(첫 근거를 보존).
+///
+/// 채팅 런타임의 턴 종료 스레드에서 불린다. 정책 파일이 없거나 소비자 항목이 없으면 아무 일도
+/// 하지 않는다 — 여기서 항목을 만들면 아직 고르지 않은 사용자의 선택을 굳혀 버린다.
+pub(crate) fn record_consumer_run_finished(
+    app_data_dir: &Path,
+    consumer_id: &str,
+    succeeded: bool,
+    completion_note: Option<&str>,
+    now: i64,
+) -> Result<Option<UsageBudgetPolicy>, CoreError> {
+    modify_existing(app_data_dir, |policy| {
+        let Some(config) = policy.consumers.get_mut(consumer_id) else {
+            return Ok(false);
+        };
+        let mut changed = false;
+        if succeeded {
+            config.completed_runs = config.completed_runs.saturating_add(1);
+            changed = true;
+        }
+        if let Some(note) = completion_note.filter(|_| succeeded) {
+            if config.active_completion_condition().is_some() && !config.completed() {
+                config.completed_at = Some(now);
+                let note = note.trim();
+                config.completion_note = (!note.is_empty())
+                    .then(|| note.chars().take(MAX_COMPLETION_CONDITION_CHARS).collect());
+                changed = true;
+            }
+        }
+        Ok(changed)
     })
 }
 
@@ -1068,6 +1296,7 @@ mod tests {
                 use_active_account: false,
                 cwd: String::new(),
                 model: None,
+                local_connection_id: None,
                 reasoning_effort: None,
                 approval_mode: ChatApprovalMode::Never,
                 mode: ChatMode::FullAccess,
@@ -1100,6 +1329,7 @@ mod tests {
             next_run_at: 0,
             last_run_at: None,
             manual_run_requested_at: None,
+            paused_reason: None,
         }
     }
 
@@ -1259,6 +1489,10 @@ mod tests {
                 enforce_ceiling: None,
                 reasoning_efforts: None,
                 spend_profile: None,
+                sprint: None,
+                completion_condition: None,
+                completion_condition_enabled: None,
+                reset_completion: None,
             },
         )
         .expect("set consumer");
@@ -1301,6 +1535,10 @@ mod tests {
                 enforce_ceiling: Some(true),
                 reasoning_efforts: None,
                 spend_profile: None,
+                sprint: None,
+                completion_condition: None,
+                completion_condition_enabled: None,
+                reset_completion: None,
             },
         )
         .expect("set consumer");
@@ -1407,6 +1645,10 @@ mod tests {
                     enforce_ceiling: None,
                     reasoning_efforts: None,
                     spend_profile: None,
+                    sprint: None,
+                    completion_condition: None,
+                    completion_condition_enabled: None,
+                    reset_completion: None,
                 }
             ),
             Err(CoreError::InvalidInput(_))
@@ -1617,6 +1859,10 @@ mod tests {
             enforce_ceiling: None,
             reasoning_efforts: None,
             spend_profile: None,
+            sprint: None,
+            completion_condition: None,
+            completion_condition_enabled: None,
+            reset_completion: None,
         };
         let policy = set_consumer(dir.path(), no_seed, base(Some(50_000))).expect("set");
         assert_eq!(policy.consumers["s-qa"].max_tokens_per_run, Some(50_000));
@@ -1625,6 +1871,10 @@ mod tests {
             SetUsageBudgetConsumerRequest {
                 reasoning_efforts: lanes,
                 spend_profile: None,
+                sprint: None,
+                completion_condition: None,
+                completion_condition_enabled: None,
+                reset_completion: None,
                 ..base(None)
             }
         };
@@ -1756,13 +2006,298 @@ mod tests {
                 ..ConsumerBudgetConfig::default()
             },
         );
-        // 등록·활성 반복 요청은 허용, 꺼진 것·미등록은 거부.
+        // 등록·활성 반복 요청은 허용, 꺼진 것은 거부.
         assert!(policy.launch_allowed(Some("s-qa"), Some("wf-qa")));
         assert!(!policy.launch_allowed(Some("s-off"), Some("wf-off")));
-        assert!(!policy.launch_allowed(Some("s-unknown"), Some("wf-unknown")));
+        // 소비자도 워크플로도 정책이 모르면 예산 밖 — 통과(직접 실행한 워크플로는 페이싱
+        // 탭에 오르지 않아 켤 방법이 없다).
+        assert!(policy.launch_allowed(Some("s-unknown"), Some("wf-unknown")));
+        assert!(policy.launch_allowed(Some("wf-unknown"), Some("wf-unknown")));
+        // 워크플로는 아는데 그 반복 요청만 미등록이면 워크플로 기준으로 판정.
+        assert!(!policy.launch_allowed(Some("s-unregistered"), Some("wf-off")));
         // 수동 실행: 소비자 id가 워크플로 id로 온다 — 그 워크플로를 켠 소비자가 있으면 허용.
         assert!(policy.launch_allowed(Some("wf-qa"), Some("wf-qa")));
         assert!(!policy.launch_allowed(Some("wf-off"), Some("wf-off")));
         assert!(!policy.launch_allowed(None, None));
+    }
+    #[test]
+    /// 완료조건·스프린트는 다른 칸을 고칠 때 유지되고, 조건을 `null`로 보내면 해제되며 완료
+    /// 상태도 함께 지워진다. "다시 시작"은 조건은 두고 상태·누적만 되돌린다.
+    fn a_consumer_completion_condition_and_sprint_follow_the_absent_null_reset_rules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let request = |body: serde_json::Value| -> SetUsageBudgetConsumerRequest {
+            serde_json::from_value(body).expect("request")
+        };
+        let policy = set_consumer(
+            dir.path(),
+            no_seed,
+            request(json!({
+                "scheduleId": "s-qa", "enabled": true, "sprint": true,
+                "completionCondition": "  리팩토링 3건 실행  "
+            })),
+        )
+        .expect("set");
+        let config = &policy.consumers["s-qa"];
+        assert!(config.sprint);
+        assert_eq!(
+            config.completion_condition.as_deref(),
+            Some("리팩토링 3건 실행")
+        );
+        assert!(!config.completed());
+
+        // 성공 두 번 + 표식 → 완료. 실패 턴은 세지 않고, 조건이 있어야만 표식이 유효하다.
+        record_consumer_run_finished(dir.path(), "s-qa", true, None, 1_000).expect("run 1");
+        record_consumer_run_finished(dir.path(), "s-qa", false, Some("끊긴 조각"), 1_500)
+            .expect("failed run");
+        record_consumer_run_finished(dir.path(), "s-qa", true, Some(" 3건 모두 커밋됨 "), 2_000)
+            .expect("run 2");
+        let policy = load_optional(dir.path()).expect("load").expect("policy");
+        let config = &policy.consumers["s-qa"];
+        assert_eq!(config.completed_runs, 2);
+        assert_eq!(config.completed_at, Some(2_000));
+        assert_eq!(config.completion_note.as_deref(), Some("3건 모두 커밋됨"));
+        assert!(
+            !policy.consumer_allowed("s-qa"),
+            "완료된 회차는 기동을 받지 않는다"
+        );
+        assert!(!policy.launch_allowed(Some("s-qa"), Some("wf-qa")));
+        // 이미 완료된 회차의 두 번째 표식은 첫 근거를 덮지 않는다(건수는 계속 센다).
+        record_consumer_run_finished(dir.path(), "s-qa", true, Some("다른 근거"), 3_000)
+            .expect("run 3");
+        let policy = load_optional(dir.path()).expect("load").expect("policy");
+        assert_eq!(policy.consumers["s-qa"].completed_runs, 3);
+        assert_eq!(policy.consumers["s-qa"].completed_at, Some(2_000));
+
+        // 우선순위만 고치면 완료 상태·스프린트·조건이 그대로다.
+        let policy = set_consumer(
+            dir.path(),
+            no_seed,
+            request(json!({ "scheduleId": "s-qa", "enabled": true, "priority": 10 })),
+        )
+        .expect("set");
+        let config = &policy.consumers["s-qa"];
+        assert!(config.sprint && config.completed() && config.completion_condition.is_some());
+
+        // 다시 시작: 상태·누적을 지우고 조건은 남긴다.
+        let policy = set_consumer(
+            dir.path(),
+            no_seed,
+            request(json!({ "scheduleId": "s-qa", "enabled": true, "resetCompletion": true })),
+        )
+        .expect("set");
+        let config = &policy.consumers["s-qa"];
+        assert!(!config.completed() && config.completion_note.is_none());
+        assert_eq!(config.completed_runs, 0);
+        assert_eq!(
+            config.completion_condition.as_deref(),
+            Some("리팩토링 3건 실행")
+        );
+        assert!(policy.consumer_allowed("s-qa"));
+
+        // 조건 해제(null): 완료 상태를 함께 지우고 누적은 남긴다. 조건이 없으면 표식도 무시.
+        record_consumer_run_finished(dir.path(), "s-qa", true, Some("근거"), 4_000).expect("run");
+        assert!(load_optional(dir.path()).unwrap().unwrap().consumers["s-qa"].completed());
+        let policy = set_consumer(
+            dir.path(),
+            no_seed,
+            request(json!({ "scheduleId": "s-qa", "enabled": true, "completionCondition": null })),
+        )
+        .expect("set");
+        let config = &policy.consumers["s-qa"];
+        assert!(config.completion_condition.is_none() && !config.completed());
+        assert_eq!(config.completed_runs, 1);
+        record_consumer_run_finished(dir.path(), "s-qa", true, Some("근거"), 5_000).expect("run");
+        let config = &load_optional(dir.path()).unwrap().unwrap().consumers["s-qa"];
+        assert!(!config.completed(), "조건이 없는 소비자의 표식은 무시한다");
+        assert_eq!(config.completed_runs, 2);
+
+        // 빈 문자열도 해제이고, 상한을 넘는 문구는 거절된다.
+        let policy = set_consumer(
+            dir.path(),
+            no_seed,
+            request(json!({ "scheduleId": "s-qa", "enabled": true, "completionCondition": "   " })),
+        )
+        .expect("set");
+        assert!(policy.consumers["s-qa"].completion_condition.is_none());
+        assert!(matches!(
+            set_consumer(
+                dir.path(),
+                no_seed,
+                request(json!({
+                    "scheduleId": "s-qa", "enabled": true,
+                    "completionCondition": "가".repeat(MAX_COMPLETION_CONDITION_CHARS + 1)
+                })),
+            ),
+            Err(CoreError::InvalidInput(message)) if message.contains("완료조건")
+        ));
+        // 정책에 없는 소비자의 종료 기록은 항목을 만들지 않는다.
+        assert_eq!(
+            record_consumer_run_finished(dir.path(), "s-unknown", true, None, 6_000).expect("noop"),
+            None
+        );
+    }
+
+    /// 완료조건 사용 스위치: 끄면 문구도 완료 근거도 남긴 채 적용만 멈추고(표식 무시·기동 재개),
+    /// 다시 켜면 문구와 완료 상태가 그대로 살아난다. 옛 저장본에는 칸이 없어 켜짐으로 읽는다.
+    #[test]
+    fn the_completion_condition_switch_keeps_the_text_and_stops_applying_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let request = |body: serde_json::Value| -> SetUsageBudgetConsumerRequest {
+            serde_json::from_value(body).expect("request")
+        };
+        let policy = set_consumer(
+            dir.path(),
+            no_seed,
+            request(json!({
+                "scheduleId": "s-qa", "enabled": true, "completionCondition": "마일스톤 완료"
+            })),
+        )
+        .expect("set");
+        let config = &policy.consumers["s-qa"];
+        assert!(
+            config.completion_condition_enabled,
+            "없던 문구를 처음 적으면 스위치를 말하지 않아도 켜진다"
+        );
+        assert_eq!(config.active_completion_condition(), Some("마일스톤 완료"));
+
+        // 조건이 충족돼 완료된 뒤 스위치를 끈다: 문구도 근거도 저장본에 남고, 판정만 풀려 다시
+        // 기동을 받는다.
+        record_consumer_run_finished(dir.path(), "s-qa", true, Some("근거"), 1_000).expect("run");
+        assert!(load_optional(dir.path()).unwrap().unwrap().consumers["s-qa"].completed());
+        let policy = set_consumer(
+            dir.path(),
+            no_seed,
+            request(json!({
+                "scheduleId": "s-qa", "enabled": true, "completionConditionEnabled": false
+            })),
+        )
+        .expect("set");
+        let config = &policy.consumers["s-qa"];
+        assert_eq!(
+            config.completion_condition.as_deref(),
+            Some("마일스톤 완료")
+        );
+        assert_eq!(config.active_completion_condition(), None);
+        assert!(!config.completed(), "꺼진 동안에는 완료가 아니다");
+        assert_eq!(
+            config.completed_at,
+            Some(1_000),
+            "찍힌 시각은 태우지 않는다"
+        );
+        assert_eq!(config.completion_note.as_deref(), Some("근거"));
+        assert_eq!(config.completed_runs, 1);
+        assert!(policy.consumer_allowed("s-qa"));
+
+        // 꺼져 있으면 표식도 무시한다(첫 근거를 덮지 않는다).
+        record_consumer_run_finished(dir.path(), "s-qa", true, Some("다른 근거"), 2_000)
+            .expect("run");
+        let config = &load_optional(dir.path()).unwrap().unwrap().consumers["s-qa"];
+        assert!(!config.completed(), "꺼진 조건의 표식은 무시한다");
+        assert_eq!(config.completion_note.as_deref(), Some("근거"));
+
+        // 다시 켜면 문구와 완료 상태가 근거까지 그대로 살아난다.
+        let policy = set_consumer(
+            dir.path(),
+            no_seed,
+            request(json!({
+                "scheduleId": "s-qa", "enabled": true, "completionConditionEnabled": true
+            })),
+        )
+        .expect("set");
+        let config = &policy.consumers["s-qa"];
+        assert_eq!(config.active_completion_condition(), Some("마일스톤 완료"));
+        assert!(config.completed() && config.completed_at == Some(1_000));
+        assert_eq!(config.completion_note.as_deref(), Some("근거"));
+        assert!(!policy.consumer_allowed("s-qa"), "다시 완료 상태다");
+
+        // 꺼 둔 채 문구를 지우면 그때는 완료 근거도 함께 사라진다(판정의 근거가 없어졌다).
+        set_consumer(
+            dir.path(),
+            no_seed,
+            request(json!({
+                "scheduleId": "s-qa", "enabled": true, "completionConditionEnabled": false
+            })),
+        )
+        .expect("set");
+        let policy = set_consumer(
+            dir.path(),
+            no_seed,
+            request(json!({ "scheduleId": "s-qa", "enabled": true, "completionCondition": null })),
+        )
+        .expect("set");
+        let config = &policy.consumers["s-qa"];
+        assert!(config.completion_condition.is_none());
+        assert!(config.completed_at.is_none() && config.completion_note.is_none());
+    }
+
+    /// 새로 만든 회차의 완료조건 스위치는 꺼져 있고, 문구가 없는 한 그대로다 — 문구 없이 켜져
+    /// 있으면 화면은 "사용 중"인데 기동 메시지에는 아무것도 붙지 않고 표식도 세지 않는다.
+    /// 칸이 없는 옛 저장본만 켜짐으로 읽는다.
+    #[test]
+    fn a_new_round_starts_with_the_completion_switch_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let request = |body: serde_json::Value| -> SetUsageBudgetConsumerRequest {
+            serde_json::from_value(body).expect("request")
+        };
+        let policy = set_consumer(
+            dir.path(),
+            no_seed,
+            request(json!({ "scheduleId": "s-new", "enabled": true })),
+        )
+        .expect("set");
+        let config = &policy.consumers["s-new"];
+        assert!(!config.completion_condition_enabled, "신규는 꺼짐");
+        assert_eq!(config.active_completion_condition(), None);
+        assert!(!config.completed() && config.accepts_runs());
+
+        // 꺼진 채로도 표식은 세지 않는다(적용되는 조건이 없다).
+        record_consumer_run_finished(dir.path(), "s-new", true, Some("근거"), 1_000).expect("run");
+        let config = &load_optional(dir.path()).unwrap().unwrap().consumers["s-new"];
+        assert!(config.completed_at.is_none() && config.completion_note.is_none());
+        assert_eq!(config.completed_runs, 1, "누적은 조건과 무관하게 센다");
+
+        // 스위치를 직접 끈 회차에서 문구를 고치는 것은 켜지 않는다 — 켜 주는 것은 없던 문구를
+        // 처음 적는 경우뿐이다.
+        set_consumer(
+            dir.path(),
+            no_seed,
+            request(json!({
+                "scheduleId": "s-new", "enabled": true, "completionCondition": "1000건"
+            })),
+        )
+        .expect("set");
+        set_consumer(
+            dir.path(),
+            no_seed,
+            request(json!({
+                "scheduleId": "s-new", "enabled": true, "completionConditionEnabled": false
+            })),
+        )
+        .expect("set");
+        let policy = set_consumer(
+            dir.path(),
+            no_seed,
+            request(json!({
+                "scheduleId": "s-new", "enabled": true, "completionCondition": "2000건"
+            })),
+        )
+        .expect("set");
+        let config = &policy.consumers["s-new"];
+        assert_eq!(config.completion_condition.as_deref(), Some("2000건"));
+        assert!(
+            !config.completion_condition_enabled,
+            "꺼 둔 스위치는 그대로"
+        );
+
+        // 칸이 없는 옛 저장본은 켜짐으로 읽는다.
+        let legacy: ConsumerBudgetConfig = serde_json::from_value(json!({
+            "enabled": true, "completionCondition": "마일스톤 완료"
+        }))
+        .expect("legacy");
+        assert_eq!(
+            legacy.active_completion_condition(),
+            Some("마일스톤 완료"),
+            "옛 저장본은 문구가 있으면 적용 중이었다"
+        );
     }
 }

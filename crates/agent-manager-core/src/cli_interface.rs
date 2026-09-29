@@ -43,27 +43,32 @@ impl CliInterface {
         let mut interface = Self::default();
         // 블록 밖 산문에 언급된 플래그도 존재 근거로 담는다. 존재는 긍정 근거로만
         // 쓰이므로 과다 수집이 선택지를 잘못 지우는 방향으로 작동하지 않는다.
-        for flag in long_flags(help) {
-            interface.flags.insert(flag);
-        }
+        interface.record_flags(long_flags(help), None);
         for block in option_blocks(help) {
             let names = long_flags(block[0]);
             if names.is_empty() {
                 continue;
             }
             let values = block_values(&block);
-            for name in names {
-                interface.flags.insert(name.clone());
-                if let Some(values) = &values {
-                    interface
-                        .values
-                        .entry(name)
-                        .or_default()
-                        .extend(values.iter().cloned());
-                }
-            }
+            interface.record_flags(names, values.as_ref());
         }
         interface
+    }
+
+    fn record_flags(
+        &mut self,
+        flags: impl IntoIterator<Item = String>,
+        values: Option<&BTreeSet<String>>,
+    ) {
+        for flag in flags {
+            self.flags.insert(flag.clone());
+            if let Some(values) = values {
+                self.values
+                    .entry(flag)
+                    .or_default()
+                    .extend(values.iter().cloned());
+            }
+        }
     }
 
     pub(crate) fn has_flag(&self, flag: &str) -> bool {
@@ -77,8 +82,8 @@ impl CliInterface {
 
     /// 허용값 목록을 읽어냈다면 그 목록에 값이 있는지, 못 읽었으면 판단을 보류하고 true.
     pub(crate) fn accepts_value(&self, flag: &str, value: &str) -> bool {
-        match self.values.get(flag) {
-            Some(values) if !values.is_empty() => values.contains(value),
+        match self.values_for(flag) {
+            Some(values) => values.contains(value),
             _ => true,
         }
     }
@@ -114,20 +119,21 @@ pub(crate) fn probe_cli_interface(executable: &Path) -> Result<CliInterface, Cor
 /// 옵션 선언 줄과 그에 딸린 설명 줄을 한 블록으로 묶는다. 블록 경계는 "들여쓴 줄이
 /// `-`로 시작한다"는, commander·clap·Go flag 도움말이 공통으로 지키는 규칙으로 잡는다.
 fn option_blocks(help: &str) -> Vec<Vec<&str>> {
-    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    let mut blocks = Vec::new();
+    let mut current = None;
     for line in help.lines() {
         if is_option_header(line) {
-            blocks.push(vec![line]);
-        } else if let Some(block) = blocks.last_mut() {
-            // 들여쓰기가 없는 줄은 새 섹션 제목이므로 블록을 닫는다.
-            if !line.trim().is_empty() && !line.starts_with(char::is_whitespace) {
-                blocks.push(Vec::new());
-            } else {
-                block.push(line);
+            if let Some(block) = current.replace(vec![line]) {
+                blocks.push(block);
             }
+        } else if !line.trim().is_empty() && !line.starts_with(char::is_whitespace) {
+            // 들여쓰기가 없는 줄은 새 섹션 제목이므로 블록을 닫는다.
+            blocks.extend(current.take());
+        } else if let Some(block) = current.as_mut() {
+            block.push(line);
         }
     }
-    blocks.retain(|block| !block.is_empty());
+    blocks.extend(current);
     blocks
 }
 
@@ -267,11 +273,9 @@ pub(crate) struct CommandOutcome {
     pub(crate) stderr: String,
 }
 
-pub(crate) fn run_capped(
-    executable: &Path,
-    args: &[&str],
-    timeout: Duration,
-) -> Result<CommandOutcome, CoreError> {
+/// 출력을 파이프로 받는 외부 명령의 공통 준비. 종료까지 모아 받는 [`run_capped`]와 줄
+/// 단위로 흘리는 호출자가 같은 환경으로 자식을 띄우도록 한 곳에 둔다.
+pub(crate) fn capped_command(executable: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(executable);
     command
         .args(args)
@@ -291,13 +295,143 @@ pub(crate) fn run_capped(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
+    command
+}
+
+pub(crate) fn run_capped(
+    executable: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<CommandOutcome, CoreError> {
+    run_capped_with(executable, args, timeout, &CappedOptions::default())
+}
+
+/// [`run_capped_with`]가 받는 선택지. 환경변수·stdin·작업 폴더·자격증명 변수 제거·
+/// 프로세스 그룹은 서로를 모르는 갈래라 한 벌로 묶어 받되, 자식을 띄우고 제한 시간까지
+/// 지켜보는 절차는 한 자리만 둔다. 세 기존 래퍼는 이 구조체의 한 칸만 채운다.
+#[derive(Default)]
+pub(crate) struct CappedOptions<'a> {
+    pub(crate) env: &'a [(String, String)],
+    /// 자식에게 물려주지 않을 변수. 상속된 리디렉션(`GIT_DIR` 등)이 사용자가 고른 대상을
+    /// 다른 곳으로 옮기지 못하게 하는 자리다.
+    pub(crate) env_remove: &'a [&'a str],
+    /// stdin으로 한 번 써 넣고 닫을 바이트. 개행을 붙이지 않는다 — 붙일지는 호출부가 정한다.
+    pub(crate) input: Option<&'a [u8]>,
+    pub(crate) current_dir: Option<&'a Path>,
+    /// `strip_inherited_credential_env`를 적용할지. 공급자 CLI가 아닌 자식(git 등)이
+    /// 계정별 자격증명 경로를 물려받을 이유가 없다.
+    pub(crate) strip_credential_env: bool,
+    /// 자식을 자기 프로세스 그룹에 두고 제한 시간에 그룹째 죽일지. 자식이 다시 자식을
+    /// 띄우는 명령(`git fetch` → `ssh`·자격증명 도우미)에서만 의미가 있다.
+    pub(crate) own_process_group: bool,
+}
+
+/// 프로세스 그룹 전체에 강제 종료를 보낸다. 실행 시간을 넘긴 자식을 정리하는 마지막
+/// 수단이라, 이미 사라졌거나 신호를 보내지 못해도 더 할 일이 없다.
+#[cfg(unix)]
+pub(crate) fn kill_process_group(pid: u32) {
+    let _ = crate::process_signal::signal_process_group(pid, libc::SIGKILL);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn kill_process_group(_pid: u32) {}
+
+/// 환경변수를 얹어 실행한다. 계정별 홈으로 공급자 CLI에 묻는 조회가 쓴다 — 계정을 인자로
+/// 받는 명령이 없는 공급자에서는 홈을 바꾸는 것이 곧 계정을 고르는 일이다.
+pub(crate) fn run_capped_with_env(
+    executable: &Path,
+    args: &[&str],
+    timeout: Duration,
+    env: &[(String, String)],
+) -> Result<CommandOutcome, CoreError> {
+    run_capped_with(
+        executable,
+        args,
+        timeout,
+        &CappedOptions {
+            env,
+            ..CappedOptions::default()
+        },
+    )
+}
+
+/// C9-19. 자식 stdin으로 한 번 써 넣고 닫는 변형. sudo 비밀번호처럼 **명령줄에 실을 수
+/// 없는** 입력이 지나는 유일한 통로다 — 인자·환경변수는 같은 호스트의 다른 프로세스가
+/// `ps`로 읽을 수 있고 명령 문자열은 승인 카드·영수증·감사 기록에 그대로 남지만, 이
+/// 통로의 값은 부모와 자식 사이에서만 오간다.
+///
+/// `input`이 `None`이면 stdin은 기존대로 닫힌 채(`Stdio::null()`) 돌아간다. 입력을 주는
+/// 쪽은 자식이 그것을 읽지 않을 수 있다는 것을 전제해야 한다 — 읽지 않아도 쓰기는
+/// 실패하지 않고, 파이프가 먼저 닫히면 `BrokenPipe`가 나지만 그것은 실행 실패가 아니다.
+pub(crate) fn run_capped_with_input(
+    executable: &Path,
+    args: &[&str],
+    timeout: Duration,
+    input: Option<&str>,
+) -> Result<CommandOutcome, CoreError> {
+    // `sudo -S`는 개행까지 읽어야 한 줄로 판단하므로 개행을 함께 보낸다.
+    let line = input.map(|value| format!("{value}\n"));
+    run_capped_with(
+        executable,
+        args,
+        timeout,
+        &CappedOptions {
+            input: line.as_deref().map(str::as_bytes),
+            ..CappedOptions::default()
+        },
+    )
+}
+
+/// 위 셋과 git 실행기가 공유하는 본체. 자식을 띄우고 제한 시간까지 지켜보는 절차는 한 벌만 둔다.
+pub(crate) fn run_capped_with(
+    executable: &Path,
+    args: &[&str],
+    timeout: Duration,
+    options: &CappedOptions<'_>,
+) -> Result<CommandOutcome, CoreError> {
+    let mut command = capped_command(executable, args);
+    for key in options.env_remove {
+        command.env_remove(key);
+    }
+    for (key, value) in options.env {
+        command.env(key, value);
+    }
+    if let Some(dir) = options.current_dir {
+        command.current_dir(dir);
+    }
+    if options.strip_credential_env {
+        crate::credential_profiles::strip_inherited_credential_env(&mut command);
+    }
+    if options.input.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    #[cfg(unix)]
+    if options.own_process_group {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command.spawn().map_err(|error| {
         CoreError::Runtime(format!(
             "{} 실행을 시작하지 못했습니다: {error}",
             executable.to_string_lossy()
         ))
     })?;
+    // 출력 회수를 먼저 띄운 뒤 stdin을 별도 스레드에서 쓴다. 자식이 stdin을 읽기 전에
+    // 파이프 한 통 넘게 출력하면(커밋 훅의 lint 출력) 이 스레드가 쓰기에서 막힌 채 제한
+    // 시간조차 시작되지 않는다. 쓰기 스레드는 다 쓰면 곧바로 닫고, 자식이 죽으면 파이프가
+    // 끊겨 스스로 끝난다.
     let output_readers = CappedOutputReaders::spawn(child.stdout.take(), child.stderr.take());
+    let stdin_writer = options.input.map(|input| {
+        let payload = input.to_vec();
+        let stdin = child.stdin.take();
+        thread::spawn(move || {
+            if let Some(mut stdin) = stdin {
+                use std::io::Write;
+                let _ = stdin.write_all(&payload);
+                let _ = stdin.flush();
+            }
+        })
+    });
 
     let started = Instant::now();
     let mut timed_out = false;
@@ -306,6 +440,9 @@ pub(crate) fn run_capped(
             Some(status) => break Some(status),
             None => {
                 if started.elapsed() >= timeout {
+                    if options.own_process_group {
+                        kill_process_group(child.id());
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     timed_out = true;
@@ -316,6 +453,10 @@ pub(crate) fn run_capped(
         }
     };
     let (stdout, stderr) = output_readers.finish();
+    // 자식이 끝났으니 파이프는 닫혔고, 쓰기 스레드는 다 썼거나 끊겨 곧 돌아온다.
+    if let Some(writer) = stdin_writer {
+        let _ = writer.join();
+    }
     Ok(CommandOutcome {
         success: status.map(|status| status.success()).unwrap_or(false),
         timed_out,

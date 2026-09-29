@@ -31,17 +31,18 @@ use crate::catalog::{
 
 use crate::domain::{
     CommonSkillDetail, CommonSkillDigest, CommonSkillSource, ProviderId, SessionSummary,
-    SkillAdapterRootView, SkillAdapterView, SkillInstallView, SkillLibrary, SkillLibraryEntry,
-    SkillLibraryIssue, SkillOriginKind, SkillOriginView, SkillProjectView, SkillProviderState,
-    SkillProviderStatus,
+    SkillAdapterRootView, SkillAdapterView, SkillDivergence, SkillInstallView, SkillLibrary,
+    SkillLibraryEntry, SkillLibraryIssue, SkillOriginKind, SkillOriginView, SkillProjectView,
+    SkillProviderState, SkillProviderStatus,
 };
 use crate::file_kind::regular_file_metadata;
 use crate::path_guard::{self, CurDirPolicy, RelativePathIssue, RootLabels};
 use crate::resource_repository::{
-    load_resource_manifest, repository_skills_root, resource_manifest_path,
-    validate_platform_variant_path, validate_variant_relative_path, HostPlatform,
-    ResourcePlatformManifest,
+    is_windows_reserved_stem, load_resource_manifest, publish_nonce, repository_skills_root,
+    resource_manifest_path, validate_platform_variant_path, validate_variant_relative_path,
+    HostPlatform, ResourcePlatformManifest,
 };
+use crate::session_management::session_string_enum;
 use crate::skill_meta::{
     load_skill_meta, record_skill_origin, remove_skill_meta, SkillMetaEntry, SkillMetaStore,
     SkillOriginMeta,
@@ -133,6 +134,16 @@ const ADAPTERS: &[SkillAdapter] = &[
         unsupported_note: None,
     },
     SkillAdapter {
+        provider: ProviderId::Local,
+        display_name: "로컬 LLM",
+        // ACP 하네스가 읽는 자리다. 개인은 설정 디렉터리 아래, 프로젝트는 `.opencode/skill`
+        // (바이너리 문자열로 확인, 2026-09-24). Codex의 `.codex/skills`를 빌려 쓰면
+        // 하네스가 읽지 않아 게시해도 아무 일이 일어나지 않는다.
+        personal_root_relative: ".config/opencode/skill",
+        project_root_relative: ".opencode/skill",
+        unsupported_note: None,
+    },
+    SkillAdapter {
         provider: ProviderId::Antigravity,
         display_name: "Google Antigravity",
         // 공식 CLI가 읽는 개인 `.gemini/config/skills`와 프로젝트 `.agents/skills`를 쓴다.
@@ -149,7 +160,7 @@ fn provider_only_frontmatter_keys(provider: ProviderId) -> &'static [&'static st
     match provider {
         // Claude 전용 실행 제어 키. Codex·Antigravity는 해석하지 않는다.
         ProviderId::Claude => &[],
-        ProviderId::Codex | ProviderId::Antigravity => {
+        ProviderId::Codex | ProviderId::Antigravity | ProviderId::Local => {
             &["allowed-tools", "allowed_tools", "disable-model-invocation"]
         }
     }
@@ -220,6 +231,8 @@ impl SkillAdapter {
                 });
                 roots.extend(self.project_root_entries(projects));
             }
+            // 하네스가 내장 스킬을 따로 깔지 않는다. 개인·프로젝트 루트만 본다.
+            ProviderId::Local => roots.extend(self.project_root_entries(projects)),
             ProviderId::Antigravity => {
                 roots.extend(ACTIVE_AG_ROOTS.iter().map(|root_name| AdapterRoot {
                     scope: "builtin",
@@ -377,19 +390,6 @@ pub(crate) fn validate_skill_key(key: &str) -> Result<String, CoreError> {
     Ok(trimmed.to_owned())
 }
 
-fn is_windows_reserved_stem(value: &str) -> bool {
-    let stem = value
-        .split('.')
-        .next()
-        .unwrap_or(value)
-        .to_ascii_uppercase();
-    const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    RESERVED.contains(&stem.as_str())
-}
-
 /// 스킬 디렉터리 안의 상대 경로가 루트를 벗어나지 않는지 확인한다. `..`, 절대
 /// 경로, 루트·접두사 구성요소를 모두 거부한다.
 fn validate_relative_path(relative: &Path) -> Result<(), CoreError> {
@@ -432,6 +432,47 @@ fn assert_within_root(root: &Path, candidate: &Path) -> Result<(), CoreError> {
     path_guard::assert_within_root(root, candidate, SKILL_PATH_LABELS)
 }
 
+/// 여러 작업이 공통 스킬 원본 디렉터리를 같은 두 걸음(키 이어붙이기 → 루트 이탈 검사)으로
+/// 연다. 그 두 걸음을 여기 모아, 새 작업이 이탈 검사를 빠뜨린 채 경로를 만들 수 없게 한다.
+fn common_skill_dir(root: &Path, key: &str) -> Result<PathBuf, CoreError> {
+    let directory = root.join(key);
+    assert_within_root(root, &directory)?;
+    Ok(directory)
+}
+
+/// 위와 같되 `SKILL.md`가 실제로 있는지까지 확인한다. 없을 때의 문구는 자리마다 달라
+/// (원본을 여는 자리인지 보관본을 찾는 자리인지) 앞머리만 인자로 받고 뒤에 키를 붙인다.
+fn existing_common_skill_dir(root: &Path, key: &str, missing: &str) -> Result<PathBuf, CoreError> {
+    let directory = common_skill_dir(root, key)?;
+    if !directory.join("SKILL.md").is_file() {
+        return Err(CoreError::NotFound(format!("{missing}: {key}")));
+    }
+    Ok(directory)
+}
+
+const MISSING_COMMON_SOURCE: &str = "공통 스킬 원본을 찾지 못했습니다";
+const MISSING_ARCHIVED_SOURCE: &str = "보관 원본이 없습니다";
+
+/// 원자 교체 한 회차가 쓰는 임시 스테이징·백업 경로 한 쌍. 두 경로가 같은 nonce를
+/// 나눠 가져야 되살리기가 어느 스테이징에서 나온 백업인지 헷갈리지 않는다.
+struct SkillStagePaths {
+    stage: PathBuf,
+    backup: PathBuf,
+}
+
+/// 루트 안에 만들 스테이징·백업 이름을 짓는다. 스테이징은 이름을 만들자마자 루트를
+/// 벗어나지 않는지 확인해, 키에 섞여 들어온 값이 루트 밖을 가리키는 채로 쓰이지
+/// 않게 한다. 백업은 같은 루트·키에서 접두사만 다르므로 같은 확인을 되풀이하지 않는다.
+fn skill_stage_paths(root: &Path, key: &str) -> Result<SkillStagePaths, CoreError> {
+    let nonce = publish_nonce();
+    let stage = root.join(format!("{STAGE_PREFIX}{key}-{nonce}"));
+    assert_within_root(root, &stage)?;
+    Ok(SkillStagePaths {
+        backup: root.join(format!("{BACKUP_PREFIX}{key}-{nonce}")),
+        stage,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 내용 지문
 // ---------------------------------------------------------------------------
@@ -441,6 +482,10 @@ struct SkillContent {
     digest: String,
     file_count: usize,
     total_bytes: u64,
+    /// 지문에 들어간 파일 중 가장 나중에 고쳐진 시각(밀리초). 지문이 갈라졌을 때
+    /// 어느 쪽이 새 내용인지는 이 값으로만 알 수 있다. 파일시스템이 수정 시각을
+    /// 주지 않으면 없다.
+    modified_at_ms: Option<i64>,
     /// 상대 경로 목록. 호환성 검사와 복사가 같은 목록을 쓴다.
     files: Vec<SkillFileEntry>,
     /// 디렉터리 안에서 발견한 심볼릭 링크. 안전하게 복사할 수 없어 그대로 보고한다.
@@ -455,6 +500,42 @@ struct SkillFileEntry {
     executable: bool,
 }
 
+impl SkillContent {
+    /// 파일 수·전체 크기 한도 위반을 점검 코드와 문구로 돌려준다. 게시 점검은 두
+    /// 위반을 모두 항목으로 세우고, 쓰기 경로는 첫 문구만 꺼내 거절한다.
+    fn size_limit_violations(&self) -> Vec<(&'static str, String)> {
+        let mut violations = Vec::new();
+        if self.truncated {
+            violations.push((
+                "file-count",
+                format!("스킬 구성 파일이 {MAX_SKILL_FILES}개를 넘습니다"),
+            ));
+        }
+        if self.total_bytes > MAX_SKILL_TOTAL_BYTES {
+            violations.push((
+                "total-bytes",
+                format!(
+                    "스킬 전체 크기가 허용 한도({}MB)를 넘습니다",
+                    MAX_SKILL_TOTAL_BYTES / (1024 * 1024)
+                ),
+            ));
+        }
+        violations
+    }
+
+    /// 쓰기 경로가 공유하는 거절 판정. 심볼릭 링크 거절 사유는 경로마다 달라
+    /// `symlink_reason`으로 받고 링크 경로를 뒤에 붙인다.
+    fn ensure_writable(&self, symlink_reason: &str) -> Result<(), CoreError> {
+        if let Some((_, message)) = self.size_limit_violations().into_iter().next() {
+            return Err(CoreError::InvalidInput(message));
+        }
+        if let Some(link) = self.symlinks.first() {
+            return Err(CoreError::InvalidInput(format!("{symlink_reason}: {link}")));
+        }
+        Ok(())
+    }
+}
+
 /// 스킬 디렉터리 내용을 순회해 지문을 계산한다. 링크는 따라가지 않고 목록에만
 /// 남긴다. 정렬된 상대 경로·실행 권한·내용을 모두 지문에 넣어 권한만 바뀐 경우도
 /// 갈라짐으로 잡는다.
@@ -463,6 +544,7 @@ fn read_skill_content(directory: &Path) -> Result<SkillContent, CoreError> {
     let mut symlinks = Vec::new();
     let mut total_bytes = 0_u64;
     let mut truncated = false;
+    let mut modified_at_ms: Option<i64> = None;
     let mut pending = vec![PathBuf::new()];
 
     while let Some(relative_dir) = pending.pop() {
@@ -498,6 +580,7 @@ fn read_skill_content(directory: &Path) -> Result<SkillContent, CoreError> {
                 continue;
             }
             total_bytes = total_bytes.saturating_add(metadata.len());
+            modified_at_ms = modified_at_ms.max(metadata_modified_ms(&metadata));
             files.push(SkillFileEntry {
                 relative,
                 size_bytes: metadata.len(),
@@ -524,10 +607,22 @@ fn read_skill_content(directory: &Path) -> Result<SkillContent, CoreError> {
         digest,
         file_count: files.len(),
         total_bytes,
+        modified_at_ms,
         files,
         symlinks,
         truncated,
     })
+}
+
+/// 파일 수정 시각(밀리초). 시각을 주지 않는 파일시스템과 UNIX 기원 이전 값은 없음으로
+/// 접어, 비교하는 쪽이 "모른다"와 "오래됐다"를 섞지 않게 한다.
+fn metadata_modified_ms(metadata: &fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as i64)
 }
 
 #[cfg(unix)]
@@ -588,6 +683,31 @@ impl SkillRoots {
     fn projects(&self) -> &[PathBuf] {
         &self.projects
     }
+
+    /// 설치본이 사는 자리는 언제나 `home`과 등록 프로젝트 목록 두 값이 함께 정한다.
+    /// 아홉 함수가 그 한 쌍을 도로 풀어 인자로 이어 넘기고 있었다. 훑는 일을 묶음
+    /// 자신이 하면 부르는 쪽에 두 값이 남지 않는다.
+    fn provider_installs(&self, issues: &mut Vec<SkillLibraryIssue>) -> Vec<ProviderInstall> {
+        scan_provider_installs(&self.home, &self.projects, issues)
+    }
+
+    /// `SkillSummary.id`로 설치본 하나를 찾는다. 훑다 나온 수집 문제는 이 조회의
+    /// 관심사가 아니므로 버린다 — 찾지 못한 것만 오류다.
+    fn install_by_id(&self, id: &str) -> Result<ProviderInstall, CoreError> {
+        let mut issues = Vec::new();
+        self.provider_installs(&mut issues)
+            .into_iter()
+            .find(|install| install.skill_id == id)
+            .ok_or_else(|| CoreError::NotFound("스킬 설치본을 찾지 못했습니다".to_owned()))
+    }
+
+    fn install_root(
+        &self,
+        provider: ProviderId,
+        location: &SkillLocation,
+    ) -> Result<Option<PathBuf>, CoreError> {
+        resolve_install_root(&self.home, &self.projects, provider, location)
+    }
 }
 
 /// 공용 보관 루트에 원본이 있는 스킬 키. 설치본이 보관 관리 대상인지 가르는 데 쓴다.
@@ -623,6 +743,26 @@ pub(crate) fn skill_directories(parent: &Path) -> Vec<PathBuf> {
     directories
 }
 
+/// 공통 원본 루트에 실제로 들어 있는 스킬을 (키, 디렉터리) 짝으로 정렬해 내놓는다.
+/// 라이브러리 적재·요약 지문·번역 원본 수집 세 곳이 같은 네 걸음(루트 존재 확인 →
+/// 하위 디렉터리 나열 → 점으로 시작하는 숨김 건너뛰기 → SKILL.md 있는 것만)을 따로
+/// 적고 있었다. 한 곳이 걸음을 빠뜨리면 목록마다 다른 스킬이 보이므로 여기 모은다.
+fn common_source_dirs(root: &Path) -> Vec<(String, PathBuf)> {
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    skill_directories(root)
+        .into_iter()
+        .filter_map(|directory| {
+            let key = directory.file_name()?.to_string_lossy().into_owned();
+            if key.starts_with('.') || !directory.join("SKILL.md").is_file() {
+                return None;
+            }
+            Some((key, directory))
+        })
+        .collect()
+}
+
 fn read_common_source(
     directory: &Path,
     key: &str,
@@ -644,6 +784,7 @@ fn read_common_source(
             content_digest: content.digest.clone(),
             file_count: content.file_count,
             total_bytes: content.total_bytes,
+            modified_at_ms: content.modified_at_ms,
         },
         content,
     ))
@@ -662,8 +803,31 @@ struct ProviderInstall {
     path: PathBuf,
     directory: PathBuf,
     digest: Option<String>,
+    /// 설치본 내용을 마지막으로 고친 시각(밀리초). 원본과 갈라졌을 때 방향을 가린다.
+    modified_at_ms: Option<i64>,
     /// 정규화한 디렉터리. 공통 원본과 같은 실체를 보는지 판정할 때 쓴다.
     canonical: Option<PathBuf>,
+}
+
+impl ProviderInstall {
+    /// 설치본 디렉터리 이름. 이것이 곧 스킬 키이므로 공통 원본과 짝을 맞출 때 쓴다.
+    /// 이름을 읽지 못하는 경로(루트·`..`)는 스킬 설치본일 수 없어 `None`이다.
+    fn dir_name(&self) -> Option<String> {
+        self.directory
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    /// 사용자가 관리할 수 있는 설치본인지. 에이전트·플러그인이 소유한 읽기 전용
+    /// 스킬은 가져오기·게시·삭제 대상이 아니다.
+    fn is_user_owned(&self) -> bool {
+        is_user_owned_scope(self.scope)
+    }
+}
+
+/// 사용자 소유 범위 판정. 이 경계가 한 군데에서만 바뀌도록 모아 둔다.
+fn is_user_owned_scope(scope: &str) -> bool {
+    matches!(scope, "personal" | "project")
 }
 
 /// 스코프 우선순위. 한 공급자에 같은 키가 여러 루트에 있으면 사용자가 관리할 수
@@ -704,15 +868,19 @@ fn scan_provider_installs(
                 if !path.is_file() {
                     continue;
                 }
-                let (digest, canonical) = match read_skill_content(&directory) {
-                    Ok(content) => (Some(content.digest), fs::canonicalize(&directory).ok()),
+                let (digest, modified_at_ms, canonical) = match read_skill_content(&directory) {
+                    Ok(content) => (
+                        Some(content.digest),
+                        content.modified_at_ms,
+                        fs::canonicalize(&directory).ok(),
+                    ),
                     Err(error) => {
                         issues.push(SkillLibraryIssue {
                             provider: Some(adapter.provider),
                             path: directory.to_string_lossy().into_owned(),
                             message: format!("스킬 내용을 읽지 못했습니다: {error}"),
                         });
-                        (None, fs::canonicalize(&directory).ok())
+                        (None, None, fs::canonicalize(&directory).ok())
                     }
                 };
                 installs.push(ProviderInstall {
@@ -725,6 +893,7 @@ fn scan_provider_installs(
                     path,
                     directory,
                     digest,
+                    modified_at_ms,
                     canonical,
                 });
             }
@@ -767,41 +936,23 @@ fn load_skill_library_from_paths(
     let mut issues = Vec::new();
 
     let mut sources: BTreeMap<String, (CommonSkillSource, SkillContent)> = BTreeMap::new();
-    if root.is_dir() {
-        for directory in skill_directories(root) {
-            let Some(key) = directory
-                .file_name()
-                .map(|value| value.to_string_lossy().into_owned())
-            else {
-                continue;
-            };
-            if key.starts_with('.') {
-                continue;
+    for (key, directory) in common_source_dirs(root) {
+        match read_common_source(&directory, &key) {
+            Ok(value) => {
+                sources.insert(key, value);
             }
-            if !directory.join("SKILL.md").is_file() {
-                continue;
-            }
-            match read_common_source(&directory, &key) {
-                Ok(value) => {
-                    sources.insert(key, value);
-                }
-                Err(error) => issues.push(SkillLibraryIssue {
-                    provider: None,
-                    path: directory.to_string_lossy().into_owned(),
-                    message: format!("공통 스킬 원본을 읽지 못했습니다: {error}"),
-                }),
-            }
+            Err(error) => issues.push(SkillLibraryIssue {
+                provider: None,
+                path: directory.to_string_lossy().into_owned(),
+                message: format!("공통 스킬 원본을 읽지 못했습니다: {error}"),
+            }),
         }
     }
 
     let installs = scan_provider_installs(home, registered_projects, &mut issues);
     let mut by_key: HashMap<String, Vec<ProviderInstall>> = HashMap::new();
     for install in installs {
-        let key = install
-            .directory
-            .file_name()
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let key = install.dir_name().unwrap_or_default();
         by_key.entry(key).or_default().push(install);
     }
 
@@ -900,14 +1051,15 @@ fn directory_created_ms(path: &Path) -> Option<i64> {
         .map(|duration| duration.as_millis() as i64)
 }
 
-/// 설치본이 공통 원본을 그대로 보는지(`linked`)와 내용이 갈라졌는지(`divergent`)를 함께
-/// 판정한다. 링크·동일 경로로 같은 실체를 보고 있으면 갈라짐은 성립하지 않으므로 두 값을
-/// 따로 계산하면 안 된다.
+/// 설치본이 공통 원본을 그대로 보는지(`linked`), 내용이 갈라졌는지(`divergent`), 갈라졌다면
+/// 어느 방향인지(`divergence`)를 함께 판정한다. 링크·동일 경로로 같은 실체를 보고 있으면
+/// 갈라짐은 성립하지 않고, 갈라지지 않았으면 방향도 없다 — 따로 계산하면 세 값이 어긋난다.
 fn install_link_state(
     common_canonical: Option<&Path>,
+    common_modified_ms: Option<i64>,
     install: &ProviderInstall,
     projected_digest: &dyn Fn(ProviderId) -> Option<String>,
-) -> (bool, bool) {
+) -> (bool, bool, Option<SkillDivergence>) {
     let linked = match (common_canonical, install.canonical.as_deref()) {
         (Some(left), Some(right)) => left == right,
         _ => false,
@@ -920,7 +1072,15 @@ fn install_link_state(
             (Some(left), Some(right)) => left != right,
             _ => false,
         };
-    (linked, divergent)
+    let divergence = divergent.then_some(match (install.modified_at_ms, common_modified_ms) {
+        // 같은 시각이면 뒤처진 쪽으로 읽는다. 배포는 원본 시각을 넘겨받지 않으므로
+        // 동시각은 "게시 직후 원본만 다시 저장됐다"는 뜻이고, 사용자가 손으로 고친
+        // 사본이라면 그 편집이 원본보다 뒤에 온다.
+        (Some(install_ms), Some(common_ms)) if install_ms > common_ms => SkillDivergence::Edited,
+        (Some(_), Some(_)) => SkillDivergence::Behind,
+        _ => SkillDivergence::Unknown,
+    });
+    (linked, divergent, divergence)
 }
 
 /// 한 공급자의 설치 현황을 화면용 상태 하나로 접는다. 같은 키가 여러 루트에 있으면
@@ -931,6 +1091,7 @@ fn build_provider_state(
     key: &str,
     installs: &[ProviderInstall],
     common_canonical: Option<&Path>,
+    common_modified_ms: Option<i64>,
     projected_digest: &dyn Fn(ProviderId) -> Option<String>,
 ) -> SkillProviderState {
     let mut candidates: Vec<&ProviderInstall> = installs
@@ -949,7 +1110,12 @@ fn build_provider_state(
     let install_views: Vec<SkillInstallView> = candidates
         .iter()
         .map(|install| {
-            let (_, divergent) = install_link_state(common_canonical, install, projected_digest);
+            let (_, divergent, divergence) = install_link_state(
+                common_canonical,
+                common_modified_ms,
+                install,
+                projected_digest,
+            );
             SkillInstallView {
                 scope: install.scope.to_owned(),
                 project_path: install
@@ -961,6 +1127,8 @@ fn build_provider_state(
                 directory: install.directory.to_string_lossy().into_owned(),
                 content_digest: install.digest.clone(),
                 divergent,
+                divergence,
+                modified_at_ms: install.modified_at_ms,
                 read_only: install.read_only,
             }
         })
@@ -985,6 +1153,8 @@ fn build_provider_state(
             read_only: !supported,
             content_digest: None,
             divergent: false,
+            divergence: None,
+            modified_at_ms: None,
             note: adapter.unsupported_note.map(str::to_owned).or_else(|| {
                 (adapter.provider == ProviderId::Antigravity).then(|| {
                     "등록 프로젝트의 .agents/skills에 위치 지정 게시할 수 있습니다".to_owned()
@@ -994,7 +1164,12 @@ fn build_provider_state(
         };
     };
 
-    let (linked, divergent) = install_link_state(common_canonical, install, projected_digest);
+    let (linked, divergent, divergence) = install_link_state(
+        common_canonical,
+        common_modified_ms,
+        install,
+        projected_digest,
+    );
     SkillProviderState {
         provider: adapter.provider,
         status: if linked {
@@ -1013,6 +1188,8 @@ fn build_provider_state(
         read_only: install.read_only,
         content_digest: install.digest.clone(),
         divergent,
+        divergence,
+        modified_at_ms: install.modified_at_ms,
         note: extra_note,
         installs: install_views,
     }
@@ -1089,6 +1266,7 @@ fn build_entry(
             key,
             installs,
             common_canonical.as_deref(),
+            source.and_then(|(value, _)| value.modified_at_ms),
             &projected_digest,
         ));
     }
@@ -1097,10 +1275,7 @@ fn build_entry(
 
     // 공통 원본이 있거나, 공통 원본으로 가져올 수 있는 쓰기 가능한 설치본이 있으면
     // Agent Manager가 관리할 수 있다. 읽기 전용 루트에만 있는 스킬은 정보용이다.
-    let managed = source.is_some()
-        || installs
-            .iter()
-            .any(|install| matches!(install.scope, "personal" | "project"));
+    let managed = source.is_some() || installs.iter().any(ProviderInstall::is_user_owned);
 
     let linked_count = providers
         .iter()
@@ -1171,13 +1346,7 @@ fn load_common_skill_detail_from_root(
     root: &Path,
     key: &str,
 ) -> Result<CommonSkillDetail, CoreError> {
-    let directory = root.join(key);
-    assert_within_root(root, &directory)?;
-    if !directory.join("SKILL.md").is_file() {
-        return Err(CoreError::NotFound(format!(
-            "공통 스킬 원본을 찾지 못했습니다: {key}"
-        )));
-    }
+    let directory = existing_common_skill_dir(root, key, MISSING_COMMON_SOURCE)?;
     let (source, _) = read_common_source(&directory, key)?;
     let body = read_text_limited(Path::new(&source.path), MAX_SKILL_MD_BYTES)?;
     let mut files = build_file_tree(&directory, MAX_SKILL_FILES)?;
@@ -1204,16 +1373,9 @@ pub(crate) fn common_skill_digests_from_home(home: &Path) -> Vec<CommonSkillDige
 }
 
 fn common_skill_digests_from_root(root: &Path) -> Vec<CommonSkillDigest> {
-    if !root.is_dir() {
-        return Vec::new();
-    }
-    skill_directories(root)
+    common_source_dirs(root)
         .into_iter()
-        .filter_map(|directory| {
-            let key = directory.file_name()?.to_string_lossy().into_owned();
-            if key.starts_with('.') || !directory.join("SKILL.md").is_file() {
-                return None;
-            }
+        .filter_map(|(key, directory)| {
             let (source, _) = read_common_source(&directory, &key).ok()?;
             Some(CommonSkillDigest {
                 key,
@@ -1249,23 +1411,8 @@ pub(crate) fn list_repository_translation_sources(
 
 fn list_common_translation_sources_from_root(root: &Path) -> Vec<CommonSkillTranslationSource> {
     let mut sources = Vec::new();
-    if !root.is_dir() {
-        return sources;
-    }
-    for directory in skill_directories(root) {
-        let Some(key) = directory
-            .file_name()
-            .map(|value| value.to_string_lossy().into_owned())
-        else {
-            continue;
-        };
-        if key.starts_with('.') {
-            continue;
-        }
+    for (key, directory) in common_source_dirs(root) {
         let path = directory.join("SKILL.md");
-        if !path.is_file() {
-            continue;
-        }
         let Ok(text) = read_text_limited(&path, MAX_SKILL_MD_BYTES) else {
             continue;
         };
@@ -1293,46 +1440,10 @@ pub enum SkillIssueSeverity {
     Warning,
 }
 
-impl SkillIssueSeverity {
-    pub const ALL: [Self; 2] = [Self::Blocking, Self::Warning];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Blocking => "blocking",
-            Self::Warning => "warning",
-        }
-    }
-
-    /// 차단 수준인지 여부.
-    pub fn is_blocking(self) -> bool {
-        matches!(self, Self::Blocking)
-    }
-
-    /// 경고 수준인지 여부.
-    pub fn is_warning(self) -> bool {
-        matches!(self, Self::Warning)
-    }
-}
-
-impl std::fmt::Display for SkillIssueSeverity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SkillIssueSeverity {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "blocking" => Ok(Self::Blocking),
-            "warning" => Ok(Self::Warning),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 스킬 호환성 문제 심각도입니다: {s}. blocking|warning 중 하나를 쓰세요"
-            ))),
-        }
-    }
-}
+session_string_enum!(SkillIssueSeverity, "알 수 없는 스킬 호환성 문제 심각도입니다", {
+    Blocking => "blocking",
+    Warning => "warning",
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1342,6 +1453,51 @@ pub struct SkillCompatibilityIssue {
     pub provider: Option<ProviderId>,
     pub code: String,
     pub message: String,
+}
+
+/// 문제 한 줄을 짓는 네 창구. 열네 자리가 같은 구조체 리터럴을 펼치면서 심각도와
+/// `provider`를 각자 적고 있었고, 공통 원본 문제에 공급자를 실어 보내는 어긋남은
+/// 컴파일러가 막아 주지 않는다. 심각도·귀속을 생성자 이름으로 고정한다.
+impl SkillCompatibilityIssue {
+    /// 공통 원본 자체의 문제. 어느 공급자로도 게시할 수 없다.
+    fn blocking(code: &str, message: String) -> Self {
+        Self {
+            severity: SkillIssueSeverity::Blocking,
+            provider: None,
+            code: code.to_owned(),
+            message,
+        }
+    }
+
+    /// 게시는 되지만 사용자가 알아야 할 공통 원본 사정.
+    fn warning(code: &str, message: String) -> Self {
+        Self {
+            severity: SkillIssueSeverity::Warning,
+            provider: None,
+            code: code.to_owned(),
+            message,
+        }
+    }
+
+    /// 공급자 한 곳의 게시만 막는 문제.
+    fn provider_blocking(provider: ProviderId, code: &str, message: String) -> Self {
+        Self {
+            severity: SkillIssueSeverity::Blocking,
+            provider: Some(provider),
+            code: code.to_owned(),
+            message,
+        }
+    }
+
+    /// 공급자 한 곳에만 걸리는 경고.
+    fn provider_warning(provider: ProviderId, code: &str, message: String) -> Self {
+        Self {
+            severity: SkillIssueSeverity::Warning,
+            provider: Some(provider),
+            code: code.to_owned(),
+            message,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1375,107 +1531,102 @@ impl SkillCompatibilityReport {
     }
 }
 
+/// 공통 원본이 스스로 안고 있는 문제를 모은다. 검사는 성격이 다른 네 갈래(OS 변형,
+/// 크기·링크, 프런트매터, 파일 이름 이식성)인데 한 함수가 100줄 넘게 이어 붙여
+/// 들고 있어 한 갈래만 보려 해도 전체를 읽어야 했다. 순서는 그대로 둔다 — 화면이
+/// `issues`를 받은 차례대로 보여 준다.
 fn check_source_content(
     key: &str,
     source: &CommonSkillSource,
     content: &SkillContent,
     issues: &mut Vec<SkillCompatibilityIssue>,
 ) {
+    check_source_platform(source, issues);
+    check_source_payload(content, issues);
+    check_source_front_matter(key, source, issues);
+    check_source_file_names(content, issues);
+}
+
+/// 플랫폼 메타데이터를 읽고, 현재 OS용 변형이 있는지 본다.
+fn check_source_platform(source: &CommonSkillSource, issues: &mut Vec<SkillCompatibilityIssue>) {
     let manifest = match checked_resource_manifest(Path::new(&source.directory)) {
         Ok(manifest) => manifest,
         Err(error) => {
-            issues.push(SkillCompatibilityIssue {
-                severity: SkillIssueSeverity::Blocking,
-                provider: None,
-                code: "platform-metadata".to_owned(),
-                message: error.to_string(),
-            });
+            issues.push(SkillCompatibilityIssue::blocking(
+                "platform-metadata",
+                error.to_string(),
+            ));
             ResourcePlatformManifest::default()
         }
     };
     let platform = HostPlatform::current();
     if manifest.migration_required(platform) {
-        issues.push(SkillCompatibilityIssue {
-            severity: SkillIssueSeverity::Blocking,
-            provider: None,
-            code: "platform-unsupported".to_owned(),
-            message: format!(
+        issues.push(SkillCompatibilityIssue::blocking(
+            "platform-unsupported",
+            format!(
                 "현재 OS({platform})용 스킬이 없습니다. AIA 마이그레이션으로 OS 변형을 먼저 만드세요"
             ),
-        });
+        ));
     }
-    if content.truncated {
-        issues.push(SkillCompatibilityIssue {
-            severity: SkillIssueSeverity::Blocking,
-            provider: None,
-            code: "file-count".to_owned(),
-            message: format!("스킬 구성 파일이 {MAX_SKILL_FILES}개를 넘습니다"),
-        });
-    }
-    if content.total_bytes > MAX_SKILL_TOTAL_BYTES {
-        issues.push(SkillCompatibilityIssue {
-            severity: SkillIssueSeverity::Blocking,
-            provider: None,
-            code: "total-bytes".to_owned(),
-            message: format!(
-                "스킬 전체 크기가 허용 한도({}MB)를 넘습니다",
-                MAX_SKILL_TOTAL_BYTES / (1024 * 1024)
-            ),
-        });
+}
+
+/// 실체가 게시할 수 있는 모양인지 본다 — 크기 한도와 심볼릭 링크.
+fn check_source_payload(content: &SkillContent, issues: &mut Vec<SkillCompatibilityIssue>) {
+    for (code, message) in content.size_limit_violations() {
+        issues.push(SkillCompatibilityIssue::blocking(code, message));
     }
     for link in &content.symlinks {
-        issues.push(SkillCompatibilityIssue {
-            severity: SkillIssueSeverity::Blocking,
-            provider: None,
-            code: "symlink".to_owned(),
-            message: format!(
-                "심볼릭 링크는 안전하게 게시할 수 없습니다. 실제 파일로 바꾸세요: {link}"
-            ),
-        });
+        issues.push(SkillCompatibilityIssue::blocking(
+            "symlink",
+            format!("심볼릭 링크는 안전하게 게시할 수 없습니다. 실제 파일로 바꾸세요: {link}"),
+        ));
     }
+}
+
+/// 공급자가 스킬을 찾고 이름 붙이는 데 쓰는 프런트매터를 본다.
+fn check_source_front_matter(
+    key: &str,
+    source: &CommonSkillSource,
+    issues: &mut Vec<SkillCompatibilityIssue>,
+) {
     if source.description.trim().is_empty() {
-        issues.push(SkillCompatibilityIssue {
-            severity: SkillIssueSeverity::Blocking,
-            provider: None,
-            code: "description-empty".to_owned(),
-            message: "description이 비어 있어 공급자가 스킬을 발견하지 못합니다".to_owned(),
-        });
+        issues.push(SkillCompatibilityIssue::blocking(
+            "description-empty",
+            "description이 비어 있어 공급자가 스킬을 발견하지 못합니다".to_owned(),
+        ));
     } else if source.description.chars().count() > MAX_DESCRIPTION_CHARS {
-        issues.push(SkillCompatibilityIssue {
-            severity: SkillIssueSeverity::Warning,
-            provider: None,
-            code: "description-long".to_owned(),
-            message: format!(
+        issues.push(SkillCompatibilityIssue::warning(
+            "description-long",
+            format!(
                 "description이 {MAX_DESCRIPTION_CHARS}자를 넘어 일부 공급자에서 잘릴 수 있습니다"
             ),
-        });
+        ));
     }
     if source.name != key {
-        issues.push(SkillCompatibilityIssue {
-            severity: SkillIssueSeverity::Warning,
-            provider: None,
-            code: "name-mismatch".to_owned(),
-            message: format!(
+        issues.push(SkillCompatibilityIssue::warning(
+            "name-mismatch",
+            format!(
                 "프런트매터 name('{}')과 디렉터리 이름('{key}')이 달라 공급자에 따라 다르게 노출될 수 있습니다",
                 source.name
             ),
-        });
+        ));
     }
+}
 
+/// 다른 OS의 파일시스템으로 옮겼을 때 깨질 파일 이름을 본다.
+fn check_source_file_names(content: &SkillContent, issues: &mut Vec<SkillCompatibilityIssue>) {
     // 대소문자만 다른 파일 이름은 대소문자를 구분하지 않는 파일시스템에서 충돌한다.
     let mut lowered: BTreeMap<String, String> = BTreeMap::new();
     for file in &content.files {
         let text = file.relative.to_string_lossy().into_owned();
         if let Some(previous) = lowered.insert(text.to_lowercase(), text.clone()) {
             if previous != text {
-                issues.push(SkillCompatibilityIssue {
-                    severity: SkillIssueSeverity::Warning,
-                    provider: None,
-                    code: "case-collision".to_owned(),
-                    message: format!(
+                issues.push(SkillCompatibilityIssue::warning(
+                    "case-collision",
+                    format!(
                         "대소문자만 다른 파일이 있어 Windows·macOS에서 충돌합니다: {previous}, {text}"
                     ),
-                });
+                ));
             }
         }
         for component in file.relative.components() {
@@ -1485,12 +1636,10 @@ fn check_source_content(
                 || name.ends_with(' ')
                 || name.contains(['<', '>', ':', '"', '|', '?', '*'])
             {
-                issues.push(SkillCompatibilityIssue {
-                    severity: SkillIssueSeverity::Warning,
-                    provider: None,
-                    code: "windows-name".to_owned(),
-                    message: format!("Windows에서 쓸 수 없는 파일 이름입니다: {name}"),
-                });
+                issues.push(SkillCompatibilityIssue::warning(
+                    "windows-name",
+                    format!("Windows에서 쓸 수 없는 파일 이름입니다: {name}"),
+                ));
             }
         }
     }
@@ -1518,21 +1667,136 @@ pub(crate) fn check_skill_publish_from_home(
     check_skill_publish_from_paths(&roots, key, providers, location)
 }
 
+/// 대상 자리에 이미 링크가 있을 때의 판정. 반환값은 그 링크가 공통 원본을 가리켜
+/// 게시해도 내용이 달라지지 않는지 여부다.
+fn check_existing_symlink(
+    provider: ProviderId,
+    target: &Path,
+    source_directory: &Path,
+    issues: &mut Vec<SkillCompatibilityIssue>,
+) -> bool {
+    // 다른 도구가 만든 링크를 실제 사본으로 바꾸는 것은 그 도구의 관리
+    // 대상을 빼앗는 일이다. 사용자가 알고 결정해야 한다.
+    let resolves_to_common = fs::canonicalize(target)
+        .ok()
+        .zip(fs::canonicalize(source_directory).ok())
+        .is_some_and(|(left, right)| left == right);
+    issues.push(SkillCompatibilityIssue::provider_warning(
+        provider,
+        "existing-symlink",
+        if resolves_to_common {
+            "이미 공통 원본을 가리키는 링크가 있습니다. 게시하면 독립 사본으로 바뀝니다".to_owned()
+        } else {
+            "다른 위치를 가리키는 링크가 있습니다. 게시하면 링크가 사본으로 바뀝니다".to_owned()
+        },
+    ));
+    resolves_to_common
+}
+
+/// 대상 자리에 이미 설치본 디렉터리가 있을 때의 판정. 반환값은 투영 결과가 기존
+/// 설치본과 같은지 여부다. 기존 설치본을 읽지 못하면 경고만 남기고 최신으로 보지
+/// 않는다 — 읽지 못한 것을 같다고 단정할 수는 없다.
+fn check_existing_directory(
+    adapter: &SkillAdapter,
+    provider: ProviderId,
+    target: &Path,
+    source_directory: &Path,
+    content: &SkillContent,
+    issues: &mut Vec<SkillCompatibilityIssue>,
+) -> bool {
+    match read_skill_content(target) {
+        Ok(existing) => {
+            projected_skill_digest(adapter, source_directory, content, HostPlatform::current())
+                .is_ok_and(|digest| existing.digest == digest)
+        }
+        Err(error) => {
+            issues.push(SkillCompatibilityIssue::provider_warning(
+                provider,
+                "existing-unreadable",
+                format!("기존 설치본을 읽지 못했습니다: {error}"),
+            ));
+            false
+        }
+    }
+}
+
+/// 공급자 하나의 게시 대상을 살펴 호환성 보고 한 줄을 만든다. 사용자가 알아야 할
+/// 사정은 `issues`에 덧붙인다. `install_root`가 `None`이면 게시를 지원하지 않는
+/// 공급자다.
+fn check_provider_publish_target(
+    adapter: &SkillAdapter,
+    provider: ProviderId,
+    install_root: Option<PathBuf>,
+    source_directory: &Path,
+    key: &str,
+    content: &SkillContent,
+    issues: &mut Vec<SkillCompatibilityIssue>,
+) -> SkillProviderCompatibility {
+    let Some(install_root) = install_root else {
+        // 게시할 수 없는 공급자는 그 공급자만 건너뛴다. 차단으로 올리면 함께
+        // 고른 다른 공급자까지 게시되지 않아, 고칠 수 없는 이유로 전체가 막힌다.
+        issues.push(SkillCompatibilityIssue::provider_warning(
+            provider,
+            "unsupported",
+            adapter
+                .unsupported_note
+                .unwrap_or("이 공급자는 사용자 스킬 루트를 제공하지 않습니다")
+                .to_owned(),
+        ));
+        return SkillProviderCompatibility {
+            provider,
+            publishable: false,
+            requires_overwrite: false,
+            already_current: false,
+            target_directory: None,
+        };
+    };
+    let target = install_root.join(key);
+    let mut publishable = true;
+    let mut requires_overwrite = false;
+    let mut already_current = false;
+
+    if let Ok(metadata) = fs::symlink_metadata(&target) {
+        requires_overwrite = true;
+        if metadata.file_type().is_symlink() {
+            already_current = check_existing_symlink(provider, &target, source_directory, issues);
+        } else if metadata.is_dir() {
+            already_current = check_existing_directory(
+                adapter,
+                provider,
+                &target,
+                source_directory,
+                content,
+                issues,
+            );
+        } else {
+            publishable = false;
+            issues.push(SkillCompatibilityIssue::provider_blocking(
+                provider,
+                "target-not-directory",
+                "대상 경로에 디렉터리가 아닌 파일이 있습니다".to_owned(),
+            ));
+        }
+    }
+
+    SkillProviderCompatibility {
+        provider,
+        publishable,
+        requires_overwrite,
+        already_current,
+        target_directory: Some(target.to_string_lossy().into_owned()),
+    }
+}
+
 fn check_skill_publish_from_paths(
     roots: &SkillRoots,
     key: &str,
     providers: &[ProviderId],
     location: &SkillLocation,
 ) -> Result<SkillCompatibilityReport, CoreError> {
-    let (home, root, projects) = (roots.home(), roots.root(), roots.projects());
+    let root = roots.root();
     let key = validate_skill_key(key)?;
-    let directory = root.join(&key);
-    assert_within_root(root, &directory)?;
-    if !directory.join("SKILL.md").is_file() {
-        return Err(CoreError::NotFound(format!(
-            "공통 스킬 원본을 찾지 못했습니다: {key}"
-        )));
-    }
+    let directory = existing_common_skill_dir(root, &key, MISSING_COMMON_SOURCE)?;
     let (source, content) = read_common_source(&directory, &key)?;
 
     let mut issues = Vec::new();
@@ -1540,104 +1804,23 @@ fn check_skill_publish_from_paths(
 
     let requested: BTreeSet<ProviderId> = providers.iter().copied().collect();
     if requested.is_empty() {
-        issues.push(SkillCompatibilityIssue {
-            severity: SkillIssueSeverity::Blocking,
-            provider: None,
-            code: "no-provider".to_owned(),
-            message: "게시할 공급자를 하나 이상 선택하세요".to_owned(),
-        });
+        issues.push(SkillCompatibilityIssue::blocking(
+            "no-provider",
+            "게시할 공급자를 하나 이상 선택하세요".to_owned(),
+        ));
     }
 
     let mut provider_reports = Vec::new();
     for provider in requested {
-        let adapter = adapter(provider);
-        let Some(install_root) = resolve_install_root(home, projects, provider, location)? else {
-            // 게시할 수 없는 공급자는 그 공급자만 건너뛴다. 차단으로 올리면 함께
-            // 고른 다른 공급자까지 게시되지 않아, 고칠 수 없는 이유로 전체가 막힌다.
-            issues.push(SkillCompatibilityIssue {
-                severity: SkillIssueSeverity::Warning,
-                provider: Some(provider),
-                code: "unsupported".to_owned(),
-                message: adapter
-                    .unsupported_note
-                    .unwrap_or("이 공급자는 사용자 스킬 루트를 제공하지 않습니다")
-                    .to_owned(),
-            });
-            provider_reports.push(SkillProviderCompatibility {
-                provider,
-                publishable: false,
-                requires_overwrite: false,
-                already_current: false,
-                target_directory: None,
-            });
-            continue;
-        };
-        let target = install_root.join(&key);
-        let mut publishable = true;
-        let mut requires_overwrite = false;
-        let mut already_current = false;
-
-        let link_metadata = fs::symlink_metadata(&target);
-        if let Ok(metadata) = link_metadata {
-            requires_overwrite = true;
-            if metadata.file_type().is_symlink() {
-                // 다른 도구가 만든 링크를 실제 사본으로 바꾸는 것은 그 도구의 관리
-                // 대상을 빼앗는 일이다. 사용자가 알고 결정해야 한다.
-                let resolves_to_common = fs::canonicalize(&target)
-                    .ok()
-                    .zip(fs::canonicalize(&directory).ok())
-                    .is_some_and(|(left, right)| left == right);
-                issues.push(SkillCompatibilityIssue {
-                    severity: SkillIssueSeverity::Warning,
-                    provider: Some(provider),
-                    code: "existing-symlink".to_owned(),
-                    message: if resolves_to_common {
-                        "이미 공통 원본을 가리키는 링크가 있습니다. 게시하면 독립 사본으로 바뀝니다"
-                            .to_owned()
-                    } else {
-                        "다른 위치를 가리키는 링크가 있습니다. 게시하면 링크가 사본으로 바뀝니다"
-                            .to_owned()
-                    },
-                });
-                if resolves_to_common {
-                    already_current = true;
-                }
-            } else if metadata.is_dir() {
-                match read_skill_content(&target) {
-                    Ok(existing) => {
-                        already_current = projected_skill_digest(
-                            adapter,
-                            &directory,
-                            &content,
-                            HostPlatform::current(),
-                        )
-                        .is_ok_and(|digest| existing.digest == digest)
-                    }
-                    Err(error) => issues.push(SkillCompatibilityIssue {
-                        severity: SkillIssueSeverity::Warning,
-                        provider: Some(provider),
-                        code: "existing-unreadable".to_owned(),
-                        message: format!("기존 설치본을 읽지 못했습니다: {error}"),
-                    }),
-                }
-            } else {
-                publishable = false;
-                issues.push(SkillCompatibilityIssue {
-                    severity: SkillIssueSeverity::Blocking,
-                    provider: Some(provider),
-                    code: "target-not-directory".to_owned(),
-                    message: "대상 경로에 디렉터리가 아닌 파일이 있습니다".to_owned(),
-                });
-            }
-        }
-
-        provider_reports.push(SkillProviderCompatibility {
+        provider_reports.push(check_provider_publish_target(
+            adapter(provider),
             provider,
-            publishable,
-            requires_overwrite,
-            already_current,
-            target_directory: Some(target.to_string_lossy().into_owned()),
-        });
+            roots.install_root(provider, location)?,
+            &directory,
+            &key,
+            &content,
+            &mut issues,
+        ));
     }
 
     Ok(SkillCompatibilityReport {
@@ -1706,46 +1889,10 @@ pub enum SkillOverwritePolicy {
     Replace,
 }
 
-impl SkillOverwritePolicy {
-    pub const ALL: [Self; 2] = [Self::Fail, Self::Replace];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Fail => "fail",
-            Self::Replace => "replace",
-        }
-    }
-
-    /// 실패 정책인지 여부.
-    pub fn is_fail(self) -> bool {
-        matches!(self, Self::Fail)
-    }
-
-    /// 교체 정책인지 여부.
-    pub fn is_replace(self) -> bool {
-        matches!(self, Self::Replace)
-    }
-}
-
-impl std::fmt::Display for SkillOverwritePolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SkillOverwritePolicy {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "fail" => Ok(Self::Fail),
-            "replace" => Ok(Self::Replace),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 스킬 덮어쓰기 정책입니다: {s}. fail|replace 중 하나를 쓰세요"
-            ))),
-        }
-    }
-}
+session_string_enum!(SkillOverwritePolicy, "알 수 없는 스킬 덮어쓰기 정책입니다", {
+    Fail => "fail",
+    Replace => "replace",
+});
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1773,78 +1920,13 @@ pub enum SkillPublishOutcome {
     Failed,
 }
 
-impl SkillPublishOutcome {
-    pub const ALL: [Self; 5] = [
-        Self::Published,
-        Self::Replaced,
-        Self::Unchanged,
-        Self::Skipped,
-        Self::Failed,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Published => "published",
-            Self::Replaced => "replaced",
-            Self::Unchanged => "unchanged",
-            Self::Skipped => "skipped",
-            Self::Failed => "failed",
-        }
-    }
-
-    /// 신규 게시 결과인지 여부.
-    pub fn is_published(self) -> bool {
-        matches!(self, Self::Published)
-    }
-
-    /// 기존 교체 게시 결과인지 여부.
-    pub fn is_replaced(self) -> bool {
-        matches!(self, Self::Replaced)
-    }
-
-    /// 내용 불변 유지 결과인지 여부.
-    pub fn is_unchanged(self) -> bool {
-        matches!(self, Self::Unchanged)
-    }
-
-    /// 건너뜀 결과인지 여부.
-    pub fn is_skipped(self) -> bool {
-        matches!(self, Self::Skipped)
-    }
-
-    /// 실패 결과인지 여부.
-    pub fn is_failed(self) -> bool {
-        matches!(self, Self::Failed)
-    }
-
-    /// 배포가 정상적으로 완료되거나 유지된 성공 상태인지 여부.
-    pub fn is_successful(self) -> bool {
-        matches!(self, Self::Published | Self::Replaced | Self::Unchanged)
-    }
-}
-
-impl std::fmt::Display for SkillPublishOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SkillPublishOutcome {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "published" => Ok(Self::Published),
-            "replaced" => Ok(Self::Replaced),
-            "unchanged" => Ok(Self::Unchanged),
-            "skipped" => Ok(Self::Skipped),
-            "failed" => Ok(Self::Failed),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 스킬 게시 결과입니다: {s}. published|replaced|unchanged|skipped|failed 중 하나를 쓰세요"
-            ))),
-        }
-    }
-}
+session_string_enum!(SkillPublishOutcome, "알 수 없는 스킬 게시 결과입니다", {
+    Published => "published",
+    Replaced => "replaced",
+    Unchanged => "unchanged",
+    Skipped => "skipped",
+    Failed => "failed",
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1891,7 +1973,7 @@ fn publish_common_skill_from_paths(
     roots: &SkillRoots,
     request: &SkillPublishRequest,
 ) -> Result<SkillPublishReceipt, CoreError> {
-    let (home, root, projects) = (roots.home(), roots.root(), roots.projects());
+    let root = roots.root();
     let report =
         check_skill_publish_from_paths(roots, &request.key, &request.providers, &request.location)?;
     if report.blocked() {
@@ -1963,8 +2045,7 @@ fn publish_common_skill_from_paths(
         }
 
         match publish_to_provider(
-            home,
-            projects,
+            roots,
             provider,
             &key,
             &directory,
@@ -1995,18 +2076,16 @@ fn publish_common_skill_from_paths(
 }
 
 fn publish_to_provider(
-    home: &Path,
-    projects: &[PathBuf],
+    roots: &SkillRoots,
     provider: ProviderId,
     key: &str,
     source_directory: &Path,
     content: &SkillContent,
     location: &SkillLocation,
 ) -> Result<SkillPublishOutcome, CoreError> {
-    let install_root =
-        resolve_install_root(home, projects, provider, location)?.ok_or_else(|| {
-            CoreError::InvalidInput("이 공급자는 사용자 스킬 루트를 제공하지 않습니다".to_owned())
-        })?;
+    let install_root = roots.install_root(provider, location)?.ok_or_else(|| {
+        CoreError::InvalidInput("이 공급자는 사용자 스킬 루트를 제공하지 않습니다".to_owned())
+    })?;
     publish_to_root(provider, &install_root, key, source_directory, content)
 }
 
@@ -2024,32 +2103,23 @@ fn publish_to_root(
     let target = install_root.join(key);
     assert_within_root(install_root, &target)?;
 
-    let nonce = publish_nonce();
-    let stage = install_root.join(format!("{STAGE_PREFIX}{key}-{nonce}"));
-    assert_within_root(install_root, &stage)?;
+    let SkillStagePaths { stage, backup } = skill_stage_paths(install_root, key)?;
     if stage.exists() {
         return Err(CoreError::Conflict(
             "임시 게시 디렉터리가 이미 있습니다".to_owned(),
         ));
     }
 
-    // 1) 전부 스테이징에 쓴다. 실패하면 대상은 손대지 않은 상태다.
-    if let Err(error) = stage_skill_copy(adapter, source_directory, &stage, content) {
-        let _ = fs::remove_dir_all(&stage);
-        return Err(error);
-    }
-
-    // 2) 기존 설치본이 있으면 백업으로 옮긴 뒤 자리를 바꾼다. 실패하면 백업을 원래
-    //    자리로 되돌리고 스테이징을 지운다.
+    // 전부 스테이징에 쓴 뒤, 기존 설치본이 있으면 백업으로 옮기고 자리를 바꾼다.
     let existed = fs::symlink_metadata(&target).is_ok();
-    let backup = install_root.join(format!("{BACKUP_PREFIX}{key}-{nonce}"));
-    StagedReplace {
-        kind: StagedKind::Directory,
-        stage: &stage,
-        target: &target,
-        backup: existed.then_some(backup.as_path()),
-    }
-    .commit()?;
+    stage_and_replace_skill(
+        adapter,
+        source_directory,
+        content,
+        &stage,
+        &target,
+        existed.then_some(backup.as_path()),
+    )?;
     if existed {
         remove_published_backup(&backup);
         Ok(SkillPublishOutcome::Replaced)
@@ -2075,6 +2145,32 @@ fn remove_published_backup(backup: &Path) {
     }
 }
 
+/// 스테이징 복사와 원자 교체를 한 벌로 묶는다. 어느 단계에서 실패하든 스테이징
+/// 잔재를 남기지 않고 대상은 손대기 전 상태로 남는다(`StagedReplace::commit`이
+/// 스스로 백업을 되돌리고 스테이징을 버린다).
+fn stage_and_replace_skill(
+    adapter: &SkillAdapter,
+    source_directory: &Path,
+    content: &SkillContent,
+    stage: &Path,
+    target: &Path,
+    backup: Option<&Path>,
+) -> Result<(), CoreError> {
+    let staged = stage_skill_copy(adapter, source_directory, stage, content).and_then(|()| {
+        StagedReplace {
+            kind: StagedKind::Directory,
+            stage,
+            target,
+            backup,
+        }
+        .commit()
+    });
+    if staged.is_err() {
+        let _ = fs::remove_dir_all(stage);
+    }
+    staged
+}
+
 fn stage_skill_copy(
     adapter: &SkillAdapter,
     source_directory: &Path,
@@ -2088,33 +2184,8 @@ fn stage_skill_copy(
             "현재 OS({platform})용 스킬 변형이 없습니다"
         )));
     }
-    fs::create_dir_all(stage)?;
     let files = projected_skill_files(source_directory, content, &manifest, platform)?;
-    for file in files.values() {
-        validate_relative_path(&file.relative)?;
-        let destination = stage.join(&file.relative);
-        assert_within_root(stage, &destination)?;
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let source_path = file.source.clone();
-        // 링크는 지문 계산에서 이미 제외했고 호환성 검사가 막는다. 그래도 복사
-        // 직전에 다시 확인해 경합으로 바뀐 경우를 잡는다.
-        if fs::symlink_metadata(&source_path)?.file_type().is_symlink() {
-            return Err(CoreError::Conflict(format!(
-                "복사 중 심볼릭 링크가 나타났습니다: {}",
-                file.relative.display()
-            )));
-        }
-        if file.relative == Path::new("SKILL.md") {
-            let text = read_text_limited(&source_path, MAX_SKILL_MD_BYTES)?;
-            fs::write(&destination, adapter.project_skill_md(&text))?;
-        } else {
-            fs::copy(&source_path, &destination)?;
-        }
-        preserve_executable_bit(&destination, file.executable)?;
-    }
-    Ok(())
+    stage_files(stage, files.values(), Some(adapter))
 }
 
 /// 공통 원본 자체를 편집 스테이지로 복제한다. 공급자 게시용 projection과 달리
@@ -2124,25 +2195,60 @@ fn stage_raw_skill_copy(
     stage: &Path,
     content: &SkillContent,
 ) -> Result<(), CoreError> {
+    let files = content
+        .files
+        .iter()
+        .map(|file| ProjectedSkillFile {
+            relative: file.relative.clone(),
+            source: source_directory.join(&file.relative),
+            executable: file.executable,
+        })
+        .collect::<Vec<_>>();
+    stage_files(stage, files.iter(), None)
+}
+
+/// 스테이지에 파일을 까는 절차는 게시용 projection과 원본 복제가 글자까지 같았다.
+/// 갈리는 곳은 `SKILL.md`를 공급자 형식으로 옮겨 적는지 하나뿐이라 `adapter`가
+/// 있을 때만 그 갈래로 간다.
+fn stage_files<'a>(
+    stage: &Path,
+    files: impl Iterator<Item = &'a ProjectedSkillFile>,
+    adapter: Option<&SkillAdapter>,
+) -> Result<(), CoreError> {
     fs::create_dir_all(stage)?;
-    for file in &content.files {
+    for file in files {
         validate_relative_path(&file.relative)?;
         let destination = stage.join(&file.relative);
         assert_within_root(stage, &destination)?;
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        let source = source_directory.join(&file.relative);
-        if fs::symlink_metadata(&source)?.file_type().is_symlink() {
+        // 링크는 지문 계산에서 이미 제외했고 호환성 검사가 막는다. 그래도 복사
+        // 직전에 다시 확인해 경합으로 바뀐 경우를 잡는다.
+        if fs::symlink_metadata(&file.source)?.file_type().is_symlink() {
             return Err(CoreError::Conflict(format!(
                 "복사 중 심볼릭 링크가 나타났습니다: {}",
                 file.relative.display()
             )));
         }
-        fs::copy(source, &destination)?;
+        match adapter.filter(|_| is_skill_md(&file.relative)) {
+            Some(adapter) => {
+                let text = read_text_limited(&file.source, MAX_SKILL_MD_BYTES)?;
+                fs::write(&destination, adapter.project_skill_md(&text))?;
+            }
+            None => {
+                fs::copy(&file.source, &destination)?;
+            }
+        }
         preserve_executable_bit(&destination, file.executable)?;
     }
     Ok(())
+}
+
+/// 공급자 형식으로 옮겨 적을 대상은 스킬 본문 하나다. 스테이지 복사와 지문 계산이
+/// 같은 규칙을 따로 적어 두지 않도록 한 자리에 둔다.
+fn is_skill_md(relative: &Path) -> bool {
+    relative == Path::new("SKILL.md")
 }
 
 #[derive(Debug, Clone)]
@@ -2232,7 +2338,7 @@ fn projected_skill_digest(
         hasher.update(file.relative.to_string_lossy().as_bytes());
         hasher.update([0]);
         hasher.update([u8::from(file.executable)]);
-        let bytes = if file.relative == Path::new("SKILL.md") {
+        let bytes = if is_skill_md(&file.relative) {
             adapter
                 .project_skill_md(&read_text_limited(&file.source, MAX_SKILL_MD_BYTES)?)
                 .into_bytes()
@@ -2307,12 +2413,6 @@ fn preserve_executable_bit(_path: &Path, _executable: bool) -> Result<(), CoreEr
     Ok(())
 }
 
-/// 스테이징·백업 이름에 쓰는 충돌 방지 값. 같은 프로세스 안에서 동시에 두 번
-/// 게시해도 이름이 겹치지 않는다.
-fn publish_nonce() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
-}
-
 // ---------------------------------------------------------------------------
 // 공통 원본 생성·가져오기
 // ---------------------------------------------------------------------------
@@ -2366,8 +2466,7 @@ fn create_common_skill_in_root(
         .to_owned();
 
     fs::create_dir_all(root)?;
-    let directory = root.join(&key);
-    assert_within_root(root, &directory)?;
+    let directory = common_skill_dir(root, &key)?;
     if fs::symlink_metadata(&directory).is_ok() {
         return Err(CoreError::Conflict(format!(
             "'{key}' 공통 스킬이 이미 있습니다"
@@ -2433,48 +2532,21 @@ fn import_skill_to_common_from_paths(
     app_data_dir: Option<&Path>,
     request: &ImportCommonSkillRequest,
 ) -> Result<CommonSkillSource, CoreError> {
-    let (home, root, projects) = (roots.home(), roots.root(), roots.projects());
-    let mut issues = Vec::new();
-    let installs = scan_provider_installs(home, projects, &mut issues);
-    let install = installs
-        .into_iter()
-        .find(|install| install.skill_id == request.skill_id)
-        .ok_or_else(|| CoreError::NotFound("스킬 설치본을 찾지 못했습니다".to_owned()))?;
+    let root = roots.root();
+    let install = roots.install_by_id(&request.skill_id)?;
 
     // 읽기 전용 공급자 스킬은 공급자·플러그인 소유 콘텐츠다. 사용자 스킬만 통합
     // 원본으로 승격한다.
-    if !matches!(install.scope, "personal" | "project") {
+    if !install.is_user_owned() {
         return Err(CoreError::InvalidInput(
             "공급자·플러그인이 소유한 스킬은 공통 원본으로 가져올 수 없습니다".to_owned(),
         ));
     }
 
-    let key = install
-        .directory
-        .file_name()
-        .map(|value| value.to_string_lossy().into_owned())
-        .ok_or_else(|| {
-            CoreError::InvalidInput("스킬 디렉터리 이름을 읽지 못했습니다".to_owned())
-        })?;
-    let key = validate_skill_key(&key)?;
+    let key = validate_skill_key(&install_key(&install)?)?;
 
     let content = read_skill_content(&install.directory)?;
-    if content.truncated {
-        return Err(CoreError::InvalidInput(format!(
-            "스킬 구성 파일이 {MAX_SKILL_FILES}개를 넘습니다"
-        )));
-    }
-    if content.total_bytes > MAX_SKILL_TOTAL_BYTES {
-        return Err(CoreError::InvalidInput(format!(
-            "스킬 전체 크기가 허용 한도({}MB)를 넘습니다",
-            MAX_SKILL_TOTAL_BYTES / (1024 * 1024)
-        )));
-    }
-    if let Some(link) = content.symlinks.first() {
-        return Err(CoreError::InvalidInput(format!(
-            "심볼릭 링크가 있어 공통 원본으로 가져올 수 없습니다: {link}"
-        )));
-    }
+    content.ensure_writable("심볼릭 링크가 있어 공통 원본으로 가져올 수 없습니다")?;
 
     fs::create_dir_all(root)?;
     let target = root.join(&key);
@@ -2485,27 +2557,17 @@ fn import_skill_to_common_from_paths(
         )));
     }
 
-    let nonce = publish_nonce();
-    let stage = root.join(format!("{STAGE_PREFIX}{key}-{nonce}"));
-    assert_within_root(root, &stage)?;
+    let stage = skill_stage_paths(root, &key)?.stage;
     // 가져오기는 공급자 고유 키를 걷어내지 않는다. 공통 원본은 모든 키를 보존하고
     // 게시할 때 대상 공급자에 맞춰 투영한다.
-    if let Err(error) = stage_skill_copy(
+    stage_and_replace_skill(
         adapter(install.provider),
         &install.directory,
-        &stage,
         &content,
-    ) {
-        let _ = fs::remove_dir_all(&stage);
-        return Err(error);
-    }
-    StagedReplace {
-        kind: StagedKind::Directory,
-        stage: &stage,
-        target: &target,
-        backup: None,
-    }
-    .commit()?;
+        &stage,
+        &target,
+        None,
+    )?;
     let (source, _) = read_common_source(&target, &key)?;
     // 보관 출처(에이전트·범위·프로젝트)를 메타에 기록한다. 사용 체크가 출처
     // 위치를 기준으로 배포·회수하는 데 쓴다.
@@ -2637,7 +2699,7 @@ fn require_unarchive_confirm(confirm: bool) -> Result<(), CoreError> {
 /// 사용자가 지울 수 있는 위치인지. 에이전트·플러그인 소유(scope plugin/system/
 /// builtin)는 코어에서 거부한다. UI 버튼 숨김만으로는 AIA 경로가 남는다.
 fn assert_user_deletable_scope(scope: &str) -> Result<(), CoreError> {
-    if matches!(scope, "personal" | "project") {
+    if is_user_owned_scope(scope) {
         Ok(())
     } else {
         Err(CoreError::InvalidInput(
@@ -2672,22 +2734,8 @@ fn skill_display_meta(skill_md: &Path, key: &str) -> (String, String) {
 
 fn install_key(install: &ProviderInstall) -> Result<String, CoreError> {
     install
-        .directory
-        .file_name()
-        .map(|value| value.to_string_lossy().into_owned())
+        .dir_name()
         .ok_or_else(|| CoreError::InvalidInput("스킬 디렉터리 이름을 읽지 못했습니다".to_owned()))
-}
-
-fn find_install_by_id(
-    home: &Path,
-    projects: &[PathBuf],
-    id: &str,
-) -> Result<ProviderInstall, CoreError> {
-    let mut issues = Vec::new();
-    scan_provider_installs(home, projects, &mut issues)
-        .into_iter()
-        .find(|install| install.skill_id == id)
-        .ok_or_else(|| CoreError::NotFound("스킬 설치본을 찾지 못했습니다".to_owned()))
 }
 
 fn is_shared_key(root: &Path, key: &str) -> bool {
@@ -2727,6 +2775,85 @@ fn trash_draft_for_install(
     }
 }
 
+/// 보관 원본 디렉터리 자체를 휴지통으로 옮길 때의 항목 정보. 삭제·보관 취소·원본
+/// 채택 세 자리가 같은 표를 각자 적고 있었다. 공급자 설치본이 아니므로 provider·
+/// scope는 비고, 보관 저장소에 있던 실체이므로 `shared`는 늘 참이다.
+fn trash_draft_for_common_source(
+    directory: &Path,
+    key: &str,
+    group_id: &str,
+    actor: &str,
+) -> SkillTrashItemDraft {
+    let (kind, link_target) = install_kind(directory);
+    let (name, description) = skill_display_meta(&directory.join("SKILL.md"), key);
+    let (content_digest, file_count, total_bytes) = read_skill_content(directory)
+        .map(|content| {
+            (
+                Some(content.digest),
+                content.file_count,
+                content.total_bytes,
+            )
+        })
+        .unwrap_or((None, 0, 0));
+    SkillTrashItemDraft {
+        group_id: group_id.to_owned(),
+        key: key.to_owned(),
+        kind,
+        link_target,
+        provider: None,
+        scope: None,
+        shared: true,
+        deleted_by: actor.to_owned(),
+        content_digest,
+        file_count,
+        total_bytes,
+        name,
+        description,
+    }
+}
+
+/// 휴지통으로 실체를 옮기는 한 묶음. 설치본 삭제·공유 삭제·보관 취소·원본 채택 네
+/// 자리가 모두 "삭제 주체를 정규화하고, 그룹 ID를 새로 뽑고, 항목 표를 만들어
+/// 저장한다"는 같은 순서를 각자 적고 있었다. 한 자리에서만 그룹 ID를 다르게 뽑거나
+/// 주체 정규화를 빠뜨려도 복구가 그룹 단위라 조용히 갈라지므로 여기 한 벌로 둔다.
+struct SkillTrashGroup<'a> {
+    app_data_dir: &'a Path,
+    /// 보관 저장소 루트. 설치본 항목이 "공유 원본이 있는 키인지" 적을 때만 쓴다.
+    common_root: &'a Path,
+    key: &'a str,
+    /// 복구 단위가 되는 그룹 ID. 한 묶음의 모든 항목이 이 값을 함께 쓴다.
+    id: String,
+    actor: String,
+}
+
+impl<'a> SkillTrashGroup<'a> {
+    fn open(
+        app_data_dir: &'a Path,
+        common_root: &'a Path,
+        key: &'a str,
+        deleted_by: Option<&str>,
+    ) -> Self {
+        Self {
+            app_data_dir,
+            common_root,
+            key,
+            id: new_trash_group_id(),
+            actor: normalized_delete_actor(deleted_by),
+        }
+    }
+
+    fn take_install(&self, install: &ProviderInstall) -> Result<SkillTrashItem, CoreError> {
+        let draft =
+            trash_draft_for_install(self.common_root, install, self.key, &self.id, &self.actor);
+        store_trash_item(self.app_data_dir, &install.directory, draft)
+    }
+
+    fn take_common_source(&self, directory: &Path) -> Result<SkillTrashItem, CoreError> {
+        let draft = trash_draft_for_common_source(directory, self.key, &self.id, &self.actor);
+        store_trash_item(self.app_data_dir, directory, draft)
+    }
+}
+
 /// 삭제 영향 확인. 파일을 쓰지 않는 읽기 작업이다. `id`는 설치본 하나,
 /// `key`는 공유 원본과 모든 배포본을 대상으로 본다.
 pub fn check_skill_delete(
@@ -2751,10 +2878,10 @@ fn check_skill_delete_from_paths(
     roots: &SkillRoots,
     request: &SkillDeleteCheckRequest,
 ) -> Result<SkillDeleteImpact, CoreError> {
-    let (home, root, projects) = (roots.home(), roots.root(), roots.projects());
+    let root = roots.root();
     match (&request.id, &request.key) {
         (Some(id), None) => {
-            let install = find_install_by_id(home, projects, id)?;
+            let install = roots.install_by_id(id)?;
             assert_user_deletable_scope(install.scope)?;
             let key = install_key(&install)?;
             let (kind, _) = install_kind(&install.directory);
@@ -2771,8 +2898,7 @@ fn check_skill_delete_from_paths(
             })
         }
         (None, Some(key)) => {
-            let (directory, targets, warnings) =
-                collect_shared_delete_targets(home, root, projects, key)?;
+            let (directory, targets, warnings) = collect_shared_delete_targets(roots, key)?;
             let mut items: Vec<SkillDeleteImpactItem> = targets
                 .iter()
                 .map(|install| {
@@ -2809,36 +2935,19 @@ fn check_skill_delete_from_paths(
 /// 포함한다. 사용 해제(개별 삭제)와 같은 규칙으로, 프로젝트 사용본도 휴지통을
 /// 경유하므로 복구할 수 있다. 에이전트·플러그인 소유 내장 스킬만 제외한다.
 fn collect_shared_delete_targets(
-    home: &Path,
-    root: &Path,
-    projects: &[PathBuf],
+    roots: &SkillRoots,
     key: &str,
 ) -> Result<(PathBuf, Vec<ProviderInstall>, Vec<String>), CoreError> {
     let key = validate_skill_key(key)?;
-    let directory = root.join(&key);
-    assert_within_root(root, &directory)?;
-    if !directory.join("SKILL.md").is_file() {
-        return Err(CoreError::NotFound(format!(
-            "공통 스킬 원본을 찾지 못했습니다: {key}"
-        )));
-    }
+    let directory = existing_common_skill_dir(roots.root(), &key, MISSING_COMMON_SOURCE)?;
     let mut issues = Vec::new();
-    let installs = scan_provider_installs(home, projects, &mut issues);
+    let installs = roots.provider_installs(&mut issues);
     let mut targets = Vec::new();
     let warnings = Vec::new();
     for install in installs {
-        let name = install
-            .directory
-            .file_name()
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if name != key {
-            continue;
-        }
-        match install.scope {
-            "personal" | "project" => targets.push(install),
-            // 에이전트·플러그인 소유 스킬은 애초에 관리 대상이 아니다.
-            _ => {}
+        // 에이전트·플러그인 소유 스킬은 애초에 관리 대상이 아니다.
+        if install.dir_name().as_deref() == Some(key.as_str()) && install.is_user_owned() {
+            targets.push(install);
         }
     }
     Ok((directory, targets, warnings))
@@ -2871,15 +2980,14 @@ fn delete_installed_skill_from_paths(
     app_data_dir: &Path,
     request: &DeleteInstalledSkillRequest,
 ) -> Result<SkillDeleteReceipt, CoreError> {
-    let (home, root, projects) = (roots.home(), roots.root(), roots.projects());
+    let root = roots.root();
     require_delete_confirm(request.confirm)?;
-    let install = find_install_by_id(home, projects, &request.id)?;
+    let install = roots.install_by_id(&request.id)?;
     assert_user_deletable_scope(install.scope)?;
     let key = install_key(&install)?;
-    let actor = normalized_delete_actor(request.deleted_by.as_deref());
-    let group_id = new_trash_group_id();
-    let draft = trash_draft_for_install(root, &install, &key, &group_id, &actor);
-    let item = store_trash_item(app_data_dir, &install.directory, draft)?;
+    let group = SkillTrashGroup::open(app_data_dir, root, &key, request.deleted_by.as_deref());
+    let item = group.take_install(&install)?;
+    let group_id = group.id;
     Ok(SkillDeleteReceipt {
         key,
         group_id,
@@ -2914,54 +3022,23 @@ fn delete_shared_skill_from_paths(
     app_data_dir: &Path,
     request: &DeleteSharedSkillRequest,
 ) -> Result<SkillDeleteReceipt, CoreError> {
-    let (home, root, projects) = (roots.home(), roots.root(), roots.projects());
+    let root = roots.root();
     require_delete_confirm(request.confirm)?;
-    let (directory, targets, warnings) =
-        collect_shared_delete_targets(home, root, projects, &request.key)?;
+    let (directory, targets, warnings) = collect_shared_delete_targets(roots, &request.key)?;
     let key = validate_skill_key(&request.key)?;
-    let actor = normalized_delete_actor(request.deleted_by.as_deref());
-    let group_id = new_trash_group_id();
+    let group = SkillTrashGroup::open(app_data_dir, root, &key, request.deleted_by.as_deref());
 
     let mut items = Vec::new();
     for install in &targets {
-        let draft = trash_draft_for_install(root, install, &key, &group_id, &actor);
-        items.push(store_trash_item(app_data_dir, &install.directory, draft)?);
+        items.push(group.take_install(install)?);
     }
 
-    let (kind, link_target) = install_kind(&directory);
-    let (name, description) = skill_display_meta(&directory.join("SKILL.md"), &key);
-    let (content_digest, file_count, total_bytes) = read_skill_content(&directory)
-        .map(|content| {
-            (
-                Some(content.digest),
-                content.file_count,
-                content.total_bytes,
-            )
-        })
-        .unwrap_or((None, 0, 0));
-    items.push(store_trash_item(
-        app_data_dir,
-        &directory,
-        SkillTrashItemDraft {
-            group_id: group_id.clone(),
-            key: key.clone(),
-            kind,
-            link_target,
-            provider: None,
-            scope: None,
-            shared: true,
-            deleted_by: actor,
-            content_digest,
-            file_count,
-            total_bytes,
-            name,
-            description,
-        },
-    )?);
+    items.push(group.take_common_source(&directory)?);
 
     // 스킬 자체를 지웠으므로 출처 메타도 함께 정리한다.
     let _ = remove_skill_meta(app_data_dir, &key);
 
+    let group_id = group.id;
     Ok(SkillDeleteReceipt {
         key,
         group_id,
@@ -2987,49 +3064,14 @@ fn unarchive_shared_skill_in(
 ) -> Result<SkillDeleteReceipt, CoreError> {
     require_unarchive_confirm(request.confirm)?;
     let key = validate_skill_key(&request.key)?;
-    let directory = root.join(&key);
-    assert_within_root(root, &directory)?;
-    if !directory.join("SKILL.md").is_file() {
-        return Err(CoreError::NotFound(format!(
-            "공통 스킬 원본을 찾지 못했습니다: {key}"
-        )));
-    }
-    let actor = normalized_delete_actor(request.deleted_by.as_deref());
-    let group_id = new_trash_group_id();
-    let (kind, link_target) = install_kind(&directory);
-    let (name, description) = skill_display_meta(&directory.join("SKILL.md"), &key);
-    let (content_digest, file_count, total_bytes) = read_skill_content(&directory)
-        .map(|content| {
-            (
-                Some(content.digest),
-                content.file_count,
-                content.total_bytes,
-            )
-        })
-        .unwrap_or((None, 0, 0));
-    let item = store_trash_item(
-        app_data_dir,
-        &directory,
-        SkillTrashItemDraft {
-            group_id: group_id.clone(),
-            key: key.clone(),
-            kind,
-            link_target,
-            provider: None,
-            scope: None,
-            shared: true,
-            deleted_by: actor,
-            content_digest,
-            file_count,
-            total_bytes,
-            name,
-            description,
-        },
-    )?;
+    let directory = existing_common_skill_dir(root, &key, MISSING_COMMON_SOURCE)?;
+    let group = SkillTrashGroup::open(app_data_dir, root, &key, request.deleted_by.as_deref());
+    let item = group.take_common_source(&directory)?;
 
     // 원본이 사라졌으므로 출처·자동 동기화 같은 원본 전제 메타도 함께 정리한다.
     let _ = remove_skill_meta(app_data_dir, &key);
 
+    let group_id = group.id;
     Ok(SkillDeleteReceipt {
         key,
         group_id,
@@ -3045,24 +3087,18 @@ fn unarchive_shared_skill_in(
 /// 키의 현재 사용본 전체에 원본을 재배포한다. 원본과 같은 실체(링크)와 skip
 /// 목록의 실체는 건너뛴다. 위치(루트)당 한 번만 게시한다.
 fn republish_to_installs(
-    home: &Path,
-    projects: &[PathBuf],
+    roots: &SkillRoots,
     key: &str,
     source_directory: &Path,
     content: &SkillContent,
     skip_canonicals: &[PathBuf],
 ) -> Vec<SkillPublishResult> {
     let mut issues = Vec::new();
-    let installs = scan_provider_installs(home, projects, &mut issues);
+    let installs = roots.provider_installs(&mut issues);
     let mut results = Vec::new();
     let mut seen_roots: BTreeSet<PathBuf> = BTreeSet::new();
     for install in installs {
-        let name = install
-            .directory
-            .file_name()
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if name != key || !matches!(install.scope, "personal" | "project") {
+        if install.dir_name().as_deref() != Some(key) || !install.is_user_owned() {
             continue;
         }
         if let Some(canonical) = install.canonical.as_ref() {
@@ -3142,83 +3178,30 @@ fn sync_skill_from_install_from_paths(
     app_data_dir: &Path,
     request: &SyncSkillRequest,
 ) -> Result<SkillSyncReceipt, CoreError> {
-    let (home, root, projects) = (roots.home(), roots.root(), roots.projects());
-    let install = find_install_by_id(home, projects, &request.skill_id)?;
+    let root = roots.root();
+    let install = roots.install_by_id(&request.skill_id)?;
     assert_user_deletable_scope(install.scope)?;
     let key = install_key(&install)?;
-    let source_dir = root.join(&key);
-    assert_within_root(root, &source_dir)?;
-    if !source_dir.join("SKILL.md").is_file() {
-        return Err(CoreError::NotFound(format!("보관 원본이 없습니다: {key}")));
-    }
+    let source_dir = existing_common_skill_dir(root, &key, MISSING_ARCHIVED_SOURCE)?;
 
     let content = read_skill_content(&install.directory)?;
-    if content.truncated {
-        return Err(CoreError::InvalidInput(format!(
-            "스킬 구성 파일이 {MAX_SKILL_FILES}개를 넘습니다"
-        )));
-    }
-    if content.total_bytes > MAX_SKILL_TOTAL_BYTES {
-        return Err(CoreError::InvalidInput(format!(
-            "스킬 전체 크기가 허용 한도({}MB)를 넘습니다",
-            MAX_SKILL_TOTAL_BYTES / (1024 * 1024)
-        )));
-    }
-    if let Some(link) = content.symlinks.first() {
-        return Err(CoreError::InvalidInput(format!(
-            "심볼릭 링크가 있어 원본으로 채택할 수 없습니다: {link}"
-        )));
-    }
+    content.ensure_writable("심볼릭 링크가 있어 원본으로 채택할 수 없습니다")?;
 
     // 이전 원본을 휴지통으로 옮긴다. 실패해도 복구할 수 있는 안전망이다.
-    let actor = normalized_delete_actor(request.deleted_by.as_deref());
-    let (kind, link_target) = install_kind(&source_dir);
-    let (name, description) = skill_display_meta(&source_dir.join("SKILL.md"), &key);
-    let (old_digest, old_count, old_bytes) = read_skill_content(&source_dir)
-        .map(|old| (Some(old.digest), old.file_count, old.total_bytes))
-        .unwrap_or((None, 0, 0));
-    let trash_item = store_trash_item(
-        app_data_dir,
-        &source_dir,
-        SkillTrashItemDraft {
-            group_id: new_trash_group_id(),
-            key: key.clone(),
-            kind,
-            link_target,
-            provider: None,
-            scope: None,
-            shared: true,
-            deleted_by: actor,
-            content_digest: old_digest,
-            file_count: old_count,
-            total_bytes: old_bytes,
-            name,
-            description,
-        },
-    )?;
+    let trash_item = SkillTrashGroup::open(app_data_dir, root, &key, request.deleted_by.as_deref())
+        .take_common_source(&source_dir)?;
 
     // 채택본을 스테이징으로 복사한 뒤 원본 자리에 넣는다. 실패하면 휴지통에서
     // 이전 원본을 되살린다.
-    let nonce = publish_nonce();
-    let stage = root.join(format!("{STAGE_PREFIX}{key}-{nonce}"));
-    assert_within_root(root, &stage)?;
-    let staged = stage_skill_copy(
+    let stage = skill_stage_paths(root, &key)?.stage;
+    if let Err(error) = stage_and_replace_skill(
         adapter(install.provider),
         &install.directory,
-        &stage,
         &content,
-    )
-    .and_then(|_| {
-        StagedReplace {
-            kind: StagedKind::Directory,
-            stage: &stage,
-            target: &source_dir,
-            backup: None,
-        }
-        .commit()
-    });
-    if let Err(error) = staged {
-        let _ = fs::remove_dir_all(&stage);
+        &stage,
+        &source_dir,
+        None,
+    ) {
         let _ = crate::skill_trash::restore_skill_trash(app_data_dir, &trash_item.id);
         return Err(error);
     }
@@ -3232,7 +3215,7 @@ fn sync_skill_from_install_from_paths(
         skip.push(canonical);
     }
     let new_content = read_skill_content(&source_dir)?;
-    let results = republish_to_installs(home, projects, &key, &source_dir, &new_content, &skip);
+    let results = republish_to_installs(roots, &key, &source_dir, &new_content, &skip);
 
     Ok(SkillSyncReceipt {
         key,
@@ -3338,67 +3321,23 @@ pub fn get_skill_migration_plan(
     })
 }
 
-pub fn save_skill_platform_variant(
+/// 보관 원본의 메타(`.agent-manager/resource.json`)만 고치는 작업 한 벌. OS 변형 저장과
+/// 대상 OS 지정이 같은 다섯 걸음(키 검증 → 저장소 루트 열기 → 현재 메타 읽기 → 고치기 →
+/// 스키마 판 고정과 메타 한 장을 실은 원본 갱신)을 각자 적고 있었다. 편집 함수는 메타를
+/// 고치면서 함께 써 넣을 파일을 돌려주므로, 변형 파일을 얹는 자리도 이 한 벌로 끝난다.
+fn edit_skill_manifest(
     app_data_dir: &Path,
     sessions: &[SessionSummary],
-    request: &SaveSkillPlatformVariantRequest,
+    key: &str,
+    expected_digest: &str,
+    edit: impl FnOnce(&mut ResourcePlatformManifest) -> Result<Vec<SkillFileWrite>, CoreError>,
 ) -> Result<SkillUpdateReceipt, CoreError> {
-    if request.files.is_empty() && request.deletes.is_empty() {
-        return Err(CoreError::InvalidInput(
-            "OS 변형 파일 또는 제외 경로를 하나 이상 제공하세요".to_owned(),
-        ));
-    }
-    let key = validate_skill_key(&request.key)?;
+    let key = validate_skill_key(key)?;
     let roots = SkillRoots::from_app_data(app_data_dir, sessions)?;
-    let root = roots.root();
-    let directory = root.join(&key);
-    assert_within_root(root, &directory)?;
+    let directory = common_skill_dir(roots.root(), &key)?;
     let mut manifest = checked_resource_manifest(&directory)?;
-    if manifest.platforms.is_empty() {
-        manifest.platforms.push(
-            request
-                .source_platform
-                .unwrap_or_else(HostPlatform::current),
-        );
-    }
-    let variant_directory = format!(".agent-manager/variants/{}", request.target_platform);
-    manifest
-        .variants
-        .insert(request.target_platform, variant_directory.clone());
-    let mut deletes = BTreeSet::new();
-    for path in &request.deletes {
-        let relative = Path::new(path);
-        validate_variant_delete_path(relative)?;
-        if !deletes.insert(path.clone()) {
-            continue;
-        }
-    }
-    if deletes.is_empty() {
-        manifest.variant_deletes.remove(&request.target_platform);
-    } else {
-        manifest
-            .variant_deletes
-            .insert(request.target_platform, deletes.into_iter().collect());
-    }
+    let mut files = edit(&mut manifest)?;
     manifest.schema_version = 1;
-
-    let mut files = Vec::with_capacity(request.files.len() + 1);
-    for file in &request.files {
-        let relative = Path::new(&file.path);
-        validate_relative_path(relative)?;
-        if relative.starts_with(".agent-manager") {
-            return Err(CoreError::InvalidInput(
-                "변형 파일 경로에는 .agent-manager를 직접 지정하지 마세요".to_owned(),
-            ));
-        }
-        files.push(SkillFileWrite {
-            path: Path::new(&variant_directory)
-                .join(relative)
-                .to_string_lossy()
-                .into_owned(),
-            content: file.content.clone(),
-        });
-    }
     files.push(SkillFileWrite {
         path: ".agent-manager/resource.json".to_owned(),
         content: format!("{}\n", serde_json::to_string_pretty(&manifest)?),
@@ -3410,7 +3349,69 @@ pub fn save_skill_platform_variant(
             key,
             files,
             deletes: Vec::new(),
-            expected_digest: request.expected_digest.clone(),
+            expected_digest: expected_digest.to_owned(),
+        },
+    )
+}
+
+pub fn save_skill_platform_variant(
+    app_data_dir: &Path,
+    sessions: &[SessionSummary],
+    request: &SaveSkillPlatformVariantRequest,
+) -> Result<SkillUpdateReceipt, CoreError> {
+    if request.files.is_empty() && request.deletes.is_empty() {
+        return Err(CoreError::InvalidInput(
+            "OS 변형 파일 또는 제외 경로를 하나 이상 제공하세요".to_owned(),
+        ));
+    }
+    edit_skill_manifest(
+        app_data_dir,
+        sessions,
+        &request.key,
+        &request.expected_digest,
+        |manifest| {
+            if manifest.platforms.is_empty() {
+                manifest.platforms.push(
+                    request
+                        .source_platform
+                        .unwrap_or_else(HostPlatform::current),
+                );
+            }
+            let variant_directory = format!(".agent-manager/variants/{}", request.target_platform);
+            manifest
+                .variants
+                .insert(request.target_platform, variant_directory.clone());
+            let mut deletes = BTreeSet::new();
+            for path in &request.deletes {
+                validate_variant_delete_path(Path::new(path))?;
+                deletes.insert(path.clone());
+            }
+            if deletes.is_empty() {
+                manifest.variant_deletes.remove(&request.target_platform);
+            } else {
+                manifest
+                    .variant_deletes
+                    .insert(request.target_platform, deletes.into_iter().collect());
+            }
+
+            let mut files = Vec::with_capacity(request.files.len() + 1);
+            for file in &request.files {
+                let relative = Path::new(&file.path);
+                validate_relative_path(relative)?;
+                if relative.starts_with(".agent-manager") {
+                    return Err(CoreError::InvalidInput(
+                        "변형 파일 경로에는 .agent-manager를 직접 지정하지 마세요".to_owned(),
+                    ));
+                }
+                files.push(SkillFileWrite {
+                    path: Path::new(&variant_directory)
+                        .join(relative)
+                        .to_string_lossy()
+                        .into_owned(),
+                    content: file.content.clone(),
+                });
+            }
+            Ok(files)
         },
     )
 }
@@ -3420,31 +3421,20 @@ pub fn set_skill_platforms(
     sessions: &[SessionSummary],
     request: &SetSkillPlatformsRequest,
 ) -> Result<SkillUpdateReceipt, CoreError> {
-    let key = validate_skill_key(&request.key)?;
-    let roots = SkillRoots::from_app_data(app_data_dir, sessions)?;
-    let root = roots.root();
-    let directory = root.join(&key);
-    assert_within_root(root, &directory)?;
-    let mut manifest = checked_resource_manifest(&directory)?;
-    manifest.platforms = request
-        .platforms
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    manifest.schema_version = 1;
-    update_common_skill_from_paths(
-        &roots,
-        true,
-        &UpdateCommonSkillRequest {
-            key,
-            files: vec![SkillFileWrite {
-                path: ".agent-manager/resource.json".to_owned(),
-                content: format!("{}\n", serde_json::to_string_pretty(&manifest)?),
-            }],
-            deletes: Vec::new(),
-            expected_digest: request.expected_digest.clone(),
+    edit_skill_manifest(
+        app_data_dir,
+        sessions,
+        &request.key,
+        &request.expected_digest,
+        |manifest| {
+            manifest.platforms = request
+                .platforms
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            Ok(Vec::new())
         },
     )
 }
@@ -3469,23 +3459,103 @@ pub(crate) fn update_common_skill_from_home(
     update_common_skill_from_paths(&roots, false, request)
 }
 
+/// 스테이징 안에서 손댈 절대 경로를 낸다. 경로 형태·전용 영역·루트 이탈을 한 자리에서
+/// 막아 쓰기와 지우기가 같은 관문을 지나게 한다.
+fn staged_skill_target(
+    stage: &Path,
+    path: &str,
+    allow_resource_metadata: bool,
+) -> Result<PathBuf, CoreError> {
+    let relative = Path::new(path);
+    validate_relative_path(relative)?;
+    if !allow_resource_metadata && relative.starts_with(".agent-manager") {
+        return Err(CoreError::InvalidInput(
+            "OS 메타데이터와 변형은 전용 작업으로만 변경할 수 있습니다".to_owned(),
+        ));
+    }
+    let target = stage.join(relative);
+    assert_within_root(stage, &target)?;
+    Ok(target)
+}
+
+/// 스테이징에서 지울 항목을 치운다. 이미 없는 항목은 지워진 것으로 본다.
+fn apply_stage_deletes(
+    stage: &Path,
+    deletes: &[String],
+    allow_resource_metadata: bool,
+) -> Result<(), CoreError> {
+    for path in deletes {
+        let target = staged_skill_target(stage, path, allow_resource_metadata)?;
+        if Path::new(path) == Path::new("SKILL.md") {
+            return Err(CoreError::InvalidInput(
+                "SKILL.md는 삭제할 수 없습니다".to_owned(),
+            ));
+        }
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&target)?,
+            Ok(_) => fs::remove_file(&target)?,
+            Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// 스테이징에 새 내용을 쓴다. 중간 디렉터리는 필요한 만큼 만든다.
+fn apply_stage_writes(
+    stage: &Path,
+    files: &[SkillFileWrite],
+    allow_resource_metadata: bool,
+) -> Result<(), CoreError> {
+    for file in files {
+        let target = staged_skill_target(stage, &file.path, allow_resource_metadata)?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target, &file.content)?;
+    }
+    Ok(())
+}
+
+/// 교체해도 되는 상태인지 스테이징을 검사하고 그 내용을 돌려준다.
+fn validated_stage_content(stage: &Path) -> Result<SkillContent, CoreError> {
+    let result = read_skill_content(stage)?;
+    checked_resource_manifest(stage)?;
+    if !stage.join("SKILL.md").is_file() {
+        return Err(CoreError::InvalidInput(
+            "SKILL.md가 없는 스킬은 저장할 수 없습니다".to_owned(),
+        ));
+    }
+    result.ensure_writable("심볼릭 링크는 저장할 수 없습니다")?;
+    Ok(result)
+}
+
+/// 현재 원본을 스테이징에 그대로 복사하고 요청의 변경을 적용한다. 투영 없이 원문
+/// 그대로 복사하기 위해 전용 키가 없는 Claude 어댑터를 쓴다. 실패하면 호출부가
+/// 스테이징을 치운다.
+fn stage_common_skill_update(
+    source_dir: &Path,
+    stage: &Path,
+    current: &SkillContent,
+    request: &UpdateCommonSkillRequest,
+    allow_resource_metadata: bool,
+) -> Result<SkillContent, CoreError> {
+    stage_raw_skill_copy(source_dir, stage, current)?;
+    apply_stage_deletes(stage, &request.deletes, allow_resource_metadata)?;
+    apply_stage_writes(stage, &request.files, allow_resource_metadata)?;
+    validated_stage_content(stage)
+}
+
 fn update_common_skill_from_paths(
     roots: &SkillRoots,
     allow_resource_metadata: bool,
     request: &UpdateCommonSkillRequest,
 ) -> Result<SkillUpdateReceipt, CoreError> {
-    let (home, root, projects) = (roots.home(), roots.root(), roots.projects());
+    let root = roots.root();
     let key = validate_skill_key(&request.key)?;
     if request.files.is_empty() && request.deletes.is_empty() {
         return Err(CoreError::InvalidInput("변경 내용이 없습니다".to_owned()));
     }
-    let source_dir = root.join(&key);
-    assert_within_root(root, &source_dir)?;
-    if !source_dir.join("SKILL.md").is_file() {
-        return Err(CoreError::NotFound(format!(
-            "보관 원본을 찾지 못했습니다: {key}"
-        )));
-    }
+    let source_dir = existing_common_skill_dir(root, &key, "보관 원본을 찾지 못했습니다")?;
     let current = read_skill_content(&source_dir)?;
     if current.digest != request.expected_digest {
         return Err(CoreError::Conflict(
@@ -3493,74 +3563,14 @@ fn update_common_skill_from_paths(
         ));
     }
 
-    // 스테이징에 현재 원본을 복사하고 변경을 적용한다. 투영 없이 원문 그대로
-    // 복사하기 위해 전용 키가 없는 Claude 어댑터를 쓴다.
-    let nonce = publish_nonce();
-    let stage = root.join(format!("{STAGE_PREFIX}{key}-{nonce}"));
-    assert_within_root(root, &stage)?;
-    let applied = (|| -> Result<SkillContent, CoreError> {
-        stage_raw_skill_copy(&source_dir, &stage, &current)?;
-        for path in &request.deletes {
-            let relative = Path::new(path);
-            validate_relative_path(relative)?;
-            if !allow_resource_metadata && relative.starts_with(".agent-manager") {
-                return Err(CoreError::InvalidInput(
-                    "OS 메타데이터와 변형은 전용 작업으로만 변경할 수 있습니다".to_owned(),
-                ));
-            }
-            if relative == Path::new("SKILL.md") {
-                return Err(CoreError::InvalidInput(
-                    "SKILL.md는 삭제할 수 없습니다".to_owned(),
-                ));
-            }
-            let target = stage.join(relative);
-            assert_within_root(&stage, &target)?;
-            match fs::symlink_metadata(&target) {
-                Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&target)?,
-                Ok(_) => fs::remove_file(&target)?,
-                Err(_) => {}
-            }
-        }
-        for file in &request.files {
-            let relative = Path::new(&file.path);
-            validate_relative_path(relative)?;
-            if !allow_resource_metadata && relative.starts_with(".agent-manager") {
-                return Err(CoreError::InvalidInput(
-                    "OS 메타데이터와 변형은 전용 작업으로만 변경할 수 있습니다".to_owned(),
-                ));
-            }
-            let target = stage.join(relative);
-            assert_within_root(&stage, &target)?;
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&target, &file.content)?;
-        }
-        let result = read_skill_content(&stage)?;
-        checked_resource_manifest(&stage)?;
-        if !stage.join("SKILL.md").is_file() {
-            return Err(CoreError::InvalidInput(
-                "SKILL.md가 없는 스킬은 저장할 수 없습니다".to_owned(),
-            ));
-        }
-        if result.truncated {
-            return Err(CoreError::InvalidInput(format!(
-                "스킬 구성 파일이 {MAX_SKILL_FILES}개를 넘습니다"
-            )));
-        }
-        if result.total_bytes > MAX_SKILL_TOTAL_BYTES {
-            return Err(CoreError::InvalidInput(format!(
-                "스킬 전체 크기가 허용 한도({}MB)를 넘습니다",
-                MAX_SKILL_TOTAL_BYTES / (1024 * 1024)
-            )));
-        }
-        if let Some(link) = result.symlinks.first() {
-            return Err(CoreError::InvalidInput(format!(
-                "심볼릭 링크는 저장할 수 없습니다: {link}"
-            )));
-        }
-        Ok(result)
-    })();
+    let SkillStagePaths { stage, backup } = skill_stage_paths(root, &key)?;
+    let applied = stage_common_skill_update(
+        &source_dir,
+        &stage,
+        &current,
+        request,
+        allow_resource_metadata,
+    );
     let result_content = match applied {
         Ok(value) => value,
         Err(error) => {
@@ -3570,7 +3580,6 @@ fn update_common_skill_from_paths(
     };
 
     // 원자 교체: 기존 원본을 백업으로 옮기고 스테이징을 자리에 넣는다.
-    let backup = root.join(format!("{BACKUP_PREFIX}{key}-{nonce}"));
     StagedReplace {
         kind: StagedKind::Directory,
         stage: &stage,
@@ -3586,7 +3595,7 @@ fn update_common_skill_from_paths(
     if let Ok(canonical) = fs::canonicalize(&source_dir) {
         skip.push(canonical);
     }
-    let results = republish_to_installs(home, projects, &key, &source_dir, &result_content, &skip);
+    let results = republish_to_installs(roots, &key, &source_dir, &result_content, &skip);
 
     Ok(SkillUpdateReceipt {
         key,
@@ -3650,53 +3659,11 @@ pub enum SkillFileChangeStatus {
     Modified,
 }
 
-impl SkillFileChangeStatus {
-    pub const ALL: [Self; 3] = [Self::Added, Self::Removed, Self::Modified];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Added => "added",
-            Self::Removed => "removed",
-            Self::Modified => "modified",
-        }
-    }
-
-    /// 추가 상태인지 여부.
-    pub fn is_added(self) -> bool {
-        matches!(self, Self::Added)
-    }
-
-    /// 삭제 상태인지 여부.
-    pub fn is_removed(self) -> bool {
-        matches!(self, Self::Removed)
-    }
-
-    /// 수정 상태인지 여부.
-    pub fn is_modified(self) -> bool {
-        matches!(self, Self::Modified)
-    }
-}
-
-impl std::fmt::Display for SkillFileChangeStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SkillFileChangeStatus {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "added" => Ok(Self::Added),
-            "removed" => Ok(Self::Removed),
-            "modified" => Ok(Self::Modified),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 스킬 파일 변경 상태입니다: {s}. added|removed|modified 중 하나를 쓰세요"
-            ))),
-        }
-    }
-}
+session_string_enum!(SkillFileChangeStatus, "알 수 없는 스킬 파일 변경 상태입니다", {
+    Added => "added",
+    Removed => "removed",
+    Modified => "modified",
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -3757,14 +3724,10 @@ fn compare_skill_install_from_paths(
     roots: &SkillRoots,
     request: &CompareSkillRequest,
 ) -> Result<SkillInstallComparison, CoreError> {
-    let (home, root, projects) = (roots.home(), roots.root(), roots.projects());
-    let install = find_install_by_id(home, projects, &request.skill_id)?;
+    let root = roots.root();
+    let install = roots.install_by_id(&request.skill_id)?;
     let key = install_key(&install)?;
-    let source_dir = root.join(&key);
-    assert_within_root(root, &source_dir)?;
-    if !source_dir.join("SKILL.md").is_file() {
-        return Err(CoreError::NotFound(format!("보관 원본이 없습니다: {key}")));
-    }
+    let source_dir = existing_common_skill_dir(root, &key, MISSING_ARCHIVED_SOURCE)?;
     if let (Ok(left), Some(right)) = (fs::canonicalize(&source_dir), install.canonical.as_ref()) {
         if &left == right {
             return Err(CoreError::InvalidInput(
@@ -3914,6 +3877,17 @@ mod tests {
             format!("---\nname: {name}\ndescription: {description}\n---\nBody\n"),
         )
         .expect("write SKILL.md");
+    }
+
+    /// 파일 수정 시각을 UNIX 기원 기준 밀리초로 고정한다. 방향 판정은 원본과 사본의
+    /// 시각 차이만 보므로, 테스트가 실제 쓰기 순서에 기대면 같은 밀리초에 몰려 흔들린다.
+    fn set_modified(path: &Path, millis: u64) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for mtime")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis))
+            .expect("set mtime");
     }
 
     fn common_dir(home: &Path, key: &str) -> PathBuf {
@@ -4144,6 +4118,50 @@ mod tests {
             .expect("codex");
         assert_eq!(codex.status, SkillProviderStatus::Copy);
         assert!(codex.divergent);
+    }
+
+    /// 지문만 보면 뒤처진 사본과 손으로 고친 사본이 같은 "갈라짐"으로 보인다. 둘은 조치가
+    /// 반대라 — 앞은 원본 재배포, 뒤는 채택 여부 판단 — 방향까지 내야 화면이 반대 안내를
+    /// 하지 않는다.
+    #[test]
+    fn divergence_direction_separates_stale_copy_from_external_edit() {
+        let temp = TempDir::new().expect("temp");
+        let home = temp.path();
+        write_skill(&common_dir(home, "review"), "review", "Original");
+        write_skill(&home.join(".codex/skills/review"), "review", "Stale copy");
+        write_skill(&home.join(".claude/skills/review"), "review", "Edited copy");
+        set_modified(&common_dir(home, "review").join("SKILL.md"), 2_000);
+        set_modified(&home.join(".codex/skills/review/SKILL.md"), 1_000);
+        set_modified(&home.join(".claude/skills/review/SKILL.md"), 3_000);
+
+        let library =
+            load_skill_library_from_home(home, &SkillMetaStore::default()).expect("library");
+        let entry = library
+            .entries
+            .iter()
+            .find(|entry| entry.key == "review")
+            .expect("entry");
+        let state = |provider: ProviderId| {
+            entry
+                .providers
+                .iter()
+                .find(|state| state.provider == provider)
+                .expect("provider state")
+        };
+
+        let codex = state(ProviderId::Codex);
+        assert_eq!(codex.divergence, Some(SkillDivergence::Behind));
+        assert_eq!(codex.modified_at_ms, Some(1_000));
+        let claude = state(ProviderId::Claude);
+        assert_eq!(claude.divergence, Some(SkillDivergence::Edited));
+        assert_eq!(
+            entry.common.as_ref().expect("common").modified_at_ms,
+            Some(2_000)
+        );
+        assert!(
+            state(ProviderId::Antigravity).divergence.is_none(),
+            "설치본이 없으면 방향도 없다"
+        );
     }
 
     #[cfg(unix)]
@@ -4736,12 +4754,21 @@ mod tests {
         stable_id(&directory.join("SKILL.md").to_string_lossy())
     }
 
+    /// 설치본 디렉터리. 마지막 조각을 따로 잇는 것이 요점이다. 제품은 공급자 루트를
+    /// `read_dir`로 훑어 항목 이름을 붙이므로 그 경계가 언제나 OS 구분자인데, 시험이
+    /// `".codex/skills/todo"`를 한 번에 이어 붙이면 Windows의 `Path::join`은 `/`를 그대로
+    /// 둔다. 같은 디렉터리를 가리키면서 문자열만 달라 [`installed_skill_id`]의 해시가
+    /// 갈리고, 제품은 그 id로는 "스킬 설치본을 찾지 못했습니다"로 답한다.
+    fn install_dir(root_owner: &Path, root_relative: &str, key: &str) -> PathBuf {
+        root_owner.join(root_relative).join(key)
+    }
+
     #[test]
     fn delete_installed_skill_moves_directory_to_trash_and_restores() {
         let home_dir = TempDir::new().expect("home");
         let data_dir = TempDir::new().expect("data");
         let home = home_dir.path();
-        let installed = home.join(".codex/skills/todo");
+        let installed = install_dir(home, ".codex/skills", "todo");
         write_skill(&installed, "todo", "Todo skill");
         fs::create_dir_all(installed.join("scripts")).expect("scripts");
         fs::write(installed.join("scripts/run.sh"), "echo run").expect("script");
@@ -4810,7 +4837,7 @@ mod tests {
     fn delete_rejects_provider_owned_scopes() {
         let home_dir = TempDir::new().expect("home");
         let data_dir = TempDir::new().expect("data");
-        let installed = home_dir.path().join(".codex/skills/.system/tool");
+        let installed = install_dir(home_dir.path(), ".codex/skills/.system", "tool");
         write_skill(&installed, "tool", "Built-in tool");
 
         let error = delete_installed_skill_from_home(
@@ -4976,7 +5003,7 @@ mod tests {
         let home_dir = TempDir::new().expect("home");
         let data_dir = TempDir::new().expect("data");
         let home = home_dir.path();
-        let installed = home.join(".codex/skills/busy");
+        let installed = install_dir(home, ".codex/skills", "busy");
         write_skill(&installed, "busy", "Busy skill");
 
         let receipt = delete_installed_skill_from_home(
@@ -5017,7 +5044,11 @@ mod tests {
         let home = home_dir.path();
         let source = common_dir(home, "scan");
         write_skill(&source, "scan", "Scan skill");
-        write_skill(&home.join(".codex/skills/scan"), "scan", "Scan skill");
+        write_skill(
+            &install_dir(home, ".codex/skills", "scan"),
+            "scan",
+            "Scan skill",
+        );
 
         let impact = check_skill_delete_from_home(
             home,
@@ -5038,7 +5069,11 @@ mod tests {
         let single = check_skill_delete_from_home(
             home,
             &SkillDeleteCheckRequest {
-                id: Some(installed_skill_id(&home.join(".codex/skills/scan"))),
+                id: Some(installed_skill_id(&install_dir(
+                    home,
+                    ".codex/skills",
+                    "scan",
+                ))),
                 key: None,
             },
         )
@@ -5113,7 +5148,7 @@ mod tests {
             serde_json::json!({ "projects": { project.to_string_lossy(): {} } }).to_string(),
         )
         .expect("claude.json");
-        let installed = project.join(".claude/skills/db-ops");
+        let installed = install_dir(&project, ".claude/skills", "db-ops");
         write_skill(&installed, "db-ops", "Project skill");
 
         let source = import_skill_to_common_from_home(
@@ -5141,7 +5176,7 @@ mod tests {
             serde_json::json!({ "projects": { project.to_string_lossy(): {} } }).to_string(),
         )
         .expect("claude.json");
-        let installed = project.join(".claude/skills/proj-skill");
+        let installed = install_dir(&project, ".claude/skills", "proj-skill");
         write_skill(&installed, "proj-skill", "Project skill");
 
         // 보관: 출처 메타에 프로젝트가 기록된다.
@@ -5245,7 +5280,7 @@ mod tests {
         )
         .expect("publish");
 
-        let edited = home.join(".codex/skills/cmp");
+        let edited = install_dir(home, ".codex/skills", "cmp");
         // 수정·추가·삭제를 하나씩 만든다. notes.md는 그대로 둔다.
         fs::write(
             edited.join("SKILL.md"),
@@ -5316,7 +5351,7 @@ mod tests {
             },
         )
         .expect("publish");
-        let installed = home.join(".claude/skills/proj");
+        let installed = install_dir(home, ".claude/skills", "proj");
 
         let comparison = compare_skill_install_from_home(
             home,
@@ -5363,7 +5398,7 @@ mod tests {
         .expect("publish");
 
         // Codex 사용본이 외부에서 수정됐다.
-        let edited = home.join(".codex/skills/sync-me");
+        let edited = install_dir(home, ".codex/skills", "sync-me");
         write_skill(&edited, "sync-me", "Edited by codex");
 
         let receipt = sync_skill_from_install_from_home(
@@ -5646,12 +5681,6 @@ mod tests {
             assert_eq!(deserialized, severity);
         }
 
-        assert!(SkillIssueSeverity::Blocking.is_blocking());
-        assert!(!SkillIssueSeverity::Blocking.is_warning());
-
-        assert!(SkillIssueSeverity::Warning.is_warning());
-        assert!(!SkillIssueSeverity::Warning.is_blocking());
-
         assert!("invalid".parse::<SkillIssueSeverity>().is_err());
     }
 
@@ -5675,12 +5704,6 @@ mod tests {
             assert_eq!(deserialized, policy);
         }
 
-        assert!(SkillOverwritePolicy::Fail.is_fail());
-        assert!(!SkillOverwritePolicy::Fail.is_replace());
-
-        assert!(SkillOverwritePolicy::Replace.is_replace());
-        assert!(!SkillOverwritePolicy::Replace.is_fail());
-
         assert!("unknown".parse::<SkillOverwritePolicy>().is_err());
     }
 
@@ -5703,22 +5726,6 @@ mod tests {
             assert_eq!(deserialized, outcome);
         }
 
-        assert!(SkillPublishOutcome::Published.is_published());
-        assert!(SkillPublishOutcome::Published.is_successful());
-        assert!(!SkillPublishOutcome::Published.is_failed());
-
-        assert!(SkillPublishOutcome::Replaced.is_replaced());
-        assert!(SkillPublishOutcome::Replaced.is_successful());
-
-        assert!(SkillPublishOutcome::Unchanged.is_unchanged());
-        assert!(SkillPublishOutcome::Unchanged.is_successful());
-
-        assert!(SkillPublishOutcome::Skipped.is_skipped());
-        assert!(!SkillPublishOutcome::Skipped.is_successful());
-
-        assert!(SkillPublishOutcome::Failed.is_failed());
-        assert!(!SkillPublishOutcome::Failed.is_successful());
-
         assert!("invalid".parse::<SkillPublishOutcome>().is_err());
     }
 
@@ -5740,18 +5747,6 @@ mod tests {
                 serde_json::from_str(&json).expect("역직렬화 성공");
             assert_eq!(deserialized, status);
         }
-
-        assert!(SkillFileChangeStatus::Added.is_added());
-        assert!(!SkillFileChangeStatus::Added.is_removed());
-        assert!(!SkillFileChangeStatus::Added.is_modified());
-
-        assert!(SkillFileChangeStatus::Removed.is_removed());
-        assert!(!SkillFileChangeStatus::Removed.is_added());
-        assert!(!SkillFileChangeStatus::Removed.is_modified());
-
-        assert!(SkillFileChangeStatus::Modified.is_modified());
-        assert!(!SkillFileChangeStatus::Modified.is_added());
-        assert!(!SkillFileChangeStatus::Modified.is_removed());
 
         assert!("invalid".parse::<SkillFileChangeStatus>().is_err());
     }

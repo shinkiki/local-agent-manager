@@ -8,25 +8,25 @@ Agent Manager 본체는 [MIT](LICENSE-MIT) 또는 [Apache License 2.0](LICENSE-A
 ## 요약
 
 - Rust(Cargo) 의존성: 598개 (워크스페이스 자체 크레이트 제외)
-- npm 배포 대상 의존성: 52개 (devDependencies 제외)
-- 수집한 고지 전문: 313종
+- npm 배포 대상 의존성: 166개 (devDependencies 제외)
+- 수집한 고지 전문: 367종
 
 | 라이선스 (SPDX) | Rust | npm |
 | --- | --- | --- |
 | MIT OR Apache-2.0 | 279 | 2 |
-| MIT | 139 | 47 |
+| MIT | 139 | 117 |
 | Apache-2.0 OR MIT | 53 | 1 |
+| ISC | 3 | 35 |
 | MIT/Apache-2.0 | 30 | 0 |
 | Unicode-3.0 | 18 | 0 |
 | Zlib OR Apache-2.0 OR MIT | 17 | 0 |
+| BSD-3-Clause | 3 | 6 |
 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 5 | 0 |
-| ISC | 3 | 2 |
 | MPL-2.0 | 5 | 0 |
 | Unlicense OR MIT | 5 | 0 |
+| Apache-2.0 | 3 | 1 |
 | Apache-2.0/MIT | 4 | 0 |
-| Apache-2.0 | 3 | 0 |
 | Apache-2.0 OR ISC OR MIT | 3 | 0 |
-| BSD-3-Clause | 3 | 0 |
 | MIT OR Apache-2.0 OR Zlib | 3 | 0 |
 | BSD-2-Clause OR Apache-2.0 OR MIT | 2 | 0 |
 | BSD-3-Clause OR Apache-2.0 | 2 | 0 |
@@ -35,6 +35,7 @@ Agent Manager 본체는 [MIT](LICENSE-MIT) 또는 [Apache License 2.0](LICENSE-A
 | Unlicense/MIT | 2 | 0 |
 | Zlib | 2 | 0 |
 | (MIT OR Apache-2.0) AND Unicode-3.0 | 1 | 0 |
+| (MPL-2.0 OR Apache-2.0) | 0 | 1 |
 | 0BSD OR MIT OR Apache-2.0 | 1 | 0 |
 | Apache-2.0 / MIT | 1 | 0 |
 | Apache-2.0 AND ISC | 1 | 0 |
@@ -45,11 +46,14 @@ Agent Manager 본체는 [MIT](LICENSE-MIT) 또는 [Apache License 2.0](LICENSE-A
 | BSD-2-Clause OR Apache-2.0 | 1 | 0 |
 | BSD-3-Clause AND MIT | 1 | 0 |
 | BSD-3-Clause/MIT | 1 | 0 |
+| CC0-1.0 | 0 | 1 |
 | CC0-1.0 OR MIT-0 OR Apache-2.0 | 1 | 0 |
 | CDLA-Permissive-2.0 | 1 | 0 |
 | ISC AND (Apache-2.0 OR ISC) | 1 | 0 |
 | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) | 1 | 0 |
 | MIT OR Zlib OR Apache-2.0 | 1 | 0 |
+| UNKNOWN | 0 | 1 |
+| Unlicense | 0 | 1 |
 
 ## Rust (Cargo) 의존성
 
@@ -658,6 +662,13 @@ Agent Manager 본체는 [MIT](LICENSE-MIT) 또는 [Apache License 2.0](LICENSE-A
 
 | 패키지 | 버전 | 라이선스 (SPDX) |
 | --- | --- | --- |
+| `@antfu/install-pkg` | 2.0.1 | MIT |
+| `@braintree/sanitize-url` | 7.1.2 | MIT |
+| `@chevrotain/types` | 11.1.2 | Apache-2.0 |
+| `@iconify-json/logos` | 1.2.14 | CC0-1.0 |
+| `@iconify/types` | 2.0.0 | MIT |
+| `@iconify/utils` | 3.1.7 | MIT |
+| `@mermaid-js/parser` | 1.2.1 | MIT |
 | `@shikijs/core` | 4.4.3 | MIT |
 | `@shikijs/engine-javascript` | 4.4.3 | MIT |
 | `@shikijs/langs` | 4.4.3 | MIT |
@@ -668,23 +679,117 @@ Agent Manager 본체는 [MIT](LICENSE-MIT) 또는 [Apache License 2.0](LICENSE-A
 | `@tauri-apps/api` | 2.11.1 | Apache-2.0 OR MIT |
 | `@tauri-apps/plugin-dialog` | 2.7.2 | MIT OR Apache-2.0 |
 | `@tauri-apps/plugin-opener` | 2.5.4 | MIT OR Apache-2.0 |
+| `@types/d3` | 7.4.3 | MIT |
+| `@types/d3-array` | 3.2.2 | MIT |
+| `@types/d3-axis` | 3.0.6 | MIT |
+| `@types/d3-brush` | 3.0.6 | MIT |
+| `@types/d3-chord` | 3.0.6 | MIT |
+| `@types/d3-color` | 3.1.3 | MIT |
+| `@types/d3-contour` | 3.0.6 | MIT |
+| `@types/d3-delaunay` | 6.0.4 | MIT |
+| `@types/d3-dispatch` | 3.0.7 | MIT |
+| `@types/d3-drag` | 3.0.7 | MIT |
+| `@types/d3-dsv` | 3.0.7 | MIT |
+| `@types/d3-ease` | 3.0.2 | MIT |
+| `@types/d3-fetch` | 3.0.7 | MIT |
+| `@types/d3-force` | 3.0.10 | MIT |
+| `@types/d3-format` | 3.0.4 | MIT |
+| `@types/d3-geo` | 3.1.1 | MIT |
+| `@types/d3-hierarchy` | 3.1.7 | MIT |
+| `@types/d3-interpolate` | 3.0.4 | MIT |
+| `@types/d3-path` | 3.1.1 | MIT |
+| `@types/d3-polygon` | 3.0.2 | MIT |
+| `@types/d3-quadtree` | 3.0.6 | MIT |
+| `@types/d3-random` | 3.0.4 | MIT |
+| `@types/d3-scale` | 4.0.9 | MIT |
+| `@types/d3-scale-chromatic` | 3.1.0 | MIT |
+| `@types/d3-selection` | 3.0.11 | MIT |
+| `@types/d3-shape` | 3.2.0 | MIT |
+| `@types/d3-time` | 3.0.4 | MIT |
+| `@types/d3-time-format` | 4.0.3 | MIT |
+| `@types/d3-timer` | 3.0.2 | MIT |
+| `@types/d3-transition` | 3.0.9 | MIT |
+| `@types/d3-zoom` | 3.0.8 | MIT |
+| `@types/geojson` | 7946.0.16 | MIT |
 | `@types/hast` | 3.0.5 | MIT |
 | `@types/mdast` | 4.0.4 | MIT |
+| `@types/trusted-types` | 2.0.7 | MIT |
 | `@types/unist` | 3.0.3 | MIT |
 | `@ungap/structured-clone` | 1.3.3 | ISC |
+| `@upsetjs/venn.js` | 2.0.0 | MIT |
 | `@xterm/addon-fit` | 0.10.0 | MIT |
 | `@xterm/xterm` | 5.5.0 | MIT |
 | `ccount` | 2.0.1 | MIT |
 | `character-entities-html4` | 2.1.0 | MIT |
 | `character-entities-legacy` | 3.0.0 | MIT |
 | `comma-separated-tokens` | 2.0.3 | MIT |
+| `commander` | 7.2.0 | MIT |
+| `commander` | 8.3.0 | MIT |
+| `cose-base` | 1.0.3 | MIT |
+| `cose-base` | 2.2.0 | MIT |
+| `cytoscape` | 3.34.3 | MIT |
+| `cytoscape-cose-bilkent` | 4.1.0 | MIT |
+| `cytoscape-fcose` | 2.2.0 | MIT |
+| `d3` | 7.9.0 | ISC |
+| `d3-array` | 2.12.1 | BSD-3-Clause |
+| `d3-array` | 3.2.4 | ISC |
+| `d3-axis` | 3.0.0 | ISC |
+| `d3-brush` | 3.0.0 | ISC |
+| `d3-chord` | 3.0.1 | ISC |
+| `d3-color` | 3.1.0 | ISC |
+| `d3-contour` | 4.0.2 | ISC |
+| `d3-delaunay` | 6.0.4 | ISC |
+| `d3-dispatch` | 3.0.1 | ISC |
+| `d3-drag` | 3.0.0 | ISC |
+| `d3-dsv` | 3.0.1 | ISC |
+| `d3-ease` | 3.0.1 | BSD-3-Clause |
+| `d3-fetch` | 3.0.1 | ISC |
+| `d3-force` | 3.0.0 | ISC |
+| `d3-format` | 3.1.2 | ISC |
+| `d3-geo` | 3.1.1 | ISC |
+| `d3-hierarchy` | 3.1.2 | ISC |
+| `d3-interpolate` | 3.0.1 | ISC |
+| `d3-path` | 1.0.9 | BSD-3-Clause |
+| `d3-path` | 3.1.0 | ISC |
+| `d3-polygon` | 3.0.1 | ISC |
+| `d3-quadtree` | 3.0.1 | ISC |
+| `d3-random` | 3.0.1 | ISC |
+| `d3-sankey` | 0.12.3 | BSD-3-Clause |
+| `d3-scale` | 4.0.2 | ISC |
+| `d3-scale-chromatic` | 3.1.0 | ISC |
+| `d3-selection` | 3.0.0 | ISC |
+| `d3-shape` | 1.3.7 | BSD-3-Clause |
+| `d3-shape` | 3.2.0 | ISC |
+| `d3-time` | 3.1.0 | ISC |
+| `d3-time-format` | 4.1.0 | ISC |
+| `d3-timer` | 3.0.1 | ISC |
+| `d3-transition` | 3.0.1 | ISC |
+| `d3-zoom` | 3.0.0 | ISC |
+| `dagre-d3-es` | 7.0.14 | MIT |
+| `dayjs` | 1.11.23 | MIT |
+| `delaunator` | 5.1.0 | ISC |
 | `dequal` | 2.0.3 | MIT |
 | `devlop` | 1.1.0 | MIT |
+| `dompurify` | 3.4.15 | (MPL-2.0 OR Apache-2.0) |
+| `es-toolkit` | 1.52.0 | MIT |
+| `fastdom` | 1.0.12 | MIT |
+| `hachure-fill` | 0.5.2 | MIT |
 | `hast-util-to-html` | 9.0.5 | MIT |
 | `hast-util-whitespace` | 3.0.0 | MIT |
 | `html-void-elements` | 3.0.0 | MIT |
+| `iconv-lite` | 0.6.3 | MIT |
+| `import-meta-resolve` | 4.2.0 | MIT |
+| `internmap` | 1.0.1 | ISC |
+| `internmap` | 2.0.3 | ISC |
+| `katex` | 0.16.47 | MIT |
+| `khroma` | 2.1.0 | UNKNOWN |
+| `layout-base` | 1.0.2 | MIT |
+| `layout-base` | 2.0.1 | MIT |
+| `lodash-es` | 4.18.1 | MIT |
 | `lucide-react` | 1.28.0 | ISC |
+| `marked` | 16.4.2 | MIT |
 | `mdast-util-to-hast` | 13.2.1 | MIT |
+| `mermaid` | 11.17.2 | MIT |
 | `micromark-util-character` | 2.1.1 | MIT |
 | `micromark-util-encode` | 2.0.1 | MIT |
 | `micromark-util-sanitize-uri` | 2.0.1 | MIT |
@@ -692,21 +797,34 @@ Agent Manager 본체는 [MIT](LICENSE-MIT) 또는 [Apache License 2.0](LICENSE-A
 | `micromark-util-types` | 2.0.2 | MIT |
 | `oniguruma-parser` | 0.12.2 | MIT |
 | `oniguruma-to-es` | 4.3.6 | MIT |
+| `package-manager-detector` | 1.8.0 | MIT |
+| `path-data-parser` | 0.1.0 | MIT |
+| `points-on-curve` | 0.2.0 | MIT |
+| `points-on-path` | 0.2.1 | MIT |
 | `property-information` | 7.2.0 | MIT |
 | `react` | 19.2.8 | MIT |
 | `react-dom` | 19.2.8 | MIT |
 | `regex` | 6.1.0 | MIT |
 | `regex-recursion` | 6.0.2 | MIT |
 | `regex-utilities` | 2.3.0 | MIT |
+| `robust-predicates` | 3.0.3 | Unlicense |
+| `roughjs` | 4.6.6 | MIT |
+| `rw` | 1.3.3 | BSD-3-Clause |
+| `safer-buffer` | 2.1.2 | MIT |
 | `scheduler` | 0.27.0 | MIT |
 | `space-separated-tokens` | 2.0.2 | MIT |
+| `strictdom` | 1.0.1 | MIT |
 | `stringify-entities` | 4.0.4 | MIT |
+| `stylis` | 4.4.0 | MIT |
+| `tinyexec` | 1.3.1 | MIT |
 | `trim-lines` | 3.0.1 | MIT |
+| `ts-dedent` | 2.3.0 | MIT |
 | `unist-util-is` | 6.0.1 | MIT |
 | `unist-util-position` | 5.0.0 | MIT |
 | `unist-util-stringify-position` | 4.0.0 | MIT |
 | `unist-util-visit` | 5.1.0 | MIT |
 | `unist-util-visit-parents` | 6.0.2 | MIT |
+| `uuid` | 14.0.2 | MIT |
 | `vfile` | 6.0.3 | MIT |
 | `vfile-message` | 4.0.3 | MIT |
 | `zwitch` | 2.0.4 | MIT |
@@ -759,15 +877,19 @@ Agent Manager 본체는 [MIT](LICENSE-MIT) 또는 [Apache License 2.0](LICENSE-A
 - `webview2-com-sys` 0.38.2 — MIT
 - `winapi-i686-pc-windows-gnu` 0.4.0 — MIT/Apache-2.0
 - `winapi-x86_64-pc-windows-gnu` 0.4.0 — MIT/Apache-2.0
+- `@iconify-json/logos` 1.2.14 — CC0-1.0
+- `fastdom` 1.0.12 — MIT
+- `strictdom` 1.0.1 — MIT
 
 ## 라이선스 및 저작권 고지 전문
 
 동일한 전문은 한 번만 싣고 해당 전문을 배포하는 패키지를 함께 표시합니다.
 
-### 고지 1 — 적용 패키지 170개
+### 고지 1 — 적용 패키지 172개
 
 <details><summary>적용 패키지 보기</summary>
 
+- @chevrotain/types 11.1.2 (LICENSE.txt)
 - aes 0.8.4 (LICENSE-APACHE)
 - async-channel 2.5.0 (LICENSE-APACHE)
 - async-executor 1.14.0 (LICENSE-APACHE)
@@ -811,6 +933,7 @@ Agent Manager 본체는 [MIT](LICENSE-MIT) 또는 [Apache License 2.0](LICENSE-A
 - dbus-secret-service 4.1.0 (LICENSE-APACHE)
 - digest 0.10.7 (LICENSE-APACHE)
 - displaydoc 0.2.7 (LICENSE-APACHE)
+- dompurify 3.4.15 (LICENSE)
 - downcast-rs 1.2.1 (LICENSE-APACHE)
 - embed_plist 1.2.2 (LICENSE-APACHE)
 - equivalent 1.0.2 (LICENSE-APACHE)
@@ -1145,7 +1268,121 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 2 — 적용 패키지 78개
+### 고지 2 — 적용 패키지 83개
+
+<details><summary>적용 패키지 보기</summary>
+
+- @types/d3 7.4.3 (LICENSE)
+- @types/d3-array 3.2.2 (LICENSE)
+- @types/d3-axis 3.0.6 (LICENSE)
+- @types/d3-brush 3.0.6 (LICENSE)
+- @types/d3-chord 3.0.6 (LICENSE)
+- @types/d3-color 3.1.3 (LICENSE)
+- @types/d3-contour 3.0.6 (LICENSE)
+- @types/d3-delaunay 6.0.4 (LICENSE)
+- @types/d3-dispatch 3.0.7 (LICENSE)
+- @types/d3-drag 3.0.7 (LICENSE)
+- @types/d3-dsv 3.0.7 (LICENSE)
+- @types/d3-ease 3.0.2 (LICENSE)
+- @types/d3-fetch 3.0.7 (LICENSE)
+- @types/d3-force 3.0.10 (LICENSE)
+- @types/d3-format 3.0.4 (LICENSE)
+- @types/d3-geo 3.1.1 (LICENSE)
+- @types/d3-hierarchy 3.1.7 (LICENSE)
+- @types/d3-interpolate 3.0.4 (LICENSE)
+- @types/d3-path 3.1.1 (LICENSE)
+- @types/d3-polygon 3.0.2 (LICENSE)
+- @types/d3-quadtree 3.0.6 (LICENSE)
+- @types/d3-random 3.0.4 (LICENSE)
+- @types/d3-scale 4.0.9 (LICENSE)
+- @types/d3-scale-chromatic 3.1.0 (LICENSE)
+- @types/d3-selection 3.0.11 (LICENSE)
+- @types/d3-shape 3.2.0 (LICENSE)
+- @types/d3-time 3.0.4 (LICENSE)
+- @types/d3-time-format 4.0.3 (LICENSE)
+- @types/d3-timer 3.0.2 (LICENSE)
+- @types/d3-transition 3.0.9 (LICENSE)
+- @types/d3-zoom 3.0.8 (LICENSE)
+- @types/geojson 7946.0.16 (LICENSE)
+- @types/hast 3.0.5 (LICENSE)
+- @types/mdast 4.0.4 (LICENSE)
+- @types/trusted-types 2.0.7 (LICENSE)
+- @types/unist 3.0.3 (LICENSE)
+- windows 0.61.3 (license-mit)
+- windows-collections 0.2.0 (license-mit)
+- windows-core 0.61.2 (license-mit)
+- windows-core 0.62.2 (license-mit)
+- windows-future 0.2.1 (license-mit)
+- windows-implement 0.60.2 (license-mit)
+- windows-interface 0.59.3 (license-mit)
+- windows-link 0.1.3 (license-mit)
+- windows-link 0.2.1 (license-mit)
+- windows-numerics 0.2.0 (license-mit)
+- windows-result 0.3.4 (license-mit)
+- windows-result 0.4.1 (license-mit)
+- windows-strings 0.4.2 (license-mit)
+- windows-strings 0.5.1 (license-mit)
+- windows-sys 0.45.0 (license-mit)
+- windows-sys 0.52.0 (license-mit)
+- windows-sys 0.59.0 (license-mit)
+- windows-sys 0.60.2 (license-mit)
+- windows-sys 0.61.2 (license-mit)
+- windows-targets 0.42.2 (license-mit)
+- windows-targets 0.52.6 (license-mit)
+- windows-targets 0.53.5 (license-mit)
+- windows-threading 0.1.0 (license-mit)
+- windows-version 0.1.7 (license-mit)
+- windows_aarch64_gnullvm 0.42.2 (license-mit)
+- windows_aarch64_gnullvm 0.52.6 (license-mit)
+- windows_aarch64_gnullvm 0.53.1 (license-mit)
+- windows_aarch64_msvc 0.42.2 (license-mit)
+- windows_aarch64_msvc 0.52.6 (license-mit)
+- windows_aarch64_msvc 0.53.1 (license-mit)
+- windows_i686_gnu 0.42.2 (license-mit)
+- windows_i686_gnu 0.52.6 (license-mit)
+- windows_i686_gnu 0.53.1 (license-mit)
+- windows_i686_gnullvm 0.52.6 (license-mit)
+- windows_i686_gnullvm 0.53.1 (license-mit)
+- windows_i686_msvc 0.42.2 (license-mit)
+- windows_i686_msvc 0.52.6 (license-mit)
+- windows_i686_msvc 0.53.1 (license-mit)
+- windows_x86_64_gnu 0.42.2 (license-mit)
+- windows_x86_64_gnu 0.52.6 (license-mit)
+- windows_x86_64_gnu 0.53.1 (license-mit)
+- windows_x86_64_gnullvm 0.42.2 (license-mit)
+- windows_x86_64_gnullvm 0.52.6 (license-mit)
+- windows_x86_64_gnullvm 0.53.1 (license-mit)
+- windows_x86_64_msvc 0.42.2 (license-mit)
+- windows_x86_64_msvc 0.52.6 (license-mit)
+- windows_x86_64_msvc 0.53.1 (license-mit)
+
+</details>
+
+```text
+MIT License
+
+    Copyright (c) Microsoft Corporation.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE
+```
+
+### 고지 3 — 적용 패키지 78개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -1256,7 +1493,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 3 — 적용 패키지 61개
+### 고지 4 — 적용 패키지 61개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -1501,87 +1738,6 @@ TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
    of your accepting any such warranty or additional liability.
 
 END OF TERMS AND CONDITIONS
-```
-
-### 고지 4 — 적용 패키지 50개
-
-<details><summary>적용 패키지 보기</summary>
-
-- @types/hast 3.0.5 (LICENSE)
-- @types/mdast 4.0.4 (LICENSE)
-- @types/unist 3.0.3 (LICENSE)
-- windows 0.61.3 (license-mit)
-- windows-collections 0.2.0 (license-mit)
-- windows-core 0.61.2 (license-mit)
-- windows-core 0.62.2 (license-mit)
-- windows-future 0.2.1 (license-mit)
-- windows-implement 0.60.2 (license-mit)
-- windows-interface 0.59.3 (license-mit)
-- windows-link 0.1.3 (license-mit)
-- windows-link 0.2.1 (license-mit)
-- windows-numerics 0.2.0 (license-mit)
-- windows-result 0.3.4 (license-mit)
-- windows-result 0.4.1 (license-mit)
-- windows-strings 0.4.2 (license-mit)
-- windows-strings 0.5.1 (license-mit)
-- windows-sys 0.45.0 (license-mit)
-- windows-sys 0.52.0 (license-mit)
-- windows-sys 0.59.0 (license-mit)
-- windows-sys 0.60.2 (license-mit)
-- windows-sys 0.61.2 (license-mit)
-- windows-targets 0.42.2 (license-mit)
-- windows-targets 0.52.6 (license-mit)
-- windows-targets 0.53.5 (license-mit)
-- windows-threading 0.1.0 (license-mit)
-- windows-version 0.1.7 (license-mit)
-- windows_aarch64_gnullvm 0.42.2 (license-mit)
-- windows_aarch64_gnullvm 0.52.6 (license-mit)
-- windows_aarch64_gnullvm 0.53.1 (license-mit)
-- windows_aarch64_msvc 0.42.2 (license-mit)
-- windows_aarch64_msvc 0.52.6 (license-mit)
-- windows_aarch64_msvc 0.53.1 (license-mit)
-- windows_i686_gnu 0.42.2 (license-mit)
-- windows_i686_gnu 0.52.6 (license-mit)
-- windows_i686_gnu 0.53.1 (license-mit)
-- windows_i686_gnullvm 0.52.6 (license-mit)
-- windows_i686_gnullvm 0.53.1 (license-mit)
-- windows_i686_msvc 0.42.2 (license-mit)
-- windows_i686_msvc 0.52.6 (license-mit)
-- windows_i686_msvc 0.53.1 (license-mit)
-- windows_x86_64_gnu 0.42.2 (license-mit)
-- windows_x86_64_gnu 0.52.6 (license-mit)
-- windows_x86_64_gnu 0.53.1 (license-mit)
-- windows_x86_64_gnullvm 0.42.2 (license-mit)
-- windows_x86_64_gnullvm 0.52.6 (license-mit)
-- windows_x86_64_gnullvm 0.53.1 (license-mit)
-- windows_x86_64_msvc 0.42.2 (license-mit)
-- windows_x86_64_msvc 0.52.6 (license-mit)
-- windows_x86_64_msvc 0.53.1 (license-mit)
-
-</details>
-
-```text
-MIT License
-
-    Copyright (c) Microsoft Corporation.
-
-    Permission is hereby granted, free of charge, to any person obtaining a copy
-    of this software and associated documentation files (the "Software"), to deal
-    in the Software without restriction, including without limitation the rights
-    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-    copies of the Software, and to permit persons to whom the Software is
-    furnished to do so, subject to the following conditions:
-
-    The above copyright notice and this permission notice shall be included in all
-    copies or substantial portions of the Software.
-
-    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-    SOFTWARE
 ```
 
 ### 고지 5 — 적용 패키지 47개
@@ -2263,7 +2419,47 @@ Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
 ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
-### 고지 10 — 적용 패키지 14개
+### 고지 10 — 적용 패키지 17개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-axis 3.0.0 (LICENSE)
+- d3-brush 3.0.0 (LICENSE)
+- d3-chord 3.0.1 (LICENSE)
+- d3-dispatch 3.0.1 (LICENSE)
+- d3-drag 3.0.0 (LICENSE)
+- d3-force 3.0.0 (LICENSE)
+- d3-hierarchy 3.1.2 (LICENSE)
+- d3-interpolate 3.0.1 (LICENSE)
+- d3-polygon 3.0.1 (LICENSE)
+- d3-quadtree 3.0.1 (LICENSE)
+- d3-random 3.0.1 (LICENSE)
+- d3-scale 4.0.2 (LICENSE)
+- d3-selection 3.0.0 (LICENSE)
+- d3-time-format 4.1.0 (LICENSE)
+- d3-timer 3.0.1 (LICENSE)
+- d3-transition 3.0.1 (LICENSE)
+- d3-zoom 3.0.0 (LICENSE)
+
+</details>
+
+```text
+Copyright 2010-2021 Mike Bostock
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+```
+
+### 고지 11 — 적용 패키지 14개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -2312,7 +2508,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 11 — 적용 패키지 14개
+### 고지 12 — 적용 패키지 14개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -2357,7 +2553,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 12 — 적용 패키지 12개
+### 고지 13 — 적용 패키지 12개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -2398,7 +2594,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 13 — 적용 패키지 11개
+### 고지 14 — 적용 패키지 11개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -2433,7 +2629,7 @@ LGPL or other licenses. For more information check the license of each GNOME
 library.
 ```
 
-### 고지 14 — 적용 패키지 9개
+### 고지 15 — 적용 패키지 9개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -2477,7 +2673,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 15 — 적용 패키지 8개
+### 고지 16 — 적용 패키지 8개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -2697,7 +2893,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 16 — 적용 패키지 8개
+### 고지 17 — 적용 패키지 8개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -2741,7 +2937,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 17 — 적용 패키지 8개
+### 고지 18 — 적용 패키지 8개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -2771,7 +2967,7 @@ The Rand project includes code from the Rust project
 published under these same licenses.
 ```
 
-### 고지 18 — 적용 패키지 8개
+### 고지 19 — 적용 패키지 8개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -2811,7 +3007,7 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 19 — 적용 패키지 7개
+### 고지 20 — 적용 패키지 7개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -2852,7 +3048,7 @@ OTHER DEALINGS IN THE SOFTWARE.
 For more information, please refer to <http://unlicense.org/>
 ```
 
-### 고지 20 — 적용 패키지 7개
+### 고지 21 — 적용 패키지 7개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -2889,7 +3085,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 21 — 적용 패키지 7개
+### 고지 22 — 적용 패키지 7개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -2932,7 +3128,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 22 — 적용 패키지 7개
+### 고지 23 — 적용 패키지 7개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -2969,7 +3165,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/tauri.git
 Creator: Person: Daniel Thompson-Yvetot
 ```
 
-### 고지 23 — 적용 패키지 7개
+### 고지 24 — 적용 패키지 7개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -3008,7 +3204,7 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 24 — 적용 패키지 6개
+### 고지 25 — 적용 패키지 6개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -3027,7 +3223,7 @@ This project is dual-licensed under the Unlicense and MIT licenses.
 You may use this code under the terms of either license.
 ```
 
-### 고지 25 — 적용 패키지 6개
+### 고지 26 — 적용 패키지 6개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -3068,7 +3264,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 26 — 적용 패키지 6개
+### 고지 27 — 적용 패키지 6개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -3302,7 +3498,7 @@ the License, but only in their entirety and only with respect to the Combined
 Software.
 ```
 
-### 고지 27 — 적용 패키지 6개
+### 고지 28 — 적용 패키지 6개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -3340,7 +3536,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 28 — 적용 패키지 5개
+### 고지 29 — 적용 패키지 5개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -3556,7 +3752,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 29 — 적용 패키지 5개
+### 고지 30 — 적용 패키지 5개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -3592,7 +3788,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 30 — 적용 패키지 5개
+### 고지 31 — 적용 패키지 5개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -3612,7 +3808,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 31 — 적용 패키지 5개
+### 고지 32 — 적용 패키지 5개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -3646,7 +3842,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 32 — 적용 패키지 5개
+### 고지 33 — 적용 패키지 5개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -3686,7 +3882,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 33 — 적용 패키지 5개
+### 고지 34 — 적용 패키지 5개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -3723,970 +3919,13 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 34 — 적용 패키지 4개
-
-<details><summary>적용 패키지 보기</summary>
-
-- dirs 4.0.0 (LICENSE-APACHE)
-- dirs 6.0.0 (LICENSE-APACHE)
-- dirs-sys 0.3.7 (LICENSE-APACHE)
-- dirs-sys 0.5.0 (LICENSE-APACHE)
-
-</details>
-
-```text
-Apache License
-                        Version 2.0, January 2004
-                     http://www.apache.org/licenses/
-
-TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
-
-1. Definitions.
-
-   "License" shall mean the terms and conditions for use, reproduction,
-   and distribution as defined by Sections 1 through 9 of this document.
-
-   "Licensor" shall mean the copyright owner or entity authorized by
-   the copyright owner that is granting the License.
-
-   "Legal Entity" shall mean the union of the acting entity and all
-   other entities that control, are controlled by, or are under common
-   control with that entity. For the purposes of this definition,
-   "control" means (i) the power, direct or indirect, to cause the
-   direction or management of such entity, whether by contract or
-   otherwise, or (ii) ownership of fifty percent (50%) or more of the
-   outstanding shares, or (iii) beneficial ownership of such entity.
-
-   "You" (or "Your") shall mean an individual or Legal Entity
-   exercising permissions granted by this License.
-
-   "Source" form shall mean the preferred form for making modifications,
-   including but not limited to software source code, documentation
-   source, and configuration files.
-
-   "Object" form shall mean any form resulting from mechanical
-   transformation or translation of a Source form, including but
-   not limited to compiled object code, generated documentation,
-   and conversions to other media types.
-
-   "Work" shall mean the work of authorship, whether in Source or
-   Object form, made available under the License, as indicated by a
-   copyright notice that is included in or attached to the work
-   (an example is provided in the Appendix below).
-
-   "Derivative Works" shall mean any work, whether in Source or Object
-   form, that is based on (or derived from) the Work and for which the
-   editorial revisions, annotations, elaborations, or other modifications
-   represent, as a whole, an original work of authorship. For the purposes
-   of this License, Derivative Works shall not include works that remain
-   separable from, or merely link (or bind by name) to the interfaces of,
-   the Work and Derivative Works thereof.
-
-   "Contribution" shall mean any work of authorship, including
-   the original version of the Work and any modifications or additions
-   to that Work or Derivative Works thereof, that is intentionally
-   submitted to Licensor for inclusion in the Work by the copyright owner
-   or by an individual or Legal Entity authorized to submit on behalf of
-   the copyright owner. For the purposes of this definition, "submitted"
-   means any form of electronic, verbal, or written communication sent
-   to the Licensor or its representatives, including but not limited to
-   communication on electronic mailing lists, source code control systems,
-   and issue tracking systems that are managed by, or on behalf of, the
-   Licensor for the purpose of discussing and improving the Work, but
-   excluding communication that is conspicuously marked or otherwise
-   designated in writing by the copyright owner as "Not a Contribution."
-
-   "Contributor" shall mean Licensor and any individual or Legal Entity
-   on behalf of whom a Contribution has been received by Licensor and
-   subsequently incorporated within the Work.
-
-2. Grant of Copyright License. Subject to the terms and conditions of
-   this License, each Contributor hereby grants to You a perpetual,
-   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-   copyright license to reproduce, prepare Derivative Works of,
-   publicly display, publicly perform, sublicense, and distribute the
-   Work and such Derivative Works in Source or Object form.
-
-3. Grant of Patent License. Subject to the terms and conditions of
-   this License, each Contributor hereby grants to You a perpetual,
-   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-   (except as stated in this section) patent license to make, have made,
-   use, offer to sell, sell, import, and otherwise transfer the Work,
-   where such license applies only to those patent claims licensable
-   by such Contributor that are necessarily infringed by their
-   Contribution(s) alone or by combination of their Contribution(s)
-   with the Work to which such Contribution(s) was submitted. If You
-   institute patent litigation against any entity (including a
-   cross-claim or counterclaim in a lawsuit) alleging that the Work
-   or a Contribution incorporated within the Work constitutes direct
-   or contributory patent infringement, then any patent licenses
-   granted to You under this License for that Work shall terminate
-   as of the date such litigation is filed.
-
-4. Redistribution. You may reproduce and distribute copies of the
-   Work or Derivative Works thereof in any medium, with or without
-   modifications, and in Source or Object form, provided that You
-   meet the following conditions:
-
-   (a) You must give any other recipients of the Work or
-       Derivative Works a copy of this License; and
-
-   (b) You must cause any modified files to carry prominent notices
-       stating that You changed the files; and
-
-   (c) You must retain, in the Source form of any Derivative Works
-       that You distribute, all copyright, patent, trademark, and
-       attribution notices from the Source form of the Work,
-       excluding those notices that do not pertain to any part of
-       the Derivative Works; and
-
-   (d) If the Work includes a "NOTICE" text file as part of its
-       distribution, then any Derivative Works that You distribute must
-       include a readable copy of the attribution notices contained
-       within such NOTICE file, excluding those notices that do not
-       pertain to any part of the Derivative Works, in at least one
-       of the following places: within a NOTICE text file distributed
-       as part of the Derivative Works; within the Source form or
-       documentation, if provided along with the Derivative Works; or,
-       within a display generated by the Derivative Works, if and
-       wherever such third-party notices normally appear. The contents
-       of the NOTICE file are for informational purposes only and
-       do not modify the License. You may add Your own attribution
-       notices within Derivative Works that You distribute, alongside
-       or as an addendum to the NOTICE text from the Work, provided
-       that such additional attribution notices cannot be construed
-       as modifying the License.
-
-   You may add Your own copyright statement to Your modifications and
-   may provide additional or different license terms and conditions
-   for use, reproduction, or distribution of Your modifications, or
-   for any such Derivative Works as a whole, provided Your use,
-   reproduction, and distribution of the Work otherwise complies with
-   the conditions stated in this License.
-
-5. Submission of Contributions. Unless You explicitly state otherwise,
-   any Contribution intentionally submitted for inclusion in the Work
-   by You to the Licensor shall be under the terms and conditions of
-   this License, without any additional terms or conditions.
-   Notwithstanding the above, nothing herein shall supersede or modify
-   the terms of any separate license agreement you may have executed
-   with Licensor regarding such Contributions.
-
-6. Trademarks. This License does not grant permission to use the trade
-   names, trademarks, service marks, or product names of the Licensor,
-   except as required for reasonable and customary use in describing the
-   origin of the Work and reproducing the content of the NOTICE file.
-
-7. Disclaimer of Warranty. Unless required by applicable law or
-   agreed to in writing, Licensor provides the Work (and each
-   Contributor provides its Contributions) on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-   implied, including, without limitation, any warranties or conditions
-   of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
-   PARTICULAR PURPOSE. You are solely responsible for determining the
-   appropriateness of using or redistributing the Work and assume any
-   risks associated with Your exercise of permissions under this License.
-
-8. Limitation of Liability. In no event and under no legal theory,
-   whether in tort (including negligence), contract, or otherwise,
-   unless required by applicable law (such as deliberate and grossly
-   negligent acts) or agreed to in writing, shall any Contributor be
-   liable to You for damages, including any direct, indirect, special,
-   incidental, or consequential damages of any character arising as a
-   result of this License or out of the use or inability to use the
-   Work (including but not limited to damages for loss of goodwill,
-   work stoppage, computer failure or malfunction, or any and all
-   other commercial damages or losses), even if such Contributor
-   has been advised of the possibility of such damages.
-
-9. Accepting Warranty or Additional Liability. While redistributing
-   the Work or Derivative Works thereof, You may choose to offer,
-   and charge a fee for, acceptance of support, warranty, indemnity,
-   or other liability obligations and/or rights consistent with this
-   License. However, in accepting such obligations, You may act only
-   on Your own behalf and on Your sole responsibility, not on behalf
-   of any other Contributor, and only if You agree to indemnify,
-   defend, and hold each Contributor harmless for any liability
-   incurred by, or claims asserted against, such Contributor by reason
-   of your accepting any such warranty or additional liability.
-```
-
 ### 고지 35 — 적용 패키지 4개
-
-<details><summary>적용 패키지 보기</summary>
-
-- dirs 4.0.0 (LICENSE-MIT)
-- dirs 6.0.0 (LICENSE-MIT)
-- dirs-sys 0.3.7 (LICENSE-MIT)
-- dirs-sys 0.5.0 (LICENSE-MIT)
-
-</details>
-
-```text
-Copyright (c) 2018-2019 dirs-rs contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
-### 고지 36 — 적용 패키지 4개
-
-<details><summary>적용 패키지 보기</summary>
-
-- getrandom 0.2.17 (LICENSE-APACHE)
-- getrandom 0.3.4 (LICENSE-APACHE)
-- getrandom 0.4.3 (LICENSE-APACHE)
-- rand_chacha 0.3.1 (LICENSE-APACHE)
-
-</details>
-
-```text
-Apache License
-                        Version 2.0, January 2004
-                     https://www.apache.org/licenses/
-
-TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
-
-1. Definitions.
-
-   "License" shall mean the terms and conditions for use, reproduction,
-   and distribution as defined by Sections 1 through 9 of this document.
-
-   "Licensor" shall mean the copyright owner or entity authorized by
-   the copyright owner that is granting the License.
-
-   "Legal Entity" shall mean the union of the acting entity and all
-   other entities that control, are controlled by, or are under common
-   control with that entity. For the purposes of this definition,
-   "control" means (i) the power, direct or indirect, to cause the
-   direction or management of such entity, whether by contract or
-   otherwise, or (ii) ownership of fifty percent (50%) or more of the
-   outstanding shares, or (iii) beneficial ownership of such entity.
-
-   "You" (or "Your") shall mean an individual or Legal Entity
-   exercising permissions granted by this License.
-
-   "Source" form shall mean the preferred form for making modifications,
-   including but not limited to software source code, documentation
-   source, and configuration files.
-
-   "Object" form shall mean any form resulting from mechanical
-   transformation or translation of a Source form, including but
-   not limited to compiled object code, generated documentation,
-   and conversions to other media types.
-
-   "Work" shall mean the work of authorship, whether in Source or
-   Object form, made available under the License, as indicated by a
-   copyright notice that is included in or attached to the work
-   (an example is provided in the Appendix below).
-
-   "Derivative Works" shall mean any work, whether in Source or Object
-   form, that is based on (or derived from) the Work and for which the
-   editorial revisions, annotations, elaborations, or other modifications
-   represent, as a whole, an original work of authorship. For the purposes
-   of this License, Derivative Works shall not include works that remain
-   separable from, or merely link (or bind by name) to the interfaces of,
-   the Work and Derivative Works thereof.
-
-   "Contribution" shall mean any work of authorship, including
-   the original version of the Work and any modifications or additions
-   to that Work or Derivative Works thereof, that is intentionally
-   submitted to Licensor for inclusion in the Work by the copyright owner
-   or by an individual or Legal Entity authorized to submit on behalf of
-   the copyright owner. For the purposes of this definition, "submitted"
-   means any form of electronic, verbal, or written communication sent
-   to the Licensor or its representatives, including but not limited to
-   communication on electronic mailing lists, source code control systems,
-   and issue tracking systems that are managed by, or on behalf of, the
-   Licensor for the purpose of discussing and improving the Work, but
-   excluding communication that is conspicuously marked or otherwise
-   designated in writing by the copyright owner as "Not a Contribution."
-
-   "Contributor" shall mean Licensor and any individual or Legal Entity
-   on behalf of whom a Contribution has been received by Licensor and
-   subsequently incorporated within the Work.
-
-2. Grant of Copyright License. Subject to the terms and conditions of
-   this License, each Contributor hereby grants to You a perpetual,
-   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-   copyright license to reproduce, prepare Derivative Works of,
-   publicly display, publicly perform, sublicense, and distribute the
-   Work and such Derivative Works in Source or Object form.
-
-3. Grant of Patent License. Subject to the terms and conditions of
-   this License, each Contributor hereby grants to You a perpetual,
-   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-   (except as stated in this section) patent license to make, have made,
-   use, offer to sell, sell, import, and otherwise transfer the Work,
-   where such license applies only to those patent claims licensable
-   by such Contributor that are necessarily infringed by their
-   Contribution(s) alone or by combination of their Contribution(s)
-   with the Work to which such Contribution(s) was submitted. If You
-   institute patent litigation against any entity (including a
-   cross-claim or counterclaim in a lawsuit) alleging that the Work
-   or a Contribution incorporated within the Work constitutes direct
-   or contributory patent infringement, then any patent licenses
-   granted to You under this License for that Work shall terminate
-   as of the date such litigation is filed.
-
-4. Redistribution. You may reproduce and distribute copies of the
-   Work or Derivative Works thereof in any medium, with or without
-   modifications, and in Source or Object form, provided that You
-   meet the following conditions:
-
-   (a) You must give any other recipients of the Work or
-       Derivative Works a copy of this License; and
-
-   (b) You must cause any modified files to carry prominent notices
-       stating that You changed the files; and
-
-   (c) You must retain, in the Source form of any Derivative Works
-       that You distribute, all copyright, patent, trademark, and
-       attribution notices from the Source form of the Work,
-       excluding those notices that do not pertain to any part of
-       the Derivative Works; and
-
-   (d) If the Work includes a "NOTICE" text file as part of its
-       distribution, then any Derivative Works that You distribute must
-       include a readable copy of the attribution notices contained
-       within such NOTICE file, excluding those notices that do not
-       pertain to any part of the Derivative Works, in at least one
-       of the following places: within a NOTICE text file distributed
-       as part of the Derivative Works; within the Source form or
-       documentation, if provided along with the Derivative Works; or,
-       within a display generated by the Derivative Works, if and
-       wherever such third-party notices normally appear. The contents
-       of the NOTICE file are for informational purposes only and
-       do not modify the License. You may add Your own attribution
-       notices within Derivative Works that You distribute, alongside
-       or as an addendum to the NOTICE text from the Work, provided
-       that such additional attribution notices cannot be construed
-       as modifying the License.
-
-   You may add Your own copyright statement to Your modifications and
-   may provide additional or different license terms and conditions
-   for use, reproduction, or distribution of Your modifications, or
-   for any such Derivative Works as a whole, provided Your use,
-   reproduction, and distribution of the Work otherwise complies with
-   the conditions stated in this License.
-
-5. Submission of Contributions. Unless You explicitly state otherwise,
-   any Contribution intentionally submitted for inclusion in the Work
-   by You to the Licensor shall be under the terms and conditions of
-   this License, without any additional terms or conditions.
-   Notwithstanding the above, nothing herein shall supersede or modify
-   the terms of any separate license agreement you may have executed
-   with Licensor regarding such Contributions.
-
-6. Trademarks. This License does not grant permission to use the trade
-   names, trademarks, service marks, or product names of the Licensor,
-   except as required for reasonable and customary use in describing the
-   origin of the Work and reproducing the content of the NOTICE file.
-
-7. Disclaimer of Warranty. Unless required by applicable law or
-   agreed to in writing, Licensor provides the Work (and each
-   Contributor provides its Contributions) on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-   implied, including, without limitation, any warranties or conditions
-   of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
-   PARTICULAR PURPOSE. You are solely responsible for determining the
-   appropriateness of using or redistributing the Work and assume any
-   risks associated with Your exercise of permissions under this License.
-
-8. Limitation of Liability. In no event and under no legal theory,
-   whether in tort (including negligence), contract, or otherwise,
-   unless required by applicable law (such as deliberate and grossly
-   negligent acts) or agreed to in writing, shall any Contributor be
-   liable to You for damages, including any direct, indirect, special,
-   incidental, or consequential damages of any character arising as a
-   result of this License or out of the use or inability to use the
-   Work (including but not limited to damages for loss of goodwill,
-   work stoppage, computer failure or malfunction, or any and all
-   other commercial damages or losses), even if such Contributor
-   has been advised of the possibility of such damages.
-
-9. Accepting Warranty or Additional Liability. While redistributing
-   the Work or Derivative Works thereof, You may choose to offer,
-   and charge a fee for, acceptance of support, warranty, indemnity,
-   or other liability obligations and/or rights consistent with this
-   License. However, in accepting such obligations, You may act only
-   on Your own behalf and on Your sole responsibility, not on behalf
-   of any other Contributor, and only if You agree to indemnify,
-   defend, and hold each Contributor harmless for any liability
-   incurred by, or claims asserted against, such Contributor by reason
-   of your accepting any such warranty or additional liability.
-
-END OF TERMS AND CONDITIONS
-
-APPENDIX: How to apply the Apache License to your work.
-
-   To apply the Apache License to your work, attach the following
-   boilerplate notice, with the fields enclosed by brackets "[]"
-   replaced with your own identifying information. (Don't include
-   the brackets!)  The text should be enclosed in the appropriate
-   comment syntax for the file format. We also recommend that a
-   file or class name and description of purpose be included on the
-   same "printed page" as the copyright notice for easier
-   identification within third-party archives.
-
-Copyright [yyyy] [name of copyright owner]
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
-
-### 고지 37 — 적용 패키지 4개
-
-<details><summary>적용 패키지 보기</summary>
-
-- lock_api 0.4.14 (LICENSE-MIT)
-- parking_lot 0.12.5 (LICENSE-MIT)
-- parking_lot_core 0.9.12 (LICENSE-MIT)
-- rustc_version 0.4.1 (LICENSE-MIT)
-
-</details>
-
-```text
-Copyright (c) 2016 The Rust Project Developers
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-```
-
-### 고지 38 — 적용 패키지 4개
-
-<details><summary>적용 패키지 보기</summary>
-
-- rand 0.10.2 (LICENSE-APACHE)
-- rand 0.8.7 (LICENSE-APACHE)
-- rand 0.9.5 (LICENSE-APACHE)
-- rand_chacha 0.9.0 (LICENSE-APACHE)
-
-</details>
-
-```text
-Apache License
-                        Version 2.0, January 2004
-                     https://www.apache.org/licenses/
-
-TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
-
-1. Definitions.
-
-   "License" shall mean the terms and conditions for use, reproduction,
-   and distribution as defined by Sections 1 through 9 of this document.
-
-   "Licensor" shall mean the copyright owner or entity authorized by
-   the copyright owner that is granting the License.
-
-   "Legal Entity" shall mean the union of the acting entity and all
-   other entities that control, are controlled by, or are under common
-   control with that entity. For the purposes of this definition,
-   "control" means (i) the power, direct or indirect, to cause the
-   direction or management of such entity, whether by contract or
-   otherwise, or (ii) ownership of fifty percent (50%) or more of the
-   outstanding shares, or (iii) beneficial ownership of such entity.
-
-   "You" (or "Your") shall mean an individual or Legal Entity
-   exercising permissions granted by this License.
-
-   "Source" form shall mean the preferred form for making modifications,
-   including but not limited to software source code, documentation
-   source, and configuration files.
-
-   "Object" form shall mean any form resulting from mechanical
-   transformation or translation of a Source form, including but
-   not limited to compiled object code, generated documentation,
-   and conversions to other media types.
-
-   "Work" shall mean the work of authorship, whether in Source or
-   Object form, made available under the License, as indicated by a
-   copyright notice that is included in or attached to the work
-   (an example is provided in the Appendix below).
-
-   "Derivative Works" shall mean any work, whether in Source or Object
-   form, that is based on (or derived from) the Work and for which the
-   editorial revisions, annotations, elaborations, or other modifications
-   represent, as a whole, an original work of authorship. For the purposes
-   of this License, Derivative Works shall not include works that remain
-   separable from, or merely link (or bind by name) to the interfaces of,
-   the Work and Derivative Works thereof.
-
-   "Contribution" shall mean any work of authorship, including
-   the original version of the Work and any modifications or additions
-   to that Work or Derivative Works thereof, that is intentionally
-   submitted to Licensor for inclusion in the Work by the copyright owner
-   or by an individual or Legal Entity authorized to submit on behalf of
-   the copyright owner. For the purposes of this definition, "submitted"
-   means any form of electronic, verbal, or written communication sent
-   to the Licensor or its representatives, including but not limited to
-   communication on electronic mailing lists, source code control systems,
-   and issue tracking systems that are managed by, or on behalf of, the
-   Licensor for the purpose of discussing and improving the Work, but
-   excluding communication that is conspicuously marked or otherwise
-   designated in writing by the copyright owner as "Not a Contribution."
-
-   "Contributor" shall mean Licensor and any individual or Legal Entity
-   on behalf of whom a Contribution has been received by Licensor and
-   subsequently incorporated within the Work.
-
-2. Grant of Copyright License. Subject to the terms and conditions of
-   this License, each Contributor hereby grants to You a perpetual,
-   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-   copyright license to reproduce, prepare Derivative Works of,
-   publicly display, publicly perform, sublicense, and distribute the
-   Work and such Derivative Works in Source or Object form.
-
-3. Grant of Patent License. Subject to the terms and conditions of
-   this License, each Contributor hereby grants to You a perpetual,
-   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-   (except as stated in this section) patent license to make, have made,
-   use, offer to sell, sell, import, and otherwise transfer the Work,
-   where such license applies only to those patent claims licensable
-   by such Contributor that are necessarily infringed by their
-   Contribution(s) alone or by combination of their Contribution(s)
-   with the Work to which such Contribution(s) was submitted. If You
-   institute patent litigation against any entity (including a
-   cross-claim or counterclaim in a lawsuit) alleging that the Work
-   or a Contribution incorporated within the Work constitutes direct
-   or contributory patent infringement, then any patent licenses
-   granted to You under this License for that Work shall terminate
-   as of the date such litigation is filed.
-
-4. Redistribution. You may reproduce and distribute copies of the
-   Work or Derivative Works thereof in any medium, with or without
-   modifications, and in Source or Object form, provided that You
-   meet the following conditions:
-
-   (a) You must give any other recipients of the Work or
-       Derivative Works a copy of this License; and
-
-   (b) You must cause any modified files to carry prominent notices
-       stating that You changed the files; and
-
-   (c) You must retain, in the Source form of any Derivative Works
-       that You distribute, all copyright, patent, trademark, and
-       attribution notices from the Source form of the Work,
-       excluding those notices that do not pertain to any part of
-       the Derivative Works; and
-
-   (d) If the Work includes a "NOTICE" text file as part of its
-       distribution, then any Derivative Works that You distribute must
-       include a readable copy of the attribution notices contained
-       within such NOTICE file, excluding those notices that do not
-       pertain to any part of the Derivative Works, in at least one
-       of the following places: within a NOTICE text file distributed
-       as part of the Derivative Works; within the Source form or
-       documentation, if provided along with the Derivative Works; or,
-       within a display generated by the Derivative Works, if and
-       wherever such third-party notices normally appear. The contents
-       of the NOTICE file are for informational purposes only and
-       do not modify the License. You may add Your own attribution
-       notices within Derivative Works that You distribute, alongside
-       or as an addendum to the NOTICE text from the Work, provided
-       that such additional attribution notices cannot be construed
-       as modifying the License.
-
-   You may add Your own copyright statement to Your modifications and
-   may provide additional or different license terms and conditions
-   for use, reproduction, or distribution of Your modifications, or
-   for any such Derivative Works as a whole, provided Your use,
-   reproduction, and distribution of the Work otherwise complies with
-   the conditions stated in this License.
-
-5. Submission of Contributions. Unless You explicitly state otherwise,
-   any Contribution intentionally submitted for inclusion in the Work
-   by You to the Licensor shall be under the terms and conditions of
-   this License, without any additional terms or conditions.
-   Notwithstanding the above, nothing herein shall supersede or modify
-   the terms of any separate license agreement you may have executed
-   with Licensor regarding such Contributions.
-
-6. Trademarks. This License does not grant permission to use the trade
-   names, trademarks, service marks, or product names of the Licensor,
-   except as required for reasonable and customary use in describing the
-   origin of the Work and reproducing the content of the NOTICE file.
-
-7. Disclaimer of Warranty. Unless required by applicable law or
-   agreed to in writing, Licensor provides the Work (and each
-   Contributor provides its Contributions) on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-   implied, including, without limitation, any warranties or conditions
-   of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
-   PARTICULAR PURPOSE. You are solely responsible for determining the
-   appropriateness of using or redistributing the Work and assume any
-   risks associated with Your exercise of permissions under this License.
-
-8. Limitation of Liability. In no event and under no legal theory,
-   whether in tort (including negligence), contract, or otherwise,
-   unless required by applicable law (such as deliberate and grossly
-   negligent acts) or agreed to in writing, shall any Contributor be
-   liable to You for damages, including any direct, indirect, special,
-   incidental, or consequential damages of any character arising as a
-   result of this License or out of the use or inability to use the
-   Work (including but not limited to damages for loss of goodwill,
-   work stoppage, computer failure or malfunction, or any and all
-   other commercial damages or losses), even if such Contributor
-   has been advised of the possibility of such damages.
-
-9. Accepting Warranty or Additional Liability. While redistributing
-   the Work or Derivative Works thereof, You may choose to offer,
-   and charge a fee for, acceptance of support, warranty, indemnity,
-   or other liability obligations and/or rights consistent with this
-   License. However, in accepting such obligations, You may act only
-   on Your own behalf and on Your sole responsibility, not on behalf
-   of any other Contributor, and only if You agree to indemnify,
-   defend, and hold each Contributor harmless for any liability
-   incurred by, or claims asserted against, such Contributor by reason
-   of your accepting any such warranty or additional liability.
-
-END OF TERMS AND CONDITIONS
-```
-
-### 고지 39 — 적용 패키지 4개
-
-<details><summary>적용 패키지 보기</summary>
-
-- rand_core 0.10.1 (LICENSE-APACHE)
-- rand_core 0.6.4 (LICENSE-APACHE)
-- rand_core 0.9.5 (LICENSE-APACHE)
-- rand_pcg 0.10.2 (LICENSE-APACHE)
-
-</details>
-
-```text
-Apache License
-                        Version 2.0, January 2004
-                     https://www.apache.org/licenses/
-
-TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
-
-1. Definitions.
-
-   "License" shall mean the terms and conditions for use, reproduction,
-   and distribution as defined by Sections 1 through 9 of this document.
-
-   "Licensor" shall mean the copyright owner or entity authorized by
-   the copyright owner that is granting the License.
-
-   "Legal Entity" shall mean the union of the acting entity and all
-   other entities that control, are controlled by, or are under common
-   control with that entity. For the purposes of this definition,
-   "control" means (i) the power, direct or indirect, to cause the
-   direction or management of such entity, whether by contract or
-   otherwise, or (ii) ownership of fifty percent (50%) or more of the
-   outstanding shares, or (iii) beneficial ownership of such entity.
-
-   "You" (or "Your") shall mean an individual or Legal Entity
-   exercising permissions granted by this License.
-
-   "Source" form shall mean the preferred form for making modifications,
-   including but not limited to software source code, documentation
-   source, and configuration files.
-
-   "Object" form shall mean any form resulting from mechanical
-   transformation or translation of a Source form, including but
-   not limited to compiled object code, generated documentation,
-   and conversions to other media types.
-
-   "Work" shall mean the work of authorship, whether in Source or
-   Object form, made available under the License, as indicated by a
-   copyright notice that is included in or attached to the work
-   (an example is provided in the Appendix below).
-
-   "Derivative Works" shall mean any work, whether in Source or Object
-   form, that is based on (or derived from) the Work and for which the
-   editorial revisions, annotations, elaborations, or other modifications
-   represent, as a whole, an original work of authorship. For the purposes
-   of this License, Derivative Works shall not include works that remain
-   separable from, or merely link (or bind by name) to the interfaces of,
-   the Work and Derivative Works thereof.
-
-   "Contribution" shall mean any work of authorship, including
-   the original version of the Work and any modifications or additions
-   to that Work or Derivative Works thereof, that is intentionally
-   submitted to Licensor for inclusion in the Work by the copyright owner
-   or by an individual or Legal Entity authorized to submit on behalf of
-   the copyright owner. For the purposes of this definition, "submitted"
-   means any form of electronic, verbal, or written communication sent
-   to the Licensor or its representatives, including but not limited to
-   communication on electronic mailing lists, source code control systems,
-   and issue tracking systems that are managed by, or on behalf of, the
-   Licensor for the purpose of discussing and improving the Work, but
-   excluding communication that is conspicuously marked or otherwise
-   designated in writing by the copyright owner as "Not a Contribution."
-
-   "Contributor" shall mean Licensor and any individual or Legal Entity
-   on behalf of whom a Contribution has been received by Licensor and
-   subsequently incorporated within the Work.
-
-2. Grant of Copyright License. Subject to the terms and conditions of
-   this License, each Contributor hereby grants to You a perpetual,
-   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-   copyright license to reproduce, prepare Derivative Works of,
-   publicly display, publicly perform, sublicense, and distribute the
-   Work and such Derivative Works in Source or Object form.
-
-3. Grant of Patent License. Subject to the terms and conditions of
-   this License, each Contributor hereby grants to You a perpetual,
-   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-   (except as stated in this section) patent license to make, have made,
-   use, offer to sell, sell, import, and otherwise transfer the Work,
-   where such license applies only to those patent claims licensable
-   by such Contributor that are necessarily infringed by their
-   Contribution(s) alone or by combination of their Contribution(s)
-   with the Work to which such Contribution(s) was submitted. If You
-   institute patent litigation against any entity (including a
-   cross-claim or counterclaim in a lawsuit) alleging that the Work
-   or a Contribution incorporated within the Work constitutes direct
-   or contributory patent infringement, then any patent licenses
-   granted to You under this License for that Work shall terminate
-   as of the date such litigation is filed.
-
-4. Redistribution. You may reproduce and distribute copies of the
-   Work or Derivative Works thereof in any medium, with or without
-   modifications, and in Source or Object form, provided that You
-   meet the following conditions:
-
-   (a) You must give any other recipients of the Work or
-       Derivative Works a copy of this License; and
-
-   (b) You must cause any modified files to carry prominent notices
-       stating that You changed the files; and
-
-   (c) You must retain, in the Source form of any Derivative Works
-       that You distribute, all copyright, patent, trademark, and
-       attribution notices from the Source form of the Work,
-       excluding those notices that do not pertain to any part of
-       the Derivative Works; and
-
-   (d) If the Work includes a "NOTICE" text file as part of its
-       distribution, then any Derivative Works that You distribute must
-       include a readable copy of the attribution notices contained
-       within such NOTICE file, excluding those notices that do not
-       pertain to any part of the Derivative Works, in at least one
-       of the following places: within a NOTICE text file distributed
-       as part of the Derivative Works; within the Source form or
-       documentation, if provided along with the Derivative Works; or,
-       within a display generated by the Derivative Works, if and
-       wherever such third-party notices normally appear. The contents
-       of the NOTICE file are for informational purposes only and
-       do not modify the License. You may add Your own attribution
-       notices within Derivative Works that You distribute, alongside
-       or as an addendum to the NOTICE text from the Work, provided
-       that such additional attribution notices cannot be construed
-       as modifying the License.
-
-   You may add Your own copyright statement to Your modifications and
-   may provide additional or different license terms and conditions
-   for use, reproduction, or distribution of Your modifications, or
-   for any such Derivative Works as a whole, provided Your use,
-   reproduction, and distribution of the Work otherwise complies with
-   the conditions stated in this License.
-
-5. Submission of Contributions. Unless You explicitly state otherwise,
-   any Contribution intentionally submitted for inclusion in the Work
-   by You to the Licensor shall be under the terms and conditions of
-   this License, without any additional terms or conditions.
-   Notwithstanding the above, nothing herein shall supersede or modify
-   the terms of any separate license agreement you may have executed
-   with Licensor regarding such Contributions.
-
-6. Trademarks. This License does not grant permission to use the trade
-   names, trademarks, service marks, or product names of the Licensor,
-   except as required for reasonable and customary use in describing the
-   origin of the Work and reproducing the content of the NOTICE file.
-
-7. Disclaimer of Warranty. Unless required by applicable law or
-   agreed to in writing, Licensor provides the Work (and each
-   Contributor provides its Contributions) on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-   implied, including, without limitation, any warranties or conditions
-   of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
-   PARTICULAR PURPOSE. You are solely responsible for determining the
-   appropriateness of using or redistributing the Work and assume any
-   risks associated with Your exercise of permissions under this License.
-
-8. Limitation of Liability. In no event and under no legal theory,
-   whether in tort (including negligence), contract, or otherwise,
-   unless required by applicable law (such as deliberate and grossly
-   negligent acts) or agreed to in writing, shall any Contributor be
-   liable to You for damages, including any direct, indirect, special,
-   incidental, or consequential damages of any character arising as a
-   result of this License or out of the use or inability to use the
-   Work (including but not limited to damages for loss of goodwill,
-   work stoppage, computer failure or malfunction, or any and all
-   other commercial damages or losses), even if such Contributor
-   has been advised of the possibility of such damages.
-
-9. Accepting Warranty or Additional Liability. While redistributing
-   the Work or Derivative Works thereof, You may choose to offer,
-   and charge a fee for, acceptance of support, warranty, indemnity,
-   or other liability obligations and/or rights consistent with this
-   License. However, in accepting such obligations, You may act only
-   on Your own behalf and on Your sole responsibility, not on behalf
-   of any other Contributor, and only if You agree to indemnify,
-   defend, and hold each Contributor harmless for any liability
-   incurred by, or claims asserted against, such Contributor by reason
-   of your accepting any such warranty or additional liability.
-
-END OF TERMS AND CONDITIONS
-
-APPENDIX: How to apply the Apache License to your work.
-
-   To apply the Apache License to your work, attach the following
-   boilerplate notice, with the fields enclosed by brackets "[]"
-   replaced with your own identifying information. (Don't include
-   the brackets!)  The text should be enclosed in the appropriate
-   comment syntax for the file format. We also recommend that a
-   file or class name and description of purpose be included on the
-   same "printed page" as the copyright notice for easier
-   identification within third-party archives.
-```
-
-### 고지 40 — 적용 패키지 4개
-
-<details><summary>적용 패키지 보기</summary>
-
-- schemars 0.8.22 (LICENSE)
-- schemars 0.9.0 (LICENSE)
-- schemars 1.2.2 (LICENSE)
-- schemars_derive 0.8.22 (LICENSE)
-
-</details>
-
-```text
-MIT License
-
-Copyright (c) 2019 Graham Esau
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
-### 고지 41 — 적용 패키지 4개
-
-<details><summary>적용 패키지 보기</summary>
-
-- winnow 0.5.40 (LICENSE-MIT)
-- winnow 0.6.26 (LICENSE-MIT)
-- winnow 0.7.15 (LICENSE-MIT)
-- winnow 1.0.4 (LICENSE-MIT)
-
-</details>
-
-```text
-Permission is hereby granted, free of charge, to any person obtaining
-a copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
-
-The above copyright notice and this permission notice shall be
-included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
-LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
-WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-```
-
-### 고지 42 — 적용 패키지 3개
-
-<details><summary>적용 패키지 보기</summary>
-
-- alloc-no-stdlib 2.0.4 (LICENSE)
-- brotli 8.0.4 (LICENSE.BSD-3-Clause)
-- brotli-decompressor 5.0.3 (LICENSE)
-
-</details>
-
-```text
-Copyright (c) 2016 Dropbox, Inc.
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
-
-1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
-
-2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
-
-3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-```
-
-### 고지 43 — 적용 패키지 3개
 
 <details><summary>적용 패키지 보기</summary>
 
 - cssparser 0.36.0 (LICENSE)
 - cssparser-macros 0.6.1 (LICENSE)
+- dompurify 3.4.15 (LICENSE-MPL)
 - dtoa-short 0.3.5 (LICENSE)
 
 </details>
@@ -5067,7 +4306,965 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
   defined by the Mozilla Public License, v. 2.0.
 ```
 
+### 고지 36 — 적용 패키지 4개
+
+<details><summary>적용 패키지 보기</summary>
+
+- dirs 4.0.0 (LICENSE-APACHE)
+- dirs 6.0.0 (LICENSE-APACHE)
+- dirs-sys 0.3.7 (LICENSE-APACHE)
+- dirs-sys 0.5.0 (LICENSE-APACHE)
+
+</details>
+
+```text
+Apache License
+                        Version 2.0, January 2004
+                     http://www.apache.org/licenses/
+
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+1. Definitions.
+
+   "License" shall mean the terms and conditions for use, reproduction,
+   and distribution as defined by Sections 1 through 9 of this document.
+
+   "Licensor" shall mean the copyright owner or entity authorized by
+   the copyright owner that is granting the License.
+
+   "Legal Entity" shall mean the union of the acting entity and all
+   other entities that control, are controlled by, or are under common
+   control with that entity. For the purposes of this definition,
+   "control" means (i) the power, direct or indirect, to cause the
+   direction or management of such entity, whether by contract or
+   otherwise, or (ii) ownership of fifty percent (50%) or more of the
+   outstanding shares, or (iii) beneficial ownership of such entity.
+
+   "You" (or "Your") shall mean an individual or Legal Entity
+   exercising permissions granted by this License.
+
+   "Source" form shall mean the preferred form for making modifications,
+   including but not limited to software source code, documentation
+   source, and configuration files.
+
+   "Object" form shall mean any form resulting from mechanical
+   transformation or translation of a Source form, including but
+   not limited to compiled object code, generated documentation,
+   and conversions to other media types.
+
+   "Work" shall mean the work of authorship, whether in Source or
+   Object form, made available under the License, as indicated by a
+   copyright notice that is included in or attached to the work
+   (an example is provided in the Appendix below).
+
+   "Derivative Works" shall mean any work, whether in Source or Object
+   form, that is based on (or derived from) the Work and for which the
+   editorial revisions, annotations, elaborations, or other modifications
+   represent, as a whole, an original work of authorship. For the purposes
+   of this License, Derivative Works shall not include works that remain
+   separable from, or merely link (or bind by name) to the interfaces of,
+   the Work and Derivative Works thereof.
+
+   "Contribution" shall mean any work of authorship, including
+   the original version of the Work and any modifications or additions
+   to that Work or Derivative Works thereof, that is intentionally
+   submitted to Licensor for inclusion in the Work by the copyright owner
+   or by an individual or Legal Entity authorized to submit on behalf of
+   the copyright owner. For the purposes of this definition, "submitted"
+   means any form of electronic, verbal, or written communication sent
+   to the Licensor or its representatives, including but not limited to
+   communication on electronic mailing lists, source code control systems,
+   and issue tracking systems that are managed by, or on behalf of, the
+   Licensor for the purpose of discussing and improving the Work, but
+   excluding communication that is conspicuously marked or otherwise
+   designated in writing by the copyright owner as "Not a Contribution."
+
+   "Contributor" shall mean Licensor and any individual or Legal Entity
+   on behalf of whom a Contribution has been received by Licensor and
+   subsequently incorporated within the Work.
+
+2. Grant of Copyright License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   copyright license to reproduce, prepare Derivative Works of,
+   publicly display, publicly perform, sublicense, and distribute the
+   Work and such Derivative Works in Source or Object form.
+
+3. Grant of Patent License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   (except as stated in this section) patent license to make, have made,
+   use, offer to sell, sell, import, and otherwise transfer the Work,
+   where such license applies only to those patent claims licensable
+   by such Contributor that are necessarily infringed by their
+   Contribution(s) alone or by combination of their Contribution(s)
+   with the Work to which such Contribution(s) was submitted. If You
+   institute patent litigation against any entity (including a
+   cross-claim or counterclaim in a lawsuit) alleging that the Work
+   or a Contribution incorporated within the Work constitutes direct
+   or contributory patent infringement, then any patent licenses
+   granted to You under this License for that Work shall terminate
+   as of the date such litigation is filed.
+
+4. Redistribution. You may reproduce and distribute copies of the
+   Work or Derivative Works thereof in any medium, with or without
+   modifications, and in Source or Object form, provided that You
+   meet the following conditions:
+
+   (a) You must give any other recipients of the Work or
+       Derivative Works a copy of this License; and
+
+   (b) You must cause any modified files to carry prominent notices
+       stating that You changed the files; and
+
+   (c) You must retain, in the Source form of any Derivative Works
+       that You distribute, all copyright, patent, trademark, and
+       attribution notices from the Source form of the Work,
+       excluding those notices that do not pertain to any part of
+       the Derivative Works; and
+
+   (d) If the Work includes a "NOTICE" text file as part of its
+       distribution, then any Derivative Works that You distribute must
+       include a readable copy of the attribution notices contained
+       within such NOTICE file, excluding those notices that do not
+       pertain to any part of the Derivative Works, in at least one
+       of the following places: within a NOTICE text file distributed
+       as part of the Derivative Works; within the Source form or
+       documentation, if provided along with the Derivative Works; or,
+       within a display generated by the Derivative Works, if and
+       wherever such third-party notices normally appear. The contents
+       of the NOTICE file are for informational purposes only and
+       do not modify the License. You may add Your own attribution
+       notices within Derivative Works that You distribute, alongside
+       or as an addendum to the NOTICE text from the Work, provided
+       that such additional attribution notices cannot be construed
+       as modifying the License.
+
+   You may add Your own copyright statement to Your modifications and
+   may provide additional or different license terms and conditions
+   for use, reproduction, or distribution of Your modifications, or
+   for any such Derivative Works as a whole, provided Your use,
+   reproduction, and distribution of the Work otherwise complies with
+   the conditions stated in this License.
+
+5. Submission of Contributions. Unless You explicitly state otherwise,
+   any Contribution intentionally submitted for inclusion in the Work
+   by You to the Licensor shall be under the terms and conditions of
+   this License, without any additional terms or conditions.
+   Notwithstanding the above, nothing herein shall supersede or modify
+   the terms of any separate license agreement you may have executed
+   with Licensor regarding such Contributions.
+
+6. Trademarks. This License does not grant permission to use the trade
+   names, trademarks, service marks, or product names of the Licensor,
+   except as required for reasonable and customary use in describing the
+   origin of the Work and reproducing the content of the NOTICE file.
+
+7. Disclaimer of Warranty. Unless required by applicable law or
+   agreed to in writing, Licensor provides the Work (and each
+   Contributor provides its Contributions) on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+   implied, including, without limitation, any warranties or conditions
+   of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+   PARTICULAR PURPOSE. You are solely responsible for determining the
+   appropriateness of using or redistributing the Work and assume any
+   risks associated with Your exercise of permissions under this License.
+
+8. Limitation of Liability. In no event and under no legal theory,
+   whether in tort (including negligence), contract, or otherwise,
+   unless required by applicable law (such as deliberate and grossly
+   negligent acts) or agreed to in writing, shall any Contributor be
+   liable to You for damages, including any direct, indirect, special,
+   incidental, or consequential damages of any character arising as a
+   result of this License or out of the use or inability to use the
+   Work (including but not limited to damages for loss of goodwill,
+   work stoppage, computer failure or malfunction, or any and all
+   other commercial damages or losses), even if such Contributor
+   has been advised of the possibility of such damages.
+
+9. Accepting Warranty or Additional Liability. While redistributing
+   the Work or Derivative Works thereof, You may choose to offer,
+   and charge a fee for, acceptance of support, warranty, indemnity,
+   or other liability obligations and/or rights consistent with this
+   License. However, in accepting such obligations, You may act only
+   on Your own behalf and on Your sole responsibility, not on behalf
+   of any other Contributor, and only if You agree to indemnify,
+   defend, and hold each Contributor harmless for any liability
+   incurred by, or claims asserted against, such Contributor by reason
+   of your accepting any such warranty or additional liability.
+```
+
+### 고지 37 — 적용 패키지 4개
+
+<details><summary>적용 패키지 보기</summary>
+
+- dirs 4.0.0 (LICENSE-MIT)
+- dirs 6.0.0 (LICENSE-MIT)
+- dirs-sys 0.3.7 (LICENSE-MIT)
+- dirs-sys 0.5.0 (LICENSE-MIT)
+
+</details>
+
+```text
+Copyright (c) 2018-2019 dirs-rs contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 38 — 적용 패키지 4개
+
+<details><summary>적용 패키지 보기</summary>
+
+- getrandom 0.2.17 (LICENSE-APACHE)
+- getrandom 0.3.4 (LICENSE-APACHE)
+- getrandom 0.4.3 (LICENSE-APACHE)
+- rand_chacha 0.3.1 (LICENSE-APACHE)
+
+</details>
+
+```text
+Apache License
+                        Version 2.0, January 2004
+                     https://www.apache.org/licenses/
+
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+1. Definitions.
+
+   "License" shall mean the terms and conditions for use, reproduction,
+   and distribution as defined by Sections 1 through 9 of this document.
+
+   "Licensor" shall mean the copyright owner or entity authorized by
+   the copyright owner that is granting the License.
+
+   "Legal Entity" shall mean the union of the acting entity and all
+   other entities that control, are controlled by, or are under common
+   control with that entity. For the purposes of this definition,
+   "control" means (i) the power, direct or indirect, to cause the
+   direction or management of such entity, whether by contract or
+   otherwise, or (ii) ownership of fifty percent (50%) or more of the
+   outstanding shares, or (iii) beneficial ownership of such entity.
+
+   "You" (or "Your") shall mean an individual or Legal Entity
+   exercising permissions granted by this License.
+
+   "Source" form shall mean the preferred form for making modifications,
+   including but not limited to software source code, documentation
+   source, and configuration files.
+
+   "Object" form shall mean any form resulting from mechanical
+   transformation or translation of a Source form, including but
+   not limited to compiled object code, generated documentation,
+   and conversions to other media types.
+
+   "Work" shall mean the work of authorship, whether in Source or
+   Object form, made available under the License, as indicated by a
+   copyright notice that is included in or attached to the work
+   (an example is provided in the Appendix below).
+
+   "Derivative Works" shall mean any work, whether in Source or Object
+   form, that is based on (or derived from) the Work and for which the
+   editorial revisions, annotations, elaborations, or other modifications
+   represent, as a whole, an original work of authorship. For the purposes
+   of this License, Derivative Works shall not include works that remain
+   separable from, or merely link (or bind by name) to the interfaces of,
+   the Work and Derivative Works thereof.
+
+   "Contribution" shall mean any work of authorship, including
+   the original version of the Work and any modifications or additions
+   to that Work or Derivative Works thereof, that is intentionally
+   submitted to Licensor for inclusion in the Work by the copyright owner
+   or by an individual or Legal Entity authorized to submit on behalf of
+   the copyright owner. For the purposes of this definition, "submitted"
+   means any form of electronic, verbal, or written communication sent
+   to the Licensor or its representatives, including but not limited to
+   communication on electronic mailing lists, source code control systems,
+   and issue tracking systems that are managed by, or on behalf of, the
+   Licensor for the purpose of discussing and improving the Work, but
+   excluding communication that is conspicuously marked or otherwise
+   designated in writing by the copyright owner as "Not a Contribution."
+
+   "Contributor" shall mean Licensor and any individual or Legal Entity
+   on behalf of whom a Contribution has been received by Licensor and
+   subsequently incorporated within the Work.
+
+2. Grant of Copyright License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   copyright license to reproduce, prepare Derivative Works of,
+   publicly display, publicly perform, sublicense, and distribute the
+   Work and such Derivative Works in Source or Object form.
+
+3. Grant of Patent License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   (except as stated in this section) patent license to make, have made,
+   use, offer to sell, sell, import, and otherwise transfer the Work,
+   where such license applies only to those patent claims licensable
+   by such Contributor that are necessarily infringed by their
+   Contribution(s) alone or by combination of their Contribution(s)
+   with the Work to which such Contribution(s) was submitted. If You
+   institute patent litigation against any entity (including a
+   cross-claim or counterclaim in a lawsuit) alleging that the Work
+   or a Contribution incorporated within the Work constitutes direct
+   or contributory patent infringement, then any patent licenses
+   granted to You under this License for that Work shall terminate
+   as of the date such litigation is filed.
+
+4. Redistribution. You may reproduce and distribute copies of the
+   Work or Derivative Works thereof in any medium, with or without
+   modifications, and in Source or Object form, provided that You
+   meet the following conditions:
+
+   (a) You must give any other recipients of the Work or
+       Derivative Works a copy of this License; and
+
+   (b) You must cause any modified files to carry prominent notices
+       stating that You changed the files; and
+
+   (c) You must retain, in the Source form of any Derivative Works
+       that You distribute, all copyright, patent, trademark, and
+       attribution notices from the Source form of the Work,
+       excluding those notices that do not pertain to any part of
+       the Derivative Works; and
+
+   (d) If the Work includes a "NOTICE" text file as part of its
+       distribution, then any Derivative Works that You distribute must
+       include a readable copy of the attribution notices contained
+       within such NOTICE file, excluding those notices that do not
+       pertain to any part of the Derivative Works, in at least one
+       of the following places: within a NOTICE text file distributed
+       as part of the Derivative Works; within the Source form or
+       documentation, if provided along with the Derivative Works; or,
+       within a display generated by the Derivative Works, if and
+       wherever such third-party notices normally appear. The contents
+       of the NOTICE file are for informational purposes only and
+       do not modify the License. You may add Your own attribution
+       notices within Derivative Works that You distribute, alongside
+       or as an addendum to the NOTICE text from the Work, provided
+       that such additional attribution notices cannot be construed
+       as modifying the License.
+
+   You may add Your own copyright statement to Your modifications and
+   may provide additional or different license terms and conditions
+   for use, reproduction, or distribution of Your modifications, or
+   for any such Derivative Works as a whole, provided Your use,
+   reproduction, and distribution of the Work otherwise complies with
+   the conditions stated in this License.
+
+5. Submission of Contributions. Unless You explicitly state otherwise,
+   any Contribution intentionally submitted for inclusion in the Work
+   by You to the Licensor shall be under the terms and conditions of
+   this License, without any additional terms or conditions.
+   Notwithstanding the above, nothing herein shall supersede or modify
+   the terms of any separate license agreement you may have executed
+   with Licensor regarding such Contributions.
+
+6. Trademarks. This License does not grant permission to use the trade
+   names, trademarks, service marks, or product names of the Licensor,
+   except as required for reasonable and customary use in describing the
+   origin of the Work and reproducing the content of the NOTICE file.
+
+7. Disclaimer of Warranty. Unless required by applicable law or
+   agreed to in writing, Licensor provides the Work (and each
+   Contributor provides its Contributions) on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+   implied, including, without limitation, any warranties or conditions
+   of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+   PARTICULAR PURPOSE. You are solely responsible for determining the
+   appropriateness of using or redistributing the Work and assume any
+   risks associated with Your exercise of permissions under this License.
+
+8. Limitation of Liability. In no event and under no legal theory,
+   whether in tort (including negligence), contract, or otherwise,
+   unless required by applicable law (such as deliberate and grossly
+   negligent acts) or agreed to in writing, shall any Contributor be
+   liable to You for damages, including any direct, indirect, special,
+   incidental, or consequential damages of any character arising as a
+   result of this License or out of the use or inability to use the
+   Work (including but not limited to damages for loss of goodwill,
+   work stoppage, computer failure or malfunction, or any and all
+   other commercial damages or losses), even if such Contributor
+   has been advised of the possibility of such damages.
+
+9. Accepting Warranty or Additional Liability. While redistributing
+   the Work or Derivative Works thereof, You may choose to offer,
+   and charge a fee for, acceptance of support, warranty, indemnity,
+   or other liability obligations and/or rights consistent with this
+   License. However, in accepting such obligations, You may act only
+   on Your own behalf and on Your sole responsibility, not on behalf
+   of any other Contributor, and only if You agree to indemnify,
+   defend, and hold each Contributor harmless for any liability
+   incurred by, or claims asserted against, such Contributor by reason
+   of your accepting any such warranty or additional liability.
+
+END OF TERMS AND CONDITIONS
+
+APPENDIX: How to apply the Apache License to your work.
+
+   To apply the Apache License to your work, attach the following
+   boilerplate notice, with the fields enclosed by brackets "[]"
+   replaced with your own identifying information. (Don't include
+   the brackets!)  The text should be enclosed in the appropriate
+   comment syntax for the file format. We also recommend that a
+   file or class name and description of purpose be included on the
+   same "printed page" as the copyright notice for easier
+   identification within third-party archives.
+
+Copyright [yyyy] [name of copyright owner]
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+### 고지 39 — 적용 패키지 4개
+
+<details><summary>적용 패키지 보기</summary>
+
+- lock_api 0.4.14 (LICENSE-MIT)
+- parking_lot 0.12.5 (LICENSE-MIT)
+- parking_lot_core 0.9.12 (LICENSE-MIT)
+- rustc_version 0.4.1 (LICENSE-MIT)
+
+</details>
+
+```text
+Copyright (c) 2016 The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+### 고지 40 — 적용 패키지 4개
+
+<details><summary>적용 패키지 보기</summary>
+
+- rand 0.10.2 (LICENSE-APACHE)
+- rand 0.8.7 (LICENSE-APACHE)
+- rand 0.9.5 (LICENSE-APACHE)
+- rand_chacha 0.9.0 (LICENSE-APACHE)
+
+</details>
+
+```text
+Apache License
+                        Version 2.0, January 2004
+                     https://www.apache.org/licenses/
+
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+1. Definitions.
+
+   "License" shall mean the terms and conditions for use, reproduction,
+   and distribution as defined by Sections 1 through 9 of this document.
+
+   "Licensor" shall mean the copyright owner or entity authorized by
+   the copyright owner that is granting the License.
+
+   "Legal Entity" shall mean the union of the acting entity and all
+   other entities that control, are controlled by, or are under common
+   control with that entity. For the purposes of this definition,
+   "control" means (i) the power, direct or indirect, to cause the
+   direction or management of such entity, whether by contract or
+   otherwise, or (ii) ownership of fifty percent (50%) or more of the
+   outstanding shares, or (iii) beneficial ownership of such entity.
+
+   "You" (or "Your") shall mean an individual or Legal Entity
+   exercising permissions granted by this License.
+
+   "Source" form shall mean the preferred form for making modifications,
+   including but not limited to software source code, documentation
+   source, and configuration files.
+
+   "Object" form shall mean any form resulting from mechanical
+   transformation or translation of a Source form, including but
+   not limited to compiled object code, generated documentation,
+   and conversions to other media types.
+
+   "Work" shall mean the work of authorship, whether in Source or
+   Object form, made available under the License, as indicated by a
+   copyright notice that is included in or attached to the work
+   (an example is provided in the Appendix below).
+
+   "Derivative Works" shall mean any work, whether in Source or Object
+   form, that is based on (or derived from) the Work and for which the
+   editorial revisions, annotations, elaborations, or other modifications
+   represent, as a whole, an original work of authorship. For the purposes
+   of this License, Derivative Works shall not include works that remain
+   separable from, or merely link (or bind by name) to the interfaces of,
+   the Work and Derivative Works thereof.
+
+   "Contribution" shall mean any work of authorship, including
+   the original version of the Work and any modifications or additions
+   to that Work or Derivative Works thereof, that is intentionally
+   submitted to Licensor for inclusion in the Work by the copyright owner
+   or by an individual or Legal Entity authorized to submit on behalf of
+   the copyright owner. For the purposes of this definition, "submitted"
+   means any form of electronic, verbal, or written communication sent
+   to the Licensor or its representatives, including but not limited to
+   communication on electronic mailing lists, source code control systems,
+   and issue tracking systems that are managed by, or on behalf of, the
+   Licensor for the purpose of discussing and improving the Work, but
+   excluding communication that is conspicuously marked or otherwise
+   designated in writing by the copyright owner as "Not a Contribution."
+
+   "Contributor" shall mean Licensor and any individual or Legal Entity
+   on behalf of whom a Contribution has been received by Licensor and
+   subsequently incorporated within the Work.
+
+2. Grant of Copyright License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   copyright license to reproduce, prepare Derivative Works of,
+   publicly display, publicly perform, sublicense, and distribute the
+   Work and such Derivative Works in Source or Object form.
+
+3. Grant of Patent License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   (except as stated in this section) patent license to make, have made,
+   use, offer to sell, sell, import, and otherwise transfer the Work,
+   where such license applies only to those patent claims licensable
+   by such Contributor that are necessarily infringed by their
+   Contribution(s) alone or by combination of their Contribution(s)
+   with the Work to which such Contribution(s) was submitted. If You
+   institute patent litigation against any entity (including a
+   cross-claim or counterclaim in a lawsuit) alleging that the Work
+   or a Contribution incorporated within the Work constitutes direct
+   or contributory patent infringement, then any patent licenses
+   granted to You under this License for that Work shall terminate
+   as of the date such litigation is filed.
+
+4. Redistribution. You may reproduce and distribute copies of the
+   Work or Derivative Works thereof in any medium, with or without
+   modifications, and in Source or Object form, provided that You
+   meet the following conditions:
+
+   (a) You must give any other recipients of the Work or
+       Derivative Works a copy of this License; and
+
+   (b) You must cause any modified files to carry prominent notices
+       stating that You changed the files; and
+
+   (c) You must retain, in the Source form of any Derivative Works
+       that You distribute, all copyright, patent, trademark, and
+       attribution notices from the Source form of the Work,
+       excluding those notices that do not pertain to any part of
+       the Derivative Works; and
+
+   (d) If the Work includes a "NOTICE" text file as part of its
+       distribution, then any Derivative Works that You distribute must
+       include a readable copy of the attribution notices contained
+       within such NOTICE file, excluding those notices that do not
+       pertain to any part of the Derivative Works, in at least one
+       of the following places: within a NOTICE text file distributed
+       as part of the Derivative Works; within the Source form or
+       documentation, if provided along with the Derivative Works; or,
+       within a display generated by the Derivative Works, if and
+       wherever such third-party notices normally appear. The contents
+       of the NOTICE file are for informational purposes only and
+       do not modify the License. You may add Your own attribution
+       notices within Derivative Works that You distribute, alongside
+       or as an addendum to the NOTICE text from the Work, provided
+       that such additional attribution notices cannot be construed
+       as modifying the License.
+
+   You may add Your own copyright statement to Your modifications and
+   may provide additional or different license terms and conditions
+   for use, reproduction, or distribution of Your modifications, or
+   for any such Derivative Works as a whole, provided Your use,
+   reproduction, and distribution of the Work otherwise complies with
+   the conditions stated in this License.
+
+5. Submission of Contributions. Unless You explicitly state otherwise,
+   any Contribution intentionally submitted for inclusion in the Work
+   by You to the Licensor shall be under the terms and conditions of
+   this License, without any additional terms or conditions.
+   Notwithstanding the above, nothing herein shall supersede or modify
+   the terms of any separate license agreement you may have executed
+   with Licensor regarding such Contributions.
+
+6. Trademarks. This License does not grant permission to use the trade
+   names, trademarks, service marks, or product names of the Licensor,
+   except as required for reasonable and customary use in describing the
+   origin of the Work and reproducing the content of the NOTICE file.
+
+7. Disclaimer of Warranty. Unless required by applicable law or
+   agreed to in writing, Licensor provides the Work (and each
+   Contributor provides its Contributions) on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+   implied, including, without limitation, any warranties or conditions
+   of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+   PARTICULAR PURPOSE. You are solely responsible for determining the
+   appropriateness of using or redistributing the Work and assume any
+   risks associated with Your exercise of permissions under this License.
+
+8. Limitation of Liability. In no event and under no legal theory,
+   whether in tort (including negligence), contract, or otherwise,
+   unless required by applicable law (such as deliberate and grossly
+   negligent acts) or agreed to in writing, shall any Contributor be
+   liable to You for damages, including any direct, indirect, special,
+   incidental, or consequential damages of any character arising as a
+   result of this License or out of the use or inability to use the
+   Work (including but not limited to damages for loss of goodwill,
+   work stoppage, computer failure or malfunction, or any and all
+   other commercial damages or losses), even if such Contributor
+   has been advised of the possibility of such damages.
+
+9. Accepting Warranty or Additional Liability. While redistributing
+   the Work or Derivative Works thereof, You may choose to offer,
+   and charge a fee for, acceptance of support, warranty, indemnity,
+   or other liability obligations and/or rights consistent with this
+   License. However, in accepting such obligations, You may act only
+   on Your own behalf and on Your sole responsibility, not on behalf
+   of any other Contributor, and only if You agree to indemnify,
+   defend, and hold each Contributor harmless for any liability
+   incurred by, or claims asserted against, such Contributor by reason
+   of your accepting any such warranty or additional liability.
+
+END OF TERMS AND CONDITIONS
+```
+
+### 고지 41 — 적용 패키지 4개
+
+<details><summary>적용 패키지 보기</summary>
+
+- rand_core 0.10.1 (LICENSE-APACHE)
+- rand_core 0.6.4 (LICENSE-APACHE)
+- rand_core 0.9.5 (LICENSE-APACHE)
+- rand_pcg 0.10.2 (LICENSE-APACHE)
+
+</details>
+
+```text
+Apache License
+                        Version 2.0, January 2004
+                     https://www.apache.org/licenses/
+
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+1. Definitions.
+
+   "License" shall mean the terms and conditions for use, reproduction,
+   and distribution as defined by Sections 1 through 9 of this document.
+
+   "Licensor" shall mean the copyright owner or entity authorized by
+   the copyright owner that is granting the License.
+
+   "Legal Entity" shall mean the union of the acting entity and all
+   other entities that control, are controlled by, or are under common
+   control with that entity. For the purposes of this definition,
+   "control" means (i) the power, direct or indirect, to cause the
+   direction or management of such entity, whether by contract or
+   otherwise, or (ii) ownership of fifty percent (50%) or more of the
+   outstanding shares, or (iii) beneficial ownership of such entity.
+
+   "You" (or "Your") shall mean an individual or Legal Entity
+   exercising permissions granted by this License.
+
+   "Source" form shall mean the preferred form for making modifications,
+   including but not limited to software source code, documentation
+   source, and configuration files.
+
+   "Object" form shall mean any form resulting from mechanical
+   transformation or translation of a Source form, including but
+   not limited to compiled object code, generated documentation,
+   and conversions to other media types.
+
+   "Work" shall mean the work of authorship, whether in Source or
+   Object form, made available under the License, as indicated by a
+   copyright notice that is included in or attached to the work
+   (an example is provided in the Appendix below).
+
+   "Derivative Works" shall mean any work, whether in Source or Object
+   form, that is based on (or derived from) the Work and for which the
+   editorial revisions, annotations, elaborations, or other modifications
+   represent, as a whole, an original work of authorship. For the purposes
+   of this License, Derivative Works shall not include works that remain
+   separable from, or merely link (or bind by name) to the interfaces of,
+   the Work and Derivative Works thereof.
+
+   "Contribution" shall mean any work of authorship, including
+   the original version of the Work and any modifications or additions
+   to that Work or Derivative Works thereof, that is intentionally
+   submitted to Licensor for inclusion in the Work by the copyright owner
+   or by an individual or Legal Entity authorized to submit on behalf of
+   the copyright owner. For the purposes of this definition, "submitted"
+   means any form of electronic, verbal, or written communication sent
+   to the Licensor or its representatives, including but not limited to
+   communication on electronic mailing lists, source code control systems,
+   and issue tracking systems that are managed by, or on behalf of, the
+   Licensor for the purpose of discussing and improving the Work, but
+   excluding communication that is conspicuously marked or otherwise
+   designated in writing by the copyright owner as "Not a Contribution."
+
+   "Contributor" shall mean Licensor and any individual or Legal Entity
+   on behalf of whom a Contribution has been received by Licensor and
+   subsequently incorporated within the Work.
+
+2. Grant of Copyright License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   copyright license to reproduce, prepare Derivative Works of,
+   publicly display, publicly perform, sublicense, and distribute the
+   Work and such Derivative Works in Source or Object form.
+
+3. Grant of Patent License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   (except as stated in this section) patent license to make, have made,
+   use, offer to sell, sell, import, and otherwise transfer the Work,
+   where such license applies only to those patent claims licensable
+   by such Contributor that are necessarily infringed by their
+   Contribution(s) alone or by combination of their Contribution(s)
+   with the Work to which such Contribution(s) was submitted. If You
+   institute patent litigation against any entity (including a
+   cross-claim or counterclaim in a lawsuit) alleging that the Work
+   or a Contribution incorporated within the Work constitutes direct
+   or contributory patent infringement, then any patent licenses
+   granted to You under this License for that Work shall terminate
+   as of the date such litigation is filed.
+
+4. Redistribution. You may reproduce and distribute copies of the
+   Work or Derivative Works thereof in any medium, with or without
+   modifications, and in Source or Object form, provided that You
+   meet the following conditions:
+
+   (a) You must give any other recipients of the Work or
+       Derivative Works a copy of this License; and
+
+   (b) You must cause any modified files to carry prominent notices
+       stating that You changed the files; and
+
+   (c) You must retain, in the Source form of any Derivative Works
+       that You distribute, all copyright, patent, trademark, and
+       attribution notices from the Source form of the Work,
+       excluding those notices that do not pertain to any part of
+       the Derivative Works; and
+
+   (d) If the Work includes a "NOTICE" text file as part of its
+       distribution, then any Derivative Works that You distribute must
+       include a readable copy of the attribution notices contained
+       within such NOTICE file, excluding those notices that do not
+       pertain to any part of the Derivative Works, in at least one
+       of the following places: within a NOTICE text file distributed
+       as part of the Derivative Works; within the Source form or
+       documentation, if provided along with the Derivative Works; or,
+       within a display generated by the Derivative Works, if and
+       wherever such third-party notices normally appear. The contents
+       of the NOTICE file are for informational purposes only and
+       do not modify the License. You may add Your own attribution
+       notices within Derivative Works that You distribute, alongside
+       or as an addendum to the NOTICE text from the Work, provided
+       that such additional attribution notices cannot be construed
+       as modifying the License.
+
+   You may add Your own copyright statement to Your modifications and
+   may provide additional or different license terms and conditions
+   for use, reproduction, or distribution of Your modifications, or
+   for any such Derivative Works as a whole, provided Your use,
+   reproduction, and distribution of the Work otherwise complies with
+   the conditions stated in this License.
+
+5. Submission of Contributions. Unless You explicitly state otherwise,
+   any Contribution intentionally submitted for inclusion in the Work
+   by You to the Licensor shall be under the terms and conditions of
+   this License, without any additional terms or conditions.
+   Notwithstanding the above, nothing herein shall supersede or modify
+   the terms of any separate license agreement you may have executed
+   with Licensor regarding such Contributions.
+
+6. Trademarks. This License does not grant permission to use the trade
+   names, trademarks, service marks, or product names of the Licensor,
+   except as required for reasonable and customary use in describing the
+   origin of the Work and reproducing the content of the NOTICE file.
+
+7. Disclaimer of Warranty. Unless required by applicable law or
+   agreed to in writing, Licensor provides the Work (and each
+   Contributor provides its Contributions) on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+   implied, including, without limitation, any warranties or conditions
+   of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+   PARTICULAR PURPOSE. You are solely responsible for determining the
+   appropriateness of using or redistributing the Work and assume any
+   risks associated with Your exercise of permissions under this License.
+
+8. Limitation of Liability. In no event and under no legal theory,
+   whether in tort (including negligence), contract, or otherwise,
+   unless required by applicable law (such as deliberate and grossly
+   negligent acts) or agreed to in writing, shall any Contributor be
+   liable to You for damages, including any direct, indirect, special,
+   incidental, or consequential damages of any character arising as a
+   result of this License or out of the use or inability to use the
+   Work (including but not limited to damages for loss of goodwill,
+   work stoppage, computer failure or malfunction, or any and all
+   other commercial damages or losses), even if such Contributor
+   has been advised of the possibility of such damages.
+
+9. Accepting Warranty or Additional Liability. While redistributing
+   the Work or Derivative Works thereof, You may choose to offer,
+   and charge a fee for, acceptance of support, warranty, indemnity,
+   or other liability obligations and/or rights consistent with this
+   License. However, in accepting such obligations, You may act only
+   on Your own behalf and on Your sole responsibility, not on behalf
+   of any other Contributor, and only if You agree to indemnify,
+   defend, and hold each Contributor harmless for any liability
+   incurred by, or claims asserted against, such Contributor by reason
+   of your accepting any such warranty or additional liability.
+
+END OF TERMS AND CONDITIONS
+
+APPENDIX: How to apply the Apache License to your work.
+
+   To apply the Apache License to your work, attach the following
+   boilerplate notice, with the fields enclosed by brackets "[]"
+   replaced with your own identifying information. (Don't include
+   the brackets!)  The text should be enclosed in the appropriate
+   comment syntax for the file format. We also recommend that a
+   file or class name and description of purpose be included on the
+   same "printed page" as the copyright notice for easier
+   identification within third-party archives.
+```
+
+### 고지 42 — 적용 패키지 4개
+
+<details><summary>적용 패키지 보기</summary>
+
+- schemars 0.8.22 (LICENSE)
+- schemars 0.9.0 (LICENSE)
+- schemars 1.2.2 (LICENSE)
+- schemars_derive 0.8.22 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2019 Graham Esau
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 43 — 적용 패키지 4개
+
+<details><summary>적용 패키지 보기</summary>
+
+- winnow 0.5.40 (LICENSE-MIT)
+- winnow 0.6.26 (LICENSE-MIT)
+- winnow 0.7.15 (LICENSE-MIT)
+- winnow 1.0.4 (LICENSE-MIT)
+
+</details>
+
+```text
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
 ### 고지 44 — 적용 패키지 3개
+
+<details><summary>적용 패키지 보기</summary>
+
+- alloc-no-stdlib 2.0.4 (LICENSE)
+- brotli 8.0.4 (LICENSE.BSD-3-Clause)
+- brotli-decompressor 5.0.3 (LICENSE)
+
+</details>
+
+```text
+Copyright (c) 2016 Dropbox, Inc.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+### 고지 45 — 적용 패키지 3개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5101,7 +5298,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 45 — 적용 패키지 3개
+### 고지 46 — 적용 패키지 3개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5139,7 +5336,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 46 — 적용 패키지 3개
+### 고지 47 — 적용 패키지 3개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5177,7 +5374,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 47 — 적용 패키지 3개
+### 고지 48 — 적용 패키지 3개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5205,7 +5402,7 @@ ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
 THIS SOFTWARE.
 ```
 
-### 고지 48 — 적용 패키지 3개
+### 고지 49 — 적용 패키지 3개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5243,7 +5440,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 49 — 적용 패키지 3개
+### 고지 50 — 적용 패키지 3개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5281,7 +5478,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 50 — 적용 패키지 3개
+### 고지 51 — 적용 패키지 3개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5315,7 +5512,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 51 — 적용 패키지 3개
+### 고지 52 — 적용 패키지 3개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5335,7 +5532,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 52 — 적용 패키지 3개
+### 고지 53 — 적용 패키지 3개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5367,7 +5564,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 53 — 적용 패키지 3개
+### 고지 54 — 적용 패키지 3개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5405,7 +5602,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 54 — 적용 패키지 3개
+### 고지 55 — 적용 패키지 3개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5443,7 +5640,33 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 55 — 적용 패키지 3개
+### 고지 56 — 적용 패키지 3개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-color 3.1.0 (LICENSE)
+- d3-shape 3.2.0 (LICENSE)
+- d3-time 3.1.0 (LICENSE)
+
+</details>
+
+```text
+Copyright 2010-2022 Mike Bostock
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+```
+
+### 고지 57 — 적용 패키지 3개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5477,7 +5700,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 56 — 적용 패키지 2개
+### 고지 58 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5534,7 +5757,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 57 — 적용 패키지 2개
+### 고지 59 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5567,7 +5790,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 58 — 적용 패키지 2개
+### 고지 60 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5604,7 +5827,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 59 — 적용 패키지 2개
+### 고지 61 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5641,7 +5864,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 60 — 적용 패키지 2개
+### 고지 62 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5664,7 +5887,7 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 고지 61 — 적용 패키지 2개
+### 고지 63 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5685,7 +5908,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 62 — 적용 패키지 2개
+### 고지 64 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5723,7 +5946,7 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 ---
 ```
 
-### 고지 63 — 적용 패키지 2개
+### 고지 65 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5760,7 +5983,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 64 — 적용 패키지 2개
+### 고지 66 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5797,7 +6020,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 65 — 적용 패키지 2개
+### 고지 67 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -5836,7 +6059,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 66 — 적용 패키지 2개
+### 고지 68 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6049,7 +6272,7 @@ Apache License
    limitations under the License.
 ```
 
-### 고지 67 — 적용 패키지 2개
+### 고지 69 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6080,7 +6303,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 68 — 적용 패키지 2개
+### 고지 70 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6117,7 +6340,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 69 — 적용 패키지 2개
+### 고지 71 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6150,7 +6373,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 70 — 적용 패키지 2개
+### 고지 72 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6187,7 +6410,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 71 — 적용 패키지 2개
+### 고지 73 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6224,7 +6447,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 72 — 적용 패키지 2개
+### 고지 74 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6257,7 +6480,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 73 — 적용 패키지 2개
+### 고지 75 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6288,7 +6511,7 @@ the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 고지 74 — 적용 패키지 2개
+### 고지 76 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6325,7 +6548,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 75 — 적용 패키지 2개
+### 고지 77 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6538,7 +6761,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 76 — 적용 패키지 2개
+### 고지 78 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6575,7 +6798,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 77 — 적용 패키지 2개
+### 고지 79 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6606,7 +6829,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 78 — 적용 패키지 2개
+### 고지 80 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6643,7 +6866,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 79 — 적용 패키지 2개
+### 고지 81 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6676,7 +6899,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 80 — 적용 패키지 2개
+### 고지 82 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6707,7 +6930,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 81 — 적용 패키지 2개
+### 고지 83 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6738,7 +6961,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 82 — 적용 패키지 2개
+### 고지 84 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6775,7 +6998,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 83 — 적용 패키지 2개
+### 고지 85 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -6988,7 +7211,7 @@ Apache License
    limitations under the License.
 ```
 
-### 고지 84 — 적용 패키지 2개
+### 고지 86 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7026,7 +7249,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 고지 85 — 적용 패키지 2개
+### 고지 87 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7059,7 +7282,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 86 — 적용 패키지 2개
+### 고지 88 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7092,7 +7315,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 87 — 적용 패키지 2개
+### 고지 89 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7131,7 +7354,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 고지 88 — 적용 패키지 2개
+### 고지 90 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7168,7 +7391,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 89 — 적용 패키지 2개
+### 고지 91 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7381,7 +7604,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 90 — 적용 패키지 2개
+### 고지 92 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7414,7 +7637,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 91 — 적용 패키지 2개
+### 고지 93 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7447,7 +7670,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 92 — 적용 패키지 2개
+### 고지 94 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7480,7 +7703,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 93 — 적용 패키지 2개
+### 고지 95 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7512,7 +7735,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 94 — 적용 패키지 2개
+### 고지 96 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7549,7 +7772,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 95 — 적용 패키지 2개
+### 고지 97 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7582,7 +7805,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 96 — 적용 패키지 2개
+### 고지 98 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7621,7 +7844,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 97 — 적용 패키지 2개
+### 고지 99 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7654,7 +7877,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 98 — 적용 패키지 2개
+### 고지 100 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7673,7 +7896,7 @@ notice may not be copied, modified, or distributed except
 according to those terms.
 ```
 
-### 고지 99 — 적용 패키지 2개
+### 고지 101 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7706,7 +7929,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 100 — 적용 패키지 2개
+### 고지 102 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7737,7 +7960,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 101 — 적용 패키지 2개
+### 고지 103 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7950,7 +8173,7 @@ Apache License
    limitations under the License.
 ```
 
-### 고지 102 — 적용 패키지 2개
+### 고지 104 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -7986,7 +8209,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 고지 103 — 적용 패키지 2개
+### 고지 105 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -8023,7 +8246,190 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 104 — 적용 패키지 2개
+### 고지 106 — 적용 패키지 2개
+
+<details><summary>적용 패키지 보기</summary>
+
+- commander 7.2.0 (LICENSE)
+- commander 8.3.0 (LICENSE)
+
+</details>
+
+```text
+(The MIT License)
+
+Copyright (c) 2011 TJ Holowaychuk <tj@vision-media.ca>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+'Software'), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+### 고지 107 — 적용 패키지 2개
+
+<details><summary>적용 패키지 보기</summary>
+
+- cose-base 1.0.3 (LICENSE)
+- cose-base 2.2.0 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2019 - present, iVis@Bilkent.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 108 — 적용 패키지 2개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3 7.9.0 (LICENSE)
+- d3-array 3.2.4 (LICENSE)
+
+</details>
+
+```text
+Copyright 2010-2023 Mike Bostock
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+```
+
+### 고지 109 — 적용 패키지 2개
+
+<details><summary>적용 패키지 보기</summary>
+
+- internmap 1.0.1 (LICENSE)
+- internmap 2.0.3 (LICENSE)
+
+</details>
+
+```text
+Copyright 2021 Mike Bostock
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+```
+
+### 고지 110 — 적용 패키지 2개
+
+<details><summary>적용 패키지 보기</summary>
+
+- layout-base 1.0.2 (LICENSE)
+- layout-base 2.0.1 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2019 iVis@Bilkent
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 111 — 적용 패키지 2개
+
+<details><summary>적용 패키지 보기</summary>
+
+- path-data-parser 0.1.0 (LICENSE)
+- points-on-curve 0.2.0 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2020 Preet Shihn
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 112 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -8056,7 +8462,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 105 — 적용 패키지 2개
+### 고지 113 — 적용 패키지 2개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -8090,7 +8496,7 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 106 — 적용 패키지 1개
+### 고지 114 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -8113,7 +8519,7 @@ AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
 OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
-### 고지 107 — 적용 패키지 1개
+### 고지 115 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -8149,7 +8555,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 108 — 적용 패키지 1개
+### 고지 116 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -8173,7 +8579,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 109 — 적용 패키지 1개
+### 고지 117 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -8204,7 +8610,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 110 — 적용 패키지 1개
+### 고지 118 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -8405,7 +8811,7 @@ Apache License
    limitations under the License.
 ```
 
-### 고지 111 — 적용 패키지 1개
+### 고지 119 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -8437,7 +8843,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 112 — 적용 패키지 1개
+### 고지 120 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -8469,7 +8875,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 113 — 적용 패키지 1개
+### 고지 121 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -8505,7 +8911,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 114 — 적용 패키지 1개
+### 고지 122 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -8718,7 +9124,7 @@ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
-### 고지 115 — 적용 패키지 1개
+### 고지 123 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -9045,7 +9451,7 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 116 — 적용 패키지 1개
+### 고지 124 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -9075,7 +9481,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 117 — 적용 패키지 1개
+### 고지 125 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -9106,7 +9512,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 118 — 적용 패키지 1개
+### 고지 126 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -9142,7 +9548,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 119 — 적용 패키지 1개
+### 고지 127 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -9214,7 +9620,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 120 — 적용 패키지 1개
+### 고지 128 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -9234,7 +9640,7 @@ The above copyright notice and this permission notice (including the next paragr
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 121 — 적용 패키지 1개
+### 고지 129 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -9270,7 +9676,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 122 — 적용 패키지 1개
+### 고지 130 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -9483,7 +9889,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 123 — 적용 패키지 1개
+### 고지 131 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -9520,7 +9926,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 124 — 적용 패키지 1개
+### 고지 132 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -9953,7 +10359,7 @@ their own copyright notices and license terms:
   copyright itself, held by the contributor.
 ```
 
-### 고지 125 — 적용 패키지 1개
+### 고지 133 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -9985,7 +10391,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 126 — 적용 패키지 1개
+### 고지 134 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -10021,7 +10427,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 127 — 적용 패키지 1개
+### 고지 135 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -10271,7 +10677,7 @@ limitations under the License.
 ~~~~
 ```
 
-### 고지 128 — 적용 패키지 1개
+### 고지 136 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -10510,7 +10916,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 129 — 적용 패키지 1개
+### 고지 137 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -10546,7 +10952,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 130 — 적용 패키지 1개
+### 고지 138 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -10578,7 +10984,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 131 — 적용 패키지 1개
+### 고지 139 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -10791,7 +11197,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 132 — 적용 패키지 1개
+### 고지 140 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -10828,7 +11234,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 133 — 적용 패키지 1개
+### 고지 141 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -10844,7 +11250,7 @@ option. All files in the project carrying such notice may not be
 copied, modified, or distributed except according to those terms.
 ```
 
-### 고지 134 — 적용 패키지 1개
+### 고지 142 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -10876,7 +11282,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 135 — 적용 패키지 1개
+### 고지 143 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -10914,7 +11320,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 136 — 적용 패키지 1개
+### 고지 144 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -11518,7 +11924,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 137 — 적용 패키지 1개
+### 고지 145 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -11554,7 +11960,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 138 — 적용 패키지 1개
+### 고지 146 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -11587,7 +11993,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 139 — 적용 패키지 1개
+### 고지 147 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -11799,7 +12205,7 @@ Apache License
    limitations under the License.
 ```
 
-### 고지 140 — 적용 패키지 1개
+### 고지 148 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -11829,7 +12235,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 141 — 적용 패키지 1개
+### 고지 149 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -11867,7 +12273,7 @@ derived from the "nipper" project (https://github.com/importcjj/nipper),
 developed by Chen Jiaju, licensed under the MIT License and the Apache License 2.0 (dual licensed).
 ```
 
-### 고지 142 — 적용 패키지 1개
+### 고지 150 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -11903,7 +12309,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 143 — 적용 패키지 1개
+### 고지 151 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -11965,7 +12371,7 @@ have been licensed under extremely permissive terms.
 ------------------------------------------------------------------------------
 ```
 
-### 고지 144 — 적용 패키지 1개
+### 고지 152 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12097,7 +12503,7 @@ express Statement of Purpose.
     this CC0 or use of the Work.
 ```
 
-### 고지 145 — 적용 패키지 1개
+### 고지 153 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12129,7 +12535,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 146 — 적용 패키지 1개
+### 고지 154 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12161,7 +12567,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 147 — 적용 패키지 1개
+### 고지 155 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12240,7 +12646,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 148 — 적용 패키지 1개
+### 고지 156 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12276,7 +12682,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 149 — 적용 패키지 1개
+### 고지 157 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12355,7 +12761,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 150 — 적용 패키지 1개
+### 고지 158 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12391,7 +12797,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 151 — 적용 패키지 1개
+### 고지 159 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12427,7 +12833,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 152 — 적용 패키지 1개
+### 고지 160 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12463,7 +12869,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 153 — 적용 패키지 1개
+### 고지 161 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12493,7 +12899,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 154 — 적용 패키지 1개
+### 고지 162 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12523,7 +12929,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 155 — 적용 패키지 1개
+### 고지 163 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12555,7 +12961,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 156 — 적용 패키지 1개
+### 고지 164 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12591,7 +12997,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 157 — 적용 패키지 1개
+### 고지 165 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12627,7 +13033,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 158 — 적용 패키지 1개
+### 고지 166 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12663,7 +13069,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 159 — 적용 패키지 1개
+### 고지 167 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12695,7 +13101,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 160 — 적용 패키지 1개
+### 고지 168 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12727,7 +13133,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 161 — 적용 패키지 1개
+### 고지 169 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12764,7 +13170,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 162 — 적용 패키지 1개
+### 고지 170 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12801,7 +13207,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 163 — 적용 패키지 1개
+### 고지 171 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12838,7 +13244,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 164 — 적용 패키지 1개
+### 고지 172 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12875,7 +13281,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 165 — 적용 패키지 1개
+### 고지 173 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12906,7 +13312,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 166 — 적용 패키지 1개
+### 고지 174 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -12943,7 +13349,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 167 — 적용 패키지 1개
+### 고지 175 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13155,7 +13561,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 168 — 적용 패키지 1개
+### 고지 176 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13191,7 +13597,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 169 — 적용 패키지 1개
+### 고지 177 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13221,7 +13627,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 170 — 적용 패키지 1개
+### 고지 178 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13251,7 +13657,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 171 — 적용 패키지 1개
+### 고지 179 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13281,7 +13687,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 172 — 적용 패키지 1개
+### 고지 180 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13314,7 +13720,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 고지 173 — 적용 패키지 1개
+### 고지 181 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13344,7 +13750,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 174 — 적용 패키지 1개
+### 고지 182 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13376,7 +13782,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 175 — 적용 패키지 1개
+### 고지 183 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13412,7 +13818,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 176 — 적용 패키지 1개
+### 고지 184 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13444,7 +13850,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 177 — 적용 패키지 1개
+### 고지 185 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13481,7 +13887,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 178 — 적용 패키지 1개
+### 고지 186 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13693,7 +14099,7 @@ Apache License
    limitations under the License.
 ```
 
-### 고지 179 — 적용 패키지 1개
+### 고지 187 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13711,7 +14117,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 180 — 적용 패키지 1개
+### 고지 188 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13744,7 +14150,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 181 — 적용 패키지 1개
+### 고지 189 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13776,7 +14182,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 182 — 적용 패키지 1개
+### 고지 190 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -13808,7 +14214,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 183 — 적용 패키지 1개
+### 고지 191 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14020,7 +14426,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 184 — 적용 패키지 1개
+### 고지 192 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14052,7 +14458,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 185 — 적용 패키지 1개
+### 고지 193 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14082,7 +14488,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 186 — 적용 패키지 1개
+### 고지 194 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14294,7 +14700,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 187 — 적용 패키지 1개
+### 고지 195 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14330,7 +14736,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 188 — 적용 패키지 1개
+### 고지 196 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14366,7 +14772,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 189 — 적용 패키지 1개
+### 고지 197 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14399,7 +14805,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 190 — 적용 패키지 1개
+### 고지 198 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14435,7 +14841,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 191 — 적용 패키지 1개
+### 고지 199 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14458,7 +14864,7 @@ NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE US
 THIS SOFTWARE.
 ```
 
-### 고지 192 — 적용 패키지 1개
+### 고지 200 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14490,7 +14896,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 193 — 적용 패키지 1개
+### 고지 201 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14530,7 +14936,7 @@ is licensed under:
 at your option.
 ```
 
-### 고지 194 — 적용 패키지 1개
+### 고지 202 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14548,7 +14954,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 195 — 적용 패키지 1개
+### 고지 203 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14578,7 +14984,7 @@ the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 고지 196 — 적용 패키지 1개
+### 고지 204 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14608,7 +15014,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 197 — 적용 패키지 1개
+### 고지 205 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14638,7 +15044,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 198 — 적용 패키지 1개
+### 고지 206 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14663,7 +15069,7 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 고지 199 — 적용 패키지 1개
+### 고지 207 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14693,7 +15099,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 200 — 적용 패키지 1개
+### 고지 208 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14723,7 +15129,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/muda.git
 Creator: Person: Daniel Thompson-Yvetot
 ```
 
-### 고지 201 — 적용 패키지 1개
+### 고지 209 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14759,7 +15165,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 202 — 적용 패키지 1개
+### 고지 210 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14791,7 +15197,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 203 — 적용 패키지 1개
+### 고지 211 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14821,7 +15227,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 204 — 적용 패키지 1개
+### 고지 212 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14857,7 +15263,7 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 205 — 적용 패키지 1개
+### 고지 213 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14883,7 +15289,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 206 — 적용 패키지 1개
+### 고지 214 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -14913,7 +15319,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 207 — 적용 패키지 1개
+### 고지 215 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -15297,7 +15703,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
   defined by the Mozilla Public License, v. 2.0.
 ```
 
-### 고지 208 — 적용 패키지 1개
+### 고지 216 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -15317,7 +15723,7 @@ option. All files in the project carrying such notice may not be
 copied, modified, or distributed except according to those terms.
 ```
 
-### 고지 209 — 적용 패키지 1개
+### 고지 217 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -15347,7 +15753,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 210 — 적용 패키지 1개
+### 고지 218 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -15559,7 +15965,7 @@ Apache License
    limitations under the License.
 ```
 
-### 고지 211 — 적용 패키지 1개
+### 고지 219 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -15589,7 +15995,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 212 — 적용 패키지 1개
+### 고지 220 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -15801,7 +16207,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 213 — 적용 패키지 1개
+### 고지 221 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -15837,7 +16243,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 214 — 적용 패키지 1개
+### 고지 222 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -15869,7 +16275,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 215 — 적용 패키지 1개
+### 고지 223 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -15903,7 +16309,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 216 — 적용 패키지 1개
+### 고지 224 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -15923,7 +16329,7 @@ licensed under the Apache License, Version 2.0 <LICENSE-APACHE> or
 <LICENSE-MIT> or <http://opensource.org/licenses/MIT>, at your option.
 ```
 
-### 고지 217 — 적용 패키지 1개
+### 고지 225 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -15959,7 +16365,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 218 — 적용 패키지 1개
+### 고지 226 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -15996,7 +16402,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 219 — 적용 패키지 1개
+### 고지 227 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -16028,7 +16434,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 220 — 적용 패키지 1개
+### 고지 228 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -16050,7 +16456,7 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 고지 221 — 적용 패키지 1개
+### 고지 229 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -16083,7 +16489,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 222 — 적용 패키지 1개
+### 고지 230 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -16295,7 +16701,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 223 — 적용 패키지 1개
+### 고지 231 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -16325,7 +16731,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 224 — 적용 패키지 1개
+### 고지 232 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -16357,7 +16763,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 225 — 적용 패키지 1개
+### 고지 233 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -16377,7 +16783,7 @@ See src/polyfill/once_cell/LICENSE-APACHE and src/polyfill/once_cell/LICENSE-MIT
 for the license to code that was sourced from the once_cell project.
 ```
 
-### 고지 226 — 적용 패키지 1개
+### 고지 234 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -16659,7 +17065,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 고지 227 — 적용 패키지 1개
+### 고지 235 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -16683,7 +17089,7 @@ OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
-### 고지 228 — 적용 패키지 1개
+### 고지 236 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -16723,7 +17129,7 @@ is licensed under:
 at your option.
 ```
 
-### 고지 229 — 적용 패키지 1개
+### 고지 237 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -16743,7 +17149,7 @@ respectively.  You may use this software under the terms of any
 of these licenses, at your option.
 ```
 
-### 고지 230 — 적용 패키지 1개
+### 고지 238 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -16955,7 +17361,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 231 — 적용 패키지 1개
+### 고지 239 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -16991,7 +17397,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 232 — 적용 패키지 1개
+### 고지 240 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17023,7 +17429,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 233 — 적용 패키지 1개
+### 고지 241 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17053,7 +17459,7 @@ The files under third-party/chromium are licensed as described in
 third-party/chromium/LICENSE.
 ```
 
-### 고지 234 — 적용 패키지 1개
+### 고지 242 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17087,7 +17493,7 @@ ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 235 — 적용 패키지 1개
+### 고지 243 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17105,7 +17511,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 236 — 적용 패키지 1개
+### 고지 244 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17141,7 +17547,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 237 — 적용 패키지 1개
+### 고지 245 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17177,7 +17583,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 238 — 적용 패키지 1개
+### 고지 246 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17201,7 +17607,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 239 — 적용 패키지 1개
+### 고지 247 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17236,7 +17642,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 고지 240 — 적용 패키지 1개
+### 고지 248 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17272,7 +17678,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 241 — 적용 패키지 1개
+### 고지 249 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17308,7 +17714,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 242 — 적용 패키지 1개
+### 고지 250 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17332,7 +17738,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 243 — 적용 패키지 1개
+### 고지 251 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17364,7 +17770,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 244 — 적용 패키지 1개
+### 고지 252 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17400,7 +17806,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 245 — 적용 패키지 1개
+### 고지 253 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17432,7 +17838,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 246 — 적용 패키지 1개
+### 고지 254 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17450,7 +17856,7 @@ http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
 option.
 ```
 
-### 고지 247 — 적용 패키지 1개
+### 고지 255 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17486,7 +17892,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 248 — 적용 패키지 1개
+### 고지 256 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17522,7 +17928,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 249 — 적용 패키지 1개
+### 고지 257 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17734,7 +18140,7 @@ Apache License
    limitations under the License.
 ```
 
-### 고지 250 — 적용 패키지 1개
+### 고지 258 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17764,7 +18170,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 251 — 적용 패키지 1개
+### 고지 259 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17800,7 +18206,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 252 — 적용 패키지 1개
+### 고지 260 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17832,7 +18238,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 253 — 적용 패키지 1개
+### 고지 261 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17866,7 +18272,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 254 — 적용 패키지 1개
+### 고지 262 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -17906,7 +18312,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 고지 255 — 적용 패키지 1개
+### 고지 263 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18118,7 +18524,7 @@ Apache License
    limitations under the License.
 ```
 
-### 고지 256 — 적용 패키지 1개
+### 고지 264 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18148,7 +18554,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 257 — 적용 패키지 1개
+### 고지 265 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18166,7 +18572,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 258 — 적용 패키지 1개
+### 고지 266 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18195,7 +18601,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/tao.git
 Creator: Person: Daniel Thompson-Yvetot
 ```
 
-### 고지 259 — 적용 패키지 1개
+### 고지 267 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18227,7 +18633,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 260 — 적용 패키지 1개
+### 고지 268 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18257,7 +18663,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/tao.git
 Creator: Person: Daniel Thompson-Yvetot
 ```
 
-### 고지 261 — 적용 패키지 1개
+### 고지 269 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18296,7 +18702,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 262 — 적용 패키지 1개
+### 고지 270 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18326,7 +18732,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/winrt-notification.git
 Creator: Person: Daniel Thompson-Yvetot
 ```
 
-### 고지 263 — 적용 패키지 1개
+### 고지 271 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18362,7 +18768,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 264 — 적용 패키지 1개
+### 고지 272 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18398,7 +18804,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 265 — 적용 패키지 1개
+### 고지 273 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18610,7 +19016,7 @@ Apache License
    limitations under the License.
 ```
 
-### 고지 266 — 적용 패키지 1개
+### 고지 274 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18642,7 +19048,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 267 — 적용 패키지 1개
+### 고지 275 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18672,7 +19078,7 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 고지 268 — 적용 패키지 1개
+### 고지 276 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18705,7 +19111,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 269 — 적용 패키지 1개
+### 고지 277 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18917,7 +19323,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 270 — 적용 패키지 1개
+### 고지 278 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18953,7 +19359,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 271 — 적용 패키지 1개
+### 고지 279 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -18984,7 +19390,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 272 — 적용 패키지 1개
+### 고지 280 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19020,7 +19426,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 273 — 적용 패키지 1개
+### 고지 281 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19050,7 +19456,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/tray-icon.git
 Creator: Person: Daniel Thompson-Yvetot
 ```
 
-### 고지 274 — 적용 패키지 1개
+### 고지 282 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19081,7 +19487,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 275 — 적용 패키지 1개
+### 고지 283 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19112,7 +19518,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 276 — 적용 패키지 1개
+### 고지 284 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19124,7 +19530,7 @@ THE SOFTWARE.
 MIT OR Apache-2.0
 ```
 
-### 고지 277 — 적용 패키지 1개
+### 고지 285 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19336,7 +19742,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 고지 278 — 적용 패키지 1개
+### 고지 286 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19368,7 +19774,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 279 — 적용 패키지 1개
+### 고지 287 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19400,7 +19806,7 @@ MIT License
     SOFTWARE
 ```
 
-### 고지 280 — 적용 패키지 1개
+### 고지 288 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19450,7 +19856,7 @@ dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 ```
 
-### 고지 281 — 적용 패키지 1개
+### 고지 289 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19474,7 +19880,7 @@ authorization of the copyright holder.
 // OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
-### 고지 282 — 적용 패키지 1개
+### 고지 290 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19506,7 +19912,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 283 — 적용 패키지 1개
+### 고지 291 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19559,7 +19965,7 @@ licensed under the Apache License, Version 2.0 <LICENSE-APACHE> or
 <LICENSE-MIT> or <http://opensource.org/licenses/MIT>, at your option.
 ```
 
-### 고지 284 — 적용 패키지 1개
+### 고지 292 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19595,7 +20001,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 285 — 적용 패키지 1개
+### 고지 293 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19632,7 +20038,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 286 — 적용 패키지 1개
+### 고지 294 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19668,7 +20074,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 287 — 적용 패키지 1개
+### 고지 295 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19698,7 +20104,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 288 — 적용 패키지 1개
+### 고지 296 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19728,7 +20134,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 289 — 적용 패키지 1개
+### 고지 297 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19758,7 +20164,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 290 — 적용 패키지 1개
+### 고지 298 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -19970,7 +20376,7 @@ Apache License
    limitations under the License.
 ```
 
-### 고지 291 — 적용 패키지 1개
+### 고지 299 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20002,7 +20408,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 292 — 적용 패키지 1개
+### 고지 300 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20033,7 +20439,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 293 — 적용 패키지 1개
+### 고지 301 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20062,7 +20468,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 294 — 적용 패키지 1개
+### 고지 302 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20134,7 +20540,7 @@ of Data, including for example machine learning models and models'
 insights.
 ```
 
-### 고지 295 — 적용 패키지 1개
+### 고지 303 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20164,7 +20570,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 296 — 적용 패키지 1개
+### 고지 304 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20196,7 +20602,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 297 — 적용 패키지 1개
+### 고지 305 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20226,7 +20632,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/window-vibrancy.git
 Creator: Person: Daniel Thompson-Yvetot
 ```
 
-### 고지 298 — 적용 패키지 1개
+### 고지 306 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20258,7 +20664,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 299 — 적용 패키지 1개
+### 고지 307 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20289,7 +20695,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/wry.git
 Creator: Person: Daniel Thompson-Yvetot
 ```
 
-### 고지 300 — 적용 패키지 1개
+### 고지 308 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20325,7 +20731,167 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 301 — 적용 패키지 1개
+### 고지 309 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- @antfu/install-pkg 2.0.1 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2021 Anthony Fu <https://github.com/antfu>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 310 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- @braintree/sanitize-url 7.1.2 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2017 Braintree
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 311 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- @iconify/types 2.0.0 (license.txt)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2021 - 2022 Vjacheslav Trushkin / Iconify OÜ
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 312 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- @iconify/utils 3.1.7 (license.txt)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2021-PRESENT Vjacheslav Trushkin
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 313 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- @mermaid-js/parser 1.2.1 (LICENSE)
+
+</details>
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2023 Yokozuna59
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 314 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20357,7 +20923,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 302 — 적용 패키지 1개
+### 고지 315 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20383,7 +20949,40 @@ OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
 PERFORMANCE OF THIS SOFTWARE.
 ```
 
-### 고지 303 — 적용 패키지 1개
+### 고지 316 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- @upsetjs/venn.js 2.0.0 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2013 Ben Frederickson
+Copyright (c) 2021 Samuel Gratzl
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 317 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20413,7 +21012,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 304 — 적용 패키지 1개
+### 고지 318 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20445,7 +21044,652 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 305 — 적용 패키지 1개
+### 고지 319 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- cytoscape 3.34.3 (LICENSE)
+
+</details>
+
+```text
+Copyright (c) 2016-2026, The Cytoscape Consortium.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the “Software”), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 320 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- cytoscape 3.34.3 (license-update.mjs)
+
+</details>
+
+```text
+import fs from 'fs';
+import path from 'path';
+
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const year = (new Date()).getFullYear();
+
+const license = `Copyright (c) 2016-${year}, The Cytoscape Consortium.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the “Software”), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.`;
+
+fs.writeFileSync(path.join(__dirname, 'LICENSE'), license);
+```
+
+### 고지 321 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- cytoscape-cose-bilkent 4.1.0 (LICENSE)
+
+</details>
+
+```text
+Copyright (c) 2016-2018, The Cytoscape Consortium.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the “Software”), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 322 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- cytoscape-fcose 2.2.0 (LICENSE)
+
+</details>
+
+```text
+Copyright (c) 2018 - present, iVis-at-Bilkent.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the “Software”), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 323 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-array 2.12.1 (LICENSE)
+
+</details>
+
+```text
+Copyright 2010-2020 Mike Bostock
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the name of the author nor the names of contributors may be used to
+  endorse or promote products derived from this software without specific prior
+  written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+### 고지 324 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-contour 4.0.2 (LICENSE)
+
+</details>
+
+```text
+Copyright 2012-2023 Mike Bostock
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+```
+
+### 고지 325 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-delaunay 6.0.4 (LICENSE)
+
+</details>
+
+```text
+Copyright 2018-2021 Observable, Inc.
+Copyright 2021 Mapbox
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+```
+
+### 고지 326 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-dsv 3.0.1 (LICENSE)
+
+</details>
+
+```text
+Copyright 2013-2021 Mike Bostock
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+```
+
+### 고지 327 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-ease 3.0.1 (LICENSE)
+
+</details>
+
+```text
+Copyright 2010-2021 Mike Bostock
+Copyright 2001 Robert Penner
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the name of the author nor the names of contributors may be used to
+  endorse or promote products derived from this software without specific prior
+  written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+### 고지 328 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-fetch 3.0.1 (LICENSE)
+
+</details>
+
+```text
+Copyright 2016-2021 Mike Bostock
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+```
+
+### 고지 329 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-format 3.1.2 (LICENSE)
+
+</details>
+
+```text
+Copyright 2010-2026 Mike Bostock
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+```
+
+### 고지 330 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-geo 3.1.1 (LICENSE)
+
+</details>
+
+```text
+Copyright 2010-2024 Mike Bostock
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+
+This license applies to GeographicLib, versions 1.12 and later.
+
+Copyright 2008-2012 Charles Karney
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+### 고지 331 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-path 1.0.9 (LICENSE)
+
+</details>
+
+```text
+Copyright 2015-2016 Mike Bostock
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the name of the author nor the names of contributors may be used to
+  endorse or promote products derived from this software without specific prior
+  written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+### 고지 332 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-path 3.1.0 (LICENSE)
+
+</details>
+
+```text
+Copyright 2015-2022 Mike Bostock
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+```
+
+### 고지 333 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-sankey 0.12.3 (LICENSE)
+
+</details>
+
+```text
+Copyright 2015, Mike Bostock
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the name of the author nor the names of contributors may be used to
+  endorse or promote products derived from this software without specific prior
+  written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+### 고지 334 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-scale-chromatic 3.1.0 (LICENSE)
+
+</details>
+
+```text
+Copyright 2010-2024 Mike Bostock
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+
+Apache-Style Software License for ColorBrewer software and ColorBrewer Color Schemes
+
+Copyright 2002 Cynthia Brewer, Mark Harrower, and The Pennsylvania State University
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+```
+
+### 고지 335 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- d3-shape 1.3.7 (LICENSE)
+
+</details>
+
+```text
+Copyright 2010-2015 Mike Bostock
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the name of the author nor the names of contributors may be used to
+  endorse or promote products derived from this software without specific prior
+  written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+### 고지 336 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- dagre-d3-es 7.0.14 (LICENSE.md)
+
+</details>
+
+```text
+Original dagre-d3 copyright: Copyright (c) 2013 Chris Pettitt
+Original dagre copyright: Copyright (c) 2012-2014 Chris Pettitt
+Original graphlib copyright: Copyright (c) 2012-2014 Chris Pettitt
+
+Copyright (c) 2022-2024 Thibaut Lassalle, David Newell, Alois Klink, Sidharth Vinod and dagre-es contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+### 고지 337 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- dayjs 1.11.23 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2018-present, iamkun
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 338 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- delaunator 5.1.0 (LICENSE)
+
+</details>
+
+```text
+ISC License
+
+Copyright (c) 2026, Mapbox
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+```
+
+### 고지 339 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20477,7 +21721,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 고지 306 — 적용 패키지 1개
+### 고지 340 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20510,7 +21754,359 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 307 — 적용 패키지 1개
+### 고지 341 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- es-toolkit 1.52.0 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2024 Viva Republica, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 342 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- es-toolkit 1.52.0 (NOTICE)
+
+</details>
+
+```text
+es-toolkit
+
+Parts of the test suite and compatibility layer in es-toolkit/compat are
+derived from Lodash (https://github.com/lodash/lodash).
+
+Lodash copyright notice and MIT permission notice:
+
+Copyright OpenJS Foundation and other contributors <https://openjsf.org/>
+
+Based on Underscore.js, copyright Jeremy Ashkenas,
+DocumentCloud and Investigative Reporters & Editors <http://underscorejs.org/>
+
+This software consists of voluntary contributions made by many
+individuals. For exact contribution history, see the revision history
+available at https://github.com/lodash/lodash
+
+The following license applies to all parts of this software except as
+documented below:
+
+====
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+### 고지 343 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- hachure-fill 0.5.2 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2023 Preet Shihn
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 344 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- iconv-lite 0.6.3 (LICENSE)
+
+</details>
+
+```text
+Copyright (c) 2011 Alexander Shtuchkin
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+### 고지 345 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- import-meta-resolve 4.2.0 (license)
+
+</details>
+
+```text
+(The MIT License)
+
+Copyright (c) Titus Wormer <mailto:tituswormer@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+'Software'), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+---
+
+This is a derivative work based on:
+<https://github.com/nodejs/node>.
+Which is licensed:
+
+"""
+Copyright Node.js contributors. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to
+deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
+"""
+
+This license applies to parts of Node.js originating from the
+https://github.com/joyent/node repository:
+
+"""
+Copyright Joyent, Inc. and other Node contributors. All rights reserved.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to
+deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
+"""
+```
+
+### 고지 346 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- katex 0.16.47 (LICENSE)
+
+</details>
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2013-2020 Khan Academy and other contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 347 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- khroma 2.1.0 (license)
+
+</details>
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2019-present Fabio Spampinato, Andrew Maney
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+### 고지 348 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- lodash-es 4.18.1 (LICENSE)
+
+</details>
+
+```text
+Copyright OpenJS Foundation and other contributors <https://openjsf.org/>
+
+Based on Underscore.js, copyright Jeremy Ashkenas,
+DocumentCloud and Investigative Reporters & Editors <http://underscorejs.org/>
+
+This software consists of voluntary contributions made by many
+individuals. For exact contribution history, see the revision history
+available at https://github.com/lodash/lodash
+
+The following license applies to all parts of this software except as
+documented below:
+
+====
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+====
+
+Copyright and related rights for sample code are waived via CC0. Sample
+code is defined as all source code displayed within the prose of the
+documentation.
+
+CC0: http://creativecommons.org/publicdomain/zero/1.0/
+
+====
+
+Files located in the node_modules and vendor directories are externally
+maintained libraries used by this software which have their own
+licenses; we recommend you read them, as their terms may differ from the
+terms above.
+```
+
+### 고지 349 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20564,7 +22160,94 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 308 — 적용 패키지 1개
+### 고지 350 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- marked 16.4.2 (LICENSE.md)
+
+</details>
+
+```text
+# License information
+
+## Contribution License Agreement
+
+If you contribute code to this project, you are implicitly allowing your code
+to be distributed under the MIT license. You are also implicitly verifying that
+all code is your original work. `</legalese>`
+
+## Marked
+
+Copyright (c) 2018+, MarkedJS (https://github.com/markedjs/)
+Copyright (c) 2011-2018, Christopher Jeffrey (https://github.com/chjj/)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+## Markdown
+
+Copyright © 2004, John Gruber
+http://daringfireball.net/
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+* Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+* Neither the name “Markdown” nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+This software is provided by the copyright holders and contributors “as is” and any express or implied warranties, including, but not limited to, the implied warranties of merchantability and fitness for a particular purpose are disclaimed. In no event shall the copyright owner or contributors be liable for any direct, indirect, incidental, special, exemplary, or consequential damages (including, but not limited to, procurement of substitute goods or services; loss of use, data, or profits; or business interruption) however caused and on any theory of liability, whether in contract, strict liability, or tort (including negligence or otherwise) arising in any way out of the use of this software, even if advised of the possibility of such damage.
+```
+
+### 고지 351 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- mermaid 11.17.2 (LICENSE)
+
+</details>
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2014 - 2022 Knut Sveidqvist
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 352 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20596,7 +22279,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 309 — 적용 패키지 1개
+### 고지 353 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20628,7 +22311,71 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 310 — 적용 패키지 1개
+### 고지 354 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- package-manager-detector 1.8.0 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2020-PRESENT Anthony Fu <https://github.com/antfu>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 355 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- points-on-path 0.2.1 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2020 Preet
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 356 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20661,7 +22408,7 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 311 — 적용 패키지 1개
+### 고지 357 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20693,7 +22440,239 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 고지 312 — 적용 패키지 1개
+### 고지 358 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- robust-predicates 3.0.3 (LICENSE)
+
+</details>
+
+```text
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or
+distribute this software, either in source code form or as a compiled
+binary, for any purpose, commercial or non-commercial, and by any
+means.
+
+In jurisdictions that recognize copyright laws, the author or authors
+of this software dedicate any and all copyright interest in the
+software to the public domain. We make this dedication for the benefit
+of the public at large and to the detriment of our heirs and
+successors. We intend this dedication to be an overt act of
+relinquishment in perpetuity of all present and future rights to this
+software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <http://unlicense.org>
+```
+
+### 고지 359 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- roughjs 4.6.6 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2019 Preet Shihn
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 360 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- rw 1.3.3 (LICENSE)
+
+</details>
+
+```text
+Copyright (c) 2014-2016, Michael Bostock
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* The name Michael Bostock may not be used to endorse or promote products
+  derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL MICHAEL BOSTOCK BE LIABLE FOR ANY DIRECT,
+INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
+EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+### 고지 361 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- safer-buffer 2.1.2 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2018 Nikita Skovoroda <chalkerx@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 362 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- stylis 4.4.0 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2016-present Sultan Tarimo
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 363 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- tinyexec 1.3.1 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2024 Tinylibs
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 364 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- ts-dedent 2.3.0 (LICENSE)
+
+</details>
+
+```text
+MIT License
+
+Copyright (c) 2018 Tamino Martinius
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 고지 365 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 
@@ -20726,7 +22705,27 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 고지 313 — 적용 패키지 1개
+### 고지 366 — 적용 패키지 1개
+
+<details><summary>적용 패키지 보기</summary>
+
+- uuid 14.0.2 (LICENSE.md)
+
+</details>
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2010-2020 Robert Kieffer and other contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+### 고지 367 — 적용 패키지 1개
 
 <details><summary>적용 패키지 보기</summary>
 

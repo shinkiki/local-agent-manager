@@ -17,7 +17,7 @@ export class ChatRejectedError extends Error {
   }
 }
 
-export interface ChatReconnectDecision {
+interface ChatReconnectDecision {
   /** true면 이 실행은 되살릴 수 없다. 재연결을 멈추고 이유를 화면에 알려야 한다. */
   terminal: boolean;
   /** 화면에 올릴 문구. 일시적 실패에서는 재시도 안내에 끼워 넣을 사유로 쓴다. */
@@ -38,14 +38,22 @@ const RESUME_HINT = "이어서 진행하려면 이 세션을 다시 열거나 �
 export const BACKEND_RESTARTED_MESSAGE =
   `백엔드가 재기동되어 이 대화의 실행을 찾을 수 없습니다. 진행 중이던 요청은 되살릴 수 없습니다. ${RESUME_HINT}`;
 
+/** 영구 거절 코드에 맞는 다음 행동 안내. 일시적 unavailable은 호출하지 않는다. */
+function terminalRejectionDetail(code: Exclude<ChatRejectionCode, "unavailable">): string {
+  switch (code) {
+    case "chatMissing":
+      return `백엔드에 이 실행이 남아 있지 않아 재연결을 멈췄습니다. ${RESUME_HINT}`;
+    case "sessionBusy":
+      return "같은 공급자 세션의 기존 실행에 다시 연결해야 합니다.";
+    default:
+      return `같은 요청으로는 다시 연결할 수 없어 재연결을 멈췄습니다. ${RESUME_HINT}`;
+  }
+}
+
 /** 재연결 시도가 실패했을 때 계속 시도할지, 포기하고 알릴지 정한다. */
 export function chatReconnectDecision(cause: unknown): ChatReconnectDecision {
   if (cause instanceof ChatRejectedError && cause.code !== "unavailable") {
-    const detail = cause.code === "chatMissing"
-      ? `백엔드에 이 실행이 남아 있지 않아 재연결을 멈췄습니다. ${RESUME_HINT}`
-      : cause.code === "sessionBusy"
-        ? "같은 공급자 세션의 기존 실행에 다시 연결해야 합니다."
-      : `같은 요청으로는 다시 연결할 수 없어 재연결을 멈췄습니다. ${RESUME_HINT}`;
+    const detail = terminalRejectionDetail(cause.code);
     return { terminal: true, message: `${cause.message} ${detail}` };
   }
   return { terminal: false, message: errorText(cause) };

@@ -1,22 +1,26 @@
-import type { SessionFolder, SessionSummary } from "../types";
-import { sessionKey } from "./sessionKey.ts";
+import type { SessionFolder } from "../types";
 import {
   ancestorChain,
   folderDepth,
   folderTree,
   hiddenIds,
-  leafFirstFolders,
-  orderedFolders,
-  rawIndexById,
   subtreeHeight,
   subtreeIds,
+  visibleSubtreeIds,
 } from "./sessionFolderTree.ts";
-import type { FolderTree } from "./sessionFolderTree.ts";
 
 /**
  * 정리폴더 트리에 던지는 질의. 색인·순회·캐시 같은 트리 자체의 규칙은
  * `sessionFolderTree.ts`가 맡고, 이 파일은 그 위에서 화면이 실제로 묻는 것만 다룬다.
+ *
+ * 폴더에 담긴 세션을 세는 일(`sessionFolderCounts.ts`)은 여기 없다. 그 한 벌만
+ * `SessionSummary`와 세션 열쇠를 알고, 나머지 질의는 폴더 목록 하나만 보고 답한다 —
+ * 세는 규칙이 같은 파일에 있던 동안에는 두 어휘가 섞여 어느 질의가 세션을 봐야 하는
+ * 질의인지 함수 본문을 열어야 갈렸다. 화면이 세기까지 이 이름으로 가져다 쓰므로,
+ * 그 창구는 여기서 다시 내보낸다.
  */
+
+export { recountSessionFolders } from "./sessionFolderCounts.ts";
 
 /** 정리폴더 트리에서 허용하는 최대 단계. Rust Core의 MAX_SESSION_FOLDER_DEPTH와 같다. */
 export const MAX_SESSION_FOLDER_DEPTH = 5;
@@ -25,60 +29,22 @@ export const MAX_SESSION_FOLDER_DEPTH = 5;
 export const ROOT_FOLDER_VALUE = "root";
 
 /**
- * 백엔드와 같은 규칙으로 폴더 목록을 트리 순서로 다시 세운다. 세션 메타를 화면에서
- * 낙관적으로 고칠 때 폴더 개수를 다시 조회하지 않고도 단계·직접 개수·하위 합계를
- * 맞추려고 쓴다. 상위 참조가 사라졌거나 순환이면 최상위로 되돌린다.
+ * 단계가 `parentDepth`인 폴더 밑에 높이 `subtreeHeight`짜리 하위 트리를 넣어도 최대 단계를
+ * 넘지 않는지. 단계는 0부터 세므로 넣은 하위 트리의 가장 깊은 잎은 1부터 센 단계로
+ * `parentDepth + subtreeHeight + 2`가 된다.
+ *
+ * 상위 후보 거르기와 하위 폴더 추가 버튼이 같은 규칙을 각자 적고 있었다. 한쪽은 트리에서
+ * 읽은 단계에 하위 트리 높이를 더하고 다른 쪽은 저장된 `depth`에 바로 `+ 2`만 적어, 둘이
+ * 같은 규칙이라는 것도 `+ 2`가 무엇인지도 식만 보고는 알 수 없었다. 0부터 세는 단계를
+ * 1부터 세는 단계로 옮기는 자리가 하나면, 최대 단계를 손볼 때 볼 곳도 하나다.
  */
-export function recountSessionFolders(folders: SessionFolder[], sessions: SessionSummary[]): SessionFolder[] {
-  const tree = folderTree(folders);
-  const ordered = orderedFolders(tree);
-  const direct = directSessionKeys(sessions);
-  const subtree = subtreeSessionKeys(tree, direct);
-  return ordered.map(({ folder, depth }) => ({
-    ...folder,
-    depth,
-    sessionCount: direct.get(folder.id)?.size ?? 0,
-    totalSessionCount: subtree.get(folder.id)?.size ?? 0,
-  }));
-}
-
-/** 폴더 ID별로 그 폴더에 직접 담긴 세션 키. 같은 세션이 여러 폴더에 담겨 있으면 각각 센다. */
-function directSessionKeys(sessions: SessionSummary[]): Map<string, Set<string>> {
-  const direct = new Map<string, Set<string>>();
-  for (const session of sessions) {
-    for (const folderId of session.meta.folderIds) {
-      const bucket = direct.get(folderId) ?? new Set<string>();
-      bucket.add(sessionKey(session.source, session.id));
-      direct.set(folderId, bucket);
-    }
-  }
-  return direct;
-}
-
-/**
- * 하위 합계는 잎에서 뿌리 방향으로 접어 올린다. 같은 세션이 한 트리의 여러 폴더에 담겨
- * 있어도 한 번만 센다. 숨긴 하위 폴더는 그 하위 트리째 빼서, 상위 폴더 배지가 숨긴
- * 세션을 다시 드러내지 않게 한다.
- */
-function subtreeSessionKeys(
-  tree: FolderTree,
-  direct: Map<string, Set<string>>,
-): Map<string, Set<string>> {
-  const subtree = new Map<string, Set<string>>();
-  for (const { folder } of leafFirstFolders(tree)) {
-    const sessionKeys = new Set(direct.get(folder.id) ?? []);
-    for (const child of tree.children.get(folder.id) ?? []) {
-      if (child.hidden) continue;
-      for (const key of subtree.get(child.id) ?? []) sessionKeys.add(key);
-    }
-    subtree.set(folder.id, sessionKeys);
-  }
-  return subtree;
+function fitsUnderParent(parentDepth: number, subtreeHeight: number): boolean {
+  return parentDepth + subtreeHeight + 2 <= MAX_SESSION_FOLDER_DEPTH;
 }
 
 /** 이 폴더와 모든 하위 폴더의 ID. 삭제 범위처럼 숨김과 무관한 트리 전체가 필요할 때 쓴다. */
 export function folderSubtreeIds(folders: SessionFolder[], id: string): Set<string> {
-  return subtreeIds(folderTree(folders), id, false);
+  return subtreeIds(folderTree(folders), id);
 }
 
 /**
@@ -87,7 +53,7 @@ export function folderSubtreeIds(folders: SessionFolder[], id: string): Set<stri
  * 포함한다 — 숨긴 폴더를 직접 누르는 것이 그 안을 보는 유일한 길이다.
  */
 export function visibleFolderSubtreeIds(folders: SessionFolder[], id: string): Set<string> {
-  return subtreeIds(folderTree(folders), id, true);
+  return visibleSubtreeIds(folderTree(folders), id);
 }
 
 /**
@@ -118,14 +84,14 @@ export function folderFilterShows(
   if (filter === "unfiled") return folderIds.length === 0;
   const tree = folderTree(folders);
   if (filter === "all") return !hiddenByFolders(folderIds, hiddenIds(tree));
-  const subtree = subtreeIds(tree, filter, true);
+  const subtree = visibleSubtreeIds(tree, filter);
   return folderIds.some((folderId) => subtree.has(folderId));
 }
 
 /** 최상위부터 이어 붙인 폴더 경로. 같은 이름이 여러 단계에 있어도 구분된다. */
 export function folderPathLabel(folders: SessionFolder[], id: string, separator = " / "): string {
-  const chain = ancestorChain(rawIndexById(folders), id);
-  return chain.reverse().map((folder) => folder.name).join(separator);
+  const chain = ancestorChain(folders, id);
+  return chain.map((folder) => folder.name).reverse().join(separator);
 }
 
 /**
@@ -134,14 +100,14 @@ export function folderPathLabel(folders: SessionFolder[], id: string, separator 
  */
 export function folderParentOptions(folders: SessionFolder[], id: string): SessionFolder[] {
   const tree = folderTree(folders);
-  const blocked = subtreeIds(tree, id, false);
+  const blocked = subtreeIds(tree, id);
   const height = subtreeHeight(tree, id);
   return tree.folders.filter((folder) => (
-    !blocked.has(folder.id) && folderDepth(tree, folder.id) + height + 2 <= MAX_SESSION_FOLDER_DEPTH
+    !blocked.has(folder.id) && fitsUnderParent(folderDepth(tree, folder.id), height)
   ));
 }
 
-/** 이 폴더 밑에 하위 폴더를 더 만들 수 있는지. */
+/** 이 폴더 밑에 하위 폴더를 더 만들 수 있는지. 새로 만드는 폴더는 잎이라 높이가 0이다. */
 export function canAddChildFolder(folder: SessionFolder): boolean {
-  return folder.depth + 2 <= MAX_SESSION_FOLDER_DEPTH;
+  return fitsUnderParent(folder.depth, 0);
 }

@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { compareSkillInstall } from "../lib/ipc";
-import { useI18n } from "../lib/i18n";
+import { useI18n, type UiText } from "../lib/i18n";
 import { errorText } from "../lib/errorText";
-import { collapseUnchanged, diffLines, diffStats } from "../lib/textDiff";
+import { collapseUnchanged, diffLines, diffStats, type DiffLine, type DiffStats } from "../lib/textDiff";
 import type { SkillFileChange, SkillInstallComparison } from "../types";
 import { ErrorBanner, LoadingState } from "./Shared";
 
@@ -34,18 +34,9 @@ export function SkillInstallDiff({ skillId, refreshKey }: { skillId: string; ref
   if (error) return <ErrorBanner message={error} />;
   if (!comparison) return <LoadingState label={text("변경 내용을 비교하는 중…", "Comparing…")} />;
 
-  const counts = { added: 0, removed: 0, modified: 0 };
-  for (const file of comparison.files) counts[file.status] += 1;
-
   return (
     <div className="skill-diff-panel" data-testid="skill-install-diff">
-      <div className="skill-diff-summary">
-        <span>{text("보관 원본 → 이 설치본", "Archived source → this install")}</span>
-        <span className="skill-diff-count added">{text(`추가 ${counts.added}`, `${counts.added} added`)}</span>
-        <span className="skill-diff-count removed">{text(`삭제 ${counts.removed}`, `${counts.removed} removed`)}</span>
-        <span className="skill-diff-count modified">{text(`수정 ${counts.modified}`, `${counts.modified} modified`)}</span>
-        <span className="skill-diff-count">{text(`동일 ${comparison.unchangedCount}`, `${comparison.unchangedCount} unchanged`)}</span>
-      </div>
+      <SkillDiffSummary comparison={comparison} />
       {comparison.symlinks.length > 0 && (
         <p className="skill-diff-note">{text(
           `설치본의 심볼릭 링크 ${comparison.symlinks.length}개는 비교에서 제외했습니다. 링크가 있으면 이 버전으로 동기화할 수 없습니다.`,
@@ -63,19 +54,12 @@ export function SkillInstallDiff({ skillId, refreshKey }: { skillId: string; ref
       ) : (
         <ul className="skill-diff-files">
           {comparison.files.map((file) => (
-            <li key={file.path}>
-              <button
-                type="button"
-                className={`skill-diff-file${openPath === file.path ? " active" : ""}`}
-                aria-expanded={openPath === file.path}
-                onClick={() => setOpenPath(openPath === file.path ? null : file.path)}
-              >
-                <span className={`skill-diff-status ${file.status}`}>{statusLabel(file, text)}</span>
-                <code>{file.path}</code>
-                <FileStats file={file} />
-              </button>
-              {openPath === file.path && <FileDiff file={file} />}
-            </li>
+            <SkillDiffFile
+              file={file}
+              open={openPath === file.path}
+              onToggle={() => setOpenPath(openPath === file.path ? null : file.path)}
+              key={file.path}
+            />
           ))}
         </ul>
       )}
@@ -83,7 +67,24 @@ export function SkillInstallDiff({ skillId, refreshKey }: { skillId: string; ref
   );
 }
 
-function statusLabel(file: SkillFileChange, text: (ko: string, en: string) => string): string {
+/** 파일 상태 집계와 요약 표시를 비교 결과의 로딩·펼침 상태에서 분리한다. */
+function SkillDiffSummary({ comparison }: { comparison: SkillInstallComparison }) {
+  const { text } = useI18n();
+  const counts = { added: 0, removed: 0, modified: 0 };
+  for (const file of comparison.files) counts[file.status] += 1;
+
+  return (
+    <div className="skill-diff-summary">
+      <span>{text("보관 원본 → 이 설치본", "Archived source → this install")}</span>
+      <span className="skill-diff-count added">{text(`추가 ${counts.added}`, `${counts.added} added`)}</span>
+      <span className="skill-diff-count removed">{text(`삭제 ${counts.removed}`, `${counts.removed} removed`)}</span>
+      <span className="skill-diff-count modified">{text(`수정 ${counts.modified}`, `${counts.modified} modified`)}</span>
+      <span className="skill-diff-count">{text(`동일 ${comparison.unchangedCount}`, `${comparison.unchangedCount} unchanged`)}</span>
+    </div>
+  );
+}
+
+function statusLabel(file: SkillFileChange, text: UiText): string {
   const base = file.status === "added"
     ? text("추가", "added")
     : file.status === "removed"
@@ -92,11 +93,44 @@ function statusLabel(file: SkillFileChange, text: (ko: string, en: string) => st
   return file.executableChanged ? `${base} · ${text("실행 권한", "exec bit")}` : base;
 }
 
-function FileStats({ file }: { file: SkillFileChange }) {
+type SkillFileAnalysis =
+  | { kind: "binary" }
+  | { kind: "too-large" }
+  | { kind: "text"; lines: DiffLine[]; stats: DiffStats };
+
+/** 파일 특성 판정과 텍스트 diff 계산을 한 번만 수행해 통계와 본문이 같은 분기를 공유한다. */
+function analyzeSkillFile(file: SkillFileChange): SkillFileAnalysis {
+  if (file.binary) return { kind: "binary" };
+  if (file.tooLarge) return { kind: "too-large" };
+  const lines = diffLines(file.source ?? "", file.install ?? "");
+  return { kind: "text", lines, stats: diffStats(lines) };
+}
+
+function SkillDiffFile({ file, open, onToggle }: { file: SkillFileChange; open: boolean; onToggle: () => void }) {
   const { text } = useI18n();
-  if (file.binary) return <small>{text("바이너리", "binary")}</small>;
-  if (file.tooLarge) return <small>{text("너무 큼", "too large")}</small>;
-  const stats = diffStats(diffLines(file.source ?? "", file.install ?? ""));
+  const analysis = useMemo(() => analyzeSkillFile(file), [file]);
+  return (
+    <li>
+      <button
+        type="button"
+        className={`skill-diff-file${open ? " active" : ""}`}
+        aria-expanded={open}
+        onClick={onToggle}
+      >
+        <span className={`skill-diff-status ${file.status}`}>{statusLabel(file, text)}</span>
+        <code>{file.path}</code>
+        <FileStats analysis={analysis} />
+      </button>
+      {open && <FileDiff file={file} analysis={analysis} />}
+    </li>
+  );
+}
+
+function FileStats({ analysis }: { analysis: SkillFileAnalysis }) {
+  const { text } = useI18n();
+  if (analysis.kind === "binary") return <small>{text("바이너리", "binary")}</small>;
+  if (analysis.kind === "too-large") return <small>{text("너무 큼", "too large")}</small>;
+  const { stats } = analysis;
   return (
     <small>
       {stats.added > 0 && <span className="skill-diff-count added">+{stats.added}</span>}
@@ -105,21 +139,20 @@ function FileStats({ file }: { file: SkillFileChange }) {
   );
 }
 
-function FileDiff({ file }: { file: SkillFileChange }) {
+function FileDiff({ file, analysis }: { file: SkillFileChange; analysis: SkillFileAnalysis }) {
   const { text } = useI18n();
   // 내용이 같은 파일은 collapseUnchanged가 동일 줄을 skip 행 하나로 접어 돌려주므로 rows가
   // 비지 않는다. "차이가 있는가"는 rows 유무가 아니라 추가·삭제 줄 수로 판단해야, 실행
   // 권한만 다른 파일이 "… N줄 동일"만 든 빈 diff 대신 안내를 받는다(QA #45).
   const { rows, changed } = useMemo(() => {
-    if (file.binary || file.tooLarge) return { rows: [], changed: false };
-    const lines = diffLines(file.source ?? "", file.install ?? "");
-    const stats = diffStats(lines);
+    if (analysis.kind !== "text") return { rows: [], changed: false };
+    const { lines, stats } = analysis;
     return { rows: collapseUnchanged(lines), changed: stats.added + stats.removed > 0 };
-  }, [file]);
-  if (file.binary) {
+  }, [analysis]);
+  if (analysis.kind === "binary") {
     return <p className="skill-diff-note">{text("텍스트가 아니어서 내용을 비교할 수 없습니다.", "Not a text file; contents cannot be compared.")}</p>;
   }
-  if (file.tooLarge) {
+  if (analysis.kind === "too-large") {
     return <p className="skill-diff-note">{text("파일이 너무 커서 내용을 싣지 않았습니다.", "File is too large to show inline.")}</p>;
   }
   if (!changed) {

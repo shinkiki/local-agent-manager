@@ -1,26 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createChatReconnectWatch } from "./chatReconnectWatch.ts";
+import { createHandleRegistry } from "./cancelableHandleFixtures.mjs";
 
 function fixture({ canRetry = () => true } = {}) {
   const delays = [];
   const attempts = [];
-  const timers = new Map();
-  let nextHandle = 1;
+  const timers = createHandleRegistry();
   let reachable = true;
   let onResume = null;
   let disposals = 0;
 
   const environment = {
+    // 지연 타이머가 손잡이 대장과 다른 점은 예약할 때마다 달라지는 지연 값뿐이라, 그것만
+    // 따로 적고 나머지는 대장에 맡긴다.
     setTimer(callback, delayMs) {
-      const handle = nextHandle++;
-      timers.set(handle, callback);
       delays.push(delayMs);
-      return handle;
+      return timers.start(callback);
     },
-    clearTimer(handle) {
-      timers.delete(handle);
-    },
+    clearTimer: timers.stop,
     canReachBackend: () => reachable,
     watchResume(callback) {
       onResume = callback;
@@ -36,7 +34,7 @@ function fixture({ canRetry = () => true } = {}) {
     attempts,
     environment,
     get pending() {
-      return timers.size;
+      return timers.pending;
     },
     get watching() {
       return onResume !== null;
@@ -47,11 +45,7 @@ function fixture({ canRetry = () => true } = {}) {
     setReachable(value) {
       reachable = value;
     },
-    fireTimer() {
-      const [handle, callback] = timers.entries().next().value;
-      timers.delete(handle);
-      callback();
-    },
+    fireTimer: timers.fire,
     resume() {
       onResume?.();
     },

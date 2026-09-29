@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { sanitizeParents } from "./sessionFolderIndex.ts";
 import {
   MAX_SESSION_FOLDER_DEPTH,
   canAddChildFolder,
@@ -76,6 +77,35 @@ test("recountSessionFolders는 없어진 상위 참조와 순환을 최상위로
   assert.ok(recounted.every((item) => item.depth === 0));
 });
 
+test("순환 아래 매달린 폴더도 함께 최상위로 되돌아간다", () => {
+  // 자신은 순환에 걸려 있지 않지만 상위 사슬이 순환으로 들어가는 폴더다. 사슬이 끝나지
+  // 않으므로 그릴 자리가 없고, 순환에 걸린 폴더와 같이 최상위로 떼어 내야 한다.
+  const recounted = recountSessionFolders([
+    folder("a", "순환1", "b"),
+    folder("b", "순환2", "a"),
+    folder("under", "순환 아래", "a"),
+    folder("sane", "정상", null),
+    folder("child", "정상 하위", "sane"),
+  ], []);
+  const byId = new Map(recounted.map((item) => [item.id, item]));
+
+  assert.equal(byId.get("under").parentId, null);
+  assert.equal(byId.get("under").depth, 0);
+  // 순환과 무관한 사슬은 그대로 남는다.
+  assert.equal(byId.get("child").parentId, "sane");
+  assert.equal(byId.get("child").depth, 1);
+});
+
+test("sanitizeParents는 고칠 상위 참조가 없으면 원본 배열 참조를 그대로 반환한다", () => {
+  const folders = workFolders();
+  assert.equal(sanitizeParents(folders), folders);
+
+  const broken = [folder("orphan", "고아", "missing")];
+  const sanitized = sanitizeParents(broken);
+  assert.notEqual(sanitized, broken);
+  assert.equal(sanitized[0].parentId, null);
+});
+
 test("folderSubtreeIds는 자신과 모든 하위를 모은다", () => {
   const folders = workFolders({ extra: folder("other", "보관", null) });
 
@@ -108,6 +138,21 @@ test("folderParentOptions는 자기 하위 트리와 단계 초과 후보를 뺀
   const deepest = folders.find((item) => item.id === `level-${MAX_SESSION_FOLDER_DEPTH - 1}`);
   assert.equal(canAddChildFolder(deepest), false);
   assert.equal(canAddChildFolder(folders.find((item) => item.id === "level-0")), true);
+});
+
+test("하위 폴더 추가 가능 여부와 잎의 상위 후보는 같은 단계 규칙을 본다", () => {
+  const chain = [];
+  for (let level = 0; level < MAX_SESSION_FOLDER_DEPTH; level += 1) {
+    chain.push(folder(`level-${level}`, `${level + 1}단계`, level === 0 ? null : `level-${level - 1}`));
+  }
+  const folders = recountSessionFolders([...chain, folder("leaf", "잎", null, 9)], []);
+  const options = new Set(folderParentOptions(folders, "leaf").map((item) => item.id));
+
+  // 잎은 높이가 0이라 "이 밑에 하위 폴더를 만들 수 있는가"와 판정이 같아야 한다.
+  for (const item of folders) {
+    if (item.id === "leaf") continue;
+    assert.equal(options.has(item.id), canAddChildFolder(item), item.id);
+  }
 });
 
 test("상위 후보는 가지가 갈린 트리에서도 가장 깊은 가지 높이로 걸러진다", () => {
@@ -196,9 +241,11 @@ test("파생 자료를 재사용해도 다른 목록에는 앞선 결과가 새�
   const hiddenTree = workFolders({ childHidden: true });
   const visibleTree = workFolders();
 
-  // 같은 배열을 거듭 물어도 답이 흔들리지 않는다.
+  // 같은 배열을 거듭 물어도 답이 흔들리지 않고 캐시된 집합 참조를 그대로 유지한다.
   assert.deepEqual(hiddenFolderIds(hiddenTree), new Set(["child", "grandchild"]));
   assert.deepEqual(hiddenFolderIds(hiddenTree), new Set(["child", "grandchild"]));
+  assert.equal(visibleFolderSubtreeIds(visibleTree, "root"), visibleFolderSubtreeIds(visibleTree, "root"));
+  assert.equal(folderSubtreeIds(visibleTree, "root"), folderSubtreeIds(visibleTree, "root"));
   // 내용이 다른 새 배열은 앞선 결과를 물려받지 않고 다시 계산된다.
   assert.deepEqual(hiddenFolderIds(visibleTree), new Set());
   assert.deepEqual(visibleFolderSubtreeIds(visibleTree, "root"), new Set(["root", "child", "grandchild"]));
@@ -222,4 +269,36 @@ test("트리 파생값을 캐시해도 세션 수 재계산이 거듭 부를 때
     first.map(({ id, depth, sessionCount, totalSessionCount }) => [id, depth, sessionCount, totalSessionCount]),
     [["root", 0, 0, 2], ["child", 1, 1, 2], ["grandchild", 2, 1, 1]],
   );
+});
+
+/**
+ * 형제 정렬값이 같으면 이름이 순서를 정한다. 그 비교는 백엔드
+ * `session_folders.rs::sibling_order`와 **같은 규칙**이어야 한다 — 저쪽은 소문자로 내린
+ * 이름을 코드포인트로 견주고(`to_lowercase().cmp()`), 로케일 대조표를 쓰지 않는다.
+ *
+ * 화면이 `localeCompare`로 견주면 두 순서가 갈린다. ko-KR 대조표는 한글을 라틴 앞에
+ * 두므로 "가계부"가 "Zoom"보다 앞서고, 코드포인트로는 "zoom"(U+007A)이 "가계부"(U+AC00)
+ * 앞이다. 낙관적 재집계가 그린 순서와 다음 스냅숏이 그린 순서가 달라 목록이 한 번 튀고,
+ * 그 순서가 실행 장치의 기본 로케일까지 탄다.
+ */
+test("정렬값이 같은 형제는 백엔드와 같은 코드포인트 순서로 선다", () => {
+  const recounted = recountSessionFolders([
+    folder("hangul", "가계부", null, 0),
+    folder("latin", "Zoom", null, 0),
+    folder("accent", "Émile", null, 0),
+    folder("plain", "Fred", null, 0),
+  ], []);
+
+  // 소문자로 내린 이름의 코드포인트 순서: "fred"(0x66) < "zoom"(0x7a) < "émile"(0xe9) < "가계부"(0xac00).
+  assert.deepEqual(recounted.map((item) => item.name), ["Fred", "Zoom", "Émile", "가계부"]);
+});
+
+/** 정렬값이 먼저다 — 이름 비교는 동률일 때만 본다. */
+test("정렬값이 다르면 이름과 무관하게 정렬값 순이다", () => {
+  const recounted = recountSessionFolders([
+    folder("later", "가계부", null, 0),
+    folder("earlier", "Zoom", null, 1),
+  ], []);
+
+  assert.deepEqual(recounted.map((item) => item.name), ["가계부", "Zoom"]);
 });

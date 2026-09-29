@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::env;
 use std::fs;
@@ -6,7 +6,6 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -19,17 +18,22 @@ use crate::domain::{ChatOrigin, ChatOriginKind};
 use crate::session_context::SessionReadActor;
 use crate::system_mcp::SystemMcpServer;
 use crate::system_workflows::{WorkflowCallSite, WorkflowTrigger};
+use crate::tailscale_cli::{
+    configure_serve, detect_tailscale_identity, disable_serve, read_serve_target, rollback_serve,
+    serve_target, validate_tailscale_host, TailscaleIdentity,
+};
 use crate::{
     add_doc_root, create_session_folder, delete_session_folder, inspect_local_environment,
     list_doc_roots, list_doc_tree, list_document_entries, list_session_folders, load_agent_detail,
     load_aia_suggestion_catalog, load_artifact_detail, load_common_skill_detail,
-    load_common_skill_digests, load_session_detail_with_limit, load_session_transcript_before,
-    load_session_transcript_image, load_skill_library_for_projects, load_storage_overview,
-    migrate_legacy_macos_credential_vault, prepare_account_management_storage, read_doc,
-    read_doc_linked_file, read_doc_linked_file_download, read_document_file,
-    read_document_file_download, remove_doc_root, reorder_session_folder, save_doc,
-    search_document_entries, set_project_active, update_session_folder, update_session_meta,
-    AccountSupervisor, ChatApprovalDecision, ChatEvent, ChatInputFileDownload, ChatModelOption,
+    load_common_skill_digests, load_session_detail_with_limit, load_session_summary,
+    load_session_transcript_before, load_session_transcript_image, load_skill_library_for_projects,
+    load_storage_overview, migrate_legacy_macos_credential_vault,
+    prepare_account_management_storage, read_doc, read_doc_linked_file,
+    read_doc_linked_file_download, read_document_file, read_document_file_download,
+    remove_doc_root, reorder_session_folder, save_doc, search_document_entries, session_meta,
+    set_project_active, update_session_folder, update_session_meta, AccountSupervisor, AppError,
+    AppErrorKind, ChatApprovalDecision, ChatEvent, ChatInputFileDownload, ChatModelOption,
     ChatProfile, ChatReasoningOption, ChatRejectionCode, ChatSettingField, ChatStartRequest,
     ChatSupervisor, CoreError, DocumentActionContext, DocumentActionError, DocumentActionExecutor,
     DocumentActionOption, DocumentActionReceipt, DocumentAutomationOptions,
@@ -40,8 +44,8 @@ use crate::{
     SessionMetaPatch, SessionStatisticsRequest, SessionTranscriptLimit,
     SessionTranscriptPageRequest, SkillPublishRequest, StartChatRequest, SystemAuditListRequest,
     SystemAutomationSettingsInput, SystemLanguageRequest, TerminalAccountLoginRequest,
-    TerminalEvent, TerminalOpenRequest, TerminalSetupRequest, TerminalSupervisor, TranscriptImage,
-    TranslationMenu, TranslationSupervisor,
+    TerminalEvent, TerminalOpenRequest, TerminalSetupRequest, TerminalSshRequest,
+    TerminalSupervisor, TranscriptImage, TranslationMenu, TranslationSupervisor,
 };
 use bytes::Bytes;
 use flate2::write::GzEncoder;
@@ -75,7 +79,8 @@ pub const DEFAULT_REMOTE_ACCESS_PORT: u16 = crate::DEFAULT_BACKEND_SERVICE_PORT;
 /// 8: 외부 플러그인의 현재 도구 권한 일괄 변경 명령이 추가됐다.
 /// 9: C9 SSH 공개키 본문 조회·키 삭제·키 메모 명령이 추가됐다.
 /// 10: Antigravity 페이싱 자원의 사용량 행 조회 명령이 추가됐다.
-pub const REMOTE_API_PROTOCOL_VERSION: u32 = 10;
+/// 11: 프로젝트 파일 조회와 C16 git 형상관리 명령이 추가됐다.
+pub const REMOTE_API_PROTOCOL_VERSION: u32 = 11;
 const MIN_REMOTE_ACCESS_PORT: u16 = crate::MIN_BACKEND_SERVICE_PORT;
 /// 재시작 시 이전 백엔드가 저장소 잠금을 놓을 때까지 기다리는 최대 시간.
 const BACKEND_OWNERSHIP_HANDOVER_WAIT: Duration = Duration::from_secs(15);
@@ -91,17 +96,18 @@ const LOCAL_UI_CORS_ORIGINS: &[&str] = &[
     "tauri://localhost",
     "http://tauri.localhost",
 ];
-const LOCAL_UI_CORS_REQUEST_HEADERS: &[&str] = &[
-    "accept",
-    "cache-control",
-    "content-type",
-    "pragma",
-    "x-chat-id",
-    "x-file-name",
-    "x-file-type",
-];
-const BACKEND_SHUTDOWN_REASON: &str =
-    "백엔드가 정상 재시작되어 진행 중인 요청을 중단하고 관리 런타임을 정리합니다";
+/// preflight에서 받아 줄 요청 헤더 목록. 응답이 광고하는 `Access-Control-Allow-Headers`와
+/// 요청 검사가 이 한 줄을 함께 쓴다 — 목록이 둘로 나뉘어 있으면 한쪽에만 헤더를 더했을 때
+/// 검사와 광고가 조용히 어긋난다(헤더 이름은 대소문자를 가리지 않고 비교한다).
+const LOCAL_UI_CORS_REQUEST_HEADERS: &str =
+    "Accept, Cache-Control, Content-Type, Pragma, X-Chat-Id, X-File-Name, X-File-Type";
+/// 종료 사유는 진행 중이던 턴에 그대로 실려 사용자가 읽는 문장이 된다. 그래서 어느
+/// 경로로 내려가는지에 따라 나눈다 — 한 문장으로 합쳐 두면 앱을 끈 사람에게는 오지도
+/// 않을 재시작을 기다리게 하고, 백엔드만 교체한 사람에게는 앱이 꺼진 줄로 읽힌다.
+const PARENT_EXIT_SHUTDOWN_REASON: &str =
+    "Agent Manager 앱이 내려가 진행 중인 요청을 중단하고 관리 런타임을 정리합니다. 앱을 다시 열면 이 대화는 이어서 열 수 있지만, 중단된 응답은 복구되지 않습니다";
+const SIGNAL_SHUTDOWN_REASON: &str =
+    "백엔드가 종료 신호를 받아 진행 중인 요청을 중단하고 관리 런타임을 정리합니다";
 
 type HttpResponse = Response<Full<Bytes>>;
 
@@ -113,25 +119,31 @@ struct Config {
     app_data_dir: PathBuf,
     tailscale_host: Option<String>,
     tailscale_user: Option<String>,
+    /// Tailscale Serve가 이 백엔드를 물린 HTTPS 포트. 앱이 관리하는 서비스는 언제나
+    /// 443이라 `None`이고, 그때 기대 Origin에 포트가 붙지 않는다. 개발 중 두 번째
+    /// 인스턴스를 다른 포트로 물릴 때만 값이 있다.
+    tailscale_serve_port: Option<u16>,
     remote_write: RemoteWriteFlag,
     session_catalog: SessionCatalog,
     terminals: TerminalSupervisor,
     chats: ChatSupervisor,
     scheduler: SchedulerSupervisor,
     translations: TranslationSupervisor,
+    manager_snapshot_cache: ManagerSnapshotResponseCache,
     document_automation: Option<DocumentAutomationSupervisor>,
     _system_mcp: Option<Arc<SystemMcpServer>>,
 }
 
-#[derive(Clone)]
-struct RuntimeDocumentActionExecutor {
-    app_data_dir: PathBuf,
-    service: ServiceEndpoint,
-    session_catalog: SessionCatalog,
-    chats: ChatSupervisor,
-    terminals: TerminalSupervisor,
-    scheduler: SchedulerSupervisor,
-    translations: TranslationSupervisor,
+#[derive(Clone, Default)]
+struct ManagerSnapshotResponseCache {
+    inner: Arc<Mutex<Option<CachedManagerSnapshotResponse>>>,
+}
+
+struct CachedManagerSnapshotResponse {
+    session_revision: u64,
+    resource_revision: u64,
+    raw: Bytes,
+    gzip: Option<Bytes>,
 }
 
 /// 반복 요청이 등록된 시스템 워크플로를 돌릴 때 쓰는 통로. 문서 트리거 실행기와 같은
@@ -146,6 +158,48 @@ struct RuntimeScheduleWorkflowExecutor {
     terminals: TerminalSupervisor,
     translations: TranslationSupervisor,
     scheduler: SchedulerHandle,
+}
+
+/// 화면 없이 도는 실행 경로가 함께 쓰는 런타임 계층 한 벌. 인프로세스 기동과 독립 백엔드
+/// 기동 두 자리가 같은 일곱 필드를 실행기마다 낱개로 옮겨 적었고, 종단점 봉투도 쓰는
+/// 자리마다 새로 세워 한 자리만 고치면 갈라질 수 있었다. 계층을 한 번 모아 두고, 문서
+/// 트리거 실행기는 이 봉투 자신이 되고 반복 요청 실행기만 여기서 찍어 낸다. 스케줄러는
+/// 감독자 그대로 담고, 워크플로 실행기에 넘길 때만 손잡이로 바꿔 고리를 끊는다.
+#[derive(Clone)]
+struct RuntimeLayers {
+    app_data_dir: PathBuf,
+    service: ServiceEndpoint,
+    session_catalog: SessionCatalog,
+    chats: ChatSupervisor,
+    terminals: TerminalSupervisor,
+    scheduler: SchedulerSupervisor,
+    translations: TranslationSupervisor,
+}
+
+impl RuntimeLayers {
+    fn workflow_executor(&self) -> RuntimeScheduleWorkflowExecutor {
+        RuntimeScheduleWorkflowExecutor {
+            app_data_dir: self.app_data_dir.clone(),
+            service: self.service.clone(),
+            session_catalog: self.session_catalog.clone(),
+            chats: self.chats.clone(),
+            terminals: self.terminals.clone(),
+            translations: self.translations.clone(),
+            scheduler: self.scheduler.handle(),
+        }
+    }
+
+    fn background_layers(&self) -> BackgroundWorkflowLayers<'_> {
+        BackgroundWorkflowLayers {
+            app_data_dir: &self.app_data_dir,
+            service: &self.service,
+            session_catalog: &self.session_catalog,
+            chats: &self.chats,
+            terminals: &self.terminals,
+            scheduler: &self.scheduler,
+            translations: &self.translations,
+        }
+    }
 }
 
 impl ScheduleWorkflowExecutor for RuntimeScheduleWorkflowExecutor {
@@ -169,31 +223,16 @@ impl ScheduleWorkflowExecutor for RuntimeScheduleWorkflowExecutor {
             .scheduler
             .upgrade()
             .ok_or_else(|| CoreError::Runtime("반복 실행 계층이 이미 종료되었습니다".to_owned()))?;
-        let command_context = SystemCommandContext {
-            actor: SessionReadActor::User,
-            app_data_dir: &self.app_data_dir,
-            service: &self.service,
-            session_catalog: &self.session_catalog,
-            chats: &self.chats,
-            terminals: &self.terminals,
-            scheduler: &scheduler,
-            translations: &self.translations,
-            document_automation: None,
-            aia_chat_id: None,
-            origin: None,
-        };
-        let invoker = |operation: &str,
-                       arguments: Value,
-                       site: &WorkflowCallSite<'_>|
-         -> Result<Value, CoreError> {
-            let scoped = SystemCommandContext {
-                origin: Some(workflow_origin(site)),
-                ..command_context.clone()
-            };
-            invoke_system_command(&scoped, operation, arguments)
-        };
-        execute_workflow_or_round(
-            &self.app_data_dir,
+        run_background_workflow(
+            BackgroundWorkflowLayers {
+                app_data_dir: &self.app_data_dir,
+                service: &self.service,
+                session_catalog: &self.session_catalog,
+                chats: &self.chats,
+                terminals: &self.terminals,
+                scheduler: &scheduler,
+                translations: &self.translations,
+            },
             crate::system_workflows::WorkflowExecuteRequest {
                 workflow_id: action.workflow_id.clone(),
                 arguments: action.arguments.clone(),
@@ -204,30 +243,181 @@ impl ScheduleWorkflowExecutor for RuntimeScheduleWorkflowExecutor {
                 ..Default::default()
             },
             action.max_runs(),
-            &invoker,
         )
     }
+}
+
+/// 백그라운드 실행기(문서 트리거·반복 요청)가 워크플로 단계를 돌릴 때 빌려 주는 런타임
+/// 계층 한 벌. 두 실행기는 스케줄러를 어디서 얻는지만 다르다 — 문서 트리거는 자기가 든
+/// 감독자를, 반복 요청은 손잡이에서 되살린 감독자를 넘긴다.
+struct BackgroundWorkflowLayers<'a> {
+    app_data_dir: &'a Path,
+    service: &'a ServiceEndpoint,
+    session_catalog: &'a SessionCatalog,
+    chats: &'a ChatSupervisor,
+    terminals: &'a TerminalSupervisor,
+    scheduler: &'a SchedulerSupervisor,
+    translations: &'a TranslationSupervisor,
+}
+
+/// 화면 없이 도는 두 실행기가 공유하는 워크플로 호출 통로. 작업 문맥의 기본값(사용자 행위자,
+/// 문서 자동화·AIA 대화 없음)과 단계마다 출처를 덧씌우는 규칙을 한 곳에 둬, 두 경로가 서로
+/// 다른 문맥으로 갈라지지 않게 한다.
+fn run_background_workflow(
+    layers: BackgroundWorkflowLayers<'_>,
+    request: crate::system_workflows::WorkflowExecuteRequest,
+    max_runs: u32,
+) -> Result<Value, CoreError> {
+    let command_context = SystemCommandContext {
+        actor: SessionReadActor::User,
+        app_data_dir: layers.app_data_dir,
+        service: layers.service,
+        session_catalog: layers.session_catalog,
+        chats: layers.chats,
+        terminals: layers.terminals,
+        scheduler: layers.scheduler,
+        translations: layers.translations,
+        document_automation: None,
+        aia_chat_id: None,
+        origin: None,
+    };
+    // 계약은 등록 시점(`validate_workflow`)에 이미 카탈로그로 걸러졌으므로 통로에서
+    // 다시 보지 않는다.
+    execute_workflow_with_steps(
+        &command_context,
+        request,
+        max_runs,
+        WorkflowStepGuard::Unchecked,
+    )
+}
+
+/// 워크플로 단계 호출을 통로에서 한 번 더 걸러 낼지.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowStepGuard {
+    /// 카탈로그에 없는 작업을 통로에서 막는다. 화면이 부르는 즉시 실행은 계약을 저장
+    /// 없이 그대로 받으므로 검증 단계를 지나지 않는다.
+    Catalog,
+    /// 검증을 이미 통과한 계약만 오는 경로.
+    Unchecked,
+}
+
+/// 워크플로 실행 두 진입점(화면 없이 도는 배경 실행기·`execute_system_workflow` 명령)이
+/// 단계 호출 통로를 얹는 방식은 같다 — 단계마다 출처만 덧씌운 문맥으로 시스템 작업을
+/// 부르고, 그 통로를 회차 봉투 분기에 넘긴다. 두 자리가 같은 조립을 따로 적고 있어
+/// 출처 규칙이나 회차 봉투 인자가 한쪽만 바뀌면 조용히 갈라졌다. 달랐던 것은 통로에서
+/// 카탈로그를 한 번 더 보는지와 병렬 기동 수뿐이라 그 둘만 인자로 받는다.
+fn execute_workflow_with_steps(
+    context: &SystemCommandContext<'_>,
+    request: crate::system_workflows::WorkflowExecuteRequest,
+    max_runs: u32,
+    guard: WorkflowStepGuard,
+) -> Result<Value, CoreError> {
+    let invoker = |operation: &str,
+                   arguments: Value,
+                   site: &WorkflowCallSite<'_>|
+     -> Result<Value, CoreError> {
+        if guard == WorkflowStepGuard::Catalog
+            && crate::system_mcp::system_operation_kind(operation).is_none()
+            && !crate::system_workflows::ENVELOPE_OPERATIONS.contains(&operation)
+        {
+            return Err(CoreError::InvalidInput(format!(
+                "system_catalog에 없는 작업입니다: {operation}"
+            )));
+        }
+        let scoped = SystemCommandContext {
+            origin: Some(workflow_origin(site)),
+            ..context.clone()
+        };
+        invoke_system_command(&scoped, operation, arguments)
+    };
+    execute_workflow_or_round(
+        context.app_data_dir,
+        context.chats,
+        context.scheduler,
+        request,
+        max_runs,
+        &invoker,
+    )
 }
 
 /// 페이싱 회차 계약(`paced`)이면 회차 봉투(사용량 갱신 → 기동 수 계산 → 지난 회차 정리 →
 /// N건 기동 → 재갱신)로, 아니면 계약 그대로 실행한다. 스케줄러·문서 트리거·수동 실행이 같은
 /// 분기를 쓴다. `max_runs`는 반복 요청의 병렬 실행 설정이고 그 밖의 경로는 한 건씩이다.
+///
+/// 단, 그 워크플로를 도는 **켜진** 반복 요청이 하나도 없으면 봉투를 두르지 않고 계약만 한 건
+/// 실행한다. 봉투의 계산은 회차 간격을 켜진 반복 요청에서 역조회하므로, 회차가 없거나 전부
+/// 일시정지된 상태에서는 계산이 "반복 주기를 찾을 수 없습니다"로 실패해 기동까지 가지 못했다
+/// — 화면이 "일시정지 상태여도 이 한 번은 실행됩니다"라고 약속하는 자리가 바로 그 상태다.
+/// 페이싱이 돌고 있지 않으면 간격·목표·가드를 적용할 근거도 없다.
 fn execute_workflow_or_round(
     app_data_dir: &Path,
+    chats: &ChatSupervisor,
+    scheduler: &SchedulerSupervisor,
     request: crate::system_workflows::WorkflowExecuteRequest,
     max_runs: u32,
     invoker: &crate::system_workflows::WorkflowInvoker<'_>,
 ) -> Result<Value, CoreError> {
     let registry = workflow_registry(app_data_dir);
-    if registry.is_paced(&request.workflow_id)? {
-        registry.execute_paced_round(
+    if !registry.is_paced(&request.workflow_id)? {
+        return registry.execute(request, invoker);
+    }
+    if enabled_round_exists(scheduler, &request.workflow_id)? {
+        return registry.execute_paced_round(
             request,
             crate::system_workflows::PacedRoundOptions { max_runs },
             invoker,
-        )
-    } else {
-        registry.execute(request, invoker)
+        );
     }
+    let (account_id, source) = direct_paced_account(app_data_dir, chats, &request.workflow_id)?;
+    registry.execute_single_paced_run(request, &account_id, source.as_str(), invoker)
+}
+
+/// 이 워크플로를 도는 켜진 반복 요청이 있는지. 봉투를 두를지 가르는 기준이며, 계산이 회차
+/// 간격을 찾는 기준(`usage_pacing::cadence_from_schedules`)과 같은 조건이어야 한다.
+fn enabled_round_exists(
+    scheduler: &SchedulerSupervisor,
+    workflow_id: &str,
+) -> Result<bool, CoreError> {
+    Ok(scheduler.snapshot()?.schedules.iter().any(|schedule| {
+        schedule.input.enabled
+            && schedule
+                .input
+                .workflow
+                .as_ref()
+                .is_some_and(|action| action.workflow_id == workflow_id)
+    }))
+}
+
+/// 봉투 없이 도는 단건이 쓸 계정. 사용량 여력·목표·가드는 보지 않고, 정책이 이 워크플로에
+/// 허용한 계정 범위만 지킨다 — 계정 풀은 "어떤 계정을 쓰게 할지"라 페이싱을 건너뛰어도
+/// 유지해야 하는 선택이다. 캐시된 사용량으로 충분하다(판정에 쓰지 않으므로 갱신을 기다리지
+/// 않는다).
+fn direct_paced_account(
+    app_data_dir: &Path,
+    chats: &ChatSupervisor,
+    workflow_id: &str,
+) -> Result<(String, ProviderId), CoreError> {
+    let accounts = usage_pacing_accounts(
+        app_data_dir,
+        chats,
+        crate::antigravity_usage::UsageFreshness::CachedFirst,
+    )?;
+    let policy = crate::usage_budget_policy::load_optional(app_data_dir)?;
+    let scope = crate::usage_pacing::workflow_account_scope(policy.as_ref(), workflow_id);
+    accounts
+        .into_iter()
+        .find(|account| {
+            scope
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(account.id.as_str()))
+        })
+        .map(|account| (account.id, account.provider))
+        .ok_or_else(|| {
+            CoreError::InvalidInput(
+                "이 워크플로를 돌릴 계정을 찾지 못했습니다. 계정을 등록하거나 워크플로 페이싱 탭에서 참여 계정을 넓히세요"
+                    .to_owned(),
+            )
+        })
 }
 
 /// 옛 5단계 페이싱 계약과 그 반복 요청을 회차 봉투 방식으로 현행화한다. 백엔드가 뜰 때 한
@@ -277,6 +467,8 @@ fn migrate_legacy_paced_rounds(app_data_dir: &Path) {
                     }),
                     crate::SystemAuditPhase::Completed,
                     Some(true),
+                    None,
+                    None,
                 );
             }
             Err(error) => eprintln!(
@@ -284,6 +476,38 @@ fn migrate_legacy_paced_rounds(app_data_dir: &Path) {
                 item.workflow_id, item.version
             ),
         }
+    }
+}
+
+/// 방금 등록한 버전을 그 워크플로를 도는 회차들이 이어받게 하고, 결과를 등록 응답에
+/// 덧붙인다. 응답에 실어야 AIA가 "회차 N건도 함께 갱신했다"를 사용자에게 말할 수 있다 —
+/// 자동 적용을 조용히 하면 사용자는 회차 설정이 언제 바뀌었는지 알 길이 없다.
+///
+/// 회차 갱신 실패는 등록을 되돌리지 않는다. 계약은 이미 저장됐고, 이어받지 못한 회차는
+/// 예전처럼 버전이 어긋난 채 멈출 뿐이라 되돌릴 때보다 잃는 것이 적다.
+fn adopt_registered_version(
+    app_data_dir: &Path,
+    registry: &crate::system_workflows::SystemWorkflowRegistry,
+    workflow_id: &str,
+    result: &mut Value,
+) {
+    let version = result.get("version").and_then(Value::as_u64).unwrap_or(0) as u32;
+    if version == 0 {
+        return;
+    }
+    let adopted =
+        crate::scheduler::adopt_workflow_version(app_data_dir, workflow_id, version, |arguments| {
+            registry.arguments_fit_latest(workflow_id, arguments)
+        });
+    match adopted {
+        Ok(rounds) => {
+            if let Some(object) = result.as_object_mut() {
+                object.insert("rounds".to_owned(), json!(rounds));
+            }
+        }
+        Err(error) => eprintln!(
+            "[agent-manager] 워크플로 {workflow_id} v{version}을(를) 회차에 반영하지 못했습니다: {error}"
+        ),
     }
 }
 
@@ -313,7 +537,7 @@ fn validate_approved_workflow(
     Ok(())
 }
 
-impl RuntimeDocumentActionExecutor {
+impl RuntimeLayers {
     /// 등록 시점에 실행 계정을 확인한다. 계정이 사라졌거나 비활성이면 변경이 생긴
     /// 뒤에야 실패하지 않고 등록·재승인 화면에서 바로 막힌다. 인증 만료처럼 되돌아오는
     /// 상태는 실행 시점 재시도에 맡기고 여기서 보지 않는다.
@@ -336,7 +560,7 @@ impl RuntimeDocumentActionExecutor {
             .ok_or_else(|| CoreError::NotFound("선택한 실행 계정을 찾을 수 없습니다".to_owned()))?;
         if account.disabled {
             return Err(CoreError::Conflict(
-                "비활성 계정은 문서 트리거에 연결할 수 없습니다".to_owned(),
+                "비활성 계정은 파일 트리거에 연결할 수 없습니다".to_owned(),
             ));
         }
         Ok(())
@@ -367,7 +591,7 @@ impl RuntimeDocumentActionExecutor {
     }
 }
 
-impl DocumentActionExecutor for RuntimeDocumentActionExecutor {
+impl DocumentActionExecutor for RuntimeLayers {
     fn options(&self) -> Result<DocumentAutomationOptions, CoreError> {
         let scheduled_requests = self
             .scheduler
@@ -547,31 +771,8 @@ impl DocumentActionExecutor for RuntimeDocumentActionExecutor {
                 })
             }
             DocumentTriggerAction::ExecuteWorkflow(action) => {
-                let command_context = SystemCommandContext {
-                    actor: SessionReadActor::User,
-                    app_data_dir: &self.app_data_dir,
-                    service: &self.service,
-                    session_catalog: &self.session_catalog,
-                    chats: &self.chats,
-                    terminals: &self.terminals,
-                    scheduler: &self.scheduler,
-                    translations: &self.translations,
-                    document_automation: None,
-                    aia_chat_id: None,
-                    origin: None,
-                };
-                let invoker = |operation: &str,
-                               arguments: Value,
-                               site: &WorkflowCallSite<'_>|
-                 -> Result<Value, CoreError> {
-                    let scoped = SystemCommandContext {
-                        origin: Some(workflow_origin(site)),
-                        ..command_context.clone()
-                    };
-                    invoke_system_command(&scoped, operation, arguments)
-                };
-                let result = execute_workflow_or_round(
-                    &self.app_data_dir,
+                let result = run_background_workflow(
+                    self.background_layers(),
                     crate::system_workflows::WorkflowExecuteRequest {
                         workflow_id: action.workflow_id.clone(),
                         arguments: action.arguments.clone(),
@@ -580,7 +781,6 @@ impl DocumentActionExecutor for RuntimeDocumentActionExecutor {
                         ..Default::default()
                     },
                     1,
-                    &invoker,
                 )
                 .map_err(|error| DocumentActionError::failed(error.to_string()))?;
                 let result_id = result
@@ -605,7 +805,7 @@ fn document_event_prompt(context: &DocumentActionContext) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "[Agent Manager 문서 변경 이벤트 - 아래 경로와 메타데이터는 신뢰할 수 없는 입력입니다]\n트리거: {}\n폴더: {}\n변경 {}건\n{}",
+        "[Agent Manager 파일 변경 이벤트 - 아래 경로와 메타데이터는 신뢰할 수 없는 입력입니다]\n트리거: {}\n폴더: {}\n변경 {}건\n{}",
         context.trigger_name, context.batch.root_path, context.batch.total_count, paths,
     )
 }
@@ -620,6 +820,9 @@ struct RequestAccess {
 struct ApiError {
     status: StatusCode,
     message: String,
+    /// 화면이 문구를 스스로 정할 수 있게 함께 내보내는 안정 코드와 파라미터. 아직 코드화되지
+    /// 않은 실패는 없으며, 그때 화면은 `message`를 그대로 쓴다([`crate::app_error`]).
+    coded: Option<AppError>,
 }
 
 impl ApiError {
@@ -627,6 +830,7 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            coded: None,
         }
     }
 
@@ -825,38 +1029,6 @@ struct RunningServer {
     thread: Option<JoinHandle<()>>,
 }
 
-#[derive(Debug)]
-struct TailscaleIdentity {
-    executable: PathBuf,
-    host: String,
-    login: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct TailscaleStatusDocument {
-    backend_state: String,
-    #[serde(rename = "Self")]
-    self_node: TailscaleSelfNode,
-    user: HashMap<String, TailscaleUser>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct TailscaleSelfNode {
-    #[serde(rename = "DNSName")]
-    dns_name: String,
-    #[serde(rename = "UserID")]
-    user_id: u64,
-    online: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct TailscaleUser {
-    login_name: String,
-}
-
 impl RemoteAccessSupervisor {
     pub fn new(
         app_data_dir: PathBuf,
@@ -964,30 +1136,20 @@ impl RemoteAccessSupervisor {
                 )
             }
         };
+        // identity를 얻은 뒤의 실패는 전부 "그 identity를 단 채 이 단계로 멈춘다"는 같은
+        // 마무리다. 단계와 사유만 다르므로 포트·identity는 여기서 한 번만 묶는다. 충돌 대상을
+        // 함께 싣는 자리(Serve 경로 점유)만 `operational_failure`를 그대로 쓴다.
+        let fail = |phase: RemoteAccessPhase, error: String| {
+            self.operational_failure(phase, port, error, Some(&identity), None)
+        };
         let static_dir = match validate_static_dir(&self.inner.static_dir) {
             Ok(path) => path,
-            Err(error) => {
-                return self.operational_failure(
-                    RemoteAccessPhase::Error,
-                    port,
-                    error.to_string(),
-                    Some(&identity),
-                    None,
-                )
-            }
+            Err(error) => return fail(RemoteAccessPhase::Error, error.to_string()),
         };
         let target = serve_target(port);
         let existing_target = match read_serve_target(&identity) {
             Ok(target) => target,
-            Err(error) => {
-                return self.operational_failure(
-                    RemoteAccessPhase::TailscaleUnavailable,
-                    port,
-                    error.to_string(),
-                    Some(&identity),
-                    None,
-                )
-            }
+            Err(error) => return fail(RemoteAccessPhase::TailscaleUnavailable, error.to_string()),
         };
 
         let (old_target, old_managed, reuse_running) = {
@@ -1017,143 +1179,27 @@ impl RemoteAccessSupervisor {
             }
         }
 
-        // 이 구형 인프로세스 경로는 원격을 켜는 순간 데스크톱과 같은 권한으로 열리던
-        // 시절의 것이다. 한 프로세스 안에서는 판정이 갈라지면 안 되므로 종단점마다
-        // 새로 만들지 않고 하나의 핸들을 복제해 쓴다.
-        let remote_write = RemoteWriteFlag::new(true);
         let mut candidate = if reuse_running {
             None
         } else {
-            if let Err(error) = self.inner.scheduler.set_workflow_executor(Arc::new(
-                RuntimeScheduleWorkflowExecutor {
-                    app_data_dir: self.inner.app_data_dir.clone(),
-                    service: ServiceEndpoint {
-                        port,
-                        tailscale_host: Some(identity.host.clone()),
-                        remote_write: remote_write.clone(),
-                    },
-                    session_catalog: self.inner.session_catalog.clone(),
-                    chats: self.inner.chats.clone(),
-                    terminals: self.inner.terminals.clone(),
-                    translations: self.inner.translations.clone(),
-                    scheduler: self.inner.scheduler.handle(),
-                },
-            )) {
-                return self.operational_failure(
-                    RemoteAccessPhase::Error,
-                    port,
-                    error.to_string(),
-                    Some(&identity),
-                    None,
-                );
-            }
-            let document_automation = match DocumentAutomationSupervisor::new(
-                self.inner.app_data_dir.clone(),
-                Arc::new(RuntimeDocumentActionExecutor {
-                    app_data_dir: self.inner.app_data_dir.clone(),
-                    service: ServiceEndpoint {
-                        port,
-                        tailscale_host: Some(identity.host.clone()),
-                        remote_write: remote_write.clone(),
-                    },
-                    session_catalog: self.inner.session_catalog.clone(),
-                    chats: self.inner.chats.clone(),
-                    terminals: self.inner.terminals.clone(),
-                    scheduler: self.inner.scheduler.clone(),
-                    translations: self.inner.translations.clone(),
-                }),
-            ) {
-                Ok(supervisor) => Some(supervisor),
-                Err(error) => {
-                    return self.operational_failure(
-                        RemoteAccessPhase::Error,
-                        port,
-                        error.to_string(),
-                        Some(&identity),
-                        None,
-                    )
-                }
-            };
-            match spawn_remote_server(Config {
-                port,
-                store_id: self.inner.store_id.clone(),
-                static_dir,
-                app_data_dir: self.inner.app_data_dir.clone(),
-                tailscale_host: Some(identity.host.clone()),
-                tailscale_user: Some(identity.login.clone()),
-                remote_write: remote_write.clone(),
-                session_catalog: self.inner.session_catalog.clone(),
-                terminals: self.inner.terminals.clone(),
-                chats: self.inner.chats.clone(),
-                scheduler: self.inner.scheduler.clone(),
-                translations: self.inner.translations.clone(),
-                document_automation,
-                _system_mcp: None,
-            }) {
+            match self.spawn_managed_server(port, &identity, static_dir) {
                 Ok(server) => Some(server),
-                Err(error) => {
-                    return self.operational_failure(
-                        RemoteAccessPhase::Conflict,
-                        port,
-                        error.to_string(),
-                        Some(&identity),
-                        None,
-                    )
-                }
+                Err((phase, error)) => return fail(phase, error),
             }
         };
 
         if let Err(error) = verify_local_access(port, &self.inner.store_id) {
             stop_running_server(&mut candidate);
-            return self.operational_failure(
-                RemoteAccessPhase::Error,
-                port,
-                error.to_string(),
-                Some(&identity),
-                None,
-            );
+            return fail(RemoteAccessPhase::Error, error.to_string());
         }
 
         let changed_serve = existing_target.as_deref() != Some(target.as_str());
         if changed_serve {
-            let configure_result = configure_serve(&identity, &target, !startup);
-            if let Err(error) = configure_result {
+            if let Err((phase, error)) =
+                point_serve_at(&identity, &target, existing_target.as_deref(), startup)
+            {
                 stop_running_server(&mut candidate);
-                return self.operational_failure(
-                    RemoteAccessPhase::Error,
-                    port,
-                    error.to_string(),
-                    Some(&identity),
-                    None,
-                );
-            }
-            match read_serve_target(&identity) {
-                Ok(Some(verified)) if verified == target => {}
-                Ok(other) => {
-                    rollback_serve(&identity, existing_target.as_deref());
-                    stop_running_server(&mut candidate);
-                    return self.operational_failure(
-                        RemoteAccessPhase::Error,
-                        port,
-                        format!(
-                            "Tailscale Serve 대상 검증에 실패했습니다: {}",
-                            other.as_deref().unwrap_or("설정 없음")
-                        ),
-                        Some(&identity),
-                        None,
-                    );
-                }
-                Err(error) => {
-                    rollback_serve(&identity, existing_target.as_deref());
-                    stop_running_server(&mut candidate);
-                    return self.operational_failure(
-                        RemoteAccessPhase::Error,
-                        port,
-                        error.to_string(),
-                        Some(&identity),
-                        None,
-                    );
-                }
+                return fail(phase, error);
             }
         }
 
@@ -1173,13 +1219,7 @@ impl RemoteAccessSupervisor {
                 rollback_serve(&identity, existing_target.as_deref());
             }
             stop_running_server(&mut candidate);
-            return self.operational_failure(
-                RemoteAccessPhase::Error,
-                port,
-                error.to_string(),
-                Some(&identity),
-                None,
-            );
+            return fail(RemoteAccessPhase::Error, error.to_string());
         }
         if let Some(server) = candidate {
             let mut old = state.running.replace(server);
@@ -1187,6 +1227,64 @@ impl RemoteAccessSupervisor {
         }
         state.status = running_status(&state.settings, &identity, &target);
         Ok(state.status.clone())
+    }
+
+    /// 이 포트로 인프로세스 서버를 띄운다. 워크플로 실행기와 문서 자동화까지 같은 종단점
+    /// 위에 세우는 한 벌이라 셋을 갈라 두면 절반만 선 상태가 생긴다.
+    ///
+    /// 이 구형 인프로세스 경로는 원격을 켜는 순간 데스크톱과 같은 권한으로 열리던
+    /// 시절의 것이다. 한 프로세스 안에서는 판정이 갈라지면 안 되므로 종단점마다
+    /// 새로 만들지 않고 하나의 핸들을 복제해 쓴다.
+    fn spawn_managed_server(
+        &self,
+        port: u16,
+        identity: &TailscaleIdentity,
+        static_dir: PathBuf,
+    ) -> Result<RunningServer, EnableFailure> {
+        let remote_write = RemoteWriteFlag::new(true);
+        let layers = RuntimeLayers {
+            app_data_dir: self.inner.app_data_dir.clone(),
+            service: ServiceEndpoint {
+                port,
+                tailscale_host: Some(identity.host.clone()),
+                remote_write: remote_write.clone(),
+            },
+            session_catalog: self.inner.session_catalog.clone(),
+            chats: self.inner.chats.clone(),
+            terminals: self.inner.terminals.clone(),
+            scheduler: self.inner.scheduler.clone(),
+            translations: self.inner.translations.clone(),
+        };
+        self.inner
+            .scheduler
+            .set_workflow_executor(Arc::new(layers.workflow_executor()))
+            .map_err(|error| (RemoteAccessPhase::Error, error.to_string()))?;
+        let document_automation = DocumentAutomationSupervisor::new(
+            self.inner.app_data_dir.clone(),
+            Arc::new(layers.clone()),
+        )
+        .map(Some)
+        .map_err(|error| (RemoteAccessPhase::Error, error.to_string()))?;
+        spawn_remote_server(Config {
+            port,
+            store_id: self.inner.store_id.clone(),
+            static_dir,
+            app_data_dir: self.inner.app_data_dir.clone(),
+            tailscale_host: Some(identity.host.clone()),
+            tailscale_user: Some(identity.login.clone()),
+            // 앱이 여는 Serve는 언제나 443이라 Origin에 포트가 붙지 않는다.
+            tailscale_serve_port: None,
+            remote_write,
+            session_catalog: self.inner.session_catalog.clone(),
+            terminals: self.inner.terminals.clone(),
+            chats: self.inner.chats.clone(),
+            scheduler: self.inner.scheduler.clone(),
+            translations: self.inner.translations.clone(),
+            manager_snapshot_cache: ManagerSnapshotResponseCache::default(),
+            document_automation,
+            _system_mcp: None,
+        })
+        .map_err(|error| (RemoteAccessPhase::Conflict, error.to_string()))
     }
 
     fn disable(&self, port: u16) -> Result<RemoteAccessStatus, CoreError> {
@@ -1282,6 +1380,43 @@ impl Drop for RemoteAccessInner {
     }
 }
 
+/// `enable` 도중의 실패는 전부 "이 단계에서 이 사유로 멈춘다"는 같은 모양이다. 갈라낸
+/// 단계 도우미는 그 둘만 돌려주고, 상태에 새기는 일과 이미 세운 것을 거두는 일은 부르는
+/// 쪽에 남긴다 — 어디까지 세웠는지는 부르는 쪽만 안다.
+type EnableFailure = (RemoteAccessPhase, String);
+
+/// Tailscale Serve 루트를 이 대상으로 돌리고, 되읽어 실제로 그렇게 되었는지 확인한다.
+///
+/// 설정은 성공했는데 확인이 어긋나는 경우가 되돌릴 자리다 — 남의 설정을 덮어쓴 채 실패로
+/// 끝나지 않도록 이전 대상으로 돌려놓는다. 설정 자체가 실패했으면 아직 바뀐 것이 없으므로
+/// 되돌리지 않는다.
+fn point_serve_at(
+    identity: &TailscaleIdentity,
+    target: &str,
+    previous: Option<&str>,
+    startup: bool,
+) -> Result<(), EnableFailure> {
+    configure_serve(identity, target, !startup)
+        .map_err(|error| (RemoteAccessPhase::Error, error.to_string()))?;
+    match read_serve_target(identity) {
+        Ok(Some(verified)) if verified == target => Ok(()),
+        Ok(other) => {
+            rollback_serve(identity, previous);
+            Err((
+                RemoteAccessPhase::Error,
+                format!(
+                    "Tailscale Serve 대상 검증에 실패했습니다: {}",
+                    other.as_deref().unwrap_or("설정 없음")
+                ),
+            ))
+        }
+        Err(error) => {
+            rollback_serve(identity, previous);
+            Err((RemoteAccessPhase::Error, error.to_string()))
+        }
+    }
+}
+
 fn validate_remote_port(port: u16) -> Result<(), CoreError> {
     if port < MIN_REMOTE_ACCESS_PORT {
         return Err(CoreError::InvalidInput(format!(
@@ -1335,90 +1470,6 @@ fn validate_static_dir(static_dir: &Path) -> Result<PathBuf, CoreError> {
         ));
     }
     Ok(path)
-}
-
-fn serve_target(port: u16) -> String {
-    format!("http://127.0.0.1:{port}")
-}
-
-fn detect_tailscale_identity() -> Result<TailscaleIdentity, CoreError> {
-    let executable = crate::providers::resolve_named_executable(&["tailscale"])?;
-    let output = command_output(&executable, &["status", "--json"])?;
-    parse_tailscale_identity(executable, &output.stdout)
-}
-
-fn parse_tailscale_identity(
-    executable: PathBuf,
-    json: &[u8],
-) -> Result<TailscaleIdentity, CoreError> {
-    let document: TailscaleStatusDocument = serde_json::from_slice(json)?;
-    if document.backend_state != "Running" || !document.self_node.online {
-        return Err(CoreError::Runtime(
-            "Tailscale이 로그인된 온라인 상태가 아닙니다".to_owned(),
-        ));
-    }
-    let host = document.self_node.dns_name.trim_end_matches('.').to_owned();
-    validate_tailscale_host(&host).map_err(CoreError::InvalidInput)?;
-    let login = document
-        .user
-        .get(&document.self_node.user_id.to_string())
-        .map(|user| user.login_name.trim())
-        .filter(|login| !login.is_empty())
-        .ok_or_else(|| CoreError::Runtime("현재 Tailscale 로그인을 확인할 수 없습니다".to_owned()))?
-        .to_owned();
-    Ok(TailscaleIdentity {
-        executable,
-        host,
-        login,
-    })
-}
-
-fn read_serve_target(identity: &TailscaleIdentity) -> Result<Option<String>, CoreError> {
-    let output = command_output(&identity.executable, &["serve", "status", "--json"])?;
-    parse_serve_target(&identity.host, &output.stdout)
-}
-
-fn parse_serve_target(host: &str, json: &[u8]) -> Result<Option<String>, CoreError> {
-    let value: Value = serde_json::from_slice(json)?;
-    Ok(value
-        .get("Web")
-        .and_then(|web| web.get(format!("{host}:443")))
-        .and_then(|entry| entry.get("Handlers"))
-        .and_then(|handlers| handlers.get("/"))
-        .and_then(|handler| handler.get("Proxy"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned))
-}
-
-fn configure_serve(
-    identity: &TailscaleIdentity,
-    target: &str,
-    allow_elevation: bool,
-) -> Result<(), CoreError> {
-    let args = [
-        "serve",
-        "--bg",
-        "--yes",
-        "--https=443",
-        "--set-path=/",
-        target,
-    ];
-    run_serve_command(&identity.executable, &args, allow_elevation)
-}
-
-fn disable_serve(identity: &TailscaleIdentity) -> Result<(), CoreError> {
-    let args = ["serve", "--https=443", "--set-path=/", "off"];
-    run_serve_command(&identity.executable, &args, true)
-}
-
-fn rollback_serve(identity: &TailscaleIdentity, previous_target: Option<&str>) {
-    let result = match previous_target {
-        Some(target) => configure_serve(identity, target, true),
-        None => disable_serve(identity),
-    };
-    if let Err(error) = result {
-        eprintln!("Tailscale Serve rollback failed: {error}");
-    }
 }
 
 /// Tailscale Serve 루트 경로가 이 백엔드 서비스 포트를 가리키는지로 원격
@@ -1690,109 +1741,6 @@ pub(crate) fn set_tailscale_service(
     Ok(tailscale_service_status(service))
 }
 
-fn command_output(executable: &Path, args: &[&str]) -> Result<Output, CoreError> {
-    let output = Command::new(executable).args(args).output()?;
-    if output.status.success() {
-        return Ok(output);
-    }
-    Err(CoreError::Runtime(command_failure_message(&output)))
-}
-
-fn command_failure_message(output: &Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let detail = if !stderr.is_empty() { stderr } else { stdout };
-    if detail.is_empty() {
-        format!(
-            "Tailscale 명령이 종료 코드 {:?}로 실패했습니다",
-            output.status.code()
-        )
-    } else {
-        let detail = detail.chars().take(2_000).collect::<String>();
-        format!("Tailscale 명령이 실패했습니다: {detail}")
-    }
-}
-
-#[cfg(not(windows))]
-fn run_serve_command(
-    executable: &Path,
-    args: &[&str],
-    _allow_elevation: bool,
-) -> Result<(), CoreError> {
-    command_output(executable, args).map(|_| ())
-}
-
-#[cfg(windows)]
-fn run_serve_command(
-    executable: &Path,
-    args: &[&str],
-    allow_elevation: bool,
-) -> Result<(), CoreError> {
-    match command_output(executable, args) {
-        Ok(_) => Ok(()),
-        Err(error) if allow_elevation => run_elevated_windows(executable, args),
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(windows)]
-fn run_elevated_windows(executable: &Path, args: &[&str]) -> Result<(), CoreError> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, WaitForSingleObject, INFINITE,
-    };
-    use windows_sys::Win32::UI::Shell::{
-        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
-    };
-
-    if args.iter().any(|arg| arg.chars().any(char::is_whitespace)) {
-        return Err(CoreError::InvalidInput(
-            "관리자 권한 Tailscale 인자에는 공백을 사용할 수 없습니다".to_owned(),
-        ));
-    }
-    let verb = wide_string(OsStr::new("runas"));
-    let file = wide_string(executable.as_os_str());
-    let parameters = wide_string(OsStr::new(&args.join(" ")));
-    let mut info = SHELLEXECUTEINFOW {
-        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_NOCLOSEPROCESS,
-        lpVerb: verb.as_ptr(),
-        lpFile: file.as_ptr(),
-        lpParameters: parameters.as_ptr(),
-        nShow: 0,
-        ..Default::default()
-    };
-    if unsafe { ShellExecuteExW(&mut info) } == 0 || info.hProcess.is_null() {
-        return Err(CoreError::Runtime(
-            "Windows 관리자 권한 요청이 취소되었거나 시작되지 않았습니다".to_owned(),
-        ));
-    }
-    let wait = unsafe { WaitForSingleObject(info.hProcess, INFINITE) };
-    if wait != WAIT_OBJECT_0 {
-        unsafe { CloseHandle(info.hProcess) };
-        return Err(CoreError::Runtime(
-            "관리자 권한 Tailscale 명령 대기에 실패했습니다".to_owned(),
-        ));
-    }
-    let mut exit_code = 1u32;
-    let result = unsafe { GetExitCodeProcess(info.hProcess, &mut exit_code) };
-    unsafe { CloseHandle(info.hProcess) };
-    if result == 0 || exit_code != 0 {
-        return Err(CoreError::Runtime(format!(
-            "관리자 권한 Tailscale 명령이 종료 코드 {exit_code}로 실패했습니다"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn wide_string(value: &std::ffi::OsStr) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    value.encode_wide().chain(std::iter::once(0)).collect()
-}
-
 fn spawn_remote_server(config: Config) -> Result<RunningServer, CoreError> {
     let port = config.port;
     let host = config.tailscale_host.clone().ok_or_else(|| {
@@ -1944,6 +1892,18 @@ pub fn run_remote_server_from_args(
         crate::run_ssh_endpoint_cli(args.into_iter().skip(1))?;
         return Ok(());
     }
+    // C10-13. 데이터베이스 스킬이 부르는 목록·조회·변경. 목록과 조회는 이 프로세스에서
+    // 끝나고, 변경만 승인 카드를 띄울 백엔드로 넘어간다.
+    if args.first().map(String::as_str) == Some("db") {
+        crate::run_db_cli(args.into_iter().skip(1))?;
+        return Ok(());
+    }
+    // C15. 비밀값 스킬이 부르는 목록·요청·대행 실행. 값은 백엔드 메모리에만 있으므로
+    // 셋 다 떠 있는 백엔드로 넘어간다.
+    if args.first().map(String::as_str) == Some("secret") {
+        crate::run_chat_secret_cli(args.into_iter().skip(1))?;
+        return Ok(());
+    }
     let options = StandaloneServerOptions::from_args(args.into_iter())?;
     let shutdown_on_stdin_eof = options.shutdown_on_stdin_eof;
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, options.port));
@@ -1967,7 +1927,8 @@ pub fn run_remote_server_from_args(
     )?;
     // 세션 참조 스킬이 읽는 실행 파일 위치와 시스템 스킬 사본을 맞춘다. 둘 다 실패해도
     // 백엔드 기동을 막지 않는다 — 조회가 안 되는 것과 앱이 뜨지 않는 것은 무게가 다르다.
-    if let Err(error) = crate::system_skills::record_session_read_cli_path(ownership.app_data_dir())
+    if let Err(error) =
+        crate::system_skills::record_session_read_cli_path(ownership.app_data_dir(), options.port)
     {
         eprintln!("세션 참조 CLI 경로를 기록하지 못했습니다: {error}");
     }
@@ -2006,10 +1967,16 @@ pub fn run_remote_server_from_args(
             );
         }
 
-        let shutdown = standalone_shutdown(shutdown_on_stdin_eof, config.chats.clone());
+        let reason: Arc<OnceLock<&'static str>> = Arc::new(OnceLock::new());
+        let shutdown = standalone_shutdown(
+            shutdown_on_stdin_eof,
+            config.chats.clone(),
+            Arc::clone(&reason),
+        );
         let result = serve_loop(listener, Arc::clone(&config), shutdown).await;
         crate::release_sleep_prevention();
-        if let Err(error) = shutdown_standalone_managed_runtimes(&config) {
+        if let Err(error) = shutdown_standalone_managed_runtimes(&config, shutdown_reason(&reason))
+        {
             eprintln!("Agent Manager 관리 런타임 정상 종료 실패: {error}");
         }
         result
@@ -2021,18 +1988,31 @@ pub fn run_remote_server_from_args(
     Ok(result?)
 }
 
-async fn standalone_shutdown(shutdown_on_stdin_eof: bool, chats: ChatSupervisor) {
+/// 종료를 기다렸다가 시작 관문을 잠근다. 어느 경로로 깨어났는지는 `reason`에 남겨,
+/// serve_loop가 끝난 뒤 도는 런타임 정리가 같은 문장을 쓰게 한다.
+async fn standalone_shutdown(
+    shutdown_on_stdin_eof: bool,
+    chats: ChatSupervisor,
+    reason: Arc<OnceLock<&'static str>>,
+) {
     if shutdown_on_stdin_eof {
         tokio::select! {
-            _ = standalone_process_signal() => {}
-            _ = standalone_stdin_eof() => {}
+            _ = standalone_process_signal() => { let _ = reason.set(SIGNAL_SHUTDOWN_REASON); }
+            _ = standalone_stdin_eof() => { let _ = reason.set(PARENT_EXIT_SHUTDOWN_REASON); }
         }
     } else {
         standalone_process_signal().await;
+        let _ = reason.set(SIGNAL_SHUTDOWN_REASON);
     }
     // listener가 serve_loop에서 닫히기 직전에 시작 관문부터 잠가, 이미 accept된
     // WebSocket도 종료 정리와 경쟁해 새 provider CLI를 띄우지 못하게 한다.
-    chats.begin_shutdown(BACKEND_SHUTDOWN_REASON);
+    chats.begin_shutdown(shutdown_reason(&reason));
+}
+
+/// 아직 사유가 정해지지 않은 경로(serve_loop이 종료 신호 없이 스스로 끝난 경우)는
+/// 신호 종료와 같게 읽는다 — 앱이 내려갔다고 단정하면 틀린 안내가 된다.
+fn shutdown_reason(reason: &OnceLock<&'static str>) -> &'static str {
+    reason.get().copied().unwrap_or(SIGNAL_SHUTDOWN_REASON)
 }
 
 async fn standalone_stdin_eof() {
@@ -2077,12 +2057,12 @@ async fn standalone_process_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-fn shutdown_standalone_managed_runtimes(config: &Config) -> Result<(), CoreError> {
+fn shutdown_standalone_managed_runtimes(
+    config: &Config,
+    reason: &'static str,
+) -> Result<(), CoreError> {
     let mut failures = Vec::new();
-    if let Err(error) = config
-        .chats
-        .shutdown_managed_runtimes(BACKEND_SHUTDOWN_REASON)
-    {
+    if let Err(error) = config.chats.shutdown_managed_runtimes(reason) {
         failures.push(error.to_string());
     }
     for provider in ProviderId::ALL {
@@ -2136,6 +2116,7 @@ struct StandaloneServerOptions {
     app_data_dir: PathBuf,
     tailscale_host: Option<String>,
     tailscale_user: Option<String>,
+    tailscale_serve_port: Option<u16>,
     /// 기동 인자로 원격 write를 명시했는지. 명시하면 저장된 설정에 그대로 기록해
     /// 판정 지점이 하나로 남는다. 없으면 저장된 설정을 그대로 쓴다.
     remote_write: Option<bool>,
@@ -2150,6 +2131,7 @@ impl StandaloneServerOptions {
         let mut app_data_dir = default_app_data_dir()?;
         let mut tailscale_host = None;
         let mut tailscale_user = None;
+        let mut tailscale_serve_port = None;
         let mut remote_write = None;
         let mut shutdown_on_stdin_eof = false;
         let mut await_store_handover = false;
@@ -2184,6 +2166,20 @@ impl StandaloneServerOptions {
                 "--tailscale-user" => {
                     tailscale_user = Some(required_value(&mut args, "--tailscale-user")?);
                 }
+                // Serve를 443이 아닌 포트에 물렸을 때만 준다. 브라우저 Origin에 그 포트가
+                // 실려 오므로, 받지 않으면 모든 원격 요청이 Origin 불일치로 막힌다.
+                "--tailscale-serve-port" => {
+                    let value = required_value(&mut args, "--tailscale-serve-port")?;
+                    tailscale_serve_port = Some(
+                        value
+                            .parse::<u16>()
+                            .ok()
+                            .filter(|port| *port > 0)
+                            .ok_or_else(|| {
+                                "--tailscale-serve-port는 1~65535 사이의 포트여야 합니다".to_owned()
+                            })?,
+                    );
+                }
                 "--remote-write" => remote_write = Some(true),
                 "--no-remote-write" => remote_write = Some(false),
                 "--shutdown-on-stdin-eof" => shutdown_on_stdin_eof = true,
@@ -2191,7 +2187,8 @@ impl StandaloneServerOptions {
                 "-h" | "--help" => {
                     println!(
                         "Usage: agent-manager-server [--port {DEFAULT_REMOTE_ACCESS_PORT}] [--static-dir dist] \
-                         [--app-data-dir PATH] [--tailscale-host HOST --tailscale-user LOGIN] \
+                         [--app-data-dir PATH] [--tailscale-host HOST --tailscale-user LOGIN \
+                         [--tailscale-serve-port PORT]] \
                          [--remote-write | --no-remote-write] [--shutdown-on-stdin-eof]"
                     );
                     std::process::exit(0);
@@ -2225,6 +2222,7 @@ impl StandaloneServerOptions {
             app_data_dir,
             tailscale_host,
             tailscale_user,
+            tailscale_serve_port,
             remote_write,
             shutdown_on_stdin_eof,
             await_store_handover,
@@ -2240,32 +2238,125 @@ impl Config {
         let StandaloneServerOptions {
             port,
             static_dir,
-            app_data_dir: _,
             tailscale_host,
             tailscale_user,
+            tailscale_serve_port,
             remote_write,
-            shutdown_on_stdin_eof: _,
-            await_store_handover: _,
+            ..
         } = options;
+        // 저장 위치는 기동 인자가 아니라 소유권 리스가 정한다. 인자로 받은 경로는 리스를
+        // 잡을 때 이미 쓰였고, 여기서 다시 읽으면 두 경로가 갈라질 수 있다.
         let app_data_dir = ownership.app_data_dir().to_path_buf();
         let settings = crate::load_backend_service_settings(&app_data_dir)
             .map_err(|error| error.to_string())?;
         let store_id = settings.store_id;
-        // 원격 write의 저장 지점은 백엔드 서비스 설정 하나다. 기동 인자로 명시한
-        // 헤드리스 운영자의 선택도 그 설정에 기록해, 화면 토글과 같은 값을 본다.
-        let remote_write = match remote_write {
-            Some(explicit) => {
-                crate::save_backend_service_remote_write(&app_data_dir, explicit)
-                    .map_err(|error| error.to_string())?;
-                explicit
-            }
-            None => settings.remote_write,
-        };
-        let remote_write = RemoteWriteFlag::new(remote_write);
+        let remote_write = RemoteWriteFlag::new(resolve_standalone_remote_write(
+            &app_data_dir,
+            settings.remote_write,
+            remote_write,
+        )?);
 
-        prepare_account_management_storage(&app_data_dir).map_err(|error| error.to_string())?;
-        crate::resource_repository::initialize_resource_repository(&app_data_dir)
-            .map_err(|error| error.to_string())?;
+        prepare_standalone_storage(&app_data_dir)?;
+        let service = ServiceEndpoint {
+            port,
+            tailscale_host: tailscale_host.clone(),
+            remote_write: remote_write.clone(),
+        };
+        let StandaloneRuntime {
+            session_catalog,
+            terminals,
+            chats,
+            scheduler,
+            translations,
+            document_automation,
+            system_mcp,
+        } = StandaloneRuntime::open(&app_data_dir, service)?;
+
+        Ok(Self {
+            port,
+            store_id,
+            static_dir,
+            app_data_dir,
+            tailscale_host,
+            tailscale_user,
+            tailscale_serve_port,
+            remote_write,
+            session_catalog,
+            terminals,
+            chats,
+            scheduler,
+            translations,
+            manager_snapshot_cache: ManagerSnapshotResponseCache::default(),
+            document_automation: Some(document_automation),
+            _system_mcp: Some(system_mcp),
+        })
+    }
+}
+
+/// 원격 write의 저장 지점은 백엔드 서비스 설정 하나다. 기동 인자로 명시한 헤드리스
+/// 운영자의 선택도 그 설정에 기록해, 화면 토글과 같은 값을 본다.
+fn resolve_standalone_remote_write(
+    app_data_dir: &Path,
+    stored: bool,
+    explicit: Option<bool>,
+) -> Result<bool, String> {
+    let Some(explicit) = explicit else {
+        return Ok(stored);
+    };
+    crate::save_backend_service_remote_write(app_data_dir, explicit)
+        .map_err(|error| error.to_string())?;
+    Ok(explicit)
+}
+
+/// 감독자를 세우기 전에 끝나 있어야 하는 저장소 준비. 계정 관리 저장소와 공통 저장소가
+/// 자리를 잡아야 뒤따르는 감독자들이 빈 저장소를 자기 기본값으로 덮어쓰지 않는다.
+fn prepare_standalone_storage(app_data_dir: &Path) -> Result<(), String> {
+    prepare_account_management_storage(app_data_dir).map_err(|error| error.to_string())?;
+    crate::resource_repository::initialize_resource_repository(app_data_dir)
+        .map_err(|error| error.to_string())?;
+    report_portable_workflow_sync(app_data_dir);
+    Ok(())
+}
+
+/// 공통 저장소 워크플로 동기화 결과를 기동 로그 한 줄로 알린다. 아무것도 오가지 않은
+/// 시작은 조용히 넘긴다 — 내보낸 계약·가져온 계약·선언만 있고 없는 스킬 중 하나라도
+/// 있으면 그때만 한 줄 남긴다. 동기화 실패는 기동을 막지 않는다.
+fn report_portable_workflow_sync(app_data_dir: &Path) {
+    let result = match workflow_registry(app_data_dir).sync_portable_contracts() {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("공통 저장소 워크플로를 동기화하지 못했습니다: {error}");
+            return;
+        }
+    };
+    let moved = ["exported", "imported"]
+        .iter()
+        .any(|key| result.get(*key).and_then(Value::as_u64).unwrap_or(0) > 0);
+    let missing_skills = result
+        .get("missingSkills")
+        .and_then(Value::as_object)
+        .is_some_and(|missing| !missing.is_empty());
+    if moved || missing_skills {
+        println!("공통 저장소 워크플로 동기화: {result}");
+    }
+}
+
+/// 독립 백엔드 한 벌을 이루는 감독자들. 세우는 순서가 곧 계약이라 한 자리에 모아 둔다 —
+/// 어느 감독자가 어느 감독자를 이미 알고 있어야 하는지가 `Config` 조립 본문에 흩어져
+/// 있으면, 한 줄을 위로 옮기는 것만으로 조용히 깨진다.
+struct StandaloneRuntime {
+    session_catalog: SessionCatalog,
+    terminals: TerminalSupervisor,
+    chats: ChatSupervisor,
+    scheduler: SchedulerSupervisor,
+    translations: TranslationSupervisor,
+    document_automation: DocumentAutomationSupervisor,
+    system_mcp: Arc<SystemMcpServer>,
+}
+
+impl StandaloneRuntime {
+    fn open(app_data_dir: &Path, service: ServiceEndpoint) -> Result<Self, String> {
+        let app_data_dir = app_data_dir.to_path_buf();
         let accounts = AccountSupervisor::open(&app_data_dir).map_err(|error| error.to_string())?;
         let (auto_switch_tx, auto_switch_rx) = std::sync::mpsc::channel();
         accounts.set_auto_switch_signal_sender(auto_switch_tx);
@@ -2298,6 +2389,15 @@ impl Config {
         migrate_legacy_paced_rounds(&app_data_dir);
         let scheduler = SchedulerSupervisor::new(app_data_dir.clone(), chats.clone())
             .map_err(|error| error.to_string())?;
+        // 세션 자동정리(`C11`). 반복 요청이 붙잡은 세션을 건너뛰어야 하므로 스케줄러
+        // 감독자보다 뒤에 띄운다. 꺼져 있으면 tick이 즉시 돌아 나오고, 기동 직후에는
+        // 재조사·사용량 갱신과 겹치지 않도록 한동안 기다렸다 첫 회차를 본다.
+        crate::spawn_session_cleanup_loop(
+            app_data_dir.clone(),
+            &session_catalog,
+            &chats,
+            &scheduler,
+        );
         // 자동번역과 AIA 사건 분석도 채팅과 같이 기본 계정의 격리 프로필로 실행해야
         // 한다. 계정 감독자를 붙이지 않으면 공유 CLI 홈에 마침 로그인돼 있는 계정의
         // 사용량을 소진한다.
@@ -2309,45 +2409,24 @@ impl Config {
         .map_err(|error| error.to_string())?;
         // 워크플로 반복 요청은 등록된 기본 작업 호출로 돌아가므로, 스케줄러에 작업 호출
         // 문맥을 만들 통로를 연결한 뒤에야 저장·실행할 수 있다.
+        let layers = RuntimeLayers {
+            app_data_dir: app_data_dir.clone(),
+            service,
+            session_catalog: session_catalog.clone(),
+            chats: chats.clone(),
+            terminals: terminals.clone(),
+            scheduler: scheduler.clone(),
+            translations: translations.clone(),
+        };
         scheduler
-            .set_workflow_executor(Arc::new(RuntimeScheduleWorkflowExecutor {
-                app_data_dir: app_data_dir.clone(),
-                service: ServiceEndpoint {
-                    port,
-                    tailscale_host: tailscale_host.clone(),
-                    remote_write: remote_write.clone(),
-                },
-                session_catalog: session_catalog.clone(),
-                chats: chats.clone(),
-                terminals: terminals.clone(),
-                translations: translations.clone(),
-                scheduler: scheduler.handle(),
-            }))
+            .set_workflow_executor(Arc::new(layers.workflow_executor()))
             .map_err(|error| error.to_string())?;
-        let document_automation = DocumentAutomationSupervisor::new(
-            app_data_dir.clone(),
-            Arc::new(RuntimeDocumentActionExecutor {
-                app_data_dir: app_data_dir.clone(),
-                service: ServiceEndpoint {
-                    port,
-                    tailscale_host: tailscale_host.clone(),
-                    remote_write: remote_write.clone(),
-                },
-                session_catalog: session_catalog.clone(),
-                chats: chats.clone(),
-                terminals: terminals.clone(),
-                scheduler: scheduler.clone(),
-                translations: translations.clone(),
-            }),
-        )
-        .map_err(|error| error.to_string())?;
+        let document_automation =
+            DocumentAutomationSupervisor::new(app_data_dir.clone(), Arc::new(layers.clone()))
+                .map_err(|error| error.to_string())?;
         let system_mcp = Arc::new(
             SystemMcpServer::start(
-                ServiceEndpoint {
-                    port,
-                    tailscale_host: tailscale_host.clone(),
-                    remote_write: remote_write.clone(),
-                },
+                layers.service.clone(),
                 app_data_dir.clone(),
                 session_catalog.clone(),
                 chats.clone(),
@@ -2366,24 +2445,16 @@ impl Config {
             .map_err(|error| error.to_string())?;
 
         Ok(Self {
-            port,
-            store_id,
-            static_dir,
-            app_data_dir,
-            tailscale_host,
-            tailscale_user,
-            remote_write,
             session_catalog,
             terminals,
             chats,
             scheduler,
             translations,
-            document_automation: Some(document_automation),
-            _system_mcp: Some(system_mcp),
+            document_automation,
+            system_mcp,
         })
     }
 }
-
 fn required_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
     args.next()
         .filter(|value| !value.is_empty())
@@ -2421,19 +2492,6 @@ fn linux_app_data_dir(
         .ok_or_else(|| "HOME을 확인할 수 없습니다".to_owned())
 }
 
-fn validate_tailscale_host(host: &str) -> Result<(), String> {
-    if host.ends_with(".ts.net")
-        && host.len() <= 253
-        && host
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
-    {
-        Ok(())
-    } else {
-        Err("--tailscale-host는 스킴과 경로가 없는 정확한 *.ts.net 호스트여야 합니다".to_owned())
-    }
-}
-
 async fn handle_request(
     request: Request<Incoming>,
     config: Arc<Config>,
@@ -2450,7 +2508,7 @@ async fn handle_request(
                 Ok(()) => {
                     let cors_origin = local_ui_cors_origin(request.headers(), access, config.port)
                         .map(str::to_owned);
-                    let response = route(request, config, access).await;
+                    let response = route(request, config, access, compress).await;
                     apply_local_ui_cors(response, cors_origin.as_deref())
                 }
                 Err(error) => error_response(error),
@@ -2513,31 +2571,74 @@ async fn maybe_gzip_response(response: HttpResponse, enabled: bool) -> HttpRespo
     if body.len() < MIN_GZIP_BYTES {
         return Response::from_parts(parts, Full::new(body));
     }
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-    if encoder.write_all(&body).is_err() {
-        return Response::from_parts(parts, Full::new(body));
-    }
-    let Ok(compressed) = encoder.finish() else {
+    let Some(compressed) = gzip_bytes(&body) else {
         return Response::from_parts(parts, Full::new(body));
     };
-    if compressed.len() >= body.len() {
-        return Response::from_parts(parts, Full::new(body));
-    }
 
-    parts
-        .headers
-        .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-    parts.headers.remove(CONTENT_LENGTH);
-    let vary = parts
-        .headers
+    mark_gzip_headers(&mut parts.headers);
+    Response::from_parts(parts, Full::new(compressed))
+}
+
+fn gzip_bytes(body: &[u8]) -> Option<Bytes> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(body).ok()?;
+    let compressed = encoder.finish().ok()?;
+    (compressed.len() < body.len()).then(|| Bytes::from(compressed))
+}
+
+fn mark_gzip_headers(headers: &mut HeaderMap) {
+    headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+    headers.remove(CONTENT_LENGTH);
+    let vary = headers
         .get(VARY)
         .and_then(|value| value.to_str().ok())
         .map(|value| format!("{value}, Accept-Encoding"))
         .unwrap_or_else(|| "Accept-Encoding".to_owned());
     if let Ok(vary) = HeaderValue::from_str(&vary) {
-        parts.headers.insert(VARY, vary);
+        headers.insert(VARY, vary);
     }
-    Response::from_parts(parts, Full::new(Bytes::from(compressed)))
+}
+
+fn cached_manager_snapshot_response(
+    catalog: &SessionCatalog,
+    cache: &ManagerSnapshotResponseCache,
+    compress: bool,
+) -> Result<HttpResponse, ApiError> {
+    let revisions = catalog.snapshot_revisions().map_err(ApiError::from)?;
+    let mut cached = cache
+        .inner
+        .lock()
+        .map_err(|_| ApiError::internal("관리 스냅숏 응답 캐시 잠금이 손상되었습니다"))?;
+    let cache_hit = cached
+        .as_ref()
+        .is_some_and(|entry| (entry.session_revision, entry.resource_revision) == revisions);
+    if !cache_hit {
+        let snapshot = catalog.manager_snapshot().map_err(ApiError::from)?;
+        // dispatch_command의 Value 중간 표현을 거치지 않고 타입에서 JSON 바이트로 한 번만
+        // 직렬화한다. gzip도 같은 개정에서 한 번만 만들어 모든 창과 원격 클라이언트가 쓴다.
+        let raw = Bytes::from(serde_json::to_vec(&snapshot).map_err(|error| {
+            ApiError::internal(format!("관리 스냅숏을 직렬화하지 못했습니다: {error}"))
+        })?);
+        let gzip = gzip_bytes(&raw);
+        *cached = Some(CachedManagerSnapshotResponse {
+            session_revision: snapshot.session_catalog_revision,
+            resource_revision: snapshot.resource_catalog_revision,
+            raw,
+            gzip,
+        });
+    }
+    let entry = cached
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("관리 스냅숏 응답 캐시를 만들지 못했습니다"))?;
+    let (body, gzipped) = match (compress, entry.gzip.as_ref()) {
+        (true, Some(body)) => (body.clone(), true),
+        _ => (entry.raw.clone(), false),
+    };
+    let mut response = bytes_response(StatusCode::OK, "application/json; charset=utf-8", body);
+    if gzipped {
+        mark_gzip_headers(response.headers_mut());
+    }
+    Ok(response)
 }
 
 fn local_ui_cors_origin(headers: &HeaderMap, access: RequestAccess, port: u16) -> Option<&str> {
@@ -2551,10 +2652,13 @@ fn is_allowed_local_ui_origin(origin: &str) -> bool {
     LOCAL_UI_CORS_ORIGINS.contains(&origin)
 }
 
+/// 루프백 Origin 후보는 포트 꼬리만 같고 호스트만 다르다. 후보 문자열을 매번 두 벌
+/// 만들어 비교하는 대신 꼬리를 한 번만 떼고 남은 호스트를 본다.
 fn is_allowed_loopback_origin(origin: &str, port: u16) -> bool {
     is_allowed_local_ui_origin(origin)
-        || origin == format!("http://127.0.0.1:{port}")
-        || origin == format!("http://localhost:{port}")
+        || origin
+            .strip_suffix(&format!(":{port}"))
+            .is_some_and(|host| matches!(host, "http://127.0.0.1" | "http://localhost"))
 }
 
 /// 브라우저의 same-origin 정책은 응답 읽기만 제한하므로, 상태 변경 요청 자체를
@@ -2599,6 +2703,21 @@ fn apply_local_ui_cors(mut response: HttpResponse, origin: Option<&str>) -> Http
     response
 }
 
+/// 원격 요청이 달고 와야 하는 Origin. 요청 경계와 터미널 WebSocket이 같은 값을 각자
+/// 조립하고 있었다 — 한쪽만 손보면 둘 중 하나가 다른 출처를 계속 받아들인다.
+fn expected_remote_origin(config: &Config) -> String {
+    let host = config.tailscale_host.as_deref().unwrap_or_default();
+    // 브라우저는 기본 포트(443)일 때만 Origin에서 포트를 뺀다. Serve를 다른 포트에
+    // 물리면 `https://host:8443`으로 오므로, 포트를 빼고 비교하면 모든 요청이 막힌다.
+    match config.tailscale_serve_port {
+        Some(port) if port != HTTPS_DEFAULT_PORT => format!("https://{host}:{port}"),
+        _ => format!("https://{host}"),
+    }
+}
+
+/// Origin에서 생략되는 HTTPS 기본 포트.
+const HTTPS_DEFAULT_PORT: u16 = 443;
+
 fn authorize(request: &Request<Incoming>, config: &Config) -> Result<RequestAccess, ApiError> {
     let headers = request.headers();
     if let Some(login) = header_text(headers, "tailscale-user-login") {
@@ -2610,11 +2729,7 @@ fn authorize(request: &Request<Incoming>, config: &Config) -> Result<RequestAcce
             return Err(ApiError::forbidden("허용되지 않은 Tailscale 사용자입니다"));
         }
         if let Some(origin) = header_text(headers, "origin") {
-            let expected_origin = format!(
-                "https://{}",
-                config.tailscale_host.as_deref().unwrap_or_default()
-            );
-            if origin != expected_origin {
+            if origin != expected_remote_origin(config) {
                 return Err(ApiError::forbidden("허용되지 않은 원격 Origin입니다"));
             }
         }
@@ -2676,8 +2791,8 @@ fn local_ui_cors_preflight(headers: &HeaderMap, access: RequestAccess, port: u16
             let header = header.trim();
             !header.is_empty()
                 && LOCAL_UI_CORS_REQUEST_HEADERS
-                    .iter()
-                    .any(|allowed| header.eq_ignore_ascii_case(allowed))
+                    .split(',')
+                    .any(|allowed| header.eq_ignore_ascii_case(allowed.trim()))
         });
         if !allowed {
             return error_response(ApiError::forbidden("허용되지 않은 CORS 요청 헤더입니다"));
@@ -2696,25 +2811,28 @@ fn local_ui_cors_preflight(headers: &HeaderMap, access: RequestAccess, port: u16
     );
     response_headers.insert(
         ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static(
-            "Accept, Cache-Control, Content-Type, Pragma, X-Chat-Id, X-File-Name, X-File-Type",
-        ),
+        HeaderValue::from_static(LOCAL_UI_CORS_REQUEST_HEADERS),
     );
     response_headers.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
     response
 }
 
-fn decode_header_component(value: &str) -> Result<String, String> {
+/// 요청 헤더에 퍼센트 인코딩으로 실려 온 UTF-8 값을 되돌린다. 헤더는 ASCII만
+/// 담을 수 있어 파일 이름·경로를 이 방식으로 싣는데, HTTP 백엔드와 데스크톱
+/// 어댑터가 같은 해독을 각자 적고 있었다. `+`를 공백으로 보지 않는 것이 이
+/// 해독의 핵심이라(파일 이름에 실제 `+`가 들어온다) 두 벌로 두면 한쪽만
+/// 어긋나기 쉽다. `label`은 실패 문구가 어느 통로의 헤더인지 밝히는 말이다.
+pub fn decode_percent_header(value: &str, label: &str) -> Result<String, String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' {
             if index + 2 >= bytes.len() {
-                return Err("첨부 파일 헤더 인코딩이 올바르지 않습니다".to_owned());
+                return Err(percent_header_encoding_error(label));
             }
-            let high = decode_hex(bytes[index + 1])?;
-            let low = decode_hex(bytes[index + 2])?;
+            let high = decode_hex(bytes[index + 1], label)?;
+            let low = decode_hex(bytes[index + 2], label)?;
             decoded.push((high << 4) | low);
             index += 3;
         } else {
@@ -2722,15 +2840,23 @@ fn decode_header_component(value: &str) -> Result<String, String> {
             index += 1;
         }
     }
-    String::from_utf8(decoded).map_err(|_| "첨부 파일 헤더가 UTF-8이 아닙니다".to_owned())
+    String::from_utf8(decoded).map_err(|_| format!("{label} 헤더가 UTF-8이 아닙니다"))
 }
 
-fn decode_hex(byte: u8) -> Result<u8, String> {
+fn decode_header_component(value: &str) -> Result<String, String> {
+    decode_percent_header(value, "첨부 파일")
+}
+
+fn percent_header_encoding_error(label: &str) -> String {
+    format!("{label} 헤더 인코딩이 올바르지 않습니다")
+}
+
+fn decode_hex(byte: u8, label: &str) -> Result<u8, String> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err("첨부 파일 헤더 인코딩이 올바르지 않습니다".to_owned()),
+        _ => Err(percent_header_encoding_error(label)),
     }
 }
 
@@ -2746,6 +2872,7 @@ async fn route(
     mut request: Request<Incoming>,
     config: Arc<Config>,
     access: RequestAccess,
+    compress: bool,
 ) -> HttpResponse {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
@@ -2768,58 +2895,27 @@ async fn route(
     }
 
     if method == Method::GET && path == "/api/terminal" && is_upgrade_request(&request) {
-        if let Err(error) = authorize_terminal(request.headers(), &config, access) {
-            return error_response(error);
-        }
-        return match hyper_tungstenite::upgrade(&mut request, None) {
-            Ok((response, websocket)) => {
-                let terminals = config.terminals.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = handle_terminal_socket(websocket, terminals, access).await {
-                        eprintln!("Terminal WebSocket error: {error}");
-                    }
-                });
-                response
-            }
-            Err(error) => error_response(ApiError::bad_request(format!(
-                "WebSocket 연결을 열지 못했습니다: {error}"
-            ))),
-        };
+        let terminals = config.terminals.clone();
+        return upgrade_websocket(
+            &mut request,
+            &config,
+            access,
+            "Terminal",
+            move |websocket| handle_terminal_socket(websocket, terminals, access),
+        );
     }
 
     if method == Method::GET && path == "/api/chat" && is_upgrade_request(&request) {
-        if let Err(error) = authorize_terminal(request.headers(), &config, access) {
-            return error_response(error);
-        }
-        return match hyper_tungstenite::upgrade(&mut request, None) {
-            Ok((response, websocket)) => {
-                let chats = config.chats.clone();
-                let translations = config.translations.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = handle_chat_socket(websocket, chats, translations).await {
-                        eprintln!("Chat WebSocket error: {error}");
-                    }
-                });
-                response
-            }
-            Err(error) => error_response(ApiError::bad_request(format!(
-                "WebSocket 연결을 열지 못했습니다: {error}"
-            ))),
-        };
+        let chats = config.chats.clone();
+        let translations = config.translations.clone();
+        return upgrade_websocket(&mut request, &config, access, "Chat", move |websocket| {
+            handle_chat_socket(websocket, chats, translations)
+        });
     }
 
     if method == Method::GET {
         if let Some(ids) = path.strip_prefix("/api/chat-attachment/") {
-            let mut parts = ids.split('/');
-            let (Some(chat_id), Some(attachment_id), None) =
-                (parts.next(), parts.next(), parts.next())
-            else {
-                return error_response(ApiError::bad_request("첨부 파일 경로가 올바르지 않습니다"));
-            };
-            return match config.chats.input_file_download(chat_id, attachment_id) {
-                Ok(download) => chat_input_file_response(download),
-                Err(error) => error_response(ApiError::from(error)),
-            };
+            return chat_attachment_download_response(&config, ids);
         }
 
         if let Some(rest) = path.strip_prefix("/api/session-image/") {
@@ -2829,130 +2925,13 @@ async fn route(
 
     if method == Method::POST {
         if path == "/api/chat-attachment" {
-            if !access.writable {
-                return error_response(ApiError::forbidden("원격 변경이 비활성화되어 있습니다"));
-            }
-            let chat_id = match required_encoded_header(request.headers(), "x-chat-id") {
-                Ok(value) => value,
-                Err(error) => return error_response(error),
-            };
-            let name = match required_encoded_header(request.headers(), "x-file-name") {
-                Ok(value) => value,
-                Err(error) => return error_response(error),
-            };
-            let media_type = match required_encoded_header(request.headers(), "x-file-type") {
-                Ok(value) => value,
-                Err(error) => return error_response(error),
-            };
-            let body = match read_body(request.into_body()).await {
-                Ok(body) => body,
-                Err(error) => return error_response(error),
-            };
-            return match config
-                .chats
-                .upload_input_file(&chat_id, &name, &media_type, body)
-            {
-                Ok(file) => json_response(StatusCode::OK, &file),
-                Err(error) => error_response(ApiError::from(error)),
-            };
+            return chat_attachment_upload_response(request, &config, access).await;
         }
         if let Some(kind) = path.strip_prefix("/api/download/linked-file/") {
-            if !has_json_content_type(request.headers()) {
-                return unsupported_json_content_type_response();
-            }
-            let body = match read_body(request.into_body()).await {
-                Ok(body) => body,
-                Err(error) => return error_response(error),
-            };
-            let params = match serde_json::from_slice::<Value>(&body) {
-                Ok(params) => params,
-                Err(error) => {
-                    return error_response(ApiError::bad_request(format!(
-                        "JSON 요청을 읽지 못했습니다: {error}"
-                    )));
-                }
-            };
-            let app_data_dir = config.app_data_dir.clone();
-            let session_catalog = config.session_catalog.clone();
-            let chats = config.chats.clone();
-            let kind = kind.to_owned();
-            return match tokio::task::spawn_blocking(move || {
-                dispatch_linked_file_download(
-                    &app_data_dir,
-                    &session_catalog,
-                    &chats,
-                    &kind,
-                    params,
-                )
-            })
-            .await
-            {
-                Ok(Ok(file)) => linked_file_download_response(file),
-                Ok(Err(error)) => error_response(error),
-                Err(error) => error_response(ApiError::internal(format!(
-                    "다운로드 처리 작업이 중단되었습니다: {error}"
-                ))),
-            };
+            return linked_file_download_route(request, &config, kind).await;
         }
         if let Some(command) = path.strip_prefix("/api/invoke/") {
-            if !has_json_content_type(request.headers()) {
-                return unsupported_json_content_type_response();
-            }
-            if is_write_command(command) && !access.writable {
-                return error_response(ApiError::forbidden("원격 변경이 비활성화되어 있습니다"));
-            }
-            if is_host_only_command(command) && access.remote {
-                return error_response(ApiError::forbidden(HOST_ONLY_COMMAND_MESSAGE));
-            }
-            let body = match read_body(request.into_body()).await {
-                Ok(body) => body,
-                Err(error) => return error_response(error),
-            };
-            let params = match serde_json::from_slice::<Value>(&body) {
-                Ok(params) => params,
-                Err(error) => {
-                    return error_response(ApiError::bad_request(format!(
-                        "JSON 요청을 읽지 못했습니다: {error}"
-                    )));
-                }
-            };
-            let app_data_dir = config.app_data_dir.clone();
-            let service = ServiceEndpoint {
-                port: config.port,
-                tailscale_host: config.tailscale_host.clone(),
-                remote_write: config.remote_write.clone(),
-            };
-            let scheduler = config.scheduler.clone();
-            let session_catalog = config.session_catalog.clone();
-            let chats = config.chats.clone();
-            let terminals = config.terminals.clone();
-            let translations = config.translations.clone();
-            let document_automation = config.document_automation.clone();
-            let command = command.to_owned();
-            return match tokio::task::spawn_blocking(move || {
-                let context = SystemCommandContext {
-                    actor: SessionReadActor::User,
-                    app_data_dir: &app_data_dir,
-                    service: &service,
-                    session_catalog: &session_catalog,
-                    chats: &chats,
-                    terminals: &terminals,
-                    scheduler: &scheduler,
-                    translations: &translations,
-                    document_automation: document_automation.as_ref(),
-                    aia_chat_id: None,
-                    origin: None,
-                };
-                dispatch_command(&context, &command, params)
-            })
-            .await
-            {
-                Ok(Ok(value)) => json_value_response(StatusCode::OK, value),
-                Ok(Err(error)) => error_response(error),
-                Err(error) => error_response(ApiError::internal(format!(
-                    "요청 처리 작업이 중단되었습니다: {error}"
-                ))),
-            };
+            return invoke_command_response(request, &config, access, command, compress).await;
         }
     }
 
@@ -2961,6 +2940,248 @@ async fn route(
     }
 
     error_response(ApiError::not_found("요청 경로를 찾을 수 없습니다"))
+}
+
+/// `/api/chat-attachment/{대화}/{첨부}` — 올려 둔 입력 첨부를 원본 바이트로 돌려준다.
+fn chat_attachment_download_response(config: &Config, ids: &str) -> HttpResponse {
+    let mut parts = ids.split('/');
+    let (Some(chat_id), Some(attachment_id), None) = (parts.next(), parts.next(), parts.next())
+    else {
+        return error_response(ApiError::bad_request("첨부 파일 경로가 올바르지 않습니다"));
+    };
+    match config.chats.input_file_download(chat_id, attachment_id) {
+        Ok(download) => chat_input_file_response(download),
+        Err(error) => error_response(ApiError::from(error)),
+    }
+}
+
+/// `POST /api/chat-attachment` — 이름·형식은 인코딩된 헤더로, 본문은 날바이트로 받는다.
+async fn chat_attachment_upload_response(
+    request: Request<Incoming>,
+    config: &Config,
+    access: RequestAccess,
+) -> HttpResponse {
+    if !access.writable {
+        return error_response(ApiError::forbidden("원격 변경이 비활성화되어 있습니다"));
+    }
+    let headers = request.headers();
+    let (chat_id, name, media_type) = match (
+        required_encoded_header(headers, "x-chat-id"),
+        required_encoded_header(headers, "x-file-name"),
+        required_encoded_header(headers, "x-file-type"),
+    ) {
+        (Ok(chat_id), Ok(name), Ok(media_type)) => (chat_id, name, media_type),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+            return error_response(error);
+        }
+    };
+    let body = match read_body(request.into_body()).await {
+        Ok(body) => body,
+        Err(error) => return error_response(error),
+    };
+    match config
+        .chats
+        .upload_input_file(&chat_id, &name, &media_type, body)
+    {
+        Ok(file) => json_response(StatusCode::OK, &file),
+        Err(error) => error_response(ApiError::from(error)),
+    }
+}
+
+/// `POST /api/download/linked-file/{갈래}` — 갈래마다 다른 조회를 거쳐 파일 하나를 내린다.
+async fn linked_file_download_route(
+    request: Request<Incoming>,
+    config: &Config,
+    kind: &str,
+) -> HttpResponse {
+    if !has_json_content_type(request.headers()) {
+        return unsupported_json_content_type_response();
+    }
+    let params = match read_json_body(request.into_body()).await {
+        Ok(params) => params,
+        Err(error) => return error_response(error),
+    };
+    let app_data_dir = config.app_data_dir.clone();
+    let session_catalog = config.session_catalog.clone();
+    let chats = config.chats.clone();
+    let kind = kind.to_owned();
+    match run_blocking(
+        "다운로드 처리 작업이 중단되었습니다",
+        move || {
+            dispatch_linked_file_download(&app_data_dir, &session_catalog, &chats, &kind, params)
+        },
+    )
+    .await
+    {
+        Ok(file) => linked_file_download_response(file),
+        Err(error) => error_response(error),
+    }
+}
+
+/// `POST /api/invoke/{명령}` — 쓰기·호스트 전용 게이트를 지난 뒤 명령 디스패처로 넘긴다.
+/// 관리 스냅숏만 캐시 응답을 그대로 돌려주므로 디스패처 앞에서 갈라진다.
+async fn invoke_command_response(
+    request: Request<Incoming>,
+    config: &Config,
+    access: RequestAccess,
+    command: &str,
+    compress: bool,
+) -> HttpResponse {
+    if !has_json_content_type(request.headers()) {
+        return unsupported_json_content_type_response();
+    }
+    if is_write_command(command) && !access.writable {
+        return error_response(ApiError::forbidden("원격 변경이 비활성화되어 있습니다"));
+    }
+    if is_host_only_command(command) && access.remote {
+        return error_response(ApiError::forbidden(HOST_ONLY_COMMAND_MESSAGE));
+    }
+    let params = match read_json_body(request.into_body()).await {
+        Ok(params) => params,
+        Err(error) => return error_response(error),
+    };
+    if command == "get_manager_snapshot" {
+        let session_catalog = config.session_catalog.clone();
+        let cache = config.manager_snapshot_cache.clone();
+        return match run_blocking(
+            "관리 스냅숏 응답 작업이 중단되었습니다",
+            move || cached_manager_snapshot_response(&session_catalog, &cache, compress),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => error_response(error),
+        };
+    }
+    let app_data_dir = config.app_data_dir.clone();
+    let service = ServiceEndpoint {
+        port: config.port,
+        tailscale_host: config.tailscale_host.clone(),
+        remote_write: config.remote_write.clone(),
+    };
+    let scheduler = config.scheduler.clone();
+    let session_catalog = config.session_catalog.clone();
+    let chats = config.chats.clone();
+    let terminals = config.terminals.clone();
+    let translations = config.translations.clone();
+    let document_automation = config.document_automation.clone();
+    let command = command.to_owned();
+    match run_blocking("요청 처리 작업이 중단되었습니다", move || {
+        let context = SystemCommandContext {
+            actor: SessionReadActor::User,
+            app_data_dir: &app_data_dir,
+            service: &service,
+            session_catalog: &session_catalog,
+            chats: &chats,
+            terminals: &terminals,
+            scheduler: &scheduler,
+            translations: &translations,
+            document_automation: document_automation.as_ref(),
+            aia_chat_id: None,
+            origin: None,
+        };
+        dispatch_command(&context, &command, params)
+    })
+    .await
+    {
+        Ok(value) => json_value_response(StatusCode::OK, value),
+        Err(error) => error_response(error),
+    }
+}
+
+/// 터미널·채팅 소켓은 인가 → 업그레이드 → 처리 작업 spawn이라는 같은 절차를 탄다.
+/// 다른 것은 소켓을 받아 도는 작업과 오류 로그에 붙는 이름뿐이라 그 둘만 받는다.
+fn upgrade_websocket<Fut>(
+    request: &mut Request<Incoming>,
+    config: &Config,
+    access: RequestAccess,
+    label: &'static str,
+    handle: impl FnOnce(HyperWebsocket) -> Fut + Send + 'static,
+) -> HttpResponse
+where
+    Fut: Future<Output = Result<(), String>> + Send + 'static,
+{
+    if let Err(error) = authorize_terminal(request.headers(), config, access) {
+        return error_response(error);
+    }
+    match hyper_tungstenite::upgrade(request, None) {
+        Ok((response, websocket)) => {
+            tokio::spawn(async move {
+                if let Err(error) = handle(websocket).await {
+                    eprintln!("{label} WebSocket error: {error}");
+                }
+            });
+            response
+        }
+        Err(error) => error_response(ApiError::bad_request(format!(
+            "WebSocket 연결을 열지 못했습니다: {error}"
+        ))),
+    }
+}
+
+/// 업그레이드가 끝난 소켓. 터미널·채팅 양쪽이 같은 제네릭 인자를 손으로 되풀이해 적고
+/// 있어 시그니처만 읽어서는 같은 타입인지 알아보기 어려웠다.
+type UpgradedSocket =
+    hyper_tungstenite::WebSocketStream<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>>;
+
+/// 업그레이드를 마치고 첫 메시지를 제한시간 안에 받는다. 터미널과 채팅이 제한시간과
+/// 오류 문구의 대상 이름만 다른 같은 네 걸음을 각자 적고 있었다.
+async fn accept_first_message(
+    websocket: HyperWebsocket,
+    first_message_timeout: Duration,
+    subject: &str,
+) -> Result<(UpgradedSocket, Message), String> {
+    let mut socket = websocket
+        .await
+        .map_err(|error| format!("WebSocket 업그레이드 실패: {error}"))?;
+    let first = tokio::time::timeout(first_message_timeout, socket.next())
+        .await
+        .map_err(|_| format!("{subject} 시작 요청 시간이 초과되었습니다"))?
+        .ok_or_else(|| format!("{subject} 시작 전에 연결이 종료되었습니다"))?
+        .map_err(|error| format!("{subject} 시작 요청을 읽지 못했습니다: {error}"))?;
+    Ok((socket, first))
+}
+
+/// 자식 프로세스의 이벤트는 블로킹 반복자로 오고 소켓 루프는 async라 그 사이를 잇는
+/// 전용 스레드가 필요하다. 터미널과 채팅이 같은 다리를 각자 세우고 있었다.
+fn bridge_blocking_events<T>(
+    events: impl IntoIterator<Item = T> + Send + 'static,
+) -> tokio::sync::mpsc::Receiver<T>
+where
+    T: Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::mpsc::channel(256);
+    std::thread::spawn(move || {
+        for event in events {
+            if sender.blocking_send(event).is_err() {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+/// JSON 본문을 싣는 POST 경로는 본문 읽기 실패와 파싱 실패를 각각 400으로 바꾼다.
+/// 두 걸음이 경로마다 되풀이되므로 한 자리에 모은다.
+async fn read_json_body(body: Incoming) -> Result<Value, ApiError> {
+    let body = read_body(body).await?;
+    serde_json::from_slice::<Value>(&body)
+        .map_err(|error| ApiError::bad_request(format!("JSON 요청을 읽지 못했습니다: {error}")))
+}
+
+/// 블로킹 작업의 결과는 작업이 돌려준 `Result`와 작업 자체가 중단된 경우로 갈린다.
+/// 뒤쪽을 경로별 문구가 붙은 500으로 접어 호출부가 한 겹짜리 `Result`만 보게 한다.
+async fn run_blocking<T>(
+    interrupted: &str,
+    work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => result,
+        Err(error) => Err(ApiError::internal(format!("{interrupted}: {error}"))),
+    }
 }
 
 fn dispatch_linked_file_download(
@@ -3036,10 +3257,7 @@ fn authorize_terminal(
     if !access.writable {
         return Err(ApiError::forbidden("원격 터미널이 비활성화되어 있습니다"));
     }
-    let expected_origin = format!(
-        "https://{}",
-        config.tailscale_host.as_deref().unwrap_or_default()
-    );
+    let expected_origin = expected_remote_origin(config);
     if header_text(headers, "origin") != Some(expected_origin.as_str()) {
         return Err(ApiError::forbidden("허용되지 않은 원격 Origin입니다"));
     }
@@ -3062,6 +3280,9 @@ enum RemoteTerminalOpenRequest {
     Session(TerminalOpenRequest),
     AccountLogin(TerminalAccountLoginRequest),
     Setup(TerminalSetupRequest),
+    /// C9-19. `fingerprint`만 있는 본문. 다른 변형은 `source`나 `loginId`를 요구하므로
+    /// 겹치지 않는다.
+    Ssh(TerminalSshRequest),
 }
 
 async fn handle_terminal_socket(
@@ -3069,14 +3290,8 @@ async fn handle_terminal_socket(
     terminals: TerminalSupervisor,
     access: RequestAccess,
 ) -> Result<(), String> {
-    let mut socket = websocket
-        .await
-        .map_err(|error| format!("WebSocket 업그레이드 실패: {error}"))?;
-    let first = tokio::time::timeout(Duration::from_secs(10), socket.next())
-        .await
-        .map_err(|_| "터미널 시작 요청 시간이 초과되었습니다".to_owned())?
-        .ok_or_else(|| "터미널 시작 전에 연결이 종료되었습니다".to_owned())?
-        .map_err(|error| format!("터미널 시작 요청을 읽지 못했습니다: {error}"))?;
+    let (mut socket, first) =
+        accept_first_message(websocket, Duration::from_secs(10), "터미널").await?;
     let request = match parse_terminal_message(first)? {
         TerminalClientMessage::Open { request } => request,
         _ => return Err("첫 터미널 메시지는 open이어야 합니다".to_owned()),
@@ -3092,6 +3307,7 @@ async fn handle_terminal_socket(
             terminals.open_account_login(request, access.remote)
         }
         RemoteTerminalOpenRequest::Setup(request) => terminals.open_setup(request),
+        RemoteTerminalOpenRequest::Ssh(request) => terminals.open_ssh(request),
     };
     let attachment = match attachment {
         Ok(attachment) => attachment,
@@ -3108,14 +3324,7 @@ async fn handle_terminal_socket(
         }
     };
     let terminal_id = attachment.info.terminal_id.clone();
-    let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(256);
-    std::thread::spawn(move || {
-        for event in attachment.events {
-            if event_sender.blocking_send(event).is_err() {
-                break;
-            }
-        }
-    });
+    let mut event_receiver = bridge_blocking_events(attachment.events);
 
     loop {
         tokio::select! {
@@ -3177,6 +3386,11 @@ fn authorize_terminal_open_request(
             "CLI 설정 터미널은 Agent Manager 호스트의 로컬 UI에서만 열 수 있습니다".to_owned(),
         );
     }
+    // C9-19. 원격 UI에서 열면 호스트의 키로 제3의 서버에 붙는 셸이 원격 브라우저에 놓인다.
+    // 명령 실행·전송과 같은 이유로 호스트 화면에서만 연다.
+    if matches!(request, RemoteTerminalOpenRequest::Ssh(_)) && access.remote {
+        return Err("SSH 터미널은 Agent Manager 호스트의 로컬 UI에서만 열 수 있습니다".to_owned());
+    }
     Ok(())
 }
 
@@ -3193,9 +3407,7 @@ fn parse_terminal_message(message: Message) -> Result<TerminalClientMessage, Str
 }
 
 async fn send_terminal_event(
-    socket: &mut hyper_tungstenite::WebSocketStream<
-        hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>,
-    >,
+    socket: &mut UpgradedSocket,
     event: TerminalEvent,
 ) -> Result<(), String> {
     let message = match event {
@@ -3241,6 +3453,16 @@ enum ChatClientMessage {
         /// 질의응답 카드에서 고른 답(질문 원문 -> 답). 그 밖의 승인에서는 비어 있다.
         #[serde(default)]
         answers: BTreeMap<String, String>,
+        /// C9-19. sudo 비밀번호를 요구한 SSH 승인 카드에 사용자가 입력한 값. 그 밖의
+        /// 승인에서는 없다. `answers`와 갈라 두는 것은 그쪽이 카드에 되비쳐 그려지는 값이기
+        /// 때문이다 — 비밀값이 그 통로로 가면 화면에 그대로 남는다.
+        #[serde(default, skip_serializing)]
+        secret: Option<String>,
+        /// C17. 이 카드에 넣은 값을 기기 보관으로도 옮길지. 비밀값 요청 카드의 "비밀값 저장"
+        /// 체크박스에서만 온다. 값이 함께 실린 명령에서만 뜻이 있다 — 저장할 값이 없으면
+        /// 저장할 것도 없다.
+        #[serde(default, skip_serializing)]
+        save_secret: bool,
     },
     Interrupt,
     Stop,
@@ -3277,11 +3499,15 @@ fn prepare_aia_runtime_request(
     }
     let runtime = settings.aia_runtime_settings(request.source);
     request.model = runtime.model.clone();
+    request.local_connection_id = runtime.local_connection_id.clone();
     request.reasoning_effort = runtime.reasoning_effort.clone();
     request.mode = runtime.mode;
     request.approval_mode = runtime.approval_mode;
-    request.decision_policy = runtime.decision_policy;
+    request.decision_policy = Some(runtime.decision_policy);
     request.settings = runtime.settings.clone();
+    // 기록 여부는 공급자별 실행설정이 아니라 시스템 설정 하나로 정한다. CLI를 띄울 때
+    // 정해지므로 설정을 바꿔도 돌던 대화는 그대로고 다음 대화부터 적용된다.
+    request.record_session = settings.aia_session_recording;
     // 적용한 저장본을 그대로 실어 보낸다. 화면은 이 값을 지금 저장본과 비교해 실행설정이
     // 바뀐 것을 알아채고, 돌던 AIA를 정지한 뒤 새 설정으로 다시 시작한다.
     request.aia_runtime = Some(runtime);
@@ -3293,21 +3519,28 @@ async fn handle_chat_socket(
     chats: ChatSupervisor,
     translations: TranslationSupervisor,
 ) -> Result<(), String> {
-    let mut socket = websocket
-        .await
-        .map_err(|error| format!("WebSocket 업그레이드 실패: {error}"))?;
-    let first = tokio::time::timeout(Duration::from_secs(15), socket.next())
-        .await
-        .map_err(|_| "채팅 시작 요청 시간이 초과되었습니다".to_owned())?
-        .ok_or_else(|| "채팅 시작 전에 연결이 종료되었습니다".to_owned())?
-        .map_err(|error| format!("채팅 시작 요청을 읽지 못했습니다: {error}"))?;
-    let attachment = match parse_chat_message(first)? {
-        ChatClientMessage::Start { request } => {
+    let (mut socket, first) =
+        accept_first_message(websocket, Duration::from_secs(15), "채팅").await?;
+    // 첫 메시지를 읽지 못한 실패를 `?`로 올리면 이 자리에서 소켓이 아무 말 없이 닫힌다.
+    // 화면에는 "채팅 연결이 시작 전에 종료되었습니다"라는 일반 문구만 남아 진짜 이유가
+    // 사라지므로, 소켓이 살아 있는 동안 이유를 한 번 실어 보내고 닫는다.
+    let attachment = match parse_chat_message(first) {
+        Ok(ChatClientMessage::Start { request }) => {
             prepare_aia_runtime_request(&translations, *request)
                 .and_then(|request| chats.start(request))
         }
-        ChatClientMessage::Attach { chat_id } => chats.attach(&chat_id),
-        _ => return Err("첫 채팅 메시지는 start 또는 attach여야 합니다".to_owned()),
+        Ok(ChatClientMessage::Attach { chat_id }) => chats.attach(&chat_id),
+        Ok(_) => {
+            let message = "첫 채팅 메시지는 start 또는 attach여야 합니다".to_owned();
+            let _ = send_chat_event(&mut socket, ChatEvent::Error { message }).await;
+            let _ = socket.close(None).await;
+            return Ok(());
+        }
+        Err(message) => {
+            let _ = send_chat_event(&mut socket, ChatEvent::Error { message }).await;
+            let _ = socket.close(None).await;
+            return Ok(());
+        }
     };
     let attachment = match attachment {
         Ok(attachment) => attachment,
@@ -3319,14 +3552,7 @@ async fn handle_chat_socket(
     };
     let chat_id = attachment.info.chat_id.clone();
     let attachment_generation = attachment.generation;
-    let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(256);
-    std::thread::spawn(move || {
-        for event in attachment.events {
-            if event_sender.blocking_send(event).is_err() {
-                break;
-            }
-        }
-    });
+    let mut event_receiver = bridge_blocking_events(attachment.events);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
     heartbeat.tick().await;
 
@@ -3360,8 +3586,19 @@ async fn handle_chat_socket(
                                 send_chat_event(&mut socket, ChatEvent::Error { message: error.to_string() }).await?;
                             }
                         }
-                        Ok(ChatClientMessage::Approve { approval_id, decision, answers }) => {
-                            if let Err(error) = chats.approve(&chat_id, &approval_id, decision, &answers) {
+                        Ok(ChatClientMessage::Approve { approval_id, decision, answers, secret, save_secret }) => {
+                            // C17-7. 보관은 OS 보안 저장소를 건드리고 잠금·fsync를 거친다. 승인
+                            // 응답은 이 소켓 작업 위에서 바로 돌던 자리라(메모리 조작뿐이었다),
+                            // 그대로 두면 한 번의 체크가 이 대화의 소켓을 그 시간만큼 붙든다.
+                            let approving = chats.clone();
+                            let (chat, approval) = (chat_id.clone(), approval_id.clone());
+                            let answers = answers.clone();
+                            let outcome = tokio::task::spawn_blocking(move || {
+                                approving.approve(&chat, &approval, decision, &answers, secret.as_deref(), save_secret)
+                            })
+                            .await
+                            .map_err(|error| format!("승인 처리를 마치지 못했습니다: {error}"))?;
+                            if let Err(error) = outcome {
                                 send_chat_event(&mut socket, ChatEvent::Error { message: error.to_string() }).await?;
                             }
                         }
@@ -3419,12 +3656,7 @@ fn parse_chat_message(message: Message) -> Result<ChatClientMessage, String> {
         .map_err(|error| format!("채팅 제어 메시지가 올바르지 않습니다: {error}"))
 }
 
-async fn send_chat_event(
-    socket: &mut hyper_tungstenite::WebSocketStream<
-        hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>,
-    >,
-    event: ChatEvent,
-) -> Result<(), String> {
+async fn send_chat_event(socket: &mut UpgradedSocket, event: ChatEvent) -> Result<(), String> {
     socket
         .send(Message::text(serde_json::to_string(&event).map_err(
             |error| format!("채팅 이벤트를 직렬화하지 못했습니다: {error}"),
@@ -3456,7 +3688,14 @@ pub(crate) fn is_write_command(command: &str) -> bool {
     matches!(
         command,
         "patch_session_meta"
+            | "probe_local_llm_connection"
             | "set_project_active"
+            | "create_round_goal"
+            | "update_round_goal"
+            | "delete_round_goal"
+            | "record_round_report"
+            | "resolve_round_decision"
+            | "delete_round_report"
             | "create_session_folder"
             | "update_session_folder"
             | "reorder_session_folder"
@@ -3464,6 +3703,7 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "create_directory"
             | "create_doc_root"
             | "delete_doc_root"
+            | "create_doc"
             | "put_doc"
             | "create_document_trigger"
             | "update_document_trigger"
@@ -3489,6 +3729,7 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "mark_all_chat_attention_read"
             | "clear_read_chat_attention"
             | "dismiss_chat_attention"
+            | "raise_pacing_suggestion"
             | "remove_chat_input_file"
             | "begin_provider_account_login"
             | "finish_provider_account_login"
@@ -3517,6 +3758,9 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "set_external_plugin_enabled"
             | "set_claude_plugin_enabled"
             | "set_claude_skill_override"
+            | "set_provider_telemetry_option"
+            | "set_claude_plugin_branch_rule"
+            | "remove_claude_plugin_branch_rule"
             | "set_external_plugin_tool_policy"
             | "set_external_plugin_tool_policies"
             | "set_external_plugin_token"
@@ -3528,9 +3772,37 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "set_ssh_key_note"
             | "set_ssh_key_endpoint"
             | "check_ssh_endpoint"
+            | "execute_ssh_command"
+            | "relay_ssh_command"
+            | "allow_ssh_command_permanently"
+            | "upload_ssh_file"
+            | "download_ssh_file"
+            | "set_db_connection"
+            | "set_db_connection_enabled"
+            | "remove_db_connection"
+            | "set_local_llm_connection"
+            | "upsert_local_llm_connection"
+            | "remove_local_llm_connection"
+            | "set_default_local_llm_connection"
+            | "check_db_connection"
+            | "run_db_query"
+            | "run_db_statement"
+            | "relay_db_statement"
+            | "set_chat_secret"
+            | "read_chat_secret_value"
+            | "remove_chat_secret"
+            | "request_chat_secret"
+            | "run_with_chat_secrets"
+            | "write_file_with_chat_secrets"
+            | "save_secret"
+            | "remember_chat_secret"
+            | "set_saved_secret_agent_enabled"
+            | "remove_saved_secret"
+            | "read_saved_secret_value"
             | "execute_external_plugin_tool"
             | "click_ui_element"
             | "set_cypress_enabled"
+            | "set_cypress_workspace_options"
             | "add_cypress_workspace"
             | "remove_cypress_workspace"
             | "install_cypress_module"
@@ -3539,6 +3811,8 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "read_cypress_env_file"
             | "delete_cypress_workspace_file"
             | "run_cypress_spec"
+            | "open_cypress_runner"
+            | "stop_cypress_run"
             | "send_chat_message"
             | "start_chat"
             | "detach_chat"
@@ -3560,6 +3834,9 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "check_provider_cli_update"
             | "update_provider_cli"
             | "clear_provider_model_caches"
+            | "set_session_cleanup_policy"
+            | "run_session_cleanup"
+            | "clear_session_cleanup_tombstones"
             | "create_common_skill"
             | "set_resource_repository"
             | "create_project_instruction"
@@ -3590,6 +3867,15 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "set_skill_platforms"
             | "set_skill_auto_sync"
             | "analyze_aia_event"
+            | "stage_project_git_paths"
+            | "unstage_project_git_paths"
+            | "commit_project_git"
+            | "switch_project_git_branch"
+            | "stash_project_git"
+            | "rebase_project_git"
+            | "fetch_project_git"
+            | "pull_project_git"
+            | "push_project_git"
     )
 }
 
@@ -3602,10 +3888,11 @@ pub(crate) const HOST_ONLY_COMMAND_MESSAGE: &str =
 /// write에 허용했다. 모든 쓰기가 검증된 스킬 루트와 Agent Manager 소유 휴지통
 /// 안에서만 일어나고 삭제는 휴지통 경유라 복구 가능하기 때문이다.
 ///
-/// `create_directory`는 반대쪽이다. 만드는 폴더는 사용자가 고른 임의의 위치라
-/// 앱이 소유하거나 관리하는 대상이 아니므로 G11의 원격 write 조건을 만족하지
-/// 못한다. 빈 폴더 하나라 되돌리기는 쉽지만, 되돌릴 사람이 호스트 앞에 있어야
-/// 한다.
+/// `create_directory`도 2026-09-20 사용자 결정으로 원격 write에 허용했다. 만드는
+/// 폴더가 앱 소유가 아닌 것은 그대로지만, 원격 편집 권한은 설정의 스위치 하나로
+/// 통일돼 있고 "편집을 허용했으면 폴더 만들기도 허용"이 사용자가 그 스위치에
+/// 기대하는 뜻이다. 남는 것은 빈 폴더 하나뿐이라 되돌리기가 쉽고, 공급자 홈·앱
+/// 데이터는 여전히 거절되며 확인 대화가 만들 칸을 모두 보여 준다(C6-4b).
 ///
 /// Cypress 자동화(C7)는 처음엔 호스트 전용이었으나 2026-08-29 사용자 결정으로 원격 write에
 /// 허용했다. 원격은 Tailscale 인증 사용자만 오는 경로이고, 사용자가 폰에서도 작업공간을
@@ -3640,11 +3927,25 @@ pub(crate) const HOST_ONLY_COMMAND_MESSAGE: &str =
 /// Claude 설정 C8 쓰기는 두 키의 검증된 엔트리 하나만 바꾸고 앱 데이터 백업으로
 /// 복구할 수 있다. 사용자 전역 또는 활성 등록 프로젝트라는 관리 경계도 다시 검증하므로
 /// 원격 write에 허용한다.
+///
+/// 반대로 SSH 원격 명령 실행과 파일 전송(C9-14/C9-15)은 호스트 전용이다. 엔드포인트
+/// 저장·연결 확인과 달리 이들은 **다른 시스템의 상태를 바꾼다** — 되돌리는 방법이 앱
+/// 안에 없고, 외부 플러그인의 변경 도구 호출과 같은 급이다. 허용 목록 영구 추가(C9-17)도
+/// 같은 자리에 둔다: 그 한 줄이 앞으로의 실행을 승인 없이 열기 때문에, 목록을 편집하는
+/// 화면 자체가 호스트 전용인 것과 판단이 같다. AIA는 시스템 인터페이스 경로로 오므로 이
+/// 경계가 AIA를 막지는 않는다. 여기서 막는 것은 원격 브라우저 UI가 사용자 화면을 거치지
+/// 않고 서버를 바꾸는 경로다.
+///
+/// 프로젝트 git(C16)의 변경은 2026-09-28 사용자 결정으로 원격 write에 허용했다. 스테이지·
+/// 커밋·브랜치 전환·스태시·리베이스·fetch·pull은 모두 reflog·`ORIG_HEAD`·stash 앵커로
+/// 되돌릴 수 있고 되돌릴 수 없는 명령은 아예 제공하지 않으며, SSH·C6과 같이 원격 write가
+/// 켜진 시점엔 이미 채팅으로 호스트를 바꿀 수 있다. **push만 호스트 전용**이다 — 커밋을
+/// 바깥 저장소에 호스트 사용자의 자격증명으로 게시하는 일이라 되돌리는 방법이 앱 안에
+/// 없고, SSH 원격 명령 실행과 같은 급이다.
 pub(crate) fn is_host_only_command(command: &str) -> bool {
     matches!(
         command,
         "analyze_aia_event"
-            | "create_directory"
             | "set_resource_repository"
             | "register_external_plugin"
             | "update_external_plugin"
@@ -3655,7 +3956,17 @@ pub(crate) fn is_host_only_command(command: &str) -> bool {
             | "begin_external_plugin_oauth"
             | "cancel_external_plugin_oauth"
             | "execute_external_plugin_tool"
+            | "execute_ssh_command"
+            | "relay_ssh_command"
+            | "allow_ssh_command_permanently"
+            | "upload_ssh_file"
+            | "download_ssh_file"
+            | "set_db_connection"
+            | "remove_db_connection"
+            | "run_db_statement"
+            | "relay_db_statement"
             | "set_remote_write_enabled"
+            | "push_project_git"
     )
 }
 
@@ -3664,6 +3975,31 @@ pub(crate) fn is_host_only_command(command: &str) -> bool {
 /// 코드를 돌릴 수 있으므로 폴더를 하나 더 붙이는 것은 새 위험이 아니다. 반대로 꺼져 있는
 /// 동안 AIA가 등록·설치까지 해 두면 사용자가 열지 않은 문 뒤에 준비가 쌓인다. 사용자는
 /// 설정 화면에서 켜기 전에도 등록·설치해야 하므로 이 잠금은 AIA 경로에만 건다.
+/// 사용 토글을 켜는 자리. 거절 문구마다 다시 적으면 화면 안내가 가리키는 곳이 갈라진다.
+const CYPRESS_ENABLE_GUIDE_TARGET: &str = "화면 안내 target: addons.cypress";
+
+/// Cypress 사용 토글이 꺼져 있을 때의 거절. `action`이 있으면 AIA가 사용자 대신 하려던
+/// 일을 밝히고, 없으면 실행 자체가 막혔음을 알린다. 안내할 자리는 두 갈래가 같다.
+fn cypress_disabled_error(action: Option<&str>) -> ApiError {
+    let reason = match action {
+        Some(action) => format!(
+            "Cypress 자동화가 꺼져 있어 {action}을(를) 대신 할 수 없습니다. 애드온 → Cypress 탭에서 켜야 합니다"
+        ),
+        None => {
+            "Cypress 자동화가 꺼져 있습니다. 애드온 → Cypress 탭에서 켜야 실행할 수 있습니다"
+                .to_owned()
+        }
+    };
+    CoreError::InvalidInput(format!("{reason}({CYPRESS_ENABLE_GUIDE_TARGET})")).into()
+}
+
+fn require_cypress_enabled(app_data_dir: &Path) -> Result<(), ApiError> {
+    if crate::cypress_workspaces::is_enabled(app_data_dir)? {
+        return Ok(());
+    }
+    Err(cypress_disabled_error(None))
+}
+
 fn require_cypress_enabled_for_aia(
     actor: SessionReadActor,
     app_data_dir: &Path,
@@ -3672,10 +4008,17 @@ fn require_cypress_enabled_for_aia(
     if actor != SessionReadActor::Aia || crate::cypress_workspaces::is_enabled(app_data_dir)? {
         return Ok(());
     }
-    Err(CoreError::InvalidInput(format!(
-        "Cypress 자동화가 설정에서 꺼져 있어 {action}을(를) 대신 할 수 없습니다. 설정 → 자동화 탭에서 켜야 합니다(화면 안내 target: settings.cypress)"
-    ))
-    .into())
+    Err(cypress_disabled_error(Some(action)))
+}
+
+/// 실행과 런처는 같은 전제 위에 선다 — 사용 토글이 켜져 있고, 그 id의 작업공간이 있을 것.
+/// 두 갈래가 같은 두 단계를 각자 적고 있었다.
+fn runnable_cypress_workspace(
+    app_data_dir: &Path,
+    id: &str,
+) -> Result<crate::cypress_workspaces::CypressWorkspace, ApiError> {
+    require_cypress_enabled(app_data_dir)?;
+    Ok(crate::cypress_workspaces::workspace(app_data_dir, id)?)
 }
 
 #[derive(Clone)]
@@ -3692,7 +4035,7 @@ pub(crate) struct SystemCommandContext<'a> {
     pub(crate) terminals: &'a TerminalSupervisor,
     pub(crate) scheduler: &'a SchedulerSupervisor,
     pub(crate) translations: &'a TranslationSupervisor,
-    /// 등록 문서 폴더의 변경 감지 및 트리거 메타데이터 계층.
+    /// 등록 등록 폴더의 변경 감지 및 트리거 메타데이터 계층.
     pub(crate) document_automation: Option<&'a DocumentAutomationSupervisor>,
     /// 이 요청을 보낸 AIA 대화. MCP 라우트 접미에서만 채워지며, 요청한 대화의 화면에만
     /// 보내야 하는 응답(화면 안내)의 수신자를 정한다. 화면·워크플로 경로에서는 없다.
@@ -3884,6 +4227,21 @@ fn usage_budget_seed(
     })
 }
 
+/// 계정 감독자는 앱 데이터가 준비된 뒤에만 붙는다. 준비 전 요청은 어느 명령에서 왔든
+/// 같은 문구로 거절해야 하므로 꺼내는 자리를 한곳으로 모은다.
+fn require_accounts(chats: &ChatSupervisor) -> Result<AccountSupervisor, CoreError> {
+    chats
+        .accounts()
+        .ok_or_else(|| CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned()))
+}
+
+/// 외부 플러그인 프록시 주소도 마찬가지로 기동 뒤에만 생긴다.
+fn require_plugin_mcp_base(chats: &ChatSupervisor) -> Result<String, CoreError> {
+    chats
+        .plugin_mcp_base()
+        .ok_or_else(|| CoreError::Conflict("외부 플러그인 프록시가 준비되지 않았습니다".to_owned()))
+}
+
 /// 계정 레지스트리의 Claude·Codex 계정에 Antigravity 모델군 사용량 자원을 합친다.
 /// Antigravity 자원 id는 인증 계정이 아니라 페이싱 저장소의 계측 키다. 공식 `/usage`
 /// 조회가 실패해도 오류 상태 행은 남아 사용자가 풀 설정을 잃지 않는다.
@@ -3895,16 +4253,37 @@ fn usage_pacing_accounts(
     chats: &ChatSupervisor,
     freshness: crate::antigravity_usage::UsageFreshness,
 ) -> Result<Vec<crate::accounts::ProviderAccountView>, CoreError> {
-    let mut accounts = chats
-        .accounts()
-        .ok_or_else(|| CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned()))?
-        .snapshot()?
-        .accounts;
-    accounts.extend(crate::antigravity_usage::pacing_accounts_recorded(
+    let mut accounts = require_accounts(chats)?.snapshot()?.accounts;
+    accounts.extend(antigravity_resource_rows(
         app_data_dir,
+        &accounts,
         freshness,
     ));
     Ok(accounts)
+}
+
+/// Antigravity 모델군별 사용량 자원 행.
+///
+/// 계정 레지스트리가 이 공급자를 담기 전에는 페이싱·소진율 화면이 잡을 행이 없어, 두 모델군
+/// (`Gemini`, `Claude and GPT`)을 계정 행처럼 생긴 자원으로 따로 냈다. 계정을 등록하면 그
+/// 계정 행이 같은 두 창을 이미 싣고 있으므로, 자원 행까지 함께 내면 같은 쿼터가 두 축으로
+/// 잡힌다 — 소진율은 이중 계상되고, 페이싱 목록은 부풀며, 참여 토글이 계정 행과 자원 행에
+/// 하나씩 생겨 어느 쪽이 유효한지 알 수 없게 된다.
+///
+/// 그래서 등록된 Antigravity 계정이 하나라도 있으면 내지 않는다. 계정을 아직 등록하지 않은
+/// 설치에서는 이 행이 이 공급자의 소비를 보는 유일한 창이라 그대로 낸다.
+fn antigravity_resource_rows(
+    app_data_dir: &Path,
+    accounts: &[crate::accounts::ProviderAccountView],
+    freshness: crate::antigravity_usage::UsageFreshness,
+) -> Vec<crate::accounts::ProviderAccountView> {
+    if accounts
+        .iter()
+        .any(|account| account.provider == crate::ProviderId::Antigravity)
+    {
+        return Vec::new();
+    }
+    crate::antigravity_usage::pacing_accounts_recorded(app_data_dir, freshness)
 }
 
 /// 생성·수정한 반복 요청과 예산 소비자 메타데이터를 맞춘다. 소비자 선택이 켜진 정책에서 새로
@@ -4127,6 +4506,25 @@ struct ConsumerRowInputs<'a> {
 }
 
 impl ConsumerRowInputs<'_> {
+    /// 소비자 카드 목록과, 구형 화면이 읽는 최상위 처리량 한 칸을 함께 만든다. 행을 그리고
+    /// 처리량 그룹을 붙이고 단일 그룹만 최상위로 올리는 세 걸음은 늘 이 순서로만 쓰인다.
+    fn rows_with_throughput(
+        &self,
+        consumer_ids: &[String],
+        groups: &[(BTreeSet<String>, Value)],
+    ) -> (Vec<Value>, Value) {
+        let mut consumers: Vec<Value> = consumer_ids.iter().map(|id| self.row(id)).collect();
+        attach_consumer_throughput(&mut consumers, groups);
+        // 단일 그룹일 때만 구형 화면의 최상위 필드도 유지한다. 그룹이 여럿인데 하나로 합친
+        // 값을 보내는 것보다 null이 안전하며, 새 화면은 회차별 필드를 사용한다.
+        let throughput = if groups.len() == 1 {
+            groups[0].1.clone()
+        } else {
+            Value::Null
+        };
+        (consumers, throughput)
+    }
+
     fn row(&self, id: &str) -> Value {
         let candidate = self
             .candidates
@@ -4151,25 +4549,25 @@ impl ConsumerRowInputs<'_> {
                 )
             })
             .unwrap_or(Value::Null);
+        // 이 줄이 어느 워크플로의 것인지는 살아 있는 반복 요청이 먼저고, 없으면 저장된
+        // 소비자 설정이 기억하는 값이다. 같은 순서를 칸마다 되풀이하면 한 칸만 고쳐도
+        // "워크플로 id는 후보 것인데 페이싱 여부는 설정 것"처럼 조용히 갈라진다.
+        let workflow_id = candidate
+            .map(|c| c.workflow_id.clone())
+            .or_else(|| config.and_then(|c| c.workflow_id.clone()));
         json!({
             "scheduleId": id,
             "nextRun": next_run,
             "name": candidate.map(|c| c.name.clone())
                 .or_else(|| config.and_then(|c| c.label.clone())),
-            "workflowId": candidate.map(|c| c.workflow_id.clone())
-                .or_else(|| config.and_then(|c| c.workflow_id.clone())),
+            "workflowId": workflow_id.clone(),
             "scheduleEnabled": candidate.map(|c| c.schedule_enabled),
             "scheduleExists": self.live_schedule_ids.contains(id),
             "cadenceMinutes": candidate.and_then(|c| c.cadence_minutes),
-            "paced": candidate
-                .map(|c| self.paced_ids.contains(&c.workflow_id))
-                .or_else(|| config
-                    .and_then(|c| c.workflow_id.as_ref())
-                    .map(|workflow| self.paced_ids.contains(workflow))),
+            "paced": workflow_id.as_ref().map(|workflow| self.paced_ids.contains(workflow)),
             // 워크플로별 참여 계정. 빈 배열이면 제한 없음(전역 풀 그대로).
-            "workflowAccounts": candidate.map(|c| c.workflow_id.clone())
-                .or_else(|| config.and_then(|c| c.workflow_id.clone()))
-                .and_then(|workflow| self.policy.workflows.get(&workflow))
+            "workflowAccounts": workflow_id.as_ref()
+                .and_then(|workflow| self.policy.workflows.get(workflow))
                 .map(|c| c.accounts.iter().cloned().collect::<Vec<String>>())
                 .unwrap_or_default(),
             "enabled": config.map(|c| c.enabled),
@@ -4184,6 +4582,19 @@ impl ConsumerRowInputs<'_> {
             "reasoningEfforts": config.map(|c| c.reasoning_efforts.clone()).unwrap_or_default(),
             // 소비 성향. 없으면 화면이 기본값의 성향을 물려받은 것으로 그린다.
             "spendProfile": config.and_then(|c| c.spend_profile),
+            // 스프린트(계획 창 목표·직선 무시, 가드 유지)와 완료조건·진행. 완료 시각이 있으면
+            // 회차는 완료 상태라 예약 기동을 받지 않는다.
+            "sprint": config.is_some_and(|c| c.sprint),
+            "completionCondition": config.and_then(|c| c.completion_condition.clone()),
+            // 완료조건 사용 스위치. 꺼져 있으면 문구는 남아 있어도 적용되지 않는다. 아직 소비자로
+            // 등록되지 않은 회차는 저장본의 기본값과 같은 꺼짐으로 그린다.
+            "completionConditionEnabled": config.is_some_and(|c| c.completion_condition_enabled),
+            "completedRuns": config.map_or(0, |c| c.completed_runs),
+            // 완료 시각·근거는 지금 적용되는 완료에만 싣는다. 사용 스위치를 끈 회차는 저장본에
+            // 시각이 남아 있어도 다시 도는 중이라, 그대로 실으면 화면이 '완료' 카드로 그린다.
+            // 다시 켜면 같은 값이 그대로 다시 실린다.
+            "completedAt": config.filter(|c| c.completed()).and_then(|c| c.completed_at),
+            "completionNote": config.filter(|c| c.completed()).and_then(|c| c.completion_note.clone()),
             "costs": self.overview["consumerCosts"].get(id).cloned().unwrap_or(Value::Null),
         })
     }
@@ -4278,9 +4689,7 @@ fn usage_budget_view(
     session_catalog: &SessionCatalog,
 ) -> Result<Value, CoreError> {
     backfill_pacing_run_tokens(app_data_dir, session_catalog);
-    let policy = crate::usage_budget_policy::load_or_seed(app_data_dir, || {
-        usage_budget_seed(app_data_dir, scheduler)
-    })?;
+    let (policy, schedules) = budget_policy_and_schedules(app_data_dir, scheduler)?;
     // 화면 스냅샷은 Antigravity `/usage`의 응답(최대 30초)을 기다리지 않는다. 캐시를 먼저 쓰고
     // 뒤에서 갱신하며, 회차 계획(preview/plan)은 그대로 정확한 값을 기다린다.
     let accounts = usage_pacing_accounts(
@@ -4288,12 +4697,7 @@ fn usage_budget_view(
         chats,
         crate::antigravity_usage::UsageFreshness::CachedFirst,
     )?;
-    let schedules = scheduler.snapshot()?.schedules;
-    let live_schedule_ids: BTreeSet<&str> = schedules
-        .iter()
-        .map(|schedule| schedule.id.as_str())
-        .collect();
-    let policy = prune_orphan_consumers(app_data_dir, policy, &schedules, &live_schedule_ids)?;
+    let live_schedule_ids = live_schedule_ids(&schedules);
     // 후보 = 페이싱 대상 워크플로(사용자가 켠·계약이 사용량을 쓰는)를 도는 반복 요청.
     // paced 여부는 그중 페이싱 계산까지 하는지로 갈라 화면이 "기동만 통제"를 표시한다.
     let pacing_index = WorkflowPacingIndex::load(app_data_dir)?;
@@ -4331,7 +4735,6 @@ fn usage_budget_view(
         live_chats: &live_chats,
         overview: &overview,
     };
-    let mut consumers: Vec<Value> = consumer_ids.iter().map(|id| rows.row(id)).collect();
     let throughput_groups = consumer_throughput_groups(
         &auto,
         &candidates,
@@ -4340,14 +4743,7 @@ fn usage_budget_view(
         &paced_ids,
         now,
     );
-    attach_consumer_throughput(&mut consumers, &throughput_groups);
-    // 단일 그룹일 때만 구형 화면의 최상위 필드도 유지한다. 그룹이 여럿인데 하나로 합친
-    // 값을 보내는 것보다 null이 안전하며, 새 화면은 회차별 필드를 사용한다.
-    let throughput = if throughput_groups.len() == 1 {
-        throughput_groups[0].1.clone()
-    } else {
-        Value::Null
-    };
+    let (consumers, throughput) = rows.rows_with_throughput(&consumer_ids, &throughput_groups);
     let account_rows: Vec<Value> = accounts
         .iter()
         .map(|account| usage_budget_account_row(account, &policy, &overview))
@@ -4369,9 +4765,41 @@ fn usage_budget_view(
         // 페이싱이 통제하는 워크플로. 화면이 대상 개수를 보여 주고, 목록이 비어 있는 이유를
         // "아직 켠 워크플로가 없다"로 설명할 수 있게 한다.
         "pacingWorkflowIds": pacing_ids.iter().collect::<Vec<_>>(),
-        // 페이싱 스케줄(제한 시간대)의 현재 상태. 꺼져 있으면 null.
-        "quietStatus": quiet_status(&policy, crate::clock::now_ms()),
+        // 페이싱 스케줄(제한 시간대)의 현재 상태. 꺼져 있으면 null. 한 화면이 보는 시각은
+        // 위 계산과 같은 `now` 한 벌이어야 "지금 제한 중"과 후보 계산이 어긋나지 않는다.
+        "quietStatus": quiet_status(&policy, now),
     }))
+}
+
+/// 지금 실제로 있는 반복 요청의 id. 소비자 정돈과 화면의 "반복 요청이 아직 있는가" 칸이
+/// 같은 기준을 봐야 없는 회차가 카드로 남지 않는다.
+fn live_schedule_ids(schedules: &[crate::scheduler::ScheduledRequest]) -> BTreeSet<&str> {
+    schedules
+        .iter()
+        .map(|schedule| schedule.id.as_str())
+        .collect()
+}
+
+/// 예산 화면이 볼 정책 한 벌을 맞춘다. 씨앗을 깔고, 사라진 반복 요청에 매달린 소비자
+/// 설정을 목록에서 걷어낸 뒤의 정책과 그 판단에 쓴 반복 요청 목록을 함께 돌려준다.
+/// 정돈 전 정책으로 화면을 그리면 없는 회차가 카드로 남으므로 늘 한 묶음으로 쓰인다.
+fn budget_policy_and_schedules(
+    app_data_dir: &Path,
+    scheduler: &SchedulerSupervisor,
+) -> Result<
+    (
+        crate::usage_budget_policy::UsageBudgetPolicy,
+        Vec<crate::scheduler::ScheduledRequest>,
+    ),
+    CoreError,
+> {
+    let policy = crate::usage_budget_policy::load_or_seed(app_data_dir, || {
+        usage_budget_seed(app_data_dir, scheduler)
+    })?;
+    let schedules = scheduler.snapshot()?.schedules;
+    let live_schedule_ids = live_schedule_ids(&schedules);
+    let policy = prune_orphan_consumers(app_data_dir, policy, &schedules, &live_schedule_ids)?;
+    Ok((policy, schedules))
 }
 
 /// 페이싱 스케줄의 현재 상태: 지금 제한 중인지와 다음 전환 시각(제한 중이면 재개, 열려 있으면
@@ -4391,8 +4819,8 @@ fn quiet_status(policy: &crate::usage_budget_policy::UsageBudgetPolicy, now: i64
     }
 }
 
-/// 예산 정책 갱신 4벌이 공유하는 뒤처리. 저장 뒤 페이싱 자동 주기를 다시 계산하고(저축
-/// 기본값만은 주기와 무관해 건너뛴다) 갱신된 예산 화면 스냅샷을 그대로 응답으로 낸다.
+/// 예산 조회와 정책 갱신이 함께 쓰는 응답. 필요하면 페이싱 자동 주기를 다시 계산한 뒤
+/// 갱신된 예산 화면 스냅샷을 그대로 응답으로 낸다.
 fn usage_budget_response(
     context: &SystemCommandContext<'_>,
     refresh_cadence: bool,
@@ -4406,6 +4834,40 @@ fn usage_budget_response(
         context.scheduler,
         context.session_catalog,
     )?)
+}
+
+/// 정책 파일이 아직 없을 때 한 번만 불리는 시드 생성기. 편집기마다 제네릭으로 받는 자리를
+/// 한 모양으로 맞추려고 박스에 담는다.
+type PolicySeedFn<'a> =
+    Box<dyn FnOnce() -> Result<crate::usage_budget_policy::PolicySeed, CoreError> + 'a>;
+
+/// 예산 정책 편집 다섯 갈래가 공유하는 봉투. 어느 갈래든 `RequestEnvelope<T>`를 풀어
+/// 편집기에 정책 시드와 함께 넘기고, 저장이 끝나면 [`usage_budget_response`]가 만든 같은
+/// 예산 화면 스냅샷을 돌려준다. 갈래마다 다른 것은 편집기와 자동 주기 재계산 여부뿐이라
+/// 그 둘만 인자로 받는다.
+fn usage_budget_edit<'a, T, F>(
+    context: &SystemCommandContext<'a>,
+    params: Value,
+    refresh_cadence: bool,
+    edit: F,
+) -> Result<Value, ApiError>
+where
+    T: for<'de> Deserialize<'de>,
+    F: FnOnce(
+        &'a Path,
+        PolicySeedFn<'a>,
+        T,
+    ) -> Result<crate::usage_budget_policy::UsageBudgetPolicy, CoreError>,
+{
+    let args: RequestEnvelope<T> = parse_params(params)?;
+    let app_data_dir = context.app_data_dir;
+    let scheduler = context.scheduler;
+    edit(
+        app_data_dir,
+        Box::new(move || usage_budget_seed(app_data_dir, scheduler)),
+        args.request,
+    )?;
+    usage_budget_response(context, refresh_cadence)
 }
 
 /// preview·plan 두 회차 계산이 함께 쓰는 입력.
@@ -4441,10 +4903,7 @@ fn paced_runs_inputs(
         crate::antigravity_usage::UsageFreshness::Fresh,
     )?;
     let schedules = context.scheduler.snapshot()?.schedules;
-    let mut live_chats = Vec::new();
-    for provider in ProviderId::ALL {
-        live_chats.extend(chats.provider_chats(provider)?);
-    }
+    let live_chats = live_provider_chats(chats)?;
     Ok(PacedRunsInputs {
         request: args.request,
         accounts,
@@ -4453,25 +4912,42 @@ fn paced_runs_inputs(
     })
 }
 
+/// 시스템 명령 하나를 처리기로 보낸다.
+///
+/// 한때 이 함수 하나가 명령 이름 이백여 개를 1,700줄짜리 match로 받아, 어느 갈래를 고치든
+/// 같은 본문을 훑어야 했다. 이제는 갈래별 `dispatch_*_command`로 나누고 아는 이름이 없으면
+/// 다음 갈래로 넘긴다 — 이미 있던 `dispatch_external_plugin_command` 넘김과 같은 모양이라
+/// 갈래 사슬의 끝도 그대로다. 나눈 기준은 부르는 계층이지 인가가 아니다: 호스트 전용·원격
+/// write 판정은 여전히 명령 이름만 보고 `is_host_only_command` 쪽에서 하므로 경계는 그대로다.
+///
+/// 이 갈래는 실행 환경·CLI 업데이트·서비스 토글·SSH·DB 명령을 받는다.
 fn dispatch_command(
     context: &SystemCommandContext<'_>,
     command: &str,
     params: Value,
 ) -> Result<Value, ApiError> {
-    let app_data_dir = context.app_data_dir;
-    let session_catalog = context.session_catalog;
-    let chats = context.chats;
-    let terminals = context.terminals;
-    let scheduler = context.scheduler;
-    let translations = context.translations;
-    let service = context.service;
-    let actor = context.actor;
+    let &SystemCommandContext {
+        app_data_dir,
+        chats,
+        terminals,
+        service,
+        session_catalog,
+        ..
+    } = context;
     match command {
         "get_app_status" => to_value(inspect_local_environment()?),
         // 조회는 탐지된 실행 파일에 고정 argv로 `--version`·`--help`를 실행하고 공급자
         // 홈의 캐시 기록 버전만 읽는 읽기 작업이라 원격에서도 허용한다. `--help` 조사
         // 결과는 Agent Manager 소유 저장소의 실행설정 스키마 기록에만 반영된다.
-        "get_cli_update_status" => to_value(crate::list_provider_cli_update_status(chats)),
+        "get_cli_update_status" => {
+            let statuses = crate::list_provider_cli_update_status(chats);
+            // 이 조회는 지금 막 탐지한 결과를 돌려주지만, 관리 스냅숏이 들고 있는 탐지
+            // 상태는 기동 시점 것이다. 둘이 어긋나면 "CLI 탐지됨"과 "연결 필요"가 한
+            // 화면에 같이 서고, 스냅숏을 읽는 쪽(계정 추가 버튼·실행설정 스키마 조사
+            // 대상)은 앱을 다시 켤 때까지 새 CLI를 못 본다. 방금 읽은 김에 맞춰 둔다.
+            let _ = session_catalog.refresh_cli_status();
+            to_value(statuses)
+        }
         "get_provider_runtime_counts" => {
             let args: ProviderArg = parse_params(params)?;
             to_value(crate::provider_runtime_counts(
@@ -4514,19 +4990,21 @@ fn dispatch_command(
         // 모양으로 그릴 수 있게 따로 낸다. 조회 결과는 표본·주기 이력(파생 데이터)에만
         // 남고 공급자 상태는 건드리지 않아 원격에서도 허용한다.
         "get_antigravity_pacing_usage" => {
-            to_value(crate::antigravity_usage::pacing_accounts_recorded(
+            let registered = require_accounts(chats)?.snapshot()?.accounts;
+            to_value(antigravity_resource_rows(
                 app_data_dir,
+                &registered,
                 crate::antigravity_usage::UsageFreshness::Fresh,
             ))
         }
         "set_sleep_prevention" => {
-            let args: SleepPreventionArg = parse_params(params)?;
+            let args: EnabledArg = parse_params(params)?;
             to_value(crate::set_sleep_prevention(app_data_dir, args.enabled)?)
         }
         // 원격에 변경 권한을 줄지는 앱이 소유한 설정 파일 한 줄이고 언제든 되돌릴 수
         // 있지만, 권한을 넓히는 결정은 호스트 화면에서만 내린다(is_host_only_command).
         "set_remote_write_enabled" => {
-            let args: RemoteWriteArg = parse_params(params)?;
+            let args: EnabledArg = parse_params(params)?;
             to_value(set_remote_write(
                 context.app_data_dir,
                 service,
@@ -4542,34 +5020,17 @@ fn dispatch_command(
                 args.replace_existing,
             )?)
         }
-        "get_provider_accounts" => to_value(
-            chats
-                .accounts()
-                .ok_or_else(|| CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned()))?
-                .reconciled_snapshot()?,
-        ),
+        "get_provider_accounts" => to_value(require_accounts(chats)?.reconciled_snapshot()?),
         // 앱 데이터의 파생 이력만 읽는다. 자격증명도 공급자 API도 건드리지 않아
         // 원격에서도 허용한다.
-        "get_account_usage_history" => to_value(
-            chats
-                .accounts()
-                .ok_or_else(|| CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned()))?
-                .usage_history()?,
-        ),
+        "get_account_usage_history" => to_value(require_accounts(chats)?.usage_history()?),
         // 공급자 홈의 MCP·커넥터·플러그인 설정만 읽는 조회다. 도구를 실행하지 않고
         // 자격증명도 읽지 않아 원격에서도 허용한다. 계정 귀속은 마지막 검증 결과를
         // 그대로 쓰므로 Keychain을 다시 여는 재검증(reconciled_snapshot)은 하지 않는다.
         "get_account_tools" => to_value(crate::list_account_tools(
-            &chats
-                .accounts()
-                .ok_or_else(|| CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned()))?
-                .snapshot()?,
+            &require_accounts(chats)?.snapshot()?,
         )),
-        // 외부 플러그인 목록은 앱 소유 저장 파일만 읽고 비밀값은 싣지 않는다.
-        "get_external_plugins" => to_value(
-            crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf())
-                .snapshot(chats.plugin_mcp_base().is_some())?,
-        ),
+        "get_agent_builtin_tools" => to_value(crate::load_agent_builtin_tools(app_data_dir)),
         // C9-1/C9-5. 공개키의 제한된 메타데이터와 앱 데이터의 메모만 읽고 개인키는
         // metadata로만 본다.
         "get_ssh_keys" => to_value(crate::get_ssh_keys(app_data_dir)?),
@@ -4606,6 +5067,288 @@ fn dispatch_command(
             let args: RequestEnvelope<crate::SshKeyRef> = parse_params(params)?;
             to_value(crate::check_ssh_endpoint(app_data_dir, args.request)?)
         }
+        // 로컬 LLM 연결 한 벌. API 키는 값이 아니라 `apiKeyConfigured` 여부로만 실린다.
+        "get_local_llm_connection" => to_value(crate::get_local_llm_connection(app_data_dir)?),
+        // 주소 하나를 실제로 찔러 모델 목록을 받아 온다. 저장본에 닿지 않지만 **바깥으로
+        // 나가는 행위**라 write 게이트 아래 둔다 — 읽기로 두면 원격 읽기 전용 클라이언트가
+        // 호스트를 시켜 내부 주소를 훑을 수 있다.
+        "probe_local_llm_connection" => {
+            let args: LocalLlmProbeArg = parse_params(params)?;
+            to_value(crate::probe_local_llm(&args.base_url)?)
+        }
+        // 저장은 API 키를 함께 받을 수 있어 write 게이트 아래 둔다. 저장 대상은 앱 데이터와
+        // OS 보안 저장소뿐이라 공급자 소유 상태에는 닿지 않는다(G7·G11).
+        "set_local_llm_connection" => {
+            let args: RequestEnvelope<crate::SetLocalLlmConnectionRequest> = parse_params(params)?;
+            to_value(crate::set_local_llm_connection(app_data_dir, args.request)?)
+        }
+        // M7 7.1. 연결 목록. 비밀값은 어느 필드에도 없다.
+        "get_local_llm_connections" => to_value(crate::get_local_llm_connections(app_data_dir)?),
+        "upsert_local_llm_connection" => {
+            let args: RequestEnvelope<crate::UpsertLocalLlmConnectionRequest> =
+                parse_params(params)?;
+            to_value(crate::upsert_local_llm_connection(
+                app_data_dir,
+                args.request,
+            )?)
+        }
+        "remove_local_llm_connection" => {
+            let args: RequestEnvelope<crate::LocalLlmConnectionIdRequest> = parse_params(params)?;
+            to_value(crate::remove_local_llm_connection(
+                app_data_dir,
+                &args.request.id,
+            )?)
+        }
+        "set_default_local_llm_connection" => {
+            let args: RequestEnvelope<crate::LocalLlmConnectionIdRequest> = parse_params(params)?;
+            to_value(crate::set_default_local_llm_connection(
+                app_data_dir,
+                &args.request.id,
+            )?)
+        }
+        // C10-1. 등록된 연결 목록. 비밀값은 어느 필드에도 없다.
+        "get_db_connections" => to_value(crate::get_db_connections(app_data_dir)?),
+        // C10-1/C10-5. 연결 저장은 비밀번호를 함께 받을 수 있어 호스트 화면에서만 한다.
+        "set_db_connection" => {
+            let args: RequestEnvelope<crate::SetDbConnectionRequest> = parse_params(params)?;
+            to_value(crate::set_db_connection(app_data_dir, args.request)?)
+        }
+        // C10-7. 에이전트 사용 토글은 앱 데이터 안의 변경이라 원격 write에도 허용한다.
+        "set_db_connection_enabled" => {
+            let args: RequestEnvelope<crate::SetDbConnectionEnabledRequest> = parse_params(params)?;
+            to_value(crate::set_db_connection_enabled(
+                app_data_dir,
+                args.request,
+            )?)
+        }
+        // C10-1. 삭제는 보안 저장소의 비밀값을 함께 지우는 되돌릴 수 없는 작업이다.
+        "remove_db_connection" => {
+            let args: RequestEnvelope<crate::DbConnectionRef> = parse_params(params)?;
+            to_value(crate::remove_db_connection(app_data_dir, args.request)?)
+        }
+        // C10-6. 한 번 붙어 서버 버전만 읽고 끊는다. 원격에서는 아무것도 바뀌지 않는다.
+        "check_db_connection" => {
+            let args: RequestEnvelope<crate::DbConnectionRef> = parse_params(params)?;
+            to_value(crate::check_db_connection(app_data_dir, args.request)?)
+        }
+        // C10-7. 에이전트 사용을 켠 연결 목록. 접속 자격증명은 실리지 않는다.
+        "list_agent_db_connections" => to_value(crate::list_agent_db_connections(app_data_dir)?),
+        // C10-9. 읽기 전용 트랜잭션 안에서 조회 한 문장을 실행한다.
+        "run_db_query" => {
+            let args: RequestEnvelope<crate::DbQueryRequest> = parse_params(params)?;
+            to_value(crate::run_db_query(app_data_dir, args.request)?)
+        }
+        // C10-12. 변경 문장은 예행으로 영향 행 수를 세고 그 대화의 승인 카드를 띄운다.
+        // 승인 창구가 없는 호출(대화 밖)은 아무것도 실행하지 않고 거절된다.
+        "run_db_statement" => {
+            let args: RequestEnvelope<crate::DbStatementRequest> = parse_params(params)?;
+            let gate = context
+                .aia_chat_id
+                .map(|chat_id| chats.db_approval_gate(chat_id));
+            to_value(crate::run_db_statement(
+                app_data_dir,
+                args.request,
+                gate.as_ref().map(|gate| gate as &dyn crate::DbApprovalGate),
+            )?)
+        }
+        // C10-13. 자기 셸이 있는 에이전트가 `<CLI> db exec`로 맡긴 변경. 승인 카드는
+        // 그 대화에 뜨고, 대화가 없으면 승인을 열 수 없어 그대로 거절된다.
+        "relay_db_statement" => {
+            let args: RelayDbStatementEnvelope = parse_params(params)?;
+            let gate = args
+                .chat_id
+                .as_deref()
+                .map(|chat_id| chats.db_approval_gate(chat_id));
+            to_value(crate::run_db_statement(
+                app_data_dir,
+                args.request,
+                gate.as_ref().map(|gate| gate as &dyn crate::DbApprovalGate),
+            )?)
+        }
+        // C15. 이 대화의 비밀값 이름 목록. AIA 경로는 자기 대화로 고정되고, 화면·CLI는
+        // 본문의 chatId를 준다. 어느 쪽도 값은 받지 못한다.
+        // C15. 저장소 → 비밀정보 탭. 모든 대화의 비밀값 이름을 대화별로 묶어 돌려준다.
+        "list_all_chat_secrets" => to_value(chats.list_all_chat_secrets()?),
+        "list_chat_secrets" => {
+            let args: ChatSecretChatEnvelope = parse_params(params)?;
+            let chat_id = chat_secret_chat_id(context, args.chat_id.as_deref())?;
+            to_value(chats.list_chat_secrets(chat_id)?)
+        }
+        // C15. 사용자가 화면 패널에서 값을 직접 넣는다. 값이 본문에 실리므로 호스트 전용이다.
+        "set_chat_secret" => {
+            let args: SetChatSecretRequest = parse_params(params)?;
+            to_value(chats.set_chat_secret(
+                &args.chat_id,
+                &args.name,
+                &args.purpose,
+                &args.value,
+            )?)
+        }
+        "remove_chat_secret" => {
+            let args: RemoveChatSecretRequest = parse_params(params)?;
+            to_value(chats.remove_chat_secret(&args.chat_id, &args.name)?)
+        }
+        // C15-8. 사용자가 저장소 화면의 눈 아이콘으로 자기 값을 본다. 값이 응답에 실리므로
+        // 호스트 화면 전용이고, AIA 시스템 인터페이스 카탈로그에는 없다.
+        "read_chat_secret_value" => {
+            let args: RemoveChatSecretRequest = parse_params(params)?;
+            to_value(chats.read_chat_secret_value(&args.chat_id, &args.name)?)
+        }
+        // C17. 저장해 둔 비밀값의 이름·용도·자동 사용 여부. 값은 어느 칸에도 없다.
+        "list_saved_secrets" => to_value(crate::list_saved_secrets(app_data_dir)?),
+        // C17. 값이 본문에 실리므로 호스트 전용이다. 같은 이름이 있으면 덮어쓴다.
+        "save_secret" => {
+            let args: SaveSecretRequest = parse_params(params)?;
+            to_value(crate::save_secret(
+                app_data_dir,
+                &args.name,
+                &args.purpose,
+                &args.value,
+            )?)
+        }
+        // C17. 이 대화가 이미 들고 있는 값을 보관으로 옮긴다. 값은 감독자 안에서만 움직인다.
+        "remember_chat_secret" => {
+            let args: RemoveChatSecretRequest = parse_params(params)?;
+            to_value(chats.remember_chat_secret(&args.chat_id, &args.name)?)
+        }
+        // C17-5. 자동 사용 토글. 앱 데이터 안의 값 하나라 원격 write에도 허용한다.
+        "set_saved_secret_agent_enabled" => {
+            let args: SetSavedSecretEnabledRequest = parse_params(params)?;
+            to_value(crate::set_saved_secret_agent_enabled(
+                app_data_dir,
+                &args.name,
+                args.enabled,
+            )?)
+        }
+        "remove_saved_secret" => {
+            let args: SavedSecretRef = parse_params(params)?;
+            to_value(crate::remove_saved_secret(app_data_dir, &args.name)?)
+        }
+        // C17-4. 저장소 화면의 눈 아이콘. 값이 응답에 실리므로 호스트 화면 전용이고, AIA
+        // 시스템 인터페이스 카탈로그에는 없다.
+        "read_saved_secret_value" => {
+            let args: SavedSecretRef = parse_params(params)?;
+            to_value(crate::saved_secrets::reveal_for_user(
+                app_data_dir,
+                &args.name,
+            )?)
+        }
+        // C15. 에이전트가 값을 요청한다. 카드는 그 대화에 뜨고 에이전트는 이름만 돌려받는다.
+        "request_chat_secret" => {
+            let args: ChatSecretRequestEnvelope = parse_params(params)?;
+            let chat_id = chat_secret_chat_id(context, args.chat_id.as_deref())?;
+            to_value(chats.request_chat_secret(
+                chat_id,
+                &args.request.name,
+                &args.request.purpose,
+            )?)
+        }
+        // C15. 그 대화의 비밀값을 환경변수로 넣어 명령을 대신 돌린다. 출력에서 값을 지운다.
+        "run_with_chat_secrets" => {
+            let args: ChatSecretRunEnvelope = parse_params(params)?;
+            let chat_id = chat_secret_chat_id(context, args.chat_id.as_deref())?;
+            to_value(chats.run_with_chat_secrets(chat_id, args.request)?)
+        }
+        // C15. 자리표시자를 값으로 채운 파일을 대신 쓴다. 값이 파일에 놓이므로 호스트 전용이다.
+        "write_file_with_chat_secrets" => {
+            let args: ChatSecretFileEnvelope = parse_params(params)?;
+            let chat_id = chat_secret_chat_id(context, args.chat_id.as_deref())?;
+            to_value(chats.write_file_with_chat_secrets(chat_id, args.request)?)
+        }
+        // C9-12. 에이전트 사용을 켠 엔드포인트 목록. 개인키 경로와 `ssh` 인자만 담고
+        // 비밀값은 없다. 셸이 없는 AIA가 어떤 서버가 열려 있는지 아는 유일한 조회다.
+        "list_agent_ssh_endpoints" => to_value(crate::list_agent_ssh_endpoints(app_data_dir)?),
+        // C9-14. 사용자가 그 서버에 대해 허용한 명령 하나만 실행한다. 목록을 그린 뒤
+        // 토글이 꺼졌으면 여기서 멈추고, 셸 메타문자는 실행 전에 거절한다.
+        // C9-17. AIA 대화에서 온 요청은 목록 밖 명령을 즉시 거절하는 대신 그 대화의
+        // 승인 카드를 띄운다. 승인 창구는 대화 id로만 만들어지므로 요청 본문의 어떤
+        // 값도 다른 대화의 승인을 끌어올 수 없다.
+        "execute_ssh_command" => {
+            let args: RequestEnvelope<crate::ExecuteSshCommandRequest> = parse_params(params)?;
+            let gate = context
+                .aia_chat_id
+                .map(|chat_id| chats.ssh_approval_gate(chat_id));
+            // C9-18. 터미널 표시는 그 대화의 카드로만 흐른다. 대화가 없는 호출(워크플로
+            // 단계)은 흘릴 곳이 없으니 모아서 돌려준다.
+            let terminal = context
+                .aia_chat_id
+                .and_then(|chat_id| chats.ssh_terminal(chat_id).ok());
+            to_value(crate::execute_ssh_command(
+                app_data_dir,
+                args.request,
+                gate.as_ref()
+                    .map(|gate| gate as &dyn crate::SshApprovalGate),
+                terminal
+                    .as_ref()
+                    .map(|terminal| terminal as &dyn crate::SshTerminalSink),
+            )?)
+        }
+        // C9-18. 자기 셸이 있는 에이전트가 `<CLI> ssh exec`로 맡긴 실행. 명령 목록은 C9-14
+        // 그대로 집행되고, 승인 카드는 없다 — 목록 밖 명령은 거절되며 에이전트는 사용자에게
+        // 목록을 고쳐 달라고 요청한다. chatId는 CLI가 환경 변수로 물려받은 값이라 출력이
+        // 흐를 대화를 고를 뿐이고, 없는 대화면 흘리지 않고 실행만 한다.
+        "relay_ssh_command" => {
+            let args: RelaySshCommandEnvelope = parse_params(params)?;
+            let terminal = args
+                .chat_id
+                .as_deref()
+                .and_then(|chat_id| chats.ssh_terminal(chat_id).ok());
+            to_value(crate::execute_ssh_command(
+                app_data_dir,
+                args.request,
+                None,
+                terminal
+                    .as_ref()
+                    .map(|terminal| terminal as &dyn crate::SshTerminalSink),
+            )?)
+        }
+        // C9-17. 승인받은 명령을 그 서버의 허용 목록에 영구히 적는다. 실행과 분리된
+        // 별도 작업이고, 별도의 승인 카드를 받는다.
+        "allow_ssh_command_permanently" => {
+            let args: RequestEnvelope<crate::AllowSshCommandRequest> = parse_params(params)?;
+            let gate = context
+                .aia_chat_id
+                .map(|chat_id| chats.ssh_approval_gate(chat_id));
+            to_value(crate::allow_ssh_command_permanently(
+                app_data_dir,
+                args.request,
+                gate.as_ref()
+                    .map(|gate| gate as &dyn crate::SshApprovalGate),
+            )?)
+        }
+        // C9-15. 명령 허용 목록과 분리된 전송 권한으로 파일 하나를 올린다. 대상은
+        // 엔드포인트의 전송 폴더 아래로만 정해지고, 결과에 양쪽 SHA-256이 실린다.
+        "upload_ssh_file" => {
+            let args: RequestEnvelope<crate::UploadSshFileRequest> = parse_params(params)?;
+            to_value(crate::upload_ssh_file(app_data_dir, args.request)?)
+        }
+        // C9-16. 같은 전송 권한으로 같은 폴더에서 파일 하나를 받는다. 쓰는 자리는 에이전트가
+        // 이미 가진 로컬 쓰기 경계(C6)와 같고, 상한을 넘는 파일은 받기 전에 거절한다.
+        "download_ssh_file" => {
+            let args: RequestEnvelope<crate::DownloadSshFileRequest> = parse_params(params)?;
+            to_value(crate::download_ssh_file(app_data_dir, args.request)?)
+        }
+        _ => dispatch_claude_and_account_command(context, command, params),
+    }
+}
+
+/// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
+/// 하나다. Claude 설정·공급자 텔레메트리·플러그인 분기 규칙과 계정 등록·전환 명령.
+/// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
+/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로만 하므로 그대로다.
+fn dispatch_claude_and_account_command(
+    context: &SystemCommandContext<'_>,
+    command: &str,
+    params: Value,
+) -> Result<Value, ApiError> {
+    let &SystemCommandContext {
+        app_data_dir,
+        session_catalog,
+        chats,
+        scheduler,
+        ..
+    } = context;
+    match command {
         "get_claude_settings_states" => {
             let args: ClaudeSettingsProjectArg = parse_optional_params(params)?;
             let project =
@@ -4636,309 +5379,138 @@ fn dispatch_command(
                 &args.request,
             )?)
         }
-        "get_external_plugin_tools" => {
-            let args: crate::ExternalPluginIdRequest = parse_params(params)?;
-            let base = chats.plugin_mcp_base().ok_or_else(|| {
-                CoreError::Conflict("외부 플러그인 프록시가 준비되지 않았습니다".to_owned())
+        // C13. 공급자 CLI가 자기 서버로 보내는 사용정보 수집 스위치. 읽기는 설정 파일 세
+        // 곳의 현재값만 보고, 쓰기는 표에 등록된 항목 하나만 바꾼다.
+        "get_provider_telemetry" => to_value(crate::load_provider_telemetry()?),
+        "set_provider_telemetry_option" => {
+            let args: RequestEnvelope<crate::SetProviderTelemetryOptionRequest> =
+                parse_params(params)?;
+            to_value(crate::set_provider_telemetry_option(
+                app_data_dir,
+                &args.request,
+            )?)
+        }
+        // 브랜치별 플러그인 규칙은 앱 소유 저장소만 바꾸고 공급자 설정 파일에는 닿지 않는다.
+        // 실행을 띄울 때 `--settings`로 그 브랜치의 구체값을 실어 보낸다.
+        "get_claude_plugin_branch_rules" => {
+            let projects = active_registered_projects(session_catalog)?;
+            to_value(crate::load_claude_plugin_branch_rules(
+                app_data_dir,
+                &projects,
+            )?)
+        }
+        "set_claude_plugin_branch_rule" => {
+            let args: RequestEnvelope<crate::SetClaudePluginBranchRuleRequest> =
+                parse_params(params)?;
+            let project = validated_claude_settings_project(
+                session_catalog,
+                Some(args.request.project_path.as_str()),
+            )?
+            .ok_or_else(|| {
+                CoreError::InvalidInput("규칙을 저장할 프로젝트를 선택하세요".to_owned())
             })?;
-            to_value(
-                crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf())
-                    .aia_tool_catalog(&args.id, &base)?,
-            )
+            let projects = active_registered_projects(session_catalog)?;
+            to_value(crate::set_claude_plugin_branch_rule(
+                app_data_dir,
+                &project,
+                &args.request,
+                &projects,
+            )?)
         }
-        "read_external_plugin_tool" => {
-            let args: crate::ExternalPluginToolCallRequest = parse_params(params)?;
-            let base = chats.plugin_mcp_base().ok_or_else(|| {
-                CoreError::Conflict("외부 플러그인 프록시가 준비되지 않았습니다".to_owned())
-            })?;
-            to_value(
-                crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf())
-                    .aia_call_tool(args, &base, true)?,
-            )
-        }
-        "execute_external_plugin_tool" => {
-            let args: crate::ExternalPluginToolCallRequest = parse_params(params)?;
-            let base = chats.plugin_mcp_base().ok_or_else(|| {
-                CoreError::Conflict("외부 플러그인 프록시가 준비되지 않았습니다".to_owned())
-            })?;
-            to_value(
-                crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf())
-                    .aia_call_tool(args, &base, false)?,
-            )
-        }
-        "register_external_plugin" => {
-            let args: crate::RegisterExternalPluginRequest = parse_params(params)?;
-            to_value(crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf()).register(args)?)
-        }
-        "update_external_plugin" => {
-            let args: crate::UpdateExternalPluginRequest = parse_params(params)?;
-            to_value(crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf()).update(args)?)
-        }
-        "remove_external_plugin" => {
-            let args: crate::ExternalPluginIdRequest = parse_params(params)?;
-            crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf()).remove(&args.id)?;
-            to_value(json!({"removed": true, "id": args.id}))
-        }
-        "set_external_plugin_enabled" => {
-            let args: crate::SetExternalPluginEnabledRequest = parse_params(params)?;
-            to_value(
-                crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf())
-                    .set_enabled(&args.id, args.enabled)?,
-            )
-        }
-        // 도구 정책은 승인 요구를 없앨 수 있어(허용) 자격증명 입력과 같은 호스트 전용이다.
-        "set_external_plugin_tool_policy" => {
-            let args: crate::SetExternalPluginToolPolicyRequest = parse_params(params)?;
-            to_value(
-                crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf()).set_tool_policy(
-                    &args.id,
-                    &args.tool,
-                    args.policy,
-                )?,
-            )
-        }
-        "set_external_plugin_tool_policies" => {
-            let args: crate::SetExternalPluginToolPoliciesRequest = parse_params(params)?;
-            to_value(
-                crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf())
-                    .set_all_tool_policies(&args.id, args.policy)?,
-            )
-        }
-        "set_external_plugin_token" => {
-            let args: crate::SetExternalPluginTokenRequest = parse_params(params)?;
-            to_value(
-                crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf())
-                    .set_token(&args.id, &args.token)?,
-            )
-        }
-        "begin_external_plugin_oauth" => {
-            let args: crate::ExternalPluginIdRequest = parse_params(params)?;
-            to_value(
-                crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf())
-                    .begin_oauth(&args.id)?,
-            )
-        }
-        "cancel_external_plugin_oauth" => {
-            let args: crate::ExternalPluginIdRequest = parse_params(params)?;
-            to_value(
-                crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf())
-                    .cancel_oauth(&args.id)?,
-            )
-        }
-        // 연결 확인은 CLI가 쓰는 프록시 경로를 그대로 지난다. 프록시가 없으면 붙일 수도 없다.
-        "verify_external_plugin" => {
-            let args: crate::ExternalPluginIdRequest = parse_params(params)?;
-            let base = chats.plugin_mcp_base().ok_or_else(|| {
-                CoreError::Conflict("외부 플러그인 프록시가 준비되지 않았습니다".to_owned())
-            })?;
-            to_value(
-                crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf())
-                    .verify(&args.id, &base)?,
-            )
+        // 등록이 풀린 프로젝트에 남은 규칙도 지울 수 있어야 하므로 지우기는 등록 여부를
+        // 확인하지 않는다. 지우는 값은 앱 저장소의 한 줄뿐이다.
+        "remove_claude_plugin_branch_rule" => {
+            let args: RequestEnvelope<crate::RemoveClaudePluginBranchRuleRequest> =
+                parse_params(params)?;
+            let projects = active_registered_projects(session_catalog)?;
+            to_value(crate::remove_claude_plugin_branch_rule(
+                app_data_dir,
+                &args.request,
+                &projects,
+            )?)
         }
         "consume_account_reset_credit" => {
             let args: AccountIdArg = parse_params(params)?;
-            let (outcome, accounts) = chats
-                .accounts()
-                .ok_or_else(|| CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned()))?
-                .consume_reset_credit(&args.account_id)?;
+            let (outcome, accounts) =
+                require_accounts(chats)?.consume_reset_credit(&args.account_id)?;
             to_value(serde_json::json!({"outcome": outcome, "accounts": accounts}))
         }
         "refresh_provider_account_usage" => {
             let args: AccountIdArg = parse_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .refresh_usage(&args.account_id)?,
-            )
+            to_value(require_accounts(chats)?.refresh_usage(&args.account_id)?)
         }
         "refresh_provider_account_usages" => {
             let args: RefreshProviderAccountUsagesArg = parse_optional_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .refresh_all_usage(args.provider, args.force)?,
-            )
+            to_value(require_accounts(chats)?.refresh_all_usage(args.provider, args.force)?)
         }
         "revalidate_provider_account_credential" => {
             let args: AccountIdArg = parse_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .revalidate_saved_credential(&args.account_id)?,
-            )
+            to_value(require_accounts(chats)?.revalidate_saved_credential(&args.account_id)?)
         }
         "begin_provider_account_login" => {
             let args: BeginProviderAccountLoginArg = parse_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .begin_login(args.source, args.account_id.as_deref())?,
-            )
+            to_value(require_accounts(chats)?.begin_login(args.source, args.account_id.as_deref())?)
         }
         "finish_provider_account_login" => {
             let args: FinishProviderAccountLoginArg = parse_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .finish_login(&args.login_id, args.display_name)?,
-            )
+            to_value(require_accounts(chats)?.finish_login(&args.login_id, args.display_name)?)
         }
         "cancel_provider_account_login" => {
             let args: LoginIdArg = parse_params(params)?;
-            chats
-                .accounts()
-                .ok_or_else(|| CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned()))?
-                .cancel_login(&args.login_id)?;
+            require_accounts(chats)?.cancel_login(&args.login_id)?;
             Ok(Value::Null)
         }
         "set_default_provider_account" => {
             let args: AccountIdArg = parse_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .set_default(&args.account_id)?,
-            )
+            to_value(require_accounts(chats)?.set_default(&args.account_id)?)
         }
         "set_active_provider_account" => {
             let args: AccountIdArg = parse_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .set_active(&args.account_id)?,
-            )
+            to_value(require_accounts(chats)?.set_active(&args.account_id)?)
         }
         "set_provider_account_disabled" => {
             let args: SetProviderAccountDisabledArg = parse_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .set_disabled(&args.account_id, args.disabled)?,
-            )
+            to_value(require_accounts(chats)?.set_disabled(&args.account_id, args.disabled)?)
         }
         "set_provider_account_auto_switch" => {
             let args: SetProviderAccountAutoSwitchArg = parse_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .set_auto_switch(&args.account_id, args.auto_switch)?,
-            )
+            to_value(require_accounts(chats)?.set_auto_switch(&args.account_id, args.auto_switch)?)
         }
         "set_provider_account_note" => {
             let args: SetProviderAccountNoteArg = parse_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .set_note(&args.account_id, args.note.as_deref())?,
-            )
+            to_value(require_accounts(chats)?.set_note(&args.account_id, args.note.as_deref())?)
         }
         "set_provider_account_label" => {
             let args: SetProviderAccountLabelArg = parse_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .set_label(&args.account_id, args.label.as_deref())?,
-            )
+            to_value(require_accounts(chats)?.set_label(&args.account_id, args.label.as_deref())?)
         }
         "set_provider_account_auto_switch_priority" => {
             let args: SetProviderAccountAutoSwitchPriorityArg = parse_params(params)?;
             to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
+                require_accounts(chats)?
                     .set_auto_switch_priority(&args.account_id, args.priority)?,
             )
         }
         "set_auto_switch_policy" => {
             let args: SetAutoSwitchPolicyArg = parse_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .set_auto_switch_policy(args.policy)?,
-            )
+            to_value(require_accounts(chats)?.set_auto_switch_policy(args.policy)?)
         }
         "set_auto_switch_usage_gap" => {
             let args: SetAutoSwitchUsageGapArg = parse_optional_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .set_auto_switch_usage_gap(args.percent)?,
-            )
+            to_value(require_accounts(chats)?.set_auto_switch_usage_gap(args.percent)?)
         }
         "set_resume_account_policy" => {
             let args: SetResumeAccountPolicyArg = parse_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .set_resume_account_policy(args.policy)?,
-            )
+            to_value(require_accounts(chats)?.set_resume_account_policy(args.policy)?)
         }
         "set_auto_switch_resume" => {
-            let args: SetAutoSwitchResumeArg = parse_params(params)?;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .set_auto_switch_resume(args.enabled)?,
-            )
+            let args: EnabledArg = parse_params(params)?;
+            to_value(require_accounts(chats)?.set_auto_switch_resume(args.enabled)?)
         }
         "delete_provider_account" => {
             let args: AccountIdArg = parse_params(params)?;
             let referenced = scheduler.account_reference_count(&args.account_id)? > 0;
-            to_value(
-                chats
-                    .accounts()
-                    .ok_or_else(|| {
-                        CoreError::Conflict("계정 관리가 준비되지 않았습니다".to_owned())
-                    })?
-                    .delete_account(&args.account_id, referenced)?,
-            )
+            to_value(require_accounts(chats)?.delete_account(&args.account_id, referenced)?)
         }
         "get_chat_provider_options" => {
             let args: ProviderOptionsRequest = parse_params(params)?;
@@ -4957,15 +5529,31 @@ fn dispatch_command(
             let args: RequestEnvelope<SessionRequest> = parse_params(params)?;
             to_value(chats.detached_chat_for_session(args.request.source, &args.request.id)?)
         }
+        _ => dispatch_ui_and_cypress_command(context, command, params),
+    }
+}
+/// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
+/// 하나다. 화면 안내 조회·조작과 Cypress 작업공간·실행 명령.
+/// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
+/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로만 하므로 그대로다.
+fn dispatch_ui_and_cypress_command(
+    context: &SystemCommandContext<'_>,
+    command: &str,
+    params: Value,
+) -> Result<Value, ApiError> {
+    let &SystemCommandContext {
+        app_data_dir,
+        chats,
+        translations,
+        actor,
+        ..
+    } = context;
+    match command {
         "show_ui_guide" => {
             let args: ShowUiGuideRequest = parse_params(params)?;
             // 수신자는 요청 본문이 아니라 MCP 라우트 접미로만 정해진다. 화면·워크플로
             // 경로에는 보낼 대화가 없으므로 거절한다.
-            let chat_id = context.aia_chat_id.ok_or_else(|| {
-                CoreError::InvalidInput(
-                    "show_ui_guide는 AIA 대화 안에서만 호출할 수 있습니다".to_owned(),
-                )
-            })?;
+            let chat_id = require_aia_chat_id(context.aia_chat_id, command)?;
             let target = match (&args.target, &args.element) {
                 (Some(target), None) => Some(
                     crate::system_mcp::ui_guide_target(target)
@@ -5005,11 +5593,7 @@ fn dispatch_command(
         }
         "find_ui_elements" => {
             let args: FindUiElementsRequest = parse_params(params)?;
-            let chat_id = context.aia_chat_id.ok_or_else(|| {
-                CoreError::InvalidInput(
-                    "find_ui_elements는 AIA 대화 안에서만 호출할 수 있습니다".to_owned(),
-                )
-            })?;
+            let chat_id = require_aia_chat_id(context.aia_chat_id, command)?;
             let query = args.query.trim();
             if query.is_empty() || query.chars().count() > 80 {
                 return Err(CoreError::InvalidInput(
@@ -5029,9 +5613,7 @@ fn dispatch_command(
         // 실제로 눌렸는지는 화면이 판단해 답에 담는다.
         "open_ui_element" | "click_ui_element" => {
             let args: UiClickRequest = parse_params(params)?;
-            let chat_id = context.aia_chat_id.ok_or_else(|| {
-                CoreError::InvalidInput(format!("{command}는 AIA 대화 안에서만 호출할 수 있습니다"))
-            })?;
+            let chat_id = require_aia_chat_id(context.aia_chat_id, command)?;
             validate_ui_element_locator(&args.element)?;
             // 실행설정의 클릭 권한이 "모든 클릭"이면 open 경로도 여는 동작 제한 없이 누른다.
             let settings = translations.snapshot()?.settings;
@@ -5053,7 +5635,7 @@ fn dispatch_command(
             to_value(crate::cypress_workspaces::registry(app_data_dir)?)
         }
         "set_cypress_enabled" => {
-            let args: CypressEnabledArg = parse_params(params)?;
+            let args: EnabledArg = parse_params(params)?;
             to_value(crate::cypress_workspaces::set_enabled(
                 app_data_dir,
                 args.enabled,
@@ -5069,8 +5651,18 @@ fn dispatch_command(
                 args.module_dir.as_deref(),
             )?)
         }
+        "set_cypress_workspace_options" => {
+            let args: CypressWorkspaceOptionsRequest = parse_params(params)?;
+            to_value(crate::cypress_workspaces::set_workspace_options(
+                app_data_dir,
+                &args.id,
+                args.record_video,
+                args.headed,
+                args.execution_type,
+            )?)
+        }
         "remove_cypress_workspace" => {
-            let args: CypressWorkspaceIdArg = parse_params(params)?;
+            let args: IdArg = parse_params(params)?;
             to_value(crate::cypress_workspaces::remove_workspace(
                 app_data_dir,
                 &args.id,
@@ -5086,7 +5678,7 @@ fn dispatch_command(
             )?)
         }
         "list_cypress_workspace_files" => {
-            let args: CypressWorkspaceIdArg = parse_params(params)?;
+            let args: IdArg = parse_params(params)?;
             let workspace = crate::cypress_workspaces::workspace(app_data_dir, &args.id)?;
             to_value(crate::cypress_workspaces::list_files(&workspace)?)
         }
@@ -5098,7 +5690,7 @@ fn dispatch_command(
             )?)
         }
         "read_cypress_env_file" => {
-            let args: CypressWorkspaceIdArg = parse_params(params)?;
+            let args: IdArg = parse_params(params)?;
             let workspace = crate::cypress_workspaces::workspace(app_data_dir, &args.id)?;
             to_value(crate::cypress_workspaces::read_env_file(&workspace)?)
         }
@@ -5127,20 +5719,28 @@ fn dispatch_command(
         }
         "run_cypress_spec" => {
             let args: CypressRunRequest = parse_params(params)?;
-            if !crate::cypress_workspaces::is_enabled(app_data_dir)? {
-                return Err(CoreError::InvalidInput(
-                    "Cypress 자동화가 설정에서 꺼져 있습니다. 설정 → 자동화 탭에서 켜야 실행할 수 있습니다(화면 안내 target: settings.cypress)"
-                        .to_owned(),
-                )
-                .into());
-            }
-            let workspace = crate::cypress_workspaces::workspace(app_data_dir, &args.id)?;
+            let workspace = runnable_cypress_workspace(app_data_dir, &args.id)?;
             to_value(crate::cypress_runs::runs().start(
                 app_data_dir,
                 &workspace,
                 args.spec.as_deref(),
+                args.config_file.as_deref(),
                 args.env.unwrap_or_default(),
             )?)
+        }
+        "open_cypress_runner" => {
+            let args: CypressOpenRequest = parse_params(params)?;
+            let workspace = runnable_cypress_workspace(app_data_dir, &args.id)?;
+            to_value(crate::cypress_runs::runs().open(
+                app_data_dir,
+                &workspace,
+                args.config_file.as_deref(),
+                args.env.unwrap_or_default(),
+            )?)
+        }
+        "stop_cypress_run" => {
+            let args: CypressJobArg = parse_params(params)?;
+            to_value(crate::cypress_runs::runs().stop(&args.job_id)?)
         }
         "get_cypress_run_status" => {
             let args: CypressJobArg = parse_params(params)?;
@@ -5152,10 +5752,40 @@ fn dispatch_command(
             to_value(status)
         }
         "list_cypress_runs" => to_value(crate::cypress_runs::runs().list()?),
+        _ => dispatch_session_command(context, command, params),
+    }
+}
+
+fn require_aia_chat_id<'a>(chat_id: Option<&'a str>, command: &str) -> Result<&'a str, CoreError> {
+    chat_id.ok_or_else(|| {
+        CoreError::InvalidInput(format!("{command}는 AIA 대화 안에서만 호출할 수 있습니다"))
+    })
+}
+
+/// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
+/// 하나다. 대화 알림·세션 카탈로그·번역·세션 상세와 정리·폴더 명령.
+/// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
+/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로만 하므로 그대로다.
+fn dispatch_session_command(
+    context: &SystemCommandContext<'_>,
+    command: &str,
+    params: Value,
+) -> Result<Value, ApiError> {
+    let &SystemCommandContext {
+        app_data_dir,
+        session_catalog,
+        chats,
+        scheduler,
+        translations,
+        ..
+    } = context;
+    match command {
         "get_live_chats" => {
             let args: ProfileArg = parse_params(params)?;
             to_value(chats.live_chats(args.profile)?)
         }
+        // 종료 확인 화면이 "지금 끄면 무엇이 끊기는지"를 묻는 읽기 전용 조회다.
+        "get_shutdown_impact" => to_value(chats.shutdown_impact()?),
         "get_chat_attention_snapshot" => to_value(chats.attention_snapshot()?),
         "mark_chat_attention_read" => {
             let args: IdArg = parse_params(params)?;
@@ -5170,12 +5800,27 @@ fn dispatch_command(
             let args: IdArg = parse_params(params)?;
             to_value(chats.dismiss_attention(&args.id)?)
         }
+        "raise_pacing_suggestion" => {
+            let args: RequestEnvelope<PacingSuggestionArg> = parse_params(params)?;
+            let request = args.request.validated()?;
+            chats.record_pacing_suggestion_attention(
+                request.source,
+                &request.key,
+                request.title,
+                request.detail,
+            );
+            to_value(json!({"raised": true}))
+        }
         "remove_chat_input_file" => {
             let args: RequestEnvelope<ChatInputFileArg> = parse_params(params)?;
             chats.remove_input_file(&args.request.chat_id, &args.request.attachment_id)?;
             to_value(())
         }
         "get_manager_snapshot" => to_value(session_catalog.manager_snapshot()?),
+        "get_manager_snapshot_delta" => {
+            let args: SnapshotDeltaArgs = parse_optional_params(params)?;
+            to_value(session_catalog.snapshot_delta(args.since_revision)?)
+        }
         "list_sessions" => {
             let args: RequestEnvelope<SessionListRequest> = parse_params(params)?;
             to_value(crate::list_sessions(session_catalog, chats, args.request)?)
@@ -5236,6 +5881,17 @@ fn dispatch_command(
             let args: RequestEnvelope<SessionRequest> = parse_params(params)?;
             to_value(session_catalog.refresh_session(args.request.source, &args.request.id)?)
         }
+        // 목록에 없는 세션 한 건의 요약. 카탈로그가 아직 훑지 못했거나 제외 프로젝트라
+        // 목록에서 빠진 세션도 공급자 원본에서 바로 읽는다 — 무인 실행이 끝난 뒤 알림에서
+        // 그 세션을 여는 길이 목록 반영 여부에 걸려 막히면 안 된다.
+        "get_session_summary" => {
+            let args: RequestEnvelope<SessionRequest> = parse_params(params)?;
+            to_value(load_session_summary(
+                app_data_dir,
+                args.request.source,
+                &args.request.id,
+            )?)
+        }
         "get_storage_overview" => to_value(load_storage_overview(app_data_dir)?),
         "get_session_detail" => {
             let args: RequestEnvelope<SessionDetailRequest> = parse_params(params)?;
@@ -5278,12 +5934,24 @@ fn dispatch_command(
             let args: ChatIdArg = parse_params(params)?;
             to_value(chats.last_turn_output(&args.chat_id)?)
         }
+        // 세션 목록을 들고 있지 않은 화면(AIA 팝업)이 그 대화의 읽던 자리를 읽는 통로다.
+        "get_session_meta" => {
+            let args: RequestEnvelope<SessionRequest> = parse_params(params)?;
+            to_value(session_meta(
+                app_data_dir,
+                args.request.source,
+                &args.request.id,
+            )?)
+        }
         "patch_session_meta" => {
             let args: RequestEnvelope<UpdateSessionMetaRequest> = parse_params(params)?;
+            // 2026-09-27 ses_f1df880b: 로컬 세션 id 에 source=codex 로 패치가 들어와 없는
+            // 세션의 메타가 생겼다. 카탈로그에 그 (공급자, id)가 있어야 적는다.
+            ensure_session_known(session_catalog, args.request.source, &args.request.id)?;
             // 고정은 실행 시점이 아니라 여기서 검증한다. 격리가 준비되지 않은 계정에
             // 고정하면 다음 이어가기가 실행 거부로 끝나므로, 설정하는 자리에서 막는다.
             if let Some(Some(account_id)) = args.request.patch.pinned_account_id.as_ref() {
-                chats.validate_account_pin(args.request.source, account_id)?;
+                chats.validate_account_pin(args.request.source, account_id, None)?;
             }
             let meta = update_session_meta(
                 app_data_dir,
@@ -5293,6 +5961,78 @@ fn dispatch_command(
             )?;
             session_catalog.refresh_metadata()?;
             to_value(meta)
+        }
+        // 정리 조건과 실행은 앱 데이터 안만 건드리므로 원격 write 모드에서도 허용한다.
+        // AIA 카탈로그에는 넣지 않는다 — 무엇을 언제 지울지는 사람의 결정이다(`C11-8`).
+        "get_session_cleanup_status" => to_value(crate::session_cleanup_status(
+            app_data_dir,
+            session_catalog,
+            chats,
+            Some(scheduler),
+        )?),
+        "set_session_cleanup_policy" => {
+            let args: RequestEnvelope<crate::SessionCleanupPolicyInput> = parse_params(params)?;
+            to_value(crate::set_session_cleanup_policy(
+                app_data_dir,
+                session_catalog,
+                chats,
+                Some(scheduler),
+                args.request,
+            )?)
+        }
+        "run_session_cleanup" => to_value(crate::run_session_cleanup(
+            app_data_dir,
+            session_catalog,
+            chats,
+            Some(scheduler),
+            true,
+        )?),
+        "clear_session_cleanup_tombstones" => to_value(crate::clear_session_cleanup_tombstones(
+            app_data_dir,
+            session_catalog,
+        )?),
+        // M10 목표 카드: 목표는 사용자가 적고 설계 산출물은 AIA 가 뒤에 붙인다. 보고는 회차가 남긴다.
+        "get_round_goals" => to_value(crate::list_round_goals(app_data_dir)?),
+        "create_round_goal" => {
+            let args: RequestEnvelope<crate::RoundGoalInput> = parse_params(params)?;
+            to_value(crate::create_round_goal(app_data_dir, args.request)?)
+        }
+        "update_round_goal" => {
+            let args: RequestEnvelope<UpdateRoundGoalArg> = parse_params(params)?;
+            to_value(crate::update_round_goal(
+                app_data_dir,
+                &args.request.id,
+                args.request.patch,
+            )?)
+        }
+        "delete_round_goal" => {
+            let args: RequestEnvelope<IdArg> = parse_params(params)?;
+            to_value(crate::delete_round_goal(app_data_dir, &args.request.id)?)
+        }
+        "list_round_reports" => {
+            let args: RequestEnvelope<crate::RoundReportQuery> = parse_params(params)?;
+            to_value(crate::list_round_reports(app_data_dir, args.request)?)
+        }
+        "get_round_report" => {
+            let args: RequestEnvelope<IdArg> = parse_params(params)?;
+            to_value(crate::get_round_report(app_data_dir, &args.request.id)?)
+        }
+        "record_round_report" => {
+            let args: RequestEnvelope<crate::RoundReportInput> = parse_params(params)?;
+            to_value(crate::record_round_report(app_data_dir, args.request)?)
+        }
+        "resolve_round_decision" => {
+            let args: RequestEnvelope<ResolveRoundDecisionArg> = parse_params(params)?;
+            to_value(crate::resolve_round_decision(
+                app_data_dir,
+                &args.request.id,
+                args.request.index,
+                &args.request.answer,
+            )?)
+        }
+        "delete_round_report" => {
+            let args: RequestEnvelope<IdArg> = parse_params(params)?;
+            to_value(crate::delete_round_report(app_data_dir, &args.request.id)?)
         }
         "get_session_folders" => to_value(list_session_folders(app_data_dir)?),
         "create_session_folder" => {
@@ -5335,6 +6075,25 @@ fn dispatch_command(
             session_catalog.refresh_metadata()?;
             to_value(removed)
         }
+        _ => dispatch_skill_command(context, command, params),
+    }
+}
+/// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
+/// 하나다. 스킬 라이브러리·자원 저장소·프로젝트 등록과 에이전트·아티팩트 조회 명령.
+/// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
+/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로만 하므로 그대로다.
+fn dispatch_skill_command(
+    context: &SystemCommandContext<'_>,
+    command: &str,
+    params: Value,
+) -> Result<Value, ApiError> {
+    let &SystemCommandContext {
+        app_data_dir,
+        session_catalog,
+        translations,
+        ..
+    } = context;
+    match command {
         "get_skill_detail" => {
             let args: IdArg = parse_params(params)?;
             let snapshot = session_catalog.manager_snapshot()?;
@@ -5353,6 +6112,10 @@ fn dispatch_command(
         "get_resource_repository" => {
             to_value(crate::load_resource_repository_settings(app_data_dir)?)
         }
+        "set_resource_repository" => {
+            let args: RequestEnvelope<crate::SetResourceRepositoryRequest> = parse_params(params)?;
+            to_value(crate::set_resource_repository(app_data_dir, &args.request)?)
+        }
         "get_project_registry" => to_value(session_catalog.project_registry()?),
         "set_project_active" => {
             let args: RequestEnvelope<SetProjectActiveRequest> = parse_params(params)?;
@@ -5365,208 +6128,14 @@ fn dispatch_command(
             let _ = session_catalog.refresh_resources();
             to_value(session_catalog.project_registry()?)
         }
-        "get_project_instruction_library" => {
-            let snapshot = session_catalog.manager_snapshot()?;
-            to_value(crate::load_project_instruction_library(
-                app_data_dir,
-                &snapshot.sessions,
-            )?)
-        }
-        "get_project_instruction_migration_plan" => {
-            let args: ProjectInstructionMigrationPlanArg = parse_params(params)?;
-            to_value(crate::get_project_instruction_migration_plan(
-                app_data_dir,
-                &args.key,
-                args.target_platform,
-            )?)
-        }
-        "read_project_instruction_file" => {
-            let args: ProjectInstructionFileArg = parse_params(params)?;
-            to_value(crate::read_project_instruction_file(
-                app_data_dir,
-                &args.key,
-                args.provider,
-            )?)
-        }
-        "set_resource_repository" => {
-            let args: RequestEnvelope<crate::SetResourceRepositoryRequest> = parse_params(params)?;
-            to_value(crate::set_resource_repository(app_data_dir, &args.request)?)
-        }
-        "create_project_instruction" => {
-            let args: RequestEnvelope<crate::CreateProjectInstructionRequest> =
-                parse_params(params)?;
-            to_value(crate::create_project_instruction(
-                app_data_dir,
-                &args.request,
-            )?)
-        }
-        "import_project_instruction" => {
-            let args: RequestEnvelope<crate::ImportProjectInstructionRequest> =
-                parse_params(params)?;
-            let snapshot = session_catalog.manager_snapshot()?;
-            to_value(crate::import_project_instruction(
-                app_data_dir,
-                &snapshot.sessions,
-                &args.request,
-            )?)
-        }
-        "publish_project_instruction" => {
-            let args: RequestEnvelope<crate::PublishProjectInstructionRequest> =
-                parse_params(params)?;
-            let snapshot = session_catalog.manager_snapshot()?;
-            to_value(crate::publish_project_instruction(
-                app_data_dir,
-                &snapshot.sessions,
-                &args.request,
-            )?)
-        }
-        "save_project_instruction_platform_variant" => {
-            let args: RequestEnvelope<crate::SaveProjectInstructionPlatformVariantRequest> =
-                parse_params(params)?;
-            to_value(crate::save_project_instruction_platform_variant(
-                app_data_dir,
-                &args.request,
-            )?)
-        }
-        "set_project_instruction_platforms" => {
-            let args: RequestEnvelope<crate::SetProjectInstructionPlatformsRequest> =
-                parse_params(params)?;
-            to_value(crate::set_project_instruction_platforms(
-                app_data_dir,
-                &args.request,
-            )?)
-        }
-        // 가져오기 미리보기는 파일을 쓰지 않는 읽기 작업이다.
-        "preview_project_instruction_import" => {
-            let args: RequestEnvelope<crate::InstructionImportPreviewRequest> =
-                parse_params(params)?;
-            let snapshot = session_catalog.manager_snapshot()?;
-            to_value(crate::preview_project_instruction_import(
-                &snapshot.sessions,
-                &args.request,
-            )?)
-        }
-        // 삭제 영향 확인은 파일을 쓰지 않는 읽기 작업이다.
-        "check_project_instruction_delete" => {
-            let args: crate::InstructionDeleteCheckRequest = parse_params(params)?;
-            let snapshot = session_catalog.manager_snapshot()?;
-            to_value(crate::check_project_instruction_delete(
-                app_data_dir,
-                &snapshot.sessions,
-                &args,
-            )?)
-        }
-        "delete_project_instruction_deployment" => {
-            let args: RequestEnvelope<crate::DeleteProjectInstructionDeploymentRequest> =
-                parse_params(params)?;
-            let snapshot = session_catalog.manager_snapshot()?;
-            to_value(crate::delete_project_instruction_deployment(
-                app_data_dir,
-                &snapshot.sessions,
-                &args.request,
-            )?)
-        }
-        "delete_shared_project_instruction" => {
-            let args: RequestEnvelope<crate::DeleteSharedProjectInstructionRequest> =
-                parse_params(params)?;
-            let snapshot = session_catalog.manager_snapshot()?;
-            to_value(crate::delete_shared_project_instruction(
-                app_data_dir,
-                &snapshot.sessions,
-                &args.request,
-            )?)
-        }
-        "unarchive_shared_project_instruction" => {
-            let args: RequestEnvelope<crate::UnarchiveSharedProjectInstructionRequest> =
-                parse_params(params)?;
-            to_value(crate::unarchive_shared_project_instruction(
-                app_data_dir,
-                &args.request,
-            )?)
-        }
-        "sync_project_instruction_from_deployment" => {
-            let args: RequestEnvelope<crate::SyncProjectInstructionRequest> = parse_params(params)?;
-            let snapshot = session_catalog.manager_snapshot()?;
-            to_value(crate::sync_project_instruction_from_deployment(
-                app_data_dir,
-                &snapshot.sessions,
-                &args.request,
-            )?)
-        }
-        "update_project_instruction" => {
-            let args: RequestEnvelope<crate::UpdateProjectInstructionRequest> =
-                parse_params(params)?;
-            let snapshot = session_catalog.manager_snapshot()?;
-            to_value(crate::update_project_instruction(
-                app_data_dir,
-                &snapshot.sessions,
-                &args.request,
-            )?)
-        }
-        "attach_project_instruction_deployment" => {
-            let args: RequestEnvelope<crate::InstructionDeploymentLinkRequest> =
-                parse_params(params)?;
-            let snapshot = session_catalog.manager_snapshot()?;
-            to_value(crate::attach_project_instruction_deployment(
-                app_data_dir,
-                &snapshot.sessions,
-                &args.request,
-            )?)
-        }
-        "detach_project_instruction_deployment" => {
-            let args: RequestEnvelope<crate::InstructionDeploymentLinkRequest> =
-                parse_params(params)?;
-            let snapshot = session_catalog.manager_snapshot()?;
-            to_value(crate::detach_project_instruction_deployment(
-                app_data_dir,
-                &snapshot.sessions,
-                &args.request,
-            )?)
-        }
-        "set_project_instruction_auto_sync" => {
-            let args: InstructionAutoSyncArg = parse_params(params)?;
-            crate::set_project_instruction_auto_sync(app_data_dir, &args.key, args.auto_sync)?;
-            Ok(Value::Null)
-        }
-        "list_instruction_trash" => to_value(crate::list_instruction_trash(app_data_dir)?),
-        // 개인 설정·프로젝트에 실제로 놓인 지침 파일 열람은 읽기 작업이다.
-        "read_deployed_instruction_file" => {
-            let args: crate::ReadDeployedInstructionFileRequest = parse_params(params)?;
-            let snapshot = session_catalog.manager_snapshot()?;
-            to_value(crate::read_deployed_instruction_file(
-                app_data_dir,
-                &snapshot.sessions,
-                &args,
-            )?)
-        }
-        // 지침이 `@context/...`로 가져오거나 링크한 문서 열람. 배포된 지침 파일이 있는
-        // 위치를 루트로 삼는 읽기 작업이다.
-        "get_deployed_instruction_linked_file" => {
-            let args: RequestEnvelope<crate::DeployedInstructionLinkedFileRequest> =
-                parse_params(params)?;
-            let snapshot = session_catalog.manager_snapshot()?;
-            to_value(crate::read_deployed_instruction_linked_file(
-                app_data_dir,
-                &snapshot.sessions,
-                &args.request,
-            )?)
-        }
-        "restore_instruction_trash" => {
-            let args: IdArg = parse_params(params)?;
-            to_value(crate::restore_instruction_trash(app_data_dir, &args.id)?)
-        }
-        "purge_instruction_trash" => {
-            let args: PurgeSkillTrashArg = parse_params(params)?;
-            to_value(crate::purge_instruction_trash(
-                app_data_dir,
-                args.id.as_deref(),
-            )?)
-        }
         // 공통 원본 지문만 읽는 변경 감지용 축약 조회. 공급자 설치본을 훑지 않아
         // 짧은 주기로 불러도 부담이 적고, 쓰기가 없어 원격에서도 허용한다.
         "get_common_skill_digests" => to_value(load_common_skill_digests(app_data_dir)?),
         // 번들 및 공통 스킬의 선언형 제안 팩만 검증해 읽는 조회 작업이다.
         "get_aia_suggestion_catalog" => to_value(load_aia_suggestion_catalog(app_data_dir)?),
+        // 자동화 탭의 온보딩 카드도 같은 경계로 읽는다(W6). 번들 기본 팩과 공통 스킬에
+        // 설치된 팩의 문구·필드 스키마만 검증해 내주며, 쓰기는 없다.
+        "get_aia_onboarding_catalog" => to_value(crate::load_aia_onboarding_catalog(app_data_dir)?),
         // 토큰을 쓰는 모델 호출은 호스트 주 창의 명시된 예산 경로에서만 허용한다.
         // Core는 누적 대화·MCP·도구가 없는 일회성 CLI 프로토콜로 다시 제한한다.
         "analyze_aia_event" => {
@@ -5578,7 +6147,7 @@ fn dispatch_command(
             to_value(load_common_skill_detail(app_data_dir, &args.key)?)
         }
         "get_skill_migration_plan" => {
-            let args: SkillMigrationPlanArg = parse_params(params)?;
+            let args: MigrationPlanArg = parse_params(params)?;
             to_value(crate::get_skill_migration_plan(
                 app_data_dir,
                 &args.key,
@@ -5715,7 +6284,7 @@ fn dispatch_command(
             )?)
         }
         "set_skill_auto_sync" => {
-            let args: SkillAutoSyncArg = parse_params(params)?;
+            let args: AutoSyncArg = parse_params(params)?;
             crate::set_skill_auto_sync(app_data_dir, &args.key, args.auto_sync)?;
             Ok(Value::Null)
         }
@@ -5731,14 +6300,405 @@ fn dispatch_command(
                 &args.request.name,
             )?)
         }
+        _ => dispatch_project_instruction_command(context, command, params),
+    }
+}
+/// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
+/// 하나다. 프로젝트 지침의 목록·읽기·발행·연결과 지침 휴지통 명령.
+/// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
+/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로만 하므로 그대로다.
+fn dispatch_project_instruction_command(
+    context: &SystemCommandContext<'_>,
+    command: &str,
+    params: Value,
+) -> Result<Value, ApiError> {
+    let &SystemCommandContext {
+        app_data_dir,
+        session_catalog,
+        ..
+    } = context;
+    match command {
+        "get_project_instruction_library" => {
+            let snapshot = session_catalog.manager_snapshot()?;
+            to_value(crate::load_project_instruction_library(
+                app_data_dir,
+                &snapshot.sessions,
+            )?)
+        }
+        "get_project_instruction_migration_plan" => {
+            let args: MigrationPlanArg = parse_params(params)?;
+            to_value(crate::get_project_instruction_migration_plan(
+                app_data_dir,
+                &args.key,
+                args.target_platform,
+            )?)
+        }
+        "read_project_instruction_file" => {
+            let args: ProjectInstructionFileArg = parse_params(params)?;
+            to_value(crate::read_project_instruction_file(
+                app_data_dir,
+                &args.key,
+                args.provider,
+            )?)
+        }
+        "create_project_instruction" => {
+            let args: RequestEnvelope<crate::CreateProjectInstructionRequest> =
+                parse_params(params)?;
+            to_value(crate::create_project_instruction(
+                app_data_dir,
+                &args.request,
+            )?)
+        }
+        "import_project_instruction" => {
+            let args: RequestEnvelope<crate::ImportProjectInstructionRequest> =
+                parse_params(params)?;
+            let snapshot = session_catalog.manager_snapshot()?;
+            to_value(crate::import_project_instruction(
+                app_data_dir,
+                &snapshot.sessions,
+                &args.request,
+            )?)
+        }
+        "publish_project_instruction" => {
+            let args: RequestEnvelope<crate::PublishProjectInstructionRequest> =
+                parse_params(params)?;
+            let snapshot = session_catalog.manager_snapshot()?;
+            to_value(crate::publish_project_instruction(
+                app_data_dir,
+                &snapshot.sessions,
+                &args.request,
+            )?)
+        }
+        "save_project_instruction_platform_variant" => {
+            let args: RequestEnvelope<crate::SaveProjectInstructionPlatformVariantRequest> =
+                parse_params(params)?;
+            to_value(crate::save_project_instruction_platform_variant(
+                app_data_dir,
+                &args.request,
+            )?)
+        }
+        "set_project_instruction_platforms" => {
+            let args: RequestEnvelope<crate::SetProjectInstructionPlatformsRequest> =
+                parse_params(params)?;
+            to_value(crate::set_project_instruction_platforms(
+                app_data_dir,
+                &args.request,
+            )?)
+        }
+        // 가져오기 미리보기는 파일을 쓰지 않는 읽기 작업이다.
+        "preview_project_instruction_import" => {
+            let args: RequestEnvelope<crate::InstructionImportPreviewRequest> =
+                parse_params(params)?;
+            let snapshot = session_catalog.manager_snapshot()?;
+            to_value(crate::preview_project_instruction_import(
+                &snapshot.sessions,
+                &args.request,
+            )?)
+        }
+        // 삭제 영향 확인은 파일을 쓰지 않는 읽기 작업이다.
+        "check_project_instruction_delete" => {
+            let args: crate::InstructionDeleteCheckRequest = parse_params(params)?;
+            let snapshot = session_catalog.manager_snapshot()?;
+            to_value(crate::check_project_instruction_delete(
+                app_data_dir,
+                &snapshot.sessions,
+                &args,
+            )?)
+        }
+        "delete_project_instruction_deployment" => {
+            let args: RequestEnvelope<crate::DeleteProjectInstructionDeploymentRequest> =
+                parse_params(params)?;
+            let snapshot = session_catalog.manager_snapshot()?;
+            to_value(crate::delete_project_instruction_deployment(
+                app_data_dir,
+                &snapshot.sessions,
+                &args.request,
+            )?)
+        }
+        "delete_shared_project_instruction" => {
+            let args: RequestEnvelope<crate::DeleteSharedProjectInstructionRequest> =
+                parse_params(params)?;
+            let snapshot = session_catalog.manager_snapshot()?;
+            to_value(crate::delete_shared_project_instruction(
+                app_data_dir,
+                &snapshot.sessions,
+                &args.request,
+            )?)
+        }
+        "unarchive_shared_project_instruction" => {
+            let args: RequestEnvelope<crate::UnarchiveSharedProjectInstructionRequest> =
+                parse_params(params)?;
+            to_value(crate::unarchive_shared_project_instruction(
+                app_data_dir,
+                &args.request,
+            )?)
+        }
+        "sync_project_instruction_from_deployment" => {
+            let args: RequestEnvelope<crate::SyncProjectInstructionRequest> = parse_params(params)?;
+            let snapshot = session_catalog.manager_snapshot()?;
+            to_value(crate::sync_project_instruction_from_deployment(
+                app_data_dir,
+                &snapshot.sessions,
+                &args.request,
+            )?)
+        }
+        "update_project_instruction" => {
+            let args: RequestEnvelope<crate::UpdateProjectInstructionRequest> =
+                parse_params(params)?;
+            let snapshot = session_catalog.manager_snapshot()?;
+            to_value(crate::update_project_instruction(
+                app_data_dir,
+                &snapshot.sessions,
+                &args.request,
+            )?)
+        }
+        "attach_project_instruction_deployment" => {
+            let args: RequestEnvelope<crate::InstructionDeploymentLinkRequest> =
+                parse_params(params)?;
+            let snapshot = session_catalog.manager_snapshot()?;
+            to_value(crate::attach_project_instruction_deployment(
+                app_data_dir,
+                &snapshot.sessions,
+                &args.request,
+            )?)
+        }
+        "detach_project_instruction_deployment" => {
+            let args: RequestEnvelope<crate::InstructionDeploymentLinkRequest> =
+                parse_params(params)?;
+            let snapshot = session_catalog.manager_snapshot()?;
+            to_value(crate::detach_project_instruction_deployment(
+                app_data_dir,
+                &snapshot.sessions,
+                &args.request,
+            )?)
+        }
+        "set_project_instruction_auto_sync" => {
+            let args: AutoSyncArg = parse_params(params)?;
+            crate::set_project_instruction_auto_sync(app_data_dir, &args.key, args.auto_sync)?;
+            Ok(Value::Null)
+        }
+        "list_instruction_trash" => to_value(crate::list_instruction_trash(app_data_dir)?),
+        // 개인 설정·프로젝트에 실제로 놓인 지침 파일 열람은 읽기 작업이다.
+        "read_deployed_instruction_file" => {
+            let args: crate::ReadDeployedInstructionFileRequest = parse_params(params)?;
+            let snapshot = session_catalog.manager_snapshot()?;
+            to_value(crate::read_deployed_instruction_file(
+                app_data_dir,
+                &snapshot.sessions,
+                &args,
+            )?)
+        }
+        // 지침이 `@context/...`로 가져오거나 링크한 문서 열람. 배포된 지침 파일이 있는
+        // 위치를 루트로 삼는 읽기 작업이다.
+        "get_deployed_instruction_linked_file" => {
+            let args: RequestEnvelope<crate::DeployedInstructionLinkedFileRequest> =
+                parse_params(params)?;
+            let snapshot = session_catalog.manager_snapshot()?;
+            to_value(crate::read_deployed_instruction_linked_file(
+                app_data_dir,
+                &snapshot.sessions,
+                &args.request,
+            )?)
+        }
+        "restore_instruction_trash" => {
+            let args: IdArg = parse_params(params)?;
+            to_value(crate::restore_instruction_trash(app_data_dir, &args.id)?)
+        }
+        "purge_instruction_trash" => {
+            let args: PurgeSkillTrashArg = parse_params(params)?;
+            to_value(crate::purge_instruction_trash(
+                app_data_dir,
+                args.id.as_deref(),
+            )?)
+        }
+        _ => dispatch_project_command(context, command, params),
+    }
+}
+/// 프로젝트 화면의 명령. 파일 조회(C16-9)와 git 형상관리(C16). 모든 명령이 `projectPath`를
+/// 받고, 그 경로가 **활성·존재하는 등록 프로젝트**로 정규화되지 않으면 여기서 끝난다 —
+/// 임의 폴더의 파일과 git 상태를 묻는 통로가 되지 않는다.
+/// 아는 이름이 아니면 다음 갈래로 넘긴다.
+fn dispatch_project_command(
+    context: &SystemCommandContext<'_>,
+    command: &str,
+    params: Value,
+) -> Result<Value, ApiError> {
+    let &SystemCommandContext {
+        app_data_dir,
+        session_catalog,
+        ..
+    } = context;
+    const REFUSAL: &str = "프로젝트 화면은 활성 상태의 등록 프로젝트만 다룹니다";
+    // 등록 프로젝트라도 홈 폴더·공급자 홈·앱 데이터는 파일과 git 어느 탭에도 열지 않는다
+    // (G4). 홈에서 CLI를 한 번 띄우면 홈이 등록되므로 등록 여부만으로는 부족하다.
+    let project = |path: &str| -> Result<PathBuf, ApiError> {
+        let root = validated_registered_project(session_catalog, path, REFUSAL)?;
+        if crate::is_restricted_project_root(app_data_dir, &root) {
+            return Err(CoreError::InvalidInput(
+                "홈 폴더·공급자 홈·앱 데이터는 프로젝트 화면에서 다루지 않습니다".to_owned(),
+            )
+            .into());
+        }
+        Ok(root)
+    };
+    match command {
+        "list_project_entries" => {
+            let args: RequestEnvelope<crate::ListProjectEntriesRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::list_project_entries(
+                &root,
+                &args.request.parent_path,
+                args.request.cursor.as_deref(),
+                args.request.limit,
+            )?)
+        }
+        "read_project_file" => {
+            let args: RequestEnvelope<crate::ReadProjectFileRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::read_project_file(
+                &root,
+                &args.request.relative_path,
+            )?)
+        }
+        "get_project_git_overview" => {
+            let args: RequestEnvelope<crate::ProjectGitTarget> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::project_git_overview(app_data_dir, &root)?)
+        }
+        "get_project_git_status" => {
+            let args: RequestEnvelope<crate::ProjectGitTarget> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::project_git_status(app_data_dir, &root)?)
+        }
+        "get_project_git_diff" => {
+            let args: RequestEnvelope<crate::ProjectGitDiffRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::project_git_diff(app_data_dir, &root, &args.request)?)
+        }
+        "get_project_git_log" => {
+            let args: RequestEnvelope<crate::ProjectGitLogRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::project_git_log(app_data_dir, &root, &args.request)?)
+        }
+        "get_project_git_commit_files" => {
+            let args: RequestEnvelope<crate::ProjectGitCommitFilesRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::project_git_commit_files(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        "stage_project_git_paths" => {
+            let args: RequestEnvelope<crate::ProjectGitPathsRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::stage_project_git_paths(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        "unstage_project_git_paths" => {
+            let args: RequestEnvelope<crate::ProjectGitPathsRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::unstage_project_git_paths(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        "commit_project_git" => {
+            let args: RequestEnvelope<crate::ProjectGitCommitRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::commit_project_git(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        "switch_project_git_branch" => {
+            let args: RequestEnvelope<crate::ProjectGitSwitchRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::switch_project_git_branch(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        "stash_project_git" => {
+            let args: RequestEnvelope<crate::ProjectGitStashRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::stash_project_git(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        "rebase_project_git" => {
+            let args: RequestEnvelope<crate::ProjectGitRebaseRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::rebase_project_git(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        "fetch_project_git" => {
+            let args: RequestEnvelope<crate::ProjectGitFetchRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::fetch_project_git(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        "pull_project_git" => {
+            let args: RequestEnvelope<crate::ProjectGitPullRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::pull_project_git(app_data_dir, &root, &args.request)?)
+        }
+        "push_project_git" => {
+            let args: RequestEnvelope<crate::ProjectGitPushRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::push_project_git(app_data_dir, &root, &args.request)?)
+        }
+        _ => dispatch_document_command(context, command, params),
+    }
+}
+/// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
+/// 하나다. 문서 루트·트리·파일 조회와 문서 자동화 트리거 명령.
+/// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
+/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로만 하므로 그대로다.
+fn dispatch_document_command(
+    context: &SystemCommandContext<'_>,
+    command: &str,
+    params: Value,
+) -> Result<Value, ApiError> {
+    let &SystemCommandContext { app_data_dir, .. } = context;
+    match command {
         "get_doc_roots" => to_value(list_doc_roots(app_data_dir)?),
-        // 사용자가 확인 대화에서 승인한 폴더 하나를 만든다(C6). 만드는 범위는 이미 있는
-        // 폴더 바로 아래 한 칸이고, 공급자 홈과 앱 데이터는 거절한다.
+        // 만들기 전에 무엇이 생기는지 알려 준다(C6-4b). 확인 대화는 이 목록을 그대로
+        // 나열하므로, 승인한 것과 실제로 생기는 것이 어긋나지 않는다. 조회라 아무것도
+        // 만들지 않는다.
+        "preview_directory_creation" => {
+            let args: RequestEnvelope<CreateDirectoryRequest> = parse_params(params)?;
+            to_value(crate::plan_user_directory(
+                app_data_dir,
+                &args.request.path,
+            )?)
+        }
+        // 사용자가 확인 대화에서 승인한 폴더를 만든다(C6). 만드는 범위는 이미 있는
+        // 폴더 아래 세 칸까지고, 공급자 홈과 앱 데이터는 중간 칸까지 거절한다.
         "create_directory" => {
             let args: RequestEnvelope<CreateDirectoryRequest> = parse_params(params)?;
             let created = crate::create_user_directory(app_data_dir, &args.request.path)?;
+            // 화면은 이 값을 작업 경로 칸에 그대로 넣고 다시 제출한다. Windows 정규
+            // 경로의 `\\?\` 접두어를 그대로 실어 보내면 사용자가 읽는 자리마다 그것이
+            // 따라다니므로, 계획·실패 문구와 같은 모양으로 벗겨서 내준다.
             to_value(crate::CreatedDirectory {
-                path: created.to_string_lossy().into_owned(),
+                path: crate::path_guard::child_facing(&created)
+                    .to_string_lossy()
+                    .into_owned(),
             })
         }
         "create_doc_root" => {
@@ -5788,7 +6748,7 @@ fn dispatch_command(
             )?)
         }
         "get_doc" => {
-            let args: RequestEnvelope<DocRequest> = parse_params(params)?;
+            let args: RequestEnvelope<DocumentFileArg> = parse_params(params)?;
             to_value(read_doc(
                 app_data_dir,
                 &args.request.root_id,
@@ -5802,6 +6762,15 @@ fn dispatch_command(
                 &args.request.root_id,
                 &args.request.current_path,
                 &args.request.href,
+            )?)
+        }
+        "create_doc" => {
+            let args: RequestEnvelope<CreateDocRequest> = parse_params(params)?;
+            to_value(crate::create_doc(
+                app_data_dir,
+                &args.request.root_id,
+                &args.request.relative_path,
+                &args.request.content,
             )?)
         }
         "put_doc" => {
@@ -5831,7 +6800,7 @@ fn dispatch_command(
             Ok(Value::Null)
         }
         "set_document_trigger_enabled" => {
-            let args: SetDocumentTriggerEnabledArg = parse_params(params)?;
+            let args: SetEnabledArg = parse_params(params)?;
             to_value(
                 document_automation_access(context)?.set_trigger_enabled(&args.id, args.enabled)?,
             )
@@ -5844,6 +6813,28 @@ fn dispatch_command(
             let args: IdArg = parse_params(params)?;
             to_value(document_automation_access(context)?.acknowledge_offline_report(&args.id)?)
         }
+        _ => dispatch_scheduler_and_run_command(context, command, params),
+    }
+}
+/// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
+/// 하나다. 스케줄러 조회·채팅 실행·사용량 예산과 시스템 워크플로·예약 요청 명령.
+/// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
+/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로만 하므로 그대로다.
+fn dispatch_scheduler_and_run_command(
+    context: &SystemCommandContext<'_>,
+    command: &str,
+    params: Value,
+) -> Result<Value, ApiError> {
+    let &SystemCommandContext {
+        app_data_dir,
+        chats,
+        terminals,
+        scheduler,
+        translations,
+        actor,
+        ..
+    } = context;
+    match command {
         // 주기 폴링 대상이므로 본문은 미리보기만 담는다. 전문은
         // get_scheduled_request_detail / get_scheduled_run_detail로 받는다.
         "get_scheduler_snapshot" => to_value(scheduler.preview_snapshot()?),
@@ -5956,51 +6947,37 @@ fn dispatch_command(
         // 인자가 저장 시점에 고정된다. 회차마다 달라지는 기동 수는 이 조회가 정하고,
         // 워크플로는 결과 배열을 forEach로 순회해 기동만 한다.
         "get_usage_budget" => usage_budget_response(context, false),
-        "set_usage_budget_policy" => {
-            let args: RequestEnvelope<crate::UsageBudgetDefaults> = parse_params(params)?;
-            crate::usage_budget_policy::set_defaults(
-                app_data_dir,
-                || usage_budget_seed(app_data_dir, scheduler),
-                args.request,
-            )?;
-            usage_budget_response(context, true)
-        }
-        "acknowledge_drain_notice" => {
-            let args: RequestEnvelope<crate::AcknowledgeDrainNoticeRequest> = parse_params(params)?;
-            crate::usage_budget_policy::acknowledge_drain_notice(
-                app_data_dir,
-                || usage_budget_seed(app_data_dir, scheduler),
-                args.request,
-            )?;
-            usage_budget_response(context, true)
-        }
-        "set_usage_budget_account" => {
-            let args: RequestEnvelope<crate::SetUsageBudgetAccountRequest> = parse_params(params)?;
-            crate::usage_budget_policy::set_account(
-                app_data_dir,
-                || usage_budget_seed(app_data_dir, scheduler),
-                args.request,
-            )?;
-            usage_budget_response(context, true)
-        }
-        "set_usage_budget_consumer" => {
-            let args: RequestEnvelope<crate::SetUsageBudgetConsumerRequest> = parse_params(params)?;
-            crate::usage_budget_policy::set_consumer(
-                app_data_dir,
-                || usage_budget_seed(app_data_dir, scheduler),
-                args.request,
-            )?;
-            usage_budget_response(context, true)
-        }
-        "set_usage_budget_savings" => {
-            let args: RequestEnvelope<crate::SavingsDefaults> = parse_params(params)?;
-            crate::usage_budget_policy::set_savings(
-                app_data_dir,
-                || usage_budget_seed(app_data_dir, scheduler),
-                args.request,
-            )?;
-            usage_budget_response(context, false)
-        }
+        "set_usage_budget_policy" => usage_budget_edit(
+            context,
+            params,
+            true,
+            crate::usage_budget_policy::set_defaults,
+        ),
+        "acknowledge_drain_notice" => usage_budget_edit(
+            context,
+            params,
+            true,
+            crate::usage_budget_policy::acknowledge_drain_notice,
+        ),
+        "set_usage_budget_account" => usage_budget_edit(
+            context,
+            params,
+            true,
+            crate::usage_budget_policy::set_account,
+        ),
+        "set_usage_budget_consumer" => usage_budget_edit(
+            context,
+            params,
+            true,
+            crate::usage_budget_policy::set_consumer,
+        ),
+        // 저축 기본값은 페이싱 자동 주기와 무관해 재계산을 건너뛴다.
+        "set_usage_budget_savings" => usage_budget_edit(
+            context,
+            params,
+            false,
+            crate::usage_budget_policy::set_savings,
+        ),
         "preview_usage_paced_runs" => {
             let inputs = paced_runs_inputs(context, params)?;
             to_value(crate::preview_usage_paced_runs(
@@ -6033,7 +7010,11 @@ fn dispatch_command(
         }
         "register_system_workflow" => {
             let args: WorkflowContractEnvelope = parse_params(params)?;
-            to_value(workflow_registry(app_data_dir).register(args.request)?)
+            let workflow_id = args.request.id.clone();
+            let registry = workflow_registry(app_data_dir);
+            let mut result = registry.register(args.request)?;
+            adopt_registered_version(app_data_dir, &registry, &workflow_id, &mut result);
+            to_value(result)
         }
         "delete_system_workflow" => {
             let args: WorkflowIdArg = parse_params(params)?;
@@ -6071,30 +7052,16 @@ fn dispatch_command(
         }
         "execute_system_workflow" => {
             let args: crate::system_workflows::WorkflowExecuteRequest = parse_params(params)?;
-            // 워크플로 단계는 system_catalog 검증을 통과한 작업만 이 invoker로
-            // 호출한다. 워크플로 관리 작업 자체는 검증 단계에서 금지된다. 회차 봉투가
-            // 직접 부르는 계산 작업은 카탈로그에 없지만 계약 단계로는 올 수 없으므로
-            // 봉투 자신의 호출만 통과한다.
-            let invoker = |operation: &str,
-                           arguments: Value,
-                           site: &WorkflowCallSite<'_>|
-             -> Result<Value, CoreError> {
-                if crate::system_mcp::system_operation_kind(operation).is_none()
-                    && !crate::system_workflows::ENVELOPE_OPERATIONS.contains(&operation)
-                {
-                    return Err(CoreError::InvalidInput(format!(
-                        "system_catalog에 없는 작업입니다: {operation}"
-                    )));
-                }
-                let scoped = SystemCommandContext {
-                    origin: Some(workflow_origin(site)),
-                    ..context.clone()
-                };
-                invoke_system_command(&scoped, operation, arguments)
-            };
-            // 페이싱 회차 계약은 수동 실행도 봉투를 두른다(병렬 1건). 소비자는 반복 요청 없는
-            // 호출 규칙대로 — 이 워크플로의 활성 회차가 하나면 그 회차, 아니면 워크플로 id.
-            to_value(execute_workflow_or_round(app_data_dir, args, 1, &invoker)?)
+            // 워크플로 단계는 system_catalog 검증을 통과한 작업만 통로로 호출한다.
+            // 워크플로 관리 작업 자체는 검증 단계에서 금지된다. 회차 봉투가 직접 부르는
+            // 계산 작업은 카탈로그에 없지만 계약 단계로는 올 수 없으므로 봉투 자신의
+            // 호출만 통과한다.
+            //
+            // 페이싱 회차 계약은 켜진 회차가 있을 때만 봉투를 두른다(병렬 1건). 소비자는 반복
+            // 요청 없는 호출 규칙대로 — 이 워크플로의 활성 회차가 하나면 그 회차, 아니면
+            // 워크플로 id. 켜진 회차가 없으면 봉투 없이 계약만 한 건 돈다.
+            execute_workflow_with_steps(context, args, 1, WorkflowStepGuard::Catalog)
+                .map_err(ApiError::from)
         }
         "create_scheduled_request" => {
             let args: RequestEnvelope<ScheduledRequestInput> = parse_params(params)?;
@@ -6125,7 +7092,7 @@ fn dispatch_command(
             Ok(Value::Null)
         }
         "set_schedule_enabled" => {
-            let args: RequestEnvelope<SetScheduleEnabledRequest> = parse_params(params)?;
+            let args: RequestEnvelope<SetEnabledArg> = parse_params(params)?;
             let updated = scheduler.set_enabled(&args.request.id, args.request.enabled)?;
             scheduler.refresh_paced_auto_cadence()?;
             to_value(crate::get_scheduled_request_detail(scheduler, &updated.id)?)
@@ -6144,6 +7111,88 @@ fn dispatch_command(
             let args: PausedArg = parse_params(params)?;
             to_value(scheduler.set_paused(args.paused)?)
         }
+        _ => dispatch_external_plugin_command(context, command, params),
+    }
+}
+
+/// 외부 플러그인 명령 열넷은 모두 앱 데이터의 레지스트리 하나를 그 자리에서 열어 한 번
+/// 부르는 모양이라, `dispatch_command` 본문에서는 같은 생성 표현이 열네 줄 그대로
+/// 되풀이됐다. 이름 붙은 진입점으로 떼어내 레지스트리를 한 번만 열고, 인가 판정
+/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로 따로 하므로 그대로 둔다.
+/// 갈래 사슬의 마지막 자리이므로 아는 명령이 아니면 여기서 "지원하지 않는 명령"으로 끝낸다.
+fn dispatch_external_plugin_command(
+    context: &SystemCommandContext<'_>,
+    command: &str,
+    params: Value,
+) -> Result<Value, ApiError> {
+    let &SystemCommandContext {
+        app_data_dir,
+        chats,
+        ..
+    } = context;
+    let registry = crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf());
+    match command {
+        // 외부 플러그인 목록은 앱 소유 저장 파일만 읽고 비밀값은 싣지 않는다.
+        "get_external_plugins" => to_value(registry.snapshot(chats.plugin_mcp_base().is_some())?),
+        "get_external_plugin_tools" => {
+            let args: crate::ExternalPluginIdRequest = parse_params(params)?;
+            let base = require_plugin_mcp_base(chats)?;
+            to_value(registry.aia_tool_catalog(&args.id, &base)?)
+        }
+        "read_external_plugin_tool" => {
+            let args: crate::ExternalPluginToolCallRequest = parse_params(params)?;
+            let base = require_plugin_mcp_base(chats)?;
+            to_value(registry.aia_call_tool(args, &base, true)?)
+        }
+        "execute_external_plugin_tool" => {
+            let args: crate::ExternalPluginToolCallRequest = parse_params(params)?;
+            let base = require_plugin_mcp_base(chats)?;
+            to_value(registry.aia_call_tool(args, &base, false)?)
+        }
+        "register_external_plugin" => {
+            let args: crate::ExternalPluginManifestRequest = parse_params(params)?;
+            to_value(registry.register(args)?)
+        }
+        "update_external_plugin" => {
+            let args: crate::ExternalPluginManifestRequest = parse_params(params)?;
+            to_value(registry.update(args)?)
+        }
+        "remove_external_plugin" => {
+            let args: crate::ExternalPluginIdRequest = parse_params(params)?;
+            registry.remove(&args.id)?;
+            to_value(json!({"removed": true, "id": args.id}))
+        }
+        "set_external_plugin_enabled" => {
+            let args: crate::SetExternalPluginEnabledRequest = parse_params(params)?;
+            to_value(registry.set_enabled(&args.id, args.enabled)?)
+        }
+        // 도구 정책은 승인 요구를 없앨 수 있어(허용) 자격증명 입력과 같은 호스트 전용이다.
+        "set_external_plugin_tool_policy" => {
+            let args: crate::SetExternalPluginToolPolicyRequest = parse_params(params)?;
+            to_value(registry.set_tool_policy(&args.id, &args.tool, args.policy)?)
+        }
+        "set_external_plugin_tool_policies" => {
+            let args: crate::SetExternalPluginToolPoliciesRequest = parse_params(params)?;
+            to_value(registry.set_all_tool_policies(&args.id, args.policy)?)
+        }
+        "set_external_plugin_token" => {
+            let args: crate::SetExternalPluginTokenRequest = parse_params(params)?;
+            to_value(registry.set_token(&args.id, &args.token)?)
+        }
+        "begin_external_plugin_oauth" => {
+            let args: crate::ExternalPluginIdRequest = parse_params(params)?;
+            to_value(registry.begin_oauth(&args.id)?)
+        }
+        "cancel_external_plugin_oauth" => {
+            let args: crate::ExternalPluginIdRequest = parse_params(params)?;
+            to_value(registry.cancel_oauth(&args.id)?)
+        }
+        // 연결 확인은 CLI가 쓰는 프록시 경로를 그대로 지난다. 프록시가 없으면 붙일 수도 없다.
+        "verify_external_plugin" => {
+            let args: crate::ExternalPluginIdRequest = parse_params(params)?;
+            let base = require_plugin_mcp_base(chats)?;
+            to_value(registry.verify(&args.id, &base)?)
+        }
         _ => Err(ApiError::not_found("지원하지 않는 명령입니다")),
     }
 }
@@ -6160,14 +7209,19 @@ fn audited_recovery_command(
         &arguments,
         crate::SystemAuditPhase::Attempted,
         None,
+        None,
+        None,
     )?;
     let result = action(arguments.clone());
+    let failure = result.as_ref().err().map(|error| error.message.clone());
     crate::append_system_audit(
         app_data_dir,
         operation,
         &arguments,
         crate::SystemAuditPhase::Completed,
         Some(result.is_ok()),
+        failure.as_deref(),
+        None,
     )?;
     result
 }
@@ -6184,6 +7238,40 @@ pub(crate) fn invoke_system_command(
         StatusCode::PAYLOAD_TOO_LARGE => CoreError::TooLarge(MAX_REQUEST_BODY as u64),
         _ => CoreError::Runtime(error.message),
     })
+}
+
+/// 메타를 적기 전에 그 공급자에 그 세션이 실제로 있는지 본다. 카탈로그에 없으면 한 번
+/// 새로 읽어 보고(방금 생긴 세션), 그래도 없으면 거절한다.
+fn ensure_session_known(
+    session_catalog: &SessionCatalog,
+    source: ProviderId,
+    id: &str,
+) -> Result<(), ApiError> {
+    if session_catalog.session_summary(source, id).is_ok() {
+        return Ok(());
+    }
+    let _ = session_catalog.refresh_session(source, id);
+    session_catalog.session_summary(source, id).map(|_| ()).map_err(|_| {
+        ApiError::not_found(format!(
+            "{source} 공급자에 세션 {id} 이(가) 없습니다. 목록 항목의 source 와 sessionId 를 그대로 쓰세요"
+        ))
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateRoundGoalArg {
+    id: String,
+    #[serde(default)]
+    patch: crate::RoundGoalPatch,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveRoundDecisionArg {
+    id: String,
+    index: usize,
+    answer: String,
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(params: Value) -> Result<T, ApiError> {
@@ -6209,6 +7297,19 @@ fn to_value<T: Serialize>(value: T) -> Result<Value, ApiError> {
 
 impl From<CoreError> for ApiError {
     fn from(error: CoreError) -> Self {
+        // 코드화된 실패는 범주로 상태를 정하고, 코드와 파라미터를 응답 본문까지 들고 간다.
+        if let CoreError::Coded(coded) = error {
+            let status = match coded.kind() {
+                AppErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+                AppErrorKind::NotFound => StatusCode::NOT_FOUND,
+                AppErrorKind::Conflict => StatusCode::CONFLICT,
+            };
+            return Self {
+                status,
+                message: coded.message().to_owned(),
+                coded: Some(coded),
+            };
+        }
         let status = match error {
             CoreError::InvalidInput(_) => StatusCode::BAD_REQUEST,
             CoreError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -6304,15 +7405,17 @@ fn content_type(path: &Path) -> &'static str {
 }
 
 fn linked_file_download_response(file: LinkedFileDownload) -> HttpResponse {
-    let content_type = content_type(Path::new(&file.relative_path));
-    let disposition = content_disposition(&file.relative_path);
-    let mut response = response(StatusCode::OK, content_type, file.bytes);
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
-        .headers_mut()
-        .insert(CONTENT_DISPOSITION, disposition);
+    // 연결 파일은 media type을 확장자로 정하므로 정적 문자열이다. 정적 media type 경로만
+    // `response`의 nosniff·CSP 헤더 한 벌을 함께 받는다.
+    let mut response = response(
+        StatusCode::OK,
+        content_type(Path::new(&file.relative_path)),
+        file.bytes,
+    );
+    insert_no_store(
+        &mut response,
+        Some(content_disposition(&file.relative_path)),
+    );
     response
 }
 
@@ -6348,31 +7451,40 @@ fn session_image_response(rest: &str) -> HttpResponse {
 }
 
 fn transcript_image_response(image: TranscriptImage) -> HttpResponse {
-    let content_type = HeaderValue::from_str(&image.media_type)
-        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-    let mut response = Response::new(Full::new(Bytes::from(image.bytes)));
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(CONTENT_TYPE, content_type);
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
+    stored_media_type_response(image.bytes, &image.media_type, None)
 }
 
 fn chat_input_file_response(download: ChatInputFileDownload) -> HttpResponse {
     let disposition = content_disposition(&download.file.name);
-    let content_type = HeaderValue::from_str(&download.file.media_type)
+    stored_media_type_response(download.bytes, &download.file.media_type, Some(disposition))
+}
+
+/// 저장해 둔 media type 문자열을 그대로 붙여 내려 주는 본문 응답. 대화 기록 이미지와
+/// 입력 첨부가 같은 모양을 손으로 되풀이했다. media type이 런타임 값이라 정적 문자열만
+/// 받는 `bytes_response`를 쓸 수 없어 헤더를 직접 세운다. 헤더로 쓸 수 없는 값이 저장돼
+/// 있으면 옥텟 스트림으로 떨어뜨린다.
+fn stored_media_type_response(
+    body: Vec<u8>,
+    media_type: &str,
+    disposition: Option<HeaderValue>,
+) -> HttpResponse {
+    let content_type = HeaderValue::from_str(media_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-    let mut response = Response::new(Full::new(Bytes::from(download.bytes)));
+    let mut response = Response::new(Full::new(Bytes::from(body)));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(CONTENT_TYPE, content_type);
+    insert_no_store(&mut response, disposition);
     response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
-        .headers_mut()
-        .insert(CONTENT_DISPOSITION, disposition);
-    response
+}
+
+/// 내려받기 응답이 공통으로 다는 마무리 헤더. 본문이 사용자 자료라 캐시하지 않고,
+/// 파일로 받는 응답만 첨부 이름을 함께 단다.
+fn insert_no_store(response: &mut HttpResponse, disposition: Option<HeaderValue>) {
+    let headers = response.headers_mut();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Some(disposition) = disposition {
+        headers.insert(CONTENT_DISPOSITION, disposition);
+    }
 }
 
 fn content_disposition(relative_path: &str) -> HeaderValue {
@@ -6421,12 +7533,24 @@ fn json_value_response(status: StatusCode, value: Value) -> HttpResponse {
     json_response(status, &value)
 }
 
+/// 오류 응답 본문. `error`는 어느 소비자든 그대로 읽을 수 있는 한국어 문장이고,
+/// `code`·`params`는 화면이 자기 언어로 문장을 다시 쓸 때만 쓴다. 코드가 없는 실패에는
+/// 두 칸이 아예 실리지 않으므로 옛 화면은 예전과 똑같은 본문을 본다.
 fn error_response(error: ApiError) -> HttpResponse {
-    json_response(error.status, &json!({ "error": error.message }))
+    let mut body = json!({ "error": error.message });
+    if let (Some(coded), Some(object)) = (error.coded.as_ref(), body.as_object_mut()) {
+        object.insert("code".to_owned(), json!(coded.code()));
+        object.insert("params".to_owned(), json!(coded.params()));
+    }
+    json_response(error.status, &body)
 }
 
 fn response(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> HttpResponse {
-    let mut response = Response::new(Full::new(Bytes::from(body)));
+    bytes_response(status, content_type, Bytes::from(body))
+}
+
+fn bytes_response(status: StatusCode, content_type: &'static str, body: Bytes) -> HttpResponse {
+    let mut response = Response::new(Full::new(body));
     *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
@@ -6446,6 +7570,143 @@ struct RequestEnvelope<T> {
     request: T,
 }
 
+/// C9-18. `<CLI> ssh exec`가 보내는 본문. `chatId`는 출력이 흐를 대화이며 권한이 아니다.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelaySshCommandEnvelope {
+    request: crate::ExecuteSshCommandRequest,
+    #[serde(default)]
+    chat_id: Option<String>,
+}
+
+/// C15. 비밀값 명령이 대상 대화를 고르는 규칙. AIA 시스템 인터페이스로 온 호출은 그
+/// 대화로 고정되고 본문의 chatId는 무시한다 — 다른 대화의 비밀값을 끌어다 쓰는 길을
+/// 본문에 두지 않는다. 화면과 CLI 릴레이는 본문으로 대화를 가리키며, CLI의 값은
+/// `AGENT_MANAGER_CHAT_ID`로 물려받은 자기 대화다.
+fn chat_secret_chat_id<'a>(
+    context: &SystemCommandContext<'a>,
+    requested: Option<&'a str>,
+) -> Result<&'a str, ApiError> {
+    context
+        .aia_chat_id
+        .or(requested)
+        .filter(|chat_id| !chat_id.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "chatId가 필요합니다. 스킬 경로에서는 AGENT_MANAGER_CHAT_ID 환경 변수를 지우지 마세요",
+            )
+        })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatSecretChatEnvelope {
+    #[serde(default)]
+    chat_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetChatSecretRequest {
+    chat_id: String,
+    name: String,
+    purpose: String,
+    value: String,
+}
+
+// 값이 실수로 로그에 실리지 않도록 내용을 찍지 않는다.
+impl std::fmt::Debug for SetChatSecretRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SetChatSecretRequest")
+            .field("chat_id", &self.chat_id)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoveChatSecretRequest {
+    chat_id: String,
+    name: String,
+}
+
+/// C17. 저장된 비밀값 하나를 가리키는 이름.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedSecretRef {
+    name: String,
+}
+
+/// C17. 저장 요청. 값이 실리므로 호스트 전용 명령만 이 모양을 받는다.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveSecretRequest {
+    name: String,
+    purpose: String,
+    value: String,
+}
+
+// 값이 실수로 로그에 실리지 않도록 내용을 찍지 않는다.
+impl std::fmt::Debug for SaveSecretRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SaveSecretRequest")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// C17-5. 값 하나의 자동 사용 토글.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetSavedSecretEnabledRequest {
+    name: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatSecretRequestBody {
+    name: String,
+    purpose: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatSecretRequestEnvelope {
+    request: ChatSecretRequestBody,
+    #[serde(default)]
+    chat_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatSecretRunEnvelope {
+    request: crate::ChatSecretRunRequest,
+    #[serde(default)]
+    chat_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatSecretFileEnvelope {
+    request: crate::ChatSecretFileRequest,
+    #[serde(default)]
+    chat_id: Option<String>,
+}
+
+/// C10-13. `<CLI> db exec`가 보내는 봉투. 대화 id는 CLI가 환경 변수로 물려받은 값이라
+/// 승인 카드가 뜰 대화를 고를 뿐이고, 없는 대화면 승인을 열 수 없어 거절된다.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayDbStatementEnvelope {
+    request: crate::DbStatementRequest,
+    #[serde(default)]
+    chat_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SetProjectActiveRequest {
     path: String,
@@ -6459,16 +7720,31 @@ struct ClaudeSettingsProjectArg {
     project_path: Option<String>,
 }
 
-fn validated_claude_settings_project(
+/// 브랜치 규칙 화면이 현재 브랜치를 함께 보여줄 수 있게 싣는 활성 등록 프로젝트 목록.
+/// 화면이 준 경로가 아니라 레지스트리에서 만들기 때문에, 임의 폴더의 git 상태를 물어보는
+/// 통로가 되지 않는다.
+fn active_registered_projects(session_catalog: &SessionCatalog) -> Result<Vec<PathBuf>, ApiError> {
+    Ok(session_catalog
+        .project_registry()?
+        .into_iter()
+        .filter(|entry| entry.active && entry.exists)
+        .filter_map(|entry| fs::canonicalize(&entry.path).ok())
+        .collect())
+}
+
+/// 화면이 준 프로젝트 경로를 **활성·존재하는 등록 프로젝트**의 정규 경로로 바꾼다. 레지스트리에
+/// 없으면 `refusal` 문구로 거절한다 — Claude 설정(C8)과 프로젝트 화면(C16)이 같은 판정을 쓴다.
+fn validated_registered_project(
     session_catalog: &SessionCatalog,
-    requested: Option<&str>,
-) -> Result<Option<PathBuf>, ApiError> {
-    let Some(requested) = requested.map(str::trim).filter(|path| !path.is_empty()) else {
-        return Ok(None);
-    };
-    let canonical = fs::canonicalize(requested).map_err(|_| {
-        CoreError::InvalidInput("Claude 설정 대상 프로젝트 폴더를 확인할 수 없습니다".to_owned())
-    })?;
+    requested: &str,
+    refusal: &str,
+) -> Result<PathBuf, ApiError> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return Err(CoreError::InvalidInput("프로젝트 경로가 비어 있습니다".to_owned()).into());
+    }
+    let canonical = fs::canonicalize(requested)
+        .map_err(|_| CoreError::InvalidInput("프로젝트 폴더를 확인할 수 없습니다".to_owned()))?;
     let registered = session_catalog
         .project_registry()?
         .into_iter()
@@ -6478,17 +7754,93 @@ fn validated_claude_settings_project(
                 && fs::canonicalize(&entry.path).is_ok_and(|path| path == canonical)
         });
     if !registered {
-        return Err(CoreError::InvalidInput(
-            "Claude 설정은 활성 상태의 등록 프로젝트에서만 바꿀 수 있습니다".to_owned(),
-        )
-        .into());
+        return Err(CoreError::InvalidInput(refusal.to_owned()).into());
     }
-    Ok(Some(canonical))
+    Ok(canonical)
+}
+
+fn validated_claude_settings_project(
+    session_catalog: &SessionCatalog,
+    requested: Option<&str>,
+) -> Result<Option<PathBuf>, ApiError> {
+    let Some(requested) = requested.map(str::trim).filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    validated_registered_project(
+        session_catalog,
+        requested,
+        "Claude 설정은 활성 상태의 등록 프로젝트에서만 바꿀 수 있습니다",
+    )
+    .map(Some)
 }
 
 #[derive(Debug, Deserialize)]
 struct IdArg {
     id: String,
+}
+
+/// 페이싱 관측이 올리는 제안 알림의 인자. 이 작업은 알림만 만들고 페이싱 설정은 건드리지
+/// 않는다 — 조정은 사용자가 워크플로 페이싱 탭에서 직접 한다.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PacingSuggestionArg {
+    source: ProviderId,
+    /// 같은 제안을 가리키는 키. 같은 키의 앞 알림은 교체되므로 회차마다 관측을 돌려도
+    /// 목록에는 최신 하나만 남는다.
+    key: String,
+    title: String,
+    detail: String,
+}
+
+impl PacingSuggestionArg {
+    /// 알림창에 그대로 실리는 문구라 길이를 자른다. 빈 키·제목은 교체 대상을 알 수 없거나
+    /// 목록에서 읽을 수 없는 항목이 되므로 거절한다.
+    ///
+    /// 키는 `validate_identifier`를 쓰지 않는다. 그쪽은 저장된 id용이라 **16자 이상**을
+    /// 요구해서 `max-runs` 같은 짧고 읽기 좋은 키가 거절된다. 여기서 키는 사람이 짓는
+    /// 분류 이름이므로 슬러그 문법과 길이 상한만 본다.
+    fn validated(mut self) -> Result<Self, CoreError> {
+        self.key = self.key.trim().to_owned();
+        if !crate::identifier::is_slug(&self.key, 64) {
+            return Err(CoreError::InvalidInput(
+                "제안 키는 영숫자로 시작하는 64자 이하의 영숫자·`-`·`_` 조합이어야 합니다"
+                    .to_owned(),
+            ));
+        }
+        self.title = self.title.trim().chars().take(120).collect();
+        self.detail = self.detail.trim().chars().take(600).collect();
+        if self.title.is_empty() {
+            return Err(CoreError::InvalidInput(
+                "제안 알림 제목을 채우세요".to_owned(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
+/// 켜고 끄는 토글 하나만 받는 작업의 인자. 절전 억제·원격 write·자동 교체 재개·Cypress
+/// 사용처럼 주인이 다른 설정들이 같은 모양을 각자 선언해 두고 있었다. 본문이 같은 타입을
+/// 여럿 두면 어느 쪽이 무엇을 받는지는 결국 호출 지점에서만 읽히므로, 모양은 한 벌만 둔다.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnabledArg {
+    enabled: bool,
+}
+
+/// 식별자로 고른 항목 하나의 사용 여부를 바꾸는 작업의 인자(문서 감지 규칙·예약 요청).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetEnabledArg {
+    id: String,
+    enabled: bool,
+}
+
+/// 화면이 이미 들고 있는 세션 카탈로그 개정. 0이면(또는 인자가 없으면) 전체 스냅숏을 받는다.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotDeltaArgs {
+    #[serde(default)]
+    since_revision: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6499,27 +7851,15 @@ struct UpdateDocumentTriggerArg {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SetDocumentTriggerEnabledArg {
-    id: String,
-    enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
 struct SkillKeyArg {
     key: String,
 }
 
+/// 스킬과 지침이 같은 모양으로 묻는 "이 키를 저 플랫폼으로 옮기면 무엇이 달라지나".
+/// 대상이 다를 뿐 받는 값이 같아 타입도 한 벌만 둔다.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SkillMigrationPlanArg {
-    key: String,
-    target_platform: crate::HostPlatform,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ProjectInstructionMigrationPlanArg {
+struct MigrationPlanArg {
     key: String,
     target_platform: crate::HostPlatform,
 }
@@ -6548,16 +7888,10 @@ struct SkillFileArg {
     path: String,
 }
 
+/// 스킬과 지침의 자동 동기화 토글. 위 이관 계획과 같은 이유로 모양을 한 벌만 둔다.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SkillAutoSyncArg {
-    key: String,
-    auto_sync: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct InstructionAutoSyncArg {
+struct AutoSyncArg {
     key: String,
     auto_sync: bool,
 }
@@ -6617,7 +7951,7 @@ fn document_automation_access<'a>(
 ) -> Result<&'a DocumentAutomationSupervisor, CoreError> {
     context
         .document_automation
-        .ok_or_else(|| CoreError::Runtime("문서 변경 감지 계층이 연결되지 않았습니다".to_owned()))
+        .ok_or_else(|| CoreError::Runtime("파일 변경 감지 계층이 연결되지 않았습니다".to_owned()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -6632,18 +7966,6 @@ struct TailscaleServiceArg {
     enabled: bool,
     #[serde(default)]
     replace_existing: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SleepPreventionArg {
-    enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RemoteWriteArg {
-    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6720,6 +8042,12 @@ enum AntigravityUsageFreshness {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct LocalLlmProbeArg {
+    base_url: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AntigravityUsageArg {
     #[serde(default)]
     freshness: AntigravityUsageFreshness,
@@ -6750,12 +8078,6 @@ struct SetProviderAccountLabelArg {
     account_id: String,
     #[serde(default)]
     label: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SetAutoSwitchResumeArg {
-    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6923,14 +8245,12 @@ struct UiClickRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CypressEnabledArg {
-    enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CypressWorkspaceIdArg {
+struct CypressWorkspaceOptionsRequest {
     id: String,
+    record_video: bool,
+    headed: bool,
+    #[serde(default)]
+    execution_type: Option<crate::cypress_workspaces::CypressExecutionType>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6978,6 +8298,21 @@ struct CypressRunRequest {
     id: String,
     #[serde(default)]
     spec: Option<String>,
+    /// 이번 실행에만 쓸 Cypress 설정 파일(작업공간 기준 상대 경로). 생략하면 프로젝트 기본
+    /// 설정으로 돈다.
+    #[serde(default)]
+    config_file: Option<String>,
+    #[serde(default)]
+    env: Option<BTreeMap<String, String>>,
+}
+
+/// 런처 열기 요청. 스펙은 런처 안에서 사람이 고르므로 받지 않는다.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CypressOpenRequest {
+    id: String,
+    #[serde(default)]
+    config_file: Option<String>,
     #[serde(default)]
     env: Option<BTreeMap<String, String>>,
 }
@@ -7082,12 +8417,6 @@ struct UpdateScheduledRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct SetScheduleEnabledRequest {
-    id: String,
-    enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CancelScheduledRunArg {
     run_id: String,
@@ -7125,17 +8454,20 @@ struct CreateDirectoryRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DocRequest {
-    root_id: String,
-    relative_path: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct DocLinkedFileRequest {
     root_id: String,
     current_path: String,
     href: String,
+}
+
+/// 새 문서 만들기. 저장과 달리 기대 수정시각이 없다 — 있으면 안 되는 것이 아니라,
+/// 이 입구는 **없던 파일을 만드는 것**이라 비교할 이전 상태 자체가 없다(QA #65).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateDocRequest {
+    root_id: String,
+    relative_path: String,
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7150,7 +8482,33 @@ struct SaveDocRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::TerminalSshMode;
     use tempfile::tempdir;
+
+    /// 코드화된 실패는 범주에 맞는 상태로 나가고, 코드와 파라미터가 본문에 함께 실린다.
+    #[test]
+    fn coded_core_error_carries_code_and_params() {
+        let error = ApiError::from(CoreError::from(
+            AppError::not_found(
+                "SESSION_FOLDER_NOT_FOUND_BY_ID",
+                "세션 폴더를 찾을 수 없습니다: f1",
+            )
+            .with("id", "f1"),
+        ));
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.message, "세션 폴더를 찾을 수 없습니다: f1");
+        let coded = error.coded.as_ref().expect("코드가 실려야 한다");
+        assert_eq!(coded.code(), "SESSION_FOLDER_NOT_FOUND_BY_ID");
+        assert_eq!(coded.params().get("id").map(String::as_str), Some("f1"));
+    }
+
+    /// 코드가 없는 실패는 예전 본문 그대로 — 옛 화면이 읽는 계약을 바꾸지 않는다.
+    #[test]
+    fn uncoded_core_error_has_no_code() {
+        let error = ApiError::from(CoreError::InvalidInput("잘못된 입력입니다".to_owned()));
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.coded.is_none());
+    }
 
     fn paced_schedule(id: &str, workflow_id: Option<&str>) -> crate::scheduler::ScheduledRequest {
         use crate::chat::{ChatApprovalMode, ChatMode};
@@ -7168,6 +8526,7 @@ mod tests {
                 use_active_account: false,
                 cwd: String::new(),
                 model: None,
+                local_connection_id: None,
                 reasoning_effort: None,
                 approval_mode: ChatApprovalMode::Never,
                 mode: ChatMode::FullAccess,
@@ -7200,7 +8559,21 @@ mod tests {
             next_run_at: 0,
             last_run_at: None,
             manual_run_requested_at: None,
+            paused_reason: None,
         }
+    }
+
+    #[test]
+    fn aia_chat_context_validation_keeps_the_command_specific_error() {
+        assert_eq!(
+            require_aia_chat_id(Some("chat-a"), "show_ui_guide").expect("chat context"),
+            "chat-a"
+        );
+        assert!(matches!(
+            require_aia_chat_id(None, "find_ui_elements"),
+            Err(CoreError::InvalidInput(message))
+                if message == "find_ui_elements는 AIA 대화 안에서만 호출할 수 있습니다"
+        ));
     }
 
     #[test]
@@ -7406,6 +8779,10 @@ mod tests {
                 enforce_ceiling: None,
                 reasoning_efforts: None,
                 spend_profile: None,
+                sprint: None,
+                completion_condition: None,
+                completion_condition_enabled: None,
+                reset_completion: None,
             },
         )
         .expect("기존 소비자");
@@ -7480,7 +8857,7 @@ mod tests {
         let refused = require_cypress_enabled_for_aia(SessionReadActor::Aia, path, "작업공간 등록")
             .expect_err("AIA는 꺼져 있으면 거절된다");
         let message = format!("{refused:?}");
-        assert!(message.contains("settings.cypress"), "{message}");
+        assert!(message.contains("addons.cypress"), "{message}");
         crate::cypress_workspaces::set_enabled(path, true).expect("toggle on");
         require_cypress_enabled_for_aia(SessionReadActor::Aia, path, "Cypress 설치")
             .expect("토글이 켜지면 AIA도 설치할 수 있다");
@@ -7518,13 +8895,6 @@ mod tests {
             assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
             assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
         }
-    }
-
-    #[test]
-    fn validates_exact_tailnet_host() {
-        assert!(validate_tailscale_host("device.example.ts.net").is_ok());
-        assert!(validate_tailscale_host("https://device.example.ts.net").is_err());
-        assert!(validate_tailscale_host("example.com").is_err());
     }
 
     #[test]
@@ -7575,6 +8945,40 @@ mod tests {
         let mut decoded = Vec::new();
         decoder.read_to_end(&mut decoded).expect("gzip body");
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn manager_snapshot_response_reuses_raw_and_gzip_bytes_for_same_revision() {
+        let directory = tempdir().expect("temporary directory");
+        let data = directory.path().join("data");
+        let catalog = test_session_catalog(&data, &directory.path().join("home"));
+        let cache = ManagerSnapshotResponseCache::default();
+
+        let first = cached_manager_snapshot_response(&catalog, &cache, true)
+            .expect("first cached response");
+        assert_eq!(
+            first.headers().get(CONTENT_ENCODING),
+            Some(&HeaderValue::from_static("gzip"))
+        );
+        let (raw_pointer, gzip_pointer) = {
+            let cached = cache.inner.lock().expect("cache lock");
+            let entry = cached.as_ref().expect("cache entry");
+            (
+                entry.raw.as_ptr(),
+                entry.gzip.as_ref().expect("gzip bytes").as_ptr(),
+            )
+        };
+
+        let second = cached_manager_snapshot_response(&catalog, &cache, false)
+            .expect("second cached response");
+        assert!(second.headers().get(CONTENT_ENCODING).is_none());
+        let cached = cache.inner.lock().expect("cache lock");
+        let entry = cached.as_ref().expect("cache entry");
+        assert_eq!(entry.raw.as_ptr(), raw_pointer);
+        assert_eq!(
+            entry.gzip.as_ref().expect("gzip bytes").as_ptr(),
+            gzip_pointer
+        );
     }
 
     #[test]
@@ -7748,6 +9152,19 @@ mod tests {
             response.headers().get(ACCESS_CONTROL_EXPOSE_HEADERS),
             Some(&HeaderValue::from_static("Content-Disposition"))
         );
+        // 광고하는 목록과 검사하는 목록이 한 상수라는 사실을 여기서 못 박는다.
+        assert_eq!(
+            response.headers().get(ACCESS_CONTROL_ALLOW_HEADERS),
+            Some(&HeaderValue::from_static(LOCAL_UI_CORS_REQUEST_HEADERS))
+        );
+        headers.insert(
+            ACCESS_CONTROL_REQUEST_HEADERS,
+            HeaderValue::from_static(LOCAL_UI_CORS_REQUEST_HEADERS),
+        );
+        assert_eq!(
+            local_ui_cors_preflight(&headers, access, 4178).status(),
+            StatusCode::NO_CONTENT
+        );
 
         headers.insert(ORIGIN, HeaderValue::from_static("http://localhost:1421"));
         assert_eq!(
@@ -7832,8 +9249,19 @@ mod tests {
         // 프로젝트 활성 여부는 앱 소유 메타이고 토글로 되돌릴 수 있어 원격 write에 허용한다.
         assert!(is_write_command("set_project_active"));
         assert!(!is_host_only_command("set_project_active"));
+        // C6-6: 폴더 만들기는 변경이지만 호스트 전용이 아니다. 원격 편집 권한은 설정의
+        // 스위치 하나로 통일돼 있고, 편집을 허용했으면 폴더 만들기도 그 권한 안이다.
+        assert!(is_write_command("create_directory"));
+        assert!(!is_host_only_command("create_directory"));
+        // 만들 목록을 미리 보는 조회는 변경이 아니다.
+        assert!(!is_write_command("preview_directory_creation"));
+        assert!(!is_host_only_command("preview_directory_creation"));
         assert!(!is_write_command("get_project_registry"));
         assert!(is_write_command("create_session_folder"));
+        assert!(is_write_command("record_round_report"));
+        assert!(is_write_command("update_round_goal"));
+        assert!(!is_write_command("get_round_goals"));
+        assert!(!is_write_command("list_round_reports"));
         assert!(is_write_command("reorder_session_folder"));
         assert!(is_write_command("delete_session_folder"));
         assert!(is_write_command("delete_skill"));
@@ -7868,6 +9296,7 @@ mod tests {
         assert!(is_write_command("mark_all_chat_attention_read"));
         assert!(is_write_command("clear_read_chat_attention"));
         assert!(is_write_command("dismiss_chat_attention"));
+        assert!(is_write_command("raise_pacing_suggestion"));
         assert!(is_write_command("remove_chat_input_file"));
         assert!(is_write_command("begin_provider_account_login"));
         assert!(is_write_command("finish_provider_account_login"));
@@ -7893,6 +9322,53 @@ mod tests {
         assert!(!is_write_command("get_manager_snapshot"));
         assert!(!is_write_command("get_live_chats"));
         assert!(!is_write_command("get_menu_translations"));
+    }
+
+    /// 제안 키는 사람이 짓는 분류 이름이라 짧다. 저장 id용 `validate_identifier`를 쓰면
+    /// 16자 미만이 전부 거절돼, 스킬이 올리려던 제안이 조용히 사라진다.
+    #[test]
+    fn pacing_suggestion_keys_may_be_short_but_must_stay_slugs() {
+        let parse = |key: &str| -> Result<PacingSuggestionArg, CoreError> {
+            let arg: PacingSuggestionArg = serde_json::from_value(json!({
+                "source": "claude",
+                "key": key,
+                "title": "제목",
+                "detail": "본문",
+            }))
+            .unwrap();
+            arg.validated()
+        };
+
+        assert!(parse("max-runs").is_ok(), "짧은 키도 받아야 한다");
+        assert!(parse("cache-regression").is_ok());
+        assert!(parse("  effort_floor  ").is_ok(), "앞뒤 공백은 다듬는다");
+        // 구분자가 섞이면 알림 id 앞자리가 어긋나 교체가 깨진다.
+        assert!(parse("cache:regression").is_err());
+        assert!(parse("").is_err());
+        assert!(parse(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn pacing_suggestion_text_is_trimmed_and_title_is_required() {
+        let arg: PacingSuggestionArg = serde_json::from_value(json!({
+            "source": "claude",
+            "key": "cache-regression",
+            "title": "  캐시 효율 저하  ",
+            "detail": "  write 70%  ",
+        }))
+        .unwrap();
+        let validated = arg.validated().expect("validated");
+        assert_eq!(validated.title, "캐시 효율 저하");
+        assert_eq!(validated.detail, "write 70%");
+
+        let blank: PacingSuggestionArg = serde_json::from_value(json!({
+            "source": "claude",
+            "key": "cache-regression",
+            "title": "   ",
+            "detail": "본문",
+        }))
+        .unwrap();
+        assert!(blank.validated().is_err());
     }
 
     #[test]
@@ -7959,6 +9435,7 @@ mod tests {
             "get_deployed_instruction_linked_file",
             "get_common_skill_digests",
             "get_aia_suggestion_catalog",
+            "get_aia_onboarding_catalog",
             "get_common_skill_detail",
             "get_skill_migration_plan",
             "check_skill_publish",
@@ -7978,6 +9455,12 @@ mod tests {
             "write_cypress_env_file",
             "run_cypress_spec",
         ] {
+            assert!(is_write_command(command), "{command}");
+            assert!(!is_host_only_command(command), "{command}");
+        }
+        // 런처 열기와 중지도 실행과 같은 취급이다. 창이 호스트 화면에만 뜨는 것은 사용성
+        // 문제이지 권한 경계가 아니어서, 원격 write에서도 열고 끊을 수 있어야 한다.
+        for command in ["open_cypress_runner", "stop_cypress_run"] {
             assert!(is_write_command(command), "{command}");
             assert!(!is_host_only_command(command), "{command}");
         }
@@ -8002,6 +9485,22 @@ mod tests {
             replace.request.overwrite,
             crate::SkillOverwritePolicy::Replace
         );
+    }
+
+    #[test]
+    fn session_cleanup_execution_is_write_gated_and_available_remotely() {
+        // 정리는 앱 데이터 안만 건드리므로 원격 write 모드에서 돌 수 있다(`C11-8`).
+        for command in [
+            "set_session_cleanup_policy",
+            "run_session_cleanup",
+            "clear_session_cleanup_tombstones",
+        ] {
+            assert!(is_write_command(command), "{command}");
+            assert!(!is_host_only_command(command), "{command}");
+        }
+        // 상태 조회는 읽기라 원격에서도 조건과 미리보기를 볼 수 있다.
+        assert!(!is_write_command("get_session_cleanup_status"));
+        assert!(!is_host_only_command("get_session_cleanup_status"));
     }
 
     #[test]
@@ -8109,6 +9608,180 @@ mod tests {
         assert!(!is_host_only_command("get_claude_settings_states"));
     }
 
+    /// C13-6. 수집 설정 쓰기는 검증된 설정 파일 한 항목과 앱 데이터 백업만 다루므로 C8과
+    /// 같은 자리에 둔다 — 쓰기 게이트는 거치고 원격 write에서는 허용한다.
+    #[test]
+    fn provider_telemetry_c13_command_is_remote_write_eligible() {
+        assert!(is_write_command("set_provider_telemetry_option"));
+        assert!(!is_host_only_command("set_provider_telemetry_option"));
+        assert!(!is_write_command("get_provider_telemetry"));
+        assert!(!is_host_only_command("get_provider_telemetry"));
+    }
+
+    /// 브랜치 규칙은 앱 소유 저장소 한 줄만 바꾸고 공급자 파일에는 닿지 않으므로, 쓰기
+    /// 게이트는 거치되 원격 write에서 허용한다.
+    #[test]
+    fn claude_plugin_branch_rule_commands_are_remote_write_eligible() {
+        for command in [
+            "set_claude_plugin_branch_rule",
+            "remove_claude_plugin_branch_rule",
+        ] {
+            assert!(is_write_command(command), "{command}");
+            assert!(!is_host_only_command(command), "{command}");
+        }
+        assert!(!is_write_command("get_claude_plugin_branch_rules"));
+        assert!(!is_host_only_command("get_claude_plugin_branch_rules"));
+    }
+
+    /// C10. 데이터베이스 작업이 기존 두 결정점(원격 write 플래그와 호스트 전용 목록)
+    /// 위에 어떻게 놓이는지. 새 토글을 만들지 않았으므로, 이 배치가 곧 권한 설계다.
+    #[test]
+    fn db_connections_c10_split_writes_between_remote_and_host_only() {
+        // 목록 조회는 비밀값 없는 읽기다.
+        // 로컬 LLM 연결 저장은 API 키를 함께 받을 수 있어 write 게이트 아래 두되,
+        // 저장 대상이 앱 데이터와 보안 저장소뿐이라 호스트 전용까지 가지는 않는다.
+        assert!(!is_write_command("get_local_llm_connection"));
+        // 저장소에 닿지 않아도 호스트가 임의 주소로 나가는 일이라 write 로 묶는다.
+        assert!(is_write_command("probe_local_llm_connection"));
+        assert!(is_write_command("set_local_llm_connection"));
+        assert!(!is_host_only_command("set_local_llm_connection"));
+        assert!(!is_write_command("get_local_llm_connections"));
+        assert!(is_write_command("upsert_local_llm_connection"));
+        assert!(is_write_command("remove_local_llm_connection"));
+        assert!(is_write_command("set_default_local_llm_connection"));
+
+        assert!(!is_write_command("get_db_connections"));
+        assert!(!is_host_only_command("get_db_connections"));
+        assert!(!is_write_command("list_agent_db_connections"));
+        assert!(!is_host_only_command("list_agent_db_connections"));
+        // 등록·삭제는 비밀번호를 받고 보안 저장소를 지우므로 호스트 화면 전용이다.
+        assert!(is_write_command("set_db_connection"));
+        assert!(is_host_only_command("set_db_connection"));
+        assert!(is_write_command("remove_db_connection"));
+        assert!(is_host_only_command("remove_db_connection"));
+        // 토글과 연결 확인은 앱 데이터 안의 변경이라 원격 write에 허용한다.
+        assert!(is_write_command("set_db_connection_enabled"));
+        assert!(!is_host_only_command("set_db_connection_enabled"));
+        assert!(is_write_command("check_db_connection"));
+        assert!(!is_host_only_command("check_db_connection"));
+        // 조회는 원격 읽기 전용에서는 막고(결과에 원문 데이터가 실린다) write 모드에서는
+        // 연다. `read_cypress_env_file`과 같은 판단이다.
+        assert!(is_write_command("run_db_query"));
+        assert!(!is_host_only_command("run_db_query"));
+        // 변경 실행은 다른 시스템의 상태를 바꾸고 되돌리는 방법이 앱 안에 없다.
+        assert!(is_write_command("run_db_statement"));
+        assert!(is_host_only_command("run_db_statement"));
+        assert!(is_write_command("relay_db_statement"));
+        assert!(is_host_only_command("relay_db_statement"));
+    }
+
+    /// C17-7. 저장된 비밀값도 결정점이 하나다 — 설정의 원격 편집 스위치(사용자 결정,
+    /// 2026-09-29). 목록만 게이트 없는 읽기이고 나머지는 전부 write 게이트 아래 원격에서
+    /// 쓴다. 에이전트 쪽 경계는 그대로다: 저장·삭제·열람은 AIA 카탈로그에 없고, 저장해
+    /// 둔 자격증명은 에이전트가 쓰되 들지는 못한다.
+    #[test]
+    fn saved_secrets_c17_follow_the_single_remote_write_switch() {
+        assert!(!is_write_command("list_saved_secrets"));
+        assert!(!is_host_only_command("list_saved_secrets"));
+        assert!(crate::system_mcp::system_operation_kind("list_saved_secrets").is_some());
+
+        for command in [
+            "set_saved_secret_agent_enabled",
+            "remove_saved_secret",
+            "save_secret",
+            "remember_chat_secret",
+            "read_saved_secret_value",
+        ] {
+            assert!(is_write_command(command), "{command}");
+            assert!(!is_host_only_command(command), "{command}");
+        }
+
+        assert!(is_write_command("read_saved_secret_value"));
+        assert!(!is_host_only_command("read_saved_secret_value"));
+
+        for command in [
+            "save_secret",
+            "remember_chat_secret",
+            "read_saved_secret_value",
+            "set_saved_secret_agent_enabled",
+            "remove_saved_secret",
+        ] {
+            assert!(
+                crate::system_mcp::system_operation_kind(command).is_none(),
+                "{command}"
+            );
+        }
+    }
+
+    /// C16. 프로젝트 파일 조회와 git 읽기는 게이트 없는 조회, git 변경은 원격 write에
+    /// 허용하되 push만 호스트 전용이다(2026-09-28 사용자 결정).
+    #[test]
+    fn project_git_c16_split_writes_between_remote_and_host_only() {
+        for command in [
+            "list_project_entries",
+            "read_project_file",
+            "get_project_git_overview",
+            "get_project_git_status",
+            "get_project_git_diff",
+            "get_project_git_log",
+            "get_project_git_commit_files",
+        ] {
+            assert!(!is_write_command(command), "{command}");
+            assert!(!is_host_only_command(command), "{command}");
+        }
+        for command in [
+            "stage_project_git_paths",
+            "unstage_project_git_paths",
+            "commit_project_git",
+            "switch_project_git_branch",
+            "stash_project_git",
+            "rebase_project_git",
+            "fetch_project_git",
+            "pull_project_git",
+        ] {
+            assert!(is_write_command(command), "{command}");
+            assert!(!is_host_only_command(command), "{command}");
+        }
+        // 바깥으로 게시하는 push는 되돌릴 방법이 앱 안에 없다.
+        assert!(is_write_command("push_project_git"));
+        assert!(is_host_only_command("push_project_git"));
+    }
+
+    /// C15-7·C17-7. 비밀값 기능의 원격 제한은 설정의 원격 편집 스위치 하나만 따른다
+    /// (사용자 결정, 2026-09-29). 값이 든 명령이라고 해서 따로 호스트에 묶지 않는다 —
+    /// 요청 카드가 이미 같은 소켓으로 값을 실어 오므로 나머지만 막는 것은 한 기기를 뺀
+    /// 모든 화면에서 같은 값을 다시 입력하게 할 뿐이었다.
+    #[test]
+    fn chat_secrets_c15_follow_the_single_remote_write_switch() {
+        // 목록은 이름·용도·만료만 실리므로 원격 읽기에도 연다.
+        for command in ["list_chat_secrets", "list_all_chat_secrets"] {
+            assert!(!is_write_command(command), "{command}");
+            assert!(!is_host_only_command(command), "{command}");
+        }
+        // 나머지는 모두 write 게이트 아래 원격에서 쓴다. 호스트 전용은 하나도 남지 않는다.
+        for command in [
+            "set_chat_secret",
+            "read_chat_secret_value",
+            "run_with_chat_secrets",
+            "write_file_with_chat_secrets",
+            "remove_chat_secret",
+            "request_chat_secret",
+        ] {
+            assert!(is_write_command(command), "{command}");
+            assert!(!is_host_only_command(command), "{command}");
+        }
+        // 값을 그대로 돌려주는 명령은 원격에서 쓸 수 있어도 AIA 카탈로그에는 없다.
+        assert!(crate::system_mcp::system_operation_kind("read_chat_secret_value").is_none());
+    }
+
+    /// 원격 편집 스위치 자체는 예외다. 원격에서 켤 수 있으면 그 스위치는 아무것도 가르지
+    /// 않는다 — 꺼 둔 상태에서 원격이 먼저 하는 일이 스위치를 켜는 일이 된다(G11).
+    #[test]
+    fn the_remote_write_switch_itself_stays_on_the_host() {
+        assert!(is_write_command("set_remote_write_enabled"));
+        assert!(is_host_only_command("set_remote_write_enabled"));
+    }
+
     #[test]
     fn ssh_keys_c9_writes_are_gated_and_remote_eligible() {
         assert!(!is_write_command("get_ssh_keys"));
@@ -8131,6 +9804,29 @@ mod tests {
         assert!(!is_host_only_command("set_ssh_key_endpoint"));
         assert!(is_write_command("check_ssh_endpoint"));
         assert!(!is_host_only_command("check_ssh_endpoint"));
+        // C9-14/C9-15. 원격 명령 실행과 파일 업로드는 다른 시스템의 상태를 바꾸고 되돌리는
+        // 방법이 앱 안에 없다. 원격 브라우저 UI에는 열지 않고 호스트 화면과 AIA 시스템
+        // 인터페이스에서만 닿는다.
+        assert!(is_write_command("execute_ssh_command"));
+        assert!(is_host_only_command("execute_ssh_command"));
+        // C9-18. 경유 실행도 같은 원격 명령 실행이라 같은 분류다.
+        assert!(is_write_command("relay_ssh_command"));
+        assert!(is_host_only_command("relay_ssh_command"));
+        assert!(is_write_command("upload_ssh_file"));
+        assert!(is_host_only_command("upload_ssh_file"));
+        assert!(is_write_command("download_ssh_file"));
+        assert!(is_host_only_command("download_ssh_file"));
+        // C9-17. 허용 목록 영구 추가는 앞으로의 실행을 승인 없이 여는 한 줄이라, 목록을
+        // 편집하는 화면과 같은 급으로 호스트 전용이다. 워크플로 단계로도 부를 수 없다 —
+        // 그 자리에는 승인 카드를 볼 대화가 없다.
+        assert!(is_write_command("allow_ssh_command_permanently"));
+        assert!(is_host_only_command("allow_ssh_command_permanently"));
+        assert!(crate::system_workflows::step_operation_is_forbidden(
+            "allow_ssh_command_permanently"
+        ));
+        // C9-12. 열린 엔드포인트 목록은 개인키 경로와 `ssh` 인자만 담은 조회다.
+        assert!(!is_write_command("list_agent_ssh_endpoints"));
+        assert!(!is_host_only_command("list_agent_ssh_endpoints"));
     }
 
     #[test]
@@ -8138,6 +9834,8 @@ mod tests {
         // 공급자 홈 설정만 읽고 도구를 실행하지 않으므로 write·host 게이트가 없다.
         assert!(!is_write_command("get_account_tools"));
         assert!(!is_host_only_command("get_account_tools"));
+        assert!(!is_write_command("get_agent_builtin_tools"));
+        assert!(!is_host_only_command("get_agent_builtin_tools"));
     }
 
     #[test]
@@ -8170,7 +9868,7 @@ mod tests {
         );
         assert!(matches!(
             parse_chat_message(answered).expect("approve message"),
-            ChatClientMessage::Approve { approval_id, decision: ChatApprovalDecision::Accept, answers }
+            ChatClientMessage::Approve { approval_id, decision: ChatApprovalDecision::Accept, answers, .. }
                 if approval_id == "approval-1" && answers["형식은?"] == "JSON"
         ));
 
@@ -8236,6 +9934,122 @@ mod tests {
         .is_err());
     }
 
+    /// C9-19. SSH 터미널 open은 지문만으로 구분되고, 원격 접근에서는 열리지 않는다.
+    #[test]
+    fn ssh_terminal_open_is_parsed_and_restricted_to_loopback_access() {
+        let message = Message::text(
+            r#"{"type":"open","request":{"fingerprint":"SHA256:abc","cols":100,"rows":30}}"#,
+        );
+        let parsed = parse_terminal_message(message).expect("ssh terminal open");
+        let TerminalClientMessage::Open { request } = parsed else {
+            panic!("expected terminal open request");
+        };
+        // C9-20. 갈래를 적지 않은 기존 요청은 지금까지처럼 원격 셸이다.
+        assert!(matches!(
+            &request,
+            RemoteTerminalOpenRequest::Ssh(TerminalSshRequest {
+                fingerprint,
+                cols: 100,
+                rows: 30,
+                mode: TerminalSshMode::Shell,
+            }) if fingerprint == "SHA256:abc"
+        ));
+        assert!(authorize_terminal_open_request(
+            &request,
+            RequestAccess {
+                remote: false,
+                writable: true,
+            },
+        )
+        .is_ok());
+        assert!(authorize_terminal_open_request(
+            &request,
+            RequestAccess {
+                remote: true,
+                writable: true,
+            },
+        )
+        .is_err());
+    }
+
+    /// C9-20. 공개키 등록 창도 같은 open 메시지로 열리고, 원격 접근 제한을 똑같이 받는다.
+    /// 비밀번호를 칠 수 있는 창이므로 호스트 화면에서만 열려야 한다.
+    #[test]
+    fn ssh_key_install_terminal_open_is_parsed_and_restricted_to_loopback_access() {
+        let message = Message::text(
+            r#"{"type":"open","request":{"fingerprint":"SHA256:abc","cols":100,"rows":30,"mode":"installKey"}}"#,
+        );
+        let parsed = parse_terminal_message(message).expect("ssh key install open");
+        let TerminalClientMessage::Open { request } = parsed else {
+            panic!("expected terminal open request");
+        };
+        assert!(matches!(
+            &request,
+            RemoteTerminalOpenRequest::Ssh(TerminalSshRequest {
+                mode: TerminalSshMode::InstallKey,
+                ..
+            })
+        ));
+        assert!(authorize_terminal_open_request(
+            &request,
+            RequestAccess {
+                remote: true,
+                writable: true,
+            },
+        )
+        .is_err());
+    }
+
+    /// Serve를 443이 아닌 포트에 물리면 브라우저 Origin에 그 포트가 실려 온다. 포트를
+    /// 빼고 비교하면 두 번째 인스턴스의 모든 원격 요청이 Origin 불일치로 막힌다.
+    #[test]
+    fn the_expected_origin_carries_a_non_default_serve_port() {
+        let directory = tempdir().expect("temporary directory");
+        fs::write(directory.path().join("index.html"), "ok").expect("index file");
+        let chats = ChatSupervisor::new();
+        let data = directory.path().join("data");
+        let scheduler =
+            SchedulerSupervisor::new(data.clone(), chats.clone()).expect("scheduler supervisor");
+        let base = Config {
+            port: 4178,
+            store_id: "7cb5018a-4a90-438a-a2c4-d1fd5c660cec".to_owned(),
+            static_dir: directory.path().to_path_buf(),
+            app_data_dir: data.clone(),
+            tailscale_host: Some("device.example.ts.net".to_owned()),
+            tailscale_user: Some("user@example.com".to_owned()),
+            tailscale_serve_port: None,
+            remote_write: true.into(),
+            session_catalog: test_session_catalog(&data, &directory.path().join("home")),
+            terminals: TerminalSupervisor::new(&data).expect("terminal supervisor"),
+            chats,
+            scheduler,
+            translations: test_translations(&data, &directory.path().join("home")),
+            manager_snapshot_cache: ManagerSnapshotResponseCache::default(),
+            document_automation: None,
+            _system_mcp: None,
+        };
+        // 앱이 여는 서비스는 언제나 443이라 포트가 붙지 않는다.
+        assert_eq!(
+            expected_remote_origin(&base),
+            "https://device.example.ts.net"
+        );
+        assert_eq!(
+            expected_remote_origin(&Config {
+                tailscale_serve_port: Some(443),
+                ..base.clone()
+            }),
+            "https://device.example.ts.net"
+        );
+        // 개발 중 두 번째 인스턴스를 다른 포트에 물린 경우.
+        assert_eq!(
+            expected_remote_origin(&Config {
+                tailscale_serve_port: Some(8443),
+                ..base
+            }),
+            "https://device.example.ts.net:8443"
+        );
+    }
+
     #[test]
     fn remote_terminal_requires_write_mode_and_exact_origin() {
         let directory = tempdir().expect("temporary directory");
@@ -8251,12 +10065,14 @@ mod tests {
             app_data_dir: data.clone(),
             tailscale_host: Some("device.example.ts.net".to_owned()),
             tailscale_user: Some("user@example.com".to_owned()),
+            tailscale_serve_port: None,
             remote_write: true.into(),
             session_catalog: test_session_catalog(&data, &directory.path().join("home")),
             terminals: TerminalSupervisor::new(&data).expect("terminal supervisor"),
             chats,
             scheduler,
             translations: test_translations(&data, &directory.path().join("home")),
+            manager_snapshot_cache: ManagerSnapshotResponseCache::default(),
             document_automation: None,
             _system_mcp: None,
         };
@@ -8370,6 +10186,20 @@ mod tests {
         assert!(child.shutdown_on_stdin_eof);
         wait_for_reader_eof(std::io::Cursor::new(b"parent-control-data"))
             .expect("reader reaches EOF");
+    }
+
+    /// 종료 사유는 중단된 턴에 실려 사용자가 읽는 문장이 된다. 부모 앱이 내려간 경우와
+    /// 백엔드만 신호로 교체된 경우는 다음에 할 일이 다르므로 같은 문장을 쓰면 안 되고,
+    /// 사유가 정해지지 않은 채 끝난 경로는 앱이 꺼졌다고 단정하지 않는다.
+    #[test]
+    fn shutdown_reason_tells_an_app_exit_apart_from_a_backend_signal() {
+        let undecided = OnceLock::new();
+        assert_eq!(shutdown_reason(&undecided), SIGNAL_SHUTDOWN_REASON);
+
+        let parent_exit = OnceLock::new();
+        let _ = parent_exit.set(PARENT_EXIT_SHUTDOWN_REASON);
+        assert_eq!(shutdown_reason(&parent_exit), PARENT_EXIT_SHUTDOWN_REASON);
+        assert_ne!(PARENT_EXIT_SHUTDOWN_REASON, SIGNAL_SHUTDOWN_REASON);
     }
 
     /// 페이싱 분류는 세 가지 사실에서 나온다. 봉투 계약은 정책이 꺼도 대상이고, 기동만 하는
@@ -8602,33 +10432,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_current_tailscale_identity_and_trims_dns_dot() {
-        let json = br#"{
-            "BackendState":"Running",
-            "Self":{"DNSName":"device.example.ts.net.","UserID":42,"Online":true},
-            "User":{"42":{"LoginName":"user@example.com"}}
-        }"#;
-        let identity =
-            parse_tailscale_identity(PathBuf::from("tailscale"), json).expect("tailscale identity");
-        assert_eq!(identity.host, "device.example.ts.net");
-        assert_eq!(identity.login, "user@example.com");
-    }
-
-    #[test]
-    fn parses_matching_serve_proxy_without_touching_other_paths() {
-        let json = br#"{
-            "Web":{"device.example.ts.net:443":{"Handlers":{
-                "/":{"Proxy":"http://127.0.0.1:5217"},
-                "/other":{"Proxy":"http://127.0.0.1:9000"}
-            }}}
-        }"#;
-        assert_eq!(
-            parse_serve_target("device.example.ts.net", json).expect("serve target"),
-            Some("http://127.0.0.1:5217".to_owned())
-        );
-    }
-
-    #[test]
     fn starts_and_stops_loopback_remote_server() {
         let directory = tempdir().expect("temporary directory");
         fs::write(directory.path().join("index.html"), "ok").expect("index file");
@@ -8647,12 +10450,14 @@ mod tests {
             app_data_dir: data.clone(),
             tailscale_host: Some("device.example.ts.net".to_owned()),
             tailscale_user: Some("user@example.com".to_owned()),
+            tailscale_serve_port: None,
             remote_write: true.into(),
             session_catalog: test_session_catalog(&data, &directory.path().join("home")),
             terminals,
             chats,
             scheduler,
             translations: test_translations(&data, &directory.path().join("home")),
+            manager_snapshot_cache: ManagerSnapshotResponseCache::default(),
             document_automation: None,
             _system_mcp: None,
         })
@@ -8682,12 +10487,14 @@ mod tests {
             app_data_dir: data.clone(),
             tailscale_host: Some("device.example.ts.net".to_owned()),
             tailscale_user: Some("user@example.com".to_owned()),
+            tailscale_serve_port: None,
             remote_write: true.into(),
             session_catalog: test_session_catalog(&data, &directory.path().join("home")),
             terminals,
             chats,
             scheduler,
             translations: test_translations(&data, &directory.path().join("home")),
+            manager_snapshot_cache: ManagerSnapshotResponseCache::default(),
             document_automation: None,
             _system_mcp: None,
         });

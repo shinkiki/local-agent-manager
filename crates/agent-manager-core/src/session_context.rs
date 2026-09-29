@@ -32,8 +32,8 @@ use serde_json::{json, Value};
 use crate::clock::now_ms;
 use crate::scheduler::{ScheduleFrequency, ScheduleRecurrence};
 use crate::session_management::{
-    SessionListRequest, SessionManagementStatus, SessionStatisticsRequest,
-    SessionTranscriptPageRequest, SystemAuditPhase,
+    session_string_enum, SessionListRequest, SessionManagementStatus, SessionScopeFilters,
+    SessionStatisticsRequest, SessionTranscriptPageRequest, SystemAuditPhase,
 };
 use crate::text_limit;
 use crate::{
@@ -65,44 +65,15 @@ pub enum SessionReadOrigin {
     Manual,
 }
 
+session_string_enum!(SessionReadOrigin, "알 수 없는 세션 참조 출처입니다", {
+    Aia => "aia",
+    Manual => "manual",
+});
+
 impl SessionReadOrigin {
-    pub const ALL: [Self; 2] = [Self::Aia, Self::Manual];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Aia => "aia",
-            Self::Manual => "manual",
-        }
-    }
-
     /// AIA가 설정한 출처인지 여부.
     pub fn is_aia(self) -> bool {
         matches!(self, Self::Aia)
-    }
-
-    /// 사용자가 수동으로 설정한 출처인지 여부.
-    pub fn is_manual(self) -> bool {
-        matches!(self, Self::Manual)
-    }
-}
-
-impl std::fmt::Display for SessionReadOrigin {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SessionReadOrigin {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "aia" => Ok(Self::Aia),
-            "manual" => Ok(Self::Manual),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 세션 참조 출처입니다: {s}. aia|manual 중 하나를 쓰세요"
-            ))),
-        }
     }
 }
 
@@ -116,21 +87,12 @@ pub enum SessionReadActor {
     Aia,
 }
 
+session_string_enum!(SessionReadActor, "알 수 없는 세션 참조 행위자입니다", {
+    User => "user",
+    Aia => "aia",
+});
+
 impl SessionReadActor {
-    pub const ALL: [Self; 2] = [Self::User, Self::Aia];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Aia => "aia",
-        }
-    }
-
-    /// 사용자 주체인지 여부.
-    pub fn is_user(self) -> bool {
-        matches!(self, Self::User)
-    }
-
     /// AIA 주체인지 여부.
     pub fn is_aia(self) -> bool {
         matches!(self, Self::Aia)
@@ -141,26 +103,6 @@ impl SessionReadActor {
         match self {
             Self::User => SessionReadOrigin::Manual,
             Self::Aia => SessionReadOrigin::Aia,
-        }
-    }
-}
-
-impl std::fmt::Display for SessionReadActor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SessionReadActor {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "user" => Ok(Self::User),
-            "aia" => Ok(Self::Aia),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 세션 참조 행위자입니다: {s}. user|aia 중 하나를 쓰세요"
-            ))),
         }
     }
 }
@@ -177,53 +119,11 @@ pub enum SessionReadProjectScope {
     AllRegistered,
 }
 
-impl SessionReadProjectScope {
-    pub const ALL: [Self; 3] = [Self::ScheduleCwd, Self::Selected, Self::AllRegistered];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ScheduleCwd => "scheduleCwd",
-            Self::Selected => "selected",
-            Self::AllRegistered => "allRegistered",
-        }
-    }
-
-    /// 현재 작업 경로(cwd) 기준 스코프인지 여부.
-    pub fn is_schedule_cwd(self) -> bool {
-        matches!(self, Self::ScheduleCwd)
-    }
-
-    /// 사용자가 선택한 프로젝트 목록 기준 스코프인지 여부.
-    pub fn is_selected(self) -> bool {
-        matches!(self, Self::Selected)
-    }
-
-    /// 전체 등록 프로젝트 기준 스코프인지 여부.
-    pub fn is_all_registered(self) -> bool {
-        matches!(self, Self::AllRegistered)
-    }
-}
-
-impl std::fmt::Display for SessionReadProjectScope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SessionReadProjectScope {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "scheduleCwd" => Ok(Self::ScheduleCwd),
-            "selected" => Ok(Self::Selected),
-            "allRegistered" => Ok(Self::AllRegistered),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 세션 참조 프로젝트 범위입니다: {s}. scheduleCwd|selected|allRegistered 중 하나를 쓰세요"
-            ))),
-        }
-    }
-}
+session_string_enum!(SessionReadProjectScope, "알 수 없는 세션 참조 프로젝트 범위입니다", {
+    ScheduleCwd => "scheduleCwd",
+    Selected => "selected",
+    AllRegistered => "allRegistered",
+});
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -237,53 +137,11 @@ pub enum SessionReadDetail {
     LimitedTranscript,
 }
 
-impl SessionReadDetail {
-    pub const ALL: [Self; 3] = [Self::Summary, Self::WorkRationale, Self::LimitedTranscript];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Summary => "summary",
-            Self::WorkRationale => "workRationale",
-            Self::LimitedTranscript => "limitedTranscript",
-        }
-    }
-
-    /// 요약 수준인지 여부.
-    pub fn is_summary(self) -> bool {
-        matches!(self, Self::Summary)
-    }
-
-    /// 수행 작업·근거 포함 수준인지 여부.
-    pub fn is_work_rationale(self) -> bool {
-        matches!(self, Self::WorkRationale)
-    }
-
-    /// 전문 제한 포함 수준인지 여부.
-    pub fn is_limited_transcript(self) -> bool {
-        matches!(self, Self::LimitedTranscript)
-    }
-}
-
-impl std::fmt::Display for SessionReadDetail {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SessionReadDetail {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "summary" => Ok(Self::Summary),
-            "workRationale" => Ok(Self::WorkRationale),
-            "limitedTranscript" => Ok(Self::LimitedTranscript),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 세션 참조 상세도입니다: {s}. summary|workRationale|limitedTranscript 중 하나를 쓰세요"
-            ))),
-        }
-    }
-}
+session_string_enum!(SessionReadDetail, "알 수 없는 세션 참조 상세도입니다", {
+    Summary => "summary",
+    WorkRationale => "workRationale",
+    LimitedTranscript => "limitedTranscript",
+});
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -295,46 +153,10 @@ pub enum SessionReadRedaction {
     Strict,
 }
 
-impl SessionReadRedaction {
-    pub const ALL: [Self; 2] = [Self::Credentials, Self::Strict];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Credentials => "credentials",
-            Self::Strict => "strict",
-        }
-    }
-
-    /// 기본 인증정보 비식별화 수준인지 여부.
-    pub fn is_credentials(self) -> bool {
-        matches!(self, Self::Credentials)
-    }
-
-    /// 엄격한 비식별화 수준인지 여부.
-    pub fn is_strict(self) -> bool {
-        matches!(self, Self::Strict)
-    }
-}
-
-impl std::fmt::Display for SessionReadRedaction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SessionReadRedaction {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "credentials" => Ok(Self::Credentials),
-            "strict" => Ok(Self::Strict),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 세션 참조 비식별화 수준입니다: {s}. credentials|strict 중 하나를 쓰세요"
-            ))),
-        }
-    }
-}
+session_string_enum!(SessionReadRedaction, "알 수 없는 세션 참조 비식별화 수준입니다", {
+    Credentials => "credentials",
+    Strict => "strict",
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -344,53 +166,11 @@ pub enum SessionReadRelativeUnit {
     Month,
 }
 
-impl SessionReadRelativeUnit {
-    pub const ALL: [Self; 3] = [Self::Day, Self::Week, Self::Month];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Day => "day",
-            Self::Week => "week",
-            Self::Month => "month",
-        }
-    }
-
-    /// 일 단위인지 여부.
-    pub fn is_day(self) -> bool {
-        matches!(self, Self::Day)
-    }
-
-    /// 주 단위인지 여부.
-    pub fn is_week(self) -> bool {
-        matches!(self, Self::Week)
-    }
-
-    /// 월 단위인지 여부.
-    pub fn is_month(self) -> bool {
-        matches!(self, Self::Month)
-    }
-}
-
-impl std::fmt::Display for SessionReadRelativeUnit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SessionReadRelativeUnit {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "day" => Ok(Self::Day),
-            "week" => Ok(Self::Week),
-            "month" => Ok(Self::Month),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 세션 참조 상대 단위입니다: {s}. day|week|month 중 하나를 쓰세요"
-            ))),
-        }
-    }
-}
+session_string_enum!(SessionReadRelativeUnit, "알 수 없는 세션 참조 상대 단위입니다", {
+    Day => "day",
+    Week => "week",
+    Month => "month",
+});
 
 /// 조회 기간. 스케줄 모델과 같은 표현을 쓰고, 상대 기간만 발급 시점에 절대 구간이 된다.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -517,34 +297,7 @@ pub struct ScheduleRunSessionRead {
 pub fn normalize_policy(mut policy: SessionReadPolicy) -> Result<SessionReadPolicy, CoreError> {
     policy.providers = dedupe_in_order(policy.providers);
     policy.statuses = dedupe_in_order(policy.statuses);
-    policy.projects = dedupe_in_order(
-        policy
-            .projects
-            .into_iter()
-            .map(|path| path.trim().to_owned())
-            .filter(|path| !path.is_empty())
-            .collect(),
-    );
-    if policy.projects.len() > MAX_SESSION_READ_PROJECTS {
-        return Err(CoreError::InvalidInput(format!(
-            "세션 참조 프로젝트는 최대 {MAX_SESSION_READ_PROJECTS}개까지 고를 수 있습니다"
-        )));
-    }
-    for path in &policy.projects {
-        if !Path::new(path).is_absolute()
-            || Path::new(path)
-                .components()
-                .any(|part| part.as_os_str() == "..")
-        {
-            return Err(CoreError::InvalidInput(format!(
-                "세션 참조 프로젝트 경로가 올바르지 않습니다: {path}"
-            )));
-        }
-    }
-    if policy.project_scope != SessionReadProjectScope::Selected {
-        // 범위를 바꿨는데 예전 선택이 남아 있으면 화면과 집행 값이 어긋난다.
-        policy.projects.clear();
-    }
+    policy.projects = normalize_projects(policy.project_scope, policy.projects)?;
     policy.max_sessions = clamp_limit(
         policy.max_sessions,
         default_max_sessions(),
@@ -560,7 +313,57 @@ pub fn normalize_policy(mut policy: SessionReadPolicy) -> Result<SessionReadPoli
         default_page_size(),
         MAX_SESSION_READ_PAGE_SIZE,
     );
-    match &mut policy.period {
+    normalize_period(&mut policy.period)?;
+    if policy.enabled
+        && policy.project_scope == SessionReadProjectScope::Selected
+        && policy.projects.is_empty()
+    {
+        return Err(CoreError::InvalidInput(
+            "선택한 등록 프로젝트 범위에는 프로젝트를 하나 이상 골라야 합니다".to_owned(),
+        ));
+    }
+    Ok(policy)
+}
+
+fn normalize_projects(
+    scope: SessionReadProjectScope,
+    projects: Vec<String>,
+) -> Result<Vec<String>, CoreError> {
+    let projects = dedupe_in_order(
+        projects
+            .into_iter()
+            .map(|path| path.trim().to_owned())
+            .filter(|path| !path.is_empty())
+            .collect(),
+    );
+    if scope != SessionReadProjectScope::Selected {
+        // 범위를 바꿨는데 예전 선택이 남아 있으면 화면과 집행 값이 어긋난다. 버릴 목록은
+        // 검사하지도 않는다 — 곧 사라질 값 하나가 범위 전환을 막으면, 사용자는 더는 쓰지도
+        // 않을 선택을 고쳐야만 그 선택에서 벗어날 수 있다. 다른 기계에서 고른 경로가
+        // 남아 있는 설정이 정확히 그 모양이다(`/tmp/...`는 Windows에서 절대 경로가 아니다).
+        return Ok(Vec::new());
+    }
+    if projects.len() > MAX_SESSION_READ_PROJECTS {
+        return Err(CoreError::InvalidInput(format!(
+            "세션 참조 프로젝트는 최대 {MAX_SESSION_READ_PROJECTS}개까지 고를 수 있습니다"
+        )));
+    }
+    for path in &projects {
+        if !Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|part| part.as_os_str() == "..")
+        {
+            return Err(CoreError::InvalidInput(format!(
+                "세션 참조 프로젝트 경로가 올바르지 않습니다: {path}"
+            )));
+        }
+    }
+    Ok(projects)
+}
+
+fn normalize_period(period: &mut SessionReadPeriod) -> Result<(), CoreError> {
+    match period {
         SessionReadPeriod::ReportPeriod => {}
         SessionReadPeriod::Relative { count, .. } => {
             *count = clamp_limit(*count, 1, MAX_SESSION_READ_RELATIVE_COUNT);
@@ -576,15 +379,7 @@ pub fn normalize_policy(mut policy: SessionReadPolicy) -> Result<SessionReadPoli
             }
         }
     }
-    if policy.enabled
-        && policy.project_scope == SessionReadProjectScope::Selected
-        && policy.projects.is_empty()
-    {
-        return Err(CoreError::InvalidInput(
-            "선택한 등록 프로젝트 범위에는 프로젝트를 하나 이상 골라야 합니다".to_owned(),
-        ));
-    }
-    Ok(policy)
+    Ok(())
 }
 
 fn clamp_limit(value: u32, fallback: u32, ceiling: u32) -> u32 {
@@ -714,6 +509,7 @@ fn provider_display(provider: ProviderId) -> &'static str {
         ProviderId::Claude => "Claude",
         ProviderId::Codex => "Codex",
         ProviderId::Antigravity => "Antigravity",
+        ProviderId::Local => "Local",
     }
 }
 
@@ -1179,24 +975,7 @@ pub fn resolve_run_session_read(
         window_to: Some(resolved.to),
         notes: resolved.notes.clone(),
     };
-    let effective = SessionReadPolicy {
-        enabled: true,
-        project_scope: SessionReadProjectScope::Selected,
-        projects: resolved.cwds.clone(),
-        providers: resolved.sources.clone(),
-        period: SessionReadPeriod::AbsoluteRange {
-            from: resolved.from,
-            to: resolved.to,
-        },
-        statuses: resolved.statuses.clone(),
-        detail: resolved.detail,
-        max_sessions: resolved.max_sessions,
-        max_turns_per_session: resolved.max_turns_per_session,
-        page_size: resolved.page_size,
-        include_linked_files: resolved.include_linked_files,
-        redaction: resolved.redaction,
-    };
-    let Ok(policy_json) = serde_json::to_string(&effective) else {
+    let Ok(policy_json) = serde_json::to_string(&effective_policy(&resolved)) else {
         return (
             None,
             ScheduleRunSessionRead {
@@ -1212,16 +991,42 @@ pub fn resolve_run_session_read(
         notes.push("조회할 등록 프로젝트가 없어 세션 참조를 안내하지 않았습니다".to_owned());
         return (None, ScheduleRunSessionRead { notes, ..record });
     }
-    let preamble = format!(
+    let preamble = session_read_preamble(&resolved.summary, &policy_json);
+    (Some(preamble), ScheduleRunSessionRead { notes, ..record })
+}
+
+/// 확정된 조회 범위를 다시 정책 형태로 되돌린다. 상대 기간은 이미 절대 구간이 되어 있어
+/// 에이전트가 이 정책을 그대로 넘기면 같은 범위가 다시 나온다.
+fn effective_policy(resolved: &ResolvedSessionRead) -> SessionReadPolicy {
+    SessionReadPolicy {
+        enabled: true,
+        project_scope: SessionReadProjectScope::Selected,
+        projects: resolved.cwds.clone(),
+        providers: resolved.sources.clone(),
+        period: SessionReadPeriod::AbsoluteRange {
+            from: resolved.from,
+            to: resolved.to,
+        },
+        statuses: resolved.statuses.clone(),
+        detail: resolved.detail,
+        max_sessions: resolved.max_sessions,
+        max_turns_per_session: resolved.max_turns_per_session,
+        page_size: resolved.page_size,
+        include_linked_files: resolved.include_linked_files,
+        redaction: resolved.redaction,
+    }
+}
+
+/// 에이전트에게 줄 지시문. 확정된 범위 요약과 정책 JSON만 갈아끼운다.
+fn session_read_preamble(summary: &str, policy_json: &str) -> String {
+    format!(
         "[세션 참조 범위]\n\
 이 실행은 다른 에이전트 세션 기록을 아래 범위 안에서만 읽습니다. `session-context` 스킬을 \
 쓰고, 아래 정책 JSON을 그대로 `--policy`에 넘기세요. 범위를 넓히지 말고, 세션 파일을 직접 \
 읽지 마세요. 범위가 좁아 답을 낼 수 없으면 무엇이 빠졌는지 밝히고 부분 보고로 처리하세요.\n\
-적용 범위: {}\n\
-정책: {}\n",
-        resolved.summary, policy_json
-    );
-    (Some(preamble), ScheduleRunSessionRead { notes, ..record })
+적용 범위: {summary}\n\
+정책: {policy_json}\n"
+    )
 }
 
 /// 모든 응답을 같은 봉투에 담는다. 정책 요약과 신뢰 경계 안내가 응답마다 함께 간다.
@@ -1431,51 +1236,20 @@ enum SessionReadCliOp {
     LinkedFile,
 }
 
+session_string_enum!(SessionReadCliOp, "알 수 없는 sessions 작업입니다", {
+    Statistics => "statistics",
+    List => "list",
+    Detail => "detail",
+    LinkedFile => "linked-file",
+});
+
 impl SessionReadCliOp {
-    #[cfg(test)]
-    const ALL: [Self; 4] = [Self::Statistics, Self::List, Self::Detail, Self::LinkedFile];
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Statistics => "statistics",
-            Self::List => "list",
-            Self::Detail => "detail",
-            Self::LinkedFile => "linked-file",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, CoreError> {
-        value.parse()
-    }
-
     fn audit_name(self) -> &'static str {
         match self {
             Self::Statistics => "session_read_cli_statistics",
             Self::List => "session_read_cli_list",
             Self::Detail => "session_read_cli_detail",
             Self::LinkedFile => "session_read_cli_linked_file",
-        }
-    }
-}
-
-impl std::fmt::Display for SessionReadCliOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SessionReadCliOp {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "statistics" => Ok(Self::Statistics),
-            "list" => Ok(Self::List),
-            "detail" => Ok(Self::Detail),
-            "linked-file" => Ok(Self::LinkedFile),
-            other => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 sessions 작업입니다: {other}. statistics|list|detail|linked-file 중 하나를 쓰세요"
-            ))),
         }
     }
 }
@@ -1496,6 +1270,26 @@ fn cli_missing(flag: &str) -> CoreError {
     CoreError::InvalidInput(format!("{flag} 값이 필요합니다"))
 }
 
+/// 값이 따라와야 하는 플래그에서 다음 인자를 꺼낸다. 플래그 이름을 갈래마다 두 번씩
+/// 적던 것을 한 번으로 줄여, 인자를 늘릴 때 "무엇이 빠졌는지" 문구가 어긋나지 않는다.
+fn cli_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, CoreError> {
+    args.next().ok_or_else(|| cli_missing(flag))
+}
+
+/// 조회 범위에 등록 프로젝트가 하나도 없을 때 본문에 적는 사유.
+const CLI_NO_PROJECT_REASON: &str = "조회할 등록 프로젝트가 없습니다";
+
+/// 작업마다 요구하는 인자가 빠졌을 때의 오류. 작업 이름은 [`SessionReadCliOp`]의
+/// 표기를 그대로 쓰므로 작업을 늘려도 문구를 따로 적을 일이 없다.
+fn cli_required<T>(value: Option<T>, op: SessionReadCliOp, flag: &str) -> Result<T, CoreError> {
+    value.ok_or_else(|| CoreError::InvalidInput(format!("{op}에는 {flag}가 필요합니다")))
+}
+
+/// 정책의 가림 수준을 적용하고 길이를 잘라 신뢰하지 않는 본문으로 감싼다.
+fn cli_untrusted_text(text: &str, cap: usize, policy: &ResolvedSessionRead) -> String {
+    untrusted_block(&redact(&truncate_chars(text, cap), policy.redaction))
+}
+
 fn cli_parse_source(value: &str) -> Result<ProviderId, CoreError> {
     value.parse::<ProviderId>().map_err(|_| {
         CoreError::InvalidInput(format!(
@@ -1504,59 +1298,46 @@ fn cli_parse_source(value: &str) -> Result<ProviderId, CoreError> {
     })
 }
 
-impl SessionReadCliOptions {
-    fn from_args(mut args: impl Iterator<Item = String>) -> Result<Self, CoreError> {
-        let op = SessionReadCliOp::parse(&args.next().ok_or_else(|| {
-            CoreError::InvalidInput(
-                "sessions 다음에 작업이 필요합니다: statistics|list|detail|linked-file".to_owned(),
-            )
-        })?)?;
-        let mut app_data_dir: Option<PathBuf> = None;
-        let mut policy_json: Option<String> = None;
-        let mut own_cwd: Option<String> = None;
-        let mut timezone: Option<String> = None;
-        let mut cursor = None;
-        let mut source = None;
-        let mut id = None;
-        let mut href = None;
+/// 플래그 루프가 읽은 그대로의 값. 기본값 채우기와 정책 해석은
+/// [`SessionReadCliFlags::resolve`]가 맡아, 인자를 읽는 일과 없는 값을 메우는 일이
+/// 한 함수에 겹치지 않게 한다.
+#[derive(Default)]
+struct SessionReadCliFlags {
+    app_data_dir: Option<PathBuf>,
+    policy_json: Option<String>,
+    own_cwd: Option<String>,
+    timezone: Option<String>,
+    cursor: Option<String>,
+    source: Option<ProviderId>,
+    id: Option<String>,
+    href: Option<String>,
+}
+
+impl SessionReadCliFlags {
+    fn collect(mut args: impl Iterator<Item = String>) -> Result<Self, CoreError> {
+        let mut flags = Self::default();
         while let Some(flag) = args.next() {
             match flag.as_str() {
                 "--app-data-dir" => {
-                    app_data_dir = Some(PathBuf::from(
-                        args.next().ok_or_else(|| cli_missing("--app-data-dir"))?,
-                    ));
+                    flags.app_data_dir = Some(PathBuf::from(cli_value(&mut args, &flag)?));
                 }
-                "--policy" => {
-                    policy_json = Some(args.next().ok_or_else(|| cli_missing("--policy"))?);
-                }
+                "--policy" => flags.policy_json = Some(cli_value(&mut args, &flag)?),
                 "--policy-file" => {
-                    let path = args.next().ok_or_else(|| cli_missing("--policy-file"))?;
-                    policy_json = Some(std::fs::read_to_string(&path).map_err(|error| {
+                    let path = cli_value(&mut args, &flag)?;
+                    flags.policy_json = Some(std::fs::read_to_string(&path).map_err(|error| {
                         CoreError::InvalidInput(format!(
                             "{path} 정책 파일을 읽지 못했습니다: {error}"
                         ))
                     })?);
                 }
-                "--own-cwd" => {
-                    own_cwd = Some(args.next().ok_or_else(|| cli_missing("--own-cwd"))?);
-                }
-                "--timezone" => {
-                    timezone = Some(args.next().ok_or_else(|| cli_missing("--timezone"))?);
-                }
-                "--cursor" => {
-                    cursor = Some(args.next().ok_or_else(|| cli_missing("--cursor"))?);
-                }
+                "--own-cwd" => flags.own_cwd = Some(cli_value(&mut args, &flag)?),
+                "--timezone" => flags.timezone = Some(cli_value(&mut args, &flag)?),
+                "--cursor" => flags.cursor = Some(cli_value(&mut args, &flag)?),
                 "--source" => {
-                    source = Some(cli_parse_source(
-                        &args.next().ok_or_else(|| cli_missing("--source"))?,
-                    )?);
+                    flags.source = Some(cli_parse_source(&cli_value(&mut args, &flag)?)?);
                 }
-                "--id" => {
-                    id = Some(args.next().ok_or_else(|| cli_missing("--id"))?);
-                }
-                "--href" => {
-                    href = Some(args.next().ok_or_else(|| cli_missing("--href"))?);
-                }
+                "--id" => flags.id = Some(cli_value(&mut args, &flag)?),
+                "--href" => flags.href = Some(cli_value(&mut args, &flag)?),
                 other => {
                     return Err(CoreError::InvalidInput(format!(
                         "알 수 없는 인자입니다: {other}"
@@ -1564,9 +1345,13 @@ impl SessionReadCliOptions {
                 }
             }
         }
+        Ok(flags)
+    }
+
+    fn resolve(self, op: SessionReadCliOp) -> Result<SessionReadCliOptions, CoreError> {
         // 정책을 생략하면 기본값(꺼짐)이 되어 아무것도 읽지 못한다. 조용히 빈 결과를
         // 주는 대신 무엇을 줘야 하는지 말한다.
-        let policy_json = policy_json.ok_or_else(|| {
+        let policy_json = self.policy_json.ok_or_else(|| {
             CoreError::InvalidInput(
                 "--policy 또는 --policy-file로 조회 정책을 주세요. 예: --policy '{\"enabled\":true,\"projectScope\":\"allRegistered\",\"period\":{\"kind\":\"relative\",\"unit\":\"week\",\"count\":1}}'"
                     .to_owned(),
@@ -1575,20 +1360,35 @@ impl SessionReadCliOptions {
         let policy: SessionReadPolicy = serde_json::from_str(&policy_json).map_err(|error| {
             CoreError::InvalidInput(format!("조회 정책 JSON이 올바르지 않습니다: {error}"))
         })?;
-        Ok(Self {
+        Ok(SessionReadCliOptions {
             op,
-            app_data_dir: match app_data_dir {
+            app_data_dir: match self.app_data_dir {
                 Some(path) => path,
                 None => crate::remote::default_app_data_dir().map_err(CoreError::InvalidInput)?,
             },
             policy: normalize_policy(policy)?,
-            own_cwd: own_cwd.unwrap_or_default(),
-            timezone: timezone.unwrap_or_else(|| "UTC".to_owned()),
-            cursor,
-            source,
-            id,
-            href,
+            own_cwd: self.own_cwd.unwrap_or_default(),
+            timezone: self.timezone.unwrap_or_else(|| "UTC".to_owned()),
+            cursor: self.cursor,
+            source: self.source,
+            id: self.id,
+            href: self.href,
         })
+    }
+}
+
+impl SessionReadCliOptions {
+    fn from_args(mut args: impl Iterator<Item = String>) -> Result<Self, CoreError> {
+        let op: SessionReadCliOp = args
+            .next()
+            .ok_or_else(|| {
+                CoreError::InvalidInput(
+                    "sessions 다음에 작업이 필요합니다: statistics|list|detail|linked-file"
+                        .to_owned(),
+                )
+            })?
+            .parse()?;
+        SessionReadCliFlags::collect(args)?.resolve(op)
     }
 }
 
@@ -1653,6 +1453,21 @@ fn run_session_read_cli_op(options: &SessionReadCliOptions) -> Result<Value, Cor
     }
 }
 
+/// 해석된 읽기 정책이 세션 조회에 거는 범위. 목록과 통계가 같은 범위를 봐야
+/// 두 화면의 수치가 맞으므로 한 자리에서 만든다. `source`·`cwd` 단수 축은 CLI
+/// 경로가 쓰지 않는다 — 정책이 허용한 집합만 그대로 넘긴다.
+fn policy_scope_filters(policy: &ResolvedSessionRead) -> SessionScopeFilters {
+    SessionScopeFilters {
+        source: None,
+        cwd: None,
+        sources: policy.sources.clone(),
+        cwds: policy.cwds.clone(),
+        statuses: policy.statuses.clone(),
+        from: Some(policy.from),
+        to: Some(policy.to),
+    }
+}
+
 fn cli_statistics(
     catalog: &SessionCatalog,
     chats: &ChatSupervisor,
@@ -1661,20 +1476,14 @@ fn cli_statistics(
     if policy.cwds.is_empty() {
         return Ok(envelope(
             policy,
-            json!({"unavailableReason": "조회할 등록 프로젝트가 없습니다"}),
+            json!({ "unavailableReason": CLI_NO_PROJECT_REASON }),
         ));
     }
     let response = crate::get_session_statistics(
         catalog,
         chats,
         SessionStatisticsRequest {
-            source: None,
-            cwd: None,
-            sources: policy.sources.clone(),
-            cwds: policy.cwds.clone(),
-            statuses: policy.statuses.clone(),
-            from: Some(policy.from),
-            to: Some(policy.to),
+            scope: policy_scope_filters(policy),
         },
     )?;
     let mut value = serde_json::to_value(response)?;
@@ -1694,7 +1503,7 @@ fn cli_list(
             json!({
                 "items": [],
                 "nextCursor": null,
-                "unavailableReason": "조회할 등록 프로젝트가 없습니다"
+                "unavailableReason": CLI_NO_PROJECT_REASON
             }),
         ));
     }
@@ -1703,19 +1512,14 @@ fn cli_list(
         catalog,
         chats,
         SessionListRequest {
-            source: None,
-            cwd: None,
-            sources: policy.sources.clone(),
-            cwds: policy.cwds.clone(),
-            statuses: policy.statuses.clone(),
-            from: Some(policy.from),
-            to: Some(policy.to),
+            scope: policy_scope_filters(policy),
             status: None,
             search: None,
             sort: crate::SessionSortField::UpdatedAt,
             direction: crate::SortDirection::Desc,
             cursor,
             limit: Some(limit),
+            unfiled: false,
         },
     )?;
     let mut value = json!({
@@ -1749,43 +1553,34 @@ fn cli_assert_in_scope(
     Ok(())
 }
 
-fn cli_detail(
-    options: &SessionReadCliOptions,
-    _catalog: &SessionCatalog,
-    chats: &ChatSupervisor,
+/// 대상 세션을 가리키는 `--source`·`--id` 한 쌍. 원문 조회와 연결 파일 조회가 같은
+/// 짝을 요구하므로 빠진 플래그 문구가 두 자리에서 어긋나지 않게 여기서 한 번만 만든다.
+fn cli_session_ref(options: &SessionReadCliOptions) -> Result<(ProviderId, String), CoreError> {
+    Ok((
+        cli_required(options.source, options.op, "--source")?,
+        cli_required(options.id.clone(), options.op, "--id")?,
+    ))
+}
+
+/// 정책 예산 안에서 고른 원문 항목과, 범위에 맞지만 예산에 밀린 항목이 있었는지.
+struct BudgetedTranscript {
+    items: Vec<Value>,
+    /// 참이면 다음 쪽 커서 대신 예산 소진을 알린다 — 남은 항목은 이 쪽 안에 있다.
+    truncated: bool,
+}
+
+/// 상세 수준이 허용한 갈래만 남기고 세션당 턴 수 예산까지 자른다. 거르기와 자르기를
+/// 한 번에 돌리는 이유는 예산에 밀린 항목도 "범위에는 맞았다"고 세어야 `truncated`가
+/// 다음 쪽이 아니라 예산 소진을 가리키기 때문이다.
+fn budgeted_transcript_items(
+    page_items: &[ManagedTranscriptItem],
     policy: &ResolvedSessionRead,
-) -> Result<Value, CoreError> {
-    let source = options
-        .source
-        .ok_or_else(|| CoreError::InvalidInput("detail에는 --source가 필요합니다".to_owned()))?;
-    let id = options
-        .id
-        .clone()
-        .ok_or_else(|| CoreError::InvalidInput("detail에는 --id가 필요합니다".to_owned()))?;
-    let page = crate::get_session_transcript_page(
-        &options.app_data_dir,
-        chats,
-        SessionTranscriptPageRequest {
-            source,
-            id: id.clone(),
-            cursor: options.cursor.clone(),
-            page_size: Some(policy.page_size as usize),
-            from: Some(policy.from),
-            to: Some(policy.to),
-            turn_start: None,
-            turn_end: None,
-        },
-    )?;
-    cli_assert_in_scope(
-        policy,
-        page.session_summary.source,
-        page.session_summary.cwd.as_deref(),
-    )?;
+) -> BudgetedTranscript {
     let allowed = allowed_categories(policy.detail);
     let cap = policy.max_turns_per_session as usize;
     let mut items = Vec::new();
     let mut matched = 0usize;
-    for item in &page.items {
+    for item in page_items {
         if !allowed.contains(&category_key(item.category)) {
             continue;
         }
@@ -1799,20 +1594,52 @@ fn cli_detail(
             "role": item.role,
             "timestamp": item.timestamp,
             "typeLabel": item.type_label,
-            "content": untrusted_block(&redact(
-                &truncate_chars(&item_text(item, policy.detail), detail_text_cap(policy.detail)),
-                policy.redaction,
-            )),
+            "content": cli_untrusted_text(
+                &item_text(item, policy.detail),
+                detail_text_cap(policy.detail),
+                policy,
+            ),
         }));
     }
     let truncated = matched > items.len();
+    BudgetedTranscript { items, truncated }
+}
+
+fn cli_detail(
+    options: &SessionReadCliOptions,
+    _catalog: &SessionCatalog,
+    chats: &ChatSupervisor,
+    policy: &ResolvedSessionRead,
+) -> Result<Value, CoreError> {
+    let (source, id) = cli_session_ref(options)?;
+    let page = crate::get_session_transcript_page(
+        &options.app_data_dir,
+        chats,
+        SessionTranscriptPageRequest {
+            source,
+            id,
+            cursor: options.cursor.clone(),
+            page_size: Some(policy.page_size as usize),
+            from: Some(policy.from),
+            to: Some(policy.to),
+            turn_start: None,
+            turn_end: None,
+        },
+    )?;
+    cli_assert_in_scope(
+        policy,
+        page.session_summary.source,
+        page.session_summary.cwd.as_deref(),
+    )?;
+    let budgeted = budgeted_transcript_items(&page.items, policy);
+    let truncated = budgeted.truncated;
     let mut summary = serde_json::to_value(&page.session_summary)?;
     redact_value(&mut summary, policy.redaction);
     Ok(envelope(
         policy,
         json!({
             "session": summary,
-            "items": items,
+            "items": budgeted.items,
             "nextCursor": if truncated { Value::Null } else { serde_json::to_value(&page.next_cursor)? },
             "totalMatching": page.total_matching,
             "detailLevel": policy.detail,
@@ -1835,17 +1662,8 @@ fn cli_linked_file(
             "이 정책은 연결 파일 조회를 허용하지 않습니다".to_owned(),
         ));
     }
-    let source = options.source.ok_or_else(|| {
-        CoreError::InvalidInput("linked-file에는 --source가 필요합니다".to_owned())
-    })?;
-    let id = options
-        .id
-        .clone()
-        .ok_or_else(|| CoreError::InvalidInput("linked-file에는 --id가 필요합니다".to_owned()))?;
-    let href = options
-        .href
-        .clone()
-        .ok_or_else(|| CoreError::InvalidInput("linked-file에는 --href가 필요합니다".to_owned()))?;
+    let (source, id) = cli_session_ref(options)?;
+    let href = cli_required(options.href.clone(), options.op, "--href")?;
     let summary = catalog.session_summary(source, &id)?;
     cli_assert_in_scope(policy, summary.source, summary.cwd.as_deref())?;
     let file = catalog.linked_file(source, &id, &href)?;
@@ -1855,10 +1673,7 @@ fn cli_linked_file(
             "relativePath": file.relative_path,
             "sizeBytes": file.size_bytes,
             "targetLine": file.target_line,
-            "content": untrusted_block(&redact(
-                &truncate_chars(&file.content, MAX_LINKED_FILE_CHARS),
-                policy.redaction,
-            )),
+            "content": cli_untrusted_text(&file.content, MAX_LINKED_FILE_CHARS, policy),
         }),
     ))
 }
@@ -2515,9 +2330,7 @@ mod tests {
 
         // 헬퍼 메서드 검증
         assert!(SessionReadOrigin::Aia.is_aia());
-        assert!(!SessionReadOrigin::Aia.is_manual());
         assert!(!SessionReadOrigin::Manual.is_aia());
-        assert!(SessionReadOrigin::Manual.is_manual());
     }
 
     #[test]
@@ -2549,14 +2362,12 @@ mod tests {
         ));
 
         // 헬퍼 메서드 검증
-        assert!(SessionReadActor::User.is_user());
         assert!(!SessionReadActor::User.is_aia());
         assert_eq!(
             SessionReadActor::User.default_origin(),
             SessionReadOrigin::Manual
         );
 
-        assert!(!SessionReadActor::Aia.is_user());
         assert!(SessionReadActor::Aia.is_aia());
         assert_eq!(
             SessionReadActor::Aia.default_origin(),
@@ -2608,17 +2419,6 @@ mod tests {
         ));
 
         // 헬퍼 메서드 검증
-        assert!(SessionReadProjectScope::ScheduleCwd.is_schedule_cwd());
-        assert!(!SessionReadProjectScope::ScheduleCwd.is_selected());
-        assert!(!SessionReadProjectScope::ScheduleCwd.is_all_registered());
-
-        assert!(!SessionReadProjectScope::Selected.is_schedule_cwd());
-        assert!(SessionReadProjectScope::Selected.is_selected());
-        assert!(!SessionReadProjectScope::Selected.is_all_registered());
-
-        assert!(!SessionReadProjectScope::AllRegistered.is_schedule_cwd());
-        assert!(!SessionReadProjectScope::AllRegistered.is_selected());
-        assert!(SessionReadProjectScope::AllRegistered.is_all_registered());
     }
 
     #[test]
@@ -2663,17 +2463,6 @@ mod tests {
         ));
 
         // 헬퍼 메서드 검증
-        assert!(SessionReadDetail::Summary.is_summary());
-        assert!(!SessionReadDetail::Summary.is_work_rationale());
-        assert!(!SessionReadDetail::Summary.is_limited_transcript());
-
-        assert!(!SessionReadDetail::WorkRationale.is_summary());
-        assert!(SessionReadDetail::WorkRationale.is_work_rationale());
-        assert!(!SessionReadDetail::WorkRationale.is_limited_transcript());
-
-        assert!(!SessionReadDetail::LimitedTranscript.is_summary());
-        assert!(!SessionReadDetail::LimitedTranscript.is_work_rationale());
-        assert!(SessionReadDetail::LimitedTranscript.is_limited_transcript());
     }
 
     #[test]
@@ -2711,10 +2500,6 @@ mod tests {
         ));
 
         // 헬퍼 메서드 검증
-        assert!(SessionReadRedaction::Credentials.is_credentials());
-        assert!(!SessionReadRedaction::Credentials.is_strict());
-        assert!(!SessionReadRedaction::Strict.is_credentials());
-        assert!(SessionReadRedaction::Strict.is_strict());
     }
 
     #[test]
@@ -2757,17 +2542,6 @@ mod tests {
         ));
 
         // 헬퍼 메서드 검증
-        assert!(SessionReadRelativeUnit::Day.is_day());
-        assert!(!SessionReadRelativeUnit::Day.is_week());
-        assert!(!SessionReadRelativeUnit::Day.is_month());
-
-        assert!(!SessionReadRelativeUnit::Week.is_day());
-        assert!(SessionReadRelativeUnit::Week.is_week());
-        assert!(!SessionReadRelativeUnit::Week.is_month());
-
-        assert!(!SessionReadRelativeUnit::Month.is_day());
-        assert!(!SessionReadRelativeUnit::Month.is_week());
-        assert!(SessionReadRelativeUnit::Month.is_month());
     }
 
     #[test]
@@ -2784,7 +2558,6 @@ mod tests {
         for op in SessionReadCliOp::ALL {
             assert_eq!(op.to_string(), op.as_str());
             assert_eq!(op.as_str().parse::<SessionReadCliOp>().unwrap(), op);
-            assert_eq!(SessionReadCliOp::parse(op.as_str()).unwrap(), op);
         }
         assert_eq!(
             "  statistics  ".parse::<SessionReadCliOp>().unwrap(),

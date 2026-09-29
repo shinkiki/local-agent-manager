@@ -58,3 +58,16 @@ test("handoff context retains the newest text within the size limit", () => {
   assert.ok(context.length <= 24_000);
   assert.match(context, /newest-answer$/);
 });
+
+test("handoff context spends the budget on the separator before truncating the older turn", () => {
+  const newest = `에이전트:\n${"b".repeat(100)}`;
+  const context = sessionHandoffContext([
+    item("user", "a".repeat(30_000)),
+    item("assistant", "b".repeat(100)),
+  ]);
+
+  // 최신 항목은 통째로, 그 앞 항목은 구분자 몫(2자)을 뺀 나머지에 꼭 맞게 잘려 들어간다.
+  assert.equal(context.length, 24_000);
+  assert.equal(context.endsWith(`\n\n${newest}`), true);
+  assert.equal(context.slice(0, 24_000 - newest.length - 2), `…${"a".repeat(24_000 - newest.length - 3)}`);
+});

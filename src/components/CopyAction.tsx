@@ -3,7 +3,7 @@ import { Check, Copy, TriangleAlert } from "lucide-react";
 import { writeClipboardText } from "../lib/clipboard";
 import { useI18n } from "../lib/i18n";
 
-type CopyKind = "response" | "section" | "code" | "path";
+type CopyKind = "response" | "section" | "code" | "path" | "link";
 type CopyState = "idle" | "copying" | "copied" | "failed";
 
 export function CopyAction({
@@ -30,7 +30,9 @@ export function CopyAction({
       ? text("섹션 복사", "Copy section")
       : kind === "path"
         ? text("경로 복사", "Copy path")
-        : text("코드 복사", "Copy code");
+        : kind === "link"
+          ? text("주소 복사", "Copy address")
+          : text("코드 복사", "Copy code");
   const stateLabel = state === "copied"
     ? text("복사됨", "Copied")
     : state === "failed"

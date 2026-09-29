@@ -9,8 +9,10 @@ import {
   workflowInputEntries,
   workflowInputsFromArguments,
   workflowModelInputChoices,
-  workflowModelInputProvider,
+  workflowModelInputIsMultiple,
 } from "./scheduleWorkflow.ts";
+// 이 이름은 예약 쪽 창구에 없다 — 입력 어휘를 직접 묻는 유일한 호출부라 제 모듈에서 가져온다.
+import { workflowModelInputProvider } from "./scheduleWorkflowInputs.ts";
 
 const field = (type, required = true, values = null) => ({ type, required, values, description: null });
 
@@ -125,13 +127,22 @@ test("paced model inputs use provider catalogs and store model IDs instead of di
     workflowModelInputProvider("claudeModel"),
     workflowModelInputProvider("codexModel"),
     workflowModelInputProvider("antigravityModel"),
-  ], ["claude", "codex", "antigravity"]);
+    workflowModelInputProvider("localModel"),
+  ], ["claude", "codex", "antigravity", "local"]);
   assert.equal(workflowModelInputProvider("message"), null);
   assert.deepEqual(workflowModelInputChoices("antigravityModel", catalogs), [{
     value: "gemini-3.8-flash-high",
     label: "Gemini 3.8 Flash (High) · gemini-3.8-flash-high",
   }]);
   assert.equal(workflowModelInputChoices("message", catalogs), null);
+
+  // 로컬만 여럿을 고른다. 사용량 한도가 없어 계정 여력으로 건수를 정할 수 없고,
+  // 참여할 모델을 직접 골라 모델마다 한 건씩 세우기 때문이다.
+  assert.equal(workflowModelInputIsMultiple("localModels"), true);
+  assert.equal(workflowModelInputProvider("localModels"), "local");
+  assert.equal(workflowModelInputIsMultiple("localModel"), false);
+  assert.equal(workflowModelInputIsMultiple("codexModel"), false);
+  assert.equal(workflowModelInputIsMultiple("message"), false);
 
   const schema = [["antigravityModel", {
     ...field("string", false),

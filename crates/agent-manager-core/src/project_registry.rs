@@ -20,19 +20,25 @@ pub(crate) struct ProjectPolicy {
 }
 
 impl ProjectPolicy {
-    fn is_excluded(&self, canonical: Option<&Path>, raw: &str) -> bool {
-        canonical.is_some_and(|path| self.excluded.contains(path))
-            || self.excluded.contains(Path::new(raw))
+    fn contains_path(paths: &BTreeSet<PathBuf>, canonical: Option<&Path>, raw: &str) -> bool {
+        canonical.is_some_and(|path| paths.contains(path)) || paths.contains(Path::new(raw))
     }
 
-    fn is_pending(&self, canonical: Option<&Path>, raw: &str) -> bool {
-        let Some(known) = self.known.as_ref() else {
-            return false;
-        };
+    fn is_excluded(&self, canonical: Option<&Path>, raw: &str) -> bool {
+        Self::contains_path(&self.excluded, canonical, raw)
+    }
+
+    /// 경로의 활성 여부(`active`)와 신규 감지 대기 여부(`pending`)를 판정한다.
+    /// 제외된 프로젝트는 즉시 비활성이며 결정 대기가 될 수 없다.
+    fn evaluate_status(&self, canonical: Option<&Path>, raw: &str) -> (bool, bool) {
         if self.is_excluded(canonical, raw) {
-            return false;
+            return (false, false);
         }
-        !(canonical.is_some_and(|path| known.contains(path)) || known.contains(Path::new(raw)))
+        let pending = self
+            .known
+            .as_ref()
+            .is_some_and(|known| !Self::contains_path(known, canonical, raw));
+        (true, pending)
     }
 }
 
@@ -43,11 +49,20 @@ pub(crate) struct ProjectPathResolver {
 }
 
 impl ProjectPathResolver {
-    pub(crate) fn canonical(&mut self, cwd: &str) -> Option<PathBuf> {
-        self.memo
-            .entry(cwd.to_owned())
-            .or_insert_with(|| fs::canonicalize(cwd).ok())
-            .clone()
+    /// 캐시에 정규화 결과를 한 번만 채우고 그 경로를 빌려준다. 호출할 때마다 cwd 키와
+    /// 정규 경로를 다시 소유하게 하면 같은 cwd를 공유하는 세션 수만큼 복제가 생긴다.
+    fn canonical(&mut self, cwd: &str) -> Option<&Path> {
+        if !self.memo.contains_key(cwd) {
+            self.memo.insert(cwd.to_owned(), fs::canonicalize(cwd).ok());
+        }
+        self.memo.get(cwd).and_then(Option::as_deref)
+    }
+
+    /// 정규화 성공 시 정규 경로를, 실패 시 원문 경로를 키로 돌려준다.
+    pub(crate) fn resolve_key(&mut self, cwd: &str) -> PathBuf {
+        self.canonical(cwd)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(cwd))
     }
 
     /// 제외 프로젝트의 세션인지. cwd가 없는 세션은 프로젝트에 속하지 않으므로 남긴다.
@@ -55,8 +70,7 @@ impl ProjectPathResolver {
         let Some(cwd) = session.cwd.as_deref() else {
             return false;
         };
-        let canonical = self.canonical(cwd);
-        policy.is_excluded(canonical.as_deref(), cwd)
+        policy.is_excluded(self.canonical(cwd), cwd)
     }
 }
 
@@ -73,12 +87,22 @@ struct ProjectAccumulator {
 impl ProjectAccumulator {
     /// 세션 정보를 읽어 프로젝트 집계 상태에 반영한다.
     fn record_session(&mut self, session: &SessionSummary, cwd: &str) {
+        self.record_identity(session, cwd);
+        self.record_activity(session);
+    }
+
+    /// 첫 세션에서 표시용 원문 경로와 프로젝트 이름을 채운다.
+    fn record_identity(&mut self, session: &SessionSummary, cwd: &str) {
         if self.raw.is_empty() {
             self.raw = cwd.to_owned();
         }
         if self.name.is_none() {
             self.name = session.project.clone().filter(|name| !name.is_empty());
         }
+    }
+
+    /// 세션 가시성·최근 시각·공급자를 프로젝트 활동 집계에 반영한다.
+    fn record_activity(&mut self, session: &SessionSummary) {
         if session.meta.hidden {
             self.hidden_session_count += 1;
         } else {
@@ -95,20 +119,20 @@ impl ProjectAccumulator {
 
     /// 집계된 상태와 정책 판정을 바탕으로 최종 등록부 항목을 만든다.
     fn into_entry(self, path: PathBuf, policy: &ProjectPolicy) -> ProjectRegistryEntry {
+        let path_str = path.to_string_lossy().into_owned();
         let raw = if self.raw.is_empty() {
-            path.to_string_lossy().into_owned()
+            path_str.clone()
         } else {
             self.raw
         };
         let name = self
             .name
             .or_else(|| display_file_name(&path))
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        let active = !policy.is_excluded(Some(&path), &raw);
-        let pending = policy.is_pending(Some(&path), &raw);
+            .unwrap_or_else(|| path_str.clone());
+        let (active, pending) = policy.evaluate_status(Some(&path), &raw);
         ProjectRegistryEntry {
             exists: path.is_dir(),
-            path: path.to_string_lossy().into_owned(),
+            path: path_str,
             name,
             session_count: self.session_count,
             hidden_session_count: self.hidden_session_count,
@@ -136,9 +160,7 @@ pub(crate) fn build_project_registry(
         let Some(cwd) = session.cwd.as_deref() else {
             continue;
         };
-        let key = resolver
-            .canonical(cwd)
-            .unwrap_or_else(|| PathBuf::from(cwd));
+        let key = resolver.resolve_key(cwd);
         projects
             .entry(key)
             .or_default()
@@ -192,6 +214,7 @@ mod tests {
             git_branch: None,
             is_subagent: false,
             aia_workspace: false,
+            default_workspace: false,
             archived: false,
             readable: true,
             size_bytes: None,
@@ -354,5 +377,49 @@ mod tests {
             .expect("fresh");
         assert!(!fresh.pending);
         assert!(!fresh.active);
+    }
+
+    #[test]
+    fn evaluate_status_and_resolve_key() {
+        let root = tempfile::tempdir().expect("temp");
+        let proj = root.path().join("proj");
+        fs::create_dir_all(&proj).expect("proj");
+        let canonical = fs::canonicalize(&proj).expect("canonical");
+        let raw_str = proj.to_string_lossy();
+
+        // 1. 시드 전 정책: 활성이며 결정 대기 아님
+        let unseeded = policy(&[], None);
+        assert_eq!(
+            unseeded.evaluate_status(Some(&canonical), &raw_str),
+            (true, false)
+        );
+
+        // 2. 이미 알려진 프로젝트: 활성이며 결정 대기 아님
+        let seeded = policy(&[], Some(&[&canonical]));
+        assert_eq!(
+            seeded.evaluate_status(Some(&canonical), &raw_str),
+            (true, false)
+        );
+
+        // 3. 새로 발견된 프로젝트: 활성이며 결정 대기
+        let other = root.path().join("other");
+        assert_eq!(seeded.evaluate_status(Some(&other), "other"), (true, true));
+
+        // 4. 제외된 프로젝트: 비활성이며 결정 대기 아님
+        let excluded = policy(&[&canonical], Some(&[&canonical]));
+        assert_eq!(
+            excluded.evaluate_status(Some(&canonical), &raw_str),
+            (false, false)
+        );
+
+        // 5. resolver resolve_key: 존재하는 디렉터리는 정규 경로, 존재하지 않으면 원문 경로
+        let mut resolver = ProjectPathResolver::default();
+        assert_eq!(resolver.resolve_key(&raw_str), canonical);
+        let nonexistent = root.path().join("nonexistent");
+        let non_str = nonexistent.to_string_lossy();
+        assert_eq!(
+            resolver.resolve_key(&non_str),
+            PathBuf::from(non_str.as_ref())
+        );
     }
 }

@@ -1,4 +1,4 @@
-import { getWebAccessStatus, type WebAccessStatus } from "./ipc";
+import { getWebAccessStatus, type WebAccessStatus } from "./ipc.ts";
 
 const REMOTE_WRITE_DISABLED_MESSAGE =
   "원격 편집이 꺼져 있어 채팅 세션을 시작할 수 없습니다. 호스트의 설정 → 백엔드 서비스에서 원격 편집 허용을 켠 뒤 다시 시도하세요.";

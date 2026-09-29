@@ -1,14 +1,24 @@
 import type { QuietHours } from "../types";
+import type { UiText } from "./i18nLocale.ts";
+import { phraseText, type TranslatedPhrase } from "./phrase.ts";
 
 /**
  * 페이싱 스케줄 — 페이싱을 멈출 시간대와 그 시간대를 적용할 요일. 회차의 소비 수치를
  * 다루는 `pacingSummary`와 붙어 있었지만 둘은 공유하는 값이 없다. 여기 있는 것은 저장된
  * 스케줄을 읽고 사람이 읽을 한 줄로 줄이는 규칙뿐이고, 그 규칙을 고칠 때 소진율 계산의
  * 경계 조건(참여 계정·회당 소비)을 함께 읽을 필요가 없도록 파일을 나눠 둔다.
+ *
+ * 언어를 고르는 손잡이는 `UiText`라는 정본 이름으로 받는다. 같은 모양을 파일마다 제
+ * 이름(`Text`)으로 다시 적으면 손잡이에 칸이 생기는 날 그 자리를 하나씩 세어 찾아야 한다.
  */
 
-type Text = (ko: string, en: string) => string;
-const identity: Text = (ko) => ko;
+/** 언어를 고르지 않는 자리(백엔드에 넘길 값·시험)의 기본 손잡이. */
+const identity: UiText = (ko) => ko;
+
+interface SelectedWeekday {
+  day: number;
+  position: number;
+}
 
 /**
  * 요일 정본 표. 인덱스가 그대로 요일 번호(0=일…6=토)이고, 한 줄이 그 요일의 한글·영문
@@ -19,15 +29,25 @@ const identity: Text = (ko) => ko;
  * 두 이름 배열은 서로 같은 자리에 같은 요일이 있어야만 맞는데 그 짝은 어디에도 적혀 있지
  * 않았고, 나머지 둘은 개수를 손으로 다시 적은 것이다. 한 줄이 한 요일을 통째로 들고 있으면
  * 한글만 고쳐 영문이 어긋나거나, 목록만 늘려 "매일"이 영원히 뜨지 않는 일이 생기지 않는다.
+ *
+ * 한 줄의 모양은 두 언어 표기의 정본(`phrase`)을 그대로 쓴다 — 도움말 문구·팝아웃 제목도
+ * 같은 모양이고, 지금 언어로 푸는 규칙도 그 정본 한 벌을 탄다.
+ *
+ * 약칭(`en`) 옆에 전체 이름(`long`)도 같은 줄에 둔다 — 요약 칸은 약칭을, 선택 칸은 전체
+ * 이름을 쓰는데 둘을 다른 표에 두면 막으려던 짝 어긋남이 그대로 되돌아온다.
  */
-const WEEKDAYS: readonly { ko: string; en: string }[] = [
-  { ko: "일", en: "Sun" },
-  { ko: "월", en: "Mon" },
-  { ko: "화", en: "Tue" },
-  { ko: "수", en: "Wed" },
-  { ko: "목", en: "Thu" },
-  { ko: "금", en: "Fri" },
-  { ko: "토", en: "Sat" },
+interface WeekdayName extends TranslatedPhrase {
+  long: string;
+}
+
+const WEEKDAYS: readonly WeekdayName[] = [
+  { ko: "일", en: "Sun", long: "Sunday" },
+  { ko: "월", en: "Mon", long: "Monday" },
+  { ko: "화", en: "Tue", long: "Tuesday" },
+  { ko: "수", en: "Wed", long: "Wednesday" },
+  { ko: "목", en: "Thu", long: "Thursday" },
+  { ko: "금", en: "Fri", long: "Friday" },
+  { ko: "토", en: "Sat", long: "Saturday" },
 ];
 
 /**
@@ -39,7 +59,26 @@ export const WEEKDAY_NAMES: readonly string[] = WEEKDAYS.map((weekday) => weekda
 export const WEEKDAY_NAMES_EN: readonly string[] = WEEKDAYS.map((weekday) => weekday.en);
 
 /** 전체 요일 번호를 번호순으로. 저장값이 없을 때의 "매일"이 이 목록 그대로 나간다. */
-const ALL_WEEKDAYS: readonly number[] = WEEKDAYS.map((_, day) => day);
+export const ALL_WEEKDAYS: readonly number[] = WEEKDAYS.map((_, day) => day);
+
+/**
+ * 요일 하나의 표시 이름. 두 언어를 정본 표의 **같은 줄**에서 함께 꺼낸다 — 화면에 넘길
+ * 두 배열(`WEEKDAY_NAMES`·`WEEKDAY_NAMES_EN`)을 인덱스로 각각 읽으면, 표를 한 줄로 묶어
+ * 막으려던 짝 어긋남이 이 파일 안에서 다시 열린다.
+ */
+function weekdayName(day: number, text: UiText): string {
+  return phraseText(WEEKDAYS[day], text);
+}
+
+/**
+ * 요일 선택 칸의 항목 이름. 한국어는 "일요일", 영어는 요일 전체 이름 — 요약 칸의 약칭과
+ * 달리 한 칸에 한 요일만 서므로 줄여 쓸 이유가 없다. 이름은 여기서도 정본 표의 같은 줄에서
+ * 꺼낸다.
+ */
+export function weekdayChoiceLabel(day: number, text: UiText): string {
+  const weekday = WEEKDAYS[day];
+  return text(`${weekday.ko}요일`, weekday.long);
+}
 
 /** 저장된 스케줄이 없을 때의 초안: 꺼진 채 평일 09:00~18:00(근무 시간을 막는 흔한 예). */
 export function defaultQuietHours(timezone: string): QuietHours {
@@ -53,22 +92,23 @@ export function quietWeekdays(hours: Pick<QuietHours, "weekdays"> | null | undef
 }
 
 /** 요일 집합을 월~일 순서로 요약: 전부면 "매일", 연속 구간이면 "월~금", 그 밖은 "월·수·금". */
-export function describeWeekdays(weekdays: readonly number[], text: Text = identity): string {
+export function describeWeekdays(weekdays: readonly number[], text: UiText = identity): string {
   // 표시 순서를 한 번만 훑고 그 자리(position)를 함께 들고 나온다. 연속 구간 판정이 자리를
   // indexOf로 다시 찾지 않아, 순서 표를 두 번 읽으며 어긋날 자리가 없다.
-  const checked = WEEKDAY_ORDER
+  const checked: SelectedWeekday[] = WEEKDAY_ORDER
     .map((day, position) => ({ day, position }))
     .filter((entry) => weekdays.includes(entry.day));
   if (checked.length === WEEKDAYS.length) return text("매일", "every day");
-  const name = (entry: { day: number }) => text(WEEKDAY_NAMES[entry.day], WEEKDAY_NAMES_EN[entry.day]);
   const contiguous = checked.length >= 3
     && checked.every((entry, index) => index === 0 || entry.position === checked[index - 1].position + 1);
-  if (contiguous) return `${name(checked[0])}~${name(checked[checked.length - 1])}`;
-  return checked.map(name).join("·");
+  if (contiguous) {
+    return `${weekdayName(checked[0].day, text)}~${weekdayName(checked[checked.length - 1].day, text)}`;
+  }
+  return checked.map((entry) => weekdayName(entry.day, text)).join("·");
 }
 
 /** 스케줄 요약 한 줄. 꺼져 있거나 없으면 null. 예: "제한 09:00~18:00 · 월~금". */
-export function describeQuietHours(hours: QuietHours | null | undefined, text: Text = identity): string | null {
+export function describeQuietHours(hours: QuietHours | null | undefined, text: UiText = identity): string | null {
   if (!hours?.enabled) return null;
   const days = describeWeekdays(quietWeekdays(hours), text);
   return text(`제한 ${hours.start}~${hours.end} · ${days}`, `Quiet ${hours.start}~${hours.end} · ${days}`);

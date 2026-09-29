@@ -1,6 +1,11 @@
 //! 세션 정리폴더 트리. 폴더 CRUD와 순서·단계·세션 수 계산을 한곳에 모아, 저장소
 //! 파일 입출력(`store`)과 폴더 트리 규칙을 갈라 둔다. 공개 함수는 `store`가 그대로
 //! 다시 내보내므로 호출부 경로(`store::create_session_folder` 등)는 그대로다.
+//!
+//! 실패는 [`crate::app_error`]의 코드화된 갈래로 낸다 — 이 모듈이 그 구조의 첫 전환
+//! 대상이다. 코드는 `SESSION_FOLDER_`로 시작하고, 문장에 끼워 넣는 값은 이름 붙은
+//! 파라미터로 나간다. 화면은 한국어가 아닐 때 코드로 자기 문구를 고른다
+//! (`src/lib/backendErrors.ts`).
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -9,12 +14,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::app_error::AppError;
 use crate::domain::SessionFolder;
 use crate::store::{load_metadata, with_metadata, with_metadata_changed, AppMetadata};
 use crate::CoreError;
 
 /// 정리폴더 트리에서 허용하는 최대 단계. 최상위가 1단계이므로 5단계까지 중첩된다.
 pub const MAX_SESSION_FOLDER_DEPTH: usize = 5;
+/// 폴더 이름의 최대 글자 수. 한도를 알리는 문구와 파라미터가 같은 값을 보도록 상수로 둔다.
+const MAX_SESSION_FOLDER_NAME_CHARS: usize = 80;
 
 pub fn list_session_folders(app_data_dir: &Path) -> Result<Vec<SessionFolder>, CoreError> {
     let metadata = load_metadata(app_data_dir)?;
@@ -75,15 +83,19 @@ pub fn update_session_folder(
                 None => None,
                 Some(parent_id) => {
                     if parent_id == id {
-                        return Err(CoreError::InvalidInput(
-                            "폴더를 자기 자신의 하위로 옮길 수 없습니다".to_owned(),
-                        ));
+                        return Err(AppError::invalid_input(
+                            "SESSION_FOLDER_PARENT_IS_SELF",
+                            "폴더를 자기 자신의 하위로 옮길 수 없습니다",
+                        )
+                        .into());
                     }
                     let subtree = folder_subtree(&metadata.folders, id);
                     if subtree.ids.iter().any(|descendant| descendant == parent_id) {
-                        return Err(CoreError::InvalidInput(
-                            "폴더를 자기 하위 폴더 아래로 옮길 수 없습니다".to_owned(),
-                        ));
+                        return Err(AppError::invalid_input(
+                            "SESSION_FOLDER_PARENT_IS_DESCENDANT",
+                            "폴더를 자기 하위 폴더 아래로 옮길 수 없습니다",
+                        )
+                        .into());
                     }
                     let parent_depth = folder_depth(&metadata.folders, parent_id)?;
                     ensure_folder_depth_fits(parent_depth, subtree.height)?;
@@ -129,23 +141,11 @@ pub enum FolderMoveDirection {
 }
 
 impl FolderMoveDirection {
-    pub const ALL: [Self; 2] = [Self::Up, Self::Down];
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Up => "up",
             Self::Down => "down",
         }
-    }
-
-    /// 위로 이동하는 방향인지 여부.
-    pub fn is_up(self) -> bool {
-        matches!(self, Self::Up)
-    }
-
-    /// 아래로 이동하는 방향인지 여부.
-    pub fn is_down(self) -> bool {
-        matches!(self, Self::Down)
     }
 
     /// 형제 순서(sort_order) 계산 시 적용할 상대 증분(Up: -1, Down: +1).
@@ -170,9 +170,12 @@ impl std::str::FromStr for FolderMoveDirection {
         match s.trim().to_ascii_lowercase().as_str() {
             "up" => Ok(Self::Up),
             "down" => Ok(Self::Down),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 폴더 이동 방향입니다: {s}. up|down 중 하나를 쓰세요"
-            ))),
+            _ => Err(AppError::invalid_input(
+                "SESSION_FOLDER_UNKNOWN_MOVE_DIRECTION",
+                format!("알 수 없는 폴더 이동 방향입니다: {s}. up|down 중 하나를 쓰세요"),
+            )
+            .with("direction", s)
+            .into()),
         }
     }
 }
@@ -212,13 +215,14 @@ pub fn delete_session_folder(app_data_dir: &Path, id: &str) -> Result<Vec<String
         ensure_folder_exists(&metadata.folders, id)?;
         let mut removed = vec![id.to_owned()];
         removed.extend(folder_subtree(&metadata.folders, id).ids);
+        let removed_ids = removed.iter().map(String::as_str).collect::<HashSet<_>>();
         metadata
             .folders
-            .retain(|folder| !removed.contains(&folder.id));
+            .retain(|folder| !removed_ids.contains(folder.id.as_str()));
         for session in metadata.sessions.values_mut() {
             session
                 .folder_ids
-                .retain(|folder_id| !removed.contains(folder_id));
+                .retain(|folder_id| !removed_ids.contains(folder_id.as_str()));
         }
         Ok(removed)
     })
@@ -347,7 +351,7 @@ fn folder_view(metadata: &AppMetadata, id: &str) -> Result<SessionFolder, CoreEr
 /// 한 곳만 고쳐도 문구가 갈라지므로 만드는 자리를 하나만 둔다. 어떤 ID를 못 찾았는지
 /// 함께 알리는 갈래(`folder_depth`·`update_session_meta`)는 문구가 다르므로 그대로 둔다.
 fn folder_not_found() -> CoreError {
-    CoreError::NotFound("세션 폴더를 찾을 수 없습니다".to_owned())
+    AppError::not_found("SESSION_FOLDER_NOT_FOUND", "세션 폴더를 찾을 수 없습니다").into()
 }
 
 /// ID로 폴더 하나를 찾는다. 없으면 [`folder_not_found`]로 실패한다.
@@ -386,9 +390,12 @@ fn normalize_folder_reference(value: Option<&str>) -> Option<&str> {
 /// 상위 폴더 단계와 옮길 하위 트리 높이를 더해 최대 단계를 넘지 않는지 확인한다.
 fn ensure_folder_depth_fits(parent_depth: usize, subtree_height: usize) -> Result<(), CoreError> {
     if parent_depth + subtree_height + 2 > MAX_SESSION_FOLDER_DEPTH {
-        return Err(CoreError::InvalidInput(format!(
-            "폴더는 {MAX_SESSION_FOLDER_DEPTH}단계까지만 중첩할 수 있습니다"
-        )));
+        return Err(AppError::invalid_input(
+            "SESSION_FOLDER_DEPTH_EXCEEDED",
+            format!("폴더는 {MAX_SESSION_FOLDER_DEPTH}단계까지만 중첩할 수 있습니다"),
+        )
+        .with("max", MAX_SESSION_FOLDER_DEPTH)
+        .into());
     }
     Ok(())
 }
@@ -426,7 +433,15 @@ fn folder_depth(folders: &[SessionFolder], id: &str) -> Result<usize, CoreError>
     let mut cursor = folders
         .iter()
         .find(|folder| folder.id == id)
-        .ok_or_else(|| CoreError::NotFound(format!("세션 폴더를 찾을 수 없습니다: {id}")))?;
+        .ok_or_else(|| {
+            CoreError::from(
+                AppError::not_found(
+                    "SESSION_FOLDER_NOT_FOUND_BY_ID",
+                    format!("세션 폴더를 찾을 수 없습니다: {id}"),
+                )
+                .with("id", id),
+            )
+        })?;
     let mut depth = 0;
     while let Some(parent) = cursor.parent_id.as_deref() {
         let Some(parent) = folders.iter().find(|folder| folder.id == parent) else {
@@ -532,12 +547,19 @@ fn sanitize_folder_parents(folders: &mut [SessionFolder]) {
 fn validate_folder_name(value: &str) -> Result<String, CoreError> {
     let name = value.trim();
     if name.is_empty() {
-        return Err(CoreError::InvalidInput("폴더 이름을 입력하세요".to_owned()));
+        return Err(AppError::invalid_input(
+            "SESSION_FOLDER_NAME_REQUIRED",
+            "폴더 이름을 입력하세요",
+        )
+        .into());
     }
-    if name.chars().count() > 80 {
-        return Err(CoreError::InvalidInput(
-            "폴더 이름은 80자 이하여야 합니다".to_owned(),
-        ));
+    if name.chars().count() > MAX_SESSION_FOLDER_NAME_CHARS {
+        return Err(AppError::invalid_input(
+            "SESSION_FOLDER_NAME_TOO_LONG",
+            format!("폴더 이름은 {MAX_SESSION_FOLDER_NAME_CHARS}자 이하여야 합니다"),
+        )
+        .with("max", MAX_SESSION_FOLDER_NAME_CHARS)
+        .into());
     }
     Ok(name.to_owned())
 }
@@ -549,9 +571,11 @@ fn validate_folder_color(value: &str) -> Result<String, CoreError> {
     {
         Ok(value.to_ascii_lowercase())
     } else {
-        Err(CoreError::InvalidInput(
-            "폴더 색상은 #RRGGBB 형식이어야 합니다".to_owned(),
-        ))
+        Err(AppError::invalid_input(
+            "SESSION_FOLDER_COLOR_INVALID",
+            "폴더 색상은 #RRGGBB 형식이어야 합니다",
+        )
+        .into())
     }
 }
 

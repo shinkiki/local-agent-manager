@@ -1,6 +1,6 @@
 [package]
 name = "agent-manager-tauri"
-version = "0.2.0"
+version = "0.3.0"
 description = "Cross-platform local AI agent session manager"
 authors = ["shinkiki"]
 edition = "2021"
@@ -16,6 +16,12 @@ repository = "https://github.com/shinkiki/local-agent-manager"
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "agent_manager_tauri_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# 실행파일 이름은 패키지 이름(agent-manager-tauri)이 아니라 제품 이름을 따른다.
+# 프로세스 목록·크래시 리포트·코드서명 대상에 구현 도구 이름이 드러나지 않게 한다.
+[[bin]]
+name = "agent-manager"
+path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

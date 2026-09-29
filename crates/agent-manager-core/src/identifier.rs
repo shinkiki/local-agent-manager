@@ -22,9 +22,14 @@ pub(crate) fn is_slug_body(value: &str) -> bool {
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+/// 식별자 길이가 비어 있지 않은 `1..=max_len` 범위인지.
+fn is_within_length_limit(value: &str, max_len: usize) -> bool {
+    !value.is_empty() && value.len() <= max_len
+}
+
 /// 길이가 `1..=max_len`이고 영숫자·`-`·`_`만 쓴 값인지.
 pub(crate) fn is_slug(value: &str, max_len: usize) -> bool {
-    !value.is_empty() && value.len() <= max_len && is_slug_body(value)
+    is_within_length_limit(value, max_len) && is_slug_body(value)
 }
 
 /// 소문자·숫자·`-`·`_`만 쓰고 영숫자로 시작하는 `1..=max_len` 값인지.
@@ -32,8 +37,7 @@ pub(crate) fn is_slug(value: &str, max_len: usize) -> bool {
 /// MCP 서버 이름으로 그대로 나가는 id가 쓰는 좁은 집합이다. Claude의 `[a-zA-Z0-9_-]+`와
 /// Codex의 TOML bare key가 겹치는 자리라 대문자를 뺀다.
 pub(crate) fn is_lowercase_slug(value: &str, max_len: usize) -> bool {
-    !value.is_empty()
-        && value.len() <= max_len
+    is_within_length_limit(value, max_len)
         && value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
         })
@@ -74,7 +78,7 @@ mod tests {
 
     #[test]
     fn lowercase_slug_rejects_uppercase_and_leading_symbol() {
-        assert!(is_lowercase_slug("notion-bizple", 32));
+        assert!(is_lowercase_slug("notion-team", 32));
         assert!(is_lowercase_slug("0abc", 32));
         assert!(!is_lowercase_slug("Notion", 32));
         assert!(!is_lowercase_slug("-lead", 32));

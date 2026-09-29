@@ -3,6 +3,8 @@
  * 기준선 보관과 차집합은 같으므로, 키 함수만 받아 한자리에서 처리한다.
  */
 
+import type { ProjectRegistryEntry } from "../types";
+
 type AttentionStateItem = {
   id: string;
   kind: string;
@@ -11,6 +13,11 @@ type AttentionStateItem = {
 /** 알림 상태 항목의 비교 키. 같은 ID라도 종류가 바뀌면 다른 상태로 본다. */
 export function attentionStateKey(item: AttentionStateItem): string {
   return `${item.id}\u0000${item.kind}`;
+}
+
+/** 감지된 프로젝트 항목의 비교 키. 경로가 같으면 같은 프로젝트로 본다. */
+export function projectStateKey(project: Pick<ProjectRegistryEntry, "path">): string {
+  return project.path;
 }
 
 /** 이번 스냅샷의 키 집합. 다음 호출의 기준선으로 그대로 보관한다. */

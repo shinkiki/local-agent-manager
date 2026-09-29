@@ -1,28 +1,23 @@
-import { FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
-import { AppWindow, CalendarClock, ChevronDown, ChevronRight, ExternalLink, MessagesSquare, PanelLeftClose, PanelLeftOpen, Plus, RotateCw, ScrollText, X } from "lucide-react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AppWindow, CalendarClock, ExternalLink, MessagesSquare, PanelLeftOpen, Plus, RotateCw, ScrollText } from "lucide-react";
 import { attachChat, connectChat, supportsDeliveryDuringTurn, type ChatConnection } from "../lib/chat";
 import { ChatRejectedError } from "../lib/chatReconnect";
 import type { TabRequest } from "../lib/uiGuide";
 import {
   createDirectory,
-  downloadChatLinkedFile,
-  getChatLinkedFile,
   getDetachedChatForSession,
   getLiveChats,
   hasTauriRuntime,
   openProviderSessionApp,
+  previewDirectoryCreation,
 } from "../lib/ipc";
-import { formatDate } from "../lib/format";
+import { sourceName } from "../lib/format";
+import { displayPath } from "../lib/displayPath";
 import { useI18n } from "../lib/i18n";
-import { missingDirectoryPath, missingDirectoryPrompt } from "../lib/missingDirectory";
-import { liveStreamBoundaryMs, transcriptBeforeLiveStream } from "../lib/transcriptOverlap";
-import {
-  ActivityFilterSelect,
-  TranscriptLimitSelect,
-  TranscriptLoadEarlier,
-  TranscriptTurns,
-  useSessionTranscript,
-} from "./SessionTranscript";
+import { runtimeText } from "../lib/i18nRuntime";
+import { directoryCreationItems, missingDirectoryPath } from "../lib/missingDirectory";
+import { useChatTranscriptHistory } from "./ChatTranscriptHistory";
+import { useReadingBookmarks } from "./ReadingBookmarks";
 import type {
   AccountSnapshot,
   ChatApprovalMode,
@@ -31,47 +26,60 @@ import type {
   ChatMode,
   ChatPhase,
   ChatSessionInfo,
+  ChatStartRequest,
   MessageDisplayMode,
   ModelOption,
   ProjectOption,
   ProviderId,
   ProviderStatus,
   QueuedChatMessage,
-  ReasoningEffort,
   SchedulerSnapshot,
+  SessionMeta,
   SessionSummary,
   SessionTranscriptLimit,
   TranscriptItem,
 } from "../types";
-import { ChatApprovalDock, ChatContextMeter, ErrorBanner, EmptyState, SourceBadge, useConfirm, useEscapeToClose } from "./Shared";
-import { LinkedFilePreview, useLinkedFilePreview } from "./LinkedFilePreview";
-import { ChatRuntimeSettingsMenu, type ChatAgentChoice } from "./ChatRuntimeSettingsMenu";
+import { ChatApprovalDock, ChatContextMeter, ErrorBanner, EmptyState, FileDropOverlay, NoticeBanner, useConfirm, useFileDropZone } from "./Shared";
+import { LinkedFilePreview } from "./LinkedFilePreview";
+import { useChatLinkedFiles } from "./ChatLinkedFiles";
+import { ChatRuntimeList, chatCatalogSession, chatTabTitle, phaseLabel, useChatListPane } from "./ChatRuntimeList";
+import { ChatRuntimeSettingsMenu, useCatalogReasoningOptions, type ChatAgentChoice } from "./ChatRuntimeSettingsMenu";
 import {
-  appendAttachmentDrafts,
-  AttachmentPicker,
-  clipboardFiles,
+  addAttachmentDrafts,
   queuedAttachmentsToDrafts,
   releaseAttachmentDraftUpload,
-  uploadAttachmentDrafts,
+  sendWithAttachmentDrafts,
   type ChatAttachmentDraft,
 } from "./ChatAttachments";
 import { ChatComposer } from "./ChatComposer";
+import { ChatSecretsPanel } from "./ChatSecretsPanel";
+import { useChatLocalMemory } from "./ChatLocalMemory";
+import {
+  detachQuietly,
+  runChatConnectionAction,
+  shutdownConnection,
+} from "./ChatConnectionAction";
+import { switchAttachedChat, useSerializedTaskQueue } from "./ChatConnectionGeneration";
 import { SchedulesPanel } from "./ChatSchedules";
 import {
   applyChatEvent,
   ChatConversationTurn,
-  ChatEntryView,
   ChatScrollControls,
-  chatTurnStatusLabel,
   lastUserMessageKey,
+  pendingChatApprovals,
   scrollToLastUserMessage,
+  useFollowLatestMessages,
   type ChatEntry,
   type ChatTurn,
 } from "./ChatConversation";
+import { ChatActivityLog } from "./ChatActivityLog";
+import { FIND_PRIORITY, useChatFind } from "./ChatFindBar";
+import { useMirroredState } from "./ChatMirroredState";
 import { accountName, activeAccountId, launchAccountChoices, resolveLaunchAccountId } from "../lib/launchAccount";
+import { limitedAccountHandoff } from "../lib/limitedAccountHandoff";
 import { buildSessionHandoffMessage } from "../lib/sessionHandoff";
 import { planExecutionRequest, planRestartMode } from "../lib/planRestart";
-import { activityMatches, type ActivityFilter } from "../lib/activityFilter";
+import type { ActivityFilter } from "../lib/activityFilter";
 import {
   approvalModeLabel,
   defaultApprovalMode,
@@ -83,15 +91,17 @@ import {
   settingField,
   settingFieldsFor,
 } from "../lib/chatSettings";
-import { submitComposerOnEnter } from "../lib/composerKeys";
 import { shouldApplyLivePhaseSnapshot } from "../lib/livePhaseSync";
 import { usePoll } from "../lib/poll";
 import { openPopoutWindow, usePopoutWindowTitle } from "../lib/popoutWindow";
-import { reasoningOptionsFor, refreshProviderOptions, useProviderOptions } from "../lib/providerOptions";
-import { defaultEffortFor, runtimeExtraSettingFields, RuntimeExtraSettings, RuntimeSettings } from "./RuntimeSettings";
-import { readSecondaryPaneOpen, writeSecondaryPaneOpen } from "../lib/secondaryPane";
+import { refreshProviderOptions, useProviderOptions } from "../lib/providerOptions";
+import { saveChatLaunchSettings } from "./ChatLocalSettings";
+import { useChatRuntimeDraft, type ChatRuntimeSettings } from "./ChatRuntimeDraft";
+import { localConnectionIdForRequest } from "../lib/localConnections";
+import { ChatLaunchForm, useCliConnectionCards, useLaunchAdvancedSettings } from "./ChatLaunchPanel";
 import { hideChatCloseConfirmation, shouldConfirmChatClose } from "../lib/chatCloseConfirmation";
 import { errorText } from "../lib/errorText";
+import { saveSessionMetaPatch } from "../lib/sessionMetaSave";
 
 interface ChatViewProps {
   providers: ProviderStatus[];
@@ -113,6 +123,8 @@ interface ChatViewProps {
   onSchedulerSnapshot: (update: (current: SchedulerSnapshot) => SchedulerSnapshot) => void;
   onConnectCli: (provider: ProviderStatus) => void;
   onOpenSession: (session: SessionSummary) => void;
+  /** 채팅 목록의 즐겨찾기 토글이 바꾼 세션 메타. 목록·대시보드가 같은 스냅샷을 쓴다. */
+  onMetaChanged: (source: ProviderId, id: string, meta: SessionMeta) => void;
   onSessionCatalogChanged: (source: ProviderId, id: string) => Promise<void>;
   attentionTarget: ChatViewAttentionTarget | null;
   onAttentionTargetHandled: (target: ChatViewAttentionTarget, opened: boolean) => void;
@@ -131,39 +143,12 @@ export interface ChatViewAttentionTarget {
 
 export type ChatTab = "conversation" | "activity" | "schedules";
 
-const MANUAL_CWD = "__manual_cwd__";
-const CHAT_LIST_OPEN_KEY = "agent-manager.chat-list-pane";
-const HIDDEN_CLI_CONNECTION_CARDS_KEY = "agent-manager.hidden-cli-connection-cards.v1";
-const PLAN_RESTART_CONFIRM_LABEL = "이 계획으로 다시 시작";
-
 /**
  * 계획을 다른 실행으로 넘기는 확인 창이 공통으로 말하는 것: 지금 실행은 승인 없이 접히고,
  * 그래서 아직 아무것도 실행되지 않았다. 앞머리만 갈래마다 다르다.
  */
 function planHandoffMessage(lead: string, notice = ""): string {
-  return `${lead}\n지금 실행은 계획을 승인하지 않고 접히므로 아직 아무것도 실행되지 않습니다.${notice}`;
-}
-
-/**
- * detach는 이미 끝난 프로세스의 이벤트 구독을 끊는 뒷정리라, 실패해도 되돌릴 것이 없고
- * 사용자에게 알릴 것도 없다. 호출부마다 같은 문장을 다르게 적기보다 여기서 한 번 삼킨다.
- */
-async function detachQuietly(connection: ChatConnection | null): Promise<void> {
-  if (!connection) return;
-  try {
-    await connection.detach();
-  } catch {
-    // 이미 사라진 프로세스에 대한 detach 실패는 정리가 끝난 것과 같다.
-  }
-}
-
-/** 종료 실패를 알릴 자리가 없는 정리 경로에서만 쓴다 — 프로세스가 이미 없을 수 있다. */
-async function stopQuietly(connection: ChatConnection): Promise<void> {
-  try {
-    await connection.stop();
-  } catch {
-    // 실행이 이미 끝났다면 종료 요청 실패는 원하던 상태와 같다.
-  }
+  return `${lead}\n${runtimeText("지금 실행은 계획을 승인하지 않고 접히므로 아직 아무것도 실행되지 않습니다.", "The current run is closed without approving the plan, so nothing has been executed yet.")}${notice}`;
 }
 
 /**
@@ -196,122 +181,83 @@ function connectingChatSurface(draft?: { text: string; attachments: ChatAttachme
   };
 }
 
+/** 종료 확인을 띄우는 자리 — 화면에 떠 있는 채팅인지, 목록에만 있는 배경 채팅인지. */
+type ChatCloseScope = "current" | "background";
+
 /**
- * 로컬 저장소는 브라우저 설정·용량에 따라 읽기와 쓰기 어느 쪽도 던질 수 있고, 담긴 값은
- * 지난 버전이 남긴 아무 모양이나 될 수 있다. 이 화면이 저장하는 것은 모두 화면 설정이라
- * 실패해도 이번 실행을 막지 않아야 하므로, 네 곳에 흩어져 있던 같은 try/catch 껍데기를
- * 여기 한 벌로 모은다. 값의 모양 검사는 그대로 각 호출부가 한다.
+ * 종료 확인에 띄울 안내. 갈래(현재·배경) × 진행 여부로 네 문구가 갈리는데, 호출부마다
+ * 삼항으로 적어 두면 "목록에서 제거된다"는 같은 사실을 자리마다 다르게 쓰게 된다.
+ *
+ * 배경 채팅의 멈춘 갈래만 제거를 한 문장에 붙여 쓰는 것은 그대로 두었다. 화면에 없는
+ * 채팅이라 "종료한 실행"이라고 가리킬 대상이 사용자 눈앞에 없기 때문이다.
  */
-function readStoredJson<T>(key: string, fallback: T): T {
-  if (typeof window === "undefined") return fallback;
-  try {
-    const raw = window.localStorage.getItem(key);
-    return raw === null ? fallback : (JSON.parse(raw) as T);
-  } catch {
-    return fallback;
+function chatCloseConfirmMessage(scope: ChatCloseScope, active: boolean): string {
+  const removal = runtimeText("종료한 실행은 채팅 목록에서 제거됩니다.", "Closed runs are removed from the chat list.");
+  if (active) {
+    const subject = scope === "current"
+      ? runtimeText("현재 진행 중인 작업과 대기열도", "In-progress work and queued messages will also")
+      : runtimeText("이 채팅에서 진행 중인 작업과 대기열도", "In-progress work and queued messages in this chat will also");
+    return `${subject} ${runtimeText("함께 종료됩니다.", "be terminated together.")}\n${removal}`;
   }
+  return scope === "current"
+    ? `${runtimeText("현재 채팅 실행을 종료합니다.", "Closing current chat run.")}\n${removal}`
+    : runtimeText("이 채팅 실행을 종료하고 채팅 목록에서 제거합니다.", "Close this chat run and remove it from the chat list.");
 }
 
-function writeStoredJson(key: string, value: unknown): void {
-  try {
-    window.localStorage.setItem(key, JSON.stringify(value));
-  } catch {
-    // 저장소를 쓸 수 없는 환경에서도 이번 실행의 화면 동작은 그대로 유지한다.
-  }
-}
-
-function readHiddenCliConnectionCards(): ProviderId[] {
-  const stored = readStoredJson<unknown>(HIDDEN_CLI_CONNECTION_CARDS_KEY, []);
-  if (!Array.isArray(stored)) return [];
-  return stored.filter((provider): provider is ProviderId => provider === "claude" || provider === "codex" || provider === "antigravity");
-}
-
-function writeHiddenCliConnectionCards(providers: ProviderId[]): void {
-  writeStoredJson(HIDDEN_CLI_CONNECTION_CARDS_KEY, providers);
-}
-
-export function ChatView({ providers, accounts, projects, models, sessions, messageDisplayMode, transcriptLimit, onTranscriptLimitChange, scheduler, onRefreshScheduler, onSchedulerSnapshot, onConnectCli, onOpenSession, onSessionCatalogChanged, attentionTarget, onAttentionTargetHandled, tabRequest = null, popout = false }: ChatViewProps) {
+export function ChatView({ providers, accounts, projects, models, sessions, messageDisplayMode, transcriptLimit, onTranscriptLimitChange, scheduler, onRefreshScheduler, onSchedulerSnapshot, onConnectCli, onOpenSession, onMetaChanged, onSessionCatalogChanged, attentionTarget, onAttentionTargetHandled, tabRequest = null, popout = false }: ChatViewProps) {
   // 정적 치환기는 화면에 그려지는 텍스트 노드만 덮는다. aria-label·title·placeholder처럼
   // 속성으로만 있는 문구는 여기서 text(ko, en)으로 직접 고른다.
   const { text } = useI18n();
+  const planRestartConfirmLabel = text("이 계획으로 다시 시작", "Restart with this plan");
   const available = useMemo(() => providers.filter((provider) => provider.cli.detected), [providers]);
   const unavailable = useMemo(() => providers.filter((provider) => !provider.cli.detected), [providers]);
-  const [hiddenCliConnectionCards, setHiddenCliConnectionCards] = useState<ProviderId[]>(readHiddenCliConnectionCards);
-  const [rememberHiddenCliConnectionCards, setRememberHiddenCliConnectionCards] = useState<ProviderId[]>([]);
-  const visibleUnavailable = useMemo(
-    () => unavailable.filter((provider) => !hiddenCliConnectionCards.includes(provider.provider)),
-    [hiddenCliConnectionCards, unavailable],
-  );
-  const closeCliConnectionCard = (provider: ProviderId) => {
-    setHiddenCliConnectionCards((current) => {
-      if (current.includes(provider)) return current;
-      const next = [...current, provider];
-      if (rememberHiddenCliConnectionCards.includes(provider)) writeHiddenCliConnectionCards(next);
-      return next;
-    });
-  };
+  const { cliConnectionCards } = useCliConnectionCards(unavailable, onConnectCli);
   const initialSource = available[0]?.provider ?? "codex";
   const [tab, setTab] = useState<ChatTab>("conversation");
-  const [chatListOpen, setChatListOpen] = useState(() => !popout && readSecondaryPaneOpen(CHAT_LIST_OPEN_KEY));
-  const chatListCloseRef = useRef<HTMLButtonElement>(null);
-  const chatListRestoreRef = useRef<HTMLButtonElement>(null);
-  const chatListFocusTargetRef = useRef<"close" | "restore" | null>(null);
-  // 좁은 화면에서만 채팅 목록이 본문을 덮는 오버레이가 된다. 그때만 Esc로 닫고,
-  // 넓은 화면의 붙박이 사이드바일 때는 Esc를 가로채지 않는다.
-  const [chatListIsOverlay, setChatListIsOverlay] = useState(() => window.matchMedia("(max-width: 760px)").matches);
-  useEffect(() => {
-    const query = window.matchMedia("(max-width: 760px)");
-    const sync = () => setChatListIsOverlay(query.matches);
-    sync();
-    query.addEventListener("change", sync);
-    return () => query.removeEventListener("change", sync);
-  }, []);
-  useEffect(() => {
-    if (!popout) writeSecondaryPaneOpen(CHAT_LIST_OPEN_KEY, chatListOpen);
-  }, [chatListOpen, popout]);
-  useLayoutEffect(() => {
-    const target = chatListFocusTargetRef.current;
-    if (!target) return;
-    chatListFocusTargetRef.current = null;
-    if (target === "close") chatListCloseRef.current?.focus();
-    else chatListRestoreRef.current?.focus();
-  }, [chatListOpen]);
-  const setChatListVisibility = (open: boolean) => {
-    chatListFocusTargetRef.current = open ? "close" : "restore";
-    setChatListOpen(open);
-  };
-  const closeChatListAndRestoreFocus = () => {
-    setChatListVisibility(false);
-  };
-  useEscapeToClose(closeChatListAndRestoreFocus, chatListOpen && chatListIsOverlay && !popout);
+  const chatListPane = useChatListPane(popout);
+  const chatListOpen = chatListPane.open;
   // 대시보드 '반복 일정' 패널에서 넘어온 요청은 반복 요청 탭을 바로 연다.
   useEffect(() => {
     if (tabRequest) setTab(tabRequest.tab);
   }, [tabRequest]);
-  const [source, setSource] = useState<ProviderId>(initialSource);
-  // 빈 값은 "실행 시점 기본 계정"이라는 기본 선택이다. 특정 계정을 고르면 그 계정으로만 실행한다.
-  const [launchAccountId, setLaunchAccountId] = useState("");
-  const [cwd, setCwd] = useState(projects[0]?.path ?? "");
-  const [manualCwd, setManualCwd] = useState(false);
-  const [model, setModel] = useState(() => readChatLaunchSettings(initialSource).model);
-  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(() => readChatLaunchSettings(initialSource).reasoningEffort);
-  const [mode, setMode] = useState<ChatMode>("workspace");
-  const [approvalMode, setApprovalMode] = useState<ChatApprovalMode>(defaultApprovalMode(initialSource));
-  const [extraSettings, setExtraSettings] = useState<Record<string, string>>({});
+  // 시작 폼은 묶음을 통째로 받아 칸을 그린다. 나머지 본문은 낱개 이름으로 읽으므로 둘 다 둔다.
+  const runtimeDraft = useChatRuntimeDraft(initialSource, projects[0]?.path ?? "");
+  const {
+    source,
+    launchAccountId,
+    setLaunchAccountId,
+    cwd,
+    setCwd,
+    model,
+    localConnectionId,
+    reasoningEffort,
+    setReasoningEffort,
+    mode,
+    setMode,
+    approvalMode,
+    setApprovalMode,
+    extraSettings,
+    setExtraSettings,
+    applySettings: applyRuntimeSettings,
+    switchSource,
+    adoptSessionSettings,
+  } = runtimeDraft;
   const [initialPrompt, setInitialPrompt] = useState("");
   const [initialAttachments, setInitialAttachments] = useState<ChatAttachmentDraft[]>([]);
-  const [composer, setComposer] = useState("");
-  const [composerAttachments, setComposerAttachments] = useState<ChatAttachmentDraft[]>([]);
+  const [composer, composerRef, putComposerText] = useMirroredState("");
+  const [composerAttachments, composerAttachmentsRef, putComposerAttachments] = useMirroredState<ChatAttachmentDraft[]>([]);
   const [uploadingAttachments, setUploadingAttachments] = useState(false);
-  const [session, setSession] = useState<ChatSessionInfo | null>(null);
+  const [session, sessionRef, putSession] = useMirroredState<ChatSessionInfo | null>(null);
   const [liveChats, setLiveChats] = useState<ChatSessionInfo[]>([]);
   // 종료를 요청한 배경 채팅. 3초 폴링이 아직 살아 있는 그 채팅을 목록에 되살리지 못하게
   // 화면에서만 걸러 낸다. 실패하면 다시 목록에 나타난다.
   const [closingChatIds, setClosingChatIds] = useState<ReadonlySet<string>>(() => new Set());
-  const [phase, setPhase] = useState<ChatPhase | "connecting">("connecting");
-  const [queue, setQueue] = useState<QueuedChatMessage[]>([]);
-  const [turns, setTurns] = useState<ChatTurn[]>([]);
+  const [phase, phaseRef, putPhase, setPhase] = useMirroredState<ChatPhase | "connecting">("connecting");
+  const [queue, queueRef, putQueue, setQueue] = useMirroredState<QueuedChatMessage[]>([]);
+  const [turns, turnsRef, putTurns, setTurns] = useMirroredState<ChatTurn[]>([]);
   const [activityFilter, setActivityFilter] = useState<ActivityFilter>("all");
+  // 승인 카드로 비밀값을 맡길 때마다 오르는 수. 비밀값 줄이 목록을 다시 읽을 신호다.
+  const [chatSecretSignal, setChatSecretSignal] = useState(0);
   const [error, setError] = useState<string | null>(null);
   /**
    * 첨부 거절 안내. 시작·연결 오류(`error`)와 자리를 나눈다 — 한 자리에 실으면 거절 뒤에
@@ -319,14 +265,36 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
    * 거절이 없는 담기는 이전 거절 안내를 지운다.
    */
   const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
+  /**
+   * 한도에 걸린 계정에서 지금의 기본 계정으로 이 대화를 옮겨 다시 열었다는 안내. 실패가
+   * 아니므로 오류 자리를 쓰지 않는다. 전송할 때마다 새로 판정하므로 다음 전송에서 지운다.
+   */
+  const [accountHandoffNotice, setAccountHandoffNotice] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
-  // 실행 계정은 CLI 프로세스가 뜰 때 고정되어 시작 뒤에는 바꿀 수 없으므로 접지 않고 본문에 둔다.
-  // 접이식 고급 옵션에는 시작 뒤에도 실행 설정 메뉴에서 바꿀 수 있는 추가 스키마 항목만 남긴다.
-  const [launchAdvancedOpen, setLaunchAdvancedOpen] = useState(false);
-  const [chatSwitching, setChatSwitching] = useState(false);
-  const [resuming, setResuming] = useState(false);
+  const [chatSwitching, chatSwitchingRef, markChatSwitching] = useMirroredState(false);
+  const [resuming, resumingRef, markResuming] = useMirroredState(false);
   const [openingProviderApp, setOpeningProviderApp] = useState(false);
   const { confirm, confirmDialog } = useConfirm();
+  /**
+   * 실패 안내를 "무엇을 못 했는지: 원인" 한 모양으로 적는다. 열세 자리가 같은 식을 각자
+   * 조립하고 있어, 구분 기호나 원인 추출을 한 자리에서만 고치면 같은 종류의 실패가 화면마다
+   * 다른 모양으로 보였다. 갈래가 정하는 것은 앞머리뿐이고 붙이는 일은 여기서 한다.
+   *
+   * 원인을 덧붙이지 않는 안내(상태 때문에 보낼 수 없다 같은 것)는 지금처럼 `setError`를
+   * 그대로 쓴다 — 이 손잡이는 "원인이 있는 실패"만 맡는다.
+   */
+  const reportFailure = (lead: string, cause: unknown) => {
+    setError(`${lead}: ${errorText(cause)}`);
+  };
+  /**
+   * 실행 설정 스키마를 다시 조사한다. 새 채팅과 실행설정 메뉴가 각자 같은 호출과 같은
+   * 실패 문구를 적고 있었다 — 조사 실패는 어느 쪽에서 눌렀든 같은 일이므로 한 벌로 둔다.
+   */
+  const loadLatestRuntimeOptions = (target: ProviderId) => {
+    void refreshProviderOptions(target).catch((cause: unknown) => {
+      reportFailure(text("최신 실행 설정을 불러오지 못했습니다", "Failed to load latest launch settings"), cause);
+    });
+  };
   const connectionRef = useRef<ChatConnection | null>(null);
   const connectionGenerationRef = useRef(0);
   /**
@@ -339,14 +307,56 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     return connectionGenerationRef.current;
   };
   /**
-   * 지금 붙어 있는 연결을 화면에서 떼어낸다. 세대를 먼저 올려 이 연결에서 뒤늦게 도착하는
-   * 이벤트를 버리게 한 다음 참조를 비우고 detach한다 — 순서가 뒤집히면 정리 도중 들어온
-   * 이벤트가 이미 지운 대화에 다시 붙는다. 새로 쓸 세대 번호를 돌려준다.
+   * 화면이 쥐고 있던 연결을 놓는다. 세대를 먼저 올려 이 연결에서 뒤늦게 도착하는 이벤트를
+   * 버리게 한 다음 참조를 비운다 — 순서가 뒤집히면 놓는 도중 들어온 이벤트가 이미 놓은
+   * 대화에 다시 붙는다. 놓은 연결과 새로 쓸 세대 번호를 함께 돌려준다.
+   *
+   * 놓기와 뒷정리(detach·stop·아무것도 안 함)는 갈래마다 다르므로 여기서 하지 않는다.
+   */
+  const takeConnection = (): { connection: ChatConnection | null; generation: number } => {
+    const generation = bumpConnectionGeneration();
+    const connection = connectionRef.current;
+    connectionRef.current = null;
+    return { connection, generation };
+  };
+  /**
+   * 지금 붙어 있는 연결을 화면에서 떼어내고 구독까지 조용히 끊는다. 떼는 순서는
+   * `takeConnection`이 지키고, 여기서는 정리할 연결을 호출부가 쥐고 있던 것으로 받는다 —
+   * 종료를 기다리는 사이에 다른 갈래가 참조를 갈아끼웠더라도 원래 붙어 있던 것을 끊는다.
+   * 새로 쓸 세대 번호를 돌려준다.
    */
   const retireConnection = async (connection: ChatConnection | null): Promise<number> => {
-    const generation = bumpConnectionGeneration();
-    connectionRef.current = null;
+    const { generation } = takeConnection();
     await detachQuietly(connection);
+    return generation;
+  };
+  /**
+   * 같은 채팅을 새 실행으로 갈아끼우기 직전까지를 한자리에서 처리한다. 설정 변경과 인계는
+   * 갈아끼우는 이유만 다를 뿐 준비 과정이 같다 — 설정 변경 중임을 세우고, 화면을 연결 중으로
+   * 돌리고, 지금 실행을 종료하고, 연결을 은퇴시켜 새 세대를 얻고, 옛 실행 앞으로 쌓인 전송
+   * 대기열을 비운다.
+   *
+   * 종료에 실패하면 화면 단계를 되돌리고 `onStopFailed`로 각자의 문구를 알린 뒤 null을
+   * 돌려준다. 멈추지 못한 실행 위에 새 연결을 얹으면 같은 세션에 프로세스가 둘 붙는다.
+   */
+  const beginChatRelaunch = async ({ onStopFailed }: { onStopFailed: (cause: unknown) => void }): Promise<number | null> => {
+    const previousPhase = phase;
+    const connection = connectionRef.current;
+    settingsChangeRef.current = true;
+    setError(null);
+    setPhase("connecting");
+    if (connection) {
+      try {
+        await connection.stop();
+      } catch (cause) {
+        setPhase(previousPhase);
+        onStopFailed(cause);
+        settingsChangeRef.current = false;
+        return null;
+      }
+    }
+    const generation = await retireConnection(connection);
+    setQueue([]);
     return generation;
   };
   /**
@@ -354,18 +364,8 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
    * 실려 나가고 지워진다 — 매 전송마다 붙이면 새 세션의 컨텍스트를 계속 갉아먹는다.
    */
   const pendingHandoffRef = useRef<{ source: ProviderId; id: string; transcript: TranscriptItem[] } | null>(null);
-  const sessionRef = useRef<ChatSessionInfo | null>(null);
-  const phaseRef = useRef<ChatPhase | "connecting">("connecting");
-  const turnsRef = useRef<ChatTurn[]>([]);
-  const queueRef = useRef<QueuedChatMessage[]>([]);
-  const composerRef = useRef("");
-  const composerAttachmentsRef = useRef<ChatAttachmentDraft[]>([]);
-  const chatDraftsRef = useRef(new Map<string, { text: string; attachments: ChatAttachmentDraft[] }>());
-  const chatScrollPositionsRef = useRef(new Map<string, number>());
-  const chatSwitchingRef = useRef(false);
-  const resumingRef = useRef(false);
-  // 채팅 전환 요청을 순서대로 처리하기 위한 꼬리 promise.
-  const chatSwitchQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const chatLocalMemory = useChatLocalMemory();
+  const queueChatSwitch = useSerializedTaskQueue();
   // 라이브 state 이벤트를 이미 반영한 연결 세대. attach 응답의 스냅숏이 이보다
   // 과거인지 판단하는 데 쓴다.
   const appliedStateGenerationRef = useRef(-1);
@@ -376,8 +376,15 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
   const activeTurnRef = useRef<string | null>(null);
   const chatStreamRef = useRef<HTMLDivElement>(null);
   const activityLogRef = useRef<HTMLDivElement>(null);
-  const followLatestMessagesRef = useRef(messageDisplayMode === "latest");
-  const handledLastUserMessageRef = useRef(new Map<string, string>());
+
+  /**
+   * 입력창의 글과 첨부를 한 벌로 옮긴다. 둘을 따로 옮기면 그사이 렌더에서 글과 첨부가
+   * 서로 다른 시점의 값으로 보인다.
+   */
+  const putComposerDraft = useCallback((value: string, drafts: ChatAttachmentDraft[]) => {
+    putComposerText(value);
+    putComposerAttachments(drafts);
+  }, [putComposerAttachments, putComposerText]);
 
   /** 지금 화면에 떠 있는 채팅 상태를 통째로 떠 둔다. 되돌릴 자리에 그대로 넘기면 복원이 된다. */
   const captureChatSurface = useCallback((): ChatSurface => ({
@@ -395,45 +402,41 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
    * 옮기는 일이 어느 경로에서도 빠지면 안 된다.
    */
   const applyChatSurface = useCallback((surface: ChatSurface) => {
-    turnsRef.current = surface.turns;
-    queueRef.current = surface.queue;
-    setTurns(surface.turns);
-    setQueue(surface.queue);
-    composerRef.current = surface.composer;
-    composerAttachmentsRef.current = surface.attachments;
-    setComposer(surface.composer);
-    setComposerAttachments(surface.attachments);
-    phaseRef.current = surface.phase;
-    setPhase(surface.phase);
+    putTurns(surface.turns);
+    putQueue(surface.queue);
+    putComposerDraft(surface.composer, surface.attachments);
+    putPhase(surface.phase);
     activeTurnRef.current = surface.activeTurnId;
-  }, []);
+  }, [putComposerDraft, putPhase, putQueue, putTurns]);
 
   /**
    * 채팅을 떠나기 전에 작성 중이던 글과 스크롤 위치를 그 채팅 몫으로 남긴다. 돌아올 때
    * `connectingChatSurface`가 이 초안을 다시 입력창에 올린다.
    */
   const rememberChatLocalState = useCallback((chatId: string) => {
-    chatDraftsRef.current.set(chatId, { text: composerRef.current, attachments: composerAttachmentsRef.current });
-    chatScrollPositionsRef.current.set(chatId, chatStreamRef.current?.scrollTop ?? 0);
-  }, []);
+    chatLocalMemory.remember(
+      chatId,
+      { text: composerRef.current, attachments: composerAttachmentsRef.current },
+      chatStreamRef.current?.scrollTop ?? 0,
+    );
+  }, [chatLocalMemory]);
 
   /**
-   * 다시 열릴 일이 없는 chatId가 남긴 기억을 지운다. 초안·스크롤 위치·마지막 사용자 메시지
-   * 표시는 모두 chatId를 열쇠로 쓰는데, 종료했거나 재개로 새 chatId를 받은 런타임의 열쇠는
-   * 다시 나타나지 않아 지우지 않으면 그대로 쌓인다.
+   * 종료 중 표시를 옮긴다. Set을 복사해 한 칸만 바꾸는 같은 모양이 시작·끝에 한 벌씩
+   * 있었다.
    */
-  const forgetChatLocalState = useCallback((chatId: string) => {
-    chatDraftsRef.current.delete(chatId);
-    chatScrollPositionsRef.current.delete(chatId);
-    handledLastUserMessageRef.current.delete(chatId);
+  const markChatClosing = useCallback((chatId: string, closing: boolean) => {
+    setClosingChatIds((current) => {
+      const next = new Set(current);
+      if (closing) next.add(chatId); else next.delete(chatId);
+      return next;
+    });
   }, []);
 
   const providerOptions = useProviderOptions(source);
   // 새 채팅의 실행 계정 선택지. 계정 스냅샷이 바뀌어 고른 계정이 사라지거나 막히면
   // 기본값(활성 계정)으로 되돌려, 화면에 없는 계정으로 시작 요청을 보내지 않는다.
   const accountChoices = useMemo(() => launchAccountChoices(accounts, source), [accounts, source]);
-  // 고급 옵션에 남는 항목은 공급자 스키마가 주는 추가 실행 설정뿐이다.
-  const launchExtraFields = useMemo(() => runtimeExtraSettingFields(providerOptions, source), [providerOptions, source]);
   const launchActiveAccountId = useMemo(() => activeAccountId(accounts, source), [accounts, source]);
   useEffect(() => {
     setLaunchAccountId((current) => resolveLaunchAccountId(current, accountChoices));
@@ -446,15 +449,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     if (!session || visible.some((chat) => chat.chatId === session.chatId)) return visible;
     return [...visible, session];
   }, [closingChatIds, liveChats, session]);
-  const loadLinkedFile = useCallback((href: string) => {
-    if (!activeChatId) return Promise.reject(new Error("연결된 채팅을 찾을 수 없습니다."));
-    return getChatLinkedFile(activeChatId, href);
-  }, [activeChatId]);
-  const downloadLinkedFile = useCallback((href: string) => {
-    if (!activeChatId) return Promise.reject(new Error("연결된 채팅을 찾을 수 없습니다."));
-    return downloadChatLinkedFile(activeChatId, href);
-  }, [activeChatId]);
-  const linkedFilePreview = useLinkedFilePreview(loadLinkedFile);
+  const { downloadLinkedFile, linkedFilePreview } = useChatLinkedFiles(activeChatId, text("연결된 채팅을 찾을 수 없습니다.", "Could not find connected chat."));
 
   // 탭마다 스크롤을 맡는 요소가 다르다. 훅은 이전 구간을 붙인 뒤 위치를 되돌릴 때만 읽으므로
   // 그 시점의 활성 탭 컨테이너를 돌려주는 프록시를 넘긴다.
@@ -463,37 +458,36 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
       return tab === "activity" ? activityLogRef.current : chatStreamRef.current;
     },
   }), [tab]);
-  /**
-   * 라이브 스트림이 대화의 처음부터를 담고 있으면 파일 원문을 읽을 이유가 없다. 리플레이
-   * 버퍼가 앞부분을 밀어냈거나(재접속·긴 대화) 기존 세션을 이어 시작한 채팅만 원문을 읽는다.
-   */
-  const liveStreamMissesHistory = Boolean(session && (session.replayTruncated || session.resuming));
-  /**
-   * 세션 파일에 남은 원문을 스트림 위에 붙이고, 라이브가 이미 담당하는 구간은 세션 상세와
-   * 같은 경계 계산으로 잘라내 같은 턴이 두 번 보이지 않게 한다.
-   */
-  const transcript = useSessionTranscript({
-    source: session?.source ?? null,
-    sessionId: liveStreamMissesHistory ? session?.providerSessionId ?? null : null,
+  const transcript = useChatTranscriptHistory({
+    session,
+    turns,
     limit: transcriptLimit,
+    onLimitChange: onTranscriptLimitChange,
+    mode: tab === "activity" ? "activity" : "conversation",
+    activityFilter,
     scrollContainerRef: historyScrollRef,
+    onOpenLocalLink: linkedFilePreview.open,
   });
-  const liveStreamBoundary = useMemo(() => liveStreamBoundaryMs(turns), [turns]);
-  const visibleTranscript = useMemo(
-    () => transcriptBeforeLiveStream(transcript.detail?.transcript ?? [], liveStreamBoundary),
-    [transcript.detail, liveStreamBoundary],
-  );
 
-  const switchSource = useCallback((nextSource: ProviderId) => {
-    setSource(nextSource);
-    // 계정은 공급자에 묶여 있으므로 공급자를 바꾸면 기본값(활성 계정)으로 되돌린다.
-    setLaunchAccountId("");
-    setApprovalMode(defaultApprovalMode(nextSource));
-    setExtraSettings({});
-    const stored = readChatLaunchSettings(nextSource);
-    setModel(stored.model);
-    setReasoningEffort(stored.reasoningEffort);
-  }, []);
+  // 대화 안에서 찾기(Cmd+F / Ctrl+F). 대화 탭과 작업 기록 탭이 각자 다른 요소를 굴리므로
+  // 스크롤 컨테이너 프록시를 그대로 쓴다. 대화를 바꾸면 찾기는 닫힌다.
+  const { findBar } = useChatFind({
+    containerRef: historyScrollRef,
+    enabled: Boolean(session) && tab !== "schedules",
+    resetKey: activeChatId,
+    priority: FIND_PRIORITY.chatView,
+  });
+
+  // 읽던 자리. 공급자 세션이 붙은 뒤부터 이 대화의 책갈피가 저장되므로, 세션 id가 아직
+  // 없는 새 채팅에서는 목록이 비어 있고 저장도 하지 않는다.
+  const { controls: readingControls, captureReadingPoint } = useReadingBookmarks({
+    containerRef: chatStreamRef,
+    source: session?.source ?? null,
+    sessionId: session?.providerSessionId ?? null,
+    resetKey: activeChatId,
+    uiAnchor: "chat.reading-bookmarks",
+    onMetaChanged,
+  });
 
   const updateLiveChat = useCallback((info: ChatSessionInfo) => {
     setLiveChats((current) => {
@@ -508,19 +502,11 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
   }, []);
 
   const applySessionInfo = useCallback((info: ChatSessionInfo) => {
-    sessionRef.current = info;
-    phaseRef.current = info.state;
-    setSession(info);
-    setPhase(info.state);
-    setSource(info.source);
-    setCwd(info.cwd);
-    setModel(info.model ?? "");
-    setReasoningEffort(info.reasoningEffort ?? "");
-    setMode(info.mode);
-    setApprovalMode(info.approvalMode);
-    setExtraSettings(info.settings ?? {});
+    putSession(info);
+    putPhase(info.state);
+    adoptSessionSettings(info);
     updateLiveChat(info);
-  }, [updateLiveChat]);
+  }, [adoptSessionSettings, putPhase, putSession, updateLiveChat]);
 
   /**
    * attach·connect 응답의 `info`는 서버가 보낸 **첫** state 이벤트의 스냅숏이다.
@@ -580,11 +566,13 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
   // 팝아웃 창 제목으로 어떤 대화를 띄운 창인지 구분한다.
   usePopoutWindowTitle(popout && session ? chatTabTitle(session, chatCatalogSession(session, sessions)) : null);
 
-  useEffect(() => { sessionRef.current = session; }, [session]);
+  // `put*` 손잡이가 이미 ref를 채우므로 그 손잡이로만 바뀌는 값(`session`·첨부 초안)은
+  // 여기서 다시 맞추지 않는다. 아래 셋은 ref를 건드리지 않는 setter로도 바뀌므로
+  // (이벤트 리듀서의 `setTurns`·`setQueue`, 재시작 절차의 `setPhase`) 렌더 뒤에 그릇을
+  // 따라오게 한다.
   useEffect(() => { phaseRef.current = phase; }, [phase]);
   useEffect(() => { turnsRef.current = turns; }, [turns]);
   useEffect(() => { queueRef.current = queue; }, [queue]);
-  useEffect(() => { composerAttachmentsRef.current = composerAttachments; }, [composerAttachments]);
 
   const handleEvent = useCallback((event: ChatEvent) => {
     applyChatEvent(event, {
@@ -598,6 +586,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
         if (info.providerSessionId) void onSessionCatalogChanged(info.source, info.providerSessionId);
       },
       onError: setError,
+      clearStaleError: true,
     });
   }, [applySessionInfo, onSessionCatalogChanged]);
 
@@ -609,26 +598,18 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     if (generation === connectionGenerationRef.current) handleEvent(event);
   };
 
-  useEffect(() => {
-    followLatestMessagesRef.current = messageDisplayMode === "latest";
-  }, [activeChatId, messageDisplayMode]);
-
-  const pauseFollowingLatestMessages = useCallback(() => {
-    followLatestMessagesRef.current = false;
-  }, []);
-  const resumeFollowingLatestMessages = useCallback(() => {
-    followLatestMessagesRef.current = messageDisplayMode === "latest";
-  }, [messageDisplayMode]);
-
-  useEffect(() => {
-    if (messageDisplayMode !== "latest" || !followLatestMessagesRef.current || tab !== "conversation") return undefined;
-    const frame = window.requestAnimationFrame(() => {
-      if (!followLatestMessagesRef.current) return;
-      const stream = chatStreamRef.current;
-      if (stream) stream.scrollTo({ top: stream.scrollHeight, behavior: "auto" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [turns, tab, messageDisplayMode]);
+  // 새 응답이 흘러들어올 때 대화 탭을 맨 아래에 붙여 둔다. AIA 팝업과 같은 규칙을 쓴다.
+  const {
+    followingRef: followLatestMessagesRef,
+    pause: pauseFollowingLatestMessages,
+    resume: resumeFollowingLatestMessages,
+  } = useFollowLatestMessages({
+    targetRef: chatStreamRef,
+    enabled: messageDisplayMode === "latest" && tab === "conversation",
+    follow: messageDisplayMode === "latest",
+    resetKey: activeChatId,
+    growth: turns,
+  });
 
   // '마지막 보낸 메시지부터' 모드: 채팅을 처음 열 때와 새 메시지를 보낼 때
   // 사용자 메시지가 화면 맨 위에 오도록 이동한다. 같은 위치는 다시 이동하지
@@ -636,20 +617,23 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
   const lastUserMessageId = useMemo(() => lastUserMessageKey(turns), [turns]);
   useEffect(() => {
     if (messageDisplayMode !== "lastUser" || tab !== "conversation" || !activeChatId || !lastUserMessageId) return undefined;
-    if (handledLastUserMessageRef.current.get(activeChatId) === lastUserMessageId) return undefined;
+    if (chatLocalMemory.lastUserMessageHandled(activeChatId, lastUserMessageId)) return undefined;
     const frame = window.requestAnimationFrame(() => {
+      // 긴 답변을 읽다 말고 새 질문을 보내면 화면이 여기서 새 요청 자리로 옮겨 간다.
+      // 읽던 자리를 잃는 지점이 바로 여기이므로, 옮기기 직전에 그 자리를 챙겨 둔다.
+      captureReadingPoint();
       if (scrollToLastUserMessage(chatStreamRef.current)) {
-        handledLastUserMessageRef.current.set(activeChatId, lastUserMessageId);
+        chatLocalMemory.markLastUserMessageHandled(activeChatId, lastUserMessageId);
       }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [messageDisplayMode, tab, activeChatId, lastUserMessageId]);
+  }, [captureReadingPoint, chatLocalMemory, messageDisplayMode, tab, activeChatId, lastUserMessageId]);
 
   // 과거 구간이 위에 붙으면 스크롤 높이가 늘어나 읽던 자리가 밀린다. 원문이 처음 도착한
   // 시점에 메시지 표시 위치 설정을 다시 적용해 화면을 제자리에 맞춘다. 채팅마다 한 번만 한다.
   const historyPlacedChatRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!transcript.detail || !activeChatId || historyPlacedChatRef.current === activeChatId) return undefined;
+    if (!transcript.loaded || !activeChatId || historyPlacedChatRef.current === activeChatId) return undefined;
     historyPlacedChatRef.current = activeChatId;
     if (messageDisplayMode === "start") return undefined;
     const frame = window.requestAnimationFrame(() => {
@@ -659,12 +643,10 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
       if (followLatestMessagesRef.current) container.scrollTo({ top: container.scrollHeight, behavior: "auto" });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [activeChatId, messageDisplayMode, tab, transcript.detail]);
+  }, [activeChatId, messageDisplayMode, tab, transcript.loaded]);
 
   useEffect(() => () => {
-    bumpConnectionGeneration();
-    const connection = connectionRef.current;
-    connectionRef.current = null;
+    const { connection } = takeConnection();
     if (connection) void connection.detach();
   }, []);
 
@@ -675,72 +657,65 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
       return true;
     }
 
-    chatSwitchingRef.current = true;
-    setChatSwitching(true);
+    markChatSwitching(true);
     const previous = connected;
     const previousInfo = sessionRef.current ?? previous?.info ?? null;
     const previousSurface = captureChatSurface();
     if (previousInfo) rememberChatLocalState(previousInfo.chatId);
 
-    const generation = bumpConnectionGeneration();
-    connectionRef.current = null;
+    const { generation } = takeConnection();
     setTab("conversation");
     setError(null);
-    applyChatSurface(connectingChatSurface(chatDraftsRef.current.get(chatId)));
+    applyChatSurface(connectingChatSurface(chatLocalMemory.draftOf(chatId)));
 
-    let detachedPrevious = false;
+    const restorable = previousInfo && previous ? { info: previousInfo, connection: previous } : null;
     try {
-      if (previous) {
-        await previous.detach();
-        detachedPrevious = true;
-      }
-      const nextConnection = await attachChat(chatId, eventsForGeneration(generation));
-      if (generation !== connectionGenerationRef.current) {
-        // 이 창이 다시 마운트되었거나 다음 전환이 시작되어 이 연결의 이벤트는 세대 검사에서
-        // 버려진다. 화면에 붙이면 세션 정보만 있고 대화는 비어 있는 상태로 남으므로,
-        // 연결을 정리하고 실패로 알려 뒤에 큐에 든 전환이 다시 붙게 한다.
-        await detachQuietly(nextConnection);
-        return false;
-      }
-      connectionRef.current = nextConnection;
-      applyAttachSnapshot(nextConnection.info, generation);
-      const scrollTop = chatScrollPositionsRef.current.get(nextConnection.info.chatId);
-      if (scrollTop !== undefined) {
-        window.requestAnimationFrame(() => chatStreamRef.current?.scrollTo({ top: scrollTop, behavior: "auto" }));
-      }
-      return true;
-    } catch (cause) {
-      let restored = false;
-      if (previousInfo && previous && detachedPrevious) {
-        try {
+      const outcome = await switchAttachedChat({
+        detachPrevious: previous ? () => previous.detach() : null,
+        attachNext: async () => {
+          const nextConnection = await attachChat(chatId, eventsForGeneration(generation));
+          if (generation !== connectionGenerationRef.current) {
+            // 이 창이 다시 마운트되었거나 다음 전환이 시작되어 이 연결의 이벤트는 세대 검사에서
+            // 버려진다. 화면에 붙이면 세션 정보만 있고 대화는 비어 있는 상태로 남으므로,
+            // 연결을 정리하고 실패로 알려 뒤에 큐에 든 전환이 다시 붙게 한다.
+            await detachQuietly(nextConnection);
+            return false;
+          }
+          connectionRef.current = nextConnection;
+          applyAttachSnapshot(nextConnection.info, generation);
+          const scrollTop = chatLocalMemory.scrollTopOf(nextConnection.info.chatId);
+          if (scrollTop !== undefined) {
+            window.requestAnimationFrame(() => chatStreamRef.current?.scrollTo({ top: scrollTop, behavior: "auto" }));
+          }
+          return true;
+        },
+        reattachPrevious: restorable && (async () => {
           const previousGeneration = bumpConnectionGeneration();
-          const previousConnection = await attachChat(previousInfo.chatId, eventsForGeneration(previousGeneration));
+          const previousConnection = await attachChat(restorable.info.chatId, eventsForGeneration(previousGeneration));
           connectionRef.current = previousConnection;
           applyAttachSnapshot(previousConnection.info, previousGeneration);
           // 스냅숏이 세션 정보와 함께 단계까지 되돌려 놓으므로, 떠 둔 화면 상태는 그 뒤에 얹는다.
           applyChatSurface(previousSurface);
-          restored = true;
-        } catch {
-          // The previous runtime remains discoverable in the live-chat tabs.
-        }
-      } else if (previousInfo && previous) {
-        connectionRef.current = previous;
-        applySessionInfo(previousInfo);
-        applyChatSurface(previousSurface);
-        restored = true;
-      }
-      if (!restored) {
-        sessionRef.current = null;
-        setSession(null);
-      }
-      setError(`${restored ? "이전 채팅은 유지했지만 " : ""}채팅으로 전환하지 못했습니다: ${errorText(cause)}`);
+          return true;
+        }),
+        keepPrevious: restorable && (() => {
+          connectionRef.current = restorable.connection;
+          applySessionInfo(restorable.info);
+          applyChatSurface(previousSurface);
+          return true;
+        }),
+      });
+      if (outcome.ok) return outcome.switched;
+      if (!outcome.restored) putSession(null);
+      reportFailure(outcome.restored
+        ? `${text("이전 채팅은 유지했지만", "Previous chat was preserved, but")} ${text("채팅으로 전환하지 못했습니다", "failed to switch to chat")}`
+        : text("채팅으로 전환하지 못했습니다", "Failed to switch to chat"), outcome.cause);
       return false;
     } finally {
-      chatSwitchingRef.current = false;
-      setChatSwitching(false);
+      markChatSwitching(false);
       void refreshLiveChats();
     }
-  }, [applyChatSurface, applySessionInfo, captureChatSurface, handleEvent, rememberChatLocalState, refreshLiveChats]);
+  }, [applyChatSurface, applySessionInfo, captureChatSurface, handleEvent, markChatSwitching, putSession, rememberChatLocalState, refreshLiveChats]);
 
   /**
    * 전환 요청을 순서대로 처리한다. 진행 중인 전환을 그냥 버리면 그 attach 결과를 받을
@@ -749,10 +724,8 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
    * 그 경우였다.
    */
   const switchChat = useCallback((chatId: string): Promise<boolean> => {
-    const pending = chatSwitchQueueRef.current.then(() => runChatSwitch(chatId));
-    chatSwitchQueueRef.current = pending.then(() => undefined, () => undefined);
-    return pending;
-  }, [runChatSwitch]);
+    return queueChatSwitch(() => runChatSwitch(chatId));
+  }, [queueChatSwitch, runChatSwitch]);
 
   useEffect(() => {
     if (!attentionTarget) return undefined;
@@ -763,46 +736,40 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     return () => { cancelled = true; };
   }, [attentionTarget, onAttentionTargetHandled, switchChat]);
 
-  const selectedProject = projects.find((project) => project.path === cwd) ?? null;
-  const usingManualCwd = manualCwd || !selectedProject;
   const providerModels = models.filter((option) => option.source === source);
-  const reasoningOptions = reasoningOptionsFor(providerOptions, model);
-
-  useEffect(() => {
-    // 카탈로그 로딩 중(options 비어 있음)에는 복원한 값을 지우지 않는다.
-    if (reasoningEffort && reasoningOptions.length > 0 && !reasoningOptions.some((option) => option.effort === reasoningEffort)) {
-      setReasoningEffort("");
-    }
-  }, [reasoningEffort, reasoningOptions]);
+  const { launchAdvancedSettings } = useLaunchAdvancedSettings({
+    source,
+    catalog: providerOptions,
+    recent: providerModels,
+    extraSettings,
+    onExtraSettingChange: (key, value) => setExtraSettings((current) => ({ ...current, [key]: value })),
+  });
+  const reasoningOptions = useCatalogReasoningOptions(providerOptions, model, reasoningEffort, () => setReasoningEffort(""));
 
   const addInitialFiles = (files: File[]) => {
-    setInitialAttachments((current) => {
-      const result = appendAttachmentDrafts(current, files);
-      setAttachmentNotice(result.error);
-      return result.drafts;
-    });
+    setInitialAttachments((current) => addAttachmentDrafts(current, files, setAttachmentNotice));
   };
 
   const addComposerFiles = (files: File[]) => {
-    setComposerAttachments((current) => {
-      const result = appendAttachmentDrafts(current, files);
-      setAttachmentNotice(result.error);
-      composerAttachmentsRef.current = result.drafts;
-      return result.drafts;
-    });
+    putComposerAttachments(addAttachmentDrafts(composerAttachmentsRef.current, files, setAttachmentNotice));
   };
 
+  // 새 채팅 화면과 진행 중인 채팅 화면 어디에 놓아도 그 화면의 첨부 목록으로 들어간다.
+  const { over: launchDropTarget, dropProps: launchDropProps } = useFileDropZone(addInitialFiles, starting, setAttachmentNotice);
+  // 앞 첨부를 올리는 중에는 받지 않는다. 전송 절차가 목록을 스냅샷으로 덮어써,
+  // 그사이 놓은 파일은 화면에서도 전송에서도 조용히 사라진다.
+  const { over: chatDropTarget, dropProps: chatDropProps } = useFileDropZone(addComposerFiles, uploadingAttachments, setAttachmentNotice);
+
   const removeComposerAttachment = (draft: ChatAttachmentDraft) => {
-    const next = composerAttachmentsRef.current.filter((item) => item.key !== draft.key);
-    composerAttachmentsRef.current = next;
-    setComposerAttachments(next);
+    putComposerAttachments(composerAttachmentsRef.current.filter((item) => item.key !== draft.key));
     releaseAttachmentDraftUpload(draft, sessionRef.current?.chatId);
   };
 
   /**
    * 아직 만들지 않은 폴더를 작업 경로로 적고 시작하는 것은 흔한 첫 동작이다. 없는 경로일
    * 때만 만들지 물어보고, 승인하면 그 한 칸을 만든 뒤 같은 시작을 한 번 더 시도한다.
-   * 실패가 이 종류가 아니거나 사용자가 거절하면 원래 실패를 그대로 올려 보낸다.
+   * 실패가 이 종류가 아니거나 사용자가 거절하면 원래 실패를 그대로 올려 보낸다. 물음은
+   * 브라우저 confirm이 아니라 화면 공용 확인 모달로 띄우고 만들 경로를 그대로 보여 준다.
    */
   const connectWithMissingDirectoryOffer = async (
     request: Parameters<typeof connectChat>[0],
@@ -812,59 +779,65 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
       return await connectChat(request, onEvent);
     } catch (cause) {
       const missing = missingDirectoryPath(errorText(cause));
-      if (!missing || !window.confirm(missingDirectoryPrompt(missing))) throw cause;
+      if (!missing) throw cause;
+      // 없는 칸이 여럿이면 중간 칸도 새로 생긴다. 승인 전에 생길 것을 모두 보여 준다(C6-4b).
+      const plan = await previewDirectoryCreation(missing).catch(() => null);
+      const items = directoryCreationItems(plan, missing);
+      const accepted = await confirm({
+        title: text("새 폴더 만들기", "Create new folder"),
+        message: items.length > 1
+          ? text("이 경로에 폴더가 없습니다. 아래 폴더를 차례로 만들고 채팅을 시작할까요?", "There is no folder at this path. Create the following folders in order and start chat?")
+          : text("이 경로에 폴더가 없습니다. 새로운 폴더를 만들고 채팅을 시작할까요?", "There is no folder at this path. Create a new folder and start chat?"),
+        items,
+        confirmLabel: text("만들고 시작", "Create and start"),
+      });
+      if (!accepted) throw cause;
       const created = await createDirectory(missing);
       setCwd(created.path);
-      return await connectChat({ ...request, cwd: created.path }, onEvent);
+      const connection = await connectChat({ ...request, cwd: created.path }, onEvent);
+      // 첫 시도의 거절은 이벤트 흐름을 타고 이미 오류 배너에 실렸다(`chatSocketAttempt`가
+      // 최초 거절을 `error` 이벤트로 올린다). 폴더를 만들고 다시 붙은 지금 그 배너는 더
+      // 이상 현재 상태가 아닌데, 뒤따르는 `state` 이벤트는 배너를 지우지 않는다 — 지우는
+      // 것은 새 턴과 리플레이뿐이라, 첫 메시지를 보내기 전까지 "경로를 찾을 수 없습니다"가
+      // 멀쩡히 도는 채팅 위에 남아 있었다. 만들어 준 쪽이 여기서 걷는다.
+      setError(null);
+      return connection;
     }
   };
 
   const start = async (event: FormEvent) => {
     event.preventDefault();
-    if (!cwd.trim() || starting) return;
+    if (starting) return;
     setStarting(true);
     setError(null);
-    turnsRef.current = [];
-    setTurns([]);
-    phaseRef.current = "connecting";
-    setPhase("connecting");
+    putTurns([]);
+    putPhase("connecting");
     try {
       const generation = bumpConnectionGeneration();
       const connection = await connectWithMissingDirectoryOffer(
-        { source, accountId: launchAccountId || null, cwd: cwd.trim(), model: model.trim() || null, reasoningEffort: reasoningEffort || null, mode, approvalMode, resumeSessionId: null, unattended: false, settings: extraSettings },
+        { source, accountId: launchAccountId || null, cwd: cwd.trim(), model: model.trim() || null, localConnectionId: localConnectionIdForRequest(source, localConnectionId), reasoningEffort: reasoningEffort || null, mode, approvalMode, resumeSessionId: null, unattended: false, settings: extraSettings },
         eventsForGeneration(generation),
       );
       connectionRef.current = connection;
       applyAttachSnapshot(connection.info, generation);
-      saveChatLaunchSettings(source, { model: model.trim(), reasoningEffort });
+      saveChatLaunchSettings(source, { model: model.trim(), reasoningEffort, localConnectionId });
       if (connection.info.providerSessionId) {
         void onSessionCatalogChanged(connection.info.source, connection.info.providerSessionId);
       }
       const first = initialPrompt.trim();
       if (first || initialAttachments.length > 0) {
-        composerRef.current = first;
-        composerAttachmentsRef.current = initialAttachments;
-        setComposer(first);
-        setComposerAttachments(initialAttachments);
+        putComposerDraft(first, initialAttachments);
         setInitialPrompt("");
         setInitialAttachments([]);
         setUploadingAttachments(true);
-        const uploaded = await uploadAttachmentDrafts(connection.info.chatId, initialAttachments, (next) => {
-          composerAttachmentsRef.current = next;
-          setComposerAttachments(next);
-        });
-        await connection.send(first, { attachmentIds: uploaded.flatMap((draft) => draft.uploaded ? [draft.uploaded.id] : []) });
-        composerRef.current = "";
-        composerAttachmentsRef.current = [];
-        setComposer("");
-        setComposerAttachments([]);
+        await sendWithAttachmentDrafts(connection, first, initialAttachments, putComposerAttachments);
+        putComposerDraft("", []);
       }
     } catch (cause) {
       if (connectionRef.current) {
-        setError(`채팅은 시작했지만 첫 메시지를 보내지 못했습니다: ${errorText(cause)}`);
+        reportFailure(text("채팅은 시작했지만 첫 메시지를 보내지 못했습니다", "Chat started, but failed to send the first message"), cause);
       } else {
-        sessionRef.current = null;
-        setSession(null);
+        putSession(null);
         setError(errorText(cause));
       }
     } finally {
@@ -881,7 +854,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
    * 공급자 세션 ID를 알고 있으면 세션 화면에서 하던 이어가기를 이 자리에서 그대로 할 수 있다.
    */
   const canResumeChat = Boolean(session?.providerSessionId) && (phase === "stopped" || phase === "failed") && !chatSwitching && !resuming;
-  const pendingApprovals = turns.flatMap((turn) => turn.entries).filter((entry): entry is Extract<ChatEntry, { type: "approval" }> => entry.type === "approval" && entry.interactive && !entry.resolved);
+  const pendingApprovals = pendingChatApprovals(turns);
   /**
    * 지금 답을 기다리는 계획 검토. 계획은 아직 아무것도 실행하지 않은 상태라, 이 자리에서만
    * 실행 중에도 에이전트·실행 계정을 바꿀 수 있다. 바꾸면 이 실행은 승인 없이 접히고
@@ -898,25 +871,19 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     if (!current || resumingRef.current || chatSwitchingRef.current) return null;
     const providerSessionId = current.providerSessionId;
     if (!providerSessionId) {
-      setError("공급자 세션이 기록되기 전에 종료된 채팅이라 이어갈 수 없습니다. 새 채팅을 시작하세요.");
+      setError(text("공급자 세션이 기록되기 전에 종료된 채팅이라 이어갈 수 없습니다. 새 채팅을 시작하세요.", "Cannot resume because the chat ended before the provider session was recorded. Please start a new chat."));
       return null;
     }
-    resumingRef.current = true;
-    setResuming(true);
+    markResuming(true);
     setError(null);
-    const previous = connectionRef.current;
     const previousPhase = phaseRef.current;
-    phaseRef.current = "connecting";
-    setPhase("connecting");
-    const generation = bumpConnectionGeneration();
-    connectionRef.current = null;
-    await detachQuietly(previous);
+    putPhase("connecting");
+    const generation = await retireConnection(connectionRef.current);
     const adoptConnection = (nextConnection: ChatConnection) => {
       connectionRef.current = nextConnection;
       // 이전 chatId로 남은 초안·스크롤 기억은 다시 열릴 일이 없는 런타임의 것이다.
-      forgetChatLocalState(current.chatId);
-      setQueue([]);
-      queueRef.current = [];
+      chatLocalMemory.forget(current.chatId);
+      putQueue([]);
       applyAttachSnapshot(nextConnection.info, generation);
       return nextConnection;
     };
@@ -934,6 +901,8 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
         source: current.source,
         cwd: current.cwd,
         model: model.trim() || null,
+        // 같은 세션은 같은 연결로 잇는다. 화면 값이 비어 있으면 세션이 보고한 연결을 쓴다.
+        localConnectionId: localConnectionIdForRequest(current.source, localConnectionId || current.localConnectionId || ""),
         reasoningEffort: reasoningEffort || null,
         mode,
         approvalMode,
@@ -951,23 +920,53 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
           setError(null);
           return adoptConnection(existingConnection);
         } catch (attachCause) {
-          phaseRef.current = previousPhase;
-          setPhase(previousPhase);
-          setError(`기존 세션 실행에 연결하지 못했습니다: ${errorText(attachCause)}`);
+          putPhase(previousPhase);
+          reportFailure(text("기존 세션 실행에 연결하지 못했습니다", "Failed to connect to existing session run"), attachCause);
           return null;
         }
       }
       // 떼어낸 연결을 되돌려 놓아 봐야 이미 끊긴 구독이다. 상태만 종료된 그대로 돌려놓고
       // 다시 시도할 수 있게 둔다(이어가기는 연결이 아니라 세션 ID로 한다).
-      phaseRef.current = previousPhase;
-      setPhase(previousPhase);
-      setError(`대화를 이어가지 못했습니다: ${errorText(cause)}`);
+      putPhase(previousPhase);
+      reportFailure(text("대화를 이어가지 못했습니다", "Failed to resume conversation"), cause);
       return null;
     } finally {
-      resumingRef.current = false;
-      setResuming(false);
+      markResuming(false);
       void refreshLiveChats();
     }
+  };
+
+  /**
+   * 한도에 걸린 계정으로 실행 중이면, 보내기 전에 같은 대화를 지금의 기본 계정에서 다시
+   * 연다. 자격증명은 CLI가 뜰 때 박히므로 살아 있는 실행에 그냥 보내면 같은 계정으로 나가
+   * 같은 한도 오류가 돌아온다 — 기본 계정을 이미 바꿔 두었더라도 그렇다. 옮길지 말지는
+   * `limitedAccountHandoff`가 정하고(고정 세션·막힌 계정은 제외), 재기동은 실행 계정을
+   * 손으로 바꿀 때와 같은 경로를 쓴다.
+   *
+   * 응답 중인 턴은 건드리지 않는다. 돌고 있다는 것은 그 계정이 아직 받아 주고 있다는
+   * 뜻이고, 여기서 끊으면 진행 중인 작업을 잃는다. 종료된 채팅의 이어가기는 백엔드가
+   * 계정을 다시 풀므로(`resolve_start_account_plan`) 이 길을 타지 않는다.
+   *
+   * 옮기려다 실패했으면 false — 오류는 `changeActiveChatSettings`가 남겼고, 이번 전송은
+   * 입력창의 글을 지우지 않고 멈춘다.
+   */
+  const reopenOnCurrentAccountIfLimited = async (): Promise<boolean> => {
+    if (!session?.providerSessionId || phase !== "ready" || settingsChangeRef.current) return true;
+    const handoff = limitedAccountHandoff({
+      accounts,
+      source: session.source,
+      runtimeAccountId: session.accountId ?? null,
+      pinnedAccountId: chatCatalogSession(session, sessions)?.meta.pinnedAccountId ?? null,
+    });
+    if (!handoff) return true;
+    const previous = connectionRef.current;
+    await changeActiveChatSettings({ accountId: handoff.toAccountId }, text("실행 계정을", "execution account"));
+    if (connectionRef.current === previous) return false;
+    setAccountHandoffNotice(text(
+      `${handoff.fromLabel} 계정이 사용량 한도에 걸려, 이 대화를 ${handoff.toLabel} 계정에서 다시 열었습니다.`,
+      `${handoff.fromLabel} hit its usage limit, so this conversation was reopened on ${handoff.toLabel}.`,
+    ));
+    return true;
   };
 
   /** deliverNow면 응답 중에도 중단 없이 진행 중인 작업에 바로 전달한다. */
@@ -975,25 +974,23 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     const draftText = composer.trim();
     const drafts = composerAttachmentsRef.current;
     if ((!draftText && drafts.length === 0) || uploadingAttachments) return;
+    setAccountHandoffNotice(null);
+    if (!await reopenOnCurrentAccountIfLimited()) return;
     // 종료된 채팅이면 먼저 이어간 뒤 그 런타임으로 보낸다.
     const connection = canResumeChat ? await resumeChat() : connectionRef.current;
     // 쓴 글이 있는데 보낼 길이 없으면 이유를 남긴다. 조용히 돌아가면 사용자에게는
     // 버튼이 먹지 않는 것과 구분되지 않는다(이어가기 실패는 resumeChat이 남긴다).
     if (!connection) {
-      if (!canResumeChat) setError("이 채팅에 연결되어 있지 않아 메시지를 보내지 못했습니다. 채팅 목록에서 이 채팅을 다시 열어 주세요.");
+      if (!canResumeChat) setError(text("이 채팅에 연결되어 있지 않아 메시지를 보내지 못했습니다. 채팅 목록에서 이 채팅을 다시 열어 주세요.", "Failed to send message because you are not connected to this chat. Please reopen this chat from the chat list."));
       return;
     }
     if (!canResumeChat && !composerUsable) {
-      setError(`지금은 메시지를 보낼 수 없는 상태입니다(${phaseLabel(phase, text)}). 잠시 뒤 다시 시도하세요.`);
+      setError(`${text("지금은 메시지를 보낼 수 없는 상태입니다", "Cannot send messages right now")}(${phaseLabel(phase, text)}). ${text("잠시 뒤 다시 시도하세요.", "Please try again in a moment.")}`);
       return;
     }
     setError(null);
     setUploadingAttachments(true);
     try {
-      const uploaded = await uploadAttachmentDrafts(connection.info.chatId, drafts, (next) => {
-        composerAttachmentsRef.current = next;
-        setComposerAttachments(next);
-      });
       // 에이전트를 바꿔 만든 새 세션의 첫 전송에만 인계 문맥을 앞에 싣는다.
       const handoff = pendingHandoffRef.current;
       pendingHandoffRef.current = null;
@@ -1005,14 +1002,8 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
           request: draftText,
         })
         : draftText;
-      await connection.send(outgoing, {
-        steer: deliverNow,
-        attachmentIds: uploaded.flatMap((draft) => draft.uploaded ? [draft.uploaded.id] : []),
-      });
-      composerRef.current = "";
-      composerAttachmentsRef.current = [];
-      setComposer("");
-      setComposerAttachments([]);
+      await sendWithAttachmentDrafts(connection, outgoing, drafts, putComposerAttachments, { steer: deliverNow });
+      putComposerDraft("", []);
     } catch (cause) {
       setError(errorText(cause));
     } finally {
@@ -1027,13 +1018,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
 
   const runConnectionAction = async (action: (connection: ChatConnection) => Promise<unknown>) => {
     setError(null);
-    const connection = connectionRef.current;
-    if (!connection) return;
-    try {
-      await action(connection);
-    } catch (cause) {
-      setError(errorText(cause));
-    }
+    await runChatConnectionAction(connectionRef.current, action, setError);
   };
 
   const removeQueued = async (messageId: string) => {
@@ -1044,33 +1029,28 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     setError(null);
     try {
       await connectionRef.current?.removeQueued(message.id);
-      setComposer((current) => {
-        const next = current.trim() ? `${current}\n${message.text}` : message.text;
-        composerRef.current = next;
-        return next;
-      });
-      const attachments = [...composerAttachmentsRef.current, ...queuedAttachmentsToDrafts(message.attachments, connectionRef.current?.info.chatId ?? null)];
-      composerAttachmentsRef.current = attachments;
-      setComposerAttachments(attachments);
+      const current = composerRef.current;
+      putComposerDraft(
+        current.trim() ? `${current}\n${message.text}` : message.text,
+        [...composerAttachmentsRef.current, ...queuedAttachmentsToDrafts(message.attachments, connectionRef.current?.info.chatId ?? null)],
+      );
     } catch (cause) {
       setError(errorText(cause));
     }
   };
 
-  const decide = async (approvalId: string, decision: ChatApprovalDecision, answers?: Record<string, string>) => {
-    await runConnectionAction((connection) => connection.approve(approvalId, decision, answers));
+  const decide = async (approvalId: string, decision: ChatApprovalDecision, answers?: Record<string, string>, secret?: string, saveSecret?: boolean) => {
+    await runConnectionAction((connection) => connection.approve(approvalId, decision, answers, secret, saveSecret));
+    // 비밀값 줄은 맡긴 값이 있을 때만 나타난다(ChatSecretsPanel). 값이 들어가는 다른 길이
+    // 이 카드이므로, 여기서 알려 주지 않으면 첫 값은 목록에 닿지 못하고 줄도 숨은 채다.
+    if (secret !== undefined) setChatSecretSignal((current) => current + 1);
   };
 
   const interrupt = async () => {
     await runConnectionAction((connection) => connection.interrupt());
   };
 
-  interface ActiveChatSettings {
-    mode: ChatMode;
-    approvalMode: ChatApprovalMode;
-    model: string;
-    reasoningEffort: ReasoningEffort | "";
-    extraSettings: Record<string, string>;
+  interface ActiveChatSettings extends ChatRuntimeSettings {
     /**
      * 이 실행이 쓸 계정. 빈 값은 "이어가기 설정이 정하는 계정"이다.
      *
@@ -1080,6 +1060,36 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
      */
     accountId: string;
   }
+
+  /**
+   * 같은 채팅을 새 실행으로 갈아끼운다. 설정 변경과 에이전트 인계가 각자 적던 뒷부분 —
+   * 새 연결 요청, 연결 채택과 첫 스냅숏 반영, 실패했을 때 단계를 멈춤으로 내리기, 끝에서
+   * 설정 변경 잠금 풀기 — 은 두 갈래가 같으므로 여기 한 벌로 둔다. 갈래마다 다른 것은
+   * 요청값과 실패 문구, 연결 앞뒤로 할 일뿐이라 손잡이로 받는다.
+   *
+   * 종료에 실패하면 `beginChatRelaunch`가 화면을 되돌리고 여기서는 아무것도 하지 않는다.
+   */
+  const relaunchChat = async ({ onStopFailed, beforeConnect, request, onConnected, onConnectFailed }: {
+    onStopFailed: (cause: unknown) => void;
+    beforeConnect?: () => void;
+    request: ChatStartRequest;
+    onConnected?: (connection: ChatConnection) => Promise<void> | void;
+    onConnectFailed: (cause: unknown) => void;
+  }): Promise<void> => {
+    const generation = await beginChatRelaunch({ onStopFailed });
+    if (generation === null) return;
+    beforeConnect?.();
+    try {
+      const nextConnection = await connectChat(request, eventsForGeneration(generation));
+      connectionRef.current = nextConnection;
+      applyAttachSnapshot(nextConnection.info, generation);
+      await onConnected?.(nextConnection);
+    } catch (cause) {
+      setPhase("stopped");
+      onConnectFailed(cause);
+    }
+    settingsChangeRef.current = false;
+  };
 
   const changeActiveChatSettings = async (next: Partial<ActiveChatSettings>, label: string) => {
     if (!session || phase === "connecting" || chatBusy || settingsChangeRef.current) return;
@@ -1099,64 +1109,40 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
       && target.accountId === current.accountId
       && sameChatSettings(target.extraSettings, current.extraSettings)) return;
     if (!session.providerSessionId && turns.length > 0) {
-      setError(`${label} 변경하려면 공급자 세션 연결이 완료되어야 합니다.`);
+      setError(`${label} ${text("변경하려면 공급자 세션 연결이 완료되어야 합니다.", "requires provider session connection to be completed.")}`);
       return;
     }
 
     const previous: ActiveChatSettings = current;
-    const previousPhase = phase;
-    const connection = connectionRef.current;
-    const apply = (settings: ActiveChatSettings) => {
-      setMode(settings.mode);
-      setApprovalMode(settings.approvalMode);
-      setModel(settings.model);
-      setReasoningEffort(settings.reasoningEffort);
-      setExtraSettings(settings.extraSettings);
-    };
 
-    settingsChangeRef.current = true;
-    apply(target);
-    setError(null);
-    setPhase("connecting");
-    if (connection) {
-      try {
-        await connection.stop();
-      } catch (cause) {
-        apply(previous);
-        setPhase(previousPhase);
-        setError(`${label} 변경하지 못했습니다: ${errorText(cause)}`);
-        settingsChangeRef.current = false;
-        return;
-      }
-    }
-
-    const generation = await retireConnection(connection);
-    setQueue([]);
-    setPhase("connecting");
-    try {
-      const nextConnection = await connectChat({
+    applyRuntimeSettings(target);
+    await relaunchChat({
+      onStopFailed: (cause) => {
+        applyRuntimeSettings(previous);
+        reportFailure(`${label} ${text("변경하지 못했습니다", "failed to change")}`, cause);
+      },
+      request: {
         source: session.source,
         accountId: target.accountId || null,
         cwd: session.cwd,
         model: target.model.trim() || null,
+        localConnectionId: localConnectionIdForRequest(session.source, target.localConnectionId ?? session.localConnectionId ?? ""),
         reasoningEffort: target.reasoningEffort || null,
         mode: target.mode,
         approvalMode: target.approvalMode,
         resumeSessionId: session.providerSessionId,
         unattended: false,
         settings: target.extraSettings,
-      }, eventsForGeneration(generation));
-      connectionRef.current = nextConnection;
-      applyAttachSnapshot(nextConnection.info, generation);
-      saveChatLaunchSettings(session.source, {
-        model: target.model.trim(),
-        reasoningEffort: target.reasoningEffort,
-      });
-    } catch (cause) {
-      setPhase("stopped");
-      setError(`${label} 변경 후 채팅에 다시 연결하지 못했습니다: ${errorText(cause)}`);
-    }
-    settingsChangeRef.current = false;
+      },
+      onConnected: () => {
+        saveChatLaunchSettings(session.source, {
+          model: target.model.trim(),
+          reasoningEffort: target.reasoningEffort,
+          localConnectionId: target.localConnectionId ?? "",
+        });
+      },
+      onConnectFailed: (cause) => reportFailure(`${label} ${text("변경 후 채팅에 다시 연결하지 못했습니다", "failed to reconnect to chat after change")}`, cause),
+    });
   };
 
   /**
@@ -1171,14 +1157,14 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     if (!session || settingsChangeRef.current || nextSource === session.source) return;
     const plan = pendingPlanApproval;
     if (!plan && (phase === "connecting" || chatBusy)) return;
-    const originSessionId = requireProviderSessionId("에이전트를");
+    const originSessionId = requireProviderSessionId(text("에이전트를", "agent"));
     if (!originSessionId) return;
     await confirmAndRestart(plan, {
-      title: "에이전트를 바꿀까요?",
+      title: text("에이전트를 바꿀까요?", "Change agent?"),
       message: plan
-        ? planHandoffMessage(`${providerLabel(nextSource)}의 새 세션을 만들어 이 계획을 넘깁니다.`, planModeNotice(mode))
-        : `${providerLabel(nextSource)}의 새 세션을 만들고 지금까지의 대화를 인계합니다.\n원본 ${providerLabel(session.source)} 세션은 변경하지 않고 그대로 남습니다.`,
-      confirmLabel: plan ? PLAN_RESTART_CONFIRM_LABEL : "새 세션으로 인계",
+        ? planHandoffMessage(`${sourceName(nextSource)}: ${text("새 세션을 만들어 이 계획을 넘깁니다.", "Create a new session to hand off this plan.")}`, planModeNotice(mode))
+        : `${sourceName(nextSource)}: ${text("새 세션을 만들고 지금까지의 대화를 인계합니다.", "Create a new session and hand over the conversation so far.")}\n${text("원본 세션은 변경하지 않고 그대로 남습니다.", "The original session remains unchanged.")}`,
+      confirmLabel: plan ? planRestartConfirmLabel : text("새 세션으로 인계", "Hand over to new session"),
     }, {
       source: nextSource,
       accountId: null,
@@ -1196,15 +1182,15 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     if (!session || settingsChangeRef.current) return;
     const plan = pendingPlanApproval;
     if (!plan) {
-      await changeActiveChatSettings({ accountId: nextAccountId }, "실행 계정을");
+      await changeActiveChatSettings({ accountId: nextAccountId }, text("실행 계정을", "execution account"));
       return;
     }
     if ((session.accountId ?? "") === nextAccountId) return;
-    if (!requireProviderSessionId("실행 계정을")) return;
+    if (!requireProviderSessionId(text("실행 계정을", "execution account"))) return;
     await confirmAndRestart(plan, {
-      title: "실행 계정을 바꿀까요?",
-      message: planHandoffMessage("같은 대화를 선택한 계정으로 다시 열어 이 계획을 넘깁니다.", planModeNotice(mode)),
-      confirmLabel: PLAN_RESTART_CONFIRM_LABEL,
+      title: text("실행 계정을 바꿀까요?", "Change execution account?"),
+      message: planHandoffMessage(text("같은 대화를 선택한 계정으로 다시 열어 이 계획을 넘깁니다.", "Reopen the same conversation with the selected account to hand off this plan."), planModeNotice(mode)),
+      confirmLabel: planRestartConfirmLabel,
     }, {
       source: session.source,
       accountId: nextAccountId || null,
@@ -1217,27 +1203,28 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
    * 요청 모드를 바꾼다.
    *
    * 평소에는 같은 세션을 새 권한 범위로 다시 연결하면 끝이다. 계획 승인 중이라면 그
-   * 사이에 답을 기다리는 계획이 있는데, 살아 있는 실행에 권한을 더 얹는 길은 승인 응답에
-   * 실어 보내는 편집 자동 승인 하나뿐이다(승인 카드의 '계획대로 실행 + 편집 자동 승인'이
-   * 그것이다). 그보다 넓은 권한으로 이 계획을 실행하려면 접고 다시 띄우는 수밖에 없어,
+   * 사이에 답을 기다리는 계획이 있는데, 살아 있는 실행에 권한을 더 얹는 길은 승인 카드의
+   * 두 선택뿐이다 — 승인 응답에 실어 보내는 편집 자동 승인('계획대로 실행 + 편집 자동
+   * 승인')과, 계획 변경·질문 외의 권한 요청을 앱이 승인하는 전체 허용('계획대로 실행 +
+   * 전체 허용(정책 제외)'). 실행 모드 자체를 넓히려면 접고 다시 띄우는 수밖에 없어,
    * 에이전트·실행 계정 변경과 같은 길을 지나며 계획 본문을 새 실행의 첫 요청으로 넘긴다.
    */
   const changeActiveChatMode = async (nextMode: ChatMode) => {
     if (!session || settingsChangeRef.current) return;
     const plan = pendingPlanApproval;
     if (!plan) {
-      await changeActiveChatSettings({ mode: nextMode }, "요청 모드를");
+      await changeActiveChatSettings({ mode: nextMode }, text("요청 모드를", "request mode"));
       return;
     }
     // 계획 모드로 되돌리는 것은 "계획을 다시 세우라"는 뜻이고, 그건 승인 카드의 '계획 다시
     // 세우기'가 할 일이다. 계획을 넘겨받을 실행을 읽기 전용으로 띄우지는 않는다.
     if (nextMode === mode || nextMode === "plan") return;
-    if (!requireProviderSessionId("요청 모드를")) return;
+    if (!requireProviderSessionId(text("요청 모드를", "request mode"))) return;
     // 요청 모드는 여기서 직접 정하므로 `planModeNotice`가 알릴 것이 없다.
     await confirmAndRestart(plan, {
-      title: "요청 모드를 바꿀까요?",
-      message: planHandoffMessage(`같은 대화를 ${permissionModeLabel(nextMode)}로 다시 열어 이 계획을 넘깁니다.`),
-      confirmLabel: PLAN_RESTART_CONFIRM_LABEL,
+      title: text("요청 모드를 바꿀까요?", "Change request mode?"),
+      message: planHandoffMessage(`${text("같은 대화를", "Reopen the same conversation in")} ${permissionModeLabel(nextMode)}${text("로 다시 열어 이 계획을 넘깁니다.", " mode to hand off this plan.")}`),
+      confirmLabel: planRestartConfirmLabel,
     }, {
       source: session.source,
       accountId: session.accountId ?? null,
@@ -1252,7 +1239,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
    */
   const requireProviderSessionId = (label: string): string | null => {
     const providerSessionId = session?.providerSessionId ?? null;
-    if (!providerSessionId) setError(`${label} 바꾸려면 공급자 세션 연결이 완료되어야 합니다.`);
+    if (!providerSessionId) setError(`${label} ${text("바꾸려면 공급자 세션 연결이 완료되어야 합니다.", "requires provider session connection to be completed.")}`);
     return providerSessionId;
   };
 
@@ -1294,7 +1281,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
   /** 계획을 넘기며 읽기 전용을 벗어난다면 확인 창에서 그 사실도 함께 말한다. */
   const planModeNotice = (currentMode: ChatMode): string =>
     currentMode === "plan"
-      ? `\n요청 모드는 계획을 실행할 수 있도록 ${permissionModeLabel("workspace")}로 바뀝니다.`
+      ? `\n${text("요청 모드는 계획을 실행할 수 있도록", "Request mode changes to")} ${permissionModeLabel("workspace")}${text("로 바뀝니다.", " to execute the plan.")}`
       : "";
 
   /**
@@ -1316,35 +1303,17 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
   }) => {
     const current = sessionRef.current ?? session;
     if (!current) return;
-    const previousPhase = phase;
-    const connection = connectionRef.current;
-    settingsChangeRef.current = true;
-    setError(null);
-    setPhase("connecting");
-    if (connection) {
-      try {
-        await connection.stop();
-      } catch (cause) {
-        setPhase(previousPhase);
-        setError(`현재 실행을 종료하지 못했습니다: ${errorText(cause)}`);
-        settingsChangeRef.current = false;
-        return;
-      }
-    }
-    const generation = await retireConnection(connection);
-    setQueue([]);
-    // 인계는 새 세션이라 이전 실행의 화면 기록을 이어받지 않는다. 같은 세션 재개는
-    // 그대로 두어야 대화가 끊겨 보이지 않는다.
-    if (handoff) {
-      turnsRef.current = [];
-      setTurns([]);
-    }
-    try {
-      const nextConnection = await connectChat({
+    await relaunchChat({
+      onStopFailed: (cause) => reportFailure(text("현재 실행을 종료하지 못했습니다", "Failed to stop current run"), cause),
+      // 인계는 새 세션이라 이전 실행의 화면 기록을 이어받지 않는다. 같은 세션 재개는
+      // 그대로 두어야 대화가 끊겨 보이지 않는다.
+      beforeConnect: () => { if (handoff) putTurns([]); },
+      request: {
         source: nextSource,
         accountId,
         cwd: current.cwd,
         model: handoff ? null : model.trim() || null,
+        localConnectionId: handoff ? null : localConnectionIdForRequest(nextSource, localConnectionId || current.localConnectionId || ""),
         reasoningEffort: handoff ? null : reasoningEffort || null,
         mode: nextMode,
         approvalMode: handoff ? defaultApprovalMode(nextSource) : approvalMode,
@@ -1352,38 +1321,34 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
         handoffOrigin: handoff,
         unattended: false,
         settings: handoff ? {} : extraSettings,
-      }, eventsForGeneration(generation));
-      connectionRef.current = nextConnection;
-      applyAttachSnapshot(nextConnection.info, generation);
-      if (handoff) {
-        const context = { source: handoff.source, id: handoff.id, transcript: transcript.detail?.transcript ?? [] };
-        if (firstMessage === undefined) {
-          pendingHandoffRef.current = context;
-        } else {
-          await nextConnection.send(buildSessionHandoffMessage({
-            source: context.source,
-            sessionId: context.id,
-            transcript: context.transcript,
-            request: firstMessage,
-          }));
+      },
+      onConnected: async (nextConnection) => {
+        if (handoff) {
+          const context = { source: handoff.source, id: handoff.id, transcript: transcript.items };
+          if (firstMessage === undefined) {
+            pendingHandoffRef.current = context;
+          } else {
+            await nextConnection.send(buildSessionHandoffMessage({
+              source: context.source,
+              sessionId: context.id,
+              transcript: context.transcript,
+              request: firstMessage,
+            }));
+          }
+        } else if (firstMessage !== undefined) {
+          await nextConnection.send(firstMessage);
         }
-      } else if (firstMessage !== undefined) {
-        await nextConnection.send(firstMessage);
-      }
-    } catch (cause) {
-      setPhase("stopped");
-      setError(handoff
-        ? `인계할 새 세션을 시작하지 못했습니다: ${errorText(cause)}`
-        : `대화를 다시 연결하지 못했습니다: ${errorText(cause)}`);
-    }
-    settingsChangeRef.current = false;
+      },
+      onConnectFailed: (cause) => reportFailure(handoff
+        ? text("인계할 새 세션을 시작하지 못했습니다", "Failed to start new session to hand off")
+        : text("대화를 다시 연결하지 못했습니다", "Failed to reconnect conversation"), cause),
+    });
     void refreshLiveChats();
   };
 
   const newChat = async () => {
     if (chatSwitchingRef.current) return;
-    chatSwitchingRef.current = true;
-    setChatSwitching(true);
+    markChatSwitching(true);
     try {
       const connection = connectionRef.current;
       if (connection) {
@@ -1391,24 +1356,20 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
         rememberChatLocalState(current.chatId);
         await connection.detach();
       }
-      bumpConnectionGeneration();
-      connectionRef.current = null;
-      sessionRef.current = null;
-      setSession(null);
+      // 이미 떼어낸 연결이라 정리할 것은 없다. 세대만 올려 뒤늦은 이벤트를 버린다.
+      takeConnection();
+      putSession(null);
       applyChatSurface(connectingChatSurface());
       setError(null);
       // 실행 계정은 채팅 하나에만 적용하는 선택이다. 새 채팅은 기본값(활성 계정)에서 시작한다.
       setLaunchAccountId("");
       // 넘기려던 대화도 이 채팅과 함께 두고 간다.
       pendingHandoffRef.current = null;
-      void refreshProviderOptions(source).catch((cause) => {
-        setError(`최신 실행 설정을 불러오지 못했습니다: ${errorText(cause)}`);
-      });
+      loadLatestRuntimeOptions(source);
     } catch (cause) {
-      setError(`현재 채팅을 백그라운드로 보내지 못했습니다: ${errorText(cause)}`);
+      reportFailure(text("현재 채팅을 백그라운드로 보내지 못했습니다", "Failed to send current chat to background"), cause);
     } finally {
-      chatSwitchingRef.current = false;
-      setChatSwitching(false);
+      markChatSwitching(false);
       void refreshLiveChats();
     }
   };
@@ -1424,22 +1385,50 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
   };
 
   /**
+   * 채팅 목록 행의 즐겨찾기. 즐겨찾기는 세션 메타에 달리므로 공급자 세션이 아직 없는
+   * 채팅(첫 응답 전)에는 달 곳이 없다 — 그때는 버튼을 비활성으로 두고 사유를 툴팁에
+   * 남긴다. 바뀐 메타는 App의 스냅샷으로 올려 세션 목록·대시보드와 갈라지지 않게 한다.
+   */
+  const toggleChatFavorite = useCallback(async (chat: ChatSessionInfo) => {
+    const target = chatCatalogSession(chat, sessions);
+    if (!target) return;
+    await saveSessionMetaPatch(
+      target.source,
+      target.id,
+      target.meta,
+      { favorite: !target.meta.favorite },
+      (meta) => onMetaChanged(target.source, target.id, meta),
+      setError,
+    );
+  }, [sessions, onMetaChanged]);
+
+  /**
    * 채팅 실행 종료 확인을 받는다. 현재 채팅과 배경 채팅은 안내 문구만 다르고 제목·버튼·
    * '다음부터 표시 안 함' 처리가 같으므로, 확인을 꺼 둔 사용자를 묻지 않고 통과시키는
-   * 판단까지 여기 둔다.
+   * 판단까지 여기 둔다. 어느 문구를 쓸지는 갈래·진행 여부만 넘기면 `chatCloseConfirmMessage`가
+   * 정한다 — 호출부가 문구를 들고 있으면 한쪽만 고쳐 같은 동작을 두 가지로 설명하게 된다.
    */
-  const confirmChatClose = async (message: string): Promise<boolean> => {
+  const confirmChatClose = async (scope: ChatCloseScope, active: boolean): Promise<boolean> => {
     if (!shouldConfirmChatClose()) return true;
     return confirm({
-      title: "채팅 실행을 종료할까요?",
-      message,
-      confirmLabel: "종료",
+      title: text("채팅 실행을 종료할까요?", "Close chat run?"),
+      message: chatCloseConfirmMessage(scope, active),
+      confirmLabel: text("종료", "Close"),
       tone: "danger",
       checkbox: {
-        label: "다음부터 표시 안 함",
+        label: text("다음부터 표시 안 함", "Do not show again"),
         onConfirm: (checked) => { if (checked) hideChatCloseConfirmation(); },
       },
     });
+  };
+
+  /**
+   * 종료가 끝난 채팅을 화면 목록과 로컬 기억에서 함께 지운다. 두 갈래가 각자 두 줄로
+   * 적고 있었는데, 한쪽만 지우면 다시 열릴 일이 없는 채팅의 작성 초안·읽던 자리가 남는다.
+   */
+  const dropClosedChat = (chatId: string) => {
+    setLiveChats((chats) => chats.filter((chat) => chat.chatId !== chatId));
+    chatLocalMemory.forget(chatId);
   };
 
   const stopCurrentChat = async () => {
@@ -1447,31 +1436,24 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     const current = sessionRef.current;
     if (!connection || !current || chatSwitchingRef.current) return;
     const active = phaseRef.current === "running" || phaseRef.current === "waitingApproval";
-    const accepted = await confirmChatClose(active
-      ? "현재 진행 중인 작업과 대기열도 함께 종료됩니다.\n종료한 실행은 채팅 목록에서 제거됩니다."
-      : "현재 채팅 실행을 종료합니다.\n종료한 실행은 채팅 목록에서 제거됩니다.");
+    const accepted = await confirmChatClose("current", active);
     if (!accepted) return;
 
     const nextChatId = openChats.find((chat) => chat.chatId !== current.chatId)?.chatId ?? null;
-    chatSwitchingRef.current = true;
-    setChatSwitching(true);
+    markChatSwitching(true);
     setError(null);
     try {
       await connection.stop();
     } catch (cause) {
-      setError(`채팅 실행을 종료하지 못했습니다: ${errorText(cause)}`);
-      chatSwitchingRef.current = false;
-      setChatSwitching(false);
+      reportFailure(text("채팅 실행을 종료하지 못했습니다", "Failed to close chat run"), cause);
+      markChatSwitching(false);
       return;
     }
     await retireConnection(connection);
-    setLiveChats((chats) => chats.filter((chat) => chat.chatId !== current.chatId));
-    forgetChatLocalState(current.chatId);
-    sessionRef.current = null;
-    setSession(null);
+    dropClosedChat(current.chatId);
+    putSession(null);
     applyChatSurface(connectingChatSurface());
-    chatSwitchingRef.current = false;
-    setChatSwitching(false);
+    markChatSwitching(false);
     if (nextChatId) {
       await switchChat(nextChatId);
     } else {
@@ -1486,39 +1468,28 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     }
     if (chatSwitchingRef.current || closingChatIds.has(chat.chatId)) return;
     const active = chat.state === "running" || chat.state === "waitingApproval";
-    const accepted = await confirmChatClose(active
-      ? "이 채팅에서 진행 중인 작업과 대기열도 함께 종료됩니다.\n종료한 실행은 채팅 목록에서 제거됩니다."
-      : "이 채팅 실행을 종료하고 채팅 목록에서 제거합니다.");
+    const accepted = await confirmChatClose("background", active);
     if (!accepted) return;
 
     // 이 경로는 소켓을 새로 붙여 CLI 프로세스를 끝낼 때까지 몇 초가 걸린다. 그동안
     // chatSwitching으로 목록 전체를 잠그면 다른 채팅으로 옮기지도, 새 채팅을 열지도 못한다.
     // 지우는 행만 목록에서 먼저 빼고, 나머지 목록은 계속 쓸 수 있게 둔다.
     setError(null);
-    setClosingChatIds((current) => {
-      const next = new Set(current);
-      next.add(chat.chatId);
-      return next;
-    });
+    markChatClosing(chat.chatId, true);
     let backgroundConnection: ChatConnection | null = null;
     try {
       backgroundConnection = await attachChat(chat.chatId, () => {});
       await backgroundConnection.stop();
       await detachQuietly(backgroundConnection);
-      setLiveChats((chats) => chats.filter((candidate) => candidate.chatId !== chat.chatId));
-      forgetChatLocalState(chat.chatId);
+      dropClosedChat(chat.chatId);
     } catch (cause) {
       await detachQuietly(backgroundConnection);
-      setError(`채팅을 종료하지 못했습니다: ${errorText(cause)}`);
+      reportFailure(text("채팅을 종료하지 못했습니다", "Failed to close chat"), cause);
     } finally {
       // 서버 목록이 이 채팅을 실제로 뺐는지 확인한 뒤에 가림을 푼다. 먼저 풀면 종료 요청
       // 전에 떠난 폴링 응답이 방금 지운 행을 잠깐 되살린다. 실패했다면 행이 다시 보인다.
       try { await refreshLiveChats(); } catch { /* 폴링이 곧 다시 맞춘다. */ }
-      setClosingChatIds((current) => {
-        const next = new Set(current);
-        next.delete(chat.chatId);
-        return next;
-      });
+      markChatClosing(chat.chatId, false);
     }
   };
 
@@ -1527,14 +1498,9 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     if (session?.source !== "codex" || !providerSessionId || openingProviderApp) return;
     setOpeningProviderApp(true);
     setError(null);
-    bumpConnectionGeneration();
-    const connection = connectionRef.current;
-    connectionRef.current = null;
+    const { connection } = takeConnection();
     try {
-      if (connection) {
-        await stopQuietly(connection);
-        await detachQuietly(connection);
-      }
+      await shutdownConnection(connection);
       setPhase("stopped");
       setQueue([]);
       await openProviderSessionApp(session.source, providerSessionId);
@@ -1545,45 +1511,12 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     }
   };
 
-  // 잘라낸 결과가 비어도 더 불러올 앞 구간이 남아 있으면 머리말과 '이전 대화 더보기'는 남긴다.
-  // 파일에 1,000개가 있고 최신 100개를 라이브가 전부 담당하는 채팅이 그 경우다.
-  const transcriptHistory = session && (visibleTranscript.length > 0 || transcript.earlierLoadCount > 0) ? (
-    <div className="chat-transcript-history">
-      <div className="chat-transcript-history-head">
-        <div><strong>이전 대화 내역</strong><small>{transcript.detail?.skippedLines ? `읽지 못한 줄 ${transcript.detail.skippedLines.toLocaleString()}개` : "현재 연결 이전 기록"}</small></div>
-        <TranscriptLimitSelect
-          label="채팅 대화 표시 범위"
-          value={transcriptLimit}
-          itemCount={transcript.detail ? visibleTranscript.length : null}
-          onChange={onTranscriptLimitChange}
-        />
-      </div>
-      {transcript.error && <ErrorBanner message={transcript.error} />}
-      <TranscriptLoadEarlier
-        count={transcript.earlierLoadCount}
-        loading={transcript.loadingEarlier}
-        error={transcript.earlierError}
-        onLoad={() => void transcript.loadEarlier()}
-      />
-      <TranscriptTurns
-        items={visibleTranscript}
-        mode={tab === "activity" ? "activity" : "conversation"}
-        activityFilter={activityFilter}
-        source={session.source}
-        sessionId={session.providerSessionId}
-        onOpenLocalLink={linkedFilePreview.open}
-        scrollContainerRef={historyScrollRef}
-        windowed={transcriptLimit === "all"}
-      />
-      {turns.length > 0 && <div className="chat-transcript-boundary"><span>여기부터 현재 연결</span></div>}
-    </div>
-  ) : null;
 
   // 팝아웃 창은 이 대화 하나만 담당한다. 보기 전환과 채팅 목록은 본 창의 몫이므로,
   // 창에는 대화 패널만 남겨 창 전체를 쓰게 한다.
   const tabs = popout ? null : (
     <div className="chat-hub-tabs">
-      {tab !== "schedules" && !chatListOpen && <button ref={chatListRestoreRef} className="secondary-pane-restore chat-list-restore" type="button" aria-label={text("채팅 목록 보기", "Show chat list")} title={text("채팅 목록 보기", "Show chat list")} aria-expanded={false} onClick={() => setChatListVisibility(true)}><PanelLeftOpen size={15} aria-hidden="true" /><span>{text("채팅", "Chat")}</span></button>}
+      {tab !== "schedules" && !chatListOpen && <button ref={chatListPane.restoreRef} className="secondary-pane-restore chat-list-restore" type="button" aria-label={text("채팅 목록 보기", "Show chat list")} title={text("채팅 목록 보기", "Show chat list")} aria-expanded={false} onClick={() => chatListPane.setVisibility(true)}><PanelLeftOpen size={15} aria-hidden="true" /><span>{text("채팅", "Chat")}</span></button>}
       {/* tablist는 탭 세 개만 소유한다. 목록 복원·새 채팅 버튼은 같은 줄에 놓이지만 탭이 아니므로
           바깥에 둔다. 이 껍데기는 display: contents라 레이아웃은 그대로 .chat-hub-tabs가 맡는다. */}
       <div className="chat-hub-tablist" role="tablist" aria-label={text("채팅 보기", "Chat views")} style={{ display: "contents" }}>
@@ -1600,45 +1533,19 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     </div>
   );
 
-  const closeChatListOnMobile = () => {
-    if (window.matchMedia("(max-width: 760px)").matches) closeChatListAndRestoreFocus();
-  };
-
-  const runtimeList = chatListOpen && !popout ? (
-    <aside className="chat-runtime-list" id="chat-runtime-list" aria-label={text("열린 채팅 목록", "Open chats")}>
-      <header>
-        <div><strong>{text("채팅", "Chat")}</strong><span>{openChats.length}</span></div>
-        <button ref={chatListCloseRef} className="secondary-pane-toggle" type="button" aria-label={text("채팅 목록 숨기기", "Hide chat list")} title={text("채팅 목록 숨기기", "Hide chat list")} onClick={closeChatListAndRestoreFocus}><PanelLeftClose size={15} /></button>
-      </header>
-      <div className="chat-runtime-list-items">
-        <button className={`chat-runtime-list-new${session ? "" : " active"}`} type="button" aria-current={!session ? "page" : undefined} disabled={chatSwitching} onClick={() => { void newChat().then(closeChatListOnMobile); }}>
-          <span><Plus size={15} aria-hidden="true" /></span><strong>{text("새 채팅", "New chat")}</strong>
-        </button>
-        {openChats.map((chat) => {
-          const active = session?.chatId === chat.chatId;
-          const title = chatTabTitle(chat, chatCatalogSession(chat, sessions));
-          return <div className={`chat-runtime-list-item-shell${active ? " active" : ""}`} key={chat.chatId}>
-            <button className="chat-runtime-list-item" type="button" aria-current={active ? "page" : undefined} disabled={chatSwitching} title={`${title} · ${providerLabel(chat.source)} · ${phaseLabel(chat.state, text)}`} onClick={() => { void switchChat(chat.chatId).then((opened) => { if (opened) closeChatListOnMobile(); }); }}>
-              <span className={`terminal-status terminal-status-${chat.state}`} />
-              <span><strong>{title}</strong><small>{providerLabel(chat.source)} · {phaseLabel(chat.state, text)}</small></span>
-            </button>
-            {!popout && <button className="chat-runtime-list-popout" type="button" disabled={chatSwitching} aria-label={`${title} 새 창으로 열기`} title="새 창으로 열기" onClick={() => popOutChat(chat.chatId)}><AppWindow size={12} /></button>}
-            <button className="chat-runtime-list-close" type="button" disabled={chatSwitching} aria-label={`${title} 실행 종료 및 목록에서 제거`} title="실행 종료 및 목록에서 제거" onClick={() => { void stopBackgroundChat(chat); }}><X size={12} /></button>
-          </div>;
-        })}
-      </div>
-    </aside>
-  ) : null;
-
-  const runtimeBackdrop = chatListOpen && !popout
-    ? <button className="chat-runtime-list-backdrop" type="button" aria-label={text("채팅 목록 닫기", "Close chat list")} onClick={closeChatListAndRestoreFocus} />
-    : null;
-
-  // 접어 둔 고급 옵션에 기본값이 아닌 선택이 남아 있으면 펼치지 않아도 보이게 요약한다.
-  // 고를 항목이 하나도 없는 공급자에서는 빈 상자만 남으므로 고급 옵션 자체를 그리지 않는다.
-  const launchAdvancedSummary = launchExtraFields
-    .map((field) => extraSettings[field.key]?.trim() ? `${field.label} ${extraSettings[field.key]}` : null)
-    .filter(Boolean).join(" · ") || `${launchExtraFields.map((field) => field.label).join(" · ")} 기본값`;
+  const runtimeList = <ChatRuntimeList
+    pane={chatListPane}
+    chats={openChats}
+    sessions={sessions}
+    activeChatId={activeChatId}
+    busy={chatSwitching}
+    popout={popout}
+    onNewChat={newChat}
+    onSwitchChat={switchChat}
+    onToggleFavorite={(chat) => { void toggleChatFavorite(chat); }}
+    onPopOut={popOutChat}
+    onStopChat={(chat) => { void stopBackgroundChat(chat); }}
+  />;
 
   if (tab === "schedules") {
     return <div className={`chat-hub${popout ? " popout" : ""}`}>{tabs}<SchedulesPanel providers={available} accounts={accounts} projects={projects} models={models} sessions={sessions} snapshot={scheduler} onRefresh={onRefreshScheduler} onSnapshot={onSchedulerSnapshot} currentSession={session} currentPrompt={composer} onOpenSession={onOpenSession} /></div>;
@@ -1650,84 +1557,31 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
         {tabs}
         <section className={`chat-runtime-layout${tab === "conversation" ? " chat-runtime-launch-shell" : ""}${chatListOpen ? " list-open" : " list-hidden"}`}>
           {runtimeList}
-          {runtimeBackdrop}
-          {tab === "activity" ? <div className="chat-runtime-empty"><EmptyState title="표시할 작업 로그가 없습니다" detail="대화를 시작하면 요청별 추론과 도구 실행이 여기에 모입니다." /></div> : (
-            <section className="chat-launch-layout chat-launch-workspace">
-              <article className="chat-launch-card">
-              <div className="section-heading"><div><h2>새 CLI 채팅</h2><p>설치된 공급자 CLI를 구조화 채팅으로 시작합니다.</p></div></div>
-              {visibleUnavailable.length > 0 && <div className="chat-cli-connections" aria-label="CLI 연결 필요">
-                {visibleUnavailable.map((provider) => <div className="chat-cli-connection-card" key={provider.provider}>
-                  <button className="chat-cli-connection-main" type="button" onClick={() => onConnectCli(provider)}>
-                    <SourceBadge source={provider.provider} />
-                    <span><strong>{provider.displayName}</strong><small>{provider.history.detected ? "채팅은 탐지됨 · CLI 연결 필요" : "CLI 연결 필요"}</small></span>
-                    <em>연결</em>
-                  </button>
-                  <div className="chat-cli-connection-dismiss">
-                    <label>
-                      <input
-                        type="checkbox"
-                        checked={rememberHiddenCliConnectionCards.includes(provider.provider)}
-                        onChange={(event) => setRememberHiddenCliConnectionCards((current) => event.target.checked
-                          ? [...current, provider.provider]
-                          : current.filter((item) => item !== provider.provider))}
-                      />
-                      <span>다시 표시 안 함</span>
-                    </label>
-                    <button className="chat-cli-connection-close" type="button" aria-label={`${provider.displayName} 연결 카드 닫기`} title="닫기" onClick={() => closeCliConnectionCard(provider.provider)}><X size={14} /></button>
-                  </div>
-                </div>)}
-              </div>}
-              {available.length === 0 ? <EmptyState title="연결 가능한 CLI가 없습니다" detail="위 공급자를 선택하면 설치·로그인용 터미널 가이드가 열립니다." /> : (
-                <form className="chat-launch-form" onSubmit={start}>
-                  <label><span>공급자</span><select value={source} onChange={(event) => switchSource(event.target.value as ProviderId)}>{available.map((provider) => <option key={provider.provider} value={provider.provider}>{provider.displayName}</option>)}</select></label>
-                  <label>
-                    <span>작업 경로</span>
-                    {projects.length > 0 && <select value={usingManualCwd ? MANUAL_CWD : cwd} onChange={(event) => { const value = event.target.value; setManualCwd(value === MANUAL_CWD); if (value !== MANUAL_CWD) setCwd(value); }}>{projects.map((project) => <option value={project.path} key={project.path}>{project.name} · {project.path}</option>)}<option value={MANUAL_CWD}>직접 입력…</option></select>}
-                    {usingManualCwd ? <input value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="/absolute/project/path" required autoFocus={manualCwd} /> : <small className="chat-path-hint">{selectedProject?.path} · 세션 {selectedProject?.count}개</small>}
-                  </label>
-                  {accountChoices.length > 0 && <label>
-                    <span>실행 계정</span>
-                    <select value={launchAccountId} onChange={(event) => setLaunchAccountId(event.target.value)}>
-                      <option value="">활성 계정{launchActiveAccountId ? ` · ${accountName(accounts, source, launchActiveAccountId)}` : ""}</option>
-                      {accountChoices.map((choice) => <option value={choice.id} key={choice.id} disabled={choice.blocked} title={choice.blockedReason ?? undefined}>
-                        {choice.label}{choice.blocked ? " · 자격증명 격리 불가" : ""}
-                      </option>)}
-                    </select>
-                    {launchAccountId !== "" && <small className="chat-path-hint">이 채팅만 선택한 계정으로 실행합니다. 활성 계정은 그대로 둡니다.</small>}
-                  </label>}
-                  <RuntimeSettings
-                    source={source}
-                    mode={mode}
-                    onModeChange={setMode}
-                    approvalMode={approvalMode}
-                    onApprovalModeChange={setApprovalMode}
-                    model={model}
-                    onModelChange={setModel}
-                    catalog={providerOptions}
-                    recent={providerModels}
-                    reasoningEffort={reasoningEffort}
-                    onReasoningChange={setReasoningEffort}
-                    reasoningOptions={reasoningOptions}
-                    defaultEffort={defaultEffortFor(providerOptions, model)}
-                  />
-                  {/* 추가 스키마 항목(예비 모델 등)은 아래 고급 옵션의 RuntimeExtraSettings가 맡는다.
-                      여기에 onExtraSettingChange를 다시 넘기면 같은 항목이 두 번 그려진다. */}
-                  {launchExtraFields.length > 0 && <section className="chat-launch-advanced">
-                    <button className="chat-launch-advanced-toggle" type="button" aria-expanded={launchAdvancedOpen} onClick={() => setLaunchAdvancedOpen((open) => !open)}>
-                      {launchAdvancedOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}고급 옵션<small>{launchAdvancedSummary}</small>
-                    </button>
-                    {launchAdvancedOpen && <div className="chat-launch-advanced-body">
-                      <RuntimeExtraSettings source={source} catalog={providerOptions} recent={providerModels} extraSettings={extraSettings} onExtraSettingChange={(key, value) => setExtraSettings((current) => ({ ...current, [key]: value }))} />
-                    </div>}
-                  </section>}
-                  <div className="chat-initial-composer"><label><span>첫 메시지 <small>선택</small></span><textarea value={initialPrompt} onChange={(event) => setInitialPrompt(event.target.value)} onKeyDown={submitComposerOnEnter} onPaste={(event) => { const files = clipboardFiles(event); if (files.length > 0) addInitialFiles(files); }} rows={1} placeholder="CLI 연결 직후 보낼 요청" /></label></div>
-                  {error && <ErrorBanner message={error} />}
-                  {attachmentNotice && <ErrorBanner message={attachmentNotice} />}
-                  <div className="chat-launch-footer"><AttachmentPicker drafts={initialAttachments} disabled={starting} onAdd={addInitialFiles} onRemove={(draft) => setInitialAttachments((current) => current.filter((item) => item.key !== draft.key))} /><button className="button primary chat-start-button" type="submit" disabled={starting || !cwd.trim()}>{starting ? "CLI 연결 중…" : "새 채팅 시작"}</button></div>
-                </form>
-              )}
-              </article>
-            </section>
+          {tab === "activity" ? <div className="chat-runtime-empty"><EmptyState title={text("표시할 작업 로그가 없습니다", "No activity logs to display")} detail={text("대화를 시작하면 요청별 추론과 도구 실행이 여기에 모입니다.", "Reasoning and tool executions per request will gather here once a conversation starts.")} /></div> : (
+            <ChatLaunchForm
+              draft={runtimeDraft}
+              available={available}
+              accounts={accounts}
+              projects={projects}
+              accountChoices={accountChoices}
+              activeAccountId={launchActiveAccountId}
+              catalog={providerOptions}
+              recentModels={providerModels}
+              reasoningOptions={reasoningOptions}
+              cliConnectionCards={cliConnectionCards}
+              advancedSettings={launchAdvancedSettings}
+              prompt={initialPrompt}
+              onPromptChange={setInitialPrompt}
+              attachments={initialAttachments}
+              onAddFiles={addInitialFiles}
+              onRemoveAttachment={(draft) => setInitialAttachments((current) => current.filter((item) => item.key !== draft.key))}
+              starting={starting}
+              error={error}
+              notice={attachmentNotice}
+              dropOver={launchDropTarget}
+              dropProps={launchDropProps}
+              onSubmit={start}
+            />
           )}
         </section>
         {confirmDialog}
@@ -1742,7 +1596,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     source: provider.provider,
     label: provider.displayName,
     disabled: !provider.cli.detected,
-    disabledReason: provider.cli.detected ? null : "이 공급자의 CLI가 연결되어 있지 않습니다",
+    disabledReason: provider.cli.detected ? null : text("이 공급자의 CLI가 연결되어 있지 않습니다", "CLI for this provider is not connected"),
   }));
   const runtimeAccountChoices = launchAccountChoices(accounts, session.source);
   const runningAccountLabel = session.accountId && session.accountId !== activeAccountId(accounts, session.source)
@@ -1754,10 +1608,10 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
       {tabs}
       <section className={`chat-runtime-layout${chatListOpen ? " list-open" : " list-hidden"}`}>
         {runtimeList}
-        {runtimeBackdrop}
-        <section className="structured-chat">
+        <section className="structured-chat chat-drop-zone" {...chatDropProps}>
+        {chatDropTarget && <FileDropOverlay />}
         <header className="chat-session-header">
-          <div><span className={`terminal-status terminal-status-${phase}`} /><div><strong>{providerLabel(session.source)} · {phaseLabel(phase, text)}</strong><small>{session.cwd}{runningAccountLabel ? ` · ${text("계정", "Account")} ${runningAccountLabel}` : ""}</small></div></div>
+          <div><span className={`terminal-status terminal-status-${phase}`} /><div><strong>{sourceName(session.source)} · {phaseLabel(phase, text)}</strong><small>{displayPath(session.cwd)}{runningAccountLabel ? ` · ${text("계정", "Account")} ${runningAccountLabel}` : ""}</small></div></div>
           <div className="chat-session-actions">
             {(phase === "stopped" || phase === "failed") && session.providerSessionId && <button className="button primary" type="button" disabled={!canResumeChat} onClick={() => void resumeChat()} title={text("같은 공급자 대화를 다시 띄워 이어갑니다", "Reopens the same provider conversation and continues it")}><RotateCw size={13} />{resuming ? text("이어가는 중…", "Resuming…") : text("이어가기", "Resume")}</button>}
             {/* 좁은 화면에서 팝아웃은 같은 탭을 밀어내는 꼴이라 쓸모가 없다. 그 자리를 새 채팅이 대신 쓰고,
@@ -1767,23 +1621,31 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
             {hasTauriRuntime() && session.source === "codex" && session.providerSessionId && <button className="button" type="button" disabled={openingProviderApp || phase === "running" || phase === "waitingApproval"} onClick={() => void openInCodex()} title={text("이 연결을 종료하고 같은 대화를 Codex 앱에서 엽니다", "Closes this connection and opens the same conversation in the Codex app")}><ExternalLink size={13} />{openingProviderApp ? text("여는 중…", "Opening…") : text("Codex에서 열기", "Open in Codex")}</button>}
           </div>
         </header>
-        <div className="chat-session-meta"><code>{session.providerSessionId ?? session.chatId}</code><span>{session.model ?? text("기본 모델", "Default model")}</span><span>{text("추론", "Reasoning")} {session.reasoningEffort ? reasoningLabel(session.reasoningEffort) : text("기본", "Default")}</span><span>{permissionModeLabel(session.mode)}</span>{settingField(settingFieldsFor(providerOptions, session.source), "approvalMode") && <span>{approvalModeLabel(session.approvalMode)}</span>}</div>
+        <div className="chat-session-meta"><code>{session.providerSessionId ?? session.chatId}</code><span>{session.model ?? text("기본 모델", "Default model")}</span><span>{text("추론", "Reasoning")} {session.reasoningEffort ? reasoningLabel(session.reasoningEffort) : text("기본", "Default")}</span><span>{permissionModeLabel(session.mode)}</span>{session.planAutoApproval && <span>{text("전체 허용(정책 제외)", "All allowed except decisions")}</span>}{settingField(settingFieldsFor(providerOptions, session.source), "approvalMode") && <span>{approvalModeLabel(session.approvalMode)}</span>}</div>
         {error && <div className="chat-inline-error"><ErrorBanner message={error} /></div>}
         {attachmentNotice && <div className="chat-inline-error"><ErrorBanner message={attachmentNotice} /></div>}
+        {accountHandoffNotice && <div className="chat-inline-note"><NoticeBanner message={accountHandoffNotice} /></div>}
+        {/* 찾기 막대는 대화 위에 떠 있다(스크롤 조작 묶음과 같은 껍데기 안). 흐름에 끼워 넣으면
+            열 때마다 대화가 아래로 밀린다. 두 탭이 각자 스크롤을 맡으므로 껍데기도 각자 쓴다. */}
         {tab === "activity" ? (
-          <ActivityLog containerRef={activityLogRef} history={transcriptHistory} turns={turns} chatId={activeChatId} filter={activityFilter} onFilter={setActivityFilter} onDecision={decide} onOpenLocalLink={linkedFilePreview.open} />
+          <div className="chat-stream-shell">
+            <ChatActivityLog containerRef={activityLogRef} history={transcript.history} turns={turns} chatId={activeChatId} filter={activityFilter} onFilter={setActivityFilter} onDecision={decide} onOpenLocalLink={linkedFilePreview.open} />
+            {findBar}
+          </div>
         ) : (
           <div className="chat-stream-shell">
             <div className="chat-stream" aria-live="polite" ref={chatStreamRef}>
-              {transcriptHistory}
-              {turns.length === 0 && !transcriptHistory && <EmptyState title={text("CLI가 연결되었습니다", "CLI connected")} detail={text("아래 입력창에서 첫 메시지를 보내세요.", "Send your first message from the composer below.")} />}
+              {transcript.history}
+              {turns.length === 0 && !transcript.history && <EmptyState title={text("CLI가 연결되었습니다", "CLI connected")} detail={text("아래 입력창에서 첫 메시지를 보내세요.", "Send your first message from the composer below.")} />}
               {turns.map((turn) => <ChatConversationTurn turn={turn} chatId={activeChatId} onDecision={decide} onOpenLocalLink={linkedFilePreview.open} key={turn.id} />)}
             </div>
             <ChatScrollControls
               targetRef={chatStreamRef}
+              leading={readingControls}
               onScrollAwayFromLatest={pauseFollowingLatestMessages}
               onScrollToLatest={resumeFollowingLatestMessages}
             />
+            {findBar}
           </div>
         )}
         <ChatApprovalDock title={text("권한 승인 대기", "Awaiting permission approval")} hint={text("선택할 때까지 에이전트 작업이 일시 정지됩니다.", "The agent pauses until you choose.")} prompts={pendingApprovals} onDecision={decide} />
@@ -1810,19 +1672,16 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
             : undefined}
           statusIndicator={<span className={`terminal-status terminal-status-${phase}`} />}
           contextMeter={<ChatContextMeter usedTokens={session.contextUsedTokens} windowTokens={session.contextWindowTokens} />}
-          onOpen={() => {
-            void refreshProviderOptions(session.source).catch((cause) => {
-              setError(`최신 실행 설정을 불러오지 못했습니다: ${errorText(cause)}`);
-            });
-          }}
+          onOpen={() => loadLatestRuntimeOptions(session.source)}
           onAgentChange={(nextSource) => void changeActiveChatAgent(nextSource)}
           onAccountChange={(nextAccountId) => void changeActiveChatAccount(nextAccountId)}
           onModeChange={(nextMode) => void changeActiveChatMode(nextMode)}
-          onApprovalModeChange={(nextMode) => void changeActiveChatSettings({ approvalMode: nextMode }, "승인 처리를")}
-          onModelChange={(nextModel) => void changeActiveChatSettings({ model: nextModel }, "응답 모델을")}
-          onReasoningEffortChange={(nextEffort) => void changeActiveChatSettings({ reasoningEffort: nextEffort }, "추론 수준을")}
-          onExtraSettingsApply={(nextSettings) => void changeActiveChatSettings({ extraSettings: nextSettings }, "추가 설정을")}
+          onApprovalModeChange={(nextMode) => void changeActiveChatSettings({ approvalMode: nextMode }, text("승인 처리를", "approval mode"))}
+          onModelChange={(nextModel) => void changeActiveChatSettings({ model: nextModel }, text("응답 모델을", "response model"))}
+          onReasoningEffortChange={(nextEffort) => void changeActiveChatSettings({ reasoningEffort: nextEffort }, text("추론 수준을", "reasoning effort"))}
+          onExtraSettingsApply={(nextSettings) => void changeActiveChatSettings({ extraSettings: nextSettings }, text("추가 설정을", "extra settings"))}
         />
+        <ChatSecretsPanel chatId={activeChatId} disabled={phase === "connecting"} refreshSignal={chatSecretSignal} />
         <ChatComposer
           ariaLabel={text("채팅 메시지", "Chat message")}
           value={composer}
@@ -1839,7 +1698,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
                     : text("채팅이 종료되었습니다. 새 채팅을 시작하세요", "This chat has ended. Start a new chat")}
           queue={queue}
           canDeliver={supportsDeliveryDuringTurn(session.source)}
-          onChange={(value) => { composerRef.current = value; setComposer(value); }}
+          onChange={putComposerText}
           onAddFiles={addComposerFiles}
           onRemoveAttachment={removeComposerAttachment}
           onSubmit={send}
@@ -1857,63 +1716,4 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
   );
 }
 
-function ActivityLog({ containerRef, history, turns, chatId, filter, onFilter, onDecision, onOpenLocalLink }: { containerRef: RefObject<HTMLDivElement | null>; history: ReactNode; turns: ChatTurn[]; chatId: string | null; filter: ActivityFilter; onFilter: (filter: ActivityFilter) => void; onDecision: (id: string, decision: ChatApprovalDecision) => void; onOpenLocalLink: (href: string) => void }) {
-  return (
-    <div className="activity-log" ref={containerRef}>
-      <header><strong>요청별 작업 로그</strong><ActivityFilterSelect value={filter} onChange={onFilter} /></header>
-      {history}
-      {turns.length === 0 ? (history ? null : <EmptyState title="작업 로그가 없습니다" />) : turns.map((turn) => {
-        const entries = turn.entries.filter((entry) => activityMatches(entry, filter));
-        if (entries.length === 0) return null;
-        const userEntry = turn.entries.find((entry): entry is Extract<ChatEntry, { type: "message" }> => entry.type === "message" && entry.role === "user");
-        const title = userEntry?.text.slice(0, 80) || userEntry?.attachments[0]?.name || "시스템 작업";
-        return <section className="activity-turn" key={turn.id}><header><span className={`chat-tool-state chat-tool-state-${turn.status}`} /><strong>{title}</strong><time>{chatTurnStatusLabel(turn.status)} · {formatDate(turn.startedAt)}</time></header><div>{entries.map((entry) => <ChatEntryView entry={entry} chatId={chatId} onDecision={onDecision} onOpenLocalLink={onOpenLocalLink} key={`${entry.type}-${entry.id}`} />)}</div></section>;
-      })}
-    </div>
-  );
-}
 
-const CHAT_LAUNCH_SETTINGS_KEY = "agent-manager.chat-launch-settings";
-
-interface ChatLaunchSettings {
-  model: string;
-  reasoningEffort: ReasoningEffort | "";
-}
-
-type StoredChatLaunchSettings = Record<string, Partial<ChatLaunchSettings>> | null;
-
-function readChatLaunchSettings(source: ProviderId): ChatLaunchSettings {
-  const entry = readStoredJson<StoredChatLaunchSettings>(CHAT_LAUNCH_SETTINGS_KEY, null)?.[source];
-  return {
-    model: typeof entry?.model === "string" ? entry.model : "",
-    reasoningEffort: typeof entry?.reasoningEffort === "string" ? entry.reasoningEffort : "",
-  };
-}
-
-function saveChatLaunchSettings(source: ProviderId, settings: ChatLaunchSettings) {
-  const stored = readStoredJson<StoredChatLaunchSettings>(CHAT_LAUNCH_SETTINGS_KEY, null);
-  writeStoredJson(CHAT_LAUNCH_SETTINGS_KEY, { ...stored, [source]: settings });
-}
-
-function chatCatalogSession(chat: ChatSessionInfo, sessions: SessionSummary[]): SessionSummary | null {
-  return chat.providerSessionId
-    ? sessions.find((candidate) => candidate.source === chat.source && candidate.id === chat.providerSessionId) ?? null
-    : null;
-}
-
-function chatTabTitle(chat: ChatSessionInfo, session: SessionSummary | null): string {
-  const parts = chat.cwd.split(/[\\/]/).filter(Boolean);
-  const fallback = parts[parts.length - 1] ?? providerLabel(chat.source);
-  return session?.title ?? `${fallback} · ${chat.chatId.slice(0, 4)}`;
-}
-
-function providerLabel(source: ProviderId): string { return source === "claude" ? "Claude" : source === "codex" ? "Codex" : "Antigravity"; }
-type TextPicker = (ko: string, en: string) => string;
-function phaseLabel(phase: ChatPhase | "connecting", text: TextPicker): string {
-  return phase === "connecting" ? text("연결 중", "Connecting")
-    : phase === "ready" ? text("입력 대기", "Ready")
-      : phase === "running" ? text("응답 중", "Responding")
-        : phase === "waitingApproval" ? text("승인 대기", "Awaiting approval")
-          : phase === "stopped" ? text("종료됨", "Stopped")
-            : text("오류", "Error");
-}

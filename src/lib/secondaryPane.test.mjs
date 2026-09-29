@@ -102,6 +102,13 @@ test("readSecondaryPaneOpen falls back to viewport width when not stored", () =>
   });
 });
 
+test("readSecondaryPaneOpen treats an unknown stored value as unstored", () => {
+  withMockWindow({ matches: true }, ({ storage }) => {
+    storage.setItem("unknown-state", "expanded");
+    assert.equal(readSecondaryPaneOpen("unknown-state"), false);
+  });
+});
+
 test("readSecondaryPaneOpen handles localStorage exceptions gracefully", () => {
   withBrokenStorage("getItem", () => {
     assert.equal(readSecondaryPaneOpen("error-key"), true);

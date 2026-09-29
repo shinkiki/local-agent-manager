@@ -5,7 +5,7 @@
 //! delegated through [`DocumentActionExecutor`] so this layer never learns provider
 //! credentials and never executes shell strings.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
@@ -20,6 +20,7 @@ use walkdir::{DirEntry, WalkDir};
 
 use crate::app_data_file::{ensure_schema_version, write_private_json};
 use crate::clock::now_ms;
+use crate::domain::wire_enum;
 use crate::file_kind::ensure_not_symlink;
 use crate::store_lock::{self, StoreLock};
 use crate::{list_doc_roots, ChatApprovalMode, ChatMode, CoreError, ProviderId, ReasoningEffort};
@@ -51,37 +52,14 @@ pub enum DocumentChangeKind {
     Deleted,
 }
 
+wire_enum!(trimmed DocumentChangeKind, "알 수 없는 파일 변경 종류입니다", {
+    Created => "created",
+    Modified => "modified",
+    Deleted => "deleted",
+});
+
 impl DocumentChangeKind {
     pub const ALL: [Self; 3] = [Self::Created, Self::Modified, Self::Deleted];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Created => "created",
-            Self::Modified => "modified",
-            Self::Deleted => "deleted",
-        }
-    }
-}
-
-impl std::fmt::Display for DocumentChangeKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for DocumentChangeKind {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "created" => Ok(Self::Created),
-            "modified" => Ok(Self::Modified),
-            "deleted" => Ok(Self::Deleted),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 문서 변경 종류입니다: {s}"
-            ))),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,8 +148,17 @@ pub enum DocumentTriggerStatus {
     Restricted,
 }
 
+wire_enum!(trimmed DocumentTriggerStatus, "알 수 없는 파일 트리거 상태입니다", {
+    Active => "active",
+    Paused => "paused",
+    Degraded => "degraded",
+    NeedsReview => "needsReview",
+    Restricted => "restricted",
+});
+
 impl DocumentTriggerStatus {
-    pub const ALL: [Self; 5] = [
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 5] = [
         Self::Active,
         Self::Paused,
         Self::Degraded,
@@ -179,36 +166,21 @@ impl DocumentTriggerStatus {
         Self::Restricted,
     ];
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Paused => "paused",
-            Self::Degraded => "degraded",
-            Self::NeedsReview => "needsReview",
-            Self::Restricted => "restricted",
+    /// 활성화 여부로부터 상태와 사유를 결정한다.
+    pub fn from_enabled(enabled: bool) -> (Self, Option<String>) {
+        if enabled {
+            (Self::Active, None)
+        } else {
+            (Self::Paused, Some("사용자가 비활성화했습니다".to_owned()))
         }
     }
-}
 
-impl std::fmt::Display for DocumentTriggerStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for DocumentTriggerStatus {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "active" => Ok(Self::Active),
-            "paused" => Ok(Self::Paused),
-            "degraded" => Ok(Self::Degraded),
-            "needsReview" => Ok(Self::NeedsReview),
-            "restricted" => Ok(Self::Restricted),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 문서 트리거 상태입니다: {s}"
-            ))),
+    /// 액션 실패 종류로부터 전이할 상태를 결정한다.
+    pub fn from_action_error_kind(kind: DocumentActionErrorKind) -> Option<Self> {
+        match kind {
+            DocumentActionErrorKind::NeedsReview => Some(Self::NeedsReview),
+            DocumentActionErrorKind::Degraded => Some(Self::Degraded),
+            DocumentActionErrorKind::Failed => None,
         }
     }
 }
@@ -246,6 +218,47 @@ pub struct DocumentTrigger {
     pub updated_at: i64,
 }
 
+impl DocumentTrigger {
+    pub(crate) fn new(id: String, input: DocumentTriggerInput, now: i64) -> Self {
+        let (status, status_reason) = DocumentTriggerStatus::from_enabled(input.enabled);
+        Self {
+            id,
+            input,
+            status,
+            status_reason,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    pub(crate) fn set_enabled(&mut self, enabled: bool) {
+        self.input.enabled = enabled;
+        let (status, status_reason) = DocumentTriggerStatus::from_enabled(enabled);
+        self.status = status;
+        self.status_reason = status_reason;
+    }
+
+    pub(crate) fn update_input(&mut self, input: DocumentTriggerInput, now: i64) {
+        let (status, status_reason) = DocumentTriggerStatus::from_enabled(input.enabled);
+        self.input = input;
+        self.status = status;
+        self.status_reason = status_reason;
+        self.updated_at = now;
+    }
+
+    /// 상태와 사유를 갱신하고 수정 시각을 기록한다.
+    pub(crate) fn apply_status(
+        &mut self,
+        status: DocumentTriggerStatus,
+        status_reason: Option<String>,
+        now: i64,
+    ) {
+        self.status = status;
+        self.status_reason = status_reason;
+        self.updated_at = now;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DocumentTriggerRunStatus {
@@ -255,43 +268,24 @@ pub enum DocumentTriggerRunStatus {
     Skipped,
 }
 
-impl DocumentTriggerRunStatus {
-    pub const ALL: [Self; 4] = [Self::Running, Self::Completed, Self::Failed, Self::Skipped];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Skipped => "skipped",
-        }
+wire_enum!(
+    trimmed DocumentTriggerRunStatus,
+    "알 수 없는 파일 트리거 실행 상태입니다",
+    {
+        Running => "running",
+        Completed => "completed",
+        Failed => "failed",
+        Skipped => "skipped",
     }
+);
+
+impl DocumentTriggerRunStatus {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 4] = [Self::Running, Self::Completed, Self::Failed, Self::Skipped];
 
     /// 실행이 종료된 상태인지 확인합니다.
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Skipped)
-    }
-}
-
-impl std::fmt::Display for DocumentTriggerRunStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for DocumentTriggerRunStatus {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "running" => Ok(Self::Running),
-            "completed" => Ok(Self::Completed),
-            "failed" => Ok(Self::Failed),
-            "skipped" => Ok(Self::Skipped),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 문서 트리거 실행 상태입니다: {s}"
-            ))),
-        }
     }
 }
 
@@ -449,6 +443,16 @@ struct TriggerStore {
     triggers: Vec<DocumentTrigger>,
 }
 
+impl TriggerStore {
+    fn trigger_mut(&mut self, id: &str) -> Option<&mut DocumentTrigger> {
+        self.triggers.iter_mut().find(|trigger| trigger.id == id)
+    }
+
+    fn require_trigger_mut(&mut self, id: &str) -> Result<&mut DocumentTrigger, CoreError> {
+        self.trigger_mut(id).ok_or_else(document_trigger_not_found)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileState {
     size_bytes: u64,
@@ -461,6 +465,19 @@ struct PendingRootBatch {
     root_path: String,
     last_change_at: i64,
     changes: BTreeMap<String, DocumentChange>,
+}
+
+/// 쿨다운을 넘긴 대기 요청 하나의 처리 방향.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingActionGate {
+    /// 트리거가 사라졌거나 꺼져 있어 쌓인 요청을 버린다.
+    Drop,
+    /// 재승인 대기처럼 요청은 남기고 지금은 보내지 않는다.
+    Hold,
+    /// 짧은 시간에 너무 자주 돌아 요청을 버리고 트리거를 멈춘다.
+    CircuitBreak,
+    /// 지금 실행한다.
+    Launch,
 }
 
 #[derive(Default)]
@@ -545,7 +562,7 @@ impl DocumentAutomationSupervisor {
                 .name("document-baseline".to_owned())
                 .spawn(move || {
                     if let Err(error) = baseline.initialize_baseline() {
-                        eprintln!("[document-automation] 문서 루트 기준선 스캔 실패: {error}");
+                        eprintln!("[document-automation] 등록 폴더 기준선 스캔 실패: {error}");
                     }
                     spawn_poll_loop(Arc::downgrade(&baseline.inner));
                 })?;
@@ -581,18 +598,11 @@ impl DocumentAutomationSupervisor {
         let input = self.validate_input(input)?;
         self.inner.executor.validate_action(&input.action)?;
         let now = now_ms();
-        let trigger = DocumentTrigger {
-            id: format!("doc-trigger-{}", Uuid::new_v4().simple()),
-            status: if input.enabled {
-                DocumentTriggerStatus::Active
-            } else {
-                DocumentTriggerStatus::Paused
-            },
-            status_reason: (!input.enabled).then(|| "사용자가 비활성화했습니다".to_owned()),
+        let trigger = DocumentTrigger::new(
+            format!("doc-trigger-{}", Uuid::new_v4().simple()),
             input,
-            created_at: now,
-            updated_at: now,
-        };
+            now,
+        );
         self.with_trigger_store(|store| {
             store.triggers.push(trigger.clone());
             Ok(trigger)
@@ -607,20 +617,8 @@ impl DocumentAutomationSupervisor {
         let input = self.validate_input(input)?;
         self.inner.executor.validate_action(&input.action)?;
         self.with_trigger_store(|store| {
-            let trigger = store
-                .triggers
-                .iter_mut()
-                .find(|trigger| trigger.id == id)
-                .ok_or_else(document_trigger_not_found)?;
-            trigger.input = input;
-            trigger.status = if trigger.input.enabled {
-                DocumentTriggerStatus::Active
-            } else {
-                DocumentTriggerStatus::Paused
-            };
-            trigger.status_reason =
-                (!trigger.input.enabled).then(|| "사용자가 비활성화했습니다".to_owned());
-            trigger.updated_at = now_ms();
+            let trigger = store.require_trigger_mut(id)?;
+            trigger.update_input(input, now_ms());
             Ok(trigger.clone())
         })
     }
@@ -649,26 +647,12 @@ impl DocumentAutomationSupervisor {
         if enabled {
             // 승인 지문이 어긋나 멈춘 트리거를 스위치만 다시 켜서 Active로 되돌릴 수
             // 없게 한다. 재승인 경로는 트리거를 다시 저장하는 것뿐이다.
-            let current = self
-                .load_triggers()?
-                .into_iter()
-                .find(|trigger| trigger.id == id)
-                .ok_or_else(document_trigger_not_found)?;
+            let current = self.require_trigger(id)?;
             self.inner.executor.validate_action(&current.input.action)?;
         }
         let trigger = self.with_trigger_store(|store| {
-            let trigger = store
-                .triggers
-                .iter_mut()
-                .find(|trigger| trigger.id == id)
-                .ok_or_else(document_trigger_not_found)?;
-            trigger.input.enabled = enabled;
-            trigger.status = if enabled {
-                DocumentTriggerStatus::Active
-            } else {
-                DocumentTriggerStatus::Paused
-            };
-            trigger.status_reason = (!enabled).then(|| "사용자가 비활성화했습니다".to_owned());
+            let trigger = store.require_trigger_mut(id)?;
+            trigger.set_enabled(enabled);
             trigger.updated_at = now_ms();
             Ok(trigger.clone())
         })?;
@@ -681,11 +665,7 @@ impl DocumentAutomationSupervisor {
     }
 
     pub fn test_trigger(&self, id: &str) -> Result<DocumentTriggerRun, CoreError> {
-        let trigger = self
-            .load_triggers()?
-            .into_iter()
-            .find(|trigger| trigger.id == id)
-            .ok_or_else(document_trigger_not_found)?;
+        let trigger = self.require_trigger(id)?;
         let root = self.eligible_root(&trigger.input.root_id)?;
         self.inner.executor.validate_action(&trigger.input.action)?;
         let batch = DocumentChangeBatch {
@@ -711,13 +691,9 @@ impl DocumentAutomationSupervisor {
             params![report_id],
         )?;
         if changed == 0 {
-            return Err(CoreError::NotFound(
-                "중단 중 문서 변경 보고를 찾을 수 없습니다".to_owned(),
-            ));
+            return Err(offline_report_not_found());
         }
-        load_offline_report(&connection, report_id)?.ok_or_else(|| {
-            CoreError::NotFound("중단 중 문서 변경 보고를 찾을 수 없습니다".to_owned())
-        })
+        load_offline_report(&connection, report_id)?.ok_or_else(offline_report_not_found)
     }
 
     fn validate_input(
@@ -727,7 +703,7 @@ impl DocumentAutomationSupervisor {
         input.name = input.name.trim().chars().take(120).collect();
         if input.name.is_empty() {
             return Err(CoreError::InvalidInput(
-                "문서 트리거 이름을 입력하세요".to_owned(),
+                "파일 트리거 이름을 입력하세요".to_owned(),
             ));
         }
         self.eligible_root(&input.root_id)?;
@@ -756,15 +732,15 @@ impl DocumentAutomationSupervisor {
         let root = list_doc_roots(&self.inner.app_data_dir)?
             .into_iter()
             .find(|root| root.root.id == root_id)
-            .ok_or_else(|| CoreError::NotFound("문서 폴더를 찾을 수 없습니다".to_owned()))?;
+            .ok_or_else(|| CoreError::NotFound("등록 폴더를 찾을 수 없습니다".to_owned()))?;
         if root.restricted {
             return Err(CoreError::Conflict(
-                "제한된 문서 폴더에는 트리거를 등록할 수 없습니다".to_owned(),
+                "제한된 등록 폴더에는 트리거를 등록할 수 없습니다".to_owned(),
             ));
         }
         if !root.exists {
             return Err(CoreError::Conflict(
-                "문서 폴더 경로가 존재하지 않습니다".to_owned(),
+                "등록 폴더 경로가 존재하지 않습니다".to_owned(),
             ));
         }
         Ok(root.root.path)
@@ -775,11 +751,18 @@ impl DocumentAutomationSupervisor {
         Ok(self.load_trigger_store_unlocked()?.triggers)
     }
 
+    fn require_trigger(&self, id: &str) -> Result<DocumentTrigger, CoreError> {
+        self.load_triggers()?
+            .into_iter()
+            .find(|trigger| trigger.id == id)
+            .ok_or_else(document_trigger_not_found)
+    }
+
     fn lock_trigger_store(&self) -> Result<StoreLock, CoreError> {
         store_lock::acquire(
             &self.inner.app_data_dir,
             TRIGGER_LOCK_FILE_NAME,
-            "문서 트리거 저장소",
+            "파일 트리거 저장소",
         )
     }
 
@@ -798,7 +781,7 @@ impl DocumentAutomationSupervisor {
         ensure_schema_version(
             store.schema_version,
             TRIGGER_STORE_SCHEMA_VERSION,
-            "문서 트리거 저장소",
+            "파일 트리거 저장소",
         )?;
         Ok(store)
     }
@@ -875,11 +858,10 @@ impl DocumentAutomationSupervisor {
         self.with_trigger_store(|store| {
             let now = now_ms();
             for trigger in &mut store.triggers {
-                let next = desired_root_status(trigger, &roots);
-                if let Some((status, reason)) = next {
-                    trigger.status = status;
-                    trigger.status_reason = reason;
-                    trigger.updated_at = now;
+                if let Some((status, reason)) = desired_root_status(trigger, &roots) {
+                    if trigger.status != status || trigger.status_reason != reason {
+                        trigger.apply_status(status, reason, now);
+                    }
                 }
             }
             Ok(())
@@ -997,75 +979,101 @@ impl DocumentAutomationSupervisor {
             .into_iter()
             .map(|trigger| (trigger.id.clone(), trigger))
             .collect::<HashMap<_, _>>();
-        let ready = {
-            let runtime = lock_runtime(&self.inner)?;
-            runtime
-                .pending_actions
-                .keys()
-                .filter(|id| !runtime.running.contains(*id))
-                .filter_map(|id| {
-                    let trigger = triggers.get(id)?;
-                    let last = latest_run_started_at(&self.inner.app_data_dir, id).ok()?;
-                    (last.is_none_or(|started| {
-                        now.saturating_sub(started) >= trigger.input.cooldown_ms
-                    }))
-                    .then(|| id.clone())
-                })
-                .collect::<Vec<_>>()
-        };
-        for id in ready {
-            let Some(trigger) = triggers.get(&id).cloned() else {
-                let mut runtime = lock_runtime(&self.inner)?;
-                runtime.pending_actions.remove(&id);
-                save_pending_state(&self.inner.app_data_dir, &runtime)?;
-                continue;
-            };
-            if !trigger.input.enabled || trigger.status == DocumentTriggerStatus::Paused {
-                let mut runtime = lock_runtime(&self.inner)?;
-                runtime.pending_actions.remove(&id);
-                save_pending_state(&self.inner.app_data_dir, &runtime)?;
-                continue;
-            }
-            if trigger.status != DocumentTriggerStatus::Active {
-                // 워크플로·스킬이 바뀐 경우 이벤트를 버리지 않고 재승인 뒤 이어서 실행한다.
-                continue;
-            }
-            if recent_run_count(
-                &self.inner.app_data_dir,
-                &id,
-                now.saturating_sub(CIRCUIT_WINDOW_MS),
-            )? >= CIRCUIT_MAX_RUNS
-            {
-                {
-                    let mut runtime = lock_runtime(&self.inner)?;
-                    runtime.pending_actions.remove(&id);
-                    save_pending_state(&self.inner.app_data_dir, &runtime)?;
+        for id in self.cooldown_ready_action_ids(&triggers, now)? {
+            match self.gate_pending_action(triggers.get(&id), &id, now)? {
+                PendingActionGate::Drop => self.drop_pending_action(&id)?,
+                PendingActionGate::Hold => {}
+                PendingActionGate::CircuitBreak => {
+                    self.drop_pending_action(&id)?;
+                    self.pause_for_circuit_breaker(&id)?;
                 }
-                self.pause_for_circuit_breaker(&id)?;
-                continue;
+                PendingActionGate::Launch => {
+                    let Some(trigger) = triggers.get(&id).cloned() else {
+                        continue;
+                    };
+                    let Some(batch) = self.claim_pending_batch(&id)? else {
+                        continue;
+                    };
+                    launch_trigger(Arc::clone(&self.inner), trigger, batch);
+                }
             }
-            let batch = {
-                let mut runtime = lock_runtime(&self.inner)?;
-                let Some(batch) = runtime.pending_actions.remove(&id) else {
-                    continue;
-                };
-                runtime.running.insert(id.clone());
-                runtime.inflight_actions.insert(id.clone(), batch.clone());
-                save_pending_state(&self.inner.app_data_dir, &runtime)?;
-                batch
-            };
-            launch_trigger(Arc::clone(&self.inner), trigger, batch);
         }
         Ok(())
     }
 
+    /// 쿨다운이 끝나 지금 보낼 수 있는 대기 요청의 트리거 ID. 이미 실행 중인 트리거는 뺀다.
+    fn cooldown_ready_action_ids(
+        &self,
+        triggers: &HashMap<String, DocumentTrigger>,
+        now: i64,
+    ) -> Result<Vec<String>, CoreError> {
+        let runtime = lock_runtime(&self.inner)?;
+        Ok(runtime
+            .pending_actions
+            .keys()
+            .filter(|id| !runtime.running.contains(*id))
+            .filter_map(|id| {
+                let trigger = triggers.get(id)?;
+                let last = latest_run_started_at(&self.inner.app_data_dir, id).ok()?;
+                (last
+                    .is_none_or(|started| now.saturating_sub(started) >= trigger.input.cooldown_ms))
+                .then(|| id.clone())
+            })
+            .collect())
+    }
+
+    /// 쿨다운을 넘긴 대기 요청 하나를 어떻게 처리할지 가른다. 저장 상태는 바꾸지 않는다.
+    fn gate_pending_action(
+        &self,
+        trigger: Option<&DocumentTrigger>,
+        id: &str,
+        now: i64,
+    ) -> Result<PendingActionGate, CoreError> {
+        let Some(trigger) = trigger else {
+            return Ok(PendingActionGate::Drop);
+        };
+        if !trigger.input.enabled || trigger.status == DocumentTriggerStatus::Paused {
+            return Ok(PendingActionGate::Drop);
+        }
+        if trigger.status != DocumentTriggerStatus::Active {
+            // 워크플로·스킬이 바뀐 경우 이벤트를 버리지 않고 재승인 뒤 이어서 실행한다.
+            return Ok(PendingActionGate::Hold);
+        }
+        let recent = recent_run_count(
+            &self.inner.app_data_dir,
+            id,
+            now.saturating_sub(CIRCUIT_WINDOW_MS),
+        )?;
+        if recent >= CIRCUIT_MAX_RUNS {
+            return Ok(PendingActionGate::CircuitBreak);
+        }
+        Ok(PendingActionGate::Launch)
+    }
+
+    /// 쌓인 실행 요청을 버린다.
+    fn drop_pending_action(&self, id: &str) -> Result<(), CoreError> {
+        let mut runtime = lock_runtime(&self.inner)?;
+        runtime.pending_actions.remove(id);
+        save_pending_state(&self.inner.app_data_dir, &runtime)
+    }
+
+    /// 대기 중인 묶음을 실행 중으로 옮겨 가져온다. 그사이 사라졌으면 없음을 준다.
+    fn claim_pending_batch(&self, id: &str) -> Result<Option<DocumentChangeBatch>, CoreError> {
+        let mut runtime = lock_runtime(&self.inner)?;
+        let Some(batch) = runtime.pending_actions.remove(id) else {
+            return Ok(None);
+        };
+        runtime.running.insert(id.to_owned());
+        runtime
+            .inflight_actions
+            .insert(id.to_owned(), batch.clone());
+        save_pending_state(&self.inner.app_data_dir, &runtime)?;
+        Ok(Some(batch))
+    }
+
     fn pause_for_circuit_breaker(&self, trigger_id: &str) -> Result<(), CoreError> {
         self.with_trigger_store(|store| {
-            let trigger = store
-                .triggers
-                .iter_mut()
-                .find(|trigger| trigger.id == trigger_id)
-                .ok_or_else(document_trigger_not_found)?;
+            let trigger = store.require_trigger_mut(trigger_id)?;
             trigger.input.enabled = false;
             trigger.status = DocumentTriggerStatus::Paused;
             trigger.status_reason = Some(
@@ -1100,16 +1108,13 @@ fn desired_root_status(
         )),
         Some(root) if !root.exists => Some((
             DocumentTriggerStatus::Degraded,
-            Some("문서 폴더 경로가 존재하지 않습니다".to_owned()),
+            Some("등록 폴더 경로가 존재하지 않습니다".to_owned()),
         )),
         None => Some((
             DocumentTriggerStatus::Degraded,
-            Some("등록된 문서 폴더가 제거되었습니다".to_owned()),
+            Some("등록된 폴더가 제거되었습니다".to_owned()),
         )),
-        Some(_) if !trigger.input.enabled => Some((
-            DocumentTriggerStatus::Paused,
-            Some("사용자가 비활성화했습니다".to_owned()),
-        )),
+        Some(_) if !trigger.input.enabled => Some(DocumentTriggerStatus::from_enabled(false)),
         Some(_)
             if matches!(
                 trigger.status,
@@ -1181,12 +1186,12 @@ fn is_visible_entry(entry: &DirEntry) -> bool {
 fn scan_root(root: &Path) -> Result<BTreeMap<String, FileState>, CoreError> {
     ensure_not_symlink(
         &fs::symlink_metadata(root)?,
-        "심볼릭 링크 문서 루트는 감시할 수 없습니다",
+        "심볼릭 링크 등록 폴더는 감시할 수 없습니다",
     )?;
     let canonical = fs::canonicalize(root)?;
     if !canonical.is_dir() {
         return Err(CoreError::InvalidInput(
-            "문서 루트가 폴더가 아닙니다".to_owned(),
+            "등록한 경로가 폴더가 아닙니다".to_owned(),
         ));
     }
     let mut snapshot = BTreeMap::new();
@@ -1207,7 +1212,7 @@ fn scan_root(root: &Path) -> Result<BTreeMap<String, FileState>, CoreError> {
                     continue;
                 }
                 return Err(CoreError::Runtime(format!(
-                    "문서 폴더를 스캔하지 못했습니다: {error}"
+                    "등록 폴더를 스캔하지 못했습니다: {error}"
                 )));
             }
         };
@@ -1244,38 +1249,68 @@ fn modified_ns(metadata: &fs::Metadata) -> i64 {
         .unwrap_or_default()
 }
 
+/// 이전 스냅샷과 현재 스냅샷을 비교해 변경 사항 목록을 만든다.
+/// 두 BTreeMap이 이미 경로순으로 정렬되어 있으므로 병합 순회하여 중간 할당과
+/// 무변화 파일의 경로 복제를 피한다.
 fn compare_snapshots(
     previous: &BTreeMap<String, FileState>,
     current: &BTreeMap<String, FileState>,
 ) -> Vec<DocumentChange> {
-    let paths = previous
-        .keys()
-        .chain(current.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    paths
-        .into_iter()
-        .filter_map(|relative_path| {
-            match (previous.get(&relative_path), current.get(&relative_path)) {
-                (None, Some(state)) => Some(DocumentChange {
-                    kind: DocumentChangeKind::Created,
-                    relative_path,
-                    size_bytes: Some(state.size_bytes),
-                }),
-                (Some(_), None) => Some(DocumentChange {
+    let mut changes = Vec::new();
+    let mut prev_iter = previous.iter().peekable();
+    let mut curr_iter = current.iter().peekable();
+
+    while let (Some(&(prev_path, prev_state)), Some(&(curr_path, curr_state))) =
+        (prev_iter.peek(), curr_iter.peek())
+    {
+        match prev_path.cmp(curr_path) {
+            std::cmp::Ordering::Less => {
+                changes.push(DocumentChange {
                     kind: DocumentChangeKind::Deleted,
-                    relative_path,
+                    relative_path: prev_path.clone(),
                     size_bytes: None,
-                }),
-                (Some(before), Some(after)) if before != after => Some(DocumentChange {
-                    kind: DocumentChangeKind::Modified,
-                    relative_path,
-                    size_bytes: Some(after.size_bytes),
-                }),
-                _ => None,
+                });
+                prev_iter.next();
             }
-        })
-        .collect()
+            std::cmp::Ordering::Greater => {
+                changes.push(DocumentChange {
+                    kind: DocumentChangeKind::Created,
+                    relative_path: curr_path.clone(),
+                    size_bytes: Some(curr_state.size_bytes),
+                });
+                curr_iter.next();
+            }
+            std::cmp::Ordering::Equal => {
+                if prev_state != curr_state {
+                    changes.push(DocumentChange {
+                        kind: DocumentChangeKind::Modified,
+                        relative_path: curr_path.clone(),
+                        size_bytes: Some(curr_state.size_bytes),
+                    });
+                }
+                prev_iter.next();
+                curr_iter.next();
+            }
+        }
+    }
+
+    for (prev_path, _) in prev_iter {
+        changes.push(DocumentChange {
+            kind: DocumentChangeKind::Deleted,
+            relative_path: prev_path.clone(),
+            size_bytes: None,
+        });
+    }
+
+    for (curr_path, curr_state) in curr_iter {
+        changes.push(DocumentChange {
+            kind: DocumentChangeKind::Created,
+            relative_path: curr_path.clone(),
+            size_bytes: Some(curr_state.size_bytes),
+        });
+    }
+
+    changes
 }
 
 fn merge_change(changes: &mut BTreeMap<String, DocumentChange>, next: DocumentChange) {
@@ -1412,7 +1447,7 @@ fn spawn_poll_loop(inner: Weak<DocumentAutomationInner>) {
         };
         let supervisor = DocumentAutomationSupervisor { inner };
         if let Err(error) = supervisor.poll_once(now_ms()) {
-            eprintln!("[document-automation] 문서 변경 감지 실패: {error}");
+            eprintln!("[document-automation] 파일 변경 감지 실패: {error}");
         }
         drop(supervisor);
         thread::sleep(POLL_INTERVAL);
@@ -1441,7 +1476,7 @@ fn launch_trigger(
                 merge_action_batch(&mut runtime.pending_actions, &trigger.id, batch);
             }
             if let Err(error) = save_pending_state(&inner.app_data_dir, &runtime) {
-                eprintln!("[document-automation] 문서 트리거 대기열 저장 실패: {error}");
+                eprintln!("[document-automation] 파일 트리거 대기열 저장 실패: {error}");
             }
         }
     });
@@ -1486,20 +1521,8 @@ fn execute_trigger(
         Err(error) => {
             run.status = DocumentTriggerRunStatus::Failed;
             run.error = Some(error.message.clone());
-            if matches!(
-                error.kind,
-                DocumentActionErrorKind::NeedsReview | DocumentActionErrorKind::Degraded
-            ) {
-                update_trigger_failure_status(
-                    inner,
-                    &trigger.id,
-                    if error.kind == DocumentActionErrorKind::NeedsReview {
-                        DocumentTriggerStatus::NeedsReview
-                    } else {
-                        DocumentTriggerStatus::Degraded
-                    },
-                    error.message,
-                )?;
+            if let Some(target_status) = DocumentTriggerStatus::from_action_error_kind(error.kind) {
+                update_trigger_failure_status(inner, &trigger.id, target_status, error.message)?;
             }
         }
     }
@@ -1518,14 +1541,8 @@ fn update_trigger_failure_status(
         inner: Arc::clone(inner),
     };
     supervisor.with_trigger_store(|store| {
-        if let Some(trigger) = store
-            .triggers
-            .iter_mut()
-            .find(|trigger| trigger.id == trigger_id)
-        {
-            trigger.status = status;
-            trigger.status_reason = Some(reason);
-            trigger.updated_at = now_ms();
+        if let Some(trigger) = store.trigger_mut(trigger_id) {
+            trigger.apply_status(status, Some(reason), now_ms());
         }
         Ok(())
     })
@@ -1537,11 +1554,15 @@ fn lock_runtime(
     inner
         .runtime
         .lock()
-        .map_err(|_| CoreError::Runtime("문서 자동화 실행 상태 잠금이 손상되었습니다".to_owned()))
+        .map_err(|_| CoreError::Runtime("변경 자동화 실행 상태 잠금이 손상되었습니다".to_owned()))
 }
 
 fn document_trigger_not_found() -> CoreError {
-    CoreError::NotFound("문서 트리거를 찾을 수 없습니다".to_owned())
+    CoreError::NotFound("파일 트리거를 찾을 수 없습니다".to_owned())
+}
+
+fn offline_report_not_found() -> CoreError {
+    CoreError::NotFound("중단 중 파일 변경 보고를 찾을 수 없습니다".to_owned())
 }
 
 fn load_trigger_status(
@@ -1551,11 +1572,8 @@ fn load_trigger_status(
     DocumentAutomationSupervisor {
         inner: Arc::clone(inner),
     }
-    .load_triggers()?
-    .into_iter()
-    .find(|trigger| trigger.id == trigger_id)
+    .require_trigger(trigger_id)
     .map(|trigger| trigger.status)
-    .ok_or_else(document_trigger_not_found)
 }
 
 fn load_pending_store(app_data_dir: &Path) -> Result<DurablePendingStore, CoreError> {
@@ -1570,7 +1588,7 @@ fn load_pending_store(app_data_dir: &Path) -> Result<DurablePendingStore, CoreEr
     ensure_schema_version(
         store.schema_version,
         PENDING_STORE_SCHEMA_VERSION,
-        "문서 트리거 대기열",
+        "파일 트리거 대기열",
     )?;
     Ok(store)
 }
@@ -1646,16 +1664,112 @@ fn open_database(app_data_dir: &Path) -> Result<Connection, CoreError> {
     Ok(connection)
 }
 
+/// 여러 행 조회. 문장 준비·`query_map`·행 수집 세 걸음을 세 조회가 각자 적고 있었다.
+/// 한 자리로 모으면 `Statement`를 부르는 쪽이 들고 있을 이유가 없어져, 수명 때문에
+/// 블록을 따로 열던 자리도 사라진다. 첫 오류에서 멈춘다.
+fn query_all<T, P, F>(
+    connection: &Connection,
+    sql: &str,
+    params: P,
+    map: F,
+) -> Result<Vec<T>, CoreError>
+where
+    P: rusqlite::Params,
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+{
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement.query_map(params, map)?;
+    let mut collected = Vec::new();
+    for row in rows {
+        collected.push(row?);
+    }
+    Ok(collected)
+}
+
+/// 행이 없을 수 있는 단건 조회. `query_row` → `optional` → `map_err`를 네 조회가 같은
+/// 순서로 적던 자리를 한 줄로 줄인다. "없음"은 오류가 아니라 `None`이다.
+fn query_optional<T, P, F>(
+    connection: &Connection,
+    sql: &str,
+    params: P,
+    map: F,
+) -> Result<Option<T>, CoreError>
+where
+    P: rusqlite::Params,
+    F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+{
+    connection
+        .query_row(sql, params, map)
+        .optional()
+        .map_err(CoreError::from)
+}
+
+/// JSON 본문을 담은 열을 값으로 푼다. 실패는 rusqlite 변환 오류로 감싸므로
+/// `query_map` 클로저 안에서 그대로 `?`로 전파된다.
+fn decode_json_column<T: serde::de::DeserializeOwned>(json: &str) -> rusqlite::Result<T> {
+    serde_json::from_str(json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            json.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+/// `offline_reports` 열 순서. 저장과 조회가 같은 문자열을 쓰고
+/// [`offline_report_from_row`]가 그 순서대로 읽는다. 열 목록이 세 군데에 따로 적혀
+/// 있으면 열을 늘릴 때 조회 쪽 위치 인덱스만 조용히 어긋난다.
+const OFFLINE_REPORT_COLUMNS: &str =
+    "id, created_at, root_count, changes_json, total_count, omitted_count, acknowledged";
+
+/// `trigger_runs` 열 순서. 위와 같은 이유로 [`run_from_row`] 바로 옆에 둔다.
+const RUN_COLUMNS: &str = "id, trigger_id, event_id, action, status, started_at, finished_at, \
+     result_id, result_json, error, is_test";
+
+/// [`OFFLINE_REPORT_COLUMNS`] 순서로 늘어선 행 하나를 보고서로 푼다.
+fn offline_report_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DocumentOfflineChangeReport> {
+    let changes_json: String = row.get(3)?;
+    Ok(DocumentOfflineChangeReport {
+        id: row.get(0)?,
+        created_at: row.get(1)?,
+        root_count: row.get(2)?,
+        changes: decode_json_column(&changes_json)?,
+        total_count: row.get(4)?,
+        omitted_count: row.get(5)?,
+        acknowledged: row.get::<_, i64>(6)? != 0,
+    })
+}
+
+/// [`RUN_COLUMNS`] 순서로 늘어선 행 하나를 실행 기록으로 푼다.
+fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentTriggerRun> {
+    let status: String = row.get(4)?;
+    let result_json: Option<String> = row.get(8)?;
+    Ok(DocumentTriggerRun {
+        id: row.get(0)?,
+        trigger_id: row.get(1)?,
+        event_id: row.get(2)?,
+        action: row.get(3)?,
+        status: parse_run_status(&status),
+        started_at: row.get(5)?,
+        finished_at: row.get(6)?,
+        result_id: row.get(7)?,
+        result: result_json.as_deref().map(decode_json_column).transpose()?,
+        error: row.get(9)?,
+        test: row.get::<_, i64>(10)? != 0,
+    })
+}
+
 fn root_has_baseline(app_data_dir: &Path, root_id: &str) -> Result<bool, CoreError> {
     let connection = open_database(app_data_dir)?;
-    Ok(connection
-        .query_row(
-            "SELECT 1 FROM root_baselines WHERE root_id = ?1",
-            params![root_id],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
+    Ok(query_optional(
+        &connection,
+        "SELECT 1 FROM root_baselines WHERE root_id = ?1",
+        params![root_id],
+        |_| Ok(()),
+    )?
+    .is_some())
 }
 
 fn load_root_snapshot(
@@ -1663,25 +1777,22 @@ fn load_root_snapshot(
     root_id: &str,
 ) -> Result<BTreeMap<String, FileState>, CoreError> {
     let connection = open_database(app_data_dir)?;
-    let mut statement = connection.prepare(
+    let rows = query_all(
+        &connection,
         "SELECT relative_path, size_bytes, modified_ns
          FROM document_entries WHERE root_id = ?1 ORDER BY relative_path",
+        params![root_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                FileState {
+                    size_bytes: row.get(1)?,
+                    modified_ns: row.get(2)?,
+                },
+            ))
+        },
     )?;
-    let rows = statement.query_map(params![root_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            FileState {
-                size_bytes: row.get(1)?,
-                modified_ns: row.get(2)?,
-            },
-        ))
-    })?;
-    let mut snapshot = BTreeMap::new();
-    for row in rows {
-        let (path, state) = row?;
-        snapshot.insert(path, state);
-    }
-    Ok(snapshot)
+    Ok(rows.into_iter().collect())
 }
 
 fn replace_root_snapshot(
@@ -1721,15 +1832,12 @@ fn purge_unregistered_roots(
     registered: &HashSet<String>,
 ) -> Result<(), CoreError> {
     let mut connection = open_database(app_data_dir)?;
-    let known = {
-        let mut statement = connection.prepare("SELECT root_id FROM root_baselines")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        let mut known = Vec::new();
-        for row in rows {
-            known.push(row?);
-        }
-        known
-    };
+    let known: Vec<String> = query_all(
+        &connection,
+        "SELECT root_id FROM root_baselines",
+        [],
+        |row| row.get(0),
+    )?;
     let transaction = connection.transaction()?;
     for root_id in known {
         if !registered.contains(&root_id) {
@@ -1780,9 +1888,10 @@ fn save_offline_report(
         [],
     )?;
     connection.execute(
-        "INSERT INTO offline_reports(
-             id, created_at, root_count, changes_json, total_count, omitted_count, acknowledged
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+        &format!(
+            "INSERT INTO offline_reports({OFFLINE_REPORT_COLUMNS})
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)"
+        ),
         params![
             report.id,
             report.created_at,
@@ -1805,9 +1914,7 @@ fn load_latest_offline_report(
     } else {
         "SELECT id FROM offline_reports ORDER BY created_at DESC LIMIT 1"
     };
-    let id = connection
-        .query_row(query, [], |row| row.get::<_, String>(0))
-        .optional()?;
+    let id: Option<String> = query_optional(&connection, query, [], |row| row.get(0))?;
     id.map(|id| load_offline_report(&connection, &id))
         .transpose()
         .map(Option::flatten)
@@ -1817,52 +1924,30 @@ fn load_offline_report(
     connection: &Connection,
     id: &str,
 ) -> Result<Option<DocumentOfflineChangeReport>, CoreError> {
-    connection
-        .query_row(
-            "SELECT id, created_at, root_count, changes_json, total_count,
-                    omitted_count, acknowledged
-             FROM offline_reports WHERE id = ?1",
-            params![id],
-            |row| {
-                let changes_json: String = row.get(3)?;
-                let changes = serde_json::from_str(&changes_json).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        changes_json.len(),
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?;
-                Ok(DocumentOfflineChangeReport {
-                    id: row.get(0)?,
-                    created_at: row.get(1)?,
-                    root_count: row.get(2)?,
-                    changes,
-                    total_count: row.get(4)?,
-                    omitted_count: row.get(5)?,
-                    acknowledged: row.get::<_, i64>(6)? != 0,
-                })
-            },
-        )
-        .optional()
-        .map_err(CoreError::from)
+    query_optional(
+        connection,
+        &format!("SELECT {OFFLINE_REPORT_COLUMNS} FROM offline_reports WHERE id = ?1"),
+        params![id],
+        offline_report_from_row,
+    )
 }
 
 fn save_run(app_data_dir: &Path, run: &DocumentTriggerRun) -> Result<(), CoreError> {
     let connection = open_database(app_data_dir)?;
     connection.execute(
-        "INSERT INTO trigger_runs(
-             id, trigger_id, event_id, action, status, started_at, finished_at,
-             result_id, result_json, error, is_test
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-         ON CONFLICT(id) DO UPDATE SET status = excluded.status,
-             finished_at = excluded.finished_at, result_id = excluded.result_id,
-             result_json = excluded.result_json, error = excluded.error",
+        &format!(
+            "INSERT INTO trigger_runs({RUN_COLUMNS})
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(id) DO UPDATE SET status = excluded.status,
+                 finished_at = excluded.finished_at, result_id = excluded.result_id,
+                 result_json = excluded.result_json, error = excluded.error"
+        ),
         params![
             run.id,
             run.trigger_id,
             run.event_id,
             run.action,
-            run_status_name(run.status),
+            run.status.as_str(),
             run.started_at,
             run.finished_at,
             run.result_id,
@@ -1882,57 +1967,23 @@ fn save_run(app_data_dir: &Path, run: &DocumentTriggerRun) -> Result<(), CoreErr
 
 fn load_runs(app_data_dir: &Path, limit: usize) -> Result<Vec<DocumentTriggerRun>, CoreError> {
     let connection = open_database(app_data_dir)?;
-    let mut statement = connection.prepare(
-        "SELECT id, trigger_id, event_id, action, status, started_at, finished_at,
-                result_id, result_json, error, is_test
-         FROM trigger_runs ORDER BY started_at DESC LIMIT ?1",
-    )?;
-    let rows = statement.query_map(params![limit], |row| {
-        let status: String = row.get(4)?;
-        let result_json: Option<String> = row.get(8)?;
-        let result = result_json
-            .map(|json| {
-                serde_json::from_str(&json).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        json.len(),
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })
-            })
-            .transpose()?;
-        Ok(DocumentTriggerRun {
-            id: row.get(0)?,
-            trigger_id: row.get(1)?,
-            event_id: row.get(2)?,
-            action: row.get(3)?,
-            status: parse_run_status(&status),
-            started_at: row.get(5)?,
-            finished_at: row.get(6)?,
-            result_id: row.get(7)?,
-            result,
-            error: row.get(9)?,
-            test: row.get::<_, i64>(10)? != 0,
-        })
-    })?;
-    let mut runs = Vec::new();
-    for row in rows {
-        runs.push(row?);
-    }
-    Ok(runs)
+    query_all(
+        &connection,
+        &format!("SELECT {RUN_COLUMNS} FROM trigger_runs ORDER BY started_at DESC LIMIT ?1"),
+        params![limit],
+        run_from_row,
+    )
 }
 
 fn latest_run_started_at(app_data_dir: &Path, trigger_id: &str) -> Result<Option<i64>, CoreError> {
     let connection = open_database(app_data_dir)?;
-    connection
-        .query_row(
-            "SELECT started_at FROM trigger_runs
-             WHERE trigger_id = ?1 AND is_test = 0 ORDER BY started_at DESC LIMIT 1",
-            params![trigger_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(CoreError::from)
+    query_optional(
+        &connection,
+        "SELECT started_at FROM trigger_runs
+         WHERE trigger_id = ?1 AND is_test = 0 ORDER BY started_at DESC LIMIT 1",
+        params![trigger_id],
+        |row| row.get(0),
+    )
 }
 
 fn recent_run_count(app_data_dir: &Path, trigger_id: &str, since: i64) -> Result<usize, CoreError> {
@@ -1944,10 +1995,6 @@ fn recent_run_count(app_data_dir: &Path, trigger_id: &str, since: i64) -> Result
         |row| row.get(0),
     )?;
     Ok(count.max(0) as usize)
-}
-
-fn run_status_name(status: DocumentTriggerRunStatus) -> &'static str {
-    status.as_str()
 }
 
 fn parse_run_status(status: &str) -> DocumentTriggerRunStatus {
@@ -2025,7 +2072,7 @@ mod tests {
 
     fn trigger_input(root_id: String) -> DocumentTriggerInput {
         DocumentTriggerInput {
-            name: "문서 변경".to_owned(),
+            name: "파일 변경".to_owned(),
             root_id,
             include: vec!["**/*.md".to_owned()],
             exclude: vec!["draft/**".to_owned()],
@@ -2375,7 +2422,6 @@ mod tests {
                 status.as_str().parse::<DocumentTriggerRunStatus>().unwrap(),
                 status
             );
-            assert_eq!(run_status_name(status), status.as_str());
             assert_eq!(parse_run_status(status.as_str()), status);
             // 종료 상태 판정 검증
             if matches!(status, DocumentTriggerRunStatus::Running) {
@@ -2401,6 +2447,145 @@ mod tests {
         assert_eq!(
             parse_run_status("unknown"),
             DocumentTriggerRunStatus::Running
+        );
+    }
+
+    #[test]
+    fn document_trigger_status_helpers_and_trigger_mutation() {
+        // 1. from_enabled 검증
+        assert_eq!(
+            DocumentTriggerStatus::from_enabled(true),
+            (DocumentTriggerStatus::Active, None)
+        );
+        assert_eq!(
+            DocumentTriggerStatus::from_enabled(false),
+            (
+                DocumentTriggerStatus::Paused,
+                Some("사용자가 비활성화했습니다".to_owned())
+            )
+        );
+
+        // 2. from_action_error_kind 검증
+        assert_eq!(
+            DocumentTriggerStatus::from_action_error_kind(DocumentActionErrorKind::NeedsReview),
+            Some(DocumentTriggerStatus::NeedsReview)
+        );
+        assert_eq!(
+            DocumentTriggerStatus::from_action_error_kind(DocumentActionErrorKind::Degraded),
+            Some(DocumentTriggerStatus::Degraded)
+        );
+        assert_eq!(
+            DocumentTriggerStatus::from_action_error_kind(DocumentActionErrorKind::Failed),
+            None
+        );
+
+        // 3. DocumentTrigger::new 및 상태 변이 검증
+        let mut input = trigger_input("root-1".to_owned());
+        input.enabled = false;
+        let mut trigger = DocumentTrigger::new("doc-1".to_owned(), input.clone(), 1000);
+        assert_eq!(trigger.status, DocumentTriggerStatus::Paused);
+        assert_eq!(
+            trigger.status_reason.as_deref(),
+            Some("사용자가 비활성화했습니다")
+        );
+        assert_eq!(trigger.created_at, 1000);
+        assert_eq!(trigger.updated_at, 1000);
+
+        trigger.set_enabled(true);
+        assert_eq!(trigger.status, DocumentTriggerStatus::Active);
+        assert_eq!(trigger.status_reason, None);
+        assert!(trigger.input.enabled);
+
+        input.enabled = false;
+        trigger.update_input(input, 2000);
+        assert_eq!(trigger.status, DocumentTriggerStatus::Paused);
+        assert_eq!(
+            trigger.status_reason.as_deref(),
+            Some("사용자가 비활성화했습니다")
+        );
+        assert_eq!(trigger.updated_at, 2000);
+
+        trigger.apply_status(
+            DocumentTriggerStatus::Degraded,
+            Some("등록 폴더 경로가 존재하지 않습니다".to_owned()),
+            3000,
+        );
+        assert_eq!(trigger.status, DocumentTriggerStatus::Degraded);
+        assert_eq!(
+            trigger.status_reason.as_deref(),
+            Some("등록 폴더 경로가 존재하지 않습니다")
+        );
+        assert_eq!(trigger.updated_at, 3000);
+    }
+
+    #[test]
+    fn compare_snapshots_detects_created_deleted_modified_and_skips_unchanged() {
+        let mut previous = BTreeMap::new();
+        previous.insert(
+            "deleted.txt".to_owned(),
+            FileState {
+                size_bytes: 10,
+                modified_ns: 100,
+            },
+        );
+        previous.insert(
+            "modified.txt".to_owned(),
+            FileState {
+                size_bytes: 20,
+                modified_ns: 200,
+            },
+        );
+        previous.insert(
+            "unchanged.txt".to_owned(),
+            FileState {
+                size_bytes: 30,
+                modified_ns: 300,
+            },
+        );
+
+        let mut current = BTreeMap::new();
+        current.insert(
+            "created.txt".to_owned(),
+            FileState {
+                size_bytes: 40,
+                modified_ns: 400,
+            },
+        );
+        current.insert(
+            "modified.txt".to_owned(),
+            FileState {
+                size_bytes: 25,
+                modified_ns: 250,
+            },
+        );
+        current.insert(
+            "unchanged.txt".to_owned(),
+            FileState {
+                size_bytes: 30,
+                modified_ns: 300,
+            },
+        );
+
+        let changes = compare_snapshots(&previous, &current);
+        assert_eq!(
+            changes,
+            vec![
+                DocumentChange {
+                    kind: DocumentChangeKind::Created,
+                    relative_path: "created.txt".to_owned(),
+                    size_bytes: Some(40),
+                },
+                DocumentChange {
+                    kind: DocumentChangeKind::Deleted,
+                    relative_path: "deleted.txt".to_owned(),
+                    size_bytes: None,
+                },
+                DocumentChange {
+                    kind: DocumentChangeKind::Modified,
+                    relative_path: "modified.txt".to_owned(),
+                    size_bytes: Some(25),
+                },
+            ]
         );
     }
 }

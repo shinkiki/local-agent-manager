@@ -10,12 +10,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs4::FileExt;
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{
+    native_pty_system, Child as PtyChild, ChildKiller, CommandBuilder, MasterPty, PtySize,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::catalog::{load_session_summary, SessionCatalog};
-use crate::chat::resolve_executable;
+use crate::chat::{chat_string_enum, resolve_executable};
 use crate::credential_profiles::CLAUDE_SECURESTORAGE_CONFIG_DIR;
 use crate::domain::ProviderId;
 #[cfg(unix)]
@@ -34,6 +36,7 @@ const MIN_COLS: u16 = 20;
 const MAX_COLS: u16 = 500;
 const MIN_ROWS: u16 = 5;
 const MAX_ROWS: u16 = 300;
+#[cfg(unix)]
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_millis(750);
 const FORCED_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -63,6 +66,29 @@ pub struct TerminalAccountLoginRequest {
     pub rows: u16,
 }
 
+/// C9-19. 저장된 SSH 연결 서버로 사용자가 직접 붙는 대화형 터미널.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSshRequest {
+    pub fingerprint: String,
+    pub cols: u16,
+    pub rows: u16,
+    /// 이 창으로 무엇을 할지. 적지 않으면 지금까지처럼 원격 셸이다.
+    #[serde(default)]
+    pub mode: TerminalSshMode,
+}
+
+/// C9-20. 같은 서버로 여는 대화형 창의 두 갈래.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalSshMode {
+    /// 사용자가 직접 명령을 치는 원격 셸.
+    #[default]
+    Shell,
+    /// 이 키의 공개키를 원격 `authorized_keys`에 한 번 등록하고 끝나는 창.
+    InstallKey,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TerminalPhase {
@@ -73,55 +99,34 @@ pub enum TerminalPhase {
     Failed,
 }
 
-impl TerminalPhase {
-    pub const ALL: &'static [Self] = &[
-        Self::Running,
-        Self::Detached,
-        Self::Stopping,
-        Self::Exited,
-        Self::Failed,
-    ];
+// `ALL`·`as_str`·`Display`·`FromStr` 네 덩어리를 손으로 적던 자리다. 채팅 열거형이 쓰는
+// 대응표 매크로와 글자 하나까지 같은 모양이었고, 상태를 하나 늘리면 네 곳을 맞춰 고쳐야
+// 했다. 이제 표만 적으면 `FromStr`가 그 표를 뒤집어 쓰므로 양방향이 어긋날 수 없다.
+chat_string_enum!(TerminalPhase, "알 수 없는 터미널 상태입니다", {
+    Running => "running",
+    Detached => "detached",
+    Stopping => "stopping",
+    Exited => "exited",
+    Failed => "failed",
+});
 
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Detached => "detached",
-            Self::Stopping => "stopping",
-            Self::Exited => "exited",
-            Self::Failed => "failed",
-        }
+impl TerminalPhase {
+    /// 클라이언트가 화면을 붙이거나 입력을 보낼 수 있는 활성 상태인지.
+    fn is_active(self) -> bool {
+        matches!(self, Self::Running | Self::Detached)
     }
 
     fn can_attach(self) -> bool {
-        matches!(self, Self::Running | Self::Detached)
+        self.is_active()
     }
 
     fn can_restart(self) -> bool {
         self == Self::Exited
     }
-}
 
-impl std::fmt::Display for TerminalPhase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for TerminalPhase {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "running" => Ok(Self::Running),
-            "detached" => Ok(Self::Detached),
-            "stopping" => Ok(Self::Stopping),
-            "exited" => Ok(Self::Exited),
-            "failed" => Ok(Self::Failed),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 터미널 상태입니다: {}",
-                s
-            ))),
-        }
+    /// 프로세스가 이미 종료되었거나 실패해 추가 종료 처리가 필요 없는 종단 상태인지.
+    fn is_terminated(self) -> bool {
+        matches!(self, Self::Exited | Self::Failed)
     }
 }
 
@@ -129,7 +134,8 @@ impl std::str::FromStr for TerminalPhase {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalSessionInfo {
     pub terminal_id: String,
-    pub source: ProviderId,
+    /// 공급자 CLI 터미널의 공급자. SSH 대화형 터미널(C9-19)은 공급자가 없어 `None`이다.
+    pub source: Option<ProviderId>,
     pub session_id: String,
     pub state: TerminalPhase,
     pub reconnect_deadline: Option<i64>,
@@ -178,8 +184,42 @@ pub struct TerminalSupervisor {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SessionKey {
-    source: ProviderId,
+    /// `None`은 공급자에 묶이지 않은 터미널(SSH 대화형)이다. 공급자별 일괄 종료에서
+    /// 제외되고 잠금 파일 이름은 `ssh-`로 시작한다.
+    source: Option<ProviderId>,
     session_id: String,
+}
+
+impl SessionKey {
+    fn provider(source: ProviderId, session_id: impl Into<String>) -> Self {
+        Self {
+            source: Some(source),
+            session_id: session_id.into(),
+        }
+    }
+
+    fn setup(source: ProviderId) -> Self {
+        Self::provider(source, "cli-setup")
+    }
+
+    fn account_login(source: ProviderId, login_id: &str) -> Self {
+        Self::provider(source, format!("account-login-{login_id}"))
+    }
+
+    fn ssh(fingerprint: &str, mode: TerminalSshMode) -> Self {
+        Self {
+            source: None,
+            session_id: ssh_terminal_session_id(fingerprint, mode),
+        }
+    }
+
+    fn source_label(&self) -> &'static str {
+        self.source.map_or("ssh", ProviderId::as_str)
+    }
+
+    fn lock_path(&self, lock_dir: &Path) -> PathBuf {
+        lock_dir.join(format!("{}-{}.lock", self.source_label(), self.session_id))
+    }
 }
 
 struct SupervisorInner {
@@ -190,9 +230,22 @@ struct SupervisorInner {
     accounts: Option<AccountSupervisor>,
 }
 
+impl SupervisorInner {
+    /// 같은 Arc 인스턴스가 등록되어 있을 때만 세션 맵에서 지운다.
+    fn remove_matching_session(
+        &self,
+        key: &SessionKey,
+        expected: &Arc<TerminalRuntime>,
+    ) -> Result<Option<Arc<TerminalRuntime>>, CoreError> {
+        let mut sessions = lock(&self.sessions)?;
+        Ok(remove_matching_session(&mut sessions, key, expected))
+    }
+}
+
 struct TerminalRuntime {
     terminal_id: String,
     key: SessionKey,
+    #[cfg_attr(not(unix), allow(dead_code))]
     process_id: Option<u32>,
     state: Mutex<RuntimeState>,
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -229,11 +282,22 @@ impl RuntimeState {
         self.expires_at = None;
     }
 
+    /// 연결이 끊긴 터미널을 재연결 유예 동안 남기고 화면에도 마감 시각을 알린다.
+    fn begin_detached_grace(&mut self) {
+        self.phase = TerminalPhase::Detached;
+        self.begin_reconnect_grace(Some(unix_millis_after(RECONNECT_GRACE)));
+    }
+
     /// 프로세스가 끝난 터미널을 재연결 유예 동안만 남겨 둔다. 유예 시각은 내부 청소용이라
     /// 화면에 노출하는 재연결 마감(`reconnect_deadline`)과 달리 비워 둔다.
     fn begin_exit_grace(&mut self) {
+        self.begin_reconnect_grace(None);
+    }
+
+    /// 재연결 유예의 내부 만료와 화면용 마감 시각을 함께 갱신한다.
+    fn begin_reconnect_grace(&mut self, reconnect_deadline: Option<i64>) {
         self.expires_at = Some(Instant::now() + RECONNECT_GRACE);
-        self.reconnect_deadline = None;
+        self.reconnect_deadline = reconnect_deadline;
     }
 }
 
@@ -244,16 +308,32 @@ struct LaunchSpec {
     env: Vec<(String, String)>,
 }
 
+impl LaunchSpec {
+    /// PTY는 경로를 손대지 않고 그대로 `CreateProcessW`에 넘긴다. `std::process::Command`와
+    /// 달리 프로그램 경로를 정규화해 주지 않으므로, 확장 경로가 들어오면 `cmd.exe`가 작업
+    /// 경로를 거부하고 배치 셈(`codex.cmd`)을 열지 못한다. 네 곳의 생성자가 각자 조심하는
+    /// 대신 여기서 한 번 벗겨, 어떤 실행 경로도 접두어를 달고 나갈 수 없게 한다 —
+    /// `resolve_ssh_launch_spec`은 실제로 `canonical_path`를 거치지 않는다.
+    fn new(executable: PathBuf, cwd: PathBuf, args: Vec<String>) -> Self {
+        Self {
+            executable: crate::path_guard::child_facing(&executable),
+            cwd: crate::path_guard::child_facing(&cwd),
+            args,
+            env: Vec::new(),
+        }
+    }
+
+    /// 환경변수를 얹는다. 이것을 쓰는 것은 계정 로그인 경로 하나뿐이지만, 생성자를
+    /// 비켜 구조체를 손으로 채우면 칸이 하나 늘 때 그 자리만 빠지게 된다.
+    fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = env;
+        self
+    }
+}
+
 impl TerminalSupervisor {
     pub fn new(app_data_dir: impl AsRef<Path>) -> Result<Self, CoreError> {
         Self::create(app_data_dir.as_ref(), None, None)
-    }
-
-    pub fn with_session_catalog(
-        app_data_dir: impl AsRef<Path>,
-        session_catalog: SessionCatalog,
-    ) -> Result<Self, CoreError> {
-        Self::create(app_data_dir.as_ref(), Some(session_catalog), None)
     }
 
     pub fn with_accounts(
@@ -290,11 +370,7 @@ impl TerminalSupervisor {
         request: TerminalOpenRequest,
     ) -> Result<TerminalAttachment, CoreError> {
         validate_identifier(&request.session_id)?;
-        validate_size(request.cols, request.rows)?;
-        let key = SessionKey {
-            source: request.source,
-            session_id: request.session_id.clone(),
-        };
+        let key = SessionKey::provider(request.source, request.session_id.clone());
 
         // 세션에 묶인 계정으로 재개한다. 자격증명이 계정별로 갈려 있어 다른 계정으로
         // 붙으면 그 계정의 한도를 쓰고 사용량 집계도 세션과 어긋난다.
@@ -370,11 +446,20 @@ impl TerminalSupervisor {
 
     /// 계정에 묶이지 않는 터미널(설정·로그인)의 실행 임차. 계정 감독자가 없는
     /// 원격 구성에서는 임차 없이 뜬다.
+    ///
+    /// 계정을 두지 않는 공급자(로컬)도 임차 없이 뜬다. 이 임차는 공유 홈 자격증명을
+    /// 바꾸는 동안 살아 있는 런타임을 세는 자리(C1-6)이고, 자격증명이 없는 공급자에는
+    /// 셀 것도 막을 것도 없다. 그런데도 임차를 요구하면 `credential_switch_guard`가
+    /// "계정 관리를 지원하지 않습니다"로 거절해, 하네스를 설치하러 여는 설정 터미널이
+    /// 통째로 열리지 않았다.
     fn unscoped_lease(
         &self,
         provider: ProviderId,
         kind: UnscopedRuntimeKind,
     ) -> Result<Option<AccountRuntimeLease>, CoreError> {
+        if !provider.manages_accounts() {
+            return Ok(None);
+        }
         self.inner
             .accounts
             .as_ref()
@@ -386,11 +471,7 @@ impl TerminalSupervisor {
         &self,
         request: TerminalSetupRequest,
     ) -> Result<TerminalAttachment, CoreError> {
-        validate_size(request.cols, request.rows)?;
-        let key = SessionKey {
-            source: request.source,
-            session_id: "cli-setup".to_owned(),
-        };
+        let key = SessionKey::setup(request.source);
         self.open_with(
             key,
             request.cols,
@@ -408,27 +489,44 @@ impl TerminalSupervisor {
         remote: bool,
     ) -> Result<TerminalAttachment, CoreError> {
         validate_identifier(&request.login_id)?;
-        validate_size(request.cols, request.rows)?;
         let accounts = self.inner.accounts.as_ref().ok_or_else(|| {
             CoreError::Conflict("계정 로그인은 로컬 데스크톱에서만 사용할 수 있습니다".to_owned())
         })?;
         let login = accounts.login_session(&request.login_id)?;
-        let key = SessionKey {
-            source: login.provider,
-            session_id: format!("account-login-{}", request.login_id),
-        };
+        let key = SessionKey::account_login(login.provider, &request.login_id);
         let provider = login.provider;
-        let accounts = accounts.clone();
         self.open_with(
             key,
             request.cols,
             request.rows,
             || resolve_account_login_launch_spec(login, remote),
-            || {
-                accounts
-                    .acquire_unscoped_runtime(provider, UnscopedRuntimeKind::IsolatedLogin)
-                    .map(Some)
-            },
+            || self.unscoped_lease(provider, UnscopedRuntimeKind::IsolatedLogin),
+        )
+    }
+
+    /// C9-19. 저장된 SSH 연결 서버로 사용자가 직접 붙는 대화형 터미널을 연다. 같은 서버의
+    /// 터미널이 살아 있으면 거기에 다시 붙는다. 계정 lease는 없다 — 공급자 자원을 쓰지
+    /// 않는다. 명령 목록은 적용하지 않는다: 그 목록은 에이전트를 묶는 규칙이고, 사용자가
+    /// 자기 손으로 치는 셸에 앞머리 대조를 걸 방법도 없다.
+    pub fn open_ssh(&self, request: TerminalSshRequest) -> Result<TerminalAttachment, CoreError> {
+        let launch = match request.mode {
+            TerminalSshMode::Shell => crate::ssh_endpoints::ssh_terminal_launch(
+                &self.inner.app_data_dir,
+                &request.fingerprint,
+            ),
+            // C9-20. 공개키 등록은 원격 명령 하나를 달고 열려 끝나면 스스로 닫힌다.
+            TerminalSshMode::InstallKey => crate::ssh_endpoints::ssh_key_install_launch(
+                &self.inner.app_data_dir,
+                &request.fingerprint,
+            ),
+        }?;
+        let key = SessionKey::ssh(&launch.fingerprint, request.mode);
+        self.open_with(
+            key,
+            request.cols,
+            request.rows,
+            move || resolve_ssh_launch_spec(launch),
+            || Ok(None),
         )
     }
 
@@ -440,35 +538,9 @@ impl TerminalSupervisor {
         resolve_spec: impl FnOnce() -> Result<LaunchSpec, CoreError>,
         resolve_account_lease: impl FnOnce() -> Result<Option<AccountRuntimeLease>, CoreError>,
     ) -> Result<TerminalAttachment, CoreError> {
-        let existing = {
-            let sessions = lock(&self.inner.sessions)?;
-            sessions.get(&key).cloned()
-        };
-        if let Some(runtime) = existing {
-            let phase = runtime.phase()?;
-            if phase.can_attach() {
-                runtime.resize(cols, rows)?;
-                return runtime.attach();
-            }
-            if phase.can_restart() {
-                let removed = {
-                    let mut sessions = lock(&self.inner.sessions)?;
-                    if sessions
-                        .get(&key)
-                        .is_some_and(|current| Arc::ptr_eq(current, &runtime))
-                    {
-                        sessions.remove(&key)
-                    } else {
-                        None
-                    }
-                };
-                drop(runtime);
-                drop(removed);
-            } else {
-                return Err(CoreError::Conflict(
-                    "터미널 프로세스를 정리하고 있습니다. 잠시 후 다시 연결하세요".to_owned(),
-                ));
-            }
+        validate_size(cols, rows)?;
+        if let Some(attachment) = self.attach_existing(&key, cols, rows)? {
+            return Ok(attachment);
         }
 
         let spec = resolve_spec()?;
@@ -487,6 +559,37 @@ impl TerminalSupervisor {
         sessions.insert(key, Arc::clone(&runtime));
         drop(sessions);
         runtime.attach()
+    }
+
+    /// 이미 등록된 런타임은 재연결하거나, 종료된 항목이면 새 기동을 위해 맵에서 걷어낸다.
+    fn attach_existing(
+        &self,
+        key: &SessionKey,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Option<TerminalAttachment>, CoreError> {
+        let existing = {
+            let sessions = lock(&self.inner.sessions)?;
+            sessions.get(key).cloned()
+        };
+        let Some(runtime) = existing else {
+            return Ok(None);
+        };
+        let phase = runtime.phase()?;
+        if phase.can_attach() {
+            runtime.resize(cols, rows)?;
+            return runtime.attach().map(Some);
+        }
+        if !phase.can_restart() {
+            return Err(CoreError::Conflict(
+                "터미널 프로세스를 정리하고 있습니다. 잠시 후 다시 연결하세요".to_owned(),
+            ));
+        }
+
+        let removed = self.inner.remove_matching_session(key, &runtime)?;
+        drop(runtime);
+        drop(removed);
+        Ok(None)
     }
 
     pub fn write(&self, terminal_id: &str, data: &[u8]) -> Result<(), CoreError> {
@@ -518,17 +621,7 @@ impl TerminalSupervisor {
         &self,
         provider: ProviderId,
     ) -> Result<StopProviderTerminalsReport, CoreError> {
-        let targets: Vec<Arc<TerminalRuntime>> = {
-            let sessions = lock(&self.inner.sessions)?;
-            let mut targets = Vec::new();
-            for runtime in sessions.values() {
-                if runtime.key.source != provider || runtime.phase()? == TerminalPhase::Exited {
-                    continue;
-                }
-                targets.push(Arc::clone(runtime));
-            }
-            targets
-        };
+        let targets = self.provider_runtimes(provider)?;
         let requested_count = targets.len();
         let mut forced_count = 0usize;
         let mut failed = Vec::new();
@@ -539,11 +632,7 @@ impl TerminalSupervisor {
                         forced_count += 1;
                     }
                 }
-                Err(error) => failed.push(StopTerminalFailure {
-                    terminal_id: runtime.terminal_id.clone(),
-                    session_id: runtime.key.session_id.clone(),
-                    error: error.to_string(),
-                }),
+                Err(error) => failed.push(runtime.to_stop_failure(error)),
             }
         }
         let remaining_terminal_count = self.provider_terminal_count(provider)?;
@@ -559,14 +648,23 @@ impl TerminalSupervisor {
 
     /// 종료 확인이 끝나지 않은 해당 공급자의 관리 터미널 수를 반환한다.
     pub fn provider_terminal_count(&self, provider: ProviderId) -> Result<usize, CoreError> {
+        Ok(self.provider_runtimes(provider)?.len())
+    }
+
+    /// 아직 종료가 확인되지 않은 해당 공급자의 관리 런타임. 일괄 종료와 잔여 수 확인이
+    /// 같은 조건으로 각자 순회하고 있어 한 자리로 모았다.
+    fn provider_runtimes(
+        &self,
+        provider: ProviderId,
+    ) -> Result<Vec<Arc<TerminalRuntime>>, CoreError> {
         let sessions = lock(&self.inner.sessions)?;
-        let mut remaining = 0usize;
+        let mut runtimes = Vec::new();
         for runtime in sessions.values() {
-            if runtime.key.source == provider && runtime.phase()? != TerminalPhase::Exited {
-                remaining += 1;
+            if runtime.key.source == Some(provider) && runtime.phase()? != TerminalPhase::Exited {
+                runtimes.push(Arc::clone(runtime));
             }
         }
-        Ok(remaining)
+        Ok(runtimes)
     }
 
     fn runtime(&self, terminal_id: &str) -> Result<Arc<TerminalRuntime>, CoreError> {
@@ -597,43 +695,11 @@ impl TerminalRuntime {
         session_lock: File,
         account_runtime_lease: Option<AccountRuntimeLease>,
     ) -> Result<Arc<Self>, CoreError> {
-        let pair = native_pty_system()
-            .openpty(pty_size(cols, rows))
-            .map_err(|error| CoreError::Runtime(format!("PTY를 열지 못했습니다: {error}")))?;
-        let mut command = CommandBuilder::new(spec.executable.as_os_str());
-        command.args(spec.args);
-        command.cwd(spec.cwd.as_os_str());
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-        // PTY로 셸이 아니라 CLI를 직접 띄우므로 프로필이 PATH를 보정해 주지 않는다.
-        // GUI 실행 시 빠지는 공통 디렉터리만 상속 PATH 뒤에 덧붙인다.
-        if let Some(path) = crate::providers::appended_search_path() {
-            command.env("PATH", path);
-        }
-        for (key, value) in spec.env {
-            command.env(key, value);
-        }
-
-        let mut child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|error| CoreError::Runtime(format!("CLI를 시작하지 못했습니다: {error}")))?;
-        let process_id = child.process_id();
-        let killer = child.clone_killer();
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|error| CoreError::Runtime(format!("PTY 출력을 열지 못했습니다: {error}")))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|error| CoreError::Runtime(format!("PTY 입력을 열지 못했습니다: {error}")))?;
-        drop(pair.slave);
-
+        let pty = open_terminal_pty(cols, rows, spec)?;
         let runtime = Arc::new(Self {
             terminal_id: Uuid::new_v4().to_string(),
             key,
-            process_id,
+            process_id: pty.process_id,
             state: Mutex::new(RuntimeState {
                 phase: TerminalPhase::Running,
                 subscriber: None,
@@ -643,30 +709,13 @@ impl TerminalRuntime {
                 expires_at: None,
                 exit_code: None,
             }),
-            master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
-            killer: Mutex::new(killer),
+            master: Mutex::new(pty.master),
+            writer: Mutex::new(pty.writer),
+            killer: Mutex::new(pty.killer),
             session_lock: Mutex::new(Some(session_lock)),
             account_runtime_lease: Mutex::new(account_runtime_lease),
         });
-
-        let reader_runtime = Arc::clone(&runtime);
-        thread::Builder::new()
-            .name(format!("terminal-reader-{}", runtime.terminal_id))
-            .spawn(move || read_terminal(reader_runtime, reader))
-            .map_err(CoreError::Io)?;
-
-        let wait_runtime = Arc::clone(&runtime);
-        thread::Builder::new()
-            .name(format!("terminal-wait-{}", runtime.terminal_id))
-            .spawn(move || match child.wait() {
-                Ok(status) => wait_runtime.mark_exited(Some(status.exit_code())),
-                Err(error) => {
-                    wait_runtime.mark_failed(format!("CLI 종료 상태를 읽지 못했습니다: {error}"))
-                }
-            })
-            .map_err(CoreError::Io)?;
-
+        attach_runtime_threads(&runtime, pty.reader, pty.child)?;
         Ok(runtime)
     }
 
@@ -683,27 +732,35 @@ impl TerminalRuntime {
             state.clear_deadlines();
         }
         let info = self.info(&state);
-        sender
-            .try_send(TerminalEvent::State {
+        // 연결 직후 밀어 넣는 세 이벤트가 모두 '보내고, 막히면 그 자리의 문구로 실패'라
+        // 같은 모양이었다. 실패 문구만 다르므로 전송을 한 자리로 모으고 문구를 받는다.
+        let send = |event: TerminalEvent, failure: &str| -> Result<(), CoreError> {
+            sender
+                .try_send(event)
+                .map_err(|_| CoreError::Runtime(failure.to_owned()))
+        };
+        send(
+            TerminalEvent::State {
                 session: info.clone(),
-            })
-            .map_err(|_| CoreError::Runtime("터미널 이벤트 채널을 열지 못했습니다".to_owned()))?;
+            },
+            "터미널 이벤트 채널을 열지 못했습니다",
+        )?;
         let replay = state.replay.iter().copied().collect::<Vec<_>>();
         for chunk in replay.chunks(REPLAY_CHUNK_BYTES) {
-            sender
-                .try_send(TerminalEvent::Output {
+            send(
+                TerminalEvent::Output {
                     data: chunk.to_vec(),
-                })
-                .map_err(|_| CoreError::Runtime("터미널 출력을 재생하지 못했습니다".to_owned()))?;
+                },
+                "터미널 출력을 재생하지 못했습니다",
+            )?;
         }
         if state.phase == TerminalPhase::Exited {
-            sender
-                .try_send(TerminalEvent::Exit {
+            send(
+                TerminalEvent::Exit {
                     code: state.exit_code,
-                })
-                .map_err(|_| {
-                    CoreError::Runtime("터미널 종료 상태를 전달하지 못했습니다".to_owned())
-                })?;
+                },
+                "터미널 종료 상태를 전달하지 못했습니다",
+            )?;
         }
         state.subscriber = Some(sender);
         Ok(TerminalAttachment {
@@ -718,7 +775,7 @@ impl TerminalRuntime {
 
     fn write(&self, data: &[u8]) -> Result<(), CoreError> {
         let phase = lock(&self.state)?.phase;
-        if !matches!(phase, TerminalPhase::Running | TerminalPhase::Detached) {
+        if !phase.is_active() {
             return Err(CoreError::Conflict(
                 "종료된 터미널에는 입력할 수 없습니다".to_owned(),
             ));
@@ -740,26 +797,26 @@ impl TerminalRuntime {
     fn detach(&self) -> Result<(), CoreError> {
         let mut state = lock(&self.state)?;
         state.subscriber = None;
-        if matches!(
-            state.phase,
-            TerminalPhase::Running | TerminalPhase::Detached
-        ) {
-            set_detached_deadline(&mut state);
+        if state.phase.is_active() {
+            state.begin_detached_grace();
         }
         Ok(())
     }
 
     fn terminate(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            if matches!(state.phase, TerminalPhase::Exited | TerminalPhase::Failed) {
-                return;
+        let already_terminated = self.with_state(|state| {
+            if state.phase.is_terminated() {
+                return true;
             }
             state.phase = TerminalPhase::Stopping;
-            self.emit_state(&mut state);
+            self.emit_state(state);
+            false
+        });
+        // 상태를 못 읽었으면(잠금 오염) 이미 끝났는지 알 수 없으므로 종료 신호는 보낸다.
+        if already_terminated == Some(true) {
+            return;
         }
-        if let Ok(mut killer) = self.killer.lock() {
-            let _ = killer.kill();
-        }
+        self.kill_child();
     }
 
     /// SIGTERM 정상 종료 후 PID 기반 SIGKILL 승격을 수행한다. 반환값이 true면
@@ -773,72 +830,94 @@ impl TerminalRuntime {
 
         #[cfg(unix)]
         {
-            let pid = self.process_id.ok_or_else(|| {
-                CoreError::Runtime(format!(
-                    "터미널 {}의 프로세스 PID를 확인할 수 없습니다",
-                    self.terminal_id
-                ))
-            })?;
-            if let Ok(false) = send_terminal_signal(pid, libc::SIGTERM) {
-                self.mark_exited(None);
-                return Ok(false);
+            let pid = self
+                .process_id
+                .ok_or_else(|| self.stop_error("프로세스 PID를 확인할 수 없습니다".to_owned()))?;
+            let outcome = process_signal::escalate_stop(
+                (
+                    // SIGTERM을 보내지 못한 것은 종료 여부를 알 수 없다는 뜻일 뿐이라
+                    // 사라졌다고 보지 않고 그대로 기다려 본다.
+                    || {
+                        Ok(match send_terminal_signal(pid, libc::SIGTERM) {
+                            Ok(false) => process_signal::SignalDelivery::Gone,
+                            _ => process_signal::SignalDelivery::Delivered,
+                        })
+                    },
+                    GRACEFUL_STOP_TIMEOUT,
+                ),
+                (
+                    || {
+                        send_terminal_signal(pid, libc::SIGKILL)
+                            .map(|_| process_signal::SignalDelivery::Delivered)
+                            .map_err(|error| {
+                                self.stop_error(format!(
+                                    "PID {pid} 강제 종료 신호를 보내지 못했습니다: {error}"
+                                ))
+                            })
+                    },
+                    FORCED_STOP_TIMEOUT,
+                ),
+                |timeout| self.wait_for_exit(timeout),
+            )?;
+            match outcome {
+                process_signal::StopEscalation::AlreadyGone => {
+                    self.mark_exited(None);
+                    Ok(false)
+                }
+                process_signal::StopEscalation::Graceful => Ok(false),
+                process_signal::StopEscalation::Forced => Ok(true),
+                process_signal::StopEscalation::Stuck => {
+                    Err(self
+                        .stop_error(format!("PID {pid}가 SIGKILL 이후에도 종료되지 않았습니다")))
+                }
             }
-            if self.wait_for_exit(GRACEFUL_STOP_TIMEOUT)? {
-                return Ok(false);
-            }
-
-            send_terminal_signal(pid, libc::SIGKILL).map_err(|error| {
-                CoreError::Runtime(format!(
-                    "터미널 {}의 PID {pid} 강제 종료 신호를 보내지 못했습니다: {error}",
-                    self.terminal_id
-                ))
-            })?;
-            if self.wait_for_exit(FORCED_STOP_TIMEOUT)? {
-                return Ok(true);
-            }
-            Err(CoreError::Runtime(format!(
-                "터미널 {}의 PID {pid}가 SIGKILL 이후에도 종료되지 않았습니다",
-                self.terminal_id
-            )))
         }
 
         #[cfg(not(unix))]
         {
             if let Ok(mut killer) = self.killer.lock() {
                 killer.kill().map_err(|error| {
-                    CoreError::Runtime(format!(
-                        "터미널 {}의 종료 신호를 보내지 못했습니다: {error}",
-                        self.terminal_id
-                    ))
+                    self.stop_error(format!("종료 신호를 보내지 못했습니다: {error}"))
                 })?;
             }
             if self.wait_for_exit(FORCED_STOP_TIMEOUT)? {
                 return Ok(false);
             }
-            Err(CoreError::Runtime(format!(
-                "터미널 {}의 종료를 확인하지 못했습니다",
-                self.terminal_id
-            )))
+            Err(self.stop_error("종료를 확인하지 못했습니다".to_owned()))
+        }
+    }
+
+    /// 종료 단계의 오류 문구. 어느 터미널인지 밝히는 앞머리가 모두 같아 한 자리로 모았다.
+    fn stop_error(&self, reason: String) -> CoreError {
+        CoreError::Runtime(format!("터미널 {}의 {reason}", self.terminal_id))
+    }
+
+    fn to_stop_failure(&self, error: impl ToString) -> StopTerminalFailure {
+        StopTerminalFailure {
+            terminal_id: self.terminal_id.clone(),
+            session_id: self.key.session_id.clone(),
+            error: error.to_string(),
         }
     }
 
     fn mark_stopping(&self) {
-        if let Ok(mut state) = self.state.lock() {
+        self.with_state(|state| {
             if state.phase == TerminalPhase::Exited {
                 return;
             }
             state.phase = TerminalPhase::Stopping;
             state.clear_deadlines();
-            self.emit_state(&mut state);
-        }
+            self.emit_state(state);
+        });
     }
 
     fn wait_for_exit(&self, timeout: Duration) -> Result<bool, CoreError> {
-        let deadline = Instant::now() + timeout;
-        loop {
+        crate::chat::poll_until(timeout, STOP_POLL_INTERVAL, || {
             if self.phase()? == TerminalPhase::Exited {
                 return Ok(true);
             }
+            // 자식이 PTY를 남긴 채 사라지면 종료 이벤트가 오지 않는다. PID가 없어진 것을
+            // 보면 그 자리에서 종료로 기록한다.
             #[cfg(unix)]
             if let Some(pid) = self.process_id {
                 if !terminal_pid_exists(pid)? {
@@ -846,62 +925,56 @@ impl TerminalRuntime {
                     return Ok(true);
                 }
             }
-            if Instant::now() >= deadline {
-                return Ok(false);
-            }
-            thread::sleep(STOP_POLL_INTERVAL);
-        }
+            Ok(false)
+        })
     }
 
     fn append_output(&self, data: &[u8]) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        state.append_replay(data);
-        try_send(
-            &mut state,
-            TerminalEvent::Output {
-                data: data.to_vec(),
-            },
-        );
+        self.with_state(|state| {
+            state.append_replay(data);
+            try_send(
+                state,
+                TerminalEvent::Output {
+                    data: data.to_vec(),
+                },
+            );
+        });
     }
 
     fn mark_exited(&self, code: Option<u32>) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        if state.phase == TerminalPhase::Exited {
-            if state.exit_code.is_none() {
-                state.exit_code = code;
+        self.with_state(|state| {
+            if state.phase == TerminalPhase::Exited {
+                if state.exit_code.is_none() {
+                    state.exit_code = code;
+                }
+                return;
             }
-            return;
-        }
-        state.phase = TerminalPhase::Exited;
-        state.exit_code = code;
-        state.begin_exit_grace();
-        if let Ok(mut session_lock) = self.session_lock.lock() {
-            *session_lock = None;
-        }
-        if let Ok(mut lease) = self.account_runtime_lease.lock() {
-            if let Some(mut lease) = lease.take() {
-                lease.release();
+            state.phase = TerminalPhase::Exited;
+            state.exit_code = code;
+            state.begin_exit_grace();
+            if let Ok(mut session_lock) = self.session_lock.lock() {
+                *session_lock = None;
             }
-        }
-        try_send(&mut state, TerminalEvent::Exit { code });
-        self.emit_state(&mut state);
+            if let Ok(mut lease) = self.account_runtime_lease.lock() {
+                if let Some(mut lease) = lease.take() {
+                    lease.release();
+                }
+            }
+            try_send(state, TerminalEvent::Exit { code });
+            self.emit_state(state);
+        });
     }
 
     fn mark_failed(&self, message: String) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        state.phase = TerminalPhase::Failed;
-        state.begin_exit_grace();
-        try_send(&mut state, TerminalEvent::Error { message });
-        self.emit_state(&mut state);
-        drop(state);
-        if let Ok(mut killer) = self.killer.lock() {
-            let _ = killer.kill();
+        let marked = self.with_state(|state| {
+            state.phase = TerminalPhase::Failed;
+            state.begin_exit_grace();
+            try_send(state, TerminalEvent::Error { message });
+            self.emit_state(state);
+        });
+        // 상태 잠금을 놓은 뒤에 죽인다. 자식이 끝나며 도는 보조 스레드가 같은 잠금을 잡는다.
+        if marked.is_some() {
+            self.kill_child();
         }
     }
 
@@ -911,6 +984,22 @@ impl TerminalRuntime {
             .ok()
             .and_then(|state| state.expires_at)
             .is_some_and(|expires_at| expires_at <= now)
+    }
+
+    /// 상태 잠금을 잡고 전이 하나를 적용한다. 잠금이 오염됐으면(상태를 바꾸던 스레드가
+    /// 패닉) 아무것도 하지 않고 `None`을 돌려준다 — 상태를 만지는 다섯 자리가 모두 같은
+    /// 판단을 하고 있어 한 벌로 모았다. 뒷정리가 딸린 호출부는 반환값으로 갈라본다.
+    fn with_state<T>(&self, body: impl FnOnce(&mut RuntimeState) -> T) -> Option<T> {
+        let mut state = self.state.lock().ok()?;
+        Some(body(&mut state))
+    }
+
+    /// 자식에게 종료 신호를 보낸다. 이미 죽었거나 신호를 못 보내도 할 수 있는 일이 없어
+    /// 실패는 삼킨다. 종료 확인이 필요한 경로는 `stop_with_escalation`이 따로 맡는다.
+    fn kill_child(&self) {
+        if let Ok(mut killer) = self.killer.lock() {
+            let _ = killer.kill();
+        }
     }
 
     /// 지금 상태를 구독자에게 알린다. 상태를 바꾼 자리는 모두 이 한 줄로 닫는다.
@@ -930,6 +1019,101 @@ impl TerminalRuntime {
             replay_truncated: state.replay_truncated,
         }
     }
+}
+
+/// PTY를 열고 CLI를 띄운 직후에 손에 남는 것들. 런타임 구조체가 들고 갈 손잡이와
+/// 보조 스레드로 넘길 손잡이가 섞여 있어 한 묶음으로 돌려준다.
+struct SpawnedPty {
+    master: Box<dyn MasterPty + Send>,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    child: Box<dyn PtyChild + Send + Sync>,
+    process_id: Option<u32>,
+}
+
+/// 실행 스펙을 PTY 명령으로 옮긴다.
+fn terminal_command(spec: LaunchSpec) -> CommandBuilder {
+    let mut command = CommandBuilder::new(spec.executable.as_os_str());
+    command.args(spec.args);
+    command.cwd(spec.cwd.as_os_str());
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    // PTY로 셸이 아니라 CLI를 직접 띄우므로 프로필이 PATH를 보정해 주지 않는다.
+    // GUI 실행 시 빠지는 공통 디렉터리만 상속 PATH 뒤에 덧붙인다.
+    if let Some(path) = crate::providers::appended_search_path() {
+        command.env("PATH", path);
+    }
+    for (key, value) in spec.env {
+        command.env(key, value);
+    }
+    command
+}
+
+/// PTY 한 쌍을 열고 그 안에서 CLI를 띄운다. slave는 자식에게 넘겨준 뒤 이쪽에서 닫아야
+/// 자식이 끝났을 때 master 쪽 읽기가 EOF로 닫힌다.
+fn open_terminal_pty(cols: u16, rows: u16, spec: LaunchSpec) -> Result<SpawnedPty, CoreError> {
+    let pair = native_pty_system()
+        .openpty(pty_size(cols, rows))
+        .map_err(|error| CoreError::Runtime(format!("PTY를 열지 못했습니다: {error}")))?;
+    let child = pair
+        .slave
+        .spawn_command(terminal_command(spec))
+        .map_err(|error| CoreError::Runtime(format!("CLI를 시작하지 못했습니다: {error}")))?;
+    let process_id = child.process_id();
+    let killer = child.clone_killer();
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|error| CoreError::Runtime(format!("PTY 출력을 열지 못했습니다: {error}")))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|error| CoreError::Runtime(format!("PTY 입력을 열지 못했습니다: {error}")))?;
+    drop(pair.slave);
+    Ok(SpawnedPty {
+        master: pair.master,
+        reader,
+        writer,
+        killer,
+        child,
+        process_id,
+    })
+}
+
+/// 런타임에 딸리는 두 보조 스레드 — PTY 출력 읽기와 자식 종료 대기. 런타임이 만들어진
+/// 뒤에만 붙일 수 있어 기동 함수에서 떼어 냈다.
+fn attach_runtime_threads(
+    runtime: &Arc<TerminalRuntime>,
+    reader: Box<dyn Read + Send>,
+    mut child: Box<dyn PtyChild + Send + Sync>,
+) -> Result<(), CoreError> {
+    let reader_runtime = Arc::clone(runtime);
+    spawn_named_thread(
+        format!("terminal-reader-{}", runtime.terminal_id),
+        move || read_terminal(reader_runtime, reader),
+    )?;
+
+    let wait_runtime = Arc::clone(runtime);
+    spawn_named_thread(
+        format!("terminal-wait-{}", runtime.terminal_id),
+        move || match child.wait() {
+            Ok(status) => wait_runtime.mark_exited(Some(status.exit_code())),
+            Err(error) => {
+                wait_runtime.mark_failed(format!("CLI 종료 상태를 읽지 못했습니다: {error}"))
+            }
+        },
+    )
+}
+
+/// 이름 붙인 스레드 하나를 띄운다. 두 보조 스레드가 같은 모양으로 이름을 짓고 같은
+/// 오류로 감싸고 있어 한 자리로 모았다.
+fn spawn_named_thread(name: String, body: impl FnOnce() + Send + 'static) -> Result<(), CoreError> {
+    thread::Builder::new()
+        .name(name)
+        .spawn(body)
+        .map(|_| ())
+        .map_err(CoreError::Io)
 }
 
 fn read_terminal(runtime: Arc<TerminalRuntime>, mut reader: Box<dyn Read + Send>) {
@@ -955,16 +1139,10 @@ fn try_send(state: &mut RuntimeState, event: TerminalEvent) {
         Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
             state.subscriber = None;
             if state.phase == TerminalPhase::Running {
-                set_detached_deadline(state);
+                state.begin_detached_grace();
             }
         }
     }
-}
-
-fn set_detached_deadline(state: &mut RuntimeState) {
-    state.phase = TerminalPhase::Detached;
-    state.expires_at = Some(Instant::now() + RECONNECT_GRACE);
-    state.reconnect_deadline = Some(unix_millis_after(RECONNECT_GRACE));
 }
 
 fn spawn_reaper(inner: Weak<SupervisorInner>) {
@@ -988,12 +1166,7 @@ fn spawn_reaper(inner: Weak<SupervisorInner>) {
         if let Ok(mut sessions) = inner.sessions.lock() {
             for (key, runtime) in expired {
                 runtime.terminate();
-                if sessions
-                    .get(&key)
-                    .is_some_and(|current| Arc::ptr_eq(current, &runtime))
-                {
-                    sessions.remove(&key);
-                }
+                remove_matching_session(&mut sessions, &key, &runtime);
             }
         };
     });
@@ -1019,19 +1192,23 @@ fn resolve_launch_spec(
         .as_deref()
         .ok_or_else(|| CoreError::InvalidInput("세션 작업 경로가 없습니다".to_owned()))?;
     let cwd = canonical_dir(cwd, "세션 작업 경로가 디렉터리가 아닙니다")?;
-    Ok(LaunchSpec {
-        executable: resolve_executable(request.source)?,
+    Ok(LaunchSpec::new(
+        resolve_executable(request.source)?,
         cwd,
-        args: resume_args(request.source, &request.session_id),
-        env: Vec::new(),
-    })
+        resume_args(request.source, &request.session_id),
+    ))
+}
+
+/// 붙을 세션 경로가 없는 터미널(설정 셸·SSH)이 쓰는 작업 경로.
+fn home_launch_cwd() -> Result<PathBuf, CoreError> {
+    canonical_dir(
+        user_home::home_dir()?,
+        "사용자 홈 경로가 디렉터리가 아닙니다",
+    )
 }
 
 fn resolve_setup_launch_spec() -> Result<LaunchSpec, CoreError> {
-    let cwd = canonical_dir(
-        user_home::home_dir()?,
-        "사용자 홈 경로가 디렉터리가 아닙니다",
-    )?;
+    let cwd = home_launch_cwd()?;
 
     #[cfg(windows)]
     let (executable, args) = (
@@ -1046,12 +1223,14 @@ fn resolve_setup_launch_spec() -> Result<LaunchSpec, CoreError> {
     let (executable, args) = (PathBuf::from("/bin/sh"), vec!["-l".to_owned()]);
 
     let executable = canonical_file(executable, "설정 터미널 셸이 실행 파일이 아닙니다")?;
-    Ok(LaunchSpec {
-        executable,
-        cwd,
-        args,
-        env: Vec::new(),
-    })
+    Ok(LaunchSpec::new(executable, cwd, args))
+}
+
+fn resolve_ssh_launch_spec(
+    launch: crate::ssh_endpoints::SshTerminalLaunch,
+) -> Result<LaunchSpec, CoreError> {
+    let cwd = home_launch_cwd()?;
+    Ok(LaunchSpec::new(launch.executable, cwd, launch.args))
 }
 
 fn resolve_account_login_launch_spec(
@@ -1064,12 +1243,7 @@ fn resolve_account_login_launch_spec(
         "계정 로그인 실행 경로가 올바르지 않습니다",
     )?;
     let args = account_login_args(login.provider, remote)?;
-    Ok(LaunchSpec {
-        executable,
-        cwd,
-        args,
-        env: account_login_env(&login),
-    })
+    Ok(LaunchSpec::new(executable, cwd, args).with_env(account_login_env(&login)))
 }
 
 /// 로그인 CLI 인자.
@@ -1083,6 +1257,12 @@ fn resolve_account_login_launch_spec(
 /// 필요 없는 device 코드 방식으로 바꾼다.
 fn account_login_args(provider: ProviderId, remote: bool) -> Result<Vec<String>, CoreError> {
     Ok(match provider {
+        // 계정이 없어 로그인 명령 자체가 없다.
+        ProviderId::Local => {
+            return Err(CoreError::InvalidInput(
+                "로컬 공급자는 로그인이 필요하지 않습니다".to_owned(),
+            ))
+        }
         ProviderId::Codex if remote => vec!["login".to_owned(), "--device-auth".to_owned()],
         ProviderId::Codex => vec!["login".to_owned()],
         ProviderId::Claude => vec![
@@ -1090,11 +1270,16 @@ fn account_login_args(provider: ProviderId, remote: bool) -> Result<Vec<String>,
             "login".to_owned(),
             "--claudeai".to_owned(),
         ],
-        ProviderId::Antigravity => {
-            return Err(CoreError::InvalidInput(
-                "Antigravity 계정 로그인은 지원하지 않습니다".to_owned(),
-            ))
-        }
+        // 로그인만 하는 명령이 없다. `/usage`는 토큰으로 서버에 묻는 가장 가벼운 요청이라
+        // 로그인 직후 잔량이 찍히는 것으로 성공을 눈으로 확인할 수 있다. 미로그인이면 CLI가
+        // 브라우저를 열고 인증 코드를 stdin으로 기다리므로(60초), 사용자가 이 터미널에
+        // 코드를 붙여넣어 끝낸다.
+        ProviderId::Antigravity => vec![
+            "--print".to_owned(),
+            "/usage".to_owned(),
+            "--output-format".to_owned(),
+            "text".to_owned(),
+        ],
     })
 }
 
@@ -1116,39 +1301,65 @@ fn account_login_env(login: &crate::AccountLoginSessionView) -> Vec<(String, Str
             login.profile_path.clone(),
         ));
     }
+    // Windows의 `agy`는 `USERPROFILE`로 홈을 잡는다. 로그인 터미널이 실행 프로필과 같은
+    // 목록을 쓰지 않으면 로그인이 실제 홈에서 돌아 임시 프로필에는 아무것도 남지 않는다.
+    if login.provider == ProviderId::Antigravity {
+        env = crate::credential_profiles::antigravity_home_env(&login.profile_path);
+    }
     env
 }
 
-/// 실행 스펙의 작업 경로를 확정한다. 세 실행 스펙이 각자 canonicalize 후 디렉터리인지
-/// 확인하고 있어 한 자리로 모았다. 경로마다 어긋났을 때 보여줄 문구가 달라 문구는 받는다.
-fn canonical_dir(path: impl AsRef<Path>, mismatch: &str) -> Result<PathBuf, CoreError> {
-    let path = fs::canonicalize(path)?;
-    if !path.is_dir() {
+#[derive(Clone, Copy)]
+enum CanonicalPathKind {
+    Directory,
+    File,
+}
+
+impl CanonicalPathKind {
+    fn matches(self, path: &Path) -> bool {
+        match self {
+            Self::Directory => path.is_dir(),
+            Self::File => path.is_file(),
+        }
+    }
+}
+
+/// 실행 스펙의 경로를 확정하고 기대한 종류인지 확인한다. 경로마다 어긋났을 때 보여줄
+/// 문구가 다르므로 종류와 문구만 호출부에서 받는다.
+fn canonical_path(
+    path: impl AsRef<Path>,
+    kind: CanonicalPathKind,
+    mismatch: &str,
+) -> Result<PathBuf, CoreError> {
+    let path = crate::path_guard::canonical_child_facing(path)?;
+    if !kind.matches(&path) {
         return Err(CoreError::InvalidInput(mismatch.to_owned()));
     }
     Ok(path)
 }
 
-/// 실행 파일 쪽의 같은 확인. 공급자 CLI는 `resolve_executable`이 같은 검사를 품고 있어
-/// 여기 남는 것은 설정 터미널의 셸뿐이다.
+fn canonical_dir(path: impl AsRef<Path>, mismatch: &str) -> Result<PathBuf, CoreError> {
+    canonical_path(path, CanonicalPathKind::Directory, mismatch)
+}
+
+/// 공급자 CLI는 `resolve_executable`이 같은 검사를 품고 있어 여기 남는 것은 설정
+/// 터미널의 셸뿐이다.
 fn canonical_file(path: impl AsRef<Path>, mismatch: &str) -> Result<PathBuf, CoreError> {
-    let path = fs::canonicalize(path)?;
-    if !path.is_file() {
-        return Err(CoreError::InvalidInput(mismatch.to_owned()));
-    }
-    Ok(path)
+    canonical_path(path, CanonicalPathKind::File, mismatch)
 }
 
 fn resume_args(source: ProviderId, session_id: &str) -> Vec<String> {
     match source {
         ProviderId::Claude => vec!["--resume".to_owned(), session_id.to_owned()],
         ProviderId::Codex => vec!["resume".to_owned(), session_id.to_owned()],
+        // ACP 하네스는 `resume` 하위 명령이 없다. 세션을 이어 여는 것은 TUI 인자다.
+        ProviderId::Local => vec!["--session".to_owned(), session_id.to_owned()],
         ProviderId::Antigravity => vec!["--conversation".to_owned(), session_id.to_owned()],
     }
 }
 
 fn acquire_session_lock(lock_dir: &Path, key: &SessionKey) -> Result<File, CoreError> {
-    let path = lock_dir.join(format!("{}-{}.lock", key.source, key.session_id));
+    let path = key.lock_path(lock_dir);
     let file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -1170,6 +1381,22 @@ fn validate_identifier(id: &str) -> Result<(), CoreError> {
         return Err(CoreError::InvalidInput("잘못된 세션 ID입니다".to_owned()));
     }
     Ok(())
+}
+
+/// 지문(`SHA256:base64`)은 잠금 파일 이름에 못 쓰는 글자를 담으므로, 세션 id는 영문·숫자만
+/// 남긴 지문으로 만든다. 같은 지문은 같은 id가 되어 재접속이 같은 터미널에 닿는다.
+///
+/// C9-20. 갈래가 다르면 id도 달라야 한다. 같은 id를 쓰면 열려 있던 원격 셸에 다시 붙어
+/// 버려서, 공개키를 등록하려고 누른 버튼이 등록을 하지 않는다.
+fn ssh_terminal_session_id(fingerprint: &str, mode: TerminalSshMode) -> String {
+    let body = fingerprint
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>();
+    match mode {
+        TerminalSshMode::Shell => format!("ssh-{body}"),
+        TerminalSshMode::InstallKey => format!("ssh-install-{body}"),
+    }
 }
 
 fn validate_size(cols: u16, rows: u16) -> Result<(), CoreError> {
@@ -1202,11 +1429,9 @@ fn unix_millis_after(duration: Duration) -> i64 {
 /// 그 밖의 권한·플랫폼 오류는 계정 전환을 중단할 수 있도록 숨기지 않는다.
 #[cfg(unix)]
 fn send_terminal_signal(pid: u32, signal: libc::c_int) -> Result<bool, String> {
-    match process_signal::signal_pid(pid, signal) {
-        Ok(process_signal::SignalDelivery::Delivered) => Ok(true),
-        Ok(process_signal::SignalDelivery::Gone) => Ok(false),
-        Err(error) => Err(error.to_string()),
-    }
+    process_signal::signal_pid(pid, signal)
+        .map(process_signal::SignalDelivery::was_delivered)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(unix)]
@@ -1222,6 +1447,24 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, CoreError> {
     mutex
         .lock()
         .map_err(|_| CoreError::Runtime("터미널 상태 잠금이 손상되었습니다".to_owned()))
+}
+
+/// 등록된 세션이 대상과 같은 Arc 인스턴스일 때만 맵에서 지운다.
+/// 재연결 재시작이나 리퍼 정리 시점에 다른 스레드가 이미 새 세션으로 갈아끼웠으면
+/// 새 세션을 지우지 않게 보호한다.
+fn remove_matching_session(
+    sessions: &mut HashMap<SessionKey, Arc<TerminalRuntime>>,
+    key: &SessionKey,
+    expected: &Arc<TerminalRuntime>,
+) -> Option<Arc<TerminalRuntime>> {
+    if sessions
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, expected))
+    {
+        sessions.remove(key)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1287,7 +1530,12 @@ mod tests {
                 account_login_args(ProviderId::Claude, remote).expect("claude args"),
                 ["auth", "login", "--claudeai"]
             );
-            assert!(account_login_args(ProviderId::Antigravity, remote).is_err());
+            // Antigravity에는 로그인 전용 명령이 없어, 토큰으로 서버에 묻는 가장 가벼운
+            // 요청을 쓴다. 성공하면 잔량이 찍혀 로그인 완료가 눈으로 확인된다.
+            assert_eq!(
+                account_login_args(ProviderId::Antigravity, remote).expect("antigravity args"),
+                ["--print", "/usage", "--output-format", "text"]
+            );
         }
     }
 
@@ -1307,12 +1555,48 @@ mod tests {
         );
     }
 
+    /// 실행 스펙의 경로는 모두 `canonical_path`를 거치므로, 여기서 확장 경로 접두어가
+    /// 남지 않는 것이 계정 로그인 터미널까지 함께 지키는 조건이다. `\\?\C:\…`를 작업
+    /// 경로로 받은 `cmd.exe`는 `UNC 경로는 지원되지 않습니다`를 찍고 Windows 디렉터리로
+    /// 물러나, 그 위에서 도는 배치 셈(`codex.cmd`)이 `지정된 경로를 찾을 수 없습니다`로
+    /// 죽었다.
     #[test]
     fn setup_terminal_uses_a_fixed_platform_shell() {
         let spec = resolve_setup_launch_spec().expect("setup shell");
         assert!(spec.executable.is_absolute());
         assert!(spec.executable.is_file());
         assert!(spec.cwd.is_dir());
+        for path in [&spec.executable, &spec.cwd] {
+            assert!(
+                !path.to_string_lossy().starts_with(r"\\?\"),
+                "자식에게 넘기는 경로에 확장 경로 접두어가 남았습니다: {}",
+                path.display()
+            );
+        }
+    }
+
+    /// 실행 스펙을 만드는 네 자리 중 `resolve_ssh_launch_spec`은 `canonical_path`를
+    /// 거치지 않는다. 생성자가 직접 벗기므로, 어느 자리가 무엇을 넘기든 PTY에 확장
+    /// 경로가 닿지 않는다.
+    #[test]
+    fn launch_specs_never_carry_a_verbatim_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let canonical = fs::canonicalize(directory.path()).expect("canonical");
+        let spec = LaunchSpec::new(
+            canonical.join("cli"),
+            canonical.clone(),
+            vec!["login".to_owned()],
+        );
+        for path in [&spec.executable, &spec.cwd] {
+            assert!(
+                !path.to_string_lossy().starts_with(r"\\?\"),
+                "실행 스펙이 확장 경로를 들고 있습니다: {}",
+                path.display()
+            );
+        }
+        // 접두어만 벗을 뿐 가리키는 자리는 그대로다.
+        assert!(spec.cwd.is_dir());
+        assert_eq!(spec.args, ["login"]);
     }
 
     #[test]
@@ -1332,12 +1616,21 @@ mod tests {
 
     #[test]
     fn only_live_terminals_are_attached_and_exited_terminals_restart() {
+        assert!(TerminalPhase::Running.is_active());
+        assert!(TerminalPhase::Detached.is_active());
+        assert!(!TerminalPhase::Stopping.is_active());
+        assert!(!TerminalPhase::Exited.is_active());
+        assert!(!TerminalPhase::Failed.is_active());
         assert!(TerminalPhase::Running.can_attach());
         assert!(TerminalPhase::Detached.can_attach());
         assert!(!TerminalPhase::Stopping.can_attach());
         assert!(!TerminalPhase::Exited.can_attach());
         assert!(TerminalPhase::Exited.can_restart());
         assert!(!TerminalPhase::Failed.can_restart());
+        assert!(TerminalPhase::Exited.is_terminated());
+        assert!(TerminalPhase::Failed.is_terminated());
+        assert!(!TerminalPhase::Running.is_terminated());
+        assert!(!TerminalPhase::Stopping.is_terminated());
     }
 
     #[test]
@@ -1360,13 +1653,39 @@ mod tests {
         assert!(state.replay_truncated);
     }
 
+    /// C9-19. SSH 터미널 키는 공급자가 없고, 지문에서 파일 이름에 못 쓰는 글자를 뺀 id를 쓴다.
+    #[test]
+    fn c9_19_ssh_terminal_key_has_no_provider_and_a_filesystem_safe_id() {
+        let key = SessionKey::ssh("SHA256:ab+/cd=Ef", TerminalSshMode::Shell);
+        assert_eq!(key.session_id, "ssh-SHA256abcdEf");
+        assert_eq!(key.source_label(), "ssh");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let lock = acquire_session_lock(directory.path(), &key).expect("lock");
+        assert!(directory.path().join("ssh-ssh-SHA256abcdEf.lock").is_file());
+        drop(lock);
+    }
+
+    /// C9-20. 공개키 등록 창은 같은 서버의 원격 셸과 다른 세션이다. id가 같으면 열려 있던
+    /// 셸에 다시 붙어 버려서 등록 명령이 아예 실행되지 않는다.
+    #[test]
+    fn c9_20_key_install_terminal_does_not_reattach_to_the_open_shell() {
+        let shell = SessionKey::ssh("SHA256:ab+/cd=Ef", TerminalSshMode::Shell);
+        let install = SessionKey::ssh("SHA256:ab+/cd=Ef", TerminalSshMode::InstallKey);
+        assert_ne!(shell.session_id, install.session_id);
+        assert_eq!(install.session_id, "ssh-install-SHA256abcdEf");
+
+        // 두 잠금이 같은 폴더에서 함께 살아 있어야 한 쪽이 다른 쪽을 막지 않는다.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let shell_lock = acquire_session_lock(directory.path(), &shell).expect("shell lock");
+        let install_lock = acquire_session_lock(directory.path(), &install).expect("install lock");
+        drop(install_lock);
+        drop(shell_lock);
+    }
+
     #[test]
     fn session_lock_blocks_a_second_manager_process() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let key = SessionKey {
-            source: ProviderId::Codex,
-            session_id: "abc-123".to_owned(),
-        };
+        let key = SessionKey::provider(ProviderId::Codex, "abc-123");
         let first = acquire_session_lock(directory.path(), &key).expect("first lock");
         assert!(matches!(
             acquire_session_lock(directory.path(), &key),
@@ -1376,49 +1695,68 @@ mod tests {
         assert!(acquire_session_lock(directory.path(), &key).is_ok());
     }
 
+    #[test]
+    fn canonical_launch_paths_keep_file_and_directory_checks_distinct() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let file = directory.path().join("shell");
+        fs::write(&file, b"shell").expect("temporary file");
+
+        // 확정한 경로는 자식에게 그대로 넘어가므로 `fs::canonicalize` 원본이 아니라
+        // 접두어를 벗긴 모양과 같아야 한다.
+        assert_eq!(
+            canonical_dir(directory.path(), "directory mismatch").expect("canonical directory"),
+            crate::path_guard::canonical_child_facing(directory.path())
+                .expect("expected canonical directory")
+        );
+        assert_eq!(
+            canonical_file(&file, "file mismatch").expect("canonical file"),
+            crate::path_guard::canonical_child_facing(&file).expect("expected canonical file")
+        );
+        assert!(matches!(
+            canonical_dir(&file, "directory mismatch"),
+            Err(CoreError::InvalidInput(message)) if message == "directory mismatch"
+        ));
+        assert!(matches!(
+            canonical_file(directory.path(), "file mismatch"),
+            Err(CoreError::InvalidInput(message)) if message == "file mismatch"
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn provider_terminal_stop_escalates_and_does_not_touch_other_providers() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let supervisor = TerminalSupervisor::new(directory.path()).expect("terminal supervisor");
 
-        let ignored_term_key = SessionKey {
-            source: ProviderId::Codex,
-            session_id: "ignore-term".to_owned(),
-        };
+        let ignored_term_key = SessionKey::provider(ProviderId::Codex, "ignore-term");
         let ignored_term = TerminalRuntime::spawn(
             ignored_term_key.clone(),
             80,
             24,
-            LaunchSpec {
-                executable: PathBuf::from("/bin/sh"),
-                cwd: directory.path().to_path_buf(),
-                args: vec![
+            LaunchSpec::new(
+                PathBuf::from("/bin/sh"),
+                directory.path().to_path_buf(),
+                vec![
                     "-c".to_owned(),
                     "trap '' TERM; while :; do :; done".to_owned(),
                 ],
-                env: Vec::new(),
-            },
+            ),
             acquire_session_lock(&supervisor.inner.lock_dir, &ignored_term_key)
                 .expect("codex terminal lock"),
             None,
         )
         .expect("codex terminal runtime");
 
-        let other_key = SessionKey {
-            source: ProviderId::Claude,
-            session_id: "other-provider".to_owned(),
-        };
+        let other_key = SessionKey::provider(ProviderId::Claude, "other-provider");
         let other = TerminalRuntime::spawn(
             other_key.clone(),
             80,
             24,
-            LaunchSpec {
-                executable: PathBuf::from("/bin/sleep"),
-                cwd: directory.path().to_path_buf(),
-                args: vec!["30".to_owned()],
-                env: Vec::new(),
-            },
+            LaunchSpec::new(
+                PathBuf::from("/bin/sleep"),
+                directory.path().to_path_buf(),
+                vec!["30".to_owned()],
+            ),
             acquire_session_lock(&supervisor.inner.lock_dir, &other_key)
                 .expect("claude terminal lock"),
             None,
@@ -1459,7 +1797,7 @@ mod tests {
     fn test_terminal_phase_enum() {
         use std::str::FromStr;
 
-        for &phase in TerminalPhase::ALL {
+        for phase in TerminalPhase::ALL {
             let s = phase.to_string();
             assert_eq!(phase.as_str(), s);
             assert_eq!(TerminalPhase::from_str(&s).unwrap(), phase);
@@ -1471,5 +1809,70 @@ mod tests {
             assert_eq!(deserialized, phase);
         }
         assert!(TerminalPhase::from_str("unknown").is_err());
+    }
+
+    /// 시험이 끝날 때까지 살아 있기만 하면 되는 PTY 자식. `sleep`은 Windows에 없어
+    /// `ping`의 간격을 쓴다.
+    fn long_running_launch(cwd: &Path) -> LaunchSpec {
+        #[cfg(unix)]
+        {
+            LaunchSpec::new(
+                PathBuf::from("/bin/sleep"),
+                cwd.to_path_buf(),
+                vec!["10".to_owned()],
+            )
+        }
+        #[cfg(windows)]
+        {
+            LaunchSpec::new(
+                PathBuf::from("ping"),
+                cwd.to_path_buf(),
+                vec!["-n".to_owned(), "11".to_owned(), "127.0.0.1".to_owned()],
+            )
+        }
+    }
+
+    #[test]
+    fn remove_matching_session_only_removes_identical_instance() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let supervisor = TerminalSupervisor::new(directory.path()).expect("supervisor");
+        let key1 = SessionKey::provider(ProviderId::Codex, "s-1");
+        let key2 = SessionKey::provider(ProviderId::Codex, "s-2");
+        let runtime1 = TerminalRuntime::spawn(
+            key1.clone(),
+            80,
+            24,
+            long_running_launch(directory.path()),
+            acquire_session_lock(&supervisor.inner.lock_dir, &key1).expect("lock1"),
+            None,
+        )
+        .expect("runtime1");
+        let runtime2 = TerminalRuntime::spawn(
+            key2.clone(),
+            80,
+            24,
+            long_running_launch(directory.path()),
+            acquire_session_lock(&supervisor.inner.lock_dir, &key2).expect("lock2"),
+            None,
+        )
+        .expect("runtime2");
+
+        let mut sessions = HashMap::new();
+        sessions.insert(key1.clone(), Arc::clone(&runtime1));
+
+        // 다른 Arc 인스턴스인 runtime2를 넘기면 삭제되지 않는다
+        assert!(remove_matching_session(&mut sessions, &key1, &runtime2).is_none());
+        assert!(sessions.contains_key(&key1));
+
+        // 키가 다르면 삭제되지 않는다
+        assert!(remove_matching_session(&mut sessions, &key2, &runtime1).is_none());
+
+        // 일치하는 runtime1을 넘기면 삭제된다
+        let removed = remove_matching_session(&mut sessions, &key1, &runtime1);
+        assert!(removed.is_some());
+        assert!(!sessions.contains_key(&key1));
+
+        runtime1.terminate();
+        runtime2.terminate();
     }
 }

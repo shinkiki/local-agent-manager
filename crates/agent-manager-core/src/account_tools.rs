@@ -23,15 +23,16 @@
 //!   없다고 단정하지 않고 미확정으로 둔다.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::accounts::{AccountSnapshot, HomeCredentialState};
 use crate::domain::ProviderId;
+use crate::provider_settings_file::redirected_dir;
 use crate::user_home;
 
 /// 설정 파일 하나에서 읽어들일 최대 바이트. `.claude.json`은 프로젝트 기록이 쌓이며
@@ -204,16 +205,40 @@ impl ProviderRoots {
     }
 }
 
-/// 공급자가 홈 위치를 바꿀 때 쓰는 환경변수만 읽는다. 그 밖의 환경변수는 읽지 않는다.
-fn redirected_dir(name: &str) -> Option<PathBuf> {
-    env::var_os(name)
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-}
-
 // ---------------------------------------------------------------------------
 // 수집
 // ---------------------------------------------------------------------------
+
+/// 항목이 공급자 계정에 묶이는지, 기기 단위로 공유되는지.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolScope {
+    /// 공급자 계정에 묶인 항목이라 홈을 점유한 계정에만 귀속한다.
+    Account,
+    /// 계정과 무관하게 이 기기에서 항상 쓸 수 있다.
+    Shared,
+}
+
+/// MCP 서버 하나가 계정에 묶이는지 전송 방식으로 가른다. stdio 서버는 이 기기의 실행
+/// 파일을 그대로 띄우므로 계정과 무관하고, 원격 전송(http/sse)은 공급자 계정 인증을 타므로
+/// 계정 단위로 본다. Claude와 Codex 수집기가 같은 규칙을 각자 적고 있어 한쪽만 고치면 같은
+/// 서버가 공급자에 따라 다른 귀속을 받는다. `transport` 칸이 없는 설정 형식(Codex)은
+/// `None`을 넘기면 url과 command만으로 갈린다.
+fn transport_scope(url: Option<&str>, transport: Option<&str>, command: Option<&str>) -> ToolScope {
+    if url.is_some() || matches!(transport, Some("http" | "sse")) || command.is_none() {
+        ToolScope::Account
+    } else {
+        ToolScope::Shared
+    }
+}
+
+/// 이 항목의 설정이 어디에 있는지.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolConfigSource {
+    /// 공급자 홈의 설정 파일에 항목이 있다.
+    LocalConfig,
+    /// 공급자 서버가 관리해 로컬 설정 항목이 없다(커넥터).
+    ProviderManaged,
+}
 
 /// 공급자 홈 한 곳에서 읽어낸, 아직 계정에 배분되지 않은 항목.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,9 +247,8 @@ struct ProviderTool {
     service: String,
     label: String,
     kind: AccountToolKind,
-    /// true면 공급자 계정에 묶인 항목이라 홈을 점유한 계정에만 귀속한다.
-    account_scoped: bool,
-    configured: bool,
+    scope: ToolScope,
+    config_source: ToolConfigSource,
     access: AccountToolAccess,
 }
 
@@ -270,27 +294,7 @@ fn list_account_tools_in(
             .entry(provider)
             .or_insert_with(|| collect_provider_tools(provider, roots));
 
-        // 홈을 점유한 계정: 설정 파일이 직접 기록한 계정 식별자를 먼저 믿고, 없으면
-        // 자격증명 어댑터가 공유 홈을 검증해 얻은 실제 활성 계정을 쓴다.
-        let observed = accounts
-            .providers
-            .iter()
-            .find(|state| state.provider == provider)
-            .and_then(|state| state.observed_active_account_id.clone());
-        let owner_account_id = tools
-            .owner_provider_account_id
-            .as_ref()
-            .and_then(|provider_account_id| {
-                accounts
-                    .accounts
-                    .iter()
-                    .find(|candidate| {
-                        candidate.provider == provider
-                            && &candidate.provider_account_id == provider_account_id
-                    })
-                    .map(|candidate| candidate.id.clone())
-            })
-            .or(observed);
+        let owner_account_id = provider_home_owner_account_id(accounts, provider, tools);
         let owns_home = owner_account_id.as_deref() == Some(account.id.as_str());
 
         views.push(AccountToolsView {
@@ -327,6 +331,36 @@ fn list_account_tools_in(
     }
 }
 
+/// 공급자 홈을 점유한 등록 계정을 찾는다. 설정 파일이 직접 기록한 공급자 계정 ID를
+/// 우선하고, 없거나 등록 계정과 맞지 않을 때만 자격증명 어댑터가 관측한 활성 계정을
+/// 쓴다. 두 근거의 우선순위가 계정별 표시 루프 안에 섞이지 않도록 판정을 한곳에 둔다.
+fn provider_home_owner_account_id(
+    accounts: &AccountSnapshot,
+    provider: ProviderId,
+    tools: &ProviderTools,
+) -> Option<String> {
+    tools
+        .owner_provider_account_id
+        .as_ref()
+        .and_then(|provider_account_id| {
+            accounts
+                .accounts
+                .iter()
+                .find(|candidate| {
+                    candidate.provider == provider
+                        && &candidate.provider_account_id == provider_account_id
+                })
+                .map(|candidate| candidate.id.clone())
+        })
+        .or_else(|| {
+            accounts
+                .providers
+                .iter()
+                .find(|state| state.provider == provider)
+                .and_then(|state| state.observed_active_account_id.clone())
+        })
+}
+
 /// 수집한 공급자 항목을 한 소유자(계정 하나 또는 공급자 홈) 몫의 표시 항목으로 옮긴다.
 ///
 /// `owns_home`은 그 소유자가 지금 공급자 홈을 점유했다고 확인됐는지다. 계정 단위 항목의
@@ -340,18 +374,16 @@ fn account_tool_views(tools: &[ProviderTool], owns_home: bool) -> Vec<AccountToo
             service: tool.service.clone(),
             label: tool.label.clone(),
             kind: tool.kind,
-            attribution: if !tool.account_scoped {
-                AccountToolAttribution::Shared
-            } else if owns_home {
-                AccountToolAttribution::Account
-            } else {
-                AccountToolAttribution::Unverified
+            attribution: match tool.scope {
+                ToolScope::Shared => AccountToolAttribution::Shared,
+                ToolScope::Account if owns_home => AccountToolAttribution::Account,
+                ToolScope::Account => AccountToolAttribution::Unverified,
             },
-            configured: tool.configured,
+            configured: tool.config_source == ToolConfigSource::LocalConfig,
             exposed: true,
             // 계정 귀속을 확인하지 못한 항목에 접근 검증 결과를 그대로 옮기면 다른
             // 계정의 연결 이력을 이 계정 것처럼 보여주게 된다.
-            access: if tool.account_scoped && !owns_home {
+            access: if tool.scope == ToolScope::Account && !owns_home {
                 AccountToolAccess::Unknown
             } else {
                 tool.access
@@ -366,6 +398,8 @@ fn collect_provider_tools(provider: ProviderId, roots: &ProviderRoots) -> Provid
         ProviderId::Codex => collect_codex_tools(roots),
         // Antigravity CLI는 계정 등록 대상이 아니고 MCP·커넥터 설정도 노출하지 않는다.
         ProviderId::Antigravity => ProviderTools::default(),
+        // 로컬 공급자는 계정을 관리하지 않아 이 목록에 오르지 않는다.
+        ProviderId::Local => ProviderTools::default(),
     }
 }
 
@@ -376,6 +410,17 @@ fn read_bounded(path: &Path) -> Option<String> {
         return None;
     }
     fs::read_to_string(path).ok()
+}
+
+/// 크기 제한 안의 JSON 설정만 해석한다. 설정 소스 하나가 없거나 깨져 있어도 전체 계정
+/// 도구 조회는 계속되어야 하므로 읽기·해석 실패를 모두 `None`으로 모은다.
+fn read_bounded_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    serde_json::from_str(&read_bounded(path)?).ok()
+}
+
+/// [`read_bounded_json`]과 같은 실패 경계를 TOML 설정에 적용한다.
+fn read_bounded_toml<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    toml::from_str(&read_bounded(path)?).ok()
 }
 
 /// 설정 항목 이름 하나에서 뽑아낸 식별자·서비스 슬러그·표시 이름.
@@ -407,8 +452,8 @@ impl ToolIdentity {
     fn into_tool(
         self,
         kind: AccountToolKind,
-        account_scoped: bool,
-        configured: bool,
+        scope: ToolScope,
+        config_source: ToolConfigSource,
         access: AccountToolAccess,
     ) -> ProviderTool {
         ProviderTool {
@@ -416,8 +461,8 @@ impl ToolIdentity {
             label: self.label,
             service: self.service,
             kind,
-            account_scoped,
-            configured,
+            scope,
+            config_source,
             access,
         }
     }
@@ -463,73 +508,107 @@ struct ClaudeInstalledPlugins {
     plugins: BTreeMap<String, Value>,
 }
 
-fn collect_claude_tools(roots: &ProviderRoots) -> ProviderTools {
-    let config_dir = &roots.claude_config_dir;
-    // 자격증명 어댑터의 신원 조회와 같은 후보 순서를 쓴다.
-    let config = [
-        config_dir.join(".claude.json"),
-        config_dir.join(".config.json"),
+/// 자격증명 어댑터의 신원 조회와 같은 후보 순서로 설정을 읽는다.
+fn read_claude_config(roots: &ProviderRoots) -> ClaudeConfig {
+    [
+        roots.claude_config_dir.join(".claude.json"),
+        roots.claude_config_dir.join(".config.json"),
         roots.home.join(".claude.json"),
     ]
     .iter()
-    .filter_map(|path| read_bounded(path))
-    .find_map(|raw| serde_json::from_str::<ClaudeConfig>(&raw).ok())
-    .unwrap_or_default();
+    .find_map(|path| read_bounded_json::<ClaudeConfig>(path))
+    .unwrap_or_default()
+}
 
-    let needs_auth = read_bounded(&config_dir.join("mcp-needs-auth-cache.json"))
-        .and_then(|raw| serde_json::from_str::<BTreeMap<String, Value>>(&raw).ok())
-        .map(|cache| cache.into_keys().collect::<BTreeSet<_>>())
-        .unwrap_or_default();
+/// 재인증을 기다리는 항목 이름. 캐시가 없거나 깨져 있으면 아무것도 기다리지 않는 것으로 본다.
+fn claude_needs_auth(config_dir: &Path) -> BTreeSet<String> {
+    read_bounded_json::<BTreeMap<String, Value>>(&config_dir.join("mcp-needs-auth-cache.json"))
+        .map(|cache| cache.into_keys().collect())
+        .unwrap_or_default()
+}
 
-    let mut tools = Vec::new();
+fn claude_mcp_server_tools(
+    config: &ClaudeConfig,
+    needs_auth: &BTreeSet<String>,
+) -> Vec<ProviderTool> {
+    config
+        .mcp_servers
+        .iter()
+        .filter_map(|(name, server)| {
+            let identity = ToolIdentity::new("claude", "mcp-server", name)?;
+            let access = if needs_auth.contains(name) {
+                AccountToolAccess::NeedsAuth
+            } else {
+                AccountToolAccess::Unknown
+            };
+            Some(identity.into_tool(
+                AccountToolKind::McpServer,
+                transport_scope(
+                    server.url.as_deref(),
+                    server.transport.as_deref(),
+                    server.command.as_deref(),
+                ),
+                ToolConfigSource::LocalConfig,
+                access,
+            ))
+        })
+        .collect()
+}
 
-    for (name, server) in &config.mcp_servers {
-        // stdio 서버는 이 기기의 실행 파일을 그대로 띄우므로 계정과 무관하다. 원격
-        // 전송(http/sse)은 공급자 계정 인증을 타므로 계정 단위로 본다.
-        let remote = server.url.is_some()
-            || matches!(server.transport.as_deref(), Some("http" | "sse"))
-            || server.command.is_none();
-        let Some(identity) = ToolIdentity::new("claude", "mcp-server", name) else {
-            continue;
-        };
-        let access = if needs_auth.contains(name) {
-            AccountToolAccess::NeedsAuth
-        } else {
-            AccountToolAccess::Unknown
-        };
-        tools.push(identity.into_tool(AccountToolKind::McpServer, remote, true, access));
-    }
+/// claude.ai 커넥터는 공급자 서버가 보관한다. 로컬 설정 항목이 없다.
+fn claude_connector_tools(
+    config: &ClaudeConfig,
+    needs_auth: &BTreeSet<String>,
+) -> Vec<ProviderTool> {
+    config
+        .claude_ai_mcp_ever_connected
+        .iter()
+        .filter_map(|name| {
+            let identity = ToolIdentity::new("claude", "connector", name)?;
+            let needs_reauth = needs_auth.contains(name) || needs_auth.contains(&identity.service);
+            let access = if needs_reauth {
+                AccountToolAccess::NeedsAuth
+            } else {
+                // 연결 성공 기록이 있고 재인증 대기 목록에도 없다.
+                AccountToolAccess::Verified
+            };
+            Some(identity.into_tool(
+                AccountToolKind::Connector,
+                ToolScope::Account,
+                ToolConfigSource::ProviderManaged,
+                access,
+            ))
+        })
+        .collect()
+}
 
-    for name in &config.claude_ai_mcp_ever_connected {
-        let Some(identity) = ToolIdentity::new("claude", "connector", name) else {
-            continue;
-        };
-        let needs_reauth = needs_auth.contains(name) || needs_auth.contains(&identity.service);
-        let access = if needs_reauth {
-            AccountToolAccess::NeedsAuth
-        } else {
-            // 연결 성공 기록이 있고 재인증 대기 목록에도 없다.
-            AccountToolAccess::Verified
-        };
-        // claude.ai 커넥터는 공급자 서버가 보관한다. 로컬 설정 항목이 없다.
-        tools.push(identity.into_tool(AccountToolKind::Connector, true, false, access));
-    }
-
-    let installed = read_bounded(&config_dir.join("plugins").join("installed_plugins.json"))
-        .and_then(|raw| serde_json::from_str::<ClaudeInstalledPlugins>(&raw).ok())
-        .unwrap_or_default();
-    for name in installed.plugins.keys() {
-        let Some(identity) = ToolIdentity::new("claude", "plugin", name) else {
-            continue;
-        };
-        // 마켓플레이스 플러그인은 홈에 설치된 파일이라 계정과 무관하다.
-        tools.push(identity.into_tool(
+/// 마켓플레이스 플러그인은 홈에 설치된 파일이라 계정과 무관하다.
+fn claude_plugin_tools(config_dir: &Path) -> Vec<ProviderTool> {
+    read_bounded_json::<ClaudeInstalledPlugins>(
+        &config_dir.join("plugins").join("installed_plugins.json"),
+    )
+    .unwrap_or_default()
+    .plugins
+    .into_keys()
+    .filter_map(|name| {
+        Some(ToolIdentity::new("claude", "plugin", &name)?.into_tool(
             AccountToolKind::Plugin,
-            false,
-            true,
+            ToolScope::Shared,
+            ToolConfigSource::LocalConfig,
             AccountToolAccess::Unknown,
-        ));
-    }
+        ))
+    })
+    .collect()
+}
+
+fn collect_claude_tools(roots: &ProviderRoots) -> ProviderTools {
+    let config_dir = &roots.claude_config_dir;
+    let config = read_claude_config(roots);
+    let needs_auth = claude_needs_auth(config_dir);
+
+    let mut tools = claude_mcp_server_tools(&config, &needs_auth);
+    tools.extend(claude_connector_tools(&config, &needs_auth));
+    tools.extend(claude_plugin_tools(config_dir));
 
     ProviderTools {
         tools,
@@ -572,47 +651,52 @@ struct CodexPlugin {
 /// CLI에 동봉되거나 런타임이 직접 제공하는 플러그인 출처. 계정 연결이 필요 없다.
 const CODEX_BUNDLED_PLUGIN_SOURCES: &[&str] = &["openai-bundled", "openai-primary-runtime"];
 
+fn codex_mcp_server_tools(config: &CodexConfig) -> Vec<ProviderTool> {
+    config
+        .mcp_servers
+        .iter()
+        .filter(|(_, server)| server.enabled != Some(false))
+        .filter_map(|(name, server)| {
+            Some(ToolIdentity::new("codex", "mcp-server", name)?.into_tool(
+                AccountToolKind::McpServer,
+                transport_scope(server.url.as_deref(), None, server.command.as_deref()),
+                ToolConfigSource::LocalConfig,
+                AccountToolAccess::Unknown,
+            ))
+        })
+        .collect()
+}
+
+fn codex_plugin_tools(config: &CodexConfig) -> Vec<ProviderTool> {
+    config
+        .plugins
+        .iter()
+        .filter(|(_, plugin)| plugin.enabled != Some(false))
+        .filter_map(|(id, _)| {
+            // `name@source` 형식의 뒤쪽이 배포 출처다. 큐레이션 커넥터는 ChatGPT 계정
+            // 연결을 거치고, 동봉 플러그인은 CLI와 함께 설치되어 계정과 무관하다.
+            let source = id.split_once('@').map(|(_, source)| source).unwrap_or("");
+            let scope = if CODEX_BUNDLED_PLUGIN_SOURCES.contains(&source) {
+                ToolScope::Shared
+            } else {
+                ToolScope::Account
+            };
+            Some(ToolIdentity::new("codex", "plugin", id)?.into_tool(
+                AccountToolKind::Plugin,
+                scope,
+                ToolConfigSource::LocalConfig,
+                AccountToolAccess::Unknown,
+            ))
+        })
+        .collect()
+}
+
 fn collect_codex_tools(roots: &ProviderRoots) -> ProviderTools {
-    let config = read_bounded(&roots.codex_home.join("config.toml"))
-        .and_then(|raw| toml::from_str::<CodexConfig>(&raw).ok())
-        .unwrap_or_default();
+    let config =
+        read_bounded_toml::<CodexConfig>(&roots.codex_home.join("config.toml")).unwrap_or_default();
 
-    let mut tools = Vec::new();
-
-    for (name, server) in &config.mcp_servers {
-        if server.enabled == Some(false) {
-            continue;
-        }
-        let Some(identity) = ToolIdentity::new("codex", "mcp-server", name) else {
-            continue;
-        };
-        let remote = server.url.is_some() || server.command.is_none();
-        tools.push(identity.into_tool(
-            AccountToolKind::McpServer,
-            remote,
-            true,
-            AccountToolAccess::Unknown,
-        ));
-    }
-
-    for (id, plugin) in &config.plugins {
-        if plugin.enabled == Some(false) {
-            continue;
-        }
-        let Some(identity) = ToolIdentity::new("codex", "plugin", id) else {
-            continue;
-        };
-        // `name@source` 형식의 뒤쪽이 배포 출처다. 큐레이션 커넥터는 ChatGPT 계정
-        // 연결을 거치고, 동봉 플러그인은 CLI와 함께 설치되어 계정과 무관하다.
-        let source = id.split_once('@').map(|(_, source)| source).unwrap_or("");
-        let bundled = CODEX_BUNDLED_PLUGIN_SOURCES.contains(&source);
-        tools.push(identity.into_tool(
-            AccountToolKind::Plugin,
-            !bundled,
-            true,
-            AccountToolAccess::Unknown,
-        ));
-    }
+    let mut tools = codex_mcp_server_tools(&config);
+    tools.extend(codex_plugin_tools(&config));
 
     ProviderTools {
         tools,
@@ -666,22 +750,30 @@ const SERVICE_LABELS: &[(&str, &str)] = &[
     ("visualize", "Visualize"),
 ];
 
-/// 공급자마다 다른 표기(`notion`, `claude.ai Notion`, `notion@openai-curated`,
-/// `openaiDeveloperDocs`, `node_repl`)를 하나의 슬러그로 모은다.
-fn service_slug(raw: &str) -> String {
-    let mut value = raw.trim().to_owned();
-    // claude.ai 커넥터는 공통 접두사를 달고 온다.
-    for prefix in ["claude.ai ", "claude.ai-"] {
-        if let Some(rest) = value.strip_prefix(prefix) {
-            value = rest.to_owned();
-            break;
+const CONNECTOR_PREFIXES: &[&str] = &["claude.ai ", "claude.ai-"];
+const MCP_DECORATION_PREFIXES: &[&str] = &["mcp-server-", "mcp-", "server-"];
+const MCP_DECORATION_SUFFIXES: &[&str] = &["-mcp-server", "-mcp", "-server"];
+
+fn strip_first_prefix<'a>(text: &'a str, prefixes: &[&str]) -> &'a str {
+    for prefix in prefixes {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            return rest;
         }
     }
-    // `name@source` 형식은 앞쪽 이름만 서비스다.
-    if let Some((name, _)) = value.split_once('@') {
-        value = name.to_owned();
+    text
+}
+
+fn strip_first_suffix<'a>(text: &'a str, suffixes: &[&str]) -> &'a str {
+    for suffix in suffixes {
+        if let Some(rest) = text.strip_suffix(suffix) {
+            return rest;
+        }
     }
-    // camelCase 경계를 구분자로 바꾼 뒤 소문자로 모은다.
+    text
+}
+
+/// camelCase 경계와 특수문자를 하이픈 구분자로 정규화한다.
+fn to_kebab_slug(value: &str) -> String {
     let mut spaced = String::with_capacity(value.len() + 8);
     let mut previous_lower = false;
     for character in value.chars() {
@@ -710,26 +802,11 @@ fn service_slug(raw: &str) -> String {
         }
         slug.push_str(segment);
     }
-    // MCP 서버 이름에 흔한 장식은 서비스 구분에 쓸모가 없다.
-    for prefix in ["mcp-server-", "mcp-", "server-"] {
-        if let Some(rest) = slug.strip_prefix(prefix) {
-            slug = rest.to_owned();
-            break;
-        }
-    }
-    for suffix in ["-mcp-server", "-mcp", "-server"] {
-        if let Some(rest) = slug.strip_suffix(suffix) {
-            slug = rest.to_owned();
-            break;
-        }
-    }
     slug
 }
 
-fn service_label(slug: &str) -> String {
-    if let Some((_, label)) = SERVICE_LABELS.iter().find(|(key, _)| *key == slug) {
-        return (*label).to_owned();
-    }
+/// 하이픈 구분 세그먼트를 단어별 첫 글자 대문자(Title Case)로 합친다.
+fn kebab_to_title_case(slug: &str) -> String {
     let mut label = String::with_capacity(slug.len());
     for segment in slug.split('-').filter(|segment| !segment.is_empty()) {
         if !label.is_empty() {
@@ -742,6 +819,28 @@ fn service_label(slug: &str) -> String {
         }
     }
     label
+}
+
+/// 공급자마다 다른 표기(`notion`, `claude.ai Notion`, `notion@openai-curated`,
+/// `openaiDeveloperDocs`, `node_repl`)를 하나의 슬러그로 모은다.
+fn service_slug(raw: &str) -> String {
+    let value = raw.trim();
+    // claude.ai 커넥터는 공통 접두사를 달고 온다.
+    let value = strip_first_prefix(value, CONNECTOR_PREFIXES);
+    // `name@source` 형식은 앞쪽 이름만 서비스다.
+    let value = value.split_once('@').map(|(name, _)| name).unwrap_or(value);
+    // camelCase 경계를 구분자로 바꾼 뒤 소문자 하이픈 슬러그로 모은다.
+    let slug = to_kebab_slug(value);
+    // MCP 서버 이름에 흔한 장식은 서비스 구분에 쓸모가 없다.
+    let slug = strip_first_prefix(&slug, MCP_DECORATION_PREFIXES);
+    strip_first_suffix(slug, MCP_DECORATION_SUFFIXES).to_owned()
+}
+
+fn service_label(slug: &str) -> String {
+    if let Some((_, label)) = SERVICE_LABELS.iter().find(|(key, _)| *key == slug) {
+        return (*label).to_owned();
+    }
+    kebab_to_title_case(slug)
 }
 
 #[cfg(test)]
@@ -778,6 +877,7 @@ mod tests {
             note: None,
             credential_isolated: false,
             credential_isolation_note: None,
+            credential_expires_at: None,
             runtime_count: 0,
         }
     }

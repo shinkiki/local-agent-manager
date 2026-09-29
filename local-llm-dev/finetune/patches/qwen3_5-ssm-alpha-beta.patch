@@ -1,0 +1,24 @@
+diff --git a/conversion/qwen.py b/conversion/qwen.py
+index aa0e83d..9cabb39 100644
+--- a/conversion/qwen.py
++++ b/conversion/qwen.py
+@@ -579,13 +579,17 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
+                 # [num_v_heads, dim] (v = k*v_per_k + j, k-major) or the flat
+                 # k-head representation [num_k_heads*dim, 1] that must be
+                 # expanded. GGUF layout: [dim, num_v_heads] k-major.
++                # gguf-py 가 shape 를 뒤집어 ne 로 적으므로, ne=[dim, num_v_heads] 를 내려면
++                # torch shape 는 [num_v_heads, dim] 이어야 한다. 전치하면 반대로 나간다.
+                 if data_torch.ndim == 2 and data_torch.shape[0] == num_v_heads:
+-                    data_torch = torch.transpose(data_torch, 0, 1).contiguous()
++                    # 다른 v헤드 텐서(q·k·v·z·A_log·dt_bias·conv1d)는 전부 재배열을 받는다.
++                    # alpha·beta 만 빼면 헤드 정렬이 어긋나 모델이 조용히 망가진다.
++                    data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, 1).contiguous()
+                 else:
+                     data = data_torch.squeeze(-1)
+                     data = data.reshape(num_k_heads, -1)
+                     data = data.repeat_interleave(num_v_per_k, dim=0)
+-                    data_torch = data.T.contiguous()
++                    data_torch = data.contiguous()
+ 
+             elif ".A_log" in name or ".dt_bias" in name or ".dt_proj" in name:
+                 # A_log / dt_bias: 1D parameters with num_v_heads elements

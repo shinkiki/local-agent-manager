@@ -8,6 +8,7 @@ import {
   isSkillUsageEntry,
   matchSkillLibraryEntry,
   parseInjectedSkillBody,
+  skillContextLabelName,
   skillUsageNamePreview,
 } from "./skillUsage.ts";
 
@@ -137,6 +138,13 @@ test("주입 본문은 기준 디렉터리 줄과 본문으로 나뉜다", () =>
   assert.deepEqual(parseInjectedSkillBody("# 제목"), { directory: "", body: "# 제목" });
 });
 
+test("주입 레코드 라벨에서 스킬 이름을 읽고, 이 문법이 아니면 null이다", () => {
+  assert.equal(skillContextLabelName("사용 스킬 · dataviz"), "dataviz");
+  // 라벨은 있고 이름만 비면 null이 아니다 — 상세는 붙이되 붙일 이름이 없다는 뜻이다.
+  assert.equal(skillContextLabelName("사용 스킬 · "), "");
+  assert.equal(skillContextLabelName("도구 결과"), null);
+});
+
 test("스킬 목록 조회는 플러그인·디렉터리 접두를 떼고 맞춘다", () => {
   const entries = [
     { key: "dataviz", name: "dataviz", directoryName: "dataviz" },
@@ -151,4 +159,26 @@ test("카드 머리의 이름 미리보기는 중복을 지우고 개수로 줄�
   const usage = (name) => ({ id: name, name, args: "", status: "completed", directory: "", body: "", detection: "tool" });
   assert.equal(skillUsageNamePreview([usage("a"), usage("a"), usage("b")]), "a, b");
   assert.equal(skillUsageNamePreview([usage("a"), usage("b"), usage("c"), usage("d")]), "a, b, c 외 1개");
+});
+
+test("코드 속 템플릿 경로는 스킬 이름으로 잡지 않는다", () => {
+  const usages = collectChatSkillUsages([
+    {
+      type: "tool",
+      id: "toolu_9",
+      name: "Edit",
+      status: "completed",
+      detail: '{"new_string": "skillHref: (skill) => `${skillsPath}/${skill}/SKILL.md`"}',
+      output: "",
+    },
+    {
+      type: "tool",
+      id: "exec-9",
+      name: "shell",
+      status: "completed",
+      detail: '{"command": "ls ~/.claude/skills/*/SKILL.md"}',
+      output: "",
+    },
+  ]);
+  assert.deepEqual(usages, []);
 });

@@ -1,0 +1,468 @@
+[
+  {
+    "plugin": "notion-team",
+    "names": [
+      "노션"
+    ],
+    "tools": [
+      {
+        "name": "notion-ai-search",
+        "description": "Use this tool for every content search when access discovery reports current_tool_access.ai_search.status=\"available\". This includes exact keywords, page titles, project names, and natural-language questions. Choose by the connection's access, not by query wording. If access is not already known, call get_tool_access first. If access discovery reports that AI search is not available, use search instead.\n\nSearch Notion and connected workspace sources available to you, such as Slack, Mail, and Cal…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-check-mcp-next-steps",
+        "description": "When to call: Only when a Notion fetch result instructs you to. Finish all Notion tool calls needed for the current request, then call at most once with no arguments. Never call it per fetch or failure, without that instruction, or retry it.\n\nResult handling: If no next step is returned or rendering fails, do not retry or mention it. Otherwise, finish the user's task before the follow-up.\n\nFollow-up: Add one brief sentence grounded in the user's Notion work this session, followed by the returned…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-convert-page-to-skill",
+        "description": "Mark an existing Notion page as a skill without changing its content. The page must be in the current workspace, and the authenticated user must have permission to edit it. Use this tool only when the user wants the page's current contents designated as a skill.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": false
+      },
+      {
+        "name": "notion-create-attachment",
+        "description": "Create an attachment and upload it to Notion.\n\nProvide exactly one source:\n- content for small UTF-8 text artifacts such as HTML, Markdown, plain text, CSV, JSON, XML, CSS, YAML, TSV, calendar, GPX, or SVG files.\n- source_url for a file available at a direct, publicly reachable HTTPS URL. This supports binary files and temporary signed download URLs. Notion performs a metadata-only HEAD request when supported, followed by the GET request that downloads the file. The URL must not redirect, requir…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-create-comment",
+        "description": "Add a comment to a page or specific content.\n\nProvide `page_id` to identify the page, then choose ONE targeting mode:\n- `page_id` alone: Add a top-level comment to the page\n- `page_id` + `selection_with_ellipsis`: Start a new discussion on the matching block\n- `discussion_id`: Reply to an existing discussion thread (page_id is still required)\n\n\nProvide exactly one content format:\n- `markdown`: Preferred. Inline Notion-flavored Markdown for comment text. For exact syntax, read the MCP resource `n…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-create-database",
+        "description": "Creates a new Notion database using SQL DDL syntax, or a canonical typed database for tasks, projects, or skills.\n\nProvide exactly one of:\n- schema: a CREATE TABLE statement. If no title property is provided, \"Name\" is auto-added.\n- database_type: one of tasks, projects, or skills. The database is created with the canonical required properties and typed metadata used by Notion.\n\n\nReturns Markdown with schema, SQLite definition, and data source ID in <data-source> tag for use with update_data_sou…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-create-file-upload",
+        "description": "Create a short-lived URL for uploading one local file directly to Notion.\n\nAfter calling this tool, send exactly one multipart/form-data POST request to `upload_url`. Put the file in the `file` form field and include every header returned in `upload_headers`. Files are limited to 20 MiB for this single-part upload flow, and workspace file-size limits still apply.\n\nThe upload response includes `markdown_source` and `suggested_markdown`, which can be passed directly to create-pages or update-page,…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-create-folder",
+        "description": "Creates an empty Notion Folder. Set parent.page_id for a top-level Folder owned by a page, or parent.folder_id to create a nested Folder inside another Folder. A page-owned Folder is not inserted into the page's content. A nested Folder is appended to its parent Folder's content. The Folder inherits access from its parent.\n\nThis tool creates only the empty Folder. It is non-idempotent and creates a new Folder on every successful call.",
+        "readOnly": false
+      },
+      {
+        "name": "notion-create-pages",
+        "description": "## Overview\n\nCreates one or more Notion pages, with the specified properties and content.\n\n## Parent\n\nIf the user explicitly names a private or shared destination, omit \"creation_mode\" and create the page under that parent. Otherwise, use \"creation_mode\": \"draft\" as the safe default when the user clearly wants a durable page but has not named a destination. Create the draft without first asking where it should live. Draft mode is server-enforced: it creates workspace-level private pages and cann…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-create-view",
+        "description": "Create a new view on a Notion database.\n\nExactly one of \"database_id\" or \"parent_page_id\" must be provided:\n- \"database_id\": add a new view tab to an existing database.\n- \"parent_page_id\": create an inline linked database view on a page that references the existing \"data_source_id\" (like the UI \"/linked\" command). The linked view block is appended to the end of the parent page.\n\n\nUse \"fetch\" first to get the database_id, parent_page_id, and data_source_id (from <data-source> tags in the response…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-download-attachment",
+        "description": "Download the contents of a small UTF-8 text attachment created by the Notion MCP `create-attachment` tool.\n\nPass the `file_upload_id` returned by `create-attachment`. The attachment must belong to the requesting integration, have completed uploading, and use a supported text format such as HTML, Markdown, plain text, CSV, JSON, XML, CSS, YAML, TSV, calendar, GPX, or SVG.\n\nThe response contains the complete text in `content` so you can save it locally, edit it, and call `create-attachment` again …",
+        "readOnly": true
+      },
+      {
+        "name": "notion-download-skill",
+        "description": "Download a spec-compliant Notion Skill as a complete tar.gz archive containing SKILL.md and its supporting files and nested folders. Pass the skill page ID. Returns a temporary signed url. Download and extract the archive to read or use the skill.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-duplicate-page",
+        "description": "Duplicate a Notion page. The page must be within the current workspace, and you must have permission to access it. The duplication completes asynchronously, so do not rely on the new page identified by the returned ID or URL to be populated immediately. Let the user know that the duplication is in progress and that they can check back later using the 'fetch' tool or by clicking the returned URL and viewing it in the Notion app.",
+        "readOnly": false
+      },
+      {
+        "name": "notion-fetch",
+        "description": "Retrieves details about a Notion entity (page, database, data source, or saved database view) by URL or ID.\n\nProvide URL or ID in `id` parameter. Make multiple calls to fetch multiple entities.\n\nFor pages, `path`, `verification`, and `page_last_edited_at` expose native Notion facts that may help assess the source. Verification is explicit when Notion knows it; omission means unavailable or not applicable. Treat recency as a contextual tiebreaker, not proof that a source is authoritative. Check `…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-get-async-task",
+        "description": "Retrieves the current status of an async task that was started by another tool (for example, \"create_pages\" called with \"allow_async\": true).\n\nThe status is one of \"queued\", \"running\", \"retrying\", \"succeeded\", or \"failed\". When the task has succeeded, the operation's result is included; when it has failed, an error is included instead.\n\nPoll this tool with the \"task_id\" from the original tool's \"async_task\" response. Wait briefly between polls — the original response includes a suggested backoff…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-get-comments",
+        "description": "Get comments and discussions from a Notion page.\n\nReturns discussions with full comment content in XML format. By default, returns page-level discussions only. On supported Business connections, pending suggested edits use `kind=\"suggested_edit\"` and their `discussion://` URL can be passed to `get_suggested_edit`. Resolved suggestions stay retired. Check `suggested_edits_status` to distinguish an empty result from unavailable suggestion discovery.\n\nTip: Use the `fetch` tool with `include_discuss…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-get-session-status",
+        "description": "Get the latest turn's status for a Custom Agent session without waiting.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-get-teams",
+        "description": "Retrieves a list of teams (teamspaces) in the current workspace. Shows which teams exist, user membership status, IDs, names, and roles.\n\nTeams are returned split by membership status and limited to a maximum of 10 results.\n\n<examples>\n1. List all teams (up to the limit of each type): {}\n\n2. Search for teams by name: {\"query\": \"engineering\"}\n\n3. Find a specific team: {\"query\": \"Product Design\"}\n</examples>",
+        "readOnly": true
+      },
+      {
+        "name": "notion-get-tool-access",
+        "description": "Get current tool availability, parameter restrictions, and available upgrade links for this Notion connection. Call with {} to get the full access map before using a conditionally available tool, unless current access is already in context. Reuse this map across tools. When current_tool_access.ai_search.status is \"available\", use ai_search for every content search; otherwise use search. Tool availability and restricted_parameters are independent: omit restricted options even when the tool is ava…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-get-users",
+        "description": "Retrieves a list of users in the current workspace. Shows workspace members and guests with their IDs, names, emails (if available), and types (person or bot).\n\nSupports cursor-based pagination to iterate through all users in the workspace.\n\n<examples>\n1. List all users (first page): {}\n\n2. Search for users by name or email: {\"query\": \"john\"}\n\n3. Get next page of results: {\"start_cursor\": \"abc123\"}\n\n4. Set custom page size: {\"page_size\": 20}\n\n5. Fetch a specific user by ID: {\"user_id\": \"00000000…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-list-favorite-pages",
+        "description": "List the current user's favorite pages and databases in sidebar order. Use this when the user refers to a favorite or pinned workspace item. Follow cursor pagination when the complete list is needed.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-list-private-pages",
+        "description": "List the current user's top-level pages and databases in their Private sidebar section. Use this to browse private workspace structure. For content searches, including keywords and titles, use ai_search when get_tool_access reports it is available; otherwise use search. Follow cursor pagination when the complete list is needed.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-list-recent-pages",
+        "description": "List pages and databases the current user recently viewed, ranked by recency and visit frequency. Use this to recover likely navigation context when the user refers to something they were recently working on. Follow cursor pagination when the complete list is needed.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-list-session-events",
+        "description": "List short summaries of saved events in a Custom Agent session.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-list-shared-pages",
+        "description": "List pages and databases in the current user's Shared sidebar section. Use this to browse content shared directly with the user. For content searches, including keywords and titles, use ai_search when get_tool_access reports it is available; otherwise use search. Follow cursor pagination when the complete list is needed.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-move-pages",
+        "description": "Move one or more Notion pages or databases to a new parent.",
+        "readOnly": false
+      },
+      {
+        "name": "notion-query-data-sources",
+        "description": "Query Notion data sources using faithful structured rows, SQL, or a view. This is the canonical replacement for the deprecated query_database_view tool.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.\n\nBy default, uses SQL mode to execute SQLite queries against one or more data sources. Alternatively, use view mode to execute a database view's ex…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-query-meeting-notes",
+        "description": "Query the current user's meeting notes data source.\n\nApplies a filter over meeting note properties. Title keyword searching is done via filter on property \"title\" (e.g. string_contains). Title keyword matching is case-insensitive; capitalization does not matter. Returns up to 50 rows of matching meeting notes.\n\nPrerequisites:\n1. Use the \"search\" tool to find people IDs if you need to filter by attendees\n\n\nQuery building:\n- Ignore terms semantically related to meeting outputs (e.g. \"summaries\", \"…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-query-multiple-data-sources",
+        "description": "Query data across multiple Notion data sources using read-only SQLite SQL.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.\n\nUse this tool for JOINs, UNIONs, comparisons, and aggregations that need two or more data sources. Queries across multiple data sources require a Business or Enterprise plan with Notion AI. Use query_data_sources instead whe…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-query-sessions",
+        "description": "List agent sessions available to the integration. Filter, sort, or search by title. A bounded page can be empty while has_more is true; follow next_cursor until has_more is false.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-read-session-event",
+        "description": "Read the full visible content of one saved Custom Agent session event.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-search",
+        "description": "Before the first content search for this connection, call get_tool_access with {} unless its current access result is already in context. Choose the content-search tool by current_tool_access.ai_search.status, not by query wording:\n- If the status is \"available\", use ai_search for every keyword, page-title, project-name, or natural-language content search.\n- If access discovery reports that AI search is not available to this connection, use search with short, specific keywords. Missing access in…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-search-agents",
+        "description": "Search agents by name or description, or browse the current user's favorite agents and the workspace's newest agents. Queries return one page. Without a query, follow nextCursor until it is omitted, even when a bounded workspace page is empty. Use this instead of list_agents when personal favorites or relevance-ranked search are needed.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-search-sessions",
+        "description": "Search past agent sessions by topic in a periodically refreshed index and return matching session URLs and excerpts. Recently created or updated sessions may not appear; use query_sessions for recent sessions.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-search-skills",
+        "description": "Find active Notion Skills the authenticated user can access. A Skill is a user-owned Notion page with task-scoped instructions that an assistant can write and maintain on the user's behalf.\n\nUse this when the user names a Skill without its exact URL, asks for their saved, usual, standard, or repeatable workflow, asks what reusable workflows are available, or asks to find instructions for a task. Do not search for every ordinary request. If the user provides an exact Notion URL, call `fetch` dire…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-send-message-to-session",
+        "description": "Send a follow-up message to a Custom Agent session you can access.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": false
+      },
+      {
+        "name": "notion-show-advanced-analysis-next-steps",
+        "description": "Use this exactly once at the end of a turn when query_multiple_data_sources requires the full version of Notion MCP. Call with no arguments. Do not call this once per failed query, and do not call it again if it has already been called in this turn. Use the card data to give the user the relevant next-step message and destination link in the final response. Use a compact, labeled Markdown link rather than a bare URL, and do not request or create a separate link preview.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-spawn-session",
+        "description": "Start a session with a published Custom Agent. Use get_session_status or wait_session to check its progress.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": false
+      },
+      {
+        "name": "notion-stop-session",
+        "description": "Stop a running Custom Agent session you can access.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": false
+      },
+      {
+        "name": "notion-update-data-source",
+        "description": "Update a Notion data source's schema, title, or attributes using SQL DDL statements. Returns Markdown showing updated structure and schema.\n\nAccepts a data source ID (collection ID from fetch response's <data-source> tag) or a single-source database ID. Multi-source databases require the specific data source ID.\n\nThe statements param accepts semicolon-separated DDL statements:\n- ADD COLUMN \"Name\" <type> - add a new property\n- DROP COLUMN \"Name\" - remove a property\n- RENAME COLUMN \"Old\" TO \"New\" …",
+        "readOnly": false
+      },
+      {
+        "name": "notion-update-folder",
+        "description": "Update an existing Notion Folder with an explicit Folder operation.\n\n- Use add_files with file upload IDs returned by the upload tools.\n- Fetch the Folder first, then use remove_files with the exact file URLs from that fetch result.\n- Use add_subfolder to create and insert a new nested Folder.\n\n\nUse exactly one command shape; do not mix their arguments:\n- {\"command\":\"add_files\",\"file_upload_ids\":[\"...\"]}\n- {\"command\":\"remove_files\",\"file_urls\":[\"...\"]}\n- {\"command\":\"add_subfolder\",\"title\":\"...\"}…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-update-page",
+        "description": "## Overview\n\nUpdate a Notion page's properties or content.\n\n## Properties\n\nNotion page properties are a JSON map of property names to SQLite values.\n\nFor pages in a database:\n- ALWAYS use the \"fetch\" tool first to get the data source schema and the\texact property names.\n- Provide a non-null value to update a property's value.\n- Omitted properties are left unchanged.\n\n\n**IMPORTANT**: Some property types require specific formats:\n- Date properties: Split into \"date:{property}:start\", \"date:{proper…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-update-view",
+        "description": "Update a view's name, filters, sorts, or display configuration.\n\nUse \"fetch\" to get view IDs from database responses. Only include fields\nyou want to change. The \"configure\" param uses the same DSL as create_view.\nUse CLEAR to remove settings:\n- CLEAR FILTER — remove all filters\n- CLEAR SORT — remove all sorts\n- CLEAR GROUP BY — remove grouping\n\n\nSee notion://docs/view-dsl-spec resource for full syntax (readable via your MCP client's resource-reading interface, or by passing the URI to the Notio…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-upload-skill",
+        "description": "Import a spec-compliant Agent Skills directory into a page in a Skills database. First call action=prepare with page_id and the exact tar.gz content_length and checksum_crc32. PUT the raw archive bytes to upload_url with all upload_headers, then call action=complete with the same page_id and upload_token. The archive must contain SKILL.md with name/description YAML frontmatter, either at the root or in a single matching skill-name directory. Completion replaces the page title, Description, body,…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-wait-session",
+        "description": "Wait for the latest turn in a Custom Agent session to stop running.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": true
+      }
+    ]
+  },
+  {
+    "plugin": "notion-personal",
+    "names": [
+      "노션"
+    ],
+    "tools": [
+      {
+        "name": "notion-ai-search",
+        "description": "Use this tool for every content search when access discovery reports current_tool_access.ai_search.status=\"available\". This includes exact keywords, page titles, project names, and natural-language questions. Choose by the connection's access, not by query wording. If access is not already known, call get_tool_access first. If access discovery reports that AI search is not available, use search instead.\n\nSearch Notion and connected workspace sources available to you, such as Slack, Mail, and Cal…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-check-mcp-next-steps",
+        "description": "When to call: Only when a Notion fetch result instructs you to. Finish all Notion tool calls needed for the current request, then call at most once with no arguments. Never call it per fetch or failure, without that instruction, or retry it.\n\nResult handling: If no next step is returned or rendering fails, do not retry or mention it. Otherwise, finish the user's task before the follow-up.\n\nFollow-up: Add one brief sentence grounded in the user's Notion work this session, followed by the returned…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-convert-page-to-skill",
+        "description": "Mark an existing Notion page as a skill without changing its content. The page must be in the current workspace, and the authenticated user must have permission to edit it. Use this tool only when the user wants the page's current contents designated as a skill.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": false
+      },
+      {
+        "name": "notion-create-attachment",
+        "description": "Create an attachment and upload it to Notion.\n\nProvide exactly one source:\n- content for small UTF-8 text artifacts such as HTML, Markdown, plain text, CSV, JSON, XML, CSS, YAML, TSV, calendar, GPX, or SVG files.\n- source_url for a file available at a direct, publicly reachable HTTPS URL. This supports binary files and temporary signed download URLs. Notion performs a metadata-only HEAD request when supported, followed by the GET request that downloads the file. The URL must not redirect, requir…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-create-comment",
+        "description": "Add a comment to a page or specific content.\n\nProvide `page_id` to identify the page, then choose ONE targeting mode:\n- `page_id` alone: Add a top-level comment to the page\n- `page_id` + `selection_with_ellipsis`: Start a new discussion on the matching block\n- `discussion_id`: Reply to an existing discussion thread (page_id is still required)\n\n\nProvide exactly one content format:\n- `markdown`: Preferred. Inline Notion-flavored Markdown for comment text. For exact syntax, read the MCP resource `n…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-create-database",
+        "description": "Creates a new Notion database using SQL DDL syntax, or a canonical typed database for tasks, projects, or skills.\n\nProvide exactly one of:\n- schema: a CREATE TABLE statement. If no title property is provided, \"Name\" is auto-added.\n- database_type: one of tasks, projects, or skills. The database is created with the canonical required properties and typed metadata used by Notion.\n\n\nReturns Markdown with schema, SQLite definition, and data source ID in <data-source> tag for use with update_data_sou…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-create-file-upload",
+        "description": "Create a short-lived URL for uploading one local file directly to Notion.\n\nAfter calling this tool, send exactly one multipart/form-data POST request to `upload_url`. Put the file in the `file` form field and include every header returned in `upload_headers`. Files are limited to 20 MiB for this single-part upload flow, and workspace file-size limits still apply.\n\nThe upload response includes `markdown_source` and `suggested_markdown`, which can be passed directly to create-pages or update-page,…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-create-folder",
+        "description": "Creates an empty Notion Folder. Set parent.page_id for a top-level Folder owned by a page, or parent.folder_id to create a nested Folder inside another Folder. A page-owned Folder is not inserted into the page's content. A nested Folder is appended to its parent Folder's content. The Folder inherits access from its parent.\n\nThis tool creates only the empty Folder. It is non-idempotent and creates a new Folder on every successful call.",
+        "readOnly": false
+      },
+      {
+        "name": "notion-create-pages",
+        "description": "## Overview\n\nCreates one or more Notion pages, with the specified properties and content.\n\n## Parent\n\nIf the user explicitly names a private or shared destination, omit \"creation_mode\" and create the page under that parent. Otherwise, use \"creation_mode\": \"draft\" as the safe default when the user clearly wants a durable page but has not named a destination. Create the draft without first asking where it should live. Draft mode is server-enforced: it creates workspace-level private pages and cann…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-create-view",
+        "description": "Create a new view on a Notion database.\n\nExactly one of \"database_id\" or \"parent_page_id\" must be provided:\n- \"database_id\": add a new view tab to an existing database.\n- \"parent_page_id\": create an inline linked database view on a page that references the existing \"data_source_id\" (like the UI \"/linked\" command). The linked view block is appended to the end of the parent page.\n\n\nUse \"fetch\" first to get the database_id, parent_page_id, and data_source_id (from <data-source> tags in the response…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-download-attachment",
+        "description": "Download the contents of a small UTF-8 text attachment created by the Notion MCP `create-attachment` tool.\n\nPass the `file_upload_id` returned by `create-attachment`. The attachment must belong to the requesting integration, have completed uploading, and use a supported text format such as HTML, Markdown, plain text, CSV, JSON, XML, CSS, YAML, TSV, calendar, GPX, or SVG.\n\nThe response contains the complete text in `content` so you can save it locally, edit it, and call `create-attachment` again …",
+        "readOnly": true
+      },
+      {
+        "name": "notion-download-skill",
+        "description": "Download a spec-compliant Notion Skill as a complete tar.gz archive containing SKILL.md and its supporting files and nested folders. Pass the skill page ID. Returns a temporary signed url. Download and extract the archive to read or use the skill.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-duplicate-page",
+        "description": "Duplicate a Notion page. The page must be within the current workspace, and you must have permission to access it. The duplication completes asynchronously, so do not rely on the new page identified by the returned ID or URL to be populated immediately. Let the user know that the duplication is in progress and that they can check back later using the 'fetch' tool or by clicking the returned URL and viewing it in the Notion app.",
+        "readOnly": false
+      },
+      {
+        "name": "notion-fetch",
+        "description": "Retrieves details about a Notion entity (page, database, data source, or saved database view) by URL or ID.\n\nProvide URL or ID in `id` parameter. Make multiple calls to fetch multiple entities.\n\nFor pages, `path`, `verification`, and `page_last_edited_at` expose native Notion facts that may help assess the source. Verification is explicit when Notion knows it; omission means unavailable or not applicable. Treat recency as a contextual tiebreaker, not proof that a source is authoritative. Check `…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-get-async-task",
+        "description": "Retrieves the current status of an async task that was started by another tool (for example, \"create_pages\" called with \"allow_async\": true).\n\nThe status is one of \"queued\", \"running\", \"retrying\", \"succeeded\", or \"failed\". When the task has succeeded, the operation's result is included; when it has failed, an error is included instead.\n\nPoll this tool with the \"task_id\" from the original tool's \"async_task\" response. Wait briefly between polls — the original response includes a suggested backoff…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-get-comments",
+        "description": "Get comments and discussions from a Notion page.\n\nReturns discussions with full comment content in XML format. By default, returns page-level discussions only. On supported Business connections, pending suggested edits use `kind=\"suggested_edit\"` and their `discussion://` URL can be passed to `get_suggested_edit`. Resolved suggestions stay retired. Check `suggested_edits_status` to distinguish an empty result from unavailable suggestion discovery.\n\nTip: Use the `fetch` tool with `include_discuss…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-get-session-status",
+        "description": "Get the latest turn's status for a Custom Agent session without waiting.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-get-teams",
+        "description": "Retrieves a list of teams (teamspaces) in the current workspace. Shows which teams exist, user membership status, IDs, names, and roles.\n\nTeams are returned split by membership status and limited to a maximum of 10 results.\n\n<examples>\n1. List all teams (up to the limit of each type): {}\n\n2. Search for teams by name: {\"query\": \"engineering\"}\n\n3. Find a specific team: {\"query\": \"Product Design\"}\n</examples>",
+        "readOnly": true
+      },
+      {
+        "name": "notion-get-tool-access",
+        "description": "Get current tool availability, parameter restrictions, and available upgrade links for this Notion connection. Call with {} to get the full access map before using a conditionally available tool, unless current access is already in context. Reuse this map across tools. When current_tool_access.ai_search.status is \"available\", use ai_search for every content search; otherwise use search. Tool availability and restricted_parameters are independent: omit restricted options even when the tool is ava…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-get-users",
+        "description": "Retrieves a list of users in the current workspace. Shows workspace members and guests with their IDs, names, emails (if available), and types (person or bot).\n\nSupports cursor-based pagination to iterate through all users in the workspace.\n\n<examples>\n1. List all users (first page): {}\n\n2. Search for users by name or email: {\"query\": \"john\"}\n\n3. Get next page of results: {\"start_cursor\": \"abc123\"}\n\n4. Set custom page size: {\"page_size\": 20}\n\n5. Fetch a specific user by ID: {\"user_id\": \"00000000…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-list-favorite-pages",
+        "description": "List the current user's favorite pages and databases in sidebar order. Use this when the user refers to a favorite or pinned workspace item. Follow cursor pagination when the complete list is needed.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-list-private-pages",
+        "description": "List the current user's top-level pages and databases in their Private sidebar section. Use this to browse private workspace structure. For content searches, including keywords and titles, use ai_search when get_tool_access reports it is available; otherwise use search. Follow cursor pagination when the complete list is needed.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-list-recent-pages",
+        "description": "List pages and databases the current user recently viewed, ranked by recency and visit frequency. Use this to recover likely navigation context when the user refers to something they were recently working on. Follow cursor pagination when the complete list is needed.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-list-session-events",
+        "description": "List short summaries of saved events in a Custom Agent session.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-list-shared-pages",
+        "description": "List pages and databases in the current user's Shared sidebar section. Use this to browse content shared directly with the user. For content searches, including keywords and titles, use ai_search when get_tool_access reports it is available; otherwise use search. Follow cursor pagination when the complete list is needed.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-move-pages",
+        "description": "Move one or more Notion pages or databases to a new parent.",
+        "readOnly": false
+      },
+      {
+        "name": "notion-query-data-sources",
+        "description": "Query Notion data sources using faithful structured rows, SQL, or a view. This is the canonical replacement for the deprecated query_database_view tool.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.\n\nBy default, uses SQL mode to execute SQLite queries against one or more data sources. Alternatively, use view mode to execute a database view's ex…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-query-meeting-notes",
+        "description": "Query the current user's meeting notes data source.\n\nApplies a filter over meeting note properties. Title keyword searching is done via filter on property \"title\" (e.g. string_contains). Title keyword matching is case-insensitive; capitalization does not matter. Returns up to 50 rows of matching meeting notes.\n\nPrerequisites:\n1. Use the \"search\" tool to find people IDs if you need to filter by attendees\n\n\nQuery building:\n- Ignore terms semantically related to meeting outputs (e.g. \"summaries\", \"…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-query-multiple-data-sources",
+        "description": "Query data across multiple Notion data sources using read-only SQLite SQL.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.\n\nUse this tool for JOINs, UNIONs, comparisons, and aggregations that need two or more data sources. Queries across multiple data sources require a Business or Enterprise plan with Notion AI. Use query_data_sources instead whe…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-query-sessions",
+        "description": "List agent sessions available to the integration. Filter, sort, or search by title. A bounded page can be empty while has_more is true; follow next_cursor until has_more is false.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-read-session-event",
+        "description": "Read the full visible content of one saved Custom Agent session event.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-search",
+        "description": "Before the first content search for this connection, call get_tool_access with {} unless its current access result is already in context. Choose the content-search tool by current_tool_access.ai_search.status, not by query wording:\n- If the status is \"available\", use ai_search for every keyword, page-title, project-name, or natural-language content search.\n- If access discovery reports that AI search is not available to this connection, use search with short, specific keywords. Missing access in…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-search-agents",
+        "description": "Search agents by name or description, or browse the current user's favorite agents and the workspace's newest agents. Queries return one page. Without a query, follow nextCursor until it is omitted, even when a bounded workspace page is empty. Use this instead of list_agents when personal favorites or relevance-ranked search are needed.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-search-sessions",
+        "description": "Search past agent sessions by topic in a periodically refreshed index and return matching session URLs and excerpts. Recently created or updated sessions may not appear; use query_sessions for recent sessions.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-search-skills",
+        "description": "Find active Notion Skills the authenticated user can access. A Skill is a user-owned Notion page with task-scoped instructions that an assistant can write and maintain on the user's behalf.\n\nUse this when the user names a Skill without its exact URL, asks for their saved, usual, standard, or repeatable workflow, asks what reusable workflows are available, or asks to find instructions for a task. Do not search for every ordinary request. If the user provides an exact Notion URL, call `fetch` dire…",
+        "readOnly": true
+      },
+      {
+        "name": "notion-send-message-to-session",
+        "description": "Send a follow-up message to a Custom Agent session you can access.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": false
+      },
+      {
+        "name": "notion-show-advanced-analysis-next-steps",
+        "description": "Use this exactly once at the end of a turn when query_multiple_data_sources requires the full version of Notion MCP. Call with no arguments. Do not call this once per failed query, and do not call it again if it has already been called in this turn. Use the card data to give the user the relevant next-step message and destination link in the final response. Use a compact, labeled Markdown link rather than a bare URL, and do not request or create a separate link preview.",
+        "readOnly": true
+      },
+      {
+        "name": "notion-spawn-session",
+        "description": "Start a session with a published Custom Agent. Use get_session_status or wait_session to check its progress.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": false
+      },
+      {
+        "name": "notion-stop-session",
+        "description": "Stop a running Custom Agent session you can access.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": false
+      },
+      {
+        "name": "notion-update-data-source",
+        "description": "Update a Notion data source's schema, title, or attributes using SQL DDL statements. Returns Markdown showing updated structure and schema.\n\nAccepts a data source ID (collection ID from fetch response's <data-source> tag) or a single-source database ID. Multi-source databases require the specific data source ID.\n\nThe statements param accepts semicolon-separated DDL statements:\n- ADD COLUMN \"Name\" <type> - add a new property\n- DROP COLUMN \"Name\" - remove a property\n- RENAME COLUMN \"Old\" TO \"New\" …",
+        "readOnly": false
+      },
+      {
+        "name": "notion-update-folder",
+        "description": "Update an existing Notion Folder with an explicit Folder operation.\n\n- Use add_files with file upload IDs returned by the upload tools.\n- Fetch the Folder first, then use remove_files with the exact file URLs from that fetch result.\n- Use add_subfolder to create and insert a new nested Folder.\n\n\nUse exactly one command shape; do not mix their arguments:\n- {\"command\":\"add_files\",\"file_upload_ids\":[\"...\"]}\n- {\"command\":\"remove_files\",\"file_urls\":[\"...\"]}\n- {\"command\":\"add_subfolder\",\"title\":\"...\"}…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-update-page",
+        "description": "## Overview\n\nUpdate a Notion page's properties or content.\n\n## Properties\n\nNotion page properties are a JSON map of property names to SQLite values.\n\nFor pages in a database:\n- ALWAYS use the \"fetch\" tool first to get the data source schema and the\texact property names.\n- Provide a non-null value to update a property's value.\n- Omitted properties are left unchanged.\n\n\n**IMPORTANT**: Some property types require specific formats:\n- Date properties: Split into \"date:{property}:start\", \"date:{proper…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-update-view",
+        "description": "Update a view's name, filters, sorts, or display configuration.\n\nUse \"fetch\" to get view IDs from database responses. Only include fields\nyou want to change. The \"configure\" param uses the same DSL as create_view.\nUse CLEAR to remove settings:\n- CLEAR FILTER — remove all filters\n- CLEAR SORT — remove all sorts\n- CLEAR GROUP BY — remove grouping\n\n\nSee notion://docs/view-dsl-spec resource for full syntax (readable via your MCP client's resource-reading interface, or by passing the URI to the Notio…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-upload-skill",
+        "description": "Import a spec-compliant Agent Skills directory into a page in a Skills database. First call action=prepare with page_id and the exact tar.gz content_length and checksum_crc32. PUT the raw archive bytes to upload_url with all upload_headers, then call action=complete with the same page_id and upload_token. The archive must contain SKILL.md with name/description YAML frontmatter, either at the root or in a single matching skill-name directory. Completion replaces the page title, Description, body,…",
+        "readOnly": false
+      },
+      {
+        "name": "notion-wait-session",
+        "description": "Wait for the latest turn in a Custom Agent session to stop running.\n\nIf availability is not already known for this connection, call get_tool_access with {} before using this tool. Reuse the returned access map across tools; check the status and restricted_parameters.",
+        "readOnly": true
+      }
+    ]
+  }
+]

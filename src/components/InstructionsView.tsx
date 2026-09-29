@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
-import { AlertTriangle, ArchiveX, ChevronDown, ChevronRight, ChevronUp, FileText, Folder, FolderInput, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { ArchiveX, ChevronDown, ChevronRight, ChevronUp, FileText, Folder, FolderInput, Plus, RefreshCw, Trash2 } from "lucide-react";
 import {
   attachProjectInstructionDeployment,
   checkProjectInstructionDelete,
@@ -25,16 +25,18 @@ import {
   unarchiveSharedProjectInstruction,
   updateProjectInstruction,
 } from "../lib/ipc";
-import { formatBytes } from "../lib/format";
-import { useI18n } from "../lib/i18n";
+import { formatBytes, sourceName } from "../lib/format";
+import { useI18n, type UiText } from "../lib/i18n";
+import { runtimeText } from "../lib/i18nRuntime";
 import { localDocumentLinks } from "../lib/markdownLinks";
+import { displayPath } from "../lib/displayPath";
 import { useMenuTranslations } from "../lib/translations";
 import type {
   DeployedInstructionFileContent,
   HostPlatform,
   InstructionImportLinkedDoc,
   InstructionImportPreview,
-  InstructionTrashItem,
+  InstructionPublishReceipt,
   InstructionTrashOverview,
   ProjectInstructionDeployment,
   ProjectInstructionEntry,
@@ -45,11 +47,15 @@ import type {
 } from "../types";
 import { LinkedFilePreview, useLinkedFilePreview } from "./LinkedFilePreview";
 import { MarkdownPreview } from "./MarkdownPreview";
-import { AiaMark, Drawer, EmptyState, ErrorBanner, LoadingState, Modal, SourceBadge, useConfirm, type ConfirmRequest } from "./Shared";
+import { Drawer, EmptyState, ErrorBanner, LoadingState, Modal, SourceBadge, useConfirm, type ConfirmRequest } from "./Shared";
+import { FilterAxisBar, filterMatcher, type FilterAxisSpec } from "./FilterAxisBar";
+import { OriginalContent } from "./DetailDrawer";
+import { BulkMigrationButton, HOST_PLATFORMS, LibraryRowMain, LibraryToolbar, LocationProviderMatrix, PlatformSupportFields, SkillUseToggle, ToggleMatrix, TrashRow, ViewModeTabs, arraysEqual, busyRunner, filterAxes, platformLabel, useAutoSync, useStoredChoice, useTrashGroupSizes, type BusyRunner } from "./SkillLibraryPanel";
 import { TranslateResourceButton } from "./TranslationProgress";
 import { aiaRuntimeProvider } from "../lib/aiaRuntime";
 import { instructionBulkMigrationPrompt } from "../lib/skillTransfer";
 import { errorText } from "../lib/errorText";
+import { PROVIDER_IDS } from "../lib/providerIds";
 
 /**
  * 배포 위치를 IPC가 받는 `(scope, projectPath)` 한 쌍으로 바꾼다. `scope`가 넓은 문자열
@@ -66,38 +72,51 @@ function deploymentTarget(source: { scope: string; projectPath: string | null })
     : { scope: "project", projectPath: source.projectPath };
 }
 
-const PROVIDERS: ProviderId[] = ["claude", "codex", "antigravity"];
+interface InstructionPublishSummary {
+  succeeded: number;
+  linkedWritten: number;
+  linkedSkipped: number;
+}
+
+/** 게시 영수증의 화면용 개수를 결과·연결 문서까지 한 번만 훑어 집계한다. */
+function summarizeInstructionPublish(receipt: InstructionPublishReceipt): InstructionPublishSummary {
+  const summary: InstructionPublishSummary = { succeeded: 0, linkedWritten: 0, linkedSkipped: 0 };
+  for (const result of receipt.results) {
+    if (result.outcome === "published" || result.outcome === "replaced" || result.outcome === "unchanged") {
+      summary.succeeded += 1;
+    }
+    for (const linked of result.linkedResults ?? []) {
+      if (linked.outcome === "published" || linked.outcome === "replaced") summary.linkedWritten += 1;
+      if (linked.outcome === "skipped") summary.linkedSkipped += 1;
+    }
+  }
+  return summary;
+}
+
+/**
+ * 공급자별 지침 파일 이름. 여기서 아는 것은 파일 이름 하나뿐이다 — 표시 이름은
+ * `format`의 `sourceName`이 정본이고, 새 지침의 처음 내용은 이 이름에서 짓는다.
+ * 세 값을 한 표에 나란히 두었더니 표시 이름만 정본과 따로 굳어 갔다.
+ */
+const INSTRUCTION_FILE_NAMES: Record<ProviderId, string> = {
+  claude: "CLAUDE.md",
+  codex: "AGENTS.md",
+  antigravity: "GEMINI.md",
+  // 로컬 공급자는 Codex 하네스를 빌려 쓰므로 같은 AGENTS.md를 읽는다.
+  local: "AGENTS.md",
+};
 /** 게시 위치 select에서 개인 설정을 나타내는 센티널 값. 프로젝트 경로와 겹치지 않는다. */
 const PERSONAL_LOCATION = "__personal__";
+/** 지침 키의 최대 글자 수. 백엔드 `validate_instruction_key`의 `MAX_INSTRUCTION_KEY_CHARS`와 같다. */
+const INSTRUCTION_KEY_MAX = 64;
 const INSTRUCTION_MODE_KEY = "agent-manager.instruction-mode.v1";
 
 /**
  * `info`는 개인·프로젝트에 실제로 있는 지침 파일을 그대로 보여주는 읽기 전용
  * 화면이고, `manage`는 공통 원본 보관·게시·동기화를 다루는 통합 관리 화면이다.
  */
-type InstructionViewMode = "info" | "manage";
-
-function loadInstructionMode(): InstructionViewMode {
-  try {
-    return window.localStorage.getItem(INSTRUCTION_MODE_KEY) === "manage" ? "manage" : "info";
-  } catch {
-    return "info";
-  }
-}
-
-function saveInstructionMode(mode: InstructionViewMode): void {
-  try {
-    window.localStorage.setItem(INSTRUCTION_MODE_KEY, mode);
-  } catch {
-    // 저장 실패는 무시한다. 다음 방문에 기본 탭이 열릴 뿐이다.
-  }
-}
-const PLATFORMS: HostPlatform[] = ["macos", "windows", "linux"];
-const INSTRUCTION_TEMPLATE: Record<ProviderId, string> = {
-  claude: "# CLAUDE.md\n",
-  codex: "# AGENTS.md\n",
-  antigravity: "# GEMINI.md\n",
-};
+const INSTRUCTION_VIEW_MODES = ["info", "manage"] as const;
+type InstructionViewMode = (typeof INSTRUCTION_VIEW_MODES)[number];
 
 interface InstructionsViewProps {
   onChanged?: (message: string) => void;
@@ -121,20 +140,17 @@ export function InstructionsView({
   const [library, setLibrary] = useState<ProjectInstructionLibrary | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState<string | null>(null);
+  const [busy, setBusy] = useState<InstructionBusyKind | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [trash, setTrash] = useState<InstructionTrashOverview | null>(null);
-  const [mode, setMode] = useState<InstructionViewMode>(loadInstructionMode);
+  const [mode, setMode] = useStoredChoice<InstructionViewMode>(INSTRUCTION_MODE_KEY, INSTRUCTION_VIEW_MODES, "info");
   // 만들기·가져오기·휴지통은 한 번씩 쓰는 작업이라 목록 아래에 펼쳐 두지 않고 툴바에서 연다.
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
   const [trashOpen, setTrashOpen] = useState(false);
   const { confirm, confirmDialog } = useConfirm();
 
-  useEffect(() => {
-    saveInstructionMode(mode);
-  }, [mode]);
   // 목록 새로 고침과 번역 진행 상태 변화 양쪽에서 지침 이름·설명 번역을 다시 읽는다.
   // 둘 다 단조 증가하는 값이라 더해서 변경 감지 키로 쓴다.
   const [translationRevision, setTranslationRevision] = useState(0);
@@ -177,40 +193,35 @@ export function InstructionsView({
   // 반영하고 나머지 배포 프로젝트에 재배포한다. 서로 다른 수정이 여러 개면 자동
   // 판단이 불가능하므로 수동(외부 수정 감지 카드)으로 남긴다. 배포 원장에 오른
   // 위치만 본다. 파일 이름이 같을 뿐인 남의 지침을 원본으로 채택하면 안 된다.
-  const autoSyncRunning = useRef<Set<string>>(new Set());
-  useEffect(() => {
-    for (const entry of library?.entries ?? []) {
-      if (!entry.autoSync) continue;
+  useAutoSync(
+    library,
+    () => (library?.entries ?? []).flatMap((entry) => {
+      if (!entry.autoSync) return [];
       const divergents = entry.deployments.filter((deployment) =>
         deployment.managed && deployment.present && deployment.divergent && !deployment.message);
-      if (divergents.length === 0) continue;
-      // 지침 파일이 같아도 연결 문서가 서로 다르면 어느 세트를 채택할지 알 수 없다.
-      const digests = new Set(divergents.map((deployment) => deployment.setDigest ?? deployment.contentDigest ?? ""));
-      if (digests.size !== 1) continue;
-      if (autoSyncRunning.current.has(entry.key)) continue;
-      autoSyncRunning.current.add(entry.key);
+      if (divergents.length === 0) return [];
       const target = divergents[0];
-      void syncProjectInstructionFromDeployment({
+      return [{
         key: entry.key,
-        ...deploymentTarget(target),
-        provider: target.provider,
-      })
-        .then(() => {
-          reportChanged(text(
-            `'${entry.key}' 지침을 자동 동기화했습니다. 이전 원본은 휴지통에 있습니다.`,
-            `Auto-synced instruction '${entry.key}'. The previous source is in the trash.`,
-          ));
-          return refresh();
-        })
-        .catch((cause: unknown) => {
-          setError(errorMessage(cause));
-        })
-        .finally(() => {
-          autoSyncRunning.current.delete(entry.key);
-        });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [library]);
+        // 지침 파일이 같아도 연결 문서가 서로 다르면 어느 세트를 채택할지 알 수 없다.
+        digests: divergents.map((deployment) => deployment.setDigest ?? deployment.contentDigest ?? ""),
+        run: () => syncProjectInstructionFromDeployment({
+          key: entry.key,
+          ...deploymentTarget(target),
+          provider: target.provider,
+        }),
+        done: text(
+          `'${entry.key}' 지침을 자동 동기화했습니다. 이전 원본은 휴지통에 있습니다.`,
+          `Auto-synced instruction '${entry.key}'. The previous source is in the trash.`,
+        ),
+      }];
+    }),
+    (message) => {
+      reportChanged(message);
+      return refresh();
+    },
+    (cause) => setError(errorMessage(cause)),
+  );
 
   // 휴지통을 비우면 남는 게 없으므로 서랍을 닫는다. 툴바 버튼도 같은 조건으로 사라진다.
   useEffect(() => {
@@ -222,19 +233,25 @@ export function InstructionsView({
     onChanged?.(message);
   };
 
+  // 작업을 실행하는 자식 넷(선택 지침·휴지통·가져오기·만들기)은 모두 같은 다섯 값을
+  // 받는다. 호출부마다 다섯 줄을 손으로 적어 두면 한 값을 바꿀 때 네 자리를 함께 고쳐야
+  // 하고, 실제로 빠뜨려도 타입이 잡아 줄 뿐 읽는 사람은 넷이 같은 묶음인지 알 수 없었다.
+  const childActions: ChildActionProps = { busy, setBusy, setError, reportChanged, refresh };
+
   if (loading && !library) {
     return <LoadingState label={text("지침 저장소를 읽고 있습니다", "Loading the instruction repository")} />;
   }
 
   const modeSwitch = (
-    <div className="skill-mode-tabs" role="group" aria-label={text("지침 화면 모드", "Instruction view mode")}>
-      <button className={mode === "info" ? "active" : ""} type="button" aria-pressed={mode === "info"} onClick={() => setMode("info")}>
-        {text("지침정보", "Info")}
-      </button>
-      <button className={mode === "manage" ? "active" : ""} type="button" aria-pressed={mode === "manage"} onClick={() => setMode("manage")}>
-        {text("지침관리", "Manage")}
-      </button>
-    </div>
+    <ViewModeTabs
+      label={text("지침 화면 모드", "Instruction view mode")}
+      modes={[
+        { id: "info", label: text("지침정보", "Info") },
+        { id: "manage", label: text("지침관리", "Manage") },
+      ]}
+      current={mode}
+      onSelect={setMode}
+    />
   );
 
   if (mode === "info") {
@@ -271,58 +288,47 @@ export function InstructionsView({
       <section className="toolbar-card skill-mode-toolbar">
         {modeSwitch}
         {onRequestAiaPrompt && (
-          <div className="skill-transfer-buttons">
-            <button
-              className="button compact"
-              type="button"
-              disabled={!aiaAvailable || migrationRequiredCount === 0}
-              title={!aiaAvailable
-                ? text("연결된 시스템 에이전트를 설정하세요", "Configure a connected system agent")
-                : migrationRequiredCount === 0
-                  ? text("현재 OS에서 변형이 필요한 지침이 없습니다", "No instructions need a variant on this OS")
-                  : text("AIA에게 미지원 지침 전체의 현재 OS 변형 생성을 요청합니다", "Ask AIA to create current-OS variants for every unsupported instruction")}
-              onClick={() => onRequestAiaPrompt(instructionBulkMigrationPrompt(migrationRequiredCount))}
-            ><RefreshCw size={13} aria-hidden="true" /><AiaMark size={13} />{text("일괄 마이그레이션", "Migrate all")}{migrationRequiredCount > 0 && <small>{migrationRequiredCount}</small>}</button>
-          </div>
+          <BulkMigrationButton
+            aiaAvailable={aiaAvailable}
+            count={migrationRequiredCount}
+            noneTitle={text("현재 OS에서 변형이 필요한 지침이 없습니다", "No instructions need a variant on this OS")}
+            requestTitle={text("AIA에게 미지원 지침 전체의 현재 OS 변형 생성을 요청합니다", "Ask AIA to create current-OS variants for every unsupported instruction")}
+            onRequest={() => onRequestAiaPrompt(instructionBulkMigrationPrompt(migrationRequiredCount))}
+          />
         )}
       </section>
       {error && <ErrorBanner message={error} />}
       {notice && <p className="settings-storage-note" role="status">{notice}</p>}
 
-      <section className="toolbar-card skill-library-toolbar">
-        <div className="skill-library-titlebar">
-          <div className="skill-library-summary">
-            <strong>{text("보관 지침", "Archived instructions")}</strong>
-            <small>{library
-              ? text(`${library.entries.length}개 · ${library.commonRoot}`, `${library.entries.length} · ${library.commonRoot}`)
-              : text("지침 라이브러리를 읽지 못했습니다.", "The instruction library could not be loaded.")}</small>
-          </div>
-        </div>
-        <div className="skill-library-toolbar-row">
-          <button className="button compact" type="button" disabled={busy !== null} onClick={() => { void refresh(); }}>
-            <RefreshCw size={13} aria-hidden="true" />{text("새로 고침", "Refresh")}
+      <LibraryToolbar
+        title={text("보관 지침", "Archived instructions")}
+        summary={library
+          ? text(`${library.entries.length}개 · ${library.commonRoot}`, `${library.entries.length} · ${library.commonRoot}`)
+          : text("지침 라이브러리를 읽지 못했습니다.", "The instruction library could not be loaded.")}
+      >
+        <button className="button compact" type="button" disabled={busy !== null} onClick={() => { void refresh(); }}>
+          <RefreshCw size={13} aria-hidden="true" />{text("새로 고침", "Refresh")}
+        </button>
+        <button
+          className="button compact"
+          type="button"
+          disabled={busy !== null || !library || importableCount === 0}
+          title={importableCount === 0
+            ? text("등록 프로젝트와 개인 설정에 아직 보관하지 않은 지침 파일이 없습니다", "No unarchived instruction files in registered projects or personal settings")
+            : text("이미 있는 지침 파일을 공통 원본으로 보관합니다", "Archive existing instruction files as shared sources")}
+          onClick={() => setImporting(true)}
+        >
+          <FolderInput size={13} aria-hidden="true" />{text("지침 가져오기", "Import")}{importableCount > 0 && <small>{importableCount}</small>}
+        </button>
+        <button className="button primary compact" type="button" disabled={busy !== null} onClick={() => setCreating(true)}>
+          <Plus size={13} aria-hidden="true" />{text("새 지침", "New instruction")}
+        </button>
+        {trashCount > 0 && (
+          <button className="button compact" type="button" disabled={busy !== null} onClick={() => setTrashOpen(true)}>
+            <Trash2 size={13} aria-hidden="true" />{text("휴지통", "Trash")}<small>{trashCount}</small>
           </button>
-          <button
-            className="button compact"
-            type="button"
-            disabled={busy !== null || !library || importableCount === 0}
-            title={importableCount === 0
-              ? text("등록 프로젝트와 개인 설정에 아직 보관하지 않은 지침 파일이 없습니다", "No unarchived instruction files in registered projects or personal settings")
-              : text("이미 있는 지침 파일을 공통 원본으로 보관합니다", "Archive existing instruction files as shared sources")}
-            onClick={() => setImporting(true)}
-          >
-            <FolderInput size={13} aria-hidden="true" />{text("지침 가져오기", "Import")}{importableCount > 0 && <small>{importableCount}</small>}
-          </button>
-          <button className="button primary compact" type="button" disabled={busy !== null} onClick={() => setCreating(true)}>
-            <Plus size={13} aria-hidden="true" />{text("새 지침", "New instruction")}
-          </button>
-          {trashCount > 0 && (
-            <button className="button compact" type="button" disabled={busy !== null} onClick={() => setTrashOpen(true)}>
-              <Trash2 size={13} aria-hidden="true" />{text("휴지통", "Trash")}<small>{trashCount}</small>
-            </button>
-          )}
-        </div>
-      </section>
+        )}
+      </LibraryToolbar>
 
       <section className="settings-card">
         <header>
@@ -352,14 +358,13 @@ export function InstructionsView({
                       aria-pressed={entry.key === selectedKey}
                       onClick={() => setSelectedKey(entry.key)}
                     >
-                      <div className="skill-library-row-main">
-                        <div className="skill-library-row-head">
-                          <strong data-user-content>{translations.records.get(entry.key)?.fields.name ?? entry.name}</strong>
-                          {!entry.currentPlatformSupported && <span className="skill-sync-pill conflict">{text("OS 변형 필요", "OS variant required")}</span>}
-                        </div>
-                        <p data-user-content>{(translations.records.get(entry.key)?.fields.description ?? entry.description) || text("설명이 없습니다.", "No description.")}</p>
-                        <code>{entry.directory}</code>
-                      </div>
+                      <LibraryRowMain
+                        path={entry.directory}
+                        description={(translations.records.get(entry.key)?.fields.description ?? entry.description) || text("설명이 없습니다.", "No description.")}
+                      >
+                        <strong data-user-content>{translations.records.get(entry.key)?.fields.name ?? entry.name}</strong>
+                        {!entry.currentPlatformSupported && <span className="skill-sync-pill conflict">{text("OS 변형 필요", "OS variant required")}</span>}
+                      </LibraryRowMain>
                       <div className="skill-use-matrix">
                         {entry.providers.map((provider) => <SourceBadge source={provider} key={provider} />)}
                       </div>
@@ -372,11 +377,7 @@ export function InstructionsView({
               <SelectedInstruction
                 entry={selected}
                 library={library}
-                busy={busy}
-                setBusy={setBusy}
-                setError={setError}
-                reportChanged={reportChanged}
-                refresh={refresh}
+                {...childActions}
                 onRequestAiaPrompt={onRequestAiaPrompt}
                 confirm={confirm}
                 translated={Boolean(translations.records.get(selected.key))}
@@ -396,7 +397,7 @@ export function InstructionsView({
               </header>
               <div className="detail-card">
                 {library.issues.map((issue) => (
-                  <ErrorBanner key={`${issue.provider ?? "all"}:${issue.path}:${issue.message}`} message={`${issue.path}\n${issue.message}`} />
+                  <ErrorBanner key={`${issue.provider ?? "all"}:${issue.path}:${issue.message}`} message={`${displayPath(issue.path)}\n${issue.message}`} />
                 ))}
               </div>
             </section>
@@ -406,11 +407,7 @@ export function InstructionsView({
 
       {creating && (
         <CreateInstructionModal
-          busy={busy}
-          setBusy={setBusy}
-          setError={setError}
-          reportChanged={reportChanged}
-          refresh={refresh}
+          {...childActions}
           selectInstruction={setSelectedKey}
           onClose={() => setCreating(false)}
         />
@@ -419,11 +416,7 @@ export function InstructionsView({
       {importing && library && (
         <ImportInstructionModal
           library={library}
-          busy={busy}
-          setBusy={setBusy}
-          setError={setError}
-          reportChanged={reportChanged}
-          refresh={refresh}
+          {...childActions}
           selectInstruction={setSelectedKey}
           onClose={() => setImporting(false)}
         />
@@ -432,11 +425,7 @@ export function InstructionsView({
       {trashOpen && trash && (
         <InstructionTrashDrawer
           trash={trash}
-          busy={busy}
-          setBusy={setBusy}
-          setError={setError}
-          reportChanged={reportChanged}
-          refresh={refresh}
+          {...childActions}
           confirm={confirm}
           onClose={() => setTrashOpen(false)}
         />
@@ -446,35 +435,50 @@ export function InstructionsView({
   );
 }
 
+/**
+ * 확인 대화를 먼저 띄우는 작업. 확인 문구를 만드는 동안에는 같은 이름에 `-check`를 붙여
+ * 잠가 두므로, 두 단계가 한 이름에서 갈라져 나오도록 이 갈래만 따로 센다.
+ */
+type InstructionConfirmKind = "matrix" | "sync" | "delete" | "unarchive";
+
+/**
+ * 지침 화면이 잠긴 이유. 한 화면의 잠금 표식 하나를 단계 패널 여섯과 서랍 둘, 모달 둘이
+ * 나눠 읽는데 값이 `string`이라 `busy === "edit_save"` 같은 빗나간 비교가 타입 검사를
+ * 그대로 통과했다 — 버튼이 영영 "저장 중…"으로 바뀌지 않아도 아무 데서도 걸리지 않는다.
+ * 쓰는 이름을 한 곳에 세어 두어 잘못된 이름이 컴파일에서 걸리게 한다.
+ */
+type InstructionBusyKind =
+  | InstructionConfirmKind
+  | `${InstructionConfirmKind}-check`
+  | "publish"
+  | "migration"
+  | "instruction-platforms"
+  | "edit-load"
+  | "edit-save"
+  | "viewer"
+  | "info-viewer"
+  | "trash-restore"
+  | "trash-purge"
+  | "import"
+  | "create";
+
 interface ChildActionProps {
-  busy: string | null;
-  setBusy: (value: string | null) => void;
+  busy: InstructionBusyKind | null;
+  setBusy: (value: InstructionBusyKind | null) => void;
   setError: (value: string | null) => void;
   reportChanged: (message: string) => void;
   refresh: () => Promise<void>;
 }
 
 /**
- * busy 표시와 오류 표시를 두르는 공통 껍데기. 각 동작이 setBusy/setError(null)/try-catch-finally를
- * 손으로 반복하면서 초기화가 빠진 자리와 순서가 다른 자리가 섞여 있었다. 실패하면 null을 돌려주므로
- * 뒤이어 확인 결과를 쓰는 자리는 그대로 이어 쓸 수 있다.
+ * busy 표시와 오류 표시를 두르는 공통 껍데기. 스킬관리 화면 것과 같은 껍데기라 그쪽 한 벌을
+ * 가져다 쓰고, 이 화면만 다른 점(거절을 원문 대신 안내 문장으로 보여 준다)은 인자로 준다.
  */
-function busyRunner(
-  setBusy: (value: string | null) => void,
+function instructionBusyRunner(
+  setBusy: (value: InstructionBusyKind | null) => void,
   setError: (value: string | null) => void,
-) {
-  return async <T,>(kind: string, action: () => Promise<T>): Promise<T | null> => {
-    setBusy(kind);
-    setError(null);
-    try {
-      return await action();
-    } catch (cause) {
-      setError(errorMessage(cause));
-      return null;
-    } finally {
-      setBusy(null);
-    }
-  };
+): BusyRunner<InstructionBusyKind> {
+  return busyRunner<InstructionBusyKind>(setBusy, setError, errorMessage);
 }
 
 interface DeploymentLocationRow {
@@ -483,6 +487,35 @@ interface DeploymentLocationRow {
   projectPath: string | null;
   label: string;
   title: string;
+}
+
+/**
+ * 위치 목록의 뼈대: 개인 설정 한 줄 + 등록 프로젝트 한 줄씩. 배포 매트릭스·지침정보 묶음·
+ * 가져오기 모달이 같은 라벨과 같은 설명을 각자 손으로 적어 두어, 한 곳의 문구를 고치면
+ * 나머지 둘이 조용히 갈라졌다. 개인 행의 키만 화면마다 다르므로(게시 select는 경로와
+ * 겹치지 않는 센티널을 쓴다) 그것만 인자로 받는다.
+ */
+function instructionLocationRows(
+  projects: readonly string[],
+  text: UiText,
+  personalKey: string = "personal",
+): DeploymentLocationRow[] {
+  return [
+    {
+      key: personalKey,
+      scope: "personal",
+      projectPath: null,
+      label: text("개인 설정", "Personal settings"),
+      title: text("공급자 홈 설정 디렉터리(~/.claude, ~/.codex, ~/.gemini)", "Provider home config directories (~/.claude, ~/.codex, ~/.gemini)"),
+    },
+    ...projects.map((project) => ({
+      key: project,
+      scope: "project" as const,
+      projectPath: project,
+      label: lastPathSegment(project),
+      title: project,
+    })),
+  ];
 }
 
 /**
@@ -510,23 +543,13 @@ function useDeploymentLocationRows(
   // 달라 행 하나가 셀별로 자기 위치를 해석한다. 세션이 사라져 등록 목록에서 빠졌지만
   // 원장에 남은 위치도 행으로 싣는다. 안 그러면 회수할 방법이 없다.
   const matrixRows = useMemo<DeploymentLocationRow[]>(() => {
-    const rows: DeploymentLocationRow[] = [{
-      key: "personal",
-      scope: "personal",
-      projectPath: null,
-      label: text("개인 설정", "Personal settings"),
-      title: text("공급자 홈 설정 디렉터리(~/.claude, ~/.codex, ~/.gemini)", "Provider home config directories (~/.claude, ~/.codex, ~/.gemini)"),
-    }];
     const projects = [...(library?.projects ?? [])];
     for (const deployment of entry.deployments) {
       const path = deployment.projectPath;
       if (deployment.scope === "personal" || !deployment.managed || !path) continue;
       if (!projects.includes(path)) projects.push(path);
     }
-    for (const project of projects) {
-      rows.push({ key: project, scope: "project", projectPath: project, label: projectDisplayName(project), title: project });
-    }
-    return rows;
+    return instructionLocationRows(projects, text);
   }, [library?.projects, entry.deployments, text]);
 
   const projectRowCount = useMemo(
@@ -572,139 +595,308 @@ function useDeploymentLocationRows(
   };
 }
 
-function SelectedInstruction({
-  entry,
-  library,
-  busy,
-  setBusy,
-  setError,
-  reportChanged,
-  refresh,
-  onRequestAiaPrompt,
-  confirm,
-  translated,
-  automation,
-  onAutomationChange,
-}: ChildActionProps & {
-  entry: ProjectInstructionEntry;
-  library: ProjectInstructionLibrary | null;
-  onRequestAiaPrompt?: (prompt: string) => void;
-  confirm: (request: ConfirmRequest) => Promise<boolean>;
-  translated: boolean;
-  automation: SystemAutomationSnapshot | null;
-  onAutomationChange?: (snapshot: SystemAutomationSnapshot) => void;
-}) {
-  const { text } = useI18n();
-  const runBusy = busyRunner(setBusy, setError);
-  const [projectPath, setProjectPath] = useState<string>(PERSONAL_LOCATION);
-  const [providers, setProviders] = useState<ProviderId[]>(entry.providers);
-  const [overwrite, setOverwrite] = useState<SkillOverwritePolicy>("fail");
-  const [platforms, setPlatforms] = useState<HostPlatform[]>(entry.platforms);
-  const [editing, setEditing] = useState(false);
-  // 자동 반영 체크박스를 서버 확정 전에 먼저 보여 주기 위한 덧댄 값. 목록이 갱신되면 버린다.
-  const [autoSyncOverride, setAutoSyncOverride] = useState<boolean | null>(null);
-  const [editName, setEditName] = useState(entry.name);
-  const [editDescription, setEditDescription] = useState(entry.description);
-  const [editContents, setEditContents] = useState<Partial<Record<ProviderId, string>>>({});
-  const [loadedContents, setLoadedContents] = useState<Partial<Record<ProviderId, string>>>({});
-  const [variantSources, setVariantSources] = useState<Partial<Record<ProviderId, HostPlatform>>>({});
-  const [activeStep, setActiveStep] = useState(1);
+/** useDeploymentLocationRows가 돌려주는 한 벌. 2단계 패널이 그대로 받아 쓴다. */
+type DeploymentLocationRows = ReturnType<typeof useDeploymentLocationRows>;
 
-  // 단계·편집 상태는 고른 지침이 바뀔 때만 처음으로 돌린다. 목록을 다시 읽으면(새로 고침·배포 토글 뒤
-  // refresh) 같은 지침이라도 entry와 그 안의 providers·platforms 배열이 새 신원으로 오므로, 배열 신원에
-  // 걸어 두면 값이 같아도 효과가 다시 발화해 보고 있던 2단계 배포 매트릭스가 사라진다. 그래서 마지막으로
-  // 반영한 값을 기억해 두고, 지침이 같으면 값이 실제로 달라진 축만 따라간다.
-  const syncedEntry = useRef<{ key: string; providers: ProviderId[]; platforms: HostPlatform[] } | null>(null);
-  useEffect(() => {
-    const previous = syncedEntry.current;
-    syncedEntry.current = { key: entry.key, providers: entry.providers, platforms: entry.platforms };
-    if (!previous || previous.key !== entry.key) {
-      setProviders(entry.providers);
-      setPlatforms(entry.platforms);
+/** 같은 링크가 여러 위치에서 걸린 것을 한 줄로 묶은 안내. */
+interface InstructionLinkNotice {
+  href: string;
+  reason: string;
+  locations: number;
+}
+
+/**
+ * 지침 원본 편집(5단계)의 상태와 두 동작을 한 자리로 모은 훅. 편집 중 여부·이름·설명·
+ * 공급자별 본문·읽어 온 본문·변형 출처 여섯 상태와 열기·저장 두 동작이 배포·게시·열람과
+ * 뒤섞여 화면 본문에 흩어져 있어, 어느 상태가 편집 몫인지 읽히지 않았다. 훅으로 옮겨도
+ * 상태는 선택 지침 카드에 그대로 남으므로 단계 탭을 옮겨 다녀도 쓰던 초안이 살아 있다
+ * (패널 컴포넌트가 상태를 들면 탭을 벗어날 때 초안이 사라진다).
+ *
+ * 고른 지침이 바뀌면 편집을 닫는다. 예전에는 providers·platforms를 되맞추는 효과가
+ * 곁다리로 함께 껐는데, 그 효과는 배열 신원까지 따지느라 조건이 복잡해 편집과 얽힐 이유가
+ * 없었다. 여기서는 지침 키만 본다.
+ */
+function useInstructionSourceEditor(
+  entry: ProjectInstructionEntry,
+  runBusy: BusyRunner<InstructionBusyKind>,
+  refresh: () => Promise<void>,
+  reportChanged: (message: string) => void,
+) {
+  const { text } = useI18n();
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(entry.name);
+  const [description, setDescription] = useState(entry.description);
+  const [contents, setContents] = useState<Partial<Record<ProviderId, string>>>({});
+  // 열 때 읽어 온 본문. 저장할 때 실제로 달라진 공급자만 골라 보내는 기준이다.
+  const [loaded, setLoaded] = useState<Partial<Record<ProviderId, string>>>({});
+  const [variantSources, setVariantSources] = useState<Partial<Record<ProviderId, HostPlatform>>>({});
+
+  useEffect(() => setEditing(false), [entry.key]);
+
+  const open = async () => {
+    await runBusy("edit-load", async () => {
+      const files = await Promise.all(entry.providers.map(async (provider) => ({
+        provider,
+        file: await readProjectInstructionFile(entry.key, provider),
+      })));
+      const nextContents: Partial<Record<ProviderId, string>> = {};
+      const variants: Partial<Record<ProviderId, HostPlatform>> = {};
+      for (const { provider, file } of files) {
+        nextContents[provider] = file.content;
+        if (file.sourceVariant) variants[provider] = file.sourceVariant;
+      }
+      setContents(nextContents);
+      setLoaded(nextContents);
+      setVariantSources(variants);
+      setName(entry.name);
+      setDescription(entry.description);
+      setEditing(true);
+    });
+  };
+
+  const save = async () => {
+    const files = entry.providers
+      .filter((provider) => (contents[provider] ?? "") !== (loaded[provider] ?? ""))
+      .map((provider) => ({ provider, content: contents[provider] ?? "" }));
+    const nameChanged = name.trim() !== entry.name;
+    const descriptionChanged = description.trim() !== entry.description;
+    if (files.length === 0 && !nameChanged && !descriptionChanged) {
       setEditing(false);
-      setActiveStep(1);
       return;
     }
-    if (!arraysEqual(previous.providers, entry.providers)) setProviders(entry.providers);
-    if (!arraysEqual(previous.platforms, entry.platforms)) setPlatforms(entry.platforms);
-  }, [entry.key, entry.platforms, entry.providers]);
+    await runBusy("edit-save", async () => {
+      const receipt = await updateProjectInstruction({
+        key: entry.key,
+        name: nameChanged ? name : null,
+        description: descriptionChanged ? description : null,
+        files,
+        expectedDigest: entry.sourceDigest,
+      });
+      setEditing(false);
+      await refresh();
+      reportChanged(text(
+        `지침 원본을 저장하고 배포 프로젝트 ${receipt.results.length}곳에 재배포했습니다.`,
+        `Saved the instruction source and redeployed to ${receipt.results.length} deployed project(s).`,
+      ));
+    });
+  };
 
-  useEffect(() => {
-    if (projectPath !== PERSONAL_LOCATION && !library?.projects.includes(projectPath)) {
-      setProjectPath(PERSONAL_LOCATION);
-    }
-  }, [library, projectPath]);
+  return {
+    editing,
+    close: () => setEditing(false),
+    name,
+    setName,
+    description,
+    setDescription,
+    contents,
+    setContents,
+    variantSources,
+    open,
+    save,
+  };
+}
 
-  // 같은 링크가 여러 위치에서 걸리면 한 줄로 묶어 보여준다.
-  const linkNotices = useMemo(() => {
-    const grouped = new Map<string, { href: string; reason: string; locations: number }>();
-    for (const deployment of entry.deployments) {
-      for (const issue of deployment.linkIssues ?? []) {
-        const key = `${issue.href}\n${issue.reason}`;
-        const found = grouped.get(key);
-        if (found) found.locations += 1;
-        else grouped.set(key, { href: issue.href, reason: issue.reason, locations: 1 });
-      }
-    }
-    return [...grouped.values()];
-  }, [entry.deployments]);
+type InstructionSourceEditor = ReturnType<typeof useInstructionSourceEditor>;
 
-  // 배포로 다루는 위치는 원장에 오른 곳뿐이다. 같은 이름의 파일이 있을 뿐인 위치는
-  // 이 원본과 비교하지 않으므로 divergent도 서지 않지만, 필터에 명시해 의도를 남긴다.
-  const divergentDeployments = useMemo(
-    () => entry.deployments.filter((deployment) =>
-      deployment.managed && deployment.present && deployment.divergent && !deployment.message),
-    [entry.deployments],
-  );
-
-  const managedDeployments = useMemo(
-    () => entry.deployments.filter((deployment) =>
-      deployment.managed && deployment.present && !deployment.message),
-    [entry.deployments],
-  );
-
+/**
+ * 배포 목록의 갈래 넷. 넷 모두 "읽을 수 있는 배포"(파일이 있고 오류 메시지가 없는 것)를
+ * 공통 전제로 삼아 원장 등록·외부 수정 여부로만 갈라지므로, 같은 배열을 네 번 훑는 대신
+ * 한 순회로 함께 모은다. 배포로 다루는 위치는 원장에 오른 곳뿐이다. 같은 이름의 파일이
+ * 있을 뿐인 위치는 이 원본과 비교하지 않으므로 divergent도 서지 않지만, 갈래를 명시해
+ * 의도를 남긴다.
+ */
+function useDeploymentGroups(deployments: ProjectInstructionDeployment[]): {
+  presentDeployments: ProjectInstructionDeployment[];
+  managedDeployments: ProjectInstructionDeployment[];
+  divergentDeployments: ProjectInstructionDeployment[];
   /** 그 위치에 지침 파일은 있는데 이 원본의 배포로는 등록되지 않은 곳. */
-  const unmanagedDeployments = useMemo(
-    () => entry.deployments.filter((deployment) =>
-      deployment.present && !deployment.managed && !deployment.message),
-    [entry.deployments],
-  );
+  unmanagedDeployments: ProjectInstructionDeployment[];
+} {
+  return useMemo(() => {
+    const present: ProjectInstructionDeployment[] = [];
+    const managed: ProjectInstructionDeployment[] = [];
+    const divergent: ProjectInstructionDeployment[] = [];
+    const unmanaged: ProjectInstructionDeployment[] = [];
+    for (const deployment of deployments) {
+      if (!deployment.present || deployment.message) continue;
+      present.push(deployment);
+      if (!deployment.managed) {
+        unmanaged.push(deployment);
+        continue;
+      }
+      managed.push(deployment);
+      if (deployment.divergent) divergent.push(deployment);
+    }
+    return {
+      presentDeployments: present,
+      managedDeployments: managed,
+      divergentDeployments: divergent,
+      unmanagedDeployments: unmanaged,
+    };
+  }, [deployments]);
+}
 
-  const presentDeployments = useMemo(
-    () => entry.deployments.filter((deployment) => deployment.present && !deployment.message),
-    [entry.deployments],
-  );
-
-  const {
-    visibleRows,
-    projectRowCount,
-    hiddenRowCount,
-    locationQuery,
-    setLocationQuery,
-    showAllLocations,
-    setShowAllLocations,
-    pinLocation,
-  } = useDeploymentLocationRows(entry, library);
-
+/**
+ * 3단계 배포 확인의 원문 열람 상태. 고른 배포 파일의 원문을 읽어 두고, 고른 지침이 바뀌면
+ * 앞 지침의 원문이 남지 않도록 닫는다.
+ */
+function useDeployedFileViewer(
+  entryKey: string,
+  presentDeployments: ProjectInstructionDeployment[],
+  runBusy: BusyRunner<InstructionBusyKind>,
+): {
+  viewerTarget: string;
+  viewerContent: DeployedInstructionFileContent | null;
+  openViewer: (selection: string) => Promise<void>;
+} {
   const [viewerTarget, setViewerTarget] = useState("");
   const [viewerContent, setViewerContent] = useState<DeployedInstructionFileContent | null>(null);
 
   useEffect(() => {
     setViewerTarget("");
     setViewerContent(null);
-  }, [entry.key]);
+  }, [entryKey]);
 
-  /** 선택한 배포 파일 원문을 읽어 열람 영역에 보여준다. */
-  const openViewer = async (target: string) => {
-    setViewerTarget(target);
+  const openViewer = async (selection: string) => {
+    setViewerTarget(selection);
     setViewerContent(null);
-    const deployment = presentDeployments.find((candidate) => deploymentKey(candidate) === target);
+    const deployment = presentDeployments.find((candidate) => deploymentKey(candidate) === selection);
     if (!deployment) return;
     await runBusy("viewer", async () => {
       const target = deploymentTarget(deployment);
       setViewerContent(await readDeployedInstructionFile(target.scope, target.projectPath, deployment.provider));
     });
   };
+
+  return { viewerTarget, viewerContent, openViewer };
+}
+
+/**
+ * 4단계 자동 반영 체크박스. 체크 상태는 누른 쪽이 이미 안다. 쓰기 왕복 뒤에 목록 재조회까지
+ * 기다리면 체크박스가 두 왕복 뒤에야 움직이고, 그 사이 busy로 잠기기까지 한다. 화면을 먼저
+ * 바꾸고 재조회는 확정용으로 뒤에서 돌린다. 재조회가 끝나면 목록이 같은 값을 들고 오므로
+ * 덧댄 값을 버려, 이후 외부 변경을 그대로 따라간다.
+ */
+function useInstructionAutoSync(
+  entry: ProjectInstructionEntry,
+  refresh: () => Promise<void>,
+  setError: (value: string | null) => void,
+): { autoSyncChecked: boolean; toggleAutoSync: (autoSync: boolean) => void } {
+  // 서버 확정 전에 먼저 보여 주기 위한 덧댄 값. 목록이 갱신되면 버린다.
+  const [override, setOverride] = useState<boolean | null>(null);
+  useEffect(() => setOverride(null), [entry.autoSync]);
+
+  const toggleAutoSync = (autoSync: boolean) => {
+    setError(null);
+    setOverride(autoSync);
+    void setProjectInstructionAutoSync(entry.key, autoSync)
+      .then(() => refresh())
+      .catch((cause: unknown) => {
+        setOverride(null);
+        setError(errorMessage(cause));
+      });
+  };
+
+  return { autoSyncChecked: override ?? entry.autoSync, toggleAutoSync };
+}
+
+interface InstructionProcessStep {
+  no: number;
+  title: string;
+  detail: string;
+  /** 탭에 붙는 표시. `attention`은 점을 찍고 `muted`는 흐리게 둔다. */
+  tone: "" | "attention" | "muted";
+}
+
+/** 아래 구획이 어떤 순서로 이어지는지 카드 머리에서 먼저 알려 주는 여섯 단계 탭. */
+function instructionProcessSteps(
+  text: UiText,
+  marks: { currentPlatformSupported: boolean; hasReviewSection: boolean; hasDivergent: boolean },
+): InstructionProcessStep[] {
+  return [
+    {
+      no: 1,
+      title: text("지원 OS 지정", "Set supported OS"),
+      detail: text("base 지침을 그대로 쓸 OS를 정합니다.", "Decide which platforms use the base instruction as-is."),
+      tone: marks.currentPlatformSupported ? "" : "attention",
+    },
+    {
+      no: 2,
+      title: text("위치별 배포", "Deploy by location"),
+      detail: text("개인 설정과 프로젝트에 지침 파일을 놓거나 뺍니다.", "Place or remove the file in personal settings and projects."),
+      tone: "",
+    },
+    {
+      no: 3,
+      title: text("배포 확인", "Review deployments"),
+      detail: text("실제로 놓인 파일 원문과 링크 보관 상태를 봅니다.", "Check the deployed file contents and archived link status."),
+      tone: marks.hasReviewSection ? "" : "muted",
+    },
+    {
+      no: 4,
+      title: text("외부 수정 정리", "Resolve external edits"),
+      detail: text("원본과 달라진 배포본을 자동 반영하거나 한 버전을 원본으로 채택합니다.", "Auto-adopt external edits, or make one version the source."),
+      tone: marks.hasDivergent ? "attention" : "",
+    },
+    {
+      no: 5,
+      title: text("편집", "Edit"),
+      detail: text("보관된 원본을 고치고 배포된 위치에 다시 반영합니다.", "Edit the archived source and redeploy it."),
+      tone: "",
+    },
+    {
+      no: 6,
+      title: text("게시", "Publish"),
+      detail: text("아직 배포하지 않은 위치에 지침을 새로 게시합니다.", "Publish the instruction to a location that does not have it yet."),
+      tone: "",
+    },
+  ];
+}
+
+/** 6단계 게시 양식이 들고 있는 값. 게시와 OS 메타 저장이 그대로 읽어 요청을 만든다. */
+interface InstructionPublishForm {
+  projectPath: string;
+  providers: ProviderId[];
+  overwrite: SkillOverwritePolicy;
+  platforms: HostPlatform[];
+}
+
+/**
+ * 선택 지침을 바꾸는 작업 아홉(게시·배포 토글·원장 등록·수정본 채택·자동 반영 토글·원본
+ * 삭제·보관취소·OS 메타 저장·마이그레이션 요청)을 한 곳에 모은 훅.
+ *
+ * 이 작업들은 선택 지침 카드 한 함수 안에서 화면 상태(단계 탭·편집기·열람기·매트릭스 행)와
+ * 뒤섞여 있었다. 셋 다 같은 `entry`를 닫아 두고 있어 어느 것이 서버를 바꾸고 어느 것이
+ * 보임만 바꾸는지 읽는 쪽이 세어 봐야 했고, 작업 하나를 고칠 때 400줄을 훑어야 했다.
+ * 서버를 바꾸는 갈래만 떼어 내고, 닫혀 있던 값들(양식·확인 대화·매트릭스 고정·배포 수)은
+ * 인자로 드러낸다. 화면 상태는 카드에 그대로 남는다.
+ */
+function useInstructionMutations({
+  entry,
+  library,
+  form,
+  runBusy,
+  refresh,
+  reportChanged,
+  setError,
+  confirm,
+  pinLocation,
+  presentDeploymentCount,
+  onRequestAiaPrompt,
+}: {
+  entry: ProjectInstructionEntry;
+  library: ProjectInstructionLibrary | null;
+  form: InstructionPublishForm;
+  runBusy: BusyRunner<InstructionBusyKind>;
+  refresh: () => Promise<void>;
+  reportChanged: (message: string) => void;
+  setError: (value: string | null) => void;
+  confirm: (request: ConfirmRequest) => Promise<boolean>;
+  pinLocation: (project: string) => void;
+  presentDeploymentCount: number;
+  onRequestAiaPrompt?: (prompt: string) => void;
+}) {
+  const { text } = useI18n();
 
   // personal 행은 공급자마다 디렉터리(projectPath)가 달라 scope로만 찾는다.
   const deploymentAt = (
@@ -717,25 +909,55 @@ function SelectedInstruction({
       && deployment.scope === scope
       && (scope === "personal" || deployment.projectPath === project)) ?? null;
 
+  /**
+   * "확인받고 → 실행하고 → 목록을 다시 읽고 → 결과를 보고한다"는 네 갈래 작업(배포 제거·
+   * 수정본 채택·원본 삭제·보관취소)이 같은 골격을 각자 펼쳐 놓고 있었다. 되풀이되던 순서를
+   * 한 곳에 모아, 각 작업은 확인 문구와 실제 호출만 넘긴다.
+   *
+   * 확인 문구를 만들려면 먼저 서버를 읽어야 하는 작업(삭제 영향 조회)은 `request`에 함수를
+   * 넘긴다. 그 조회는 `<kind>-check` 바쁨 상태로 감싸 확인 대화가 뜰 때까지 화면이 잠긴
+   * 채로 있게 한다.
+   */
+  const runConfirmed = async (
+    kind: InstructionConfirmKind,
+    request: ConfirmRequest | (() => Promise<ConfirmRequest | null>),
+    /** 결과값은 쓰지 않는다. 호출을 그대로 넘길 수 있게 반환형만 열어 둔다. */
+    action: () => Promise<unknown>,
+    done: string,
+  ) => {
+    if (typeof request === "function") {
+      const accepted = await runBusy(`${kind}-check`, async () => {
+        const built = await request();
+        return built === null ? false : await confirm(built);
+      });
+      if (!accepted) return;
+    } else if (!await confirm(request)) {
+      return;
+    }
+    await runBusy(kind, async () => {
+      await action();
+      await refresh();
+      reportChanged(done);
+    });
+  };
+
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     await runBusy("publish", async () => {
       const receipt = await publishProjectInstruction({
         key: entry.key,
-        scope: projectPath === PERSONAL_LOCATION ? "personal" : "project",
-        projectPath: projectPath === PERSONAL_LOCATION ? null : projectPath,
-        providers,
-        overwrite,
+        scope: form.projectPath === PERSONAL_LOCATION ? "personal" : "project",
+        projectPath: form.projectPath === PERSONAL_LOCATION ? null : form.projectPath,
+        providers: form.providers,
+        overwrite: form.overwrite,
       });
       await refresh();
-      const succeeded = receipt.results.filter((result) => result.outcome === "published" || result.outcome === "replaced" || result.outcome === "unchanged").length;
-      const linkedWritten = receipt.results.reduce((total, result) => total
-        + (result.linkedResults ?? []).filter((linked) => linked.outcome === "published" || linked.outcome === "replaced").length, 0);
-      const linkedSkipped = receipt.results.reduce((total, result) => total
-        + (result.linkedResults ?? []).filter((linked) => linked.outcome === "skipped").length, 0);
+      const { succeeded, linkedWritten, linkedSkipped } = summarizeInstructionPublish(receipt);
+      const skipPart = linkedSkipped > 0
+        ? text(`, ${linkedSkipped}개 건너뜀`, `, ${linkedSkipped} skipped`)
+        : "";
       const linkedNote = linkedWritten > 0 || linkedSkipped > 0
-        ? text(` · 연결 문서 ${linkedWritten}개 배포${linkedSkipped > 0 ? `, ${linkedSkipped}개 건너뜀` : ""}`,
-          ` · ${linkedWritten} linked doc(s) deployed${linkedSkipped > 0 ? `, ${linkedSkipped} skipped` : ""}`)
+        ? `${text(` · 연결 문서 ${linkedWritten}개 배포`, ` · ${linkedWritten} linked doc(s) deployed`)}${skipPart}`
         : "";
       reportChanged(text(
         `${entry.name} 지침 게시를 처리했습니다. 성공 ${succeeded}/${receipt.results.length}${linkedNote}`,
@@ -772,22 +994,21 @@ function SelectedInstruction({
     }
     const deployment = deploymentAt(scope, project, provider);
     if (!deployment) return;
-    const accepted = await confirm({
-      title: text("배포 지침 파일 제거", "Remove deployed instruction file"),
-      message: text(
-        "이 위치에서 지침 파일을 제거합니다. 파일은 휴지통으로 이동해 복구할 수 있습니다.",
-        "Remove the instruction file from this location. The file moves to the trash and can be restored.",
-      ),
-      items: [deployment.filePath],
-      confirmLabel: text("제거", "Remove"),
-      tone: "danger",
-    });
-    if (!accepted) return;
-    await runBusy("matrix", async () => {
-      await deleteProjectInstructionDeployment(scope, project, provider);
-      await refresh();
-      reportChanged(text("배포 지침 파일을 휴지통으로 옮겼습니다.", "Moved the deployed instruction file to the trash."));
-    });
+    await runConfirmed(
+      "matrix",
+      {
+        title: text("배포 지침 파일 제거", "Remove deployed instruction file"),
+        message: text(
+          "이 위치에서 지침 파일을 제거합니다. 파일은 휴지통으로 이동해 복구할 수 있습니다.",
+          "Remove the instruction file from this location. The file moves to the trash and can be restored.",
+        ),
+        items: [deployment.filePath],
+        confirmLabel: text("제거", "Remove"),
+        tone: "danger",
+      },
+      () => deleteProjectInstructionDeployment(scope, project, provider),
+      text("배포 지침 파일을 휴지통으로 옮겼습니다.", "Moved the deployed instruction file to the trash."),
+    );
   };
 
   /**
@@ -815,156 +1036,89 @@ function SelectedInstruction({
 
   /** 외부 수정본을 새 원본으로 채택하고 나머지 배포 프로젝트에 재배포한다. */
   const adoptDeployment = async (deployment: ProjectInstructionDeployment) => {
-    const accepted = await confirm({
-      title: text("이 버전으로 동기화", "Sync to this version"),
-      message: text(
-        "이 파일이 공통 원본이 되고 같은 공급자 지침이 배포된 나머지 프로젝트에 재배포됩니다.\n이전 원본은 휴지통으로 이동합니다.",
-        "This file becomes the shared source and is redeployed to the other projects using this provider instruction.\nThe previous source moves to the trash.",
-      ),
-      items: [deployment.filePath],
-      confirmLabel: text("동기화", "Sync"),
-    });
-    if (!accepted) return;
-    await runBusy("sync", async () => {
-      await syncProjectInstructionFromDeployment({
-        key: entry.key,
-        ...deploymentTarget(deployment),
-        provider: deployment.provider,
-      });
-      await refresh();
-      reportChanged(text(
+    await runConfirmed(
+      "sync",
+      {
+        title: text("이 버전으로 동기화", "Sync to this version"),
+        message: text(
+          "이 파일이 공통 원본이 되고 같은 공급자 지침이 배포된 나머지 프로젝트에 재배포됩니다.\n이전 원본은 휴지통으로 이동합니다.",
+          "This file becomes the shared source and is redeployed to the other projects using this provider instruction.\nThe previous source moves to the trash.",
+        ),
+        items: [deployment.filePath],
+        confirmLabel: text("동기화", "Sync"),
+      },
+      async () => {
+        await syncProjectInstructionFromDeployment({
+          key: entry.key,
+          ...deploymentTarget(deployment),
+          provider: deployment.provider,
+        });
+      },
+      text(
         "수정본을 원본으로 채택하고 재배포했습니다. 이전 원본은 휴지통에 있습니다.",
         "Adopted the edited file as the source and redeployed. The previous source is in the trash.",
-      ));
-    });
+      ),
+    );
   };
 
-  /**
-   * 체크 상태는 누른 쪽이 이미 안다. 쓰기 왕복 뒤에 목록 재조회까지 기다리면 체크박스가 두
-   * 왕복 뒤에야 움직이고, 그 사이 busy로 잠기기까지 한다. 화면을 먼저 바꾸고 재조회는
-   * 확정용으로 뒤에서 돌린다. 재조회가 끝나면 prop이 같은 값을 들고 오므로 덧댄 값을 버린다.
-   */
-  // 갱신된 목록이 같은 값을 들고 오면 덧댄 값을 버려, 이후 외부 변경을 그대로 따라간다.
-  useEffect(() => setAutoSyncOverride(null), [entry.autoSync]);
-  const autoSyncChecked = autoSyncOverride ?? entry.autoSync;
-
-  const toggleAutoSync = (autoSync: boolean) => {
-    setError(null);
-    setAutoSyncOverride(autoSync);
-    void setProjectInstructionAutoSync(entry.key, autoSync)
-      .then(() => refresh())
-      .catch((cause: unknown) => {
-        setAutoSyncOverride(null);
-        setError(errorMessage(cause));
-      });
-  };
-
-  const openEditor = async () => {
-    await runBusy("edit-load", async () => {
-      const files = await Promise.all(entry.providers.map(async (provider) => ({
-        provider,
-        file: await readProjectInstructionFile(entry.key, provider),
-      })));
-      const contents: Partial<Record<ProviderId, string>> = {};
-      const variants: Partial<Record<ProviderId, HostPlatform>> = {};
-      for (const { provider, file } of files) {
-        contents[provider] = file.content;
-        if (file.sourceVariant) variants[provider] = file.sourceVariant;
-      }
-      setEditContents(contents);
-      setLoadedContents(contents);
-      setVariantSources(variants);
-      setEditName(entry.name);
-      setEditDescription(entry.description);
-      setEditing(true);
-    });
-  };
-
-  const saveEdit = async () => {
-    const files = entry.providers
-      .filter((provider) => (editContents[provider] ?? "") !== (loadedContents[provider] ?? ""))
-      .map((provider) => ({ provider, content: editContents[provider] ?? "" }));
-    const nameChanged = editName.trim() !== entry.name;
-    const descriptionChanged = editDescription.trim() !== entry.description;
-    if (files.length === 0 && !nameChanged && !descriptionChanged) {
-      setEditing(false);
-      return;
-    }
-    await runBusy("edit-save", async () => {
-      const receipt = await updateProjectInstruction({
-        key: entry.key,
-        name: nameChanged ? editName : null,
-        description: descriptionChanged ? editDescription : null,
-        files,
-        expectedDigest: entry.sourceDigest,
-      });
-      setEditing(false);
-      await refresh();
-      reportChanged(text(
-        `지침 원본을 저장하고 배포 프로젝트 ${receipt.results.length}곳에 재배포했습니다.`,
-        `Saved the instruction source and redeployed to ${receipt.results.length} deployed project(s).`,
-      ));
-    });
-  };
+  const { autoSyncChecked, toggleAutoSync } = useInstructionAutoSync(entry, refresh, setError);
 
   /** 원본과 원본 내용 그대로인 배포 파일을 확인 후 한 그룹으로 삭제한다. */
   const deleteShared = async () => {
-    const accepted = await runBusy("delete-check", async () => {
-      const impact = await checkProjectInstructionDelete({ key: entry.key });
-      return await confirm({
-        title: text("지침 원본 삭제", "Delete instruction source"),
-        message: text(
-          "공통 원본과 원본 내용 그대로인 배포 파일을 휴지통으로 옮깁니다. 그룹 단위로 복구할 수 있습니다.",
-          "Move the shared source and matching deployed files to the trash. They can be restored as a group.",
-        ),
-        items: impact.items.map((item) => item.path),
-        warning: impact.warnings.length > 0
-          ? text(
-            `외부에서 수정된 ${impact.warnings.length}개 파일은 남겨둡니다.`,
-            `${impact.warnings.length} externally edited file(s) will be left in place.`,
-          )
-          : undefined,
-        confirmLabel: text("삭제", "Delete"),
-        tone: "danger",
-      });
-    });
-    if (!accepted) return;
-    await runBusy("delete", async () => {
-      await deleteSharedProjectInstruction(entry.key);
-      await refresh();
-      reportChanged(text(
+    await runConfirmed(
+      "delete",
+      async () => {
+        const impact = await checkProjectInstructionDelete({ key: entry.key });
+        return {
+          title: text("지침 원본 삭제", "Delete instruction source"),
+          message: text(
+            "공통 원본과 원본 내용 그대로인 배포 파일을 휴지통으로 옮깁니다. 그룹 단위로 복구할 수 있습니다.",
+            "Move the shared source and matching deployed files to the trash. They can be restored as a group.",
+          ),
+          items: impact.items.map((item) => item.path),
+          warning: impact.warnings.length > 0
+            ? text(
+              `외부에서 수정된 ${impact.warnings.length}개 파일은 남겨둡니다.`,
+              `${impact.warnings.length} externally edited file(s) will be left in place.`,
+            )
+            : undefined,
+          confirmLabel: text("삭제", "Delete"),
+          tone: "danger" as const,
+        };
+      },
+      () => deleteSharedProjectInstruction(entry.key),
+      text(
         `'${entry.name}' 지침을 휴지통으로 옮겼습니다.`,
         `Moved instruction '${entry.name}' to the trash.`,
-      ));
-    });
+      ),
+    );
   };
 
   /** 보관만 취소한다. 배포 파일은 그 자리에 남고 원본만 휴지통으로 간다. */
   const unarchiveShared = async () => {
-    const deployedCount = presentDeployments.length;
-    const accepted = await confirm({
-      title: text("지침 보관취소", "Unarchive instruction"),
-      message: deployedCount > 0
-        ? text(
-          `'${entry.name}' 지침의 보관을 취소할까요?\n보관 원본만 휴지통으로 가고, 배포된 지침 파일 ${deployedCount}곳과 연결 문서는 그 자리에 남아 '미보관'으로 돌아갑니다.`,
-          `Unarchive instruction '${entry.name}'?\nOnly the archived source moves to the trash. The ${deployedCount} deployed file(s) and their linked documents stay in place and return to 'unarchived'.`,
-        )
-        : text(
-          `'${entry.name}' 지침의 보관을 취소할까요?\n배포된 파일이 없어 목록에서 사라집니다. 휴지통에서 되돌릴 수 있습니다.`,
-          `Unarchive instruction '${entry.name}'?\nIt has no deployed files, so it disappears from the list. You can restore it from the trash.`,
-        ),
-      items: [entry.directory],
-      confirmLabel: text("보관취소", "Unarchive"),
-    });
-    if (!accepted) return;
-    await runBusy("unarchive", async () => {
-      await unarchiveSharedProjectInstruction(entry.key);
-      await refresh();
-      reportChanged(text(
+    const deployedCount = presentDeploymentCount;
+    await runConfirmed(
+      "unarchive",
+      {
+        title: text("지침 보관취소", "Unarchive instruction"),
+        message: deployedCount > 0
+          ? text(
+            `'${entry.name}' 지침의 보관을 취소할까요?\n보관 원본만 휴지통으로 가고, 배포된 지침 파일 ${deployedCount}곳과 연결 문서는 그 자리에 남아 '미보관'으로 돌아갑니다.`,
+            `Unarchive instruction '${entry.name}'?\nOnly the archived source moves to the trash. The ${deployedCount} deployed file(s) and their linked documents stay in place and return to 'unarchived'.`,
+          )
+          : text(
+            `'${entry.name}' 지침의 보관을 취소할까요?\n배포된 파일이 없어 목록에서 사라집니다. 휴지통에서 되돌릴 수 있습니다.`,
+            `Unarchive instruction '${entry.name}'?\nIt has no deployed files, so it disappears from the list. You can restore it from the trash.`,
+          ),
+        items: [entry.directory],
+        confirmLabel: text("보관취소", "Unarchive"),
+      },
+      () => unarchiveSharedProjectInstruction(entry.key),
+      text(
         `'${entry.name}' 지침의 보관을 취소했습니다.`,
         `Unarchived instruction '${entry.name}'.`,
-      ));
-    });
+      ),
+    );
   };
 
   const requestMigration = async () => {
@@ -976,53 +1130,11 @@ function SelectedInstruction({
     });
   };
 
-  // 아래 구획이 어떤 순서로 이어지는지 카드 머리에서 먼저 알려 준다.
-  const hasReviewSection = entry.linkedFiles.length > 0 || linkNotices.length > 0 || presentDeployments.length > 0;
-  const processSteps = [
-    {
-      no: 1,
-      title: text("지원 OS 지정", "Set supported OS"),
-      detail: text("base 지침을 그대로 쓸 OS를 정합니다.", "Decide which platforms use the base instruction as-is."),
-      tone: entry.currentPlatformSupported ? "" : "attention",
-    },
-    {
-      no: 2,
-      title: text("위치별 배포", "Deploy by location"),
-      detail: text("개인 설정과 프로젝트에 지침 파일을 놓거나 뺍니다.", "Place or remove the file in personal settings and projects."),
-      tone: "",
-    },
-    {
-      no: 3,
-      title: text("배포 확인", "Review deployments"),
-      detail: text("실제로 놓인 파일 원문과 링크 보관 상태를 봅니다.", "Check the deployed file contents and archived link status."),
-      tone: hasReviewSection ? "" : "muted",
-    },
-    {
-      no: 4,
-      title: text("외부 수정 정리", "Resolve external edits"),
-      detail: text("원본과 달라진 배포본을 자동 반영하거나 한 버전을 원본으로 채택합니다.", "Auto-adopt external edits, or make one version the source."),
-      tone: divergentDeployments.length > 0 ? "attention" : "",
-    },
-    {
-      no: 5,
-      title: text("편집", "Edit"),
-      detail: text("보관된 원본을 고치고 배포된 위치에 다시 반영합니다.", "Edit the archived source and redeploy it."),
-      tone: "",
-    },
-    {
-      no: 6,
-      title: text("게시", "Publish"),
-      detail: text("아직 배포하지 않은 위치에 지침을 새로 게시합니다.", "Publish the instruction to a location that does not have it yet."),
-      tone: "",
-    },
-  ];
-  const activeStepInfo = processSteps.find((step) => step.no === activeStep) ?? processSteps[0];
-
   const savePlatformMetadata = async () => {
     await runBusy("instruction-platforms", async () => {
       await setProjectInstructionPlatforms({
         key: entry.key,
-        platforms,
+        platforms: form.platforms,
         expectedDigest: entry.sourceDigest,
       });
       await refresh();
@@ -1032,6 +1144,140 @@ function SelectedInstruction({
       ));
     });
   };
+
+  return {
+    deploymentAt,
+    submit,
+    toggleDeployment,
+    setDeploymentRegistered,
+    adoptDeployment,
+    autoSyncChecked,
+    toggleAutoSync,
+    deleteShared,
+    unarchiveShared,
+    requestMigration,
+    savePlatformMetadata,
+  };
+}
+
+function SelectedInstruction({
+  entry,
+  library,
+  busy,
+  setBusy,
+  setError,
+  reportChanged,
+  refresh,
+  onRequestAiaPrompt,
+  confirm,
+  translated,
+  automation,
+  onAutomationChange,
+}: ChildActionProps & {
+  entry: ProjectInstructionEntry;
+  library: ProjectInstructionLibrary | null;
+  onRequestAiaPrompt?: (prompt: string) => void;
+  confirm: (request: ConfirmRequest) => Promise<boolean>;
+  translated: boolean;
+  automation: SystemAutomationSnapshot | null;
+  onAutomationChange?: (snapshot: SystemAutomationSnapshot) => void;
+}) {
+  const { text } = useI18n();
+  const runBusy = instructionBusyRunner(setBusy, setError);
+  const [projectPath, setProjectPath] = useState<string>(PERSONAL_LOCATION);
+  const [providers, setProviders] = useState<ProviderId[]>(entry.providers);
+  const [overwrite, setOverwrite] = useState<SkillOverwritePolicy>("fail");
+  const [platforms, setPlatforms] = useState<HostPlatform[]>(entry.platforms);
+  const [activeStep, setActiveStep] = useState(1);
+  const editor = useInstructionSourceEditor(entry, runBusy, refresh, reportChanged);
+
+  // 단계·편집 상태는 고른 지침이 바뀔 때만 처음으로 돌린다. 목록을 다시 읽으면(새로 고침·배포 토글 뒤
+  // refresh) 같은 지침이라도 entry와 그 안의 providers·platforms 배열이 새 신원으로 오므로, 배열 신원에
+  // 걸어 두면 값이 같아도 효과가 다시 발화해 보고 있던 2단계 배포 매트릭스가 사라진다. 그래서 마지막으로
+  // 반영한 값을 기억해 두고, 지침이 같으면 값이 실제로 달라진 축만 따라간다.
+  const syncedEntry = useRef<{ key: string; providers: ProviderId[]; platforms: HostPlatform[] } | null>(null);
+  useEffect(() => {
+    const previous = syncedEntry.current;
+    syncedEntry.current = { key: entry.key, providers: entry.providers, platforms: entry.platforms };
+    if (!previous || previous.key !== entry.key) {
+      setProviders(entry.providers);
+      setPlatforms(entry.platforms);
+      setActiveStep(1);
+      return;
+    }
+    if (!arraysEqual(previous.providers, entry.providers)) setProviders(entry.providers);
+    if (!arraysEqual(previous.platforms, entry.platforms)) setPlatforms(entry.platforms);
+  }, [entry.key, entry.platforms, entry.providers]);
+
+  useEffect(() => {
+    if (projectPath !== PERSONAL_LOCATION && !library?.projects.includes(projectPath)) {
+      setProjectPath(PERSONAL_LOCATION);
+    }
+  }, [library, projectPath]);
+
+  // 같은 링크가 여러 위치에서 걸리면 한 줄로 묶어 보여준다.
+  const linkNotices = useMemo(() => {
+    const grouped = new Map<string, { href: string; reason: string; locations: number }>();
+    for (const deployment of entry.deployments) {
+      for (const issue of deployment.linkIssues ?? []) {
+        const key = `${issue.href}\n${issue.reason}`;
+        const found = grouped.get(key);
+        if (found) found.locations += 1;
+        else grouped.set(key, { href: issue.href, reason: issue.reason, locations: 1 });
+      }
+    }
+    return [...grouped.values()];
+  }, [entry.deployments]);
+
+  const {
+    presentDeployments,
+    managedDeployments,
+    divergentDeployments,
+    unmanagedDeployments,
+  } = useDeploymentGroups(entry.deployments);
+
+  const locationRows = useDeploymentLocationRows(entry, library);
+  const { pinLocation } = locationRows;
+
+  const { viewerTarget, viewerContent, openViewer } = useDeployedFileViewer(entry.key, presentDeployments, runBusy);
+
+  const {
+    deploymentAt,
+    submit,
+    toggleDeployment,
+    setDeploymentRegistered,
+    adoptDeployment,
+    autoSyncChecked,
+    toggleAutoSync,
+    deleteShared,
+    unarchiveShared,
+    requestMigration,
+    savePlatformMetadata,
+  } = useInstructionMutations({
+    entry,
+    library,
+    form: { projectPath, providers, overwrite, platforms },
+    runBusy,
+    refresh,
+    reportChanged,
+    setError,
+    confirm,
+    pinLocation,
+    presentDeploymentCount: presentDeployments.length,
+    onRequestAiaPrompt,
+  });
+
+  const hasReviewSection = entry.linkedFiles.length > 0 || linkNotices.length > 0 || presentDeployments.length > 0;
+  const processSteps = instructionProcessSteps(text, {
+    currentPlatformSupported: entry.currentPlatformSupported,
+    hasReviewSection,
+    hasDivergent: divergentDeployments.length > 0,
+  });
+  const activeStepInfo = processSteps.find((step) => step.no === activeStep) ?? processSteps[0];
+  const currentPlatformLabel = platformLabel(library?.currentPlatform ?? "macos", text);
+  const supportedPlatformsLabel = entry.platforms.length > 0
+    ? entry.platforms.map((platform) => platformLabel(platform, text)).join(", ")
+    : text("전체", "All");
 
   return (
     <div className="detail-card instruction-manage-card">
@@ -1056,8 +1302,8 @@ function SelectedInstruction({
         </div>
       </div>
       <p className="prose-copy">{text(
-        `현재 OS: ${platformLabel(library?.currentPlatform ?? "macos", text)} · 지원 OS: ${entry.platforms.length ? entry.platforms.map((platform) => platformLabel(platform, text)).join(", ") : text("전체", "All")}`,
-        `Current OS: ${platformLabel(library?.currentPlatform ?? "macos", text)} · Supported OS: ${entry.platforms.length ? entry.platforms.map((platform) => platformLabel(platform, text)).join(", ") : text("전체", "All")}`,
+        `현재 OS: ${currentPlatformLabel} · 지원 OS: ${supportedPlatformsLabel}`,
+        `Current OS: ${currentPlatformLabel} · Supported OS: ${supportedPlatformsLabel}`,
       )}</p>
       <p className="prose-copy instruction-process-copy">{text(
         "지침 하나는 지원 OS 지정 → 위치별 배포 → 배포 확인 → 외부 수정 정리 → 편집 → 게시 순서로 다룹니다. 아래 탭에서 단계를 고르세요.",
@@ -1093,389 +1339,501 @@ function SelectedInstruction({
           <span>{activeStepInfo.detail}</span>
         </p>
         {activeStep === 1 && (
-          <>
-            <p className="prose-copy">{text(
-              "base 지침을 그대로 사용할 OS를 선택하세요. 미선택이면 모든 OS에서 사용하는 portable 지침입니다.",
-              "Select platforms that can use the base instruction as-is. No selection means the instruction is portable.",
-            )}</p>
-            <div className="skill-use-matrix">
-              {PLATFORMS.map((platform) => (
-                <label className={`skill-use-toggle${platforms.includes(platform) ? " used" : ""}`} key={platform}>
-                  <input
-                    type="checkbox"
-                    checked={platforms.includes(platform)}
-                    disabled={busy !== null}
-                    onChange={() => setPlatforms(toggleValue(platforms, platform))}
-                  />
-                  {platformLabel(platform, text)}
-                </label>
-              ))}
-            </div>
-            <div className="form-actions">
-              <button className="button" type="button" disabled={busy !== null || arraysEqual(platforms, entry.platforms)} onClick={() => { void savePlatformMetadata(); }}>
-                {busy === "instruction-platforms" ? text("저장 중…", "Saving…") : text("지원 OS 저장", "Save supported OS")}
-              </button>
-            </div>
-            {!entry.currentPlatformSupported && (
-              <div className="form-actions">
-                <button className="button" type="button" disabled={busy !== null || !onRequestAiaPrompt} onClick={() => { void requestMigration(); }}>
-                  {busy === "migration" ? text("계획 확인 중…", "Loading plan…") : text("AIA로 현재 OS 변형 만들기", "Create current OS variant with AIA")}
-                </button>
-              </div>
-            )}
-          </>
+          <InstructionPlatformStep
+            entry={entry}
+            platforms={platforms}
+            onPlatformsChange={setPlatforms}
+            busy={busy}
+            onSave={savePlatformMetadata}
+            onRequestMigration={requestMigration}
+            migrationAvailable={Boolean(onRequestAiaPrompt)}
+          />
         )}
         {activeStep === 2 && (
-          <>
-            <p className="prose-copy">{text(
-              "개인 설정과 프로젝트별로 지침 파일 배포를 켜고 끕니다. 해제된 파일은 휴지통으로 이동합니다.",
-              "Turn instruction file deployment on or off for personal settings and each project. Removed files move to the trash.",
-            )}</p>
-            <div className="instruction-location-toolbar">
-              {projectRowCount > 5 && (
-                <input
-                  className="search-input"
-                  type="search"
-                  value={locationQuery}
-                  placeholder={text("프로젝트 검색", "Search projects")}
-                  onChange={(event) => setLocationQuery(event.target.value)}
-                />
-              )}
-              {hiddenRowCount > 0 && (
-                <button className="button compact" type="button" onClick={() => setShowAllLocations(true)}>
-                  <ChevronDown size={13} aria-hidden="true" />
-                  {text(`프로젝트 ${hiddenRowCount}곳 더 보기`, `Show ${hiddenRowCount} more project${hiddenRowCount > 1 ? "s" : ""}`)}
-                </button>
-              )}
-              {showAllLocations && !locationQuery.trim() && (
-                <button className="button compact" type="button" onClick={() => setShowAllLocations(false)}>
-                  <ChevronUp size={13} aria-hidden="true" />
-                  {text("배포된 곳만 보기", "Show deployed only")}
-                </button>
-              )}
-            </div>
-            <table className="skill-location-matrix">
-              <thead>
-                <tr>
-                  <th>{text("위치", "Location")}</th>
-                  {entry.providers.map((provider) => <th key={provider}>{providerLabel(provider)}</th>)}
-                </tr>
-              </thead>
-              <tbody>
-                {visibleRows.map((row) => (
-                  <tr key={row.key}>
-                    <td title={row.title}>{row.label}</td>
-                    {entry.providers.map((provider) => {
-                      const deployment = deploymentAt(row.scope, row.projectPath, provider);
-                      const blocked = Boolean(deployment?.present && deployment.message);
-                      // 체크는 "이 원본의 배포로 등록됨"이다. 파일만 있는 위치는 남의
-                      // 지침일 수 있어 켜진 것으로 보이면 안 된다(해제가 삭제이므로).
-                      const foreign = Boolean(deployment?.present && !deployment.managed && !blocked);
-                      return (
-                        <td key={provider}>
-                          <label
-                            className={`skill-use-toggle${deployment?.managed ? " used" : ""}${foreign ? " foreign" : ""}${deployment?.divergent && !blocked ? " divergent" : ""}`}
-                            title={deployment?.message
-                              ?? (foreign
-                                ? text(
-                                  `${deployment?.filePath ?? ""}\n이 위치에 지침 파일이 이미 있지만 이 원본의 배포는 아닙니다. 아래 "등록되지 않은 지침 파일"에서 배포로 등록하세요.`,
-                                  `${deployment?.filePath ?? ""}\nAn instruction file already exists here but is not a deployment of this source. Register it under "Unregistered instruction files" below.`,
-                                )
-                                : deployment?.filePath ?? undefined)}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={Boolean(deployment?.managed)}
-                              disabled={busy !== null || blocked || (!deployment?.present && !entry.currentPlatformSupported)}
-                              onChange={(event) => { void toggleDeployment(row.scope, row.projectPath, provider, event.target.checked); }}
-                            />
-                            {deployment?.divergent && !blocked && <AlertTriangle size={10} aria-hidden="true" />}
-                            {foreign && <FileText size={10} aria-hidden="true" />}
-                          </label>
-                        </td>
-                      );
-                    })}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {locationQuery.trim() && visibleRows.length === 1 && (
-              <p className="prose-copy">{text("검색과 맞는 프로젝트가 없습니다.", "No project matches the search.")}</p>
-            )}
-            {unmanagedDeployments.length > 0 && (
-              <InstructionSection
-                title={text("등록되지 않은 지침 파일", "Unregistered instruction files")}
-                description={text(
-                  "아래 위치에는 같은 이름의 지침 파일이 있지만 이 원본의 배포가 아닙니다. 그래서 원본을 편집해도 갱신되지 않고, 외부 수정 감지에도 잡히지 않습니다. 이 파일이 이 지침의 배포라면 등록하세요. 등록 시점의 내용을 기준으로 삼아 다음 편집부터 함께 갱신합니다.",
-                  "These locations hold a file with the same name that is not a deployment of this source, so editing the source leaves it alone and drift detection ignores it. Register it if it really is this instruction's deployment; the current content becomes the baseline and later edits update it too.",
-                )}
-              >
-                <div className="skill-divergent-list">
-                  {unmanagedDeployments.map((deployment) => (
-                    <DeploymentRow deployment={deployment} key={deploymentKey(deployment)}>
-                      <button className="button compact" type="button" disabled={busy !== null} onClick={() => { void setDeploymentRegistered(deployment, true); }}>
-                        <FolderInput size={13} aria-hidden="true" />{text("배포로 등록", "Register")}
-                      </button>
-                    </DeploymentRow>
-                  ))}
-                </div>
-              </InstructionSection>
-            )}
-            {managedDeployments.length > 0 && (
-              <InstructionSection
-                title={text("배포 등록", "Registered deployments")}
-                description={text(
-                  "원본을 편집하면 아래 위치가 함께 갱신되고, 외부 수정 감지도 이 위치들만 봅니다. 등록을 해제하면 파일은 그대로 남고 이후 갱신에서만 빠집니다.",
-                  "Editing the source updates these locations, and drift detection watches only them. Unregistering leaves the file in place and only stops future updates.",
-                )}
-              >
-                <div className="skill-divergent-list">
-                  {managedDeployments.map((deployment) => (
-                    <DeploymentRow deployment={deployment} key={deploymentKey(deployment)}>
-                      <button className="button compact" type="button" disabled={busy !== null} onClick={() => { void setDeploymentRegistered(deployment, false); }}>
-                        {text("등록 해제", "Unregister")}
-                      </button>
-                    </DeploymentRow>
-                  ))}
-                </div>
-              </InstructionSection>
-            )}
-          </>
+          <InstructionDeployStep
+            entry={entry}
+            rows={locationRows}
+            busy={busy}
+            deploymentAt={deploymentAt}
+            onToggleDeployment={toggleDeployment}
+            onSetRegistered={setDeploymentRegistered}
+            unmanagedDeployments={unmanagedDeployments}
+            managedDeployments={managedDeployments}
+          />
         )}
         {activeStep === 3 && (
-          <>
-            {!hasReviewSection && (
-              <p className="prose-copy">{text(
-                "아직 배포된 파일이 없어 확인할 내용이 없습니다. 먼저 위치별 배포에서 지침을 배포하세요.",
-                "Nothing to review yet because the instruction is not deployed anywhere. Deploy it first under deployments by location.",
-              )}</p>
-            )}
-            {entry.linkedFiles.length > 0 && (
-              <InstructionSection
-                title={text("함께 보관한 연결 문서", "Archived linked documents")}
-                description={text(
-                  "지침이 가져오기(@경로)와 링크로 함께 읽는 문서입니다. 게시하면 배포 위치의 같은 상대 경로로 함께 갑니다.",
-                  "Documents the instruction reads through @path imports and links. Publishing copies them to the same relative paths at the target.",
-                )}
-              >
-                <div className="skill-divergent-list">
-                  {entry.linkedFiles.map((relative) => (
-                    <div className="skill-divergent-row" key={relative}><code>{relative}</code></div>
-                  ))}
-                </div>
-              </InstructionSection>
-            )}
-
-            {linkNotices.length > 0 && (
-              <InstructionSection
-                title={text("보관하지 못한 링크", "Links not archived")}
-                description={text(
-                  "배포된 지침이 참조하지만 함께 보관하지 않은 링크입니다. 위치에 매인 링크(~/, 절대 경로)는 그 위치에서만 뜻이 통하므로 보관하지 않습니다.",
-                  "Links the deployed instruction references but that are not archived. Location-bound links (~/, absolute paths) only make sense where they are, so they stay out of the archive.",
-                )}
-              >
-                <details className="instruction-link-disclosure">
-                  <summary>
-                    <strong>{text(`링크 ${linkNotices.length}개`, `${linkNotices.length} link${linkNotices.length > 1 ? "s" : ""}`)}</strong>
-                    <span>{text("펼쳐서 전체 목록 보기", "Expand to see the full list")}</span>
-                  </summary>
-                  <div className="skill-divergent-list">
-                    {linkNotices.map((notice) => (
-                      <div className="skill-divergent-row" key={`${notice.href}\n${notice.reason}`}>
-                        <code>{notice.href}</code>
-                        <small>{notice.reason}{notice.locations > 1
-                          ? text(` · ${notice.locations}곳`, ` · ${notice.locations} locations`)
-                          : ""}</small>
-                      </div>
-                    ))}
-                  </div>
-                </details>
-              </InstructionSection>
-            )}
-
-            {presentDeployments.length > 0 && (
-              <InstructionSection
-                title={text("배포 파일 내용", "Deployed file contents")}
-                description={text(
-                  "개인 설정·프로젝트에 실제로 놓여 있는 지침 파일 원문을 확인합니다.",
-                  "View the instruction file exactly as it exists in personal settings or a project.",
-                )}
-              >
-                <div className="form-row">
-                  <label htmlFor="instruction-view-target">{text("파일", "File")}</label>
-                  <select
-                    id="instruction-view-target"
-                    value={viewerTarget}
-                    onChange={(event) => { void openViewer(event.target.value); }}
-                    disabled={busy !== null}
-                  >
-                    <option value="">{text("선택하세요", "Select a file")}</option>
-                    {presentDeployments.map((deployment) => (
-                      <option value={deploymentKey(deployment)} key={deploymentKey(deployment)}>
-                        {deploymentLabel(deployment, text)}
-                        {deployment.divergent ? text(" · 원본과 다름", " · differs from source") : ""}
-                        {!deployment.managed ? text(" · 배포로 등록되지 않음", " · not registered") : ""}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                {viewerContent && (
-                  <div className="form-row">
-                    <label>{providerFileName(viewerContent.provider)}</label>
-                    <div>
-                      {viewerContent.content.trim()
-                        ? <>
-                          <MarkdownPreview source={viewerContent.content} compact />
-                          <details className="original-content">
-                            <summary>{text("원문 보기", "View original")}</summary>
-                            <pre className="markdown-source">{viewerContent.content}</pre>
-                          </details>
-                        </>
-                        : <p className="prose-copy">{text("(빈 파일)", "(Empty file)")}</p>}
-                      <small className="settings-storage-note">{viewerContent.filePath}</small>
-                    </div>
-                  </div>
-                )}
-              </InstructionSection>
-            )}
-          </>
+          <InstructionReviewStep
+            entry={entry}
+            hasReviewSection={hasReviewSection}
+            linkNotices={linkNotices}
+            presentDeployments={presentDeployments}
+            viewerTarget={viewerTarget}
+            viewerContent={viewerContent}
+            busy={busy}
+            onOpenViewer={openViewer}
+          />
         )}
         {activeStep === 4 && (
-          <>
-            <p className="prose-copy">{text(
-              "배포된 파일을 다른 도구로 고치면 공통 원본과 달라집니다. 자동 반영을 켜 두면 달라진 배포본을 원본으로 그대로 받아들입니다. 여기서 보는 대상은 이 지침의 배포로 등록된 위치뿐입니다(위치별 배포에서 등록합니다).",
-              "Editing a deployed file elsewhere makes it differ from the shared source. With auto-adopt on, the changed deployment becomes the new source. Only locations registered as this instruction's deployments are watched (register them under deployments by location).",
-            )}</p>
-            <div className="skill-use-matrix">
-              <label className={`skill-use-toggle skill-auto-toggle${autoSyncChecked ? " used" : ""}`}>
-                <input
-                  type="checkbox"
-                  checked={autoSyncChecked}
-                  onChange={(event) => toggleAutoSync(event.target.checked)}
-                />
-                {text("외부 수정 자동 반영", "Auto-adopt external edits")}
-              </label>
-            </div>
-            {divergentDeployments.length === 0 && (
-              <p className="prose-copy">{text(
-                "지금은 원본과 다른 배포 파일이 없습니다. 등록된 배포 위치만 봅니다.",
-                "No registered deployment currently differs from the source.",
-              )}</p>
-            )}
-            {divergentDeployments.length > 0 && (
-              <InstructionSection
-                title={text("외부 수정 감지", "Externally edited")}
-                description={text(
-                  "아래 배포 파일이 공통 원본과 다릅니다. 한 버전을 선택해 동기화하면 그 버전이 원본이 되고 나머지 배포 프로젝트에 재배포됩니다. 이전 원본은 휴지통으로 이동합니다.",
-                  "These deployed files differ from the shared source. Syncing adopts one version as the source and redeploys to the other projects. The previous source moves to the trash.",
-                )}
-              >
-                <div className="skill-divergent-list">
-                  {divergentDeployments.map((deployment) => (
-                    <DeploymentRow deployment={deployment} key={deploymentKey(deployment)}>
-                      <small>{divergenceReason(deployment, text)}</small>
-                      <button className="button compact" type="button" disabled={busy !== null} onClick={() => { void adoptDeployment(deployment); }}>
-                        <RefreshCw size={13} aria-hidden="true" />{busy === "sync" ? text("동기화 중…", "Syncing…") : text("이 버전으로 동기화", "Sync to this version")}
-                      </button>
-                    </DeploymentRow>
-                  ))}
-                </div>
-              </InstructionSection>
-            )}
-          </>
+          <InstructionDriftStep
+            autoSyncChecked={autoSyncChecked}
+            onToggleAutoSync={toggleAutoSync}
+            divergentDeployments={divergentDeployments}
+            busy={busy}
+            onAdopt={adoptDeployment}
+          />
         )}
-        {activeStep === 5 && (
-          <>
-            {!editing && (
-              <div className="form-actions">
-                <button className="button" type="button" disabled={busy !== null} onClick={() => { void openEditor(); }}>
-                  {busy === "edit-load" ? text("읽는 중…", "Loading…") : text("직접 편집", "Edit files")}
-                </button>
-              </div>
-            )}
-            {editing && (
-              <div className="skill-editor">
-                <div className="form-row">
-                  <label htmlFor="instruction-edit-name">{text("표시 이름", "Display name")}</label>
-                  <input id="instruction-edit-name" value={editName} onChange={(event) => setEditName(event.target.value)} disabled={busy !== null} />
-                </div>
-                <div className="form-row">
-                  <label htmlFor="instruction-edit-description">{text("설명", "Description")}</label>
-                  <textarea id="instruction-edit-description" rows={2} value={editDescription} onChange={(event) => setEditDescription(event.target.value)} disabled={busy !== null} />
-                </div>
-                {entry.providers.map((provider) => (
-                  <div className="form-row" key={provider}>
-                    <label htmlFor={`instruction-edit-${provider}`}>{providerFileName(provider)}</label>
-                    <div>
-                      <textarea
-                        id={`instruction-edit-${provider}`}
-                        rows={8}
-                        value={editContents[provider] ?? ""}
-                        onChange={(event) => setEditContents((current) => ({ ...current, [provider]: event.target.value }))}
-                        disabled={busy !== null}
-                      />
-                      {variantSources[provider] && (
-                        <small className="settings-storage-note">{text(
-                          `${platformLabel(variantSources[provider] as HostPlatform, text)} 변형에서 읽었습니다. 저장하면 base 파일에 씁니다.`,
-                          `Loaded from the ${platformLabel(variantSources[provider] as HostPlatform, text)} variant. Saving writes to the base file.`,
-                        )}</small>
-                      )}
-                    </div>
-                  </div>
-                ))}
-                <div className="form-actions">
-                  <button className="button" type="button" disabled={busy !== null} onClick={() => setEditing(false)}>
-                    {text("취소", "Cancel")}
-                  </button>
-                  <button className="button primary" type="button" disabled={busy !== null} onClick={() => { void saveEdit(); }}>
-                    {busy === "edit-save" ? text("저장 중…", "Saving…") : text("저장하고 재배포", "Save and redeploy")}
-                  </button>
-                </div>
-              </div>
-            )}
-          </>
-        )}
+        {activeStep === 5 && <InstructionEditorPanel editor={editor} providers={entry.providers} busy={busy} />}
         {activeStep === 6 && (
-          <>
-            <form onSubmit={(event) => { void submit(event); }}>
-              <div className="form-row">
-                <label htmlFor="instruction-publish-project">{text("위치", "Location")}</label>
-                <select id="instruction-publish-project" value={projectPath} onChange={(event) => setProjectPath(event.target.value)} disabled={busy !== null}>
-                  <option value={PERSONAL_LOCATION}>{text("개인 설정 (~/.claude · ~/.codex · ~/.gemini)", "Personal settings (~/.claude · ~/.codex · ~/.gemini)")}</option>
-                  {(library?.projects ?? []).map((path) => <option value={path} key={path}>{path}</option>)}
-                </select>
-              </div>
-              <div className="form-row">
-                <label>{text("공급자", "Providers")}</label>
-                <div className="skill-use-matrix">
-                  {entry.providers.map((provider) => (
-                    <label className={`skill-use-toggle${providers.includes(provider) ? " used" : ""}`} key={provider}>
-                      <input
-                        type="checkbox"
-                        checked={providers.includes(provider)}
-                        onChange={() => setProviders(toggleValue(providers, provider))}
-                        disabled={busy !== null}
-                      />
-                      {providerLabel(provider)}
-                    </label>
-                  ))}
-                </div>
-              </div>
-              <div className="form-row">
-                <label htmlFor="instruction-overwrite">{text("기존 파일", "Existing files")}</label>
-                <select id="instruction-overwrite" value={overwrite} onChange={(event) => setOverwrite(event.target.value as SkillOverwritePolicy)} disabled={busy !== null}>
-                  <option value="fail">{text("덮어쓰지 않음", "Do not overwrite")}</option>
-                  <option value="replace">{text("원자적으로 교체", "Replace atomically")}</option>
-                </select>
-              </div>
-              <div className="form-actions">
-                <button className="button primary" type="submit" disabled={busy !== null || !projectPath || providers.length === 0 || !entry.currentPlatformSupported}>
-                  {busy === "publish" ? text("게시 중…", "Publishing…") : text("프로젝트에 게시", "Publish to project")}
-                </button>
-              </div>
-            </form>
-          </>
+          <InstructionPublishStep
+            entry={entry}
+            library={library}
+            projectPath={projectPath}
+            onProjectPathChange={setProjectPath}
+            providers={providers}
+            onProvidersChange={setProviders}
+            overwrite={overwrite}
+            onOverwriteChange={setOverwrite}
+            busy={busy}
+            onSubmit={submit}
+          />
         )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 1단계: base 지침을 그대로 쓸 OS를 정한다. 고른 OS 집합은 선택 지침 카드가 들고 있어
+ * 단계 탭을 옮겨 다녀도 저장 전 선택이 남는다.
+ */
+function InstructionPlatformStep({ entry, platforms, onPlatformsChange, busy, onSave, onRequestMigration, migrationAvailable }: {
+  entry: ProjectInstructionEntry;
+  platforms: HostPlatform[];
+  onPlatformsChange: (platforms: HostPlatform[]) => void;
+  busy: InstructionBusyKind | null;
+  onSave: () => Promise<void>;
+  onRequestMigration: () => Promise<void>;
+  /** AIA 입력창이 없는 화면에서는 변형 만들기 버튼을 누를 수 없다. */
+  migrationAvailable: boolean;
+}) {
+  const { text } = useI18n();
+  return (
+    <PlatformSupportFields
+      description={text(
+        "base 지침을 그대로 사용할 OS를 선택하세요. 미선택이면 모든 OS에서 사용하는 portable 지침입니다.",
+        "Select platforms that can use the base instruction as-is. No selection means the instruction is portable.",
+      )}
+      platforms={platforms}
+      saved={entry.platforms}
+      disabled={busy !== null}
+      saving={busy === "instruction-platforms"}
+      onPlatformsChange={onPlatformsChange}
+      onSave={() => { void onSave(); }}
+      migration={entry.currentPlatformSupported ? null : {
+        disabled: !migrationAvailable,
+        busy: busy === "migration",
+        onRequest: () => { void onRequestMigration(); },
+      }}
+    />
+  );
+}
+
+/**
+ * 2단계: 위치별 배포 매트릭스와 배포 원장 손질. 행 목록·검색·펼침은 useDeploymentLocationRows가
+ * 들고 있는 한 벌을 그대로 받아 쓴다.
+ */
+function InstructionDeployStep({ entry, rows, busy, deploymentAt, onToggleDeployment, onSetRegistered, unmanagedDeployments, managedDeployments }: {
+  entry: ProjectInstructionEntry;
+  rows: DeploymentLocationRows;
+  busy: InstructionBusyKind | null;
+  deploymentAt: (scope: "personal" | "project", project: string | null, provider: ProviderId) => ProjectInstructionDeployment | null;
+  onToggleDeployment: (scope: "personal" | "project", project: string | null, provider: ProviderId, use: boolean) => Promise<void>;
+  onSetRegistered: (deployment: ProjectInstructionDeployment, registered: boolean) => Promise<void>;
+  unmanagedDeployments: ProjectInstructionDeployment[];
+  managedDeployments: ProjectInstructionDeployment[];
+}) {
+  const { text } = useI18n();
+  const { visibleRows, projectRowCount, hiddenRowCount, locationQuery, setLocationQuery, showAllLocations, setShowAllLocations } = rows;
+  return (
+    <>
+      <p className="prose-copy">{text(
+        "개인 설정과 프로젝트별로 지침 파일 배포를 켜고 끕니다. 해제된 파일은 휴지통으로 이동합니다.",
+        "Turn instruction file deployment on or off for personal settings and each project. Removed files move to the trash.",
+      )}</p>
+      <div className="instruction-location-toolbar">
+        {projectRowCount > 5 && (
+          <input
+            className="search-input"
+            type="search"
+            value={locationQuery}
+            placeholder={text("프로젝트 검색", "Search projects")}
+            onChange={(event) => setLocationQuery(event.target.value)}
+          />
+        )}
+        {hiddenRowCount > 0 && (
+          <button className="button compact" type="button" onClick={() => setShowAllLocations(true)}>
+            <ChevronDown size={13} aria-hidden="true" />
+            {text(`프로젝트 ${hiddenRowCount}곳 더 보기`, `Show ${hiddenRowCount} more project${hiddenRowCount > 1 ? "s" : ""}`)}
+          </button>
+        )}
+        {showAllLocations && !locationQuery.trim() && (
+          <button className="button compact" type="button" onClick={() => setShowAllLocations(false)}>
+            <ChevronUp size={13} aria-hidden="true" />
+            {text("배포된 곳만 보기", "Show deployed only")}
+          </button>
+        )}
+      </div>
+      <LocationProviderMatrix
+        locationHeader={text("위치", "Location")}
+        columns={entry.providers}
+        columnProvider={(provider) => provider}
+        rows={visibleRows}
+        cell={(row, provider) => {
+          const deployment = deploymentAt(row.scope, row.projectPath, provider);
+          const blocked = Boolean(deployment?.present && deployment.message);
+          // 체크는 "이 원본의 배포로 등록됨"이다. 파일만 있는 위치는 남의
+          // 지침일 수 있어 켜진 것으로 보이면 안 된다(해제가 삭제이므로).
+          const foreign = Boolean(deployment?.present && !deployment.managed && !blocked);
+          return (
+            <SkillUseToggle
+              used={Boolean(deployment?.managed)}
+              foreign={foreign}
+              divergent={Boolean(deployment?.divergent) && !blocked}
+              disabled={busy !== null || blocked || (!deployment?.present && !entry.currentPlatformSupported)}
+              title={deployment?.message
+                ?? (foreign
+                  ? text(
+                    `${deployment?.filePath ?? ""}\n이 위치에 지침 파일이 이미 있지만 이 원본의 배포는 아닙니다. 아래 "등록되지 않은 지침 파일"에서 배포로 등록하세요.`,
+                    `${deployment?.filePath ?? ""}\nAn instruction file already exists here but is not a deployment of this source. Register it under "Unregistered instruction files" below.`,
+                  )
+                  : deployment?.filePath ?? undefined)}
+              onChange={(checked) => { void onToggleDeployment(row.scope, row.projectPath, provider, checked); }}
+            />
+          );
+        }}
+      />
+      {locationQuery.trim() && visibleRows.length === 1 && (
+        <p className="prose-copy">{text("검색과 맞는 프로젝트가 없습니다.", "No project matches the search.")}</p>
+      )}
+      {unmanagedDeployments.length > 0 && (
+        <InstructionSection
+          title={text("등록되지 않은 지침 파일", "Unregistered instruction files")}
+          description={text(
+            "아래 위치에는 같은 이름의 지침 파일이 있지만 이 원본의 배포가 아닙니다. 그래서 원본을 편집해도 갱신되지 않고, 외부 수정 감지에도 잡히지 않습니다. 이 파일이 이 지침의 배포라면 등록하세요. 등록 시점의 내용을 기준으로 삼아 다음 편집부터 함께 갱신합니다.",
+            "These locations hold a file with the same name that is not a deployment of this source, so editing the source leaves it alone and drift detection ignores it. Register it if it really is this instruction's deployment; the current content becomes the baseline and later edits update it too.",
+          )}
+        >
+          <div className="skill-divergent-list">
+            {unmanagedDeployments.map((deployment) => (
+              <DeploymentRow deployment={deployment} key={deploymentKey(deployment)}>
+                <button className="button compact" type="button" disabled={busy !== null} onClick={() => { void onSetRegistered(deployment, true); }}>
+                  <FolderInput size={13} aria-hidden="true" />{text("배포로 등록", "Register")}
+                </button>
+              </DeploymentRow>
+            ))}
+          </div>
+        </InstructionSection>
+      )}
+      {managedDeployments.length > 0 && (
+        <InstructionSection
+          title={text("배포 등록", "Registered deployments")}
+          description={text(
+            "원본을 편집하면 아래 위치가 함께 갱신되고, 외부 수정 감지도 이 위치들만 봅니다. 등록을 해제하면 파일은 그대로 남고 이후 갱신에서만 빠집니다.",
+            "Editing the source updates these locations, and drift detection watches only them. Unregistering leaves the file in place and only stops future updates.",
+          )}
+        >
+          <div className="skill-divergent-list">
+            {managedDeployments.map((deployment) => (
+              <DeploymentRow deployment={deployment} key={deploymentKey(deployment)}>
+                <button className="button compact" type="button" disabled={busy !== null} onClick={() => { void onSetRegistered(deployment, false); }}>
+                  {text("등록 해제", "Unregister")}
+                </button>
+              </DeploymentRow>
+            ))}
+          </div>
+        </InstructionSection>
+      )}
+    </>
+  );
+}
+
+/**
+ * 3단계: 실제로 놓인 배포 파일 원문과 링크 보관 상태를 확인한다. 읽어 온 원문은 선택 지침
+ * 카드가 들고 있어 이 패널은 그리기만 한다.
+ */
+function InstructionReviewStep({ entry, hasReviewSection, linkNotices, presentDeployments, viewerTarget, viewerContent, busy, onOpenViewer }: {
+  entry: ProjectInstructionEntry;
+  hasReviewSection: boolean;
+  linkNotices: InstructionLinkNotice[];
+  presentDeployments: ProjectInstructionDeployment[];
+  viewerTarget: string;
+  viewerContent: DeployedInstructionFileContent | null;
+  busy: InstructionBusyKind | null;
+  onOpenViewer: (target: string) => Promise<void>;
+}) {
+  const { text } = useI18n();
+  return (
+    <>
+      {!hasReviewSection && (
+        <p className="prose-copy">{text(
+          "아직 배포된 파일이 없어 확인할 내용이 없습니다. 먼저 위치별 배포에서 지침을 배포하세요.",
+          "Nothing to review yet because the instruction is not deployed anywhere. Deploy it first under deployments by location.",
+        )}</p>
+      )}
+      {entry.linkedFiles.length > 0 && (
+        <InstructionSection
+          title={text("함께 보관한 연결 문서", "Archived linked documents")}
+          description={text(
+            "지침이 가져오기(@경로)와 링크로 함께 읽는 문서입니다. 게시하면 배포 위치의 같은 상대 경로로 함께 갑니다.",
+            "Documents the instruction reads through @path imports and links. Publishing copies them to the same relative paths at the target.",
+          )}
+        >
+          <div className="skill-divergent-list">
+            {entry.linkedFiles.map((relative) => (
+              <div className="skill-divergent-row" key={relative}><code>{relative}</code></div>
+            ))}
+          </div>
+        </InstructionSection>
+      )}
+
+      {linkNotices.length > 0 && (
+        <InstructionSection
+          title={text("보관하지 못한 링크", "Links not archived")}
+          description={text(
+            "배포된 지침이 참조하지만 함께 보관하지 않은 링크입니다. 위치에 매인 링크(~/, 절대 경로)는 그 위치에서만 뜻이 통하므로 보관하지 않습니다.",
+            "Links the deployed instruction references but that are not archived. Location-bound links (~/, absolute paths) only make sense where they are, so they stay out of the archive.",
+          )}
+        >
+          <details className="instruction-link-disclosure">
+            <summary>
+              <strong>{text(`링크 ${linkNotices.length}개`, `${linkNotices.length} link${linkNotices.length > 1 ? "s" : ""}`)}</strong>
+              <span>{text("펼쳐서 전체 목록 보기", "Expand to see the full list")}</span>
+            </summary>
+            <div className="skill-divergent-list">
+              {linkNotices.map((notice) => (
+                <div className="skill-divergent-row" key={`${notice.href}\n${notice.reason}`}>
+                  <code>{notice.href}</code>
+                  <small>{notice.reason}{notice.locations > 1
+                    ? text(` · ${notice.locations}곳`, ` · ${notice.locations} locations`)
+                    : ""}</small>
+                </div>
+              ))}
+            </div>
+          </details>
+        </InstructionSection>
+      )}
+
+      {presentDeployments.length > 0 && (
+        <InstructionSection
+          title={text("배포 파일 내용", "Deployed file contents")}
+          description={text(
+            "개인 설정·프로젝트에 실제로 놓여 있는 지침 파일 원문을 확인합니다.",
+            "View the instruction file exactly as it exists in personal settings or a project.",
+          )}
+        >
+          <div className="form-row">
+            <label htmlFor="instruction-view-target">{text("파일", "File")}</label>
+            <select
+              id="instruction-view-target"
+              value={viewerTarget}
+              onChange={(event) => { void onOpenViewer(event.target.value); }}
+              disabled={busy !== null}
+            >
+              <option value="">{text("선택하세요", "Select a file")}</option>
+              {presentDeployments.map((deployment) => (
+                <option value={deploymentKey(deployment)} key={deploymentKey(deployment)}>
+                  {deploymentLabel(deployment, text)}
+                  {deployment.divergent ? text(" · 원본과 다름", " · differs from source") : ""}
+                  {!deployment.managed ? text(" · 배포로 등록되지 않음", " · not registered") : ""}
+                </option>
+              ))}
+            </select>
+          </div>
+          {viewerContent && (
+            <div className="form-row">
+              <label>{providerFileName(viewerContent.provider)}</label>
+              <div>
+                {viewerContent.content.trim()
+                  ? <>
+                    <MarkdownPreview source={viewerContent.content} compact />
+                    <OriginalContent>
+                      <pre className="markdown-source">{viewerContent.content}</pre>
+                    </OriginalContent>
+                  </>
+                  : <p className="prose-copy">{text("(빈 파일)", "(Empty file)")}</p>}
+                <small className="settings-storage-note">{viewerContent.filePath}</small>
+              </div>
+            </div>
+          )}
+        </InstructionSection>
+      )}
+    </>
+  );
+}
+
+/** 4단계: 외부에서 고쳐져 원본과 달라진 배포본을 자동 반영하거나 한 버전을 원본으로 채택한다. */
+function InstructionDriftStep({ autoSyncChecked, onToggleAutoSync, divergentDeployments, busy, onAdopt }: {
+  autoSyncChecked: boolean;
+  onToggleAutoSync: (autoSync: boolean) => void;
+  divergentDeployments: ProjectInstructionDeployment[];
+  busy: InstructionBusyKind | null;
+  onAdopt: (deployment: ProjectInstructionDeployment) => Promise<void>;
+}) {
+  const { text } = useI18n();
+  return (
+    <>
+      <p className="prose-copy">{text(
+        "배포된 파일을 다른 도구로 고치면 공통 원본과 달라집니다. 자동 반영을 켜 두면 달라진 배포본을 원본으로 그대로 받아들입니다. 여기서 보는 대상은 이 지침의 배포로 등록된 위치뿐입니다(위치별 배포에서 등록합니다).",
+        "Editing a deployed file elsewhere makes it differ from the shared source. With auto-adopt on, the changed deployment becomes the new source. Only locations registered as this instruction's deployments are watched (register them under deployments by location).",
+      )}</p>
+      <div className="skill-use-matrix">
+        <label className={`skill-use-toggle skill-auto-toggle${autoSyncChecked ? " used" : ""}`}>
+          <input
+            type="checkbox"
+            checked={autoSyncChecked}
+            onChange={(event) => onToggleAutoSync(event.target.checked)}
+          />
+          {text("외부 수정 자동 반영", "Auto-adopt external edits")}
+        </label>
+      </div>
+      {divergentDeployments.length === 0 && (
+        <p className="prose-copy">{text(
+          "지금은 원본과 다른 배포 파일이 없습니다. 등록된 배포 위치만 봅니다.",
+          "No registered deployment currently differs from the source.",
+        )}</p>
+      )}
+      {divergentDeployments.length > 0 && (
+        <InstructionSection
+          title={text("외부 수정 감지", "Externally edited")}
+          description={text(
+            "아래 배포 파일이 공통 원본과 다릅니다. 한 버전을 선택해 동기화하면 그 버전이 원본이 되고 나머지 배포 프로젝트에 재배포됩니다. 이전 원본은 휴지통으로 이동합니다.",
+            "These deployed files differ from the shared source. Syncing adopts one version as the source and redeploys to the other projects. The previous source moves to the trash.",
+          )}
+        >
+          <div className="skill-divergent-list">
+            {divergentDeployments.map((deployment) => (
+              <DeploymentRow deployment={deployment} key={deploymentKey(deployment)}>
+                <small>{divergenceReason(deployment, text)}</small>
+                <button className="button compact" type="button" disabled={busy !== null} onClick={() => { void onAdopt(deployment); }}>
+                  <RefreshCw size={13} aria-hidden="true" />{busy === "sync" ? text("동기화 중…", "Syncing…") : text("이 버전으로 동기화", "Sync to this version")}
+                </button>
+              </DeploymentRow>
+            ))}
+          </div>
+        </InstructionSection>
+      )}
+    </>
+  );
+}
+
+/** 6단계: 아직 배포하지 않은 위치에 지침을 새로 게시하는 폼. */
+function InstructionPublishStep({ entry, library, projectPath, onProjectPathChange, providers, onProvidersChange, overwrite, onOverwriteChange, busy, onSubmit }: {
+  entry: ProjectInstructionEntry;
+  library: ProjectInstructionLibrary | null;
+  projectPath: string;
+  onProjectPathChange: (path: string) => void;
+  providers: ProviderId[];
+  onProvidersChange: (providers: ProviderId[]) => void;
+  overwrite: SkillOverwritePolicy;
+  onOverwriteChange: (policy: SkillOverwritePolicy) => void;
+  busy: InstructionBusyKind | null;
+  onSubmit: (event: FormEvent) => Promise<void>;
+}) {
+  const { text } = useI18n();
+  return (
+    <>
+      <form onSubmit={(event) => { void onSubmit(event); }}>
+        <div className="form-row">
+          <label htmlFor="instruction-publish-project">{text("위치", "Location")}</label>
+          <select id="instruction-publish-project" value={projectPath} onChange={(event) => onProjectPathChange(event.target.value)} disabled={busy !== null}>
+            <option value={PERSONAL_LOCATION}>{text("개인 설정 (~/.claude · ~/.codex · ~/.gemini)", "Personal settings (~/.claude · ~/.codex · ~/.gemini)")}</option>
+            {(library?.projects ?? []).map((path) => <option value={path} key={path}>{displayPath(path)}</option>)}
+          </select>
+        </div>
+        <div className="form-row">
+          <label>{text("공급자", "Providers")}</label>
+          <ToggleMatrix
+            values={entry.providers}
+            selected={providers}
+            disabled={busy !== null}
+            label={sourceName}
+            onChange={onProvidersChange}
+          />
+        </div>
+        <div className="form-row">
+          <label htmlFor="instruction-overwrite">{text("기존 파일", "Existing files")}</label>
+          <select id="instruction-overwrite" value={overwrite} onChange={(event) => onOverwriteChange(event.target.value as SkillOverwritePolicy)} disabled={busy !== null}>
+            <option value="fail">{text("덮어쓰지 않음", "Do not overwrite")}</option>
+            <option value="replace">{text("원자적으로 교체", "Replace atomically")}</option>
+          </select>
+        </div>
+        <div className="form-actions">
+          <button className="button primary" type="submit" disabled={busy !== null || !projectPath || providers.length === 0 || !entry.currentPlatformSupported}>
+            {busy === "publish" ? text("게시 중…", "Publishing…") : text("프로젝트에 게시", "Publish to project")}
+          </button>
+        </div>
+      </form>
+    </>
+  );
+}
+
+/**
+ * 지침 원본 편집(5단계)의 화면. 편집 상태는 선택 지침 카드가 훅으로 들고 있고, 여기서는
+ * 그 값을 그리기만 한다. 편집을 열기 전에는 버튼 한 줄, 연 뒤에는 이름·설명·공급자별 본문
+ * 칸이 선다.
+ */
+function InstructionEditorPanel({ editor, providers, busy }: {
+  editor: InstructionSourceEditor;
+  providers: ProviderId[];
+  busy: InstructionBusyKind | null;
+}) {
+  const { text } = useI18n();
+  if (!editor.editing) {
+    return (
+      <div className="form-actions">
+        <button className="button" type="button" disabled={busy !== null} onClick={() => { void editor.open(); }}>
+          {busy === "edit-load" ? text("읽는 중…", "Loading…") : text("직접 편집", "Edit files")}
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="skill-editor">
+      <div className="form-row">
+        <label htmlFor="instruction-edit-name">{text("표시 이름", "Display name")}</label>
+        <input id="instruction-edit-name" value={editor.name} onChange={(event) => editor.setName(event.target.value)} disabled={busy !== null} />
+      </div>
+      <div className="form-row">
+        <label htmlFor="instruction-edit-description">{text("설명", "Description")}</label>
+        <textarea id="instruction-edit-description" rows={2} value={editor.description} onChange={(event) => editor.setDescription(event.target.value)} disabled={busy !== null} />
+      </div>
+      {providers.map((provider) => (
+        <div className="form-row" key={provider}>
+          <label htmlFor={`instruction-edit-${provider}`}>{providerFileName(provider)}</label>
+          <div>
+            <textarea
+              id={`instruction-edit-${provider}`}
+              rows={8}
+              value={editor.contents[provider] ?? ""}
+              onChange={(event) => editor.setContents((current) => ({ ...current, [provider]: event.target.value }))}
+              disabled={busy !== null}
+            />
+            {editor.variantSources[provider] && (
+              <small className="settings-storage-note">{text(
+                `${platformLabel(editor.variantSources[provider] as HostPlatform, text)} 변형에서 읽었습니다. 저장하면 base 파일에 씁니다.`,
+                `Loaded from the ${platformLabel(editor.variantSources[provider] as HostPlatform, text)} variant. Saving writes to the base file.`,
+              )}</small>
+            )}
+          </div>
+        </div>
+      ))}
+      <div className="form-actions">
+        <button className="button" type="button" disabled={busy !== null} onClick={editor.close}>
+          {text("취소", "Cancel")}
+        </button>
+        <button className="button primary" type="button" disabled={busy !== null} onClick={() => { void editor.save(); }}>
+          {busy === "edit-save" ? text("저장 중…", "Saving…") : text("저장하고 재배포", "Save and redeploy")}
+        </button>
       </div>
     </div>
   );
@@ -1540,12 +1898,9 @@ function InstructionTrashDrawer({
   onClose: () => void;
 }) {
   const { text } = useI18n();
-  const runBusy = busyRunner(setBusy, setError);
+  const runBusy = instructionBusyRunner(setBusy, setError);
 
-  // 지침 하나를 지우면 공통 원본과 배포 파일이 한 groupId로 함께 들어오고, 복구도 그 그룹 단위로 돈다
-  // (instruction_trash.rs). 행 하나의 '복구'가 다른 행까지 되살린다는 사실을 스킬 휴지통과 같은 배지로 알린다.
-  const groupSize = (item: InstructionTrashItem) =>
-    trash.items.filter((candidate) => candidate.groupId === item.groupId).length;
+  const groupSize = useTrashGroupSizes(trash.items);
 
   const restore = async (id: string) => {
     await runBusy("trash-restore", async () => {
@@ -1591,30 +1946,28 @@ function InstructionTrashDrawer({
       )}</p>
       <div className="detail-card skill-trash-list">
         {trash.items.map((item) => (
-          <div className="skill-trash-row" key={item.id}>
-            <div className="skill-trash-main">
-              <div className="skill-trash-head">
-                <strong>{item.name}</strong>
-                {item.provider && <SourceBadge source={item.provider} />}
-                <small>{item.kind === "directory"
-                  ? text("공통 원본", "Shared source")
-                  : item.scope === "personal"
-                    ? text("개인 배포 파일", "Personal deployed file")
-                    : text("프로젝트 배포 파일", "Project deployed file")}</small>
-                <small>{new Date(item.deletedAtMs).toLocaleString()}</small>
-                {groupSize(item) > 1 && <small>{text(`그룹 ${groupSize(item)}개 항목`, `group of ${groupSize(item)}`)}</small>}
-              </div>
-              <code>{item.originalPath}</code>
-            </div>
-            <div className="skill-trash-actions">
+          <TrashRow
+            key={item.id}
+            groupSize={groupSize(item)}
+            path={item.originalPath}
+            actions={<>
               <button className="button compact" type="button" disabled={busy !== null} onClick={() => { void restore(item.id); }}>
                 {text("복구", "Restore")}
               </button>
               <button className="button compact danger-subtle" type="button" disabled={busy !== null} onClick={() => { void purge(item.id); }}>
                 {text("영구 삭제", "Delete forever")}
               </button>
-            </div>
-          </div>
+            </>}
+          >
+            <strong>{item.name}</strong>
+            {item.provider && <SourceBadge source={item.provider} />}
+            <small>{item.kind === "directory"
+              ? text("공통 원본", "Shared source")
+              : item.scope === "personal"
+                ? text("개인 배포 파일", "Personal deployed file")
+                : text("프로젝트 배포 파일", "Project deployed file")}</small>
+            <small>{new Date(item.deletedAtMs).toLocaleString()}</small>
+          </TrashRow>
         ))}
       </div>
     </Drawer>
@@ -1627,11 +1980,11 @@ function deploymentKey(deployment: ProjectInstructionDeployment): string {
 
 function deploymentLabel(
   deployment: ProjectInstructionDeployment,
-  text: (ko: string, en: string) => string,
+  text: UiText,
 ): string {
   const location = deployment.scope === "personal"
     ? text("개인 설정", "Personal settings")
-    : projectDisplayName(deployment.projectPath);
+    : lastPathSegment(deployment.projectPath);
   return `${location} · ${providerFileName(deployment.provider)}`;
 }
 
@@ -1641,7 +1994,7 @@ function deploymentLabel(
  */
 function divergenceReason(
   deployment: ProjectInstructionDeployment,
-  text: (ko: string, en: string) => string,
+  text: UiText,
 ): string {
   const parts: string[] = [];
   if (deployment.contentDigest !== deployment.sourceDigest) {
@@ -1656,8 +2009,12 @@ function divergenceReason(
   return parts.join(" · ");
 }
 
-/** 프로젝트 경로 마지막 조각. 매트릭스 행 라벨용이고 전체 경로는 title로 보여준다. */
-function projectDisplayName(path: string): string {
+/**
+ * 경로의 마지막 조각. 매트릭스 행 라벨과 문서 트리 라벨이 쓰고, 전체 경로는 둘 다 title로
+ * 보여준다. 같은 계산이 두 벌 있었고 한쪽만 `/`로 갈라 윈도우 경로에서 통째로 나왔다 —
+ * 이 파일의 `deploymentRoot`는 처음부터 두 구분자를 함께 봤으므로 그쪽에 맞춘다.
+ */
+function lastPathSegment(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] ?? path;
 }
@@ -1674,44 +2031,96 @@ interface InfoFile {
   archived: ProjectInstructionDeployment | null;
 }
 
-interface InfoFilterOption<V extends string> {
-  value: V;
-  label: string;
-  /** 이 값을 골랐을 때 남는 파일. 버튼에 붙는 개수도 같은 판정을 쓴다. */
-  accept: (file: InfoFile) => boolean;
+interface ArchivedInstructionMatch {
+  key: string;
+  deployment: ProjectInstructionDeployment;
 }
 
 /**
- * 정보 탭 툴바의 필터 묶음 하나. 위치·공급자·보관 세 묶음이 마크업도 개수 규칙도
- * 같아서 한 벌로 모았다. 개수는 자기 축을 뺀 나머지 필터만 적용해 세므로 세는 일은
- * 호출부(countWhere)가 하고 여기서는 고른 값과 그 판정만 넘겨받는다.
+ * 실제 배포 위치를 관리하는 보관 원본을 찾는다. 내용까지 일치하는 원본을 우선하고,
+ * 모두 갈라졌다면 연결 문서 정보를 보여 줄 첫 원본을 대신 돌려준다.
  */
-function InfoFilterGroup<V extends string>({ label, groupLabel, options, value, onChange, count }: {
-  label: string;
-  groupLabel: string;
-  options: readonly InfoFilterOption<V>[];
-  value: V;
-  onChange: (value: V) => void;
-  count: (accept: (file: InfoFile) => boolean) => number;
-}) {
-  return (
-    <div className="skill-filter-group">
-      <span className="skill-filter-label">{label}</span>
-      <div className="source-tabs" role="group" aria-label={groupLabel}>
-        {options.map((option) => (
-          <button
-            className={value === option.value ? "active" : ""}
-            type="button"
-            key={option.value}
-            aria-pressed={value === option.value}
-            onClick={() => onChange(option.value)}
-          >
-            {option.label}<small>{count(option.accept).toLocaleString()}</small>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
+function archivedInstructionMatch(
+  entries: readonly ProjectInstructionEntry[],
+  deployment: ProjectInstructionDeployment,
+): ArchivedInstructionMatch | null {
+  let divergentMatch: ArchivedInstructionMatch | null = null;
+  for (const entry of entries) {
+    for (const candidate of entry.deployments) {
+      if (candidate.provider !== deployment.provider
+        || candidate.scope !== deployment.scope
+        || candidate.projectPath !== deployment.projectPath
+        || !candidate.managed || !candidate.present || candidate.message) continue;
+      if (!candidate.divergent) return { key: entry.key, deployment: candidate };
+      divergentMatch ??= { key: entry.key, deployment: candidate };
+    }
+  }
+  return divergentMatch;
+}
+
+/** 위치 한 줄과 그 아래 설 지침 파일. 트리 컴포넌트가 그대로 받는 모양이다. */
+interface InfoGroupRow extends DeploymentLocationRow {
+  files: InfoFile[];
+}
+
+interface InfoFilters {
+  location: InfoLocationFilter;
+  provider: InfoProviderFilter;
+  state: InfoStateFilter;
+}
+
+/**
+ * 필터 축 셋의 판정. 남길 파일을 고르는 일과 버튼에 붙는 개수를 세는 일이 같은 조건을
+ * 각자 적어 두고 있었다. 조건이 여기 한 벌만 있으면 축을 늘리거나 규칙을 고칠 때 한쪽만
+ * 바뀌는 일이 생기지 않는다. 스킬 목록과 같은 조립기를 쓴다.
+ */
+const INFO_FILTER = filterMatcher<InfoFile, InfoFilters>({
+  location: (file, value) => value === "all" || file.deployment.scope === value,
+  provider: (file, value) => value === "all" || file.deployment.provider === value,
+  state: (file, value) => value === "all"
+    || (value === "archived" ? file.matched !== null : file.matched === null),
+});
+
+/**
+ * 지침정보 탭의 필터 축 셋. 개수 배지·활성 표시·"고르면 그 축만 바꾼다"는 축 줄에서 나오므로
+ * 여기에는 이름표와 고를 수 있는 값만 적는다. 세 축 모두 0건 칩도 눌러서 그 축으로 옮겨 갈 수
+ * 있어야 하므로 칩 줄의 잠금 규칙은 끈다.
+ */
+function infoFilterAxes(text: UiText): FilterAxisSpec<InfoFilters>[] {
+  return filterAxes<InfoFilters>([
+    {
+      axis: "location",
+      label: text("위치", "Location"),
+      groupLabel: text("지침 위치 필터", "Instruction location filter"),
+      alwaysEnabled: true,
+      chips: [
+        { value: "all", label: text("전체", "All") },
+        { value: "personal", label: text("개인", "Personal") },
+        { value: "project", label: text("프로젝트", "Project") },
+      ],
+    },
+    {
+      axis: "provider",
+      label: text("공급자", "Provider"),
+      groupLabel: text("지침 공급자 필터", "Instruction provider filter"),
+      alwaysEnabled: true,
+      chips: [
+        { value: "all", label: text("전체", "All") },
+        ...PROVIDER_IDS.map((provider) => ({ value: provider, label: sourceName(provider) })),
+      ],
+    },
+    {
+      axis: "state",
+      label: text("보관", "Archive"),
+      groupLabel: text("지침 보관 상태 필터", "Instruction archive filter"),
+      alwaysEnabled: true,
+      chips: [
+        { value: "all", label: text("전체", "All") },
+        { value: "archived", label: text("보관 일치", "Archived") },
+        { value: "unarchived", label: text("미보관", "Unarchived") },
+      ],
+    },
+  ]);
 }
 
 /** 지침 파일과 그 문서가 참조하는 연결 문서를 같은 모양으로 다루는 열람 캐시 항목. */
@@ -1746,11 +2155,6 @@ function deploymentRoot(filePath: string): string {
   return filePath.replace(/[\\/][^\\/]*$/, "");
 }
 
-/** 트리 라벨용 경로 마지막 조각. 전체 경로는 title로 보여준다. */
-function pathTail(path: string): string {
-  const parts = path.split("/").filter(Boolean);
-  return parts[parts.length - 1] ?? path;
-}
 
 /**
  * 지침 정보 화면의 문서 트리 상태. 어떤 노드를 고르고 폈는지, 그 노드의 원문을
@@ -1760,7 +2164,7 @@ function pathTail(path: string): string {
 function useInstructionDocTree(
   filtered: InfoFile[],
   library: ProjectInstructionLibrary,
-  setBusy: (value: string | null) => void,
+  setBusy: (value: InstructionBusyKind | null) => void,
   setError: (value: string | null) => void,
 ) {
   const [selectedFile, setSelectedFile] = useState("");
@@ -1930,7 +2334,7 @@ function InstructionInfoPanel({
   onAutomationChange,
 }: {
   library: ProjectInstructionLibrary;
-  setBusy: (value: string | null) => void;
+  setBusy: (value: InstructionBusyKind | null) => void;
   setError: (value: string | null) => void;
   selectInstruction: (key: string) => void;
   /** 번역이 저장된 보관 원본 키. 버튼 문구를 번역/재번역으로 가른다. */
@@ -1939,31 +2343,13 @@ function InstructionInfoPanel({
   onAutomationChange?: (snapshot: SystemAutomationSnapshot) => void;
 }) {
   const { text } = useI18n();
-  const [locationFilter, setLocationFilter] = useState<InfoLocationFilter>("all");
-  const [providerFilter, setProviderFilter] = useState<InfoProviderFilter>("all");
-  const [stateFilter, setStateFilter] = useState<InfoStateFilter>("all");
+  const [filters, setFilters] = useState<InfoFilters>({ location: "all", provider: "all", state: "all" });
 
   const files = useMemo<InfoFile[]>(() => {
-    // 이 위치를 관리하는 보관 원본을 찾는다. 내용까지 같은 원본이 있으면 그것이
-    // 보관 일치이고, 갈라진 원본만 있으면 연결 문서 정보만 빌려 온다.
-    const archivedFor = (deployment: ProjectInstructionDeployment) => {
-      let divergentMatch: { key: string; deployment: ProjectInstructionDeployment } | null = null;
-      for (const entry of library.entries) {
-        for (const candidate of entry.deployments) {
-          if (candidate.provider !== deployment.provider
-            || candidate.scope !== deployment.scope
-            || candidate.projectPath !== deployment.projectPath
-            || !candidate.managed || !candidate.present || candidate.message) continue;
-          if (!candidate.divergent) return { key: entry.key, deployment: candidate };
-          divergentMatch ??= { key: entry.key, deployment: candidate };
-        }
-      }
-      return divergentMatch;
-    };
     return library.deployments
       .filter((deployment) => deployment.present && !deployment.message)
       .map((deployment) => {
-        const archived = archivedFor(deployment);
+        const archived = archivedInstructionMatch(library.entries, deployment);
         return {
           deployment,
           matched: archived && !archived.deployment.divergent ? archived.key : null,
@@ -1972,31 +2358,17 @@ function InstructionInfoPanel({
       });
   }, [library]);
 
-  const matches = (file: InfoFile, ignore: "location" | "provider" | "state" | null): boolean =>
-    (ignore === "location" || locationFilter === "all" || file.deployment.scope === locationFilter)
-    && (ignore === "provider" || providerFilter === "all" || file.deployment.provider === providerFilter)
-    && (ignore === "state" || stateFilter === "all"
-      || (stateFilter === "archived" ? file.matched !== null : file.matched === null));
+  const filtered = files.filter((file) => INFO_FILTER.matches(file, filters));
+  /** 그 축만 이 값으로 바꿨을 때 남는 파일 수. 자기 축은 빼고 나머지 필터만 적용한다. */
+  const countWhere = INFO_FILTER.counter(files, filters);
 
-  const filtered = files.filter((file) => matches(file, null));
-  const countWhere = (ignore: "location" | "provider" | "state", accept: (file: InfoFile) => boolean): number =>
-    files.filter((file) => matches(file, ignore) && accept(file)).length;
-
-  const groups = useMemo(() => {
-    const rows: { key: string; scope: "personal" | "project"; label: string; title: string; files: InfoFile[] }[] = [{
-      key: "personal",
-      scope: "personal",
-      label: text("개인 설정", "Personal settings"),
-      title: text("공급자 홈 설정 디렉터리(~/.claude, ~/.codex, ~/.gemini)", "Provider home config directories (~/.claude, ~/.codex, ~/.gemini)"),
-      files: [],
-    }];
-    for (const project of library.projects) {
-      rows.push({ key: project, scope: "project", label: projectDisplayName(project), title: project, files: [] });
-    }
+  const groups = useMemo<InfoGroupRow[]>(() => {
+    const rows = instructionLocationRows(library.projects, text)
+      .map((location): InfoGroupRow => ({ ...location, files: [] }));
     for (const file of filtered) {
       const row = rows.find((candidate) => candidate.scope === "personal"
         ? file.deployment.scope === "personal"
-        : file.deployment.projectPath === candidate.key);
+        : file.deployment.projectPath === candidate.projectPath);
       row?.files.push(file);
     }
     return rows.filter((row) => row.files.length > 0);
@@ -2006,6 +2378,69 @@ function InstructionInfoPanel({
     docs, expanded, collapsed, selected, selectedFile, selectedTrail, selectedNodeId,
     selectNode, activateNode, toggleGroup, downloadSelected,
   } = useInstructionDocTree(filtered, library, setBusy, setError);
+
+  return (
+    <>
+      <section className="toolbar-card skill-library-filterbar">
+        <FilterAxisBar axes={infoFilterAxes(text)} filters={filters} countWhere={countWhere} onChange={setFilters} />
+      </section>
+
+      {filtered.length === 0 ? (
+        <EmptyState
+          title={text("조건에 맞는 지침 파일이 없습니다", "No instruction files match the filters")}
+          detail={text("필터를 넓히거나 지침관리 탭에서 지침을 게시하세요.", "Broaden the filters or publish an instruction from the Manage tab.")}
+        />
+      ) : (
+        <div className="instruction-info-layout">
+          <InstructionInfoTree
+            groups={groups}
+            docs={docs}
+            expanded={expanded}
+            collapsed={collapsed}
+            selectedNodeId={selectedNodeId}
+            onToggleGroup={toggleGroup}
+            onActivate={activateNode}
+          />
+          <section className="instruction-info-content">
+            {!selected ? (
+              <EmptyState title={text("왼쪽에서 지침 파일을 선택하세요", "Select an instruction file on the left")} />
+            ) : (
+              <InstructionInfoDetail
+                file={selected}
+                doc={docs[selectedNodeId]}
+                trail={selectedTrail}
+                fileKey={selectedFile}
+                translatedKeys={translatedKeys}
+                automation={automation}
+                onAutomationChange={onAutomationChange}
+                onSelectInstruction={selectInstruction}
+                onSelectNode={selectNode}
+                onDownload={downloadSelected}
+              />
+            )}
+          </section>
+        </div>
+      )}
+    </>
+  );
+}
+
+/**
+ * 지침 파일 트리. 위치 묶음 → 지침 파일 → 연결 문서를 한 축으로 그린다. 연결 문서 가지는
+ * 부모 원문에서 목록이 나오므로 자기 자신을 다시 부르는 꼴이 되는데, 이 재귀를 화면 본문
+ * 안에 클로저로 두면 트리 그리기와 오른쪽 상세 그리기가 같은 함수 몸통에서 섞였다.
+ * 트리에 필요한 것은 캐시·펼침·선택뿐이라 그것만 받는다.
+ */
+function InstructionInfoTree({ groups, docs, expanded, collapsed, selectedNodeId, onToggleGroup, onActivate }: {
+  groups: readonly InfoGroupRow[];
+  docs: Record<string, InstructionDocNode>;
+  expanded: ReadonlySet<string>;
+  collapsed: ReadonlySet<string>;
+  selectedNodeId: string;
+  onToggleGroup: (key: string) => void;
+  onActivate: (fileKey: string, trail: string[]) => void;
+}) {
+  const { text } = useI18n();
 
   const renderLinks = (file: InfoFile, trail: string[], parent: InstructionDocNode, ancestors: string[]) => {
     if (parent.status !== "ready") return null;
@@ -2026,12 +2461,12 @@ function InstructionInfoPanel({
             type="button"
             style={{ paddingLeft: 20 + childTrail.length * 11 }}
             title={doc?.status === "error" ? `${href} — ${doc.message}` : label}
-            onClick={() => activateNode(fileKey, childTrail)}
+            onClick={() => onActivate(fileKey, childTrail)}
           >
             <span>{cyclic || (doc?.status === "ready" && localDocumentLinks(doc.content).length === 0)
               ? "·"
               : open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</span>
-            <strong>{pathTail(label)}</strong>
+            <strong>{lastPathSegment(label)}</strong>
             {doc?.status === "error" && <em className="instruction-tree-pill">{text("열 수 없음", "Unavailable")}</em>}
             {cyclic && <em className="instruction-tree-pill">{text("순환", "Cycle")}</em>}
           </button>
@@ -2042,188 +2477,145 @@ function InstructionInfoPanel({
     });
   };
 
-  const locationOptions: readonly InfoFilterOption<InfoLocationFilter>[] = [
-    { value: "all", label: text("전체", "All"), accept: () => true },
-    { value: "personal", label: text("개인", "Personal"), accept: (file) => file.deployment.scope === "personal" },
-    { value: "project", label: text("프로젝트", "Project"), accept: (file) => file.deployment.scope === "project" },
-  ];
-  const providerOptions: readonly InfoFilterOption<InfoProviderFilter>[] = [
-    { value: "all", label: text("전체", "All"), accept: () => true },
-    ...PROVIDERS.map((provider) => ({
-      value: provider,
-      label: providerLabel(provider),
-      accept: (file: InfoFile) => file.deployment.provider === provider,
-    })),
-  ];
-  const stateOptions: readonly InfoFilterOption<InfoStateFilter>[] = [
-    { value: "all", label: text("전체", "All"), accept: () => true },
-    { value: "archived", label: text("보관 일치", "Archived"), accept: (file) => file.matched !== null },
-    { value: "unarchived", label: text("미보관", "Unarchived"), accept: (file) => file.matched === null },
-  ];
+  return (
+    <aside className="instruction-info-tree" aria-label={text("지침 파일 트리", "Instruction file tree")}>
+      {groups.map((group) => (
+        <div key={group.key}>
+          <button className="tree-row" type="button" title={group.title} onClick={() => onToggleGroup(group.key)}>
+            <span>{collapsed.has(group.key) ? <ChevronRight size={12} /> : <ChevronDown size={12} />}</span>
+            <strong>{group.label}</strong>
+            <em>{group.files.length}</em>
+          </button>
+          {!collapsed.has(group.key) && group.files.map((file) => {
+            const fileKey = deploymentKey(file.deployment);
+            const doc = docs[fileKey];
+            const open = expanded.has(fileKey);
+            return (
+              <div key={fileKey}>
+                <button
+                  className={`tree-row file${fileKey === selectedNodeId ? " active" : ""}`}
+                  type="button"
+                  title={file.deployment.filePath}
+                  onClick={() => onActivate(fileKey, [])}
+                >
+                  <span>{open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</span>
+                  <strong>{providerFileName(file.deployment.provider)}</strong>
+                  {file.matched
+                    ? <em className="instruction-tree-pill archived" title={text(`보관 원본 '${file.matched}'과 일치`, `Matches archived source '${file.matched}'`)}>{file.matched}</em>
+                    : <em className="instruction-tree-pill">{text("미보관", "Unarchived")}</em>}
+                </button>
+                {open && doc && renderLinks(file, [], doc, [])}
+              </div>
+            );
+          })}
+        </div>
+      ))}
+    </aside>
+  );
+}
 
-  const selectedDoc = selected ? docs[selectedNodeId] : undefined;
-  const selectedHref = selectedTrail[selectedTrail.length - 1] ?? null;
-  const archivedLinkedCount = selected?.archived?.linkedFiles?.length ?? 0;
+/**
+ * 고른 지침 문서 한 건의 오른쪽 상세. 머리단의 배지·이동 버튼과 본문의 마크다운·원문
+ * 표시가 트리와 한 몸통에 있을 때는 `selected*` 파생값 여섯이 트리 코드 사이에 끼어
+ * 어느 것이 어느 쪽을 위한 값인지 흐렸다. 파생은 모두 여기서 고른 문서로부터 만든다.
+ */
+function InstructionInfoDetail({ file, doc, trail, fileKey, translatedKeys, automation, onAutomationChange, onSelectInstruction, onSelectNode, onDownload }: {
+  file: InfoFile;
+  doc: InstructionDocNode | undefined;
+  trail: string[];
+  fileKey: string;
+  translatedKeys: Set<string>;
+  automation: SystemAutomationSnapshot | null;
+  onAutomationChange?: (snapshot: SystemAutomationSnapshot) => void;
+  onSelectInstruction: (key: string) => void;
+  onSelectNode: (fileKey: string, trail: string[]) => void;
+  onDownload: () => Promise<void>;
+}) {
+  const { text } = useI18n();
+  const selectedHref = trail[trail.length - 1] ?? null;
+  const archivedLinkedCount = file.archived?.linkedFiles?.length ?? 0;
   // 보관되지 않은 링크. 보관 가능한데 원본에 없는 문서와, 위치에 매여 보관하지
   // 않는 링크를 함께 세어 지침 세트가 어디까지 보관됐는지 알린다.
   const outstandingLinks = [
-    ...(selected?.archived?.linkedUnarchived ?? []),
-    ...(selected?.archived?.linkIssues ?? []).map((issue) => `${issue.href} — ${issue.reason}`),
+    ...(file.archived?.linkedUnarchived ?? []),
+    ...(file.archived?.linkIssues ?? []).map((issue) => `${issue.href} — ${issue.reason}`),
   ];
-  const markdown = selectedDoc?.status === "ready"
-    && (selectedDoc.relativePath === null || /\.(md|markdown|mdx|txt)$/i.test(selectedDoc.relativePath));
+  const markdown = doc?.status === "ready"
+    && (doc.relativePath === null || /\.(md|markdown|mdx|txt)$/i.test(doc.relativePath));
 
   return (
     <>
-      <section className="toolbar-card skill-library-filterbar">
-        <InfoFilterGroup
-          label={text("위치", "Location")}
-          groupLabel={text("지침 위치 필터", "Instruction location filter")}
-          options={locationOptions}
-          value={locationFilter}
-          onChange={setLocationFilter}
-          count={(accept) => countWhere("location", accept)}
-        />
-        <InfoFilterGroup
-          label={text("공급자", "Provider")}
-          groupLabel={text("지침 공급자 필터", "Instruction provider filter")}
-          options={providerOptions}
-          value={providerFilter}
-          onChange={setProviderFilter}
-          count={(accept) => countWhere("provider", accept)}
-        />
-        <InfoFilterGroup
-          label={text("보관", "Archive")}
-          groupLabel={text("지침 보관 상태 필터", "Instruction archive filter")}
-          options={stateOptions}
-          value={stateFilter}
-          onChange={setStateFilter}
-          count={(accept) => countWhere("state", accept)}
-        />
-      </section>
-
-      {filtered.length === 0 ? (
-        <EmptyState
-          title={text("조건에 맞는 지침 파일이 없습니다", "No instruction files match the filters")}
-          detail={text("필터를 넓히거나 지침관리 탭에서 지침을 게시하세요.", "Broaden the filters or publish an instruction from the Manage tab.")}
-        />
-      ) : (
-        <div className="instruction-info-layout">
-          <aside className="instruction-info-tree" aria-label={text("지침 파일 트리", "Instruction file tree")}>
-            {groups.map((group) => (
-              <div key={group.key}>
-                <button className="tree-row" type="button" title={group.title} onClick={() => toggleGroup(group.key)}>
-                  <span>{collapsed.has(group.key) ? <ChevronRight size={12} /> : <ChevronDown size={12} />}</span>
-                  <strong>{group.label}</strong>
-                  <em>{group.files.length}</em>
-                </button>
-                {!collapsed.has(group.key) && group.files.map((file) => {
-                  const fileKey = deploymentKey(file.deployment);
-                  const doc = docs[fileKey];
-                  const open = expanded.has(fileKey);
-                  return (
-                    <div key={fileKey}>
-                      <button
-                        className={`tree-row file${fileKey === selectedNodeId ? " active" : ""}`}
-                        type="button"
-                        title={file.deployment.filePath}
-                        onClick={() => activateNode(fileKey, [])}
-                      >
-                        <span>{open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</span>
-                        <strong>{providerFileName(file.deployment.provider)}</strong>
-                        {file.matched
-                          ? <em className="instruction-tree-pill archived" title={text(`보관 원본 '${file.matched}'과 일치`, `Matches archived source '${file.matched}'`)}>{file.matched}</em>
-                          : <em className="instruction-tree-pill">{text("미보관", "Unarchived")}</em>}
-                      </button>
-                      {open && doc && renderLinks(file, [], doc, [])}
-                    </div>
-                  );
-                })}
-              </div>
-            ))}
-          </aside>
-          <section className="instruction-info-content">
-            {!selected ? (
-              <EmptyState title={text("왼쪽에서 지침 파일을 선택하세요", "Select an instruction file on the left")} />
-            ) : (
-              <>
-                <header>
-                  <div>
-                    <strong>{selectedDoc?.status === "ready" && selectedDoc.relativePath !== null
-                      ? selectedDoc.relativePath
-                      : selectedHref ?? providerFileName(selected.deployment.provider)}</strong>
-                    <small>{selectedDoc?.status === "ready"
-                      ? `${selectedDoc.path}${selectedDoc.sizeBytes === null ? "" : ` · ${formatBytes(selectedDoc.sizeBytes)}`}`
-                      : selected.deployment.filePath}</small>
-                  </div>
-                  <div className="instruction-info-head-actions">
-                    <SourceBadge source={selected.deployment.provider} />
-                    {selectedTrail.length === 0 && selected.deployment.scope === "personal" && <span className="skill-origin-pill">{text("개인", "Personal")}</span>}
-                    {selectedTrail.length === 0 && archivedLinkedCount > 0 && (
-                      <span className="skill-origin-pill" title={selected.archived?.linkedFiles?.join("\n")}>
-                        {text(`연결 문서 ${archivedLinkedCount}개 보관`, `${archivedLinkedCount} linked doc(s) archived`)}
-                      </span>
-                    )}
-                    {selectedTrail.length === 0 && outstandingLinks.length > 0 && (
-                      <span className="skill-origin-pill" title={outstandingLinks.join("\n")}>
-                        {text(`보관 안 된 링크 ${outstandingLinks.length}개`, `${outstandingLinks.length} link(s) not archived`)}
-                      </span>
-                    )}
-                    {selectedTrail.length === 0 && selected.matched && (
-                      <button className="button compact" type="button" onClick={() => selectInstruction(selected.matched as string)}>
-                        {text("보관 원본으로 이동", "Go to archived source")}
-                      </button>
-                    )}
-                    {selectedTrail.length === 0 && selected.matched && onAutomationChange && (
-                      <TranslateResourceButton
-                        menu="instructions"
-                        resourceId={selected.matched}
-                        translated={translatedKeys.has(selected.matched)}
-                        automation={automation}
-                        onAutomationChange={onAutomationChange}
-                      />
-                    )}
-                    {selectedTrail.length > 0 && (
-                      <>
-                        <button className="button compact" type="button" onClick={() => selectNode(selectedFile, selectedTrail.slice(0, -1))}>
-                          {text("상위 문서", "Parent document")}
-                        </button>
-                        <button className="button compact" type="button" disabled={selectedDoc?.status !== "ready"} onClick={() => { void downloadSelected(); }}>
-                          {text("다운로드", "Download")}
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </header>
-                <div className="instruction-info-body">
-                  {!selectedDoc
-                    ? <LoadingState label={text("문서를 읽고 있습니다", "Reading the document")} />
-                    : selectedDoc.status === "error"
-                      ? <ErrorBanner message={selectedDoc.message} />
-                      : selectedDoc.content.trim()
-                        ? <>
-                          {markdown
-                            ? <MarkdownPreview
-                              source={selectedDoc.content}
-                              compact
-                              linkImports
-                              onOpenLocalLink={(href) => selectNode(selectedFile, [...selectedTrail, href])}
-                            />
-                            : <pre className="markdown-source">{selectedDoc.content}</pre>}
-                          {markdown && (
-                            <details className="original-content">
-                              <summary>{text("원문 보기", "View original")}</summary>
-                              <pre className="markdown-source">{selectedDoc.content}</pre>
-                            </details>
-                          )}
-                        </>
-                        : <p className="prose-copy">{text("(빈 파일)", "(Empty file)")}</p>}
-                </div>
-              </>
-            )}
-          </section>
+      <header>
+        <div>
+          <strong>{doc?.status === "ready" && doc.relativePath !== null
+            ? doc.relativePath
+            : selectedHref ?? providerFileName(file.deployment.provider)}</strong>
+          <small>{doc?.status === "ready"
+            ? `${doc.path}${doc.sizeBytes === null ? "" : ` · ${formatBytes(doc.sizeBytes)}`}`
+            : file.deployment.filePath}</small>
         </div>
-      )}
+        <div className="instruction-info-head-actions">
+          <SourceBadge source={file.deployment.provider} />
+          {trail.length === 0 && file.deployment.scope === "personal" && <span className="skill-origin-pill">{text("개인", "Personal")}</span>}
+          {trail.length === 0 && archivedLinkedCount > 0 && (
+            <span className="skill-origin-pill" title={file.archived?.linkedFiles?.join("\n")}>
+              {text(`연결 문서 ${archivedLinkedCount}개 보관`, `${archivedLinkedCount} linked doc(s) archived`)}
+            </span>
+          )}
+          {trail.length === 0 && outstandingLinks.length > 0 && (
+            <span className="skill-origin-pill" title={outstandingLinks.join("\n")}>
+              {text(`보관 안 된 링크 ${outstandingLinks.length}개`, `${outstandingLinks.length} link(s) not archived`)}
+            </span>
+          )}
+          {trail.length === 0 && file.matched && (
+            <button className="button compact" type="button" onClick={() => onSelectInstruction(file.matched as string)}>
+              {text("보관 원본으로 이동", "Go to archived source")}
+            </button>
+          )}
+          {trail.length === 0 && file.matched && onAutomationChange && (
+            <TranslateResourceButton
+              menu="instructions"
+              resourceId={file.matched}
+              translated={translatedKeys.has(file.matched)}
+              automation={automation}
+              onAutomationChange={onAutomationChange}
+            />
+          )}
+          {trail.length > 0 && (
+            <>
+              <button className="button compact" type="button" onClick={() => onSelectNode(fileKey, trail.slice(0, -1))}>
+                {text("상위 문서", "Parent document")}
+              </button>
+              <button className="button compact" type="button" disabled={doc?.status !== "ready"} onClick={() => { void onDownload(); }}>
+                {text("다운로드", "Download")}
+              </button>
+            </>
+          )}
+        </div>
+      </header>
+      <div className="instruction-info-body">
+        {!doc
+          ? <LoadingState label={text("문서를 읽고 있습니다", "Reading the document")} />
+          : doc.status === "error"
+            ? <ErrorBanner message={doc.message} />
+            : doc.content.trim()
+              ? <>
+                {markdown
+                  ? <MarkdownPreview
+                    source={doc.content}
+                    compact
+                    linkImports
+                    onOpenLocalLink={(href) => onSelectNode(fileKey, [...trail, href])}
+                  />
+                  : <pre className="markdown-source">{doc.content}</pre>}
+                {markdown && (
+                  <OriginalContent>
+                    <pre className="markdown-source">{doc.content}</pre>
+                  </OriginalContent>
+                )}
+              </>
+              : <p className="prose-copy">{text("(빈 파일)", "(Empty file)")}</p>}
+      </div>
     </>
   );
 }
@@ -2241,24 +2633,19 @@ interface ImportLocationRow {
  */
 function instructionImportLocations(
   library: ProjectInstructionLibrary,
-  text: (ko: string, en: string) => string,
+  text: UiText,
 ): ImportLocationRow[] {
   const candidates = library.deployments.filter((deployment) => deployment.present && !deployment.message);
-  const rows: ImportLocationRow[] = [];
-  const personal = candidates.filter((candidate) => candidate.scope === "personal");
-  if (personal.length > 0) {
-    rows.push({
-      key: PERSONAL_LOCATION,
-      label: text("개인 설정", "Personal settings"),
-      title: text("공급자 홈 설정 디렉터리(~/.claude, ~/.codex, ~/.gemini)", "Provider home config directories (~/.claude, ~/.codex, ~/.gemini)"),
-      files: personal,
-    });
-  }
-  for (const project of library.projects) {
-    const files = candidates.filter((candidate) => candidate.scope !== "personal" && candidate.projectPath === project);
-    if (files.length > 0) rows.push({ key: project, label: projectDisplayName(project), title: project, files });
-  }
-  return rows;
+  return instructionLocationRows(library.projects, text, PERSONAL_LOCATION)
+    .map((location) => ({
+      key: location.key,
+      label: location.label,
+      title: location.title,
+      files: candidates.filter((candidate) => location.scope === "personal"
+        ? candidate.scope === "personal"
+        : candidate.scope !== "personal" && candidate.projectPath === location.projectPath),
+    }))
+    .filter((row) => row.files.length > 0);
 }
 
 /**
@@ -2826,15 +3213,21 @@ function CreateInstructionModal({
   const [description, setDescription] = useState("");
   const [providers, setProviders] = useState<ProviderId[]>(["codex"]);
   const [platforms, setPlatforms] = useState<HostPlatform[]>([]);
-  const [contents, setContents] = useState<Record<ProviderId, string>>({ ...INSTRUCTION_TEMPLATE });
+  const [contents, setContents] = useState<Record<ProviderId, string>>(() => Object.fromEntries(
+    PROVIDER_IDS.map((provider) => [provider, initialInstructionBody(provider)]),
+  ) as Record<ProviderId, string>);
   const [error, setLocalError] = useState<string | null>(null);
+
+  // 실패는 모달 안에 남겨야 하므로 오류를 로컬 상태로 받되, 화면 위쪽에 이미 떠 있던
+  // 오류는 공통 껍데기가 시작할 때 비우는 그 한 번으로 함께 걷는다.
+  const runBusy = instructionBusyRunner(setBusy, (value) => {
+    setError(null);
+    setLocalError(value);
+  });
 
   const submit = async (event?: FormEvent) => {
     event?.preventDefault();
-    setBusy("create");
-    setError(null);
-    setLocalError(null);
-    try {
+    await runBusy("create", async () => {
       const entry = await createProjectInstruction({
         key: key.trim(),
         name: name.trim() || key.trim(),
@@ -2846,11 +3239,7 @@ function CreateInstructionModal({
       onClose();
       await refresh();
       reportChanged(text(`${entry.name} 지침을 만들었습니다.`, `Created ${entry.name}.`));
-    } catch (cause) {
-      setLocalError(errorMessage(cause));
-    } finally {
-      setBusy(null);
-    }
+    });
   };
 
   const ready = Boolean(key.trim()) && providers.length > 0 && providers.every((provider) => contents[provider].trim());
@@ -2876,7 +3265,14 @@ function CreateInstructionModal({
       <form onSubmit={(event) => { void submit(event); }}>
         <div className="form-row">
           <label htmlFor="instruction-create-key">{text("키", "Key")}</label>
-          <input id="instruction-create-key" value={key} onChange={(event) => setKey(event.target.value)} placeholder="team-instruction" disabled={busy !== null} autoFocus />
+          <input id="instruction-create-key" value={key} onChange={(event) => setKey(event.target.value)} placeholder="team-instruction" disabled={busy !== null} autoFocus maxLength={INSTRUCTION_KEY_MAX} />
+          {/* 규칙을 만들기 전에 알린다. 적어 두지 않으면 한글·공백 키를 다 친 뒤에야
+              백엔드 거절로 알게 된다(QA #87). 문구는 백엔드 검증과 같은 규칙이다
+              (`project_instructions.rs`의 `validate_instruction_key`). */}
+          <small>{text(
+            `영문·숫자·하이픈·밑줄만, 1~${INSTRUCTION_KEY_MAX}자`,
+            `Letters, digits, hyphens and underscores only, 1–${INSTRUCTION_KEY_MAX} characters`,
+          )}</small>
         </div>
         <div className="form-row">
           <label htmlFor="instruction-create-name">{text("표시 이름", "Display name")}</label>
@@ -2889,27 +3285,25 @@ function CreateInstructionModal({
         <div className="form-row">
           <label>{text("지원 OS", "Supported OS")}</label>
           <div>
-            <div className="skill-use-matrix">
-              {PLATFORMS.map((platform) => (
-                <label className={`skill-use-toggle${platforms.includes(platform) ? " used" : ""}`} key={platform}>
-                  <input type="checkbox" checked={platforms.includes(platform)} onChange={() => setPlatforms(toggleValue(platforms, platform))} disabled={busy !== null} />
-                  {platformLabel(platform, text)}
-                </label>
-              ))}
-            </div>
+            <ToggleMatrix
+              values={HOST_PLATFORMS}
+              selected={platforms}
+              disabled={busy !== null}
+              label={(platform) => platformLabel(platform, text)}
+              onChange={setPlatforms}
+            />
             <small className="settings-storage-note">{text("미선택이면 모든 OS에서 같은 지침을 사용합니다.", "Leave unselected to use the same instruction on every OS.")}</small>
           </div>
         </div>
         <div className="form-row">
           <label>{text("공급자", "Providers")}</label>
-          <div className="skill-use-matrix">
-            {PROVIDERS.map((provider) => (
-              <label className={`skill-use-toggle${providers.includes(provider) ? " used" : ""}`} key={provider}>
-                <input type="checkbox" checked={providers.includes(provider)} onChange={() => setProviders(toggleValue(providers, provider))} disabled={busy !== null} />
-                {providerLabel(provider)}
-              </label>
-            ))}
-          </div>
+          <ToggleMatrix
+            values={PROVIDER_IDS}
+            selected={providers}
+            disabled={busy !== null}
+            label={sourceName}
+            onChange={setProviders}
+          />
         </div>
         {providers.map((provider) => (
           <div className="form-row" key={provider}>
@@ -2932,36 +3326,16 @@ function toggleValue<T>(values: T[], value: T): T[] {
   return values.includes(value) ? values.filter((item) => item !== value) : [...values, value];
 }
 
-function arraysEqual<T>(left: T[], right: T[]): boolean {
-  return left.length === right.length && left.every((value) => right.includes(value));
-}
-
-function providerLabel(provider: ProviderId): string {
-  switch (provider) {
-    case "claude": return "Claude";
-    case "codex": return "Codex";
-    case "antigravity": return "Antigravity";
-  }
-}
-
 function providerFileName(provider: ProviderId): string {
-  switch (provider) {
-    case "claude": return "CLAUDE.md";
-    case "codex": return "AGENTS.md";
-    case "antigravity": return "GEMINI.md";
-  }
+  return INSTRUCTION_FILE_NAMES[provider];
 }
 
-function platformLabel(platform: HostPlatform, text: (ko: string, en: string) => string): string {
-  switch (platform) {
-    case "macos": return "macOS";
-    case "windows": return "Windows";
-    case "linux": return "Linux";
-    default: return text("알 수 없음", "Unknown");
-  }
+/** 새로 만드는 지침의 처음 내용. 파일 이름을 제목 한 줄로 세운 빈 문서다. */
+function initialInstructionBody(provider: ProviderId): string {
+  return `# ${providerFileName(provider)}\n`;
 }
 
 /** 지침 화면은 `Error`가 아닌 거절을 원문 대신 같은 안내 문장으로 보여 준다. */
 function errorMessage(cause: unknown): string {
-  return errorText(cause, "요청을 처리하지 못했습니다.");
+  return errorText(cause, runtimeText("요청을 처리하지 못했습니다.", "The request could not be completed."));
 }

@@ -33,7 +33,13 @@ test("공급자별로 걸러 해당 공급자에서 쓴 모델만 남긴다", ()
   const sessions = [
     session("claude", "claude-fable-5", 30),
     session("codex", "gpt-5.6-sol", 20),
+    session("claude", "claude-fable-5", 50),
+    session("claude", "claude-opus-5", 40),
   ];
-  assert.deepEqual(recentModelsFor(sessions, "claude").map((option) => option.model), ["claude-fable-5"]);
+  assert.deepEqual(recentModelsFor(sessions, "claude"), [
+    { source: "claude", model: "claude-fable-5", count: 2, updatedAt: 50 },
+    { source: "claude", model: "claude-opus-5", count: 1, updatedAt: 40 },
+  ]);
   assert.deepEqual(recentModelsFor(sessions, "antigravity"), []);
 });
+

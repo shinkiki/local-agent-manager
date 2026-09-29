@@ -21,6 +21,16 @@ test("chat close confirmation remains enabled until the preference is hidden", (
 });
 
 test("chat close confirmation fails safe when preference storage is unavailable", () => {
-  assert.equal(shouldConfirmChatClose({ getItem: () => { throw new Error("blocked"); } }), true);
-  assert.doesNotThrow(() => hideChatCloseConfirmation({ setItem: () => { throw new Error("blocked"); } }));
+  const blocked = {
+    getItem: () => { throw new Error("blocked"); },
+    setItem: () => { throw new Error("blocked"); },
+  };
+
+  assert.equal(shouldConfirmChatClose(blocked), true);
+  assert.doesNotThrow(() => hideChatCloseConfirmation(blocked));
+});
+
+test("chat close confirmation keeps asking when there is no storage at all", () => {
+  assert.equal(shouldConfirmChatClose(null), true);
+  assert.doesNotThrow(() => hideChatCloseConfirmation(null));
 });

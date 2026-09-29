@@ -1,0 +1,1327 @@
+{
+  "schemaVersion": 1,
+  "packId": "agent-manager",
+  "version": "1.0.0",
+  "displayName": "기본 온보딩",
+  "cards": [
+    {
+      "id": "project-milestones",
+      "icon": "target",
+      "title": {
+        "ko": "프로젝트 진행 온보딩",
+        "en": "Project delivery onboarding"
+      },
+      "summary": {
+        "ko": "프로젝트를 고르고 목표와 마일스톤을 확인해 한 회차씩 진행하는 워크플로를 등록합니다.",
+        "en": "Pick a project, set the goal, confirm milestones, and register a workflow that advances it round by round."
+      },
+      "description": {
+        "ko": "등록된 프로젝트 하나를 골라 목표와 완료 기준을 정하고, 마일스톤을 어디서 읽을지 고릅니다. 코드 저장소든 문서·조사 작업이든 같은 회차로 돌며, 커밋은 저장소일 때만 합니다.",
+        "en": "Choose a registered project, state the goal and definition of done, and pick where milestones live. Code repositories and document or research work use the same round; committing happens only when it is a repository."
+      },
+      "steps": [
+        {
+          "id": "project",
+          "title": {
+            "ko": "프로젝트 선택",
+            "en": "Project"
+          },
+          "hint": {
+            "ko": "어느 프로젝트를 어떤 브랜치에서 진행할지",
+            "en": "Which project, on which branch"
+          },
+          "fields": [
+            {
+              "key": "projectPath",
+              "label": {
+                "ko": "프로젝트",
+                "en": "Project"
+              },
+              "kind": "projectPicker",
+              "required": true,
+              "wide": true,
+              "help": {
+                "ko": "Agent Manager가 세션에서 확인한 활성 프로젝트입니다.",
+                "en": "Active projects Agent Manager discovered from sessions."
+              }
+            },
+            {
+              "key": "branch",
+              "label": {
+                "ko": "작업브랜치(저장소일 때)",
+                "en": "Development line (repositories only)"
+              },
+              "kind": "branchPicker",
+              "help": {
+                "ko": "고른 프로젝트에서 읽어 온 브랜치입니다. 현재 브랜치가 미리 채워지고, 목록에 없는 이름을 적으면 첫 회차가 현재 위치에서 그 브랜치를 만듭니다. 비워 두면 커밋하지 않습니다.",
+                "en": "Branches read from the chosen project; the current one is prefilled. Typing a name that does not exist makes the first round create it from the current commit. Empty means no commit."
+              },
+              "allowOther": true
+            },
+            {
+              "key": "projectKey",
+              "label": {
+                "ko": "워크플로 id",
+                "en": "Workflow id"
+              },
+              "kind": "text",
+              "required": true,
+              "placeholder": {
+                "ko": "영소문자·숫자·하이픈. 예: hr-portal",
+                "en": "lowercase, digits, hyphens — e.g. hr-portal"
+              },
+              "help": {
+                "ko": "만들어질 워크플로와 절차 스킬의 이름이 됩니다. 프로젝트마다 달라야 합니다.",
+                "en": "Becomes the name of the workflow and its procedure skill; it must differ per project."
+              }
+            }
+          ]
+        },
+        {
+          "id": "goal",
+          "title": {
+            "ko": "목표 설정",
+            "en": "Goal"
+          },
+          "hint": {
+            "ko": "무엇을 어디까지, 한 회차에 얼마나",
+            "en": "What, how far, and how much per round"
+          },
+          "fields": [
+            {
+              "key": "workKind",
+              "label": {
+                "ko": "작업 종류",
+                "en": "Kind of work"
+              },
+              "kind": "select",
+              "required": true,
+              "wide": true,
+              "defaultValue": "코드 변경",
+              "options": [
+                {
+                  "value": "코드 변경",
+                  "label": {
+                    "ko": "코드 변경",
+                    "en": "Code changes"
+                  }
+                },
+                {
+                  "value": "문서·산출물",
+                  "label": {
+                    "ko": "문서·산출물",
+                    "en": "Documents and deliverables"
+                  }
+                },
+                {
+                  "value": "조사·분석",
+                  "label": {
+                    "ko": "조사·분석",
+                    "en": "Research and analysis"
+                  }
+                },
+                {
+                  "value": "섞여 있음",
+                  "label": {
+                    "ko": "섞여 있음",
+                    "en": "Mixed"
+                  }
+                }
+              ],
+              "help": {
+                "ko": "코드가 아닌 작업이면 회차가 빌드·테스트 대신 완료 기준으로 확인하고, 저장소가 아니면 커밋 없이 산출물을 제자리에 남깁니다.",
+                "en": "For non-code work the round checks the definition of done instead of build and tests, and without a repository it leaves deliverables in place rather than committing."
+              },
+              "allowOther": true
+            },
+            {
+              "key": "goal",
+              "label": {
+                "ko": "목표",
+                "en": "Goal"
+              },
+              "kind": "textarea",
+              "required": true,
+              "wide": true,
+              "placeholder": {
+                "ko": "예: 주문 목록 화면을 새 컴포넌트로 옮긴다 / 운영 이관 문서를 완성한다",
+                "en": "e.g. move the order list to the new components, or finish the handover document"
+              }
+            },
+            {
+              "key": "doneCriteria",
+              "label": {
+                "ko": "완료 기준",
+                "en": "Definition of done"
+              },
+              "kind": "textarea",
+              "wide": true,
+              "placeholder": {
+                "ko": "예: 마일스톤 항목이 모두 완료이고 검증이 통과한다 / 검토자가 승인한다",
+                "en": "e.g. every milestone item is done and checks pass, or a reviewer signs off"
+              }
+            },
+            {
+              "key": "roundScope",
+              "label": {
+                "ko": "회차당 진행량",
+                "en": "Work per round"
+              },
+              "kind": "select",
+              "defaultValue": "one-item",
+              "options": [
+                {
+                  "value": "one-item",
+                  "label": {
+                    "ko": "마일스톤 항목 1건",
+                    "en": "One milestone item"
+                  }
+                },
+                {
+                  "value": "one-milestone",
+                  "label": {
+                    "ko": "마일스톤 1개",
+                    "en": "One milestone"
+                  }
+                }
+              ],
+              "allowOther": true
+            },
+            {
+              "key": "deadline",
+              "label": {
+                "ko": "마감",
+                "en": "Deadline"
+              },
+              "kind": "text",
+              "placeholder": {
+                "ko": "예: 2026-12-31",
+                "en": "e.g. 2026-12-31"
+              }
+            }
+          ]
+        },
+        {
+          "id": "milestones",
+          "title": {
+            "ko": "마일스톤 확인",
+            "en": "Milestones"
+          },
+          "hint": {
+            "ko": "할 일을 어디서 읽고 어디에 남길지",
+            "en": "Where the work items are read and written"
+          },
+          "fields": [
+            {
+              "key": "milestoneSource",
+              "label": {
+                "ko": "마일스톤 위치",
+                "en": "Milestone source"
+              },
+              "kind": "recordTargetPicker",
+              "required": true,
+              "wide": true,
+              "help": {
+                "ko": "노션·지라는 그 플러그인이 붙어 있을 때만 고를 수 있습니다. 없으면 프로젝트 안의 마크다운으로 구성합니다.",
+                "en": "Notion and Jira appear only when that plugin is connected; otherwise milestones live as Markdown inside the project."
+              }
+            },
+            {
+              "key": "milestoneDir",
+              "label": {
+                "ko": "프로젝트 내 경로",
+                "en": "Path inside the project"
+              },
+              "kind": "text",
+              "required": true,
+              "wide": true,
+              "defaultValue": "docs/milestones",
+              "visibleWhen": {
+                "field": "milestoneSource",
+                "equals": "markdown"
+              },
+              "help": {
+                "ko": "없으면 만들 수 있습니다. 이미 있는 폴더 아래로 세 칸까지 만들며, 만들 폴더는 승인 화면에 모두 나열됩니다.",
+                "en": "Can be created if missing — up to three new segments under an existing folder, every one listed in the confirmation."
+              }
+            },
+            {
+              "key": "milestoneFilePattern",
+              "label": {
+                "ko": "파일 구성",
+                "en": "File layout"
+              },
+              "kind": "text",
+              "required": true,
+              "wide": true,
+              "defaultValue": "M{n}-{주제}.md",
+              "visibleWhen": {
+                "field": "milestoneSource",
+                "equals": "markdown"
+              },
+              "help": {
+                "ko": "마일스톤 하나가 파일 하나입니다. 머리말에 상태·완료조건·기한을 적습니다.",
+                "en": "One file per milestone, with status, exit criteria, and due date in the front matter."
+              }
+            },
+            {
+              "key": "notionDatabase",
+              "label": {
+                "ko": "노션 데이터베이스",
+                "en": "Notion database"
+              },
+              "kind": "text",
+              "required": true,
+              "wide": true,
+              "placeholder": {
+                "ko": "노션에서 복사한 주소",
+                "en": "URL copied from Notion"
+              },
+              "visibleWhen": {
+                "field": "milestoneSource",
+                "equals": "notion"
+              },
+              "help": {
+                "ko": "그 데이터베이스를 노션에서 열고 주소창의 주소를 그대로 붙여넣으세요. 목록에서 고르게 하지 않는 것은 작업공간이 커지면 찾는 데 더 오래 걸리기 때문입니다. 붙여넣은 주소가 데이터베이스를 가리키는지는 만들기 전에 확인합니다.",
+                "en": "Open the database in Notion and paste the address bar URL. There is no picker on purpose — in a large workspace hunting for it takes longer. The pasted URL is checked before anything is created."
+              }
+            },
+            {
+              "key": "jiraProjectKey",
+              "label": {
+                "ko": "지라 프로젝트 키",
+                "en": "Jira project key"
+              },
+              "kind": "text",
+              "required": true,
+              "placeholder": {
+                "ko": "예: PRJ",
+                "en": "e.g. PRJ"
+              },
+              "visibleWhen": {
+                "field": "milestoneSource",
+                "equals": "jira"
+              },
+              "help": {
+                "ko": "이슈 키 앞부분입니다(PROJ-123의 PROJ). 대문자로 시작하는 2~10자이며 만들기 전에 확인합니다.",
+                "en": "The prefix of an issue key (PROJ in PROJ-123): 2–10 characters starting with a capital letter, checked before anything is created."
+              }
+            },
+            {
+              "key": "jiraIssueType",
+              "label": {
+                "ko": "이슈 유형",
+                "en": "Issue type"
+              },
+              "kind": "text",
+              "required": true,
+              "placeholder": {
+                "ko": "예: Task",
+                "en": "e.g. Task"
+              },
+              "visibleWhen": {
+                "field": "milestoneSource",
+                "equals": "jira"
+              }
+            }
+          ]
+        },
+        {
+          "id": "register",
+          "title": {
+            "ko": "워크플로 등록",
+            "en": "Register the workflow"
+          },
+          "hint": {
+            "ko": "언제 돌릴지 정하고 등록합니다",
+            "en": "Choose how it runs, then register"
+          },
+          "fields": [
+            {
+              "key": "execution",
+              "label": {
+                "ko": "실행 방식",
+                "en": "Execution"
+              },
+              "kind": "select",
+              "required": true,
+              "defaultValue": "paced",
+              "help": {
+                "ko": "로컬 LLM은 사용량 계정이 없어 페이싱 회차로 돌지 않습니다. 로컬 LLM으로 진행하려면 수동 실행을 고르고, 만든 뒤 실행 공급자로 Local LLM을 선택하세요.",
+                "en": "Local LLMs have no usage account and cannot run as paced rounds. Choose manual runs, then select Local LLM as the execution provider after creating the workflow."
+              },
+              "options": [
+                {
+                  "value": "paced",
+                  "label": {
+                    "ko": "사용량 페이싱 회차(무인)",
+                    "en": "Usage-paced rounds (unattended)"
+                  }
+                },
+                {
+                  "value": "manual",
+                  "label": {
+                    "ko": "수동 실행",
+                    "en": "Manual runs"
+                  }
+                }
+              ]
+            },
+            {
+              "key": "createFolder",
+              "label": {
+                "ko": "마일스톤 폴더 만들기",
+                "en": "Create the milestone folder"
+              },
+              "kind": "toggle",
+              "defaultValue": "true",
+              "visibleWhen": {
+                "field": "milestoneSource",
+                "equals": "markdown"
+              }
+            },
+            {
+              "key": "roundSkill",
+              "label": {
+                "ko": "따를 스킬",
+                "en": "Skill to follow"
+              },
+              "kind": "text",
+              "wide": true,
+              "placeholder": {
+                "ko": "회차 절차를 담은 공통 스킬 키(선택)",
+                "en": "Common skill key holding the round procedure (optional)"
+              }
+            }
+          ]
+        }
+      ],
+      "actions": [
+        {
+          "kind": "createDirectory",
+          "label": {
+            "ko": "마일스톤 폴더",
+            "en": "Milestone folder"
+          },
+          "path": "{{projectPath}}/{{milestoneDir}}",
+          "when": {
+            "field": "createFolder",
+            "equals": "true"
+          }
+        },
+        {
+          "kind": "registerWorkflow",
+          "label": {
+            "ko": "진행 회차 워크플로",
+            "en": "Delivery round workflow"
+          },
+          "workflow": {
+            "id": "{{projectKey}}-delivery",
+            "displayName": "{{projectKey}} 진행 회차",
+            "description": "{{workKind}} 작업으로 목표 \"{{goal}}\"를 향해 {{projectPath}}에서 한 회차에 {{roundScope}}만큼 진행한다. 마일스톤은 {{milestoneSource}}에서 읽고, 진행 결과를 같은 자리에 남긴다. 전체권한 런타임이 파일·명령에 접근하며 공급자 사용량을 소비한다.",
+            "message": "{{projectPath}} 프로젝트의 진행 회차다.\n\n- 작업 종류: {{workKind}}\n- 목표: {{goal}}\n- 완료 기준: {{doneCriteria}}\n- 작업브랜치: {{branch}} (비어 있으면 커밋하지 않는다)\n- 회차당 진행량: {{roundScope}}\n- 마감: {{deadline}}\n- 마일스톤 위치: {{milestoneSource}} (마크다운이면 {{projectPath}}/{{milestoneDir}}의 {{milestoneFilePattern}}, 노션이면 {{notionDatabase}}, 지라면 프로젝트 {{jiraProjectKey}}의 {{jiraIssueType}})\n\n사용자가 따를 스킬을 따로 지정했으면 그것을 우선한다: {{roundSkill}}",
+            "projectPathField": "projectPath",
+            "requiredSkills": [],
+            "parallel": true,
+            "procedure": "delivery-round"
+          }
+        },
+        {
+          "kind": "createScheduledRequest",
+          "label": {
+            "ko": "페이싱 회차",
+            "en": "Paced round"
+          },
+          "schedule": {
+            "name": "{{projectKey}} 진행 회차",
+            "enabled": false
+          },
+          "when": {
+            "field": "execution",
+            "equals": "paced"
+          }
+        }
+      ]
+    },
+    {
+      "id": "qa-workflow",
+      "icon": "flaskConical",
+      "title": {
+        "ko": "QA 워크플로 온보딩",
+        "en": "QA workflow onboarding"
+      },
+      "summary": {
+        "ko": "시스템 하나를 골라 QA 관리항목과 기록 대상을 정하고 QA 실행·티켓 처리 워크플로를 등록합니다.",
+        "en": "Pick a system, choose the QA fields and record destination, then register the QA round and ticket-handling workflows."
+      },
+      "description": {
+        "ko": "대상 시스템 · 테스트 환경 · 시나리오 축 · 기록 대상 · 회차 운영을 차례로 정합니다. 웹 화면이 아닌 시스템(API·배치·모바일·CLI)도 검증 수단만 고르면 그대로 씁니다. 워크플로 두 개가 만들어집니다 — QA를 수행해 시나리오와 결함 티켓을 남기는 회차, 그리고 사용자가 상태를 바꿔 둔 티켓을 가져가 고치는 회차입니다.",
+        "en": "Target system, test environment, scenario axes, records, and round operation in order. Systems without a web UI (APIs, batch jobs, mobile, CLI) work too — just pick how they are exercised. Two workflows are created: one runs QA and files scenarios and defect tickets, the other picks up tickets whose state the user changed and fixes them."
+      },
+      "templates": [
+        {
+          "key": "<system>-qa",
+          "title": {
+            "ko": "QA 회차 절차",
+            "en": "QA round procedure"
+          },
+          "meta": {
+            "ko": "회차당 신규 패턴 몇 건 · 관리항목을 채워 기록",
+            "en": "A few new patterns per round, recorded with the required fields"
+          },
+          "steps": [
+            {
+              "ko": "대상 확인",
+              "en": "Pick targets"
+            },
+            {
+              "ko": "회귀 선별",
+              "en": "Select regressions"
+            },
+            {
+              "ko": "신규 패턴",
+              "en": "New patterns"
+            },
+            {
+              "ko": "검증 축 확인",
+              "en": "Walk the axes"
+            },
+            {
+              "ko": "실행",
+              "en": "Run"
+            },
+            {
+              "ko": "시나리오 등록",
+              "en": "Register scenarios"
+            },
+            {
+              "ko": "결함은 티켓",
+              "en": "Defects to tickets"
+            },
+            {
+              "ko": "데이터 정리",
+              "en": "Clean up data"
+            },
+            {
+              "ko": "최종 보고",
+              "en": "Final report"
+            }
+          ]
+        },
+        {
+          "key": "qa-flow",
+          "title": {
+            "ko": "오류 티켓 처리 절차",
+            "en": "Defect ticket handling"
+          },
+          "meta": {
+            "ko": "사용자가 바꾼 티켓 상태를 보고 가져가 수정·커밋·결과 작성까지",
+            "en": "Takes tickets by the state the user set, through fix, commit, and write-up"
+          },
+          "steps": [
+            {
+              "ko": "티켓 확인",
+              "en": "Read the ticket"
+            },
+            {
+              "ko": "코드 수정",
+              "en": "Fix code"
+            },
+            {
+              "ko": "작업브랜치 커밋",
+              "en": "Commit to the dev line"
+            },
+            {
+              "ko": "로컬 원격 리베이스",
+              "en": "Rebase local origin"
+            },
+            {
+              "ko": "결과 작성",
+              "en": "Write results"
+            }
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "system",
+          "title": {
+            "ko": "대상 시스템",
+            "en": "Target system"
+          },
+          "hint": {
+            "ko": "무엇을 테스트하는지 — 이름·저장소·주소",
+            "en": "What is tested — name, repository, address"
+          },
+          "fields": [
+            {
+              "key": "systemName",
+              "label": {
+                "ko": "시스템 이름",
+                "en": "System name"
+              },
+              "kind": "text",
+              "required": true,
+              "placeholder": {
+                "ko": "예: 인사 포털",
+                "en": "e.g. HR portal"
+              }
+            },
+            {
+              "key": "systemKey",
+              "label": {
+                "ko": "워크플로 id",
+                "en": "Workflow id"
+              },
+              "kind": "text",
+              "required": true,
+              "placeholder": {
+                "ko": "영소문자·숫자·하이픈. 예: hr-portal",
+                "en": "lowercase, digits, hyphens — e.g. hr-portal"
+              },
+              "help": {
+                "ko": "만들어질 워크플로와 절차 스킬의 이름이 됩니다. 프로젝트마다 달라야 합니다.",
+                "en": "Becomes the name of the workflow and its procedure skill; it must differ per project."
+              }
+            },
+            {
+              "key": "businessAreas",
+              "label": {
+                "ko": "업무 영역",
+                "en": "Business areas"
+              },
+              "kind": "text",
+              "wide": true,
+              "placeholder": {
+                "ko": "예: 로그인 · 주문 · 정산 · 알림",
+                "en": "e.g. sign-in, orders, billing, notifications"
+              }
+            },
+            {
+              "key": "projectPath",
+              "label": {
+                "ko": "저장소",
+                "en": "Repository"
+              },
+              "kind": "projectPicker",
+              "required": true,
+              "wide": true
+            },
+            {
+              "key": "devServer",
+              "label": {
+                "ko": "테스트 대상 주소",
+                "en": "Target address"
+              },
+              "kind": "text",
+              "wide": true,
+              "placeholder": {
+                "ko": "예: https://dev.example.com · localhost:8080 · 패키지명(모바일)",
+                "en": "e.g. https://dev.example.com, localhost:8080, or a mobile package name"
+              }
+            },
+            {
+              "key": "branch",
+              "label": {
+                "ko": "작업브랜치(고칠 때)",
+                "en": "Work branch (when fixing)"
+              },
+              "kind": "branchPicker",
+              "wide": true,
+              "allowOther": true,
+              "help": {
+                "ko": "결함을 고칠 때 커밋할 브랜치입니다. 티켓만 남기는 회차는 쓰지 않습니다. 비워 두면 고치더라도 커밋하지 않고 변경을 그대로 두므로, 고칠 계획이면 채우세요.",
+                "en": "The branch fixes are committed to. Rounds that only file tickets never use it. Empty means a fix is left uncommitted, so fill it in if fixing is planned."
+              }
+            }
+          ]
+        },
+        {
+          "id": "environment",
+          "title": {
+            "ko": "테스트 환경",
+            "en": "Test environment"
+          },
+          "hint": {
+            "ko": "어떻게 실행하고 어떤 계정으로 보는지",
+            "en": "How it runs and which accounts it uses"
+          },
+          "fields": [
+            {
+              "key": "automation",
+              "label": {
+                "ko": "검증 수단",
+                "en": "How it is exercised"
+              },
+              "kind": "select",
+              "required": true,
+              "wide": true,
+              "defaultValue": "manual",
+              "options": [
+                {
+                  "value": "cypress",
+                  "label": {
+                    "ko": "웹 화면 — Cypress 자동화",
+                    "en": "Web UI — Cypress"
+                  }
+                },
+                {
+                  "value": "project",
+                  "label": {
+                    "ko": "프로젝트의 테스트 도구로 실행",
+                    "en": "The project's own test tooling"
+                  }
+                },
+                {
+                  "value": "api",
+                  "label": {
+                    "ko": "API·CLI 호출로 확인",
+                    "en": "API or CLI calls"
+                  }
+                },
+                {
+                  "value": "manual",
+                  "label": {
+                    "ko": "사람이 직접 확인(자동화 없음)",
+                    "en": "Checked by hand (no automation)"
+                  }
+                }
+              ],
+              "help": {
+                "ko": "웹 화면이 아닌 시스템(API·배치·모바일·CLI)도 회차를 만들 수 있습니다. 고른 수단이 회차 지시문에 실립니다.",
+                "en": "Systems without a web UI (APIs, batch jobs, mobile, CLI) can have rounds too; the choice is carried into the round."
+              },
+              "allowOther": true
+            },
+            {
+              "key": "cypressWorkspace",
+              "label": {
+                "ko": "Cypress 작업공간",
+                "en": "Cypress workspace"
+              },
+              "kind": "cypressWorkspacePicker",
+              "wide": true,
+              "visibleWhen": {
+                "field": "automation",
+                "equals": "cypress"
+              }
+            },
+            {
+              "key": "accountKeys",
+              "label": {
+                "ko": "테스트 계정 키",
+                "en": "Test account keys"
+              },
+              "kind": "cypressEnvKeyPicker",
+              "wide": true,
+              "help": {
+                "ko": "회차는 이 키로 설정 파일에서 계정을 읽습니다. 값(비밀번호·토큰)은 앱도 회차도 화면에 옮기지 않습니다.",
+                "en": "The round reads accounts from the config file by these key names; values are never shown or copied."
+              },
+              "allowOther": true
+            },
+            {
+              "key": "accountRoles",
+              "label": {
+                "ko": "테스트 계정 역할",
+                "en": "Test account roles"
+              },
+              "kind": "multiSelect",
+              "wide": true,
+              "defaultValue": "일반 사용자,관리자,타 조직·타 소유자(인가 검증)",
+              "options": [
+                {
+                  "value": "일반 사용자",
+                  "label": {
+                    "ko": "일반 사용자",
+                    "en": "Regular user"
+                  }
+                },
+                {
+                  "value": "관리자",
+                  "label": {
+                    "ko": "관리자",
+                    "en": "Admin"
+                  }
+                },
+                {
+                  "value": "권한 제한 사용자",
+                  "label": {
+                    "ko": "권한 제한 사용자",
+                    "en": "Restricted user"
+                  }
+                },
+                {
+                  "value": "비로그인",
+                  "label": {
+                    "ko": "비로그인",
+                    "en": "Signed out"
+                  }
+                },
+                {
+                  "value": "타 조직·타 소유자(인가 검증)",
+                  "label": {
+                    "ko": "타 조직·타 소유자(인가 검증)",
+                    "en": "Other tenant or owner (authz check)"
+                  }
+                }
+              ],
+              "help": {
+                "ko": "이 시스템의 역할 이름으로 바꿔 적어도 됩니다(기안자·결재자처럼). 인가 검증 역할 하나는 남겨 두는 편이 좋습니다.",
+                "en": "Rename these to the system's own roles if it helps. Keeping one authorization-check role is worthwhile."
+              },
+              "allowOther": true
+            }
+          ]
+        },
+        {
+          "id": "scenario",
+          "title": {
+            "ko": "시나리오 축·규율",
+            "en": "Scenario axes and rules"
+          },
+          "hint": {
+            "ko": "회차마다 무엇을 얼마나 볼지",
+            "en": "What each round looks at, and how much"
+          },
+          "fields": [
+            {
+              "key": "newPatterns",
+              "label": {
+                "ko": "회차당 신규 패턴",
+                "en": "New patterns per round"
+              },
+              "kind": "number",
+              "defaultValue": "1",
+              "min": 1,
+              "max": 3
+            },
+            {
+              "key": "scenarioPrefix",
+              "label": {
+                "ko": "시나리오 ID 접두어",
+                "en": "Scenario ID prefix"
+              },
+              "kind": "text",
+              "placeholder": {
+                "ko": "예: QA-, WEB-",
+                "en": "e.g. QA-, WEB-"
+              }
+            },
+            {
+              "key": "axes",
+              "label": {
+                "ko": "검증 축",
+                "en": "Verification axes"
+              },
+              "kind": "multiSelect",
+              "wide": true,
+              "defaultValue": "입력·유효성,권한·접근제어,상태 전이,오류 처리·복구",
+              "options": [
+                {
+                  "value": "입력·유효성",
+                  "label": {
+                    "ko": "입력·유효성",
+                    "en": "Input and validation"
+                  }
+                },
+                {
+                  "value": "권한·접근제어",
+                  "label": {
+                    "ko": "권한·접근제어",
+                    "en": "Permissions and access control"
+                  }
+                },
+                {
+                  "value": "상태 전이",
+                  "label": {
+                    "ko": "상태 전이",
+                    "en": "State transitions"
+                  }
+                },
+                {
+                  "value": "목록·검색·정렬",
+                  "label": {
+                    "ko": "목록·검색·정렬",
+                    "en": "Lists, search, sorting"
+                  }
+                },
+                {
+                  "value": "출력·내보내기",
+                  "label": {
+                    "ko": "출력·내보내기",
+                    "en": "Print and export"
+                  }
+                },
+                {
+                  "value": "연동·알림",
+                  "label": {
+                    "ko": "연동·알림",
+                    "en": "Integrations and notifications"
+                  }
+                },
+                {
+                  "value": "오류 처리·복구",
+                  "label": {
+                    "ko": "오류 처리·복구",
+                    "en": "Error handling and recovery"
+                  }
+                },
+                {
+                  "value": "성능·응답",
+                  "label": {
+                    "ko": "성능·응답",
+                    "en": "Performance and latency"
+                  }
+                }
+              ],
+              "help": {
+                "ko": "이 시스템에서 볼 축만 남기세요. 회차마다 고른 축을 차례로 확인하므로, 많이 고를수록 회차가 길어집니다.",
+                "en": "Keep only the axes this system needs — each round walks all of them, so more axes mean longer rounds."
+              },
+              "allowOther": true
+            },
+            {
+              "key": "regressionRule",
+              "label": {
+                "ko": "회귀 선별 규칙",
+                "en": "Regression selection rule"
+              },
+              "kind": "textarea",
+              "wide": true,
+              "placeholder": {
+                "ko": "예: 직전 회차 결함 재검증 + 무작위 2건. 매회 전부 돌리지 않는다.",
+                "en": "e.g. re-verify last round's defects plus two random picks; never run everything each round."
+              }
+            }
+          ]
+        },
+        {
+          "id": "records",
+          "title": {
+            "ko": "기록 대상",
+            "en": "Records"
+          },
+          "hint": {
+            "ko": "시나리오와 결함을 어디에 남기고 무엇을 채울지",
+            "en": "Where scenarios and defects go, and what they carry"
+          },
+          "fields": [
+            {
+              "key": "recordTarget",
+              "label": {
+                "ko": "기록 대상",
+                "en": "Record destination"
+              },
+              "kind": "recordTargetPicker",
+              "required": true,
+              "wide": true
+            },
+            {
+              "key": "recordRoot",
+              "label": {
+                "ko": "등록 폴더",
+                "en": "Registered folder"
+              },
+              "kind": "docRootPicker",
+              "wide": true,
+              "visibleWhen": {
+                "field": "recordTarget",
+                "equals": "markdown"
+              }
+            },
+            {
+              "key": "roundDocPath",
+              "label": {
+                "ko": "회차 문서 경로",
+                "en": "Round document path"
+              },
+              "kind": "text",
+              "defaultValue": "qa/rounds/{round}.md",
+              "visibleWhen": {
+                "field": "recordTarget",
+                "equals": "markdown"
+              }
+            },
+            {
+              "key": "ticketPath",
+              "label": {
+                "ko": "QA 티켓 경로",
+                "en": "QA ticket path"
+              },
+              "kind": "text",
+              "defaultValue": "qa/tickets/{id}.md",
+              "visibleWhen": {
+                "field": "recordTarget",
+                "equals": "markdown"
+              }
+            },
+            {
+              "key": "scenarioDatabase",
+              "label": {
+                "ko": "Test Scenario 데이터베이스",
+                "en": "Test Scenario database"
+              },
+              "kind": "text",
+              "wide": true,
+              "placeholder": {
+                "ko": "노션 데이터베이스 주소",
+                "en": "Notion database URL"
+              },
+              "visibleWhen": {
+                "field": "recordTarget",
+                "equals": "notion"
+              }
+            },
+            {
+              "key": "ticketDatabase",
+              "label": {
+                "ko": "QA Sheets 데이터베이스",
+                "en": "QA Sheets database"
+              },
+              "kind": "text",
+              "wide": true,
+              "placeholder": {
+                "ko": "노션 데이터베이스 주소",
+                "en": "Notion database URL"
+              },
+              "visibleWhen": {
+                "field": "recordTarget",
+                "equals": "notion"
+              }
+            },
+            {
+              "key": "jiraProject",
+              "label": {
+                "ko": "지라 프로젝트 키",
+                "en": "Jira project key"
+              },
+              "kind": "text",
+              "placeholder": {
+                "ko": "예: QA",
+                "en": "e.g. QA"
+              },
+              "visibleWhen": {
+                "field": "recordTarget",
+                "equals": "jira"
+              },
+              "help": {
+                "ko": "이슈 키 앞부분입니다(PROJ-123의 PROJ). 대문자로 시작하는 2~10자이며 만들기 전에 확인합니다.",
+                "en": "The prefix of an issue key (PROJ in PROJ-123): 2–10 characters starting with a capital letter, checked before anything is created."
+              }
+            },
+            {
+              "key": "jiraType",
+              "label": {
+                "ko": "이슈 유형",
+                "en": "Issue type"
+              },
+              "kind": "text",
+              "placeholder": {
+                "ko": "예: Bug",
+                "en": "e.g. Bug"
+              },
+              "visibleWhen": {
+                "field": "recordTarget",
+                "equals": "jira"
+              }
+            },
+            {
+              "key": "qaChecklist",
+              "label": {
+                "ko": "관리항목",
+                "en": "QA fields"
+              },
+              "kind": "multiSelect",
+              "wide": true,
+              "defaultValue": "디바이스(단말 모델),OS·버전,브라우저·버전,네트워크,테스트환경,접근 경로(출처),기능·업무구분,메뉴경로,사전조건·재현 절차,기대결과·테스트 결과,우선순위,보고유형,검토결과,버전,증적(캡처·로그)",
+              "options": [
+                {
+                  "value": "디바이스(단말 모델)",
+                  "label": {
+                    "ko": "디바이스(단말 모델)",
+                    "en": "Device model"
+                  }
+                },
+                {
+                  "value": "OS·버전",
+                  "label": {
+                    "ko": "OS·버전",
+                    "en": "OS and version"
+                  }
+                },
+                {
+                  "value": "브라우저·버전",
+                  "label": {
+                    "ko": "브라우저·버전",
+                    "en": "Browser and version"
+                  }
+                },
+                {
+                  "value": "네트워크",
+                  "label": {
+                    "ko": "네트워크",
+                    "en": "Network"
+                  }
+                },
+                {
+                  "value": "테스트환경",
+                  "label": {
+                    "ko": "테스트환경",
+                    "en": "Test environment"
+                  }
+                },
+                {
+                  "value": "접근 경로(출처)",
+                  "label": {
+                    "ko": "접근 경로(출처)",
+                    "en": "Entry point (source)"
+                  }
+                },
+                {
+                  "value": "기능·업무구분",
+                  "label": {
+                    "ko": "기능·업무구분",
+                    "en": "Feature area"
+                  }
+                },
+                {
+                  "value": "메뉴경로",
+                  "label": {
+                    "ko": "메뉴경로",
+                    "en": "Menu path"
+                  }
+                },
+                {
+                  "value": "사전조건·재현 절차",
+                  "label": {
+                    "ko": "사전조건·재현 절차",
+                    "en": "Preconditions and steps"
+                  }
+                },
+                {
+                  "value": "기대결과·테스트 결과",
+                  "label": {
+                    "ko": "기대결과·테스트 결과",
+                    "en": "Expected and actual result"
+                  }
+                },
+                {
+                  "value": "우선순위",
+                  "label": {
+                    "ko": "우선순위",
+                    "en": "Priority"
+                  }
+                },
+                {
+                  "value": "보고유형",
+                  "label": {
+                    "ko": "보고유형",
+                    "en": "Report type"
+                  }
+                },
+                {
+                  "value": "검토결과",
+                  "label": {
+                    "ko": "검토결과",
+                    "en": "Review note"
+                  }
+                },
+                {
+                  "value": "버전",
+                  "label": {
+                    "ko": "버전",
+                    "en": "Version"
+                  }
+                },
+                {
+                  "value": "증적(캡처·로그)",
+                  "label": {
+                    "ko": "증적(캡처·로그)",
+                    "en": "Evidence (captures, logs)"
+                  }
+                }
+              ],
+              "help": {
+                "ko": "시나리오와 티켓에 반드시 채울 항목입니다. 노션 QA Sheets·Test Scenario의 컬럼 축을 그대로 따랐고 기본은 전체 선택입니다. 그 시스템 시트에 없는 항목은 티켓 본문에 적습니다.",
+                "en": "Fields every scenario and ticket must carry, following the Notion QA Sheets and Test Scenario columns. All are selected by default; items the system's sheet lacks go in the ticket body."
+              },
+              "allowOther": true
+            }
+          ]
+        },
+        {
+          "id": "rounds",
+          "title": {
+            "ko": "회차 운영·생성",
+            "en": "Rounds and output"
+          },
+          "hint": {
+            "ko": "언제 돌고 결함을 누가 고칠지",
+            "en": "When it runs and who fixes the defects"
+          },
+          "fields": [
+            {
+              "key": "execution",
+              "label": {
+                "ko": "실행 방식",
+                "en": "Execution"
+              },
+              "kind": "select",
+              "required": true,
+              "defaultValue": "paced",
+              "help": {
+                "ko": "로컬 LLM은 사용량 계정이 없어 페이싱 회차로 돌지 않습니다. 로컬 LLM으로 진행하려면 수동 실행을 고르고, 만든 뒤 실행 공급자로 Local LLM을 선택하세요.",
+                "en": "Local LLMs have no usage account and cannot run as paced rounds. Choose manual runs, then select Local LLM as the execution provider after creating the workflow."
+              },
+              "options": [
+                {
+                  "value": "paced",
+                  "label": {
+                    "ko": "사용량 페이싱 회차(무인)",
+                    "en": "Usage-paced rounds (unattended)"
+                  }
+                },
+                {
+                  "value": "manual",
+                  "label": {
+                    "ko": "수동 실행",
+                    "en": "Manual runs"
+                  }
+                }
+              ]
+            },
+            {
+              "key": "ticketHandling",
+              "label": {
+                "ko": "결함 처리",
+                "en": "Defect handling"
+              },
+              "kind": "select",
+              "wide": true,
+              "required": true,
+              "defaultValue": "티켓만 남김",
+              "options": [
+                {
+                  "value": "티켓만 남김",
+                  "label": {
+                    "ko": "티켓만 남기고 티켓 처리 회차에 맡긴다",
+                    "en": "File the ticket and leave it to the ticket round"
+                  }
+                },
+                {
+                  "value": "같은 회차에서 수정",
+                  "label": {
+                    "ko": "조건을 만족하는 1건은 같은 회차에서 고친다",
+                    "en": "Fix one qualifying defect in the same round"
+                  }
+                }
+              ],
+              "help": {
+                "ko": "같은 회차에서 고치면 QA와 수정이 한 세션에 섞입니다. 티켓만 남기면 사용자가 상태를 확인한 뒤 티켓 처리 회차가 가져갑니다.",
+                "en": "Fixing in the same round mixes QA with repair. Filing only lets you review the state before the ticket round picks it up."
+              }
+            },
+            {
+              "key": "ticketStates",
+              "label": {
+                "ko": "처리할 티켓 상태",
+                "en": "Ticket states to work"
+              },
+              "kind": "text",
+              "wide": true,
+              "defaultValue": "작업대기, 재작업",
+              "help": {
+                "ko": "기록 대상의 상태 이름을 그대로 적습니다. 티켓 처리 회차는 여기 적힌 상태만 가져갑니다.",
+                "en": "Use the record destination's own state names; the ticket round only picks those up."
+              },
+              "placeholder": {
+                "ko": "쉼표로 구분. 예: 작업대기, 재작업 / To Do, Reopened",
+                "en": "Comma separated, e.g. To Do, Reopened"
+              }
+            },
+            {
+              "key": "qaSkill",
+              "label": {
+                "ko": "따를 스킬",
+                "en": "Skill to follow"
+              },
+              "kind": "text",
+              "wide": true,
+              "placeholder": {
+                "ko": "QA 회차 절차를 담은 공통 스킬 키(선택)",
+                "en": "Common skill key holding the QA round procedure (optional)"
+              }
+            }
+          ]
+        }
+      ],
+      "actions": [
+        {
+          "kind": "registerWorkflow",
+          "label": {
+            "ko": "QA 실행 워크플로",
+            "en": "QA round workflow"
+          },
+          "workflow": {
+            "id": "{{systemKey}}-qa",
+            "displayName": "{{systemName}} QA 회차",
+            "description": "{{systemName}}의 QA를 회차당 신규 패턴 {{newPatterns}}건으로 수행하고 {{recordTarget}}에 시나리오와 결함 티켓을 남긴다. 관리항목은 {{qaChecklist}}이고 결함 처리 방식은 {{ticketHandling}}이다. 전체권한 런타임이 파일·명령에 접근하며 공급자 사용량을 소비한다.",
+            "message": "{{systemName}}의 QA 회차다.\n\n- 저장소: {{projectPath}}\n- 작업브랜치: {{branch}} (비어 있으면 커밋하지 않는다)\n- 개발서버: {{devServer}}\n- 업무 영역: {{businessAreas}}\n- 검증 축: {{axes}}\n- 회차당 신규 패턴: {{newPatterns}}건\n- 회귀 선별 규칙: {{regressionRule}}\n- 시나리오 ID 접두어: {{scenarioPrefix}}\n- 테스트 계정 역할: {{accountRoles}} (계정 값은 {{accountKeys}} 키로 설정 파일에서 읽는다)\n- 검증 수단: {{automation}} (Cypress면 작업공간 {{cypressWorkspace}})\n- 기록 대상: {{recordTarget}} (노션이면 시나리오 {{scenarioDatabase}} · 티켓 {{ticketDatabase}}, 지라면 프로젝트 {{jiraProject}}의 {{jiraType}}, 마크다운이면 등록 폴더 {{recordRoot}}의 {{roundDocPath}} · {{ticketPath}})\n- 시나리오·티켓에 채울 관리항목: {{qaChecklist}}\n- 결함 처리 방식: {{ticketHandling}}\n\n사용자가 따를 스킬을 따로 지정했으면 그것을 우선한다: {{qaSkill}}",
+            "projectPathField": "projectPath",
+            "requiredSkills": [],
+            "parallel": true,
+            "procedure": "qa-round"
+          }
+        },
+        {
+          "kind": "createScheduledRequest",
+          "label": {
+            "ko": "QA 페이싱 회차",
+            "en": "QA paced round"
+          },
+          "schedule": {
+            "name": "{{systemName}} QA 회차",
+            "enabled": false
+          },
+          "when": {
+            "field": "execution",
+            "equals": "paced"
+          }
+        },
+        {
+          "kind": "registerWorkflow",
+          "label": {
+            "ko": "오류 티켓 처리 워크플로",
+            "en": "Defect ticket workflow"
+          },
+          "workflow": {
+            "id": "{{systemKey}}-qa-tickets",
+            "displayName": "{{systemName}} QA 티켓 처리",
+            "description": "사용자가 {{ticketStates}} 상태로 바꿔 둔 {{systemName}} QA 티켓을 회차당 1건 가져가 재현·수정·검증하고 작업브랜치에 커밋한 뒤 티켓 상태와 조치 내역을 갱신한다. 상태는 사용자가 정하므로 이 회차가 대상을 넓히지 않는다. 전체권한 런타임이 파일·명령에 접근하며 공급자 사용량을 소비한다.",
+            "message": "{{systemName}}의 QA 오류 티켓 처리 회차다.\n\n- 저장소: {{projectPath}}\n- 작업브랜치: {{branch}} (비어 있으면 커밋하지 않는다)\n- 개발서버: {{devServer}}\n- 티켓 위치: {{recordTarget}} (노션이면 {{ticketDatabase}}, 지라면 프로젝트 {{jiraProject}}의 {{jiraType}}, 마크다운이면 등록 폴더 {{recordRoot}}의 {{ticketPath}})\n- 가져갈 티켓 상태: {{ticketStates}}\n- 티켓에 채울 관리항목: {{qaChecklist}}\n\n상태는 사용자가 정한다. 위 상태에 있는 티켓만 가져가고 대상을 스스로 넓히지 않는다.\n사용자가 따를 스킬을 따로 지정했으면 그것을 우선한다: {{qaSkill}}",
+            "projectPathField": "projectPath",
+            "requiredSkills": [],
+            "parallel": false,
+            "procedure": "qa-ticket-round"
+          }
+        },
+        {
+          "kind": "createScheduledRequest",
+          "label": {
+            "ko": "티켓 처리 페이싱 회차",
+            "en": "Ticket paced round"
+          },
+          "schedule": {
+            "name": "{{systemName}} QA 티켓 처리",
+            "enabled": false
+          },
+          "when": {
+            "field": "execution",
+            "equals": "paced"
+          }
+        }
+      ]
+    }
+  ]
+}

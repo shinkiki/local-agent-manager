@@ -1,7 +1,7 @@
 import {
-  accountTextDraftState,
-  accountTextLength,
-  submitAccountText,
+  accountTextEditor,
+  type AccountTextDraftStateAs,
+  type AccountTextSave,
   type AccountTextSubmitResult,
 } from "./accountTextDraft.ts";
 
@@ -20,34 +20,25 @@ export function normalizeAccountNote(draft: string): string | null {
   return trimmed === "" ? null : trimmed;
 }
 
-/** 서로게이트 쌍이나 이모지를 한 글자로 세어 Rust의 문자 수 기준과 맞춘다. */
-export function accountNoteLength(draft: string): number {
-  return accountTextLength(draft, normalizeAccountNote);
-}
+/** 메모 편집기의 규격. 이 편집기가 뼈대와 다른 것은 이 세 줄뿐이다. */
+const NOTE_EDITOR = accountTextEditor({
+  normalize: normalizeAccountNote,
+  maxChars: ACCOUNT_NOTE_MAX_CHARS,
+  clearsAs: "removes",
+});
 
-export interface AccountNoteDraftState {
-  /** 저장 요청으로 보낼 값. 메모 삭제는 null. */
-  value: string | null;
-  length: number;
-  changed: boolean;
-  tooLong: boolean;
-  /** 저장하면 기존 메모가 지워지는 상태. 버튼 문구를 삭제로 바꾼다. */
-  removes: boolean;
-  canSave: boolean;
-}
+/**
+ * 이 편집기의 초안 상태. `clears`는 `removes`라는 이름으로 선다 — 저장하면 기존
+ * 메모가 지워진다는 뜻이고, 버튼 문구를 삭제로 바꾸는 근거다. 모양은 공용 뼈대가 짓는다.
+ */
+export type AccountNoteDraftState = AccountTextDraftStateAs<"removes">;
 
 /**
  * 편집 중인 메모와 저장된 메모를 비교해 저장 버튼 상태를 정한다. 값이 그대로면
  * 요청을 보내지 않고, 길이 제한을 넘으면 저장을 막아 백엔드 오류 전에 알린다.
  */
 export function accountNoteDraftState(draft: string, saved: string | null): AccountNoteDraftState {
-  const { clears, ...state } = accountTextDraftState(
-    draft,
-    saved,
-    normalizeAccountNote,
-    ACCOUNT_NOTE_MAX_CHARS,
-  );
-  return { ...state, removes: clears };
+  return NOTE_EDITOR.draftState(draft, saved);
 }
 
 export type AccountNoteSubmitResult = AccountTextSubmitResult;
@@ -59,7 +50,7 @@ export type AccountNoteSubmitResult = AccountTextSubmitResult;
 export function submitAccountNote(
   draft: string,
   saved: string | null,
-  save: (note: string | null) => Promise<string | null>,
+  save: AccountTextSave,
 ): Promise<AccountNoteSubmitResult> {
-  return submitAccountText(draft, saved, save, normalizeAccountNote, ACCOUNT_NOTE_MAX_CHARS);
+  return NOTE_EDITOR.submit(draft, saved, save);
 }

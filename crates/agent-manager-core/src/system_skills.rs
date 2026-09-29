@@ -13,12 +13,13 @@
 //! 내용 해시가 같으면 다시 쓰지 않고, 사용자가 고친 사본은 덮어쓰지 않는다.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::app_data_file::write_private_json;
+use crate::domain::wire_enum;
 use crate::resource_repository::repository_skills_root;
 use crate::CoreError;
 
@@ -38,6 +39,18 @@ const SYSTEM_SKILLS: &[SystemSkill] = &[
         key: "ssh-endpoints",
         skill_md: include_str!("../skills/ssh-endpoints/SKILL.md"),
     },
+    SystemSkill {
+        key: "db-connections",
+        skill_md: include_str!("../skills/db-connections/SKILL.md"),
+    },
+    SystemSkill {
+        key: "chat-secrets",
+        skill_md: include_str!("../skills/chat-secrets/SKILL.md"),
+    },
+    SystemSkill {
+        key: "cypress-automation",
+        skill_md: include_str!("../skills/cypress-automation/SKILL.md"),
+    },
 ];
 
 /// 앱이 이 사본을 소유한다는 표시. 사용자가 손댄 사본과 구분해 덮어쓸지를 정한다.
@@ -56,6 +69,13 @@ pub enum SystemSkillOutcome {
     UserModified,
 }
 
+wire_enum!(trimmed SystemSkillOutcome, "알 수 없는 시스템 스킬 동기화 결과입니다. installed|upToDate|updated|userModified 중 하나를 쓰세요", {
+    Installed => "installed",
+    UpToDate => "upToDate",
+    Updated => "updated",
+    UserModified => "userModified",
+});
+
 impl SystemSkillOutcome {
     #[cfg(test)]
     pub const ALL: [Self; 4] = [
@@ -64,37 +84,6 @@ impl SystemSkillOutcome {
         Self::Updated,
         Self::UserModified,
     ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Installed => "installed",
-            Self::UpToDate => "upToDate",
-            Self::Updated => "updated",
-            Self::UserModified => "userModified",
-        }
-    }
-}
-
-impl std::fmt::Display for SystemSkillOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SystemSkillOutcome {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "installed" => Ok(Self::Installed),
-            "upToDate" => Ok(Self::UpToDate),
-            "updated" => Ok(Self::Updated),
-            "userModified" => Ok(Self::UserModified),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 시스템 스킬 동기화 결과입니다: {s}. installed|upToDate|updated|userModified 중 하나를 쓰세요"
-            ))),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -125,32 +114,64 @@ pub fn ensure_system_skills(app_data_dir: &Path) -> Result<Vec<SystemSkillStatus
         .collect()
 }
 
-fn ensure_one(dir: &PathBuf, skill: &SystemSkill) -> Result<SystemSkillOutcome, CoreError> {
-    let skill_md = dir.join("SKILL.md");
-    let ownership = dir.join(OWNERSHIP_FILE);
-    let expected = digest(skill.skill_md);
-    if skill_md.exists() {
-        // 소유 표시가 없으면 사용자나 다른 도구가 만든 사본이다. 건드리지 않는다.
-        if !ownership.exists() {
-            return Ok(SystemSkillOutcome::UserModified);
-        }
-        let recorded = fs::read_to_string(&ownership).unwrap_or_default();
-        let current = fs::read_to_string(&skill_md).unwrap_or_default();
-        // 앱이 설치한 뒤 사용자가 본문을 고쳤다면 그 편집을 살린다.
-        if recorded.trim() != digest(&current) {
-            return Ok(SystemSkillOutcome::UserModified);
-        }
-        if recorded.trim() == expected {
-            return Ok(SystemSkillOutcome::UpToDate);
-        }
-        write_skill(dir, skill, &expected)?;
-        return Ok(SystemSkillOutcome::Updated);
-    }
-    write_skill(dir, skill, &expected)?;
-    Ok(SystemSkillOutcome::Installed)
+/// 기존 스킬 사본의 상태를 점검해 수행할 동작을 정한다.
+#[derive(Debug, PartialEq, Eq)]
+enum CopyAction {
+    /// 새 사본을 설치한다.
+    Install,
+    /// 기존 사본을 최신 내용으로 갱신한다.
+    Update,
+    /// 디스크를 변경하지 않고 기존 사본을 유지한다.
+    Keep(SystemSkillOutcome),
 }
 
-fn write_skill(dir: &PathBuf, skill: &SystemSkill, expected: &str) -> Result<(), CoreError> {
+impl CopyAction {
+    /// 점검에서 정한 동작을 적용하고 외부에 보고할 결과로 바꾼다.
+    fn apply(
+        self,
+        dir: &Path,
+        skill: &SystemSkill,
+        expected_digest: &str,
+    ) -> Result<SystemSkillOutcome, CoreError> {
+        let outcome = match self {
+            Self::Keep(outcome) => return Ok(outcome),
+            Self::Install => SystemSkillOutcome::Installed,
+            Self::Update => SystemSkillOutcome::Updated,
+        };
+        write_skill(dir, skill, expected_digest)?;
+        Ok(outcome)
+    }
+}
+
+/// 기존 디렉터리의 SKILL.md 및 소유 표시 파일을 점검해 설치·갱신·유지 동작을 결정한다.
+fn inspect_copy_action(dir: &Path, expected_digest: &str) -> CopyAction {
+    let skill_md = dir.join("SKILL.md");
+    let ownership = dir.join(OWNERSHIP_FILE);
+    if !skill_md.exists() {
+        return CopyAction::Install;
+    }
+    // 소유 표시가 없으면 사용자나 다른 도구가 만든 사본이다. 건드리지 않는다.
+    if !ownership.exists() {
+        return CopyAction::Keep(SystemSkillOutcome::UserModified);
+    }
+    let recorded = fs::read_to_string(&ownership).unwrap_or_default();
+    let current = fs::read_to_string(&skill_md).unwrap_or_default();
+    // 앱이 설치한 뒤 사용자가 본문을 고쳤다면 그 편집을 살린다.
+    if recorded.trim() != digest(&current) {
+        return CopyAction::Keep(SystemSkillOutcome::UserModified);
+    }
+    if recorded.trim() == expected_digest {
+        return CopyAction::Keep(SystemSkillOutcome::UpToDate);
+    }
+    CopyAction::Update
+}
+
+fn ensure_one(dir: &Path, skill: &SystemSkill) -> Result<SystemSkillOutcome, CoreError> {
+    let expected = digest(skill.skill_md);
+    inspect_copy_action(dir, &expected).apply(dir, skill, &expected)
+}
+
+fn write_skill(dir: &Path, skill: &SystemSkill, expected: &str) -> Result<(), CoreError> {
     fs::create_dir_all(dir)?;
     fs::write(dir.join("SKILL.md"), skill.skill_md)?;
     fs::write(dir.join(OWNERSHIP_FILE), expected)?;
@@ -163,16 +184,39 @@ fn write_skill(dir: &PathBuf, skill: &SystemSkill, expected: &str) -> Result<(),
 /// `executable`만으로는 부족하다. 데스크톱 앱은 자기 바이너리를 `--backend`로 다시 띄워
 /// 백엔드를 돌리므로, 그때 `current_exe`는 Tauri 바이너리이고 `sessions`를 바로 받지 않는다.
 /// 그래서 앞에 붙일 인자까지 함께 남긴다.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SessionReadCliPointer {
-    schema_version: u32,
-    executable: String,
-    argv_prefix: Vec<String>,
-    version: String,
+pub(crate) struct SessionReadCliPointer {
+    pub(crate) schema_version: u32,
+    pub(crate) executable: String,
+    pub(crate) argv_prefix: Vec<String>,
+    pub(crate) version: String,
+    /// C9-18. `<CLI> ssh exec`가 실행을 맡길 loopback 백엔드 포트. 예전 백엔드가 남긴
+    /// 파일에는 없으므로 읽는 쪽은 없는 경우를 재시작 안내로 처리한다.
+    #[serde(default)]
+    pub(crate) backend_port: Option<u16>,
+}
+
+impl SessionReadCliPointer {
+    /// 프로세스에서 읽어 온 값으로 저장 가능한 포인터를 조립한다. 환경 조회와 값 조립을
+    /// 갈라 두어 데스크톱의 `--backend` 접두사 계약을 파일 쓰기 없이 검증할 수 있게 한다.
+    fn from_process(executable: &Path, args: &[String], backend_port: u16) -> Self {
+        Self {
+            schema_version: 1,
+            executable: executable.to_string_lossy().into_owned(),
+            argv_prefix: session_read_cli_argv_prefix(args),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            backend_port: Some(backend_port),
+        }
+    }
 }
 
 pub const SESSION_READ_CLI_POINTER_FILE: &str = "session-read-cli-v1.json";
+
+/// 백엔드 위치 파일의 전체 경로를 반환한다.
+pub fn session_read_cli_pointer_path(app_data_dir: &Path) -> std::path::PathBuf {
+    app_data_dir.join(SESSION_READ_CLI_POINTER_FILE)
+}
 
 /// 지금 프로세스가 `--backend`로 위임받아 돌고 있으면 스킬도 같은 접두사를 써야 한다.
 fn session_read_cli_argv_prefix(args: &[String]) -> Vec<String> {
@@ -183,16 +227,33 @@ fn session_read_cli_argv_prefix(args: &[String]) -> Vec<String> {
     }
 }
 
-pub fn record_session_read_cli_path(app_data_dir: &Path) -> Result<(), CoreError> {
+pub fn record_session_read_cli_path(
+    app_data_dir: &Path,
+    backend_port: u16,
+) -> Result<(), CoreError> {
     let executable = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let pointer = SessionReadCliPointer {
-        schema_version: 1,
-        executable: executable.to_string_lossy().into_owned(),
-        argv_prefix: session_read_cli_argv_prefix(&args),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-    };
-    write_private_json(&app_data_dir.join(SESSION_READ_CLI_POINTER_FILE), &pointer)
+    let pointer = SessionReadCliPointer::from_process(&executable, &args, backend_port);
+    write_private_json(&session_read_cli_pointer_path(app_data_dir), &pointer)
+}
+
+/// 스킬 경로의 CLI가 자기를 띄운 백엔드를 찾을 때 읽는다. 파일이 없으면 백엔드가 한 번도
+/// 뜨지 않은 것이라, 추측으로 다른 포트를 두드리지 않고 그 사실을 그대로 알린다.
+pub(crate) fn read_session_read_cli_pointer(
+    app_data_dir: &Path,
+) -> Result<SessionReadCliPointer, CoreError> {
+    let path = session_read_cli_pointer_path(app_data_dir);
+    let raw = fs::read_to_string(&path).map_err(|error| {
+        CoreError::Conflict(format!(
+            "Agent Manager 백엔드 위치 파일({})을 읽지 못했습니다. 앱을 먼저 실행하세요: {error}",
+            path.to_string_lossy()
+        ))
+    })?;
+    serde_json::from_str(&raw).map_err(|error| {
+        CoreError::Conflict(format!(
+            "Agent Manager 백엔드 위치 파일을 해석하지 못했습니다: {error}"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -271,13 +332,22 @@ mod tests {
     }
 
     #[test]
-    fn argv_prefix_follows_how_the_backend_was_launched() {
-        assert!(session_read_cli_argv_prefix(&[]).is_empty());
-        assert!(session_read_cli_argv_prefix(&["--port".to_owned()]).is_empty());
-        assert_eq!(
-            session_read_cli_argv_prefix(&["--backend".to_owned(), "--port".to_owned()]),
-            vec!["--backend".to_owned()]
+    fn pointer_fields_follow_how_the_backend_was_launched() {
+        let executable = Path::new("/Applications/Agent Manager");
+        let direct = SessionReadCliPointer::from_process(executable, &["--port".to_owned()], 4178);
+        assert_eq!(direct.schema_version, 1);
+        assert_eq!(direct.executable, "/Applications/Agent Manager");
+        assert!(direct.argv_prefix.is_empty());
+        assert_eq!(direct.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(direct.backend_port, Some(4178));
+
+        let delegated = SessionReadCliPointer::from_process(
+            executable,
+            &["--backend".to_owned(), "--port".to_owned()],
+            55002,
         );
+        assert_eq!(delegated.argv_prefix, ["--backend"]);
+        assert_eq!(delegated.backend_port, Some(55002));
     }
 
     /// C9-12. 스킬이 안내하는 호출은 실제 CLI 계약과 같아야 한다.
@@ -345,5 +415,51 @@ mod tests {
         // 잘못된 문자열 파싱 실패 검증
         assert!("unknown".parse::<SystemSkillOutcome>().is_err());
         assert!("".parse::<SystemSkillOutcome>().is_err());
+    }
+
+    /// 백엔드 위치 파일 경로 결합을 검증한다.
+    #[test]
+    fn session_read_cli_pointer_path_joins_correct_filename() {
+        let dir = Path::new("/tmp/test-app-data");
+        assert_eq!(
+            session_read_cli_pointer_path(dir),
+            dir.join("session-read-cli-v1.json")
+        );
+    }
+
+    /// 사본 상태 점검의 동작 분기를 검증한다.
+    #[test]
+    fn inspect_copy_action_classifies_each_state() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let dir = temporary.path();
+        let expected = digest("content-v1");
+
+        // 파일 부재 시 Install
+        assert_eq!(inspect_copy_action(dir, &expected), CopyAction::Install);
+
+        // 소유권 표시 파일 부재 시 UserModified
+        fs::write(dir.join("SKILL.md"), "content-v1").expect("write");
+        assert_eq!(
+            inspect_copy_action(dir, &expected),
+            CopyAction::Keep(SystemSkillOutcome::UserModified)
+        );
+
+        // 소유권 파일과 실제 내용 불일치 시 UserModified
+        fs::write(dir.join(OWNERSHIP_FILE), digest("content-old")).expect("write");
+        assert_eq!(
+            inspect_copy_action(dir, &expected),
+            CopyAction::Keep(SystemSkillOutcome::UserModified)
+        );
+
+        // 소유권 파일과 실제 내용 일치하며 expected와 같으면 UpToDate
+        fs::write(dir.join(OWNERSHIP_FILE), &expected).expect("write");
+        assert_eq!(
+            inspect_copy_action(dir, &expected),
+            CopyAction::Keep(SystemSkillOutcome::UpToDate)
+        );
+
+        // 소유권 파일과 실제 내용 일치하지만 expected와 다르면 Update
+        let expected_v2 = digest("content-v2");
+        assert_eq!(inspect_copy_action(dir, &expected_v2), CopyAction::Update);
     }
 }

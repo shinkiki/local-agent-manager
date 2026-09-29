@@ -1,4 +1,26 @@
+import {
+  isSkillToolName,
+  launchedSkillName,
+  parseInjectedSkillBody,
+  parseSkillInvocation,
+  skillContextLabelName,
+  skillPathNames,
+} from "./skillUsageParse.ts";
 import type { ContentBlock, TranscriptItem } from "../types";
+
+/**
+ * 쓰는 쪽이 보는 입구는 이 모듈 하나다. 원문을 조각내는 문법은 수집과 읽을 것이 없어 따로
+ * 두었지만, 채팅 흐름·트랜스크립트·활동 필터가 어느 판정이 어디로 갔는지 알아야 할 이유는
+ * 없다 — 나눈 쪽의 사정이 호출부의 import 목록으로 새어 나가면 다음에 다시 나눌 때마다
+ * 호출부를 함께 고쳐야 한다.
+ */
+export {
+  isSkillToolName,
+  launchedSkillName,
+  parseInjectedSkillBody,
+  skillContextLabelName,
+  SKILL_CONTEXT_LABEL_PREFIX,
+} from "./skillUsageParse.ts";
 
 /**
  * 한 턴에서 에이전트가 실제로 실행한 스킬. 라이브 채팅(도구 이벤트)과 세션 트랜스크립트
@@ -24,20 +46,6 @@ export interface SkillUsage {
    */
   detection: "tool" | "path";
 }
-
-/** Claude CLI의 스킬 실행 도구 이름. */
-const SKILL_TOOL_NAME = "skill";
-/** Skill 도구가 돌려주는 확인 문장. 스트리밍이 끊겨 인자를 못 받았을 때의 이름 출처다. */
-const LAUNCH_PREFIX = "Launching skill:";
-/** CLI가 사용자 턴 자리에 주입하는 SKILL.md 앞머리. `catalog.rs`의 같은 상수와 짝이다. */
-const BASE_DIRECTORY_PREFIX = "Base directory for this skill:";
-/** 주입 레코드에 트랜스크립트가 붙이는 라벨. `catalog.rs`가 만든다. */
-export const SKILL_CONTEXT_LABEL_PREFIX = "사용 스킬 · ";
-/**
- * 스킬 디렉터리의 SKILL.md를 직접 가리키는 경로. `skills/<이름>/SKILL.md` 꼴만 받아,
- * 저장소 전체를 훑는 검색 명령이 스킬 실행으로 보이지 않게 한다.
- */
-const SKILL_PATH_PATTERN = /skills[\\/]([^\\/\s"'`]+)[\\/]SKILL\.md/g;
 
 /** 인자·확인 문장 어디에서도 이름을 못 얻었을 때 카드에 적는 이름. */
 const UNKNOWN_SKILL_NAME = "이름 확인 불가";
@@ -67,10 +75,6 @@ interface SkillToolEntry {
   output?: string;
 }
 
-export function isSkillToolName(name: string | undefined): boolean {
-  return name?.trim().toLowerCase() === SKILL_TOOL_NAME;
-}
-
 /**
  * 대화 흐름에서 사용 스킬 카드가 대신 보여주는 블록인지. 스킬 실행 도구 호출과 그 확인
  * 문장만 해당한다. SKILL.md를 직접 읽은 셸 명령은 그 자체로 도구 실행이므로 로그에 남긴다.
@@ -85,20 +89,55 @@ export function isSkillUsageEntry(entry: SkillToolEntry): boolean {
   return entry.type === "tool" && isSkillToolName(entry.name);
 }
 
+/**
+ * 도구 호출 하나를 읽는 데 필요한 것. 라이브 채팅 항목과 트랜스크립트 블록은 필드 이름만
+ * 다를 뿐 같은 재료를 들고 있어, 수집 지점마다 다른 것은 키를 만드는 방법과 인자에서
+ * 이름을 못 얻었을 때의 대비뿐이다.
+ */
+interface SkillToolSource {
+  /** 도구 이름. 스킬 실행 도구인지 여기서 가른다. */
+  toolName: string | undefined;
+  /** 도구 인자 원문. 스킬 이름·지시와 SKILL.md 경로를 모두 여기서 읽는다. */
+  inputJson: string;
+  status: string;
+  /** 인자에서 이름을 못 얻었을 때 쓸 이름. 라이브 채팅은 확인 문장에서 얻는다. */
+  fallbackName?: string;
+  /** 항목 키. 유일성의 근거가 수집 지점마다 달라(항목 ID / 블록 순번) 밖에서 만든다. */
+  usageId: (detection: SkillUsage["detection"], name: string) => string;
+}
+
+/**
+ * 도구 호출 하나에서 읽어낼 스킬 실행. 스킬 실행 도구면 인자에서 이름과 지시를 뽑고,
+ * 그 밖의 도구면 인자에 든 SKILL.md 경로에서 이름을 추정한다.
+ *
+ * 라이브 채팅과 트랜스크립트가 이 판정을 각자 적고 있었다. 두 벌이면 이름을 못 얻었을
+ * 때의 대비나 경로 추정 규칙을 한쪽만 고쳐도, 같은 대화가 흐름과 기록에서 다른 스킬
+ * 목록으로 보인다.
+ */
+function toolSkillUsages(source: SkillToolSource): SkillUsage[] {
+  if (isSkillToolName(source.toolName)) {
+    const invocation = parseSkillInvocation(source.inputJson);
+    const name = invocation.name || source.fallbackName || UNKNOWN_SKILL_NAME;
+    return [skillUsage(source.usageId("tool", invocation.name), name, "tool", source.status, {
+      args: invocation.args,
+    })];
+  }
+  return skillPathNames(source.inputJson)
+    .map((name) => skillUsage(source.usageId("path", name), name, "path", source.status));
+}
+
 export function collectChatSkillUsages(entries: readonly SkillToolEntry[]): SkillUsage[] {
   const collected = new SkillUsageSet();
   for (const entry of entries) {
     if (entry.type !== "tool") continue;
-    const status = entry.status ?? "running";
-    if (isSkillToolName(entry.name)) {
-      const invocation = parseSkillInvocation(entry.detail ?? "");
-      const name = invocation.name || launchedSkillName(entry.output ?? "") || UNKNOWN_SKILL_NAME;
-      collected.add(skillUsage(entry.id, name, "tool", status, { args: invocation.args }));
-      continue;
-    }
-    for (const name of skillPathNames(entry.detail ?? "")) {
-      collected.add(skillUsage(`${entry.id}:${name}`, name, "path", status));
-    }
+    const usages = toolSkillUsages({
+      toolName: entry.name,
+      inputJson: entry.detail ?? "",
+      status: entry.status ?? "running",
+      fallbackName: launchedSkillName(entry.output ?? "") ?? "",
+      usageId: (detection, name) => (detection === "tool" ? entry.id : `${entry.id}:${name}`),
+    });
+    collected.addAll(usages);
   }
   return collected.list();
 }
@@ -118,17 +157,14 @@ export function collectTranscriptSkillUsages(items: readonly TranscriptItem[]): 
  */
 function collectTranscriptBlock(collected: SkillUsageSet, index: number, block: ContentBlock): void {
   if (block.kind === "tool_use") {
-    if (isSkillToolName(block.name)) {
-      const invocation = parseSkillInvocation(block.inputJson);
-      const name = invocation.name || UNKNOWN_SKILL_NAME;
-      collected.add(skillUsage(`${index}:${invocation.name || "skill"}`, name, "tool", "completed", {
-        args: invocation.args,
-      }));
-      return;
-    }
-    for (const name of skillPathNames(block.inputJson)) {
-      collected.add(skillUsage(`${index}:${name}`, name, "path", "completed"));
-    }
+    const usages = toolSkillUsages({
+      toolName: block.name,
+      inputJson: block.inputJson,
+      status: "completed",
+      // 이름을 못 얻은 스킬 실행도 블록 순번으로는 구분된다.
+      usageId: (_detection, name) => `${index}:${name || "skill"}`,
+    });
+    collected.addAll(usages);
     return;
   }
   if (block.kind === "tool_result") {
@@ -139,98 +175,93 @@ function collectTranscriptBlock(collected: SkillUsageSet, index: number, block: 
     return;
   }
   // 주입된 SKILL.md는 앞선 실행 항목의 상세가 된다. 실행 항목을 못 만났으면 이 레코드만으로 만든다.
-  if (block.kind === "context" && block.label.startsWith(SKILL_CONTEXT_LABEL_PREFIX)) {
-    const name = block.label.slice(SKILL_CONTEXT_LABEL_PREFIX.length).trim();
-    const injected = parseInjectedSkillBody(block.text);
-    if (!collected.attach(name, injected)) {
-      collected.add(skillUsage(`${index}:${name}`, name, "tool", "completed", injected));
+  if (block.kind === "context") {
+    const name = skillContextLabelName(block.label);
+    if (name !== null) {
+      collected.addInjected(`${index}:${name}`, name, parseInjectedSkillBody(block.text));
     }
   }
 }
 
 /**
+ * 수집 지점이 알아낸 상세 중 "값이 있으면 더 확실한 것"으로 취급하는 필드. 빈 값은 아직
+ * 모른다는 뜻이지 비우라는 뜻이 아니므로, 어느 지점에서 왔든 덮는 규칙이 같다.
+ */
+const SKILL_USAGE_DETAIL_FIELDS = ["args", "directory", "body"] as const;
+
+type SkillUsageDetails = Partial<Pick<SkillUsage, (typeof SKILL_USAGE_DETAIL_FIELDS)[number]>>;
+
+/**
  * 이름이 같은 스킬 실행을 하나로 모은다. 같은 스킬 하나가 도구 호출·확인 문장·주입
  * 레코드 세 군데에 나타나므로, 그대로 쌓으면 한 번 쓴 스킬이 세 개로 보인다.
+ *
+ * 합치는 규칙은 전부 이 집합이 소유한다. 상세를 덮는 규칙이 도구 항목과 주입 레코드에
+ * 각각 적혀 있었고, 주입 레코드는 "붙여 보고 실패하면 새로 만든다"를 호출부가 두 걸음으로
+ * 밟고 있었다. 그러면 상세 필드가 하나 늘 때 한쪽만 채워도 빌드가 통과하고, 같은 스킬이
+ * 어느 경로로 먼저 왔느냐에 따라 상세가 비어 보인다.
  */
 class SkillUsageSet {
   private readonly usages: SkillUsage[] = [];
+  /**
+   * 이름 → 이미 담은 항목. 합칠 상대를 찾는 일이 항목마다 목록 전체를 되훑고 있었다.
+   * 트랜스크립트 수집은 블록 하나하나가 이 찾기를 부르므로, 긴 세션에서는 블록 수 × 담은
+   * 항목 수만큼 훑는다. 담는 자리가 여기 하나뿐이라 색인은 목록과 어긋날 수 없고,
+   * 순서는 목록이 그대로 들고 있어 `list`의 답도 달라지지 않는다.
+   */
+  private readonly byName = new Map<string, SkillUsage>();
+
+  private find(name: string): SkillUsage | undefined {
+    return this.byName.get(name);
+  }
+
+  /** 새 항목을 담는 유일한 자리. 목록과 색인이 함께 늘어야 둘이 어긋나지 않는다. */
+  private push(usage: SkillUsage): void {
+    this.usages.push(usage);
+    this.byName.set(usage.name, usage);
+  }
+
+  /** 나중에 온 상세로 기존 항목을 채운다. 빈 값은 모른다는 뜻이라 덮지 않는다. */
+  private mergeDetails(existing: SkillUsage, details: SkillUsageDetails): void {
+    for (const field of SKILL_USAGE_DETAIL_FIELDS) {
+      const value = details[field];
+      if (value) existing[field] = value;
+    }
+  }
 
   add(usage: SkillUsage): void {
-    const existing = this.usages.find((current) => current.name === usage.name);
+    const existing = this.find(usage.name);
     if (!existing) {
-      this.usages.push(usage);
+      this.push(usage);
       return;
     }
+    this.mergeDetails(existing, usage);
     // 나중에 온 값이 더 확실할 때만 덮는다. 상태는 진행 중 → 완료·실패로만 나아간다.
-    if (usage.args) existing.args = usage.args;
-    if (usage.body) existing.body = usage.body;
-    if (usage.directory) existing.directory = usage.directory;
     if (usage.detection === "tool") existing.detection = "tool";
     if (usage.status !== "running") existing.status = usage.status;
   }
 
-  attach(name: string, injected: { directory: string; body: string }): boolean {
-    const existing = this.usages.find((current) => current.name === name);
-    if (!existing) return false;
-    existing.directory = injected.directory || existing.directory;
-    existing.body = injected.body || existing.body;
-    return true;
+  /** 도구 호출 하나에서 경로별 사용이 여러 건 잡혀도 같은 병합 규칙으로 차례로 넣는다. */
+  addAll(usages: readonly SkillUsage[]): void {
+    for (const usage of usages) this.add(usage);
+  }
+
+  /**
+   * 주입된 SKILL.md를 같은 이름의 실행 항목 상세로 붙인다. 붙일 항목이 없으면 이
+   * 레코드만으로 항목을 만든다. 이 레코드는 상세일 뿐이라, 붙일 항목이 있을 때는 그
+   * 항목의 탐지 방식·상태를 건드리지 않는다(`add`와 다른 점은 이것 하나다).
+   */
+  addInjected(id: string, name: string, injected: { directory: string; body: string }): void {
+    const existing = this.find(name);
+    if (existing) {
+      this.mergeDetails(existing, injected);
+      return;
+    }
+    this.push(skillUsage(id, name, "tool", "completed", injected));
   }
 
   list(): SkillUsage[] {
     return this.usages;
   }
-}
-
-/** Skill 도구 인자에서 스킬 이름과 지시를 뽑는다. 스트리밍 중이면 JSON이 아직 깨져 있다. */
-function parseSkillInvocation(detail: string): { name: string; args: string } {
-  const text = detail.trim();
-  if (!text) return { name: "", args: "" };
-  try {
-    const value = JSON.parse(text) as { skill?: unknown; args?: unknown };
-    return {
-      name: typeof value.skill === "string" ? value.skill.trim() : "",
-      args: typeof value.args === "string" ? value.args.trim() : "",
-    };
-  } catch {
-    // 부분 JSON에서라도 이름은 알려 준다. 카드가 이름 없이 뜨는 편보다 낫다.
-    return {
-      name: text.match(/"skill"\s*:\s*"([^"]*)"/)?.[1]?.trim() ?? "",
-      args: text.match(/"args"\s*:\s*"([^"]*)"/)?.[1]?.trim() ?? "",
-    };
-  }
-}
-
-/** `Launching skill: <이름>` 확인 문장에서 스킬 이름을 뽑는다. */
-export function launchedSkillName(text: string | undefined): string | null {
-  const line = text?.trimStart().split("\n", 1)[0] ?? "";
-  if (!line.startsWith(LAUNCH_PREFIX)) return null;
-  const name = line.slice(LAUNCH_PREFIX.length).trim();
-  return name || null;
-}
-
-/** CLI가 주입한 SKILL.md 레코드를 스킬 디렉터리와 본문으로 나눈다. */
-export function parseInjectedSkillBody(text: string): { directory: string; body: string } {
-  const trimmed = text.trimStart();
-  if (!trimmed.startsWith(BASE_DIRECTORY_PREFIX)) return { directory: "", body: trimmed };
-  const breakAt = trimmed.indexOf("\n");
-  if (breakAt < 0) {
-    return { directory: trimmed.slice(BASE_DIRECTORY_PREFIX.length).trim(), body: "" };
-  }
-  return {
-    directory: trimmed.slice(BASE_DIRECTORY_PREFIX.length, breakAt).trim(),
-    body: trimmed.slice(breakAt + 1).trim(),
-  };
-}
-
-/** 도구 인자 안에서 `skills/<이름>/SKILL.md`를 가리키는 경로의 스킬 이름들. */
-function skillPathNames(detail: string): string[] {
-  const names: string[] = [];
-  for (const match of detail.matchAll(SKILL_PATH_PATTERN)) {
-    const name = match[1];
-    if (name && name !== "." && name !== ".." && !names.includes(name)) names.push(name);
-  }
-  return names;
 }
 
 /**

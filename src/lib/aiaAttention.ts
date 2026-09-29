@@ -1,15 +1,44 @@
 import type { ChatAttentionItem, ChatAttentionSnapshot } from "../types";
+import { clampPreviewText } from "./aiaPreviewText.ts";
 import { recountAttention } from "./chatAttention.ts";
 
+/** AIA 프로필 알림 항목인지 여부. */
+function isAiaAttention(item: ChatAttentionItem): boolean {
+  return item.profile === "aia";
+}
+
+/** 대화 턴이 완료되었거나 실패하여 종료된 상태인지 여부. */
+function isTerminalAttention(item: ChatAttentionItem): boolean {
+  return item.kind === "completed" || item.kind === "failed";
+}
+
 export function withoutAiaAttention(snapshot: ChatAttentionSnapshot): ChatAttentionSnapshot {
-  return recountAttention(snapshot.items.filter((item) => item.profile !== "aia"));
+  return recountAttention(snapshot.items.filter((item) => !isAiaAttention(item)));
+}
+
+/**
+ * 버린 AIA 대화(새로 시작하거나 실행설정이 어긋나 정지한 대화)에 남은 알림.
+ *
+ * 턴이 끝날 때마다 완료 알림이 하나 남고, 그 알림이 미확인으로 있으면 상단바 트리거는
+ * 팝업을 여는 대신 그 알림의 대화로 전환한다(`toggleAia`). 보고 있던 대화와 같을 때는
+ * 전환이 제자리라 티가 나지 않지만, 새로고침으로 대화를 새로 시작한 뒤에는 방금 버린
+ * 대화를 도로 열어 준다 — 닫았다 다시 열면 이전 세션이 돌아오는 갈래가 이것이다.
+ * 그래서 대화를 버릴 때 그 대화의 알림도 함께 걷는다.
+ */
+export function aiaAttentionForChat(items: ChatAttentionItem[], chatId: string): ChatAttentionItem[] {
+  return items.filter((item) => isAiaAttention(item) && item.chatId === chatId);
 }
 
 export function selectAiaAttention(items: ChatAttentionItem[]): ChatAttentionItem | null {
-  const aiaItems = items.filter((item) => item.profile === "aia");
-  return aiaItems.find((item) => item.kind === "approval")
-    ?? aiaItems.find((item) => !item.read && (item.kind === "completed" || item.kind === "failed"))
-    ?? null;
+  let unreadTerminal: ChatAttentionItem | null = null;
+  for (const item of items) {
+    if (!isAiaAttention(item)) continue;
+    if (item.kind === "approval") return item;
+    if (unreadTerminal === null && !item.read && isTerminalAttention(item)) {
+      unreadTerminal = item;
+    }
+  }
+  return unreadTerminal;
 }
 
 /** 알림 대상(attentionTarget)을 받은 팝업이 취할 행동. */
@@ -54,9 +83,16 @@ const MAX_BUBBLE_REQUEST_CHARS = 90;
  * 문장 경계까지 맞춰 보낸 미리보기를 여기서 한 번 더 자르게 된다.
  */
 const MAX_BUBBLE_RESPONSE_CHARS = 120;
-/** 상한의 몇 %보다 뒤에서만 낱말·문장 경계를 찾을지. `text_limit.rs`와 같은 기준이다. */
-const BOUNDARY_MIN_RATIO = 0.6;
-const SENTENCE_END = /[.!?。！？…]/u;
+
+/**
+ * 말풍선에 띄울 원문 응답 텍스트. 승인 대기는 아직 응답이 없으므로 세부 승인 내용이나
+ * 제목을 쓰고, 그 밖에는 미리보기 응답을 그대로 쓴다.
+ */
+function bubbleResponseText(item: ChatAttentionItem): string | null {
+  return item.kind === "approval"
+    ? item.detail?.trim() || item.title
+    : item.preview?.response ?? null;
+}
 
 /**
  * 알림 하나를 말풍선 두 줄(요청·응답)로 옮긴다. 승인 대기는 아직 응답이 없으므로
@@ -64,42 +100,7 @@ const SENTENCE_END = /[.!?。！？…]/u;
  */
 export function aiaAttentionBubble(item: ChatAttentionItem | null): AiaAttentionBubble | null {
   if (!item) return null;
-  const response = item.kind === "approval"
-    ? item.detail?.trim() || item.title
-    : item.preview?.response ?? null;
-  const trimmed = clampBubbleText(response, MAX_BUBBLE_RESPONSE_CHARS);
+  const trimmed = clampPreviewText(bubbleResponseText(item), MAX_BUBBLE_RESPONSE_CHARS);
   if (!trimmed) return null;
-  return { request: clampBubbleText(item.preview?.request ?? null, MAX_BUBBLE_REQUEST_CHARS), response: trimmed };
-}
-
-/**
- * 공백을 한 칸으로 정리하고, 제한 글자 수를 넘으면 낱말·문장을 끊지 않는 자리에서
- * 말줄임표로 마무리한다.
- *
- * 마크다운 표기는 여기서 걷지 않는다. 대화 미리보기는 백엔드가 이미 순수 텍스트로
- * 옮겨 보내고, 이 함수가 함께 다루는 승인 요청 문구는 마크다운이 아니다.
- */
-function clampBubbleText(text: string | null | undefined, limit: number): string | null {
-  const collapsed = (text ?? "").split(/\s+/u).filter(Boolean).join(" ");
-  if (!collapsed) return null;
-  const chars = [...collapsed];
-  if (chars.length <= limit) return collapsed;
-  return `${chars.slice(0, bubbleCutIndex(chars, limit)).join("").trimEnd()}…`;
-}
-
-/**
- * 상한 안쪽에서 끊을 자리를 고른다. 마지막 문장 끝을 먼저 찾고, 없으면 마지막 공백을
- * 쓴다. 상한의 `BOUNDARY_MIN_RATIO` 앞까지 물러나면 내용이 너무 줄어들므로, 그 안에
- * 경계가 없으면 상한에서 그대로 끊는다.
- */
-function bubbleCutIndex(chars: string[], limit: number): number {
-  const floor = Math.floor(limit * BOUNDARY_MIN_RATIO);
-  for (let index = limit - 1; index >= floor; index -= 1) {
-    // 뒤가 공백일 때만 문장 끝으로 본다. 그러지 않으면 `1.5`의 소수점에서 끊긴다.
-    if (SENTENCE_END.test(chars[index]) && (chars[index + 1] ?? " ") === " ") return index + 1;
-  }
-  for (let index = limit - 1; index >= floor; index -= 1) {
-    if (chars[index] === " ") return index;
-  }
-  return limit;
+  return { request: clampPreviewText(item.preview?.request ?? null, MAX_BUBBLE_REQUEST_CHARS), response: trimmed };
 }

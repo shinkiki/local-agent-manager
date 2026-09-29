@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::app_data_file::{read_private_json_or_default, write_private_json};
 use crate::domain::{ProviderId, SessionRuntimeFailure};
 use crate::identifier::validate_identifier;
+use crate::json_store;
 use crate::store::session_key;
 use crate::store_lock;
 use crate::CoreError;
@@ -45,6 +46,13 @@ struct RuntimeFailureRecord {
     failure: SessionRuntimeFailure,
 }
 
+impl RuntimeFailureRecord {
+    /// 실패 색인과 보관 한도가 공유하는 공급자별 세션 키.
+    fn session_key(&self) -> String {
+        session_key(self.source, &self.session_id)
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatRuntimeStore {
@@ -69,15 +77,9 @@ pub(crate) fn upsert_managed_chat_runtime_lease(
         validate_identifier(session_id)?;
     }
     with_chat_runtime_store(app_data_dir, |store| {
-        if let Some(existing) = store
-            .leases
-            .iter_mut()
-            .find(|existing| existing.chat_id == lease.chat_id)
-        {
-            *existing = lease;
-        } else {
-            store.leases.push(lease);
-        }
+        upsert_matching(&mut store.leases, lease, |existing, incoming| {
+            existing.chat_id == incoming.chat_id
+        });
         Ok(())
     })
 }
@@ -116,7 +118,7 @@ pub(crate) fn latest_runtime_failures(
 ) -> Result<HashMap<String, SessionRuntimeFailure>, CoreError> {
     let mut latest = HashMap::<String, SessionRuntimeFailure>::new();
     for record in load_chat_runtime_store(app_data_dir)?.failures {
-        let key = session_key(record.source, &record.session_id);
+        let key = record.session_key();
         match latest.get(&key) {
             Some(existing) if existing.occurred_at >= record.failure.occurred_at => {}
             _ => {
@@ -156,22 +158,30 @@ pub(crate) fn persist_runtime_failure(
         occurred_at,
     };
     with_chat_runtime_store(app_data_dir, |store| {
-        if let Some(existing) = store.failures.iter_mut().find(|record| {
-            record.source == source
-                && record.session_id == session_id
-                && record.failure.turn_id == turn_id
-        }) {
-            existing.failure = failure;
-        } else {
-            store.failures.push(RuntimeFailureRecord {
-                source,
-                session_id: session_id.to_owned(),
-                failure,
-            });
-        }
+        let record = RuntimeFailureRecord {
+            source,
+            session_id: session_id.to_owned(),
+            failure,
+        };
+        upsert_matching(&mut store.failures, record, |existing, incoming| {
+            existing.source == incoming.source
+                && existing.session_id == incoming.session_id
+                && existing.failure.turn_id == incoming.failure.turn_id
+        });
         trim_runtime_failures(store);
         Ok(())
     })
+}
+
+fn upsert_matching<T>(items: &mut Vec<T>, incoming: T, matches: impl Fn(&T, &T) -> bool) {
+    if let Some(existing) = items
+        .iter_mut()
+        .find(|existing| matches(existing, &incoming))
+    {
+        *existing = incoming;
+    } else {
+        items.push(incoming);
+    }
 }
 
 fn load_chat_runtime_store(app_data_dir: &Path) -> Result<ChatRuntimeStore, CoreError> {
@@ -194,20 +204,13 @@ fn with_chat_runtime_store<T>(
 }
 
 fn trim_runtime_failures(store: &mut ChatRuntimeStore) {
-    let mut per_session = HashMap::<String, usize>::new();
-    store
-        .failures
-        .sort_by_key(|record| std::cmp::Reverse(record.failure.occurred_at));
-    store.failures.retain(|record| {
-        let key = session_key(record.source, &record.session_id);
-        let count = per_session.entry(key).or_default();
-        *count += 1;
-        *count <= MAX_RUNTIME_FAILURES_PER_SESSION
-    });
-    store.failures.truncate(MAX_RUNTIME_FAILURES);
-    store
-        .failures
-        .sort_by_key(|record| record.failure.occurred_at);
+    json_store::trim_to_retention(
+        &mut store.failures,
+        MAX_RUNTIME_FAILURES,
+        MAX_RUNTIME_FAILURES_PER_SESSION,
+        |record| record.failure.occurred_at,
+        RuntimeFailureRecord::session_key,
+    );
 }
 
 #[cfg(test)]

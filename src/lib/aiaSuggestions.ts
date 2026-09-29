@@ -1,12 +1,13 @@
-import type {
-  AccountSnapshot,
-  ChatAttentionSnapshot,
-  ManagerSnapshot,
-  SchedulerSnapshot,
-  SystemAutomationSnapshot,
-} from "../types";
-import type { AiaSkillChange } from "./aiaSkillChanges.ts";
-import type { AiaSuggestionHistory, ProjectDismissalState } from "./aiaSuggestionHistory.ts";
+/**
+ * 제안 평가의 진입점. 카탈로그를 펼쳐 정의마다 평가 문맥을 짓고
+ * (`aiaSuggestionRules.ts`), 종류별 생성기가 만든 후보를(`aiaSuggestionKinds.ts`)
+ * 숨김 기록에 비춰(`aiaSuggestionHistory.ts`) 보여줄 목록을 정한다.
+ *
+ * 타입 선언은 `aiaSuggestionTypes.ts`가 갖는다. 구현 모듈이 선언을 이 파일에서
+ * 되가져오면 참조가 양방향으로 걸려, 종류를 하나 더할 때 선언과 구현을 오가며
+ * 고쳐야 했다. 기존 호출부가 경로를 바꾸지 않도록 여기서 그대로 다시 내보낸다.
+ */
+import type { ProjectDismissalState } from "./aiaSuggestionHistory.ts";
 import {
   cloneAiaSuggestionHistory,
   emptyAiaSuggestionHistory,
@@ -14,13 +15,32 @@ import {
   resolveStaleDismissals,
 } from "./aiaSuggestionHistory.ts";
 import { limitProjectSuggestions } from "./aiaProjectCleanup.ts";
-import { compareSuggestions, evaluateDefinition } from "./aiaSuggestionRules.ts";
+import { compareSuggestions } from "./aiaSuggestionKinds.ts";
+import { evaluateDefinition } from "./aiaSuggestionRules.ts";
+import type {
+  AiaSuggestion,
+  AiaSuggestionEffectivePack,
+  AiaSuggestionEvaluation,
+  AiaSuggestionEvaluationInput,
+  AiaSuggestionPack,
+} from "./aiaSuggestionTypes.ts";
+
+/**
+ * 타입 선언은 `aiaSuggestionTypes.ts`가 갖는다. 여기서는 호출부가 실제로 이 진입점을
+ * 지나 쓰는 이름만 다시 내보낸다 — 카탈로그 안쪽 모양(정의·팩·출처·검증 문제)은
+ * 카탈로그를 읽고 쓰는 모듈만 보므로 선언 모듈에서 바로 가져간다.
+ */
+export type {
+  AiaSuggestion,
+  AiaSuggestionCatalog,
+  AiaSuggestionKind,
+} from "./aiaSuggestionTypes.ts";
 
 /** 규칙 평가·정렬은 별도 모듈이 맡는다. 경로 정규화는 기존 호출부가 그대로 쓰도록 다시 내보낸다. */
 export { normalizeProjectPath } from "./aiaProjectCleanup.ts";
 
 /** 스킬 변경 감지는 별도 모듈이 맡는다. 기존 호출부가 그대로 쓰도록 여기서 다시 내보낸다. */
-export type { AiaSkillChange, AiaSkillChangeState, AiaSkillDigest } from "./aiaSkillChanges.ts";
+export type { AiaSkillChangeState } from "./aiaSkillChanges.ts";
 export {
   clearAiaSkillChange,
   emptyAiaSkillChangeState,
@@ -29,153 +49,34 @@ export {
   serializeAiaSkillChangeState,
 } from "./aiaSkillChanges.ts";
 
-export type AiaSuggestionKind =
-  | "providerCliMissing"
-  | "accountAuthError"
-  /** 폐기된 종류. 이미 배포된 팩이 담고 있어도 제안으로 만들지 않는다. */
-  | "accountUsageThreshold"
-  | "accountAutoSwitchMissing"
-  | "schedulerPaused"
-  | "scheduleRunFailed"
-  | "translationFailed"
-  | "projectSessionCleanup"
-  | "interruptedSessionReminder"
-  | "skillContentChanged"
-  | "featureTip";
-
-export interface AiaSuggestionDefinition {
-  id: string;
-  kind: AiaSuggestionKind;
-  enabled: boolean;
-  severity: string;
-  priority: number;
-  titleTemplate: string;
-  detailTemplate: string;
-  promptTemplate: string;
-  parameters?: Record<string, unknown>;
-  rearm?: Record<string, unknown>;
-}
-
-export interface AiaSuggestionPack {
-  schemaVersion?: number;
-  packId: string;
-  version?: string;
-  displayName: string;
-  source?: string;
-  skillKey?: string | null;
-  suggestions: AiaSuggestionDefinition[];
-}
-
-export type AiaSuggestionPackSource = "bundled" | "commonSkill" | "lastKnownGood" | string;
-
-export interface AiaSuggestionEffectivePack {
-  source: AiaSuggestionPackSource;
-  skillKey: string | null;
-  pack: AiaSuggestionPack;
-}
-
-export interface AiaSuggestionCatalogIssue {
-  skillKey: string;
-  message: string;
-  usingLastKnownGood: boolean;
-}
-
-export interface AiaSuggestionCatalogDefinition {
-  packId: string;
-  packDisplayName: string;
-  skillKey: string | null;
-  definition: AiaSuggestionDefinition;
-}
-
-export interface AiaSuggestionBundledSkillTemplate {
-  key: string;
-  name: string;
-  description: string;
-  files: Array<{ path: string; content: string }>;
-  installed: boolean;
-}
-
-export interface AiaSuggestionCatalog {
-  contentDigest: string;
-  packs: AiaSuggestionEffectivePack[];
-  definitions: AiaSuggestionCatalogDefinition[];
-  issues: AiaSuggestionCatalogIssue[];
-  bundledSkill: AiaSuggestionBundledSkillTemplate;
-  /** 테스트·이전 호출자가 쓰던 콘텐츠 지문 별칭. */
-  fingerprint?: string;
-}
-
-export interface AiaSuggestionFlatCatalog {
-  packs: AiaSuggestionPack[];
-  fingerprint?: string;
-}
-
-export interface AiaSuggestion {
-  id: string;
-  definitionId: string;
-  fingerprint: string;
-  kind: AiaSuggestionKind;
-  severity: string;
-  priority: number;
-  title: string;
-  detail: string;
-  prompt: string;
-  packId: string;
-  packDisplayName: string;
-  source: string;
-  skillKey: string | null;
-  targetId: string;
-  stateKey: string;
-  metadata: Record<string, string | number | boolean | null>;
-}
-
-export interface AiaSuggestionEvaluationInput {
-  catalog: AiaSuggestionCatalog | AiaSuggestionFlatCatalog | AiaSuggestionPack[];
-  manager: ManagerSnapshot;
-  accounts: AccountSnapshot | null;
-  scheduler: SchedulerSnapshot | null;
-  automation: SystemAutomationSnapshot | null;
-  attention: ChatAttentionSnapshot;
-  now: number;
-  history?: AiaSuggestionHistory | null;
-  /** 감지된 스킬 내용 변경. 즉시 트리거는 이 목록만 보고 검토 제안을 만든다. */
-  skillChanges?: AiaSkillChange[] | null;
-}
-
-export interface AiaSuggestionEvaluation {
-  suggestions: AiaSuggestion[];
-  allCandidates: AiaSuggestion[];
-  history: AiaSuggestionHistory;
-}
-
-/** 사건 감지·발송 예산은 별도 모듈이 맡는다. 기존 호출부가 그대로 쓰도록 여기서 다시 내보낸다. */
-export type {
-  AiaEvent,
-  AiaEventBaseline,
-  AiaEventBudget,
-  AiaEventKind,
-  AiaEventTransitionResult,
-} from "./aiaEvents.ts";
+/** 사건 감지는 별도 모듈이 맡는다. 기존 호출부가 그대로 쓰도록 여기서 다시 내보낸다. */
+export type { AiaEvent, AiaEventBaseline, AiaEventKind } from "./aiaEvents.ts";
 export {
-  canDispatchAiaEvent,
   captureAiaEventBaseline,
   coalesceAiaEvents,
   detectAiaEvents,
+} from "./aiaEvents.ts";
+
+/** 사건 발송 예산도 마찬가지다. 감지와 갈라 둔 모듈이지만 호출부가 보는 자리는 그대로다. */
+export {
+  canDispatchAiaEvent,
   emptyAiaEventBudget,
   parseAiaEventBudget,
   recordAiaEventDispatch,
   serializeAiaEventBudget,
-} from "./aiaEvents.ts";
+} from "./aiaEventBudget.ts";
 
 /** 숨김 기록은 별도 모듈이 맡는다. 기존 호출부가 그대로 쓰도록 여기서 다시 내보낸다. */
-export type { AiaSuggestionHistory, IncidentDismissal, ProjectDismissal } from "./aiaSuggestionHistory.ts";
+export type { AiaSuggestionHistory } from "./aiaSuggestionHistory.ts";
 export {
   dismissAiaSuggestion,
   emptyAiaSuggestionHistory,
   parseAiaSuggestionHistory,
   serializeAiaSuggestionHistory,
-  suggestionFingerprint,
 } from "./aiaSuggestionHistory.ts";
+
+/** 제안 지문은 숨김과 무관한 규칙이라 따로 선다. 호출부가 보는 자리는 그대로다. */
+export { suggestionFingerprint } from "./aiaFingerprint.ts";
 
 export function evaluateAiaSuggestions(input: AiaSuggestionEvaluationInput): AiaSuggestion[] {
   return evaluateAiaSuggestionState(input).suggestions;

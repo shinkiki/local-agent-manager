@@ -13,6 +13,11 @@ export interface AttentionRouteDeps<S> {
   syncSessionCatalog: () => Promise<unknown>;
   /** 공급자 세션에 매핑된 살아 있는 채팅 런타임의 chatId. 없으면 null, 확인 불가면 reject. */
   findActiveChatId: () => Promise<string | null>;
+  /**
+   * 목록을 거치지 않고 공급자 원본에서 읽는 세션 한 건. 색인이 끝내 세션을 올리지 못하는
+   * 경우(제외 프로젝트의 무인 실행)에도 알림이 가리키는 세션을 열 수 있는 마지막 길이다.
+   */
+  findProviderSession: () => Promise<S | null>;
 }
 
 /**
@@ -29,26 +34,44 @@ export async function resolveAttentionRoute<S>(
   deps: AttentionRouteDeps<S>,
 ): Promise<AttentionRoute<S>> {
   const sessionId = item.providerSessionId;
-  if (!sessionId) return { kind: "chat", chatId: item.chatId };
-  let session = deps.findIndexedSession(sessionId);
-  if (session) return { kind: "session", session };
+  const chatRoute: AttentionRoute<S> = { kind: "chat", chatId: item.chatId };
+  if (!sessionId) return chatRoute;
+
+  // 색인 조회는 세 번 돌아온다 — 유예 전, 짧은 유예 뒤, 남은 색인을 끝까지 기다린 뒤.
+  // 조회와 결과 변환을 각자 펼쳐 두면 목적지 모양을 바꿀 때 세 자리를 함께 고쳐야 하고,
+  // 그중 하나를 빼면 같은 세션이 어느 걸음에서 찾혔느냐에 따라 다른 화면으로 열린다.
+  const indexedRoute = (): AttentionRoute<S> | null => {
+    const session = deps.findIndexedSession(sessionId);
+    return session ? { kind: "session", session } : null;
+  };
+
+  const beforeSync = indexedRoute();
+  if (beforeSync) return beforeSync;
+
   const sync = deps.syncSessionCatalog();
   await waitWithSyncGrace(sync);
-  session = deps.findIndexedSession(sessionId);
-  if (session) return { kind: "session", session };
+  const afterGrace = indexedRoute();
+  if (afterGrace) return afterGrace;
+
   let activeChatId: string | null;
   try {
     activeChatId = await deps.findActiveChatId();
   } catch {
     // 런타임 확인이 안 되는 상태(백엔드 연결 문제)면 기존 폴백을 유지한다.
     // attach가 같은 연결 오류를 사용자에게 그대로 보여준다.
-    return { kind: "chat", chatId: item.chatId };
+    return chatRoute;
   }
   if (activeChatId) return { kind: "chat", chatId: activeChatId };
+
   await sync.catch(() => undefined);
-  session = deps.findIndexedSession(sessionId);
-  if (session) return { kind: "session", session };
-  return { kind: "ended" };
+  const afterSync = indexedRoute();
+  if (afterSync) return afterSync;
+
+  // 색인이 끝내 올리지 못한 세션이라도 원본이 있으면 상세는 열린다. 무인 실행은
+  // 사용자가 목록에서 뺀 프로젝트에서도 돌기 때문에, 여기서 멈추면 그 회차의 결과는
+  // 알림에서 영영 열리지 않는다.
+  const provider = await deps.findProviderSession().catch(() => null);
+  return provider ? { kind: "session", session: provider } : { kind: "ended" };
 }
 
 /**

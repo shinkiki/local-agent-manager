@@ -4,6 +4,12 @@
  *
  * 이 값들은 어느 한 기능의 것이 아니라 세 모듈이 같은 규칙으로 읽어야 하는 것이라
  * 제안 평가 본문에서 떼어내 여기 모았다.
+ *
+ * 그 뒤 제안 메타데이터의 값 모양과 정렬 키까지 이 파일에 얹혀 있었다. 둘은 제안이라는
+ * 한 기능의 것이라, 저장 되읽기만 필요한 모듈(`aiaEventBudget.ts`·`aiaSkillChanges.ts`)
+ * 까지 제안 도메인을 아는 파일을 바라보게 만들었다. 밑돌이 한 기능을 알면 그 기능이
+ * 자랄 때마다 밑돌을 읽는 모든 모듈이 함께 진다 — 제안의 것은 `aiaSuggestionOrder.ts`로
+ * 옮겼고, 여기 남는 것은 어느 기능도 모르는 밑돌뿐이다.
  */
 
 export const MINUTE = 60_000;
@@ -81,7 +87,36 @@ export function uniqueStrings(value: unknown): string[] {
 }
 
 export function stringRecord(value: unknown): Record<string, string> {
-  return mapRecord(value, (item, key) => (key && typeof item === "string" && item ? item : null));
+  return mapRecord(value, (item, key) => (key ? requiredString(item) : null));
+}
+
+/**
+ * 되읽기가 "없으면 항목을 버린다"로 취급하는 필수 문자열. 빈 문자열은 값이 없는 것과
+ * 같게 본다 — 저장본이 빈 이름·빈 지문을 담고 있으면 그 항목은 쓸 수 없다.
+ */
+export function requiredString(value: unknown): string | null {
+  return typeof value === "string" && value ? value : null;
+}
+
+/**
+ * 되읽기가 요구하는 숫자 필드를 한 번에 확인한다. 하나라도 숫자가 아니면 null을 주므로
+ * 호출부는 항목을 버리기만 하면 된다.
+ *
+ * 필드마다 `finiteNumber` 한 줄과 null 검사 한 줄을 쌓던 자리가 세 군데 있었고, 그중
+ * 한 곳은 검사를 다섯 줄 뒤에 몰아 두어 새 필드를 더할 때 검사에서 빠뜨리기 쉬웠다.
+ * 여기서는 키 목록에 이름을 더하는 것이 곧 검사에 더하는 것이다.
+ */
+export function requiredNumbers<K extends string>(
+  entry: Record<string, unknown>,
+  keys: readonly K[],
+): Record<K, number> | null {
+  const values = {} as Record<K, number>;
+  for (const key of keys) {
+    const value = finiteNumber(entry[key]);
+    if (value === null) return null;
+    values[key] = value;
+  }
+  return values;
 }
 
 export function numericRecord(value: unknown): Record<string, number> {
@@ -121,3 +156,4 @@ export function finiteNumber(value: unknown): number | null {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+

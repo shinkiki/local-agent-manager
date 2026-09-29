@@ -2,16 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { nearestUsageReset, sidebarUsageError, sidebarUsageMeters, sidebarUsageSources } from "./sidebarUsage.ts";
-
-/** 창 하나. 초기화 시각이 없는 창이 대부분이라 기본값을 둔다. */
-function win(label, usedPercent, resetsAt = null) {
-  return { label, usedPercent, resetsAt };
-}
-
-/** 계정 사용량 뷰. 시험마다 실제로 다른 것은 창 목록과 조회 상태뿐이다. */
-function usage(windows, overrides = {}) {
-  return { status: "ok", windows, updatedAt: 1_700_000_000_000, error: null, ...overrides };
-}
+import {
+  accountSnapshot,
+  accountUsageView as usage,
+  usageWindow as win,
+} from "./usageViewFixtures.mjs";
 
 function home(overrides = {}) {
   return {
@@ -41,16 +36,9 @@ function provider(overrides = {}) {
   };
 }
 
+/** 공급자 한 벌이 기본으로 든 스냅샷. 공급자 모양은 좌측 메뉴 시험만 보므로 여기서 얹는다. */
 function snapshot(overrides = {}) {
-  return {
-    accounts: [],
-    providers: [provider()],
-    autoSwitchResume: false,
-    autoSwitchPolicy: "registration",
-    autoSwitchUsageGapPercent: null,
-    resumeAccountPolicy: "activeAccount",
-    ...overrides,
-  };
+  return accountSnapshot({ providers: [provider()], ...overrides });
 }
 
 test("기본 계정이 있으면 홈 계정보다 우선한다", () => {
@@ -116,6 +104,7 @@ const LABELS = {
   error: "오류",
   windowUnavailable: "확인 불가",
   resetsIn: (countdown) => `${countdown} 뒤 초기화`,
+  unlimited: "무제한 · 로컬",
 };
 
 function source(overrides = {}) {
@@ -126,6 +115,26 @@ function source(overrides = {}) {
 function meterOf(usageView, now = 0) {
   return sidebarUsageMeters([source({ usage: usageView })], now, LABELS)[0];
 }
+
+test("Antigravity 계정이 등록돼 계정 소스가 나오면 공급자 단위 쿼터는 겹치지 않게 뺀다", () => {
+  const antigravity = usage([win("5시간", 29), win("7일", 71)]);
+  const account = { id: "agy-1", provider: "antigravity", displayName: "agy-user@example.com", usage: antigravity };
+  const registered = sidebarUsageSources(snapshot({
+    accounts: [account],
+    providers: [provider({ provider: "antigravity", activeAccountId: account.id })],
+  }), antigravity);
+  const homeOnly = sidebarUsageSources(snapshot({
+    providers: [provider({ provider: "antigravity", home: home({ usage: antigravity }) })],
+  }), antigravity);
+  const unverified = sidebarUsageSources(snapshot({
+    providers: [provider({ provider: "antigravity", home: home({ state: "absent" }) })],
+  }), antigravity);
+
+  assert.deepEqual(registered.map((entry) => entry.key), [`account:${account.id}`]);
+  assert.deepEqual(homeOnly.map((entry) => entry.kind), ["home"]);
+  // 계정도 검증된 홈도 없으면 공급자 단위 쿼터가 유일한 창이라 그대로 낸다.
+  assert.deepEqual(unverified.map((entry) => entry.kind), ["provider"]);
+});
 
 test("등록 계정 미터는 공급자 이름과 계정 이름을 붙이고 창 값을 반올림한다", () => {
   const [meter] = sidebarUsageMeters([source()], 1_700_000_000_000, LABELS);
@@ -275,3 +284,29 @@ test("실패를 문구로 알리는 것은 보여 줄 값이 하나도 없을 �
   assert.equal(sidebarUsageError([source({ usage: stale })]), false);
   assert.equal(sidebarUsageError([source({ usage: stale }), source({ usage: failed })]), true);
 });
+
+/**
+ * 사용량 한도가 없는 공급자는 창이 없는 것이 정상이다. "확인 불가"로 그리면 쓸 수 있는
+ * 공급자가 고장 난 것처럼 보이므로 값 자리에 무제한을 적는다. 꺼져 있으면 아예 없다.
+ */
+test("로컬 연결은 켜져 있을 때만 무제한 한 줄로 선다", () => {
+  const connection = { baseUrl: "http://127.0.0.1:11434/v1", defaultModel: "qwen3.5:9b", contextWindow: null, apiKeyConfigured: false, enabled: true };
+  const enabled = sidebarUsageSources(snapshot(), null, connection);
+  const localSource = enabled.find((entry) => entry.provider === "local");
+  assert.ok(localSource, "켜진 연결은 상태바에 선다");
+  assert.equal(localSource.unlimited, true);
+  assert.deepEqual(localSource.usage.windows, []);
+
+  for (const off of [null, { ...connection, enabled: false }, { ...connection, baseUrl: "" }]) {
+    const sources = sidebarUsageSources(snapshot(), null, off);
+    assert.equal(sources.some((entry) => entry.provider === "local"), false, JSON.stringify(off));
+  }
+
+  const [meter] = sidebarUsageMeters([localSource], 1_700_000_000_000, LABELS);
+  assert.deepEqual(meter.windows, []);
+  assert.equal(meter.unavailableValue, "무제한 · 로컬");
+  // 창이 없어도 조회 실패가 아니므로 메뉴 하단 오류 표시를 켜지 않는다.
+  assert.equal(sidebarUsageError([localSource]), false);
+  assert.equal(nearestUsageReset([localSource], 1_700_000_000_000), null);
+});
+

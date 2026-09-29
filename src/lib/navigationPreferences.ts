@@ -1,89 +1,100 @@
 import type { ViewId } from "../types";
+import {
+  configurableView,
+  DEFAULT_NAVIGATION_ORDER,
+  PREVIEW_VIEWS,
+  type ConfigurableViewId,
+} from "./navigationViews.ts";
+import { readStoredText, writeStoredText } from "./storedText.ts";
 
 /**
- * 사용자가 순서·숨김을 정할 수 없는 화면. 설정은 메뉴 맨 뒤에 고정으로 붙으므로
- * `DEFAULT_NAVIGATION_ORDER` 밖에 있다.
+ * 사용자가 정한 메뉴 순서·숨김의 저장 규칙 — 저장 세대, 옛 값 옮기기, 정규화, 한 축만
+ * 바꾼 새 설정.
  *
- * 이 목록이 그 사실의 유일한 자리다. 아래 `ConfigurableViewId`(타입 수준)와 도움말이 붙는
- * 화면 목록(`navigationHelp`의 `navigationHelpViews`)이 각자 `"settings"`를 다시 적고
- * 있었는데, 순서를 정할 수 없는 화면이 하나 더 늘면 한쪽만 고쳐진다 — 타입만 고치면 그
- * 화면이 도움말 목록에서 조용히 빠지고, 배열만 고치면 저장값 정규화가 그 화면을 계속
- * 사용자 설정 대상으로 받아들인다. 둘 다 여기서 파생되면 그 어긋남이 생길 자리가 없다.
+ * 저장 규칙의 중간 단계(정규화·옛 값 옮기기·원문 해석)는 이 파일 밖으로 내보내지 않는다.
+ * 바깥이 쓰는 모양은 저장값을 읽고 쓰는 일과 한 축만 바꾼 새 설정, 그리고 복원 폴백 넷뿐이고,
+ * 중간 단계까지 함께 내주면 정규화를 건너뛴 값이 저장되거나 옛 값을 옮기지 않고 그대로 쓰는
+ * 두 번째 경로가 열린다 — 실제로 그 셋을 부르는 것은 자기 테스트뿐이었다. 목록과 저장 규칙을
+ * 가른 `navigationViews`, 합친 결과를 내주지 않는 `projectRegistry`와 같은 경계다.
+ *
+ * 화면 목록 자체는 `navigationViews`에 있다. 설정 화면과 사이드바는 저장 규칙과 함께
+ * 쓰는 둘(`previewView`·`ConfigurableViewId`)만 이 자리에서 가져가므로 그 둘만 다시
+ * 내보낸다. 목록 상수(`DEFAULT_NAVIGATION_ORDER`·`PREVIEW_VIEWS`·`UNCONFIGURABLE_VIEWS`)도
+ * 함께 내주고 있었지만 그 통로를 지나는 것은 시험뿐이었다 — 목록을 보는 쪽이 저장 세대와
+ * 마이그레이션이 딸린 이 모듈을 거치게 되고, 목록이 어디 사는지가 두 자리에 적힌다.
  */
-export const UNCONFIGURABLE_VIEWS = ["settings"] as const;
-
-export type ConfigurableViewId = Exclude<ViewId, (typeof UNCONFIGURABLE_VIEWS)[number]>;
+export { previewView, type ConfigurableViewId } from "./navigationViews.ts";
 
 export interface NavigationPreferences {
   order: ConfigurableViewId[];
   hidden: ConfigurableViewId[];
 }
 
-export const DEFAULT_NAVIGATION_ORDER: ConfigurableViewId[] = [
-  "dashboard",
-  "chat",
-  "sessions",
-  "docs",
-  "instructions",
-  "skills",
-  "agents",
-  "artifacts",
-  "workflows",
-  "addons",
-  "storage",
-];
+/**
+ * 준비중이 풀린 화면. 저장값의 `hidden`에 이 화면이 있어도 사용자가 숨긴 것이 아니라
+ * 기본값이 남긴 흔적일 수 있어, 옛 키에서 넘어올 때 한 번만 걷어낸다. 그러지 않으면
+ * 준비중일 때 앱을 켜 본 기기에서는 기능이 완성된 뒤에도 메뉴가 계속 보이지 않는다.
+ *
+ * 걷어내는 것은 키가 넘어오는 그 한 번뿐이다. 그 뒤로 사용자가 다시 숨기면 그 결정은
+ * 새 키에 남아 그대로 존중된다.
+ */
+const RELEASED_PREVIEW_VIEWS: ConfigurableViewId[] = ["addons"];
 
 /**
- * 아직 개발 중이라 기본으로 숨기는 화면. 메뉴에는 "준비중" 태그를 붙여 보이고, 사용자가
- * 설정 → 화면에서 직접 켜면 다른 메뉴와 같게 다룬다. 기능이 완성되면 여기서 빼면 된다 —
- * 그 순간부터 새 사용자에게는 보이고, 이미 숨긴 사용자의 저장값은 그대로 존중된다.
+ * 저장값의 세대. v1은 준비중 화면이 생기기 전이라 `hidden`에 그 화면에 대한 결정이 없고,
+ * v2는 애드온이 준비중이던 때라 `hidden`에 애드온이 기본으로 들어 있다. 둘 다 지금 규칙으로
+ * 옮겨야 하므로 새 키로 올리고, 옛 키는 새것부터 차례로 찾는다.
  */
-export const PREVIEW_VIEWS: ConfigurableViewId[] = ["addons"];
-
-export function previewView(view: ViewId): boolean {
-  return (PREVIEW_VIEWS as string[]).includes(view);
-}
+const NAVIGATION_PREFERENCES_KEY = "agent-manager.navigation-preferences.v3";
 
 /**
- * v1은 준비중 화면이 생기기 전 저장값이라 `hidden`에 그 화면에 대한 결정이 없다. v1만
- * 있으면 준비중 화면을 숨긴 채 v2로 넘어가고, 그 뒤에는 사용자의 켜기·끄기만 남는다.
+ * 설정 저장 세대의 조회 순서와 레거시 판정. 키 목록과 마이그레이션 분기가 따로 있으면
+ * 새 세대를 올릴 때 한쪽만 고쳐 현재 값보다 옛 값을 먼저 읽거나, 옛 값을 지금 규칙으로
+ * 옮기지 않고 그대로 쓰는 갈래가 생긴다. 한 행이 그 세대의 두 사실을 함께 들고 있게 한다.
  */
-const NAVIGATION_PREFERENCES_KEY = "agent-manager.navigation-preferences.v2";
-const LEGACY_NAVIGATION_PREFERENCES_KEY = "agent-manager.navigation-preferences.v1";
-
-const configurableViews = new Set<string>(DEFAULT_NAVIGATION_ORDER);
-
-function configurableView(value: unknown): value is ConfigurableViewId {
-  return typeof value === "string" && configurableViews.has(value);
-}
+const NAVIGATION_PREFERENCE_STORES = [
+  { key: NAVIGATION_PREFERENCES_KEY, legacy: false },
+  { key: "agent-manager.navigation-preferences.v2", legacy: true },
+  { key: "agent-manager.navigation-preferences.v1", legacy: true },
+] as const;
 
 function uniqueConfigurableViews(value: unknown): ConfigurableViewId[] {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.filter(configurableView))];
 }
 
+/** 기존 순서를 지키면서 빠진 화면만 주어진 순서대로 뒤에 보완한다. */
+function appendMissingViews(target: ConfigurableViewId[], required: readonly ConfigurableViewId[]): void {
+  const included = new Set(target);
+  for (const view of required) {
+    if (included.has(view)) continue;
+    target.push(view);
+    included.add(view);
+  }
+}
+
 /**
  * 저장값이 오래됐거나 일부가 손상돼도 알려진 메뉴만 유지하고, 새로 추가된 메뉴는
  * 기본 순서의 뒤에 보완한다. `settings`는 사용자 설정 대상이 아니므로 항상 제외한다.
- * 숨김 목록이 아예 없으면(첫 실행·손상) 준비중 화면을 숨긴 기본값으로 시작한다. 목록이
- * 있으면 빈 배열이라도 사용자의 결정이므로 그대로 둔다.
+ * 숨김 목록이 아예 없으면(첫 실행·손상) 준비중 화면만 숨긴 기본값으로 시작한다 — 준비중
+ * 화면이 없으면 모두 보이는 것이 기본값이다. 목록이 있으면 빈 배열이라도 사용자의
+ * 결정이므로 그대로 둔다.
  */
-export function normalizeNavigationPreferences(value: unknown): NavigationPreferences {
+function normalizeNavigationPreferences(value: unknown): NavigationPreferences {
   const stored = value && typeof value === "object" ? value as Partial<NavigationPreferences> : {};
   const order = uniqueConfigurableViews(stored.order);
-  for (const view of DEFAULT_NAVIGATION_ORDER) {
-    if (!order.includes(view)) order.push(view);
-  }
+  appendMissingViews(order, DEFAULT_NAVIGATION_ORDER);
   const hidden = Array.isArray(stored.hidden) ? uniqueConfigurableViews(stored.hidden) : [...PREVIEW_VIEWS];
   return { order, hidden };
 }
 
-/** v1 저장값에 준비중 화면 숨김을 더한다. 이미 숨겨 둔 화면은 두 번 넣지 않는다. */
-export function migrateLegacyNavigationPreferences(preferences: NavigationPreferences): NavigationPreferences {
-  const hidden = [...preferences.hidden];
-  for (const view of PREVIEW_VIEWS) {
-    if (!hidden.includes(view)) hidden.push(view);
-  }
+/**
+ * 옛 키의 저장값을 지금 규칙으로 옮긴다. 준비중이 풀린 화면의 숨김을 걷어내고, 아직
+ * 준비중인 화면의 숨김을 더한다(이미 숨겨 둔 화면은 두 번 넣지 않는다).
+ */
+function migrateLegacyNavigationPreferences(preferences: NavigationPreferences): NavigationPreferences {
+  const hidden = preferences.hidden.filter((view) => !RELEASED_PREVIEW_VIEWS.includes(view));
+  appendMissingViews(hidden, PREVIEW_VIEWS);
   return { ...preferences, hidden };
 }
 
@@ -93,24 +104,11 @@ function defaultNavigationPreferences(): NavigationPreferences {
 }
 
 /**
- * 저장소에 적힌 원문. localStorage 접근 자체가 막혀 있으면(사파리 프라이빗 모드, 원격
- * 브라우저) 저장값이 없는 것과 같이 다룬다 — 저장값 없음도 접근 불가도 결론은 기본
- * 설정이고, 여기서 흡수하면 아래 해석 경로가 접근 실패를 다시 볼 필요가 없다.
- */
-function storedNavigationPreferences(key: string): string | null {
-  try {
-    return window.localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-}
-
-/**
  * 저장 원문을 설정으로 읽는다. JSON이 깨져 있어도(손으로 고친 값) 메뉴는 떠야 하므로
  * 예외로 올리지 않고 기본 설정으로 떨어뜨린다. 되돌림이 실패 종류마다 한 겹씩만 있어,
  * 어느 갈래가 어떤 실패를 흡수하는지 함수 하나만 읽어도 드러난다.
  */
-export function parseNavigationPreferences(value: string | null): NavigationPreferences {
+function parseNavigationPreferences(value: string | null): NavigationPreferences {
   if (!value) return defaultNavigationPreferences();
   try {
     return normalizeNavigationPreferences(JSON.parse(value));
@@ -119,25 +117,36 @@ export function parseNavigationPreferences(value: string | null): NavigationPref
   }
 }
 
+/**
+ * 저장 세대를 최신순으로 훑어 처음 발견한 비어 있지 않은 설정을 읽는다. 레거시 세대는
+ * 같은 행의 판정에 따라 지금 규칙으로 옮긴 뒤 돌려준다.
+ *
+ * 저장소 접근 자체가 막혀 있어도(쿠키 전면 차단, 사파리 프라이빗 모드) 저장값이 없는 것과
+ * 같이 다뤄야 하는데, 그 흡수는 `readStoredText`가 이미 한다 — 예외를 삼키는 try/catch를
+ * 여기 한 벌 더 두면 새 저장 항목이 그중 한쪽만 감싸도 아무도 알아채지 못한다.
+ */
+function firstStoredNavigationPreferences(): NavigationPreferences | null {
+  for (const store of NAVIGATION_PREFERENCE_STORES) {
+    const stored = readStoredText(store.key);
+    if (stored) {
+      const preferences = parseNavigationPreferences(stored);
+      return store.legacy ? migrateLegacyNavigationPreferences(preferences) : preferences;
+    }
+  }
+  return null;
+}
+
 export function loadNavigationPreferences(): NavigationPreferences {
   // 빈 문자열은 저장값 없음과 같이 본다 — 손으로 지운 값과 E2E 하네스의 "기본값으로 되돌림"
   // 씨앗이 모두 그 모양이다.
-  const current = storedNavigationPreferences(NAVIGATION_PREFERENCES_KEY);
-  if (current) return parseNavigationPreferences(current);
-  const legacy = storedNavigationPreferences(LEGACY_NAVIGATION_PREFERENCES_KEY);
-  if (legacy) return migrateLegacyNavigationPreferences(parseNavigationPreferences(legacy));
-  return defaultNavigationPreferences();
+  return firstStoredNavigationPreferences() ?? defaultNavigationPreferences();
 }
 
 export function saveNavigationPreferences(preferences: NavigationPreferences): void {
-  try {
-    window.localStorage.setItem(
-      NAVIGATION_PREFERENCES_KEY,
-      JSON.stringify(normalizeNavigationPreferences(preferences)),
-    );
-  } catch {
-    // 저장소가 차단돼도 현재 실행 중의 메뉴 설정은 유지한다.
-  }
+  writeStoredText(
+    NAVIGATION_PREFERENCES_KEY,
+    JSON.stringify(normalizeNavigationPreferences(preferences)),
+  );
 }
 
 /**

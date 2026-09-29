@@ -1,6 +1,6 @@
 [package]
 name = "agent-manager-core"
-version = "0.2.0"
+version = "0.3.0"
 description = "Platform-independent domain and application core for Agent Manager"
 edition = "2021"
 publish = false
@@ -14,10 +14,23 @@ sha2 = "0.10"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1"
+# C13. Codex `config.toml`을 고칠 때 주석과 서식을 그대로 두기 위한 서식 보존 편집기.
+# 값 모델(`toml`)로 다시 써 내면 사용자가 적어 둔 주석이 조용히 사라진다.
+toml_edit = "0.25"
 unicode-normalization = "0.1"
 walkdir = "2"
 same-file = "1"
+# Windows `fs::canonicalize`가 돌려주는 `\\?\` 확장 경로를 자식 프로세스(Cypress·Node)에 넘기기
+# 전에 벗긴다. 접두어를 안전하게 뗄 수 있을 때만 떼고, 다른 플랫폼에서는 그대로다.
+dunce = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
+# C10. 데이터베이스 기본도구의 내장 드라이버. 둘 다 순수 Rust 동기 클라이언트라 사용자
+# 기기에 클라이언트를 설치하지 않아도 되고, Core의 동기 호출 경로에 그대로 맞는다.
+mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
+postgres = "0.19"
+# C10. `~/.mylogin.cnf`(MySQL 로그인 경로)는 암호화가 아니라 AES-128-ECB 난독화라, 참조
+# 자격증명을 읽으려면 블록 암호 하나가 필요하다.
+aes = "0.8"
 fs4 = "1.1"
 portable-pty = "0.9"
 uuid = { version = "1", features = ["v4"] }
@@ -46,7 +59,13 @@ keyring = { version = "3", features = ["sync-secret-service", "vendored", "crypt
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Power", "Win32_System_Threading", "Win32_UI_Shell"] }
+# C4-5. Windows에서 심볼릭 링크를 만들려면 `SeCreateSymbolicLinkPrivilege`가 필요해,
+# 개발자 모드를 켜지 않은 기본 설치에서는 계정 격리 프로필이 통째로 막힌다. 정션은 같은
+# 권한을 요구하지 않으면서 디렉터리를 가리키는 같은 일을 한다. 표준 라이브러리에 정션
+# 생성 API가 없어(nightly 전용) 리파스 포인트 버퍼를 직접 쌓는 unsafe 대신 이 크레이트를
+# 쓴다. 의존하는 windows-sys 범위가 위와 같아 중복 링크되지 않는다.
+junction = { version = "2", default-features = false }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Power", "Win32_System_RemoteDesktop", "Win32_System_Threading", "Win32_UI_Shell"] }
 
 [dev-dependencies]
 tempfile = "3"

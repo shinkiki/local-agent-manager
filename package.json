@@ -1,7 +1,7 @@
 {
   "name": "agent-manager-tauri",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Local-first desktop manager for Claude Code, OpenAI Codex, and Google Antigravity sessions",
   "author": "shinkiki",
   "license": "MIT OR Apache-2.0",
@@ -16,7 +16,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "npm run i18n:catalog && tsc && vite build",
     "preview": "vite preview",
     "remote": "npm run build && cargo run -p agent-manager-server -- --static-dir dist",
     "tauri": "node ./scripts/tauri-cli.mjs",
@@ -26,17 +26,22 @@
     "tauri:dev:signed": "tauri dev --runner ./scripts/macos/signed-dev-runner.sh",
     "tauri:build:signed": "./scripts/macos/signed-build.sh",
     "server:build:signed": "./scripts/macos/signed-server-build.sh",
+    "tauri:build:release-signed": "./scripts/macos/signed-release-build.sh",
     "notices:generate": "node ./scripts/generate-third-party-notices.mjs",
+    "i18n:check": "node ./scripts/generate-ui-catalog.mjs --check && node ./scripts/check-i18n-static-ui.mjs",
     "keychain:migrate:v2": "cargo run --release -p agent-manager-server -- migrate-keychain-v2",
     "rust:fmt": "cargo fmt --all --check",
     "rust:clippy": "cargo clippy --workspace --all-targets -- -D warnings",
     "rust:test": "cargo test --workspace",
-    "check": "npm run build && npm run rust:fmt && npm run rust:clippy && npm run rust:test",
+    "check": "npm run i18n:check && npm run build && npm run rust:fmt && npm run rust:clippy && npm run rust:test",
     "test:unit": "node --experimental-strip-types --test --test-reporter=dot src/lib/*.test.mjs",
     "test:e2e": "node scripts/e2e.mjs",
-    "test:e2e:open": "node scripts/e2e.mjs --open"
+    "test:e2e:open": "node scripts/e2e.mjs --open",
+    "icons:generate": "node ./scripts/generate-service-icons.mjs",
+    "i18n:catalog": "node ./scripts/generate-ui-catalog.mjs"
   },
   "dependencies": {
+    "@iconify-json/logos": "^1.2.14",
     "@shikijs/core": "^4.4.3",
     "@shikijs/engine-javascript": "^4.4.3",
     "@shikijs/langs": "^4.4.3",
@@ -47,6 +52,7 @@
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "^5.5.0",
     "lucide-react": "^1.28.0",
+    "mermaid": "^11.17.2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

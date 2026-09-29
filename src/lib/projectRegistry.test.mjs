@@ -3,7 +3,6 @@ import test from "node:test";
 import {
   excludedProjectPaths,
   filterProjectRegistry,
-  pendingProjectsKey,
   projectRegistrySummary,
   splitProjectRegistry,
 } from "./projectRegistry.ts";
@@ -67,12 +66,4 @@ test("제외 목록과 제외 경로 집합은 같은 항목을 가리킨다", (
   ];
   const { inactive } = splitProjectRegistry(entries);
   assert.deepEqual(inactive.map((item) => item.path), [...excludedProjectPaths(entries)]);
-});
-
-test("결정 대기 키는 순서와 무관하고 항목이 늘면 달라진다", () => {
-  const a = entry({ path: "/repos/a" });
-  const b = entry({ path: "/repos/b" });
-  assert.equal(pendingProjectsKey([a, b]), pendingProjectsKey([b, a]));
-  assert.notEqual(pendingProjectsKey([a]), pendingProjectsKey([a, b]));
-  assert.equal(pendingProjectsKey([]), "");
 });

@@ -1,18 +1,15 @@
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::collections::HashSet;
 use std::env;
-use std::fs::{self, File, OpenOptions};
-#[cfg(target_os = "macos")]
-use std::io::Read;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+use std::ops::ControlFlow;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(target_os = "macos")]
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::{Child, ExitStatus};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -22,13 +19,12 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use fs4::FileExt;
-#[cfg(not(target_os = "macos"))]
-use keyring::Entry;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{
     HeaderMap, HeaderValue, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, RETRY_AFTER, USER_AGENT,
 };
 use reqwest::StatusCode;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::json;
@@ -37,9 +33,21 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::app_data_file::{replace_file, write_private_json};
+use crate::app_data_file::{open_private_file, replace_file, sync_dir, write_private_json};
 use crate::clock::now_ms;
 use crate::credential_profiles::{self, ProbeOutcome};
+use crate::domain::wire_enum;
+use crate::os_keychain::ensure_profile_keychain;
+/// OS 보안 저장소 통로는 `os_keychain`이 쥔다. 외부 플러그인·DB 접속처럼 계정이 아닌
+/// 비밀도 예전부터 이 이름으로 들어오므로, 호출부를 흔들지 않도록 여기서 다시 내보낸다.
+pub(crate) use crate::os_keychain::{
+    delete_os_keychain_password, read_os_keychain_password, write_os_keychain_password,
+};
+#[cfg(target_os = "macos")]
+use crate::os_keychain::{
+    macos_keychain_failure, macos_keychain_item_not_found, read_os_keychain_password_with_timeout,
+    run_macos_security, KEYCHAIN_COMMAND_TIMEOUT,
+};
 use crate::user_home;
 use crate::{CoreError, ProviderId};
 
@@ -86,17 +94,7 @@ pub const ACCOUNT_NOTE_MAX_CHARS: usize = 500;
 /// 사용자가 붙이는 계정 표시 이름의 최대 길이(문자 수).
 pub const ACCOUNT_LABEL_MAX_CHARS: usize = 60;
 #[cfg(target_os = "macos")]
-const MACOS_SECURITY_BIN: &str = "/usr/bin/security";
-#[cfg(target_os = "macos")]
-// 유휴 시 security 호출은 0.4초 안팎이지만, 빌드·인덱싱 등 부하가 걸리면 수 초까지
-// 늘어난다. 3초에서는 계정 전환·복구가 부하 시점에 실패해 recovery 오류가 남았다.
-const KEYCHAIN_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(target_os = "macos")]
 const KEYCHAIN_MIGRATION_TIMEOUT: Duration = Duration::from_secs(60);
-#[cfg(target_os = "macos")]
-const KEYCHAIN_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
-#[cfg(target_os = "macos")]
-const MAX_KEYCHAIN_COMMAND_OUTPUT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -108,36 +106,13 @@ pub enum AccountAuthStatus {
 
 impl AccountAuthStatus {
     pub const ALL: [Self; 3] = [Self::Ready, Self::Missing, Self::Error];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ready => "ready",
-            Self::Missing => "missing",
-            Self::Error => "error",
-        }
-    }
 }
 
-impl std::fmt::Display for AccountAuthStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for AccountAuthStatus {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "ready" => Ok(Self::Ready),
-            "missing" => Ok(Self::Missing),
-            "error" => Ok(Self::Error),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 계정 인증 상태입니다: {s}"
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed AccountAuthStatus, "알 수 없는 계정 인증 상태입니다", {
+    Ready => "ready",
+    Missing => "missing",
+    Error => "error",
+});
 
 /// 이 계정으로 지금 런타임을 띄울 수 있는지. 못 띄우는 이유를 "사용자가 껐다"와
 /// "인증이 잠깐 풀렸다"로 나눠, 호출자가 실패로 확정할지 기다릴지 고를 수 있게 한다.
@@ -180,38 +155,14 @@ pub enum AccountUsageStatus {
 
 impl AccountUsageStatus {
     pub const ALL: [Self; 4] = [Self::Idle, Self::Ok, Self::Unavailable, Self::Error];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Ok => "ok",
-            Self::Unavailable => "unavailable",
-            Self::Error => "error",
-        }
-    }
 }
 
-impl std::fmt::Display for AccountUsageStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for AccountUsageStatus {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "idle" => Ok(Self::Idle),
-            "ok" => Ok(Self::Ok),
-            "unavailable" => Ok(Self::Unavailable),
-            "error" => Ok(Self::Error),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 계정 사용량 상태입니다: {s}"
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed AccountUsageStatus, "알 수 없는 계정 사용량 상태입니다", {
+    Idle => "idle",
+    Ok => "ok",
+    Unavailable => "unavailable",
+    Error => "error",
+});
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -221,9 +172,16 @@ pub struct AccountUsageWindow {
     pub resets_at: Option<i64>,
     /// 특정 모델에만 걸린 창(Claude의 `limits[]` weekly_scoped). 그 모델을 쓰지 않는 실행까지
     /// 막으면 안 되므로 표시에만 쓰고 계정 대표 소진율·자동전환 판정에서는 뺀다
-    /// ([`governing_windows`]). 옛 저장본에는 없는 필드라 기본값 false로 읽는다.
+    /// (`governing_windows`). 옛 저장본에는 없는 필드라 기본값 false로 읽는다.
     #[serde(default)]
     pub model_scoped: bool,
+    /// 모델군 창들을 합쳐 만든 계정 대표 창(Antigravity의 `5시간`·`7일`). 가장 빡빡한
+    /// 모델군을 복사한 것이라 소진 판정에 그대로 넣으면 한 모델군의 소진이 계정 전체를
+    /// 막는다 — `model_scoped`를 판정에서 빼 둔 이유가 대표 창을 통해 되살아난다.
+    /// 화면과 대표 소진율(`tightest_window_headroom`)에는 그대로 쓰고 실행 게이트·
+    /// 자동전환 판정에서만 뺀다(`account_exhausted`). 옛 저장본에는 없다.
+    #[serde(default)]
+    pub aggregate: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -300,6 +258,10 @@ pub struct ProviderAccountView {
     pub credential_isolated: bool,
     /// 프로필 격리를 쓰지 못한 이유. 격리가 살아 있으면 None.
     pub credential_isolation_note: Option<String>,
+    /// 이 계정의 자격증명 사슬이 절대 만료되는 시각(ms). 회전으로는 늘어나지 않으므로
+    /// 이 시각이 지나면 재인증 외에 살릴 길이 없다. 화면은 이 값으로 만료를 미리
+    /// 알린다. 공급자가 만료를 밝히지 않으면 None이고, 그때는 아무것도 알리지 않는다.
+    pub credential_expires_at: Option<i64>,
     /// 이 계정에 묶인 관리 런타임 수. 0이면 이 계정으로는 아무것도 돌지 않으므로
     /// 사용량이 올라갈 수 없고, 사용량 갱신을 더 뜸하게 해도 된다.
     pub runtime_count: usize,
@@ -369,40 +331,15 @@ impl HomeCredentialState {
         Self::Expired,
         Self::Error,
     ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Unchecked => "unchecked",
-            Self::Absent => "absent",
-            Self::Verified => "verified",
-            Self::Expired => "expired",
-            Self::Error => "error",
-        }
-    }
 }
 
-impl std::fmt::Display for HomeCredentialState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for HomeCredentialState {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "unchecked" => Ok(Self::Unchecked),
-            "absent" => Ok(Self::Absent),
-            "verified" => Ok(Self::Verified),
-            "expired" => Ok(Self::Expired),
-            "error" => Ok(Self::Error),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 홈 자격증명 상태입니다: {s}"
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed HomeCredentialState, "알 수 없는 홈 자격증명 상태입니다", {
+    Unchecked => "unchecked",
+    Absent => "absent",
+    Verified => "verified",
+    Expired => "expired",
+    Error => "error",
+});
 
 /// 홈 관측의 내부 캐시. 저장소 지문이 같으면 확인한 신원을 다시 묻지 않는다.
 #[derive(Debug, Clone)]
@@ -414,6 +351,51 @@ struct HomeObservation {
     next_read_at: i64,
     /// 같은 저장소 값으로 이어진 신원 조회 실패 횟수. 재시도 간격을 넓히는 근거.
     error_streak: u32,
+}
+
+/// 홈 관측 한 번이 지문과 무관하게 쓰는 값들. 재사용 판정·신원 해석·뷰 조립 세 단계가
+/// 같은 시각과 같은 만료 계산을 보게 묶어 둔다.
+#[derive(Debug, Clone, Copy)]
+struct HomeObserveContext {
+    /// 액세스 토큰 만료 시각(Claude만). 이어 쓰는 관측도 이 값만은 다시 계산한다.
+    access_token_expires_at: Option<i64>,
+    next_read_at: i64,
+    now: i64,
+}
+
+/// 지문이 그대로인 관측을 신원을 다시 묻지 않고 이어 쓸 수 있는지. 이어 쓸 수 있으면
+/// 시각만 갱신한 관측을 `Break`로, 다시 물어야 하면 넘겨받은 관측을 그대로 `Continue`로
+/// 돌려준다 — 호출자가 실패 횟수를 잇는 데 그 관측이 필요하다.
+fn reuse_home_observation(
+    previous: HomeObservation,
+    context: &HomeObserveContext,
+) -> ControlFlow<HomeObservation, HomeObservation> {
+    match previous.view.state {
+        // 같은 값이면 신원도 같다. 만료 시각만 다시 계산해 둔다.
+        HomeCredentialState::Verified | HomeCredentialState::Expired => {
+            ControlFlow::Break(HomeObservation {
+                view: ProviderHomeView {
+                    access_token_expires_at: context.access_token_expires_at,
+                    checked_at: Some(context.now),
+                    ..previous.view
+                },
+                next_read_at: context.next_read_at,
+                ..previous
+            })
+        }
+        HomeCredentialState::Error
+            if previous
+                .view
+                .retry_at
+                .is_some_and(|retry_at| retry_at > context.now) =>
+        {
+            ControlFlow::Break(HomeObservation {
+                next_read_at: context.next_read_at,
+                ..previous
+            })
+        }
+        _ => ControlFlow::Continue(previous),
+    }
 }
 
 /// 한도 페일오버가 다음 계정을 고르는 방식. 세 방식 모두 자동전환이 켜져 있고
@@ -434,36 +416,13 @@ pub enum AutoSwitchPolicy {
 
 impl AutoSwitchPolicy {
     pub const ALL: [Self; 3] = [Self::Priority, Self::MaxHeadroom, Self::Registration];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Priority => "priority",
-            Self::MaxHeadroom => "maxHeadroom",
-            Self::Registration => "registration",
-        }
-    }
 }
 
-impl std::fmt::Display for AutoSwitchPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for AutoSwitchPolicy {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "priority" => Ok(Self::Priority),
-            "maxHeadroom" => Ok(Self::MaxHeadroom),
-            "registration" => Ok(Self::Registration),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 자동전환 정책입니다: {s}"
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed AutoSwitchPolicy, "알 수 없는 자동전환 정책입니다", {
+    Priority => "priority",
+    MaxHeadroom => "maxHeadroom",
+    Registration => "registration",
+});
 
 /// 세션을 이어갈 때 실행 계정을 고르는 방식. 어느 방식이든 세션에 고정된 계정
 /// (`SessionMeta::pinned_account_id`)이 있으면 그 계정이 먼저다.
@@ -482,34 +441,12 @@ pub enum ResumeAccountPolicy {
 
 impl ResumeAccountPolicy {
     pub const ALL: [Self; 2] = [Self::ActiveAccount, Self::LastUsedAccount];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ActiveAccount => "activeAccount",
-            Self::LastUsedAccount => "lastUsedAccount",
-        }
-    }
 }
 
-impl std::fmt::Display for ResumeAccountPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for ResumeAccountPolicy {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "activeAccount" => Ok(Self::ActiveAccount),
-            "lastUsedAccount" => Ok(Self::LastUsedAccount),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 세션 재개 계정 정책입니다: {s}"
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed ResumeAccountPolicy, "알 수 없는 세션 재개 계정 정책입니다", {
+    ActiveAccount => "activeAccount",
+    LastUsedAccount => "lastUsedAccount",
+});
 
 /// 자동전환 트리거 종류. 사용량 100% 도달, 계정 간 사용량 격차 도달, 또는 에이전트
 /// 세션의 제한 응답.
@@ -527,14 +464,6 @@ pub enum AutoSwitchReason {
 impl AutoSwitchReason {
     pub const ALL: [Self; 3] = [Self::UsageExhausted, Self::UsageSpread, Self::AgentLimited];
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::UsageExhausted => "usageExhausted",
-            Self::UsageSpread => "usageSpread",
-            Self::AgentLimited => "agentLimited",
-        }
-    }
-
     /// 알림 문구에 붙는 트리거 설명. 프런트 `autoSwitchReasonLabel`과 같은 낱말이어야
     /// 설정 화면의 전환 이력과 알림창이 같은 사건을 다르게 부르지 않는다.
     pub fn label(self) -> &'static str {
@@ -546,26 +475,11 @@ impl AutoSwitchReason {
     }
 }
 
-impl std::fmt::Display for AutoSwitchReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for AutoSwitchReason {
-    type Err = crate::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "usageExhausted" => Ok(Self::UsageExhausted),
-            "usageSpread" => Ok(Self::UsageSpread),
-            "agentLimited" => Ok(Self::AgentLimited),
-            _ => Err(crate::CoreError::InvalidInput(format!(
-                "알 수 없는 자동전환 트리거 사유입니다: {s}"
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed AutoSwitchReason, "알 수 없는 자동전환 트리거 사유입니다", {
+    UsageExhausted => "usageExhausted",
+    UsageSpread => "usageSpread",
+    AgentLimited => "agentLimited",
+});
 
 /// 자동전환 실행기(spawn_auto_switch_loop)로 전달되는 트리거 신호.
 #[derive(Debug, Clone)]
@@ -577,17 +491,38 @@ pub struct AutoSwitchSignal {
     /// 다시 묶고 나머지 세션은 건드리지 않는다. 사용량 100% 트리거처럼 채팅을
     /// 특정할 수 없으면 None이며, 그때는 해당 계정에 묶인 세션 전체가 대상이다.
     pub chat_id: Option<String>,
+    /// 이 전환이 살려야 하는 실행들의 모델. 모델군마다 쿼터가 따로인 공급자에서 **어느
+    /// 모델군을 위한 전환인지**를 말해 준다([`model_scoped_windows`]).
+    ///
+    /// 한도 응답(`AgentLimited`)은 그 실행의 모델 하나를 싣는다 — 사용량에서 거꾸로 짚는
+    /// 방법([`model_group_partition`])은 한 박자 늦어, 한도 응답 직후에는 아직 100%가 보이지
+    /// 않는다. 사용량 조회에서 온 트리거는 계정 감독자가 채울 수 없고, 전환 루프가 그 계정에
+    /// 묶인 살아 있는 세션들의 모델로 채운다(`session_management::handle_auto_switch_signal`).
+    /// 비어 있으면 무엇을 하려던 참인지 모르는 전환이다.
+    pub models: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoSwitchEventView {
     pub from_account_id: String,
+    /// 실제로 움직인 쪽의 목적지. 기본 계정이 옮겨졌으면 그곳이고, 기본 계정은 그대로인데
+    /// 세션만 옮겨졌으면 세션이 간 곳이다 — 어느 쪽인지는 `default_rotated`가 말한다.
     pub to_account_id: String,
     pub reason: AutoSwitchReason,
     pub at: i64,
     /// 전환 직후 resume으로 재시작한 채팅 세션 수.
     pub resumed_session_count: usize,
+    /// 기본 계정이 `to_account_id`로 바뀌었는지. 거짓이면 세션만 옮겨졌고 새 대화가 열리는
+    /// 자리는 그대로다 — 계획이 본 기본 계정을 그 사이 사용자가 바꿨거나, 지정 계정이 기본
+    /// 계정이 아니었거나, 회전 목적지가 없었다. 프런트는 값이 없는 옛 요약을 참으로 읽는다.
+    pub default_rotated: bool,
+    /// 세션들이 옮겨 간 계정이 `to_account_id`와 다를 때만 있다. 기본 계정은 열린 모델군을
+    /// 잃지 않는 곳으로, 세션은 자기 모델군이 남은 곳으로 각각 가므로 둘이 갈릴 수 있다 —
+    /// 화면이 "A → B · 세션 2개 복원"으로 세션까지 B로 갔다고 읽지 않게 한다. 이 규칙의 주인은
+    /// [`AccountSupervisor::record_auto_switch`] 하나다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions_to_account_id: Option<String>,
 }
 
 /// 채팅 런타임에 주입할 계정별 자격증명 프로필. 공급자 홈은 공유한 채 자격증명만
@@ -620,6 +555,17 @@ enum CredentialProfileEntry {
         /// 캐시하면 원인을 고쳐도 앱을 재시작할 때까지 격리로 못 돌아온다.
         retry_at: i64,
     },
+}
+
+/// 캐시가 답한 준비 결과. [`CredentialProfileEntry`]와 달리 시각 판정을 이미 끝낸
+/// 값이라, 읽는 쪽은 "지금 쓸 수 있는가"만 보면 된다.
+enum CachedCredentialProfile {
+    Ready {
+        dir: PathBuf,
+        env: Vec<(String, String)>,
+    },
+    /// 격리 불가 판정이 아직 재시도 시각 전이다.
+    Unsupported,
 }
 
 /// 격리 실패를 다시 확인하기까지 기다리는 시간. 실패 상태에서 매 요청마다 CLI를
@@ -690,6 +636,11 @@ struct AccountRecord {
     /// 이전 버전 레지스트리에는 필드가 없다.
     #[serde(default)]
     label: Option<String>,
+    /// 자격증명 사슬의 절대 만료 시각(ms). 사용량을 조회할 때마다 저장된 자격증명에서
+    /// 다시 읽는다. 값이 없으면 공급자가 만료를 밝히지 않았거나 아직 한 번도 조회하지
+    /// 않은 것이다. 이전 버전 레지스트리에는 필드가 없다.
+    #[serde(default)]
+    credential_expires_at: Option<i64>,
     created_at: i64,
     updated_at: i64,
 }
@@ -743,7 +694,7 @@ impl AccountRegistry {
             auto_switch_usage_gap_percent: None,
             resume_account_policy: ResumeAccountPolicy::default(),
             accounts: Vec::new(),
-            providers: [ProviderId::Codex, ProviderId::Claude]
+            providers: managed_providers()
                 .into_iter()
                 .map(|provider| ProviderAccountState {
                     provider,
@@ -952,9 +903,7 @@ impl OsCredentialVault {
         legacy_store: &dyn VaultDocumentStore,
     ) -> Result<HashSet<String>, CoreError> {
         let _operation = lock(&self.operation_lock, "자격증명 Vault 마이그레이션")?;
-        let file = open_lock_file(&self.lock_path)?;
-        FileExt::lock(&file)?;
-        let result = (|| {
+        with_vault_file_lock(&self.lock_path, || {
             let serialized = legacy_store.read()?.ok_or_else(|| {
                 CoreError::NotFound("v2 자격증명 Vault를 찾을 수 없습니다".to_owned())
             })?;
@@ -973,13 +922,7 @@ impl OsCredentialVault {
                 ));
             }
             Ok(entry_keys)
-        })();
-        let unlock = FileExt::unlock(&file).map_err(CoreError::from);
-        match (result, unlock) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-        }
+        })
     }
 
     fn with_document<T>(
@@ -988,22 +931,14 @@ impl OsCredentialVault {
         action: impl FnOnce(&mut CredentialVaultDocument) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
         let _operation = lock(&self.operation_lock, "자격증명 Vault 작업")?;
-        let file = open_lock_file(&self.lock_path)?;
-        FileExt::lock(&file)?;
-        let result = (|| {
+        with_vault_file_lock(&self.lock_path, || {
             let mut document = load_vault_document(self.store.as_ref())?;
             let result = action(&mut document)?;
             if mutate {
                 save_vault_document(self.store.as_ref(), &document)?;
             }
             Ok(result)
-        })();
-        let unlock = FileExt::unlock(&file).map_err(CoreError::from);
-        match (result, unlock) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-        }
+        })
     }
 }
 
@@ -1036,12 +971,23 @@ impl CredentialVault for OsCredentialVault {
     }
 }
 
-fn open_lock_file(path: &Path) -> Result<File, CoreError> {
-    let mut options = OpenOptions::new();
-    options.create(true).read(true).write(true).truncate(false);
-    #[cfg(unix)]
-    options.mode(0o600);
-    Ok(options.open(path)?)
+/// 자격증명 Vault 잠금 파일에 배타 잠금을 잡고 `action`을 돌린 뒤 해제한다. 해제
+/// 실패는 삼키지 않는다 — Vault는 다시 만들 수 없는 원본이라, 잠금이 남은 채 성공을
+/// 보고하면 다음 작업이 영원히 기다리게 된다. 그래서 `Drop` 가드(`store_lock`) 대신
+/// 작업 결과와 해제 결과를 합쳐 돌려주는 이 형태를 쓴다.
+fn with_vault_file_lock<T>(
+    lock_path: &Path,
+    action: impl FnOnce() -> Result<T, CoreError>,
+) -> Result<T, CoreError> {
+    let file = open_private_file(lock_path, false)?;
+    FileExt::lock(&file)?;
+    let result = action();
+    let unlock = FileExt::unlock(&file).map_err(CoreError::from);
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
 }
 
 fn load_vault_document(
@@ -1104,393 +1050,6 @@ fn save_vault_document(
     store.write(&serialized)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn vault_error(prefix: &'static str) -> impl FnOnce(keyring::Error) -> CoreError {
-    move |error| CoreError::Runtime(format!("{prefix}: {error}"))
-}
-
-#[cfg(target_os = "macos")]
-struct MacosSecurityOutput {
-    status: ExitStatus,
-    stdout: Zeroizing<Vec<u8>>,
-    stderr: Zeroizing<Vec<u8>>,
-}
-
-#[cfg(target_os = "macos")]
-fn validate_keychain_target(service: &str, account: &str) -> Result<(), CoreError> {
-    validate_keychain_field(service, "service")?;
-    validate_keychain_field(account, "account")
-}
-
-#[cfg(target_os = "macos")]
-fn validate_keychain_field(value: &str, field: &str) -> Result<(), CoreError> {
-    if value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control) {
-        return Err(CoreError::InvalidInput(format!(
-            "Keychain {field} 값이 올바르지 않습니다"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn macos_security_executable() -> Result<PathBuf, CoreError> {
-    let executable = fs::canonicalize(MACOS_SECURITY_BIN).map_err(|error| {
-        CoreError::Runtime(format!(
-            "macOS security 도구를 확인하지 못했습니다: {error}"
-        ))
-    })?;
-    if !executable.is_file() {
-        return Err(CoreError::Runtime(
-            "macOS security 도구가 실행 파일이 아닙니다".to_owned(),
-        ));
-    }
-    Ok(executable)
-}
-
-#[cfg(target_os = "macos")]
-fn read_bounded_command_output(
-    mut stream: impl Read + Send + 'static,
-) -> thread::JoinHandle<Result<Vec<u8>, std::io::Error>> {
-    thread::spawn(move || {
-        let mut output = Vec::new();
-        stream
-            .by_ref()
-            .take(MAX_KEYCHAIN_COMMAND_OUTPUT_BYTES + 1)
-            .read_to_end(&mut output)?;
-        if output.len() as u64 > MAX_KEYCHAIN_COMMAND_OUTPUT_BYTES {
-            output.zeroize();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "security command output exceeded the limit",
-            ));
-        }
-        Ok(output)
-    })
-}
-
-#[cfg(target_os = "macos")]
-struct MacosSecurityReaders {
-    stdout: thread::JoinHandle<Result<Vec<u8>, std::io::Error>>,
-    stderr: thread::JoinHandle<Result<Vec<u8>, std::io::Error>>,
-}
-
-#[cfg(target_os = "macos")]
-impl MacosSecurityReaders {
-    /// 자식이 정상 종료하지 못한 모든 경로가 공유하는 정리 절차. 프로세스를 죽이고
-    /// 두 읽기 스레드를 회수해야 파이프가 닫히고 스레드가 남지 않는다.
-    fn abort(self, child: &mut Child, message: &str) -> CoreError {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = self.stdout.join();
-        let _ = self.stderr.join();
-        CoreError::Runtime(message.to_owned())
-    }
-
-    fn finish(self, status: ExitStatus) -> Result<MacosSecurityOutput, CoreError> {
-        let stdout = join_bounded_command_output(self.stdout, "출력")?;
-        let stderr = join_bounded_command_output(self.stderr, "오류")?;
-        Ok(MacosSecurityOutput {
-            status,
-            stdout,
-            stderr,
-        })
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn join_bounded_command_output(
-    reader: thread::JoinHandle<Result<Vec<u8>, std::io::Error>>,
-    label: &str,
-) -> Result<Zeroizing<Vec<u8>>, CoreError> {
-    let bytes = reader
-        .join()
-        .map_err(|_| CoreError::Runtime(format!("security {label} 처리가 중단되었습니다")))?
-        .map_err(|_| CoreError::Runtime(format!("security {label}을 읽지 못했습니다")))?;
-    Ok(Zeroizing::new(bytes))
-}
-
-#[cfg(target_os = "macos")]
-fn spawn_macos_security(
-    executable: &Path,
-    args: &[&str],
-    secret_stdin: Option<&str>,
-) -> Result<(Child, MacosSecurityReaders), CoreError> {
-    let mut command = Command::new(executable);
-    command
-        .args(args)
-        .stdin(if secret_stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // SAFETY: `setsid` is the only operation performed between fork and exec.
-    // Detaching the controlling terminal makes `security ... -w` consume the
-    // piped stdin instead of opening `/dev/tty` during `tauri dev`.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    let mut child = command.spawn().map_err(|error| {
-        CoreError::Runtime(format!(
-            "macOS security 도구를 실행하지 못했습니다: {error}"
-        ))
-    })?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| CoreError::Runtime("security 표준 출력을 열지 못했습니다".to_owned()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| CoreError::Runtime("security 오류 출력을 열지 못했습니다".to_owned()))?;
-    let readers = MacosSecurityReaders {
-        stdout: read_bounded_command_output(stdout),
-        stderr: read_bounded_command_output(stderr),
-    };
-    Ok((child, readers))
-}
-
-/// 실패 이유를 구분하지 않는다. 호출부는 어느 단계에서 막혔든 같은 정리와 같은
-/// 메시지로 끝내므로, 비밀을 오류 문자열에 실어 나르지 않는다.
-#[cfg(target_os = "macos")]
-fn send_macos_security_stdin(child: &mut Child, secret: &str) -> Result<(), ()> {
-    let mut stdin = child.stdin.take().ok_or(())?;
-    stdin.write_all(secret.as_bytes()).map_err(|_| ())?;
-    stdin.write_all(b"\n").map_err(|_| ())?;
-    stdin.flush().map_err(|_| ())
-}
-
-/// 시한 안에 끝나면 `Some(상태)`, 시한을 넘기면 `Some` 없이 돌아온다. 정리는
-/// 호출부가 `MacosSecurityReaders::abort`로 한다.
-#[cfg(target_os = "macos")]
-fn await_macos_security_exit(
-    child: &mut Child,
-    timeout: Duration,
-) -> Result<Option<ExitStatus>, CoreError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait().map_err(|error| {
-            CoreError::Runtime(format!(
-                "macOS security 상태를 확인하지 못했습니다: {error}"
-            ))
-        })? {
-            return Ok(Some(status));
-        }
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-        thread::sleep(KEYCHAIN_COMMAND_POLL_INTERVAL);
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn run_macos_security_with_executable(
-    executable: &Path,
-    args: &[&str],
-    secret_stdin: Option<&str>,
-    timeout: Duration,
-) -> Result<MacosSecurityOutput, CoreError> {
-    let (mut child, readers) = spawn_macos_security(executable, args, secret_stdin)?;
-    if let Some(secret) = secret_stdin {
-        if send_macos_security_stdin(&mut child, secret).is_err() {
-            return Err(readers.abort(&mut child, "security 보안 입력을 전달하지 못했습니다"));
-        }
-    }
-    let status = match await_macos_security_exit(&mut child, timeout)? {
-        Some(status) => status,
-        None => return Err(readers.abort(&mut child, "macOS security 응답 시간이 초과되었습니다")),
-    };
-    readers.finish(status)
-}
-
-#[cfg(target_os = "macos")]
-fn run_macos_security(
-    args: &[&str],
-    secret_stdin: Option<&str>,
-    timeout: Duration,
-) -> Result<MacosSecurityOutput, CoreError> {
-    run_macos_security_with_executable(&macos_security_executable()?, args, secret_stdin, timeout)
-}
-
-/// 세 Keychain 명령이 같은 모양으로 적던 실패 메시지. `subject`는 조사까지 포함한다.
-#[cfg(target_os = "macos")]
-fn macos_keychain_failure(subject: &str, output: &MacosSecurityOutput) -> CoreError {
-    CoreError::Runtime(format!(
-        "macOS Keychain {subject} 실패했습니다 (종료 코드 {})",
-        output.status.code().unwrap_or(-1)
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn macos_keychain_item_not_found(output: &MacosSecurityOutput) -> bool {
-    if output.status.code() == Some(44) {
-        return true;
-    }
-    let stderr = Zeroizing::new(String::from_utf8_lossy(&output.stderr).to_ascii_lowercase());
-    stderr.contains("could not be found") || stderr.contains("not be found")
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn read_os_keychain_password(
-    service: &str,
-    account: &str,
-) -> Result<Option<Zeroizing<String>>, CoreError> {
-    read_os_keychain_password_with_timeout(service, account, KEYCHAIN_COMMAND_TIMEOUT)
-}
-
-#[cfg(target_os = "macos")]
-fn read_os_keychain_password_with_timeout(
-    service: &str,
-    account: &str,
-    timeout: Duration,
-) -> Result<Option<Zeroizing<String>>, CoreError> {
-    validate_keychain_target(service, account)?;
-    let output = run_macos_security(
-        &["find-generic-password", "-s", service, "-a", account, "-w"],
-        None,
-        timeout,
-    )?;
-    if !output.status.success() {
-        if macos_keychain_item_not_found(&output) {
-            return Ok(None);
-        }
-        return Err(macos_keychain_failure("읽기가", &output));
-    }
-
-    let mut stdout = output.stdout;
-    if stdout.last() == Some(&b'\n') {
-        stdout.pop();
-    }
-    let bytes = std::mem::take(stdout.as_mut());
-    match String::from_utf8(bytes) {
-        Ok(value) => Ok(Some(Zeroizing::new(value))),
-        Err(error) => {
-            let mut bytes = error.into_bytes();
-            bytes.zeroize();
-            Err(CoreError::Runtime(
-                "macOS Keychain 값이 UTF-8이 아닙니다".to_owned(),
-            ))
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn read_os_keychain_password(
-    service: &str,
-    account: &str,
-) -> Result<Option<Zeroizing<String>>, CoreError> {
-    let entry =
-        Entry::new(service, account).map_err(vault_error("OS 보안 저장소를 열지 못했습니다"))?;
-    match entry.get_password() {
-        Ok(value) => Ok(Some(Zeroizing::new(value))),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(CoreError::Runtime(format!(
-            "OS 보안 저장소를 읽지 못했습니다: {error}"
-        ))),
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn write_os_keychain_password(
-    service: &str,
-    account: &str,
-    secret: &str,
-) -> Result<(), CoreError> {
-    write_macos_keychain_password_with_executable(
-        &macos_security_executable()?,
-        service,
-        account,
-        secret,
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn write_macos_keychain_password_with_executable(
-    executable: &Path,
-    service: &str,
-    account: &str,
-    secret: &str,
-) -> Result<(), CoreError> {
-    validate_keychain_target(service, account)?;
-    if secret
-        .as_bytes()
-        .iter()
-        .any(|byte| matches!(byte, b'\r' | b'\n'))
-    {
-        return Err(CoreError::InvalidInput(
-            "macOS Keychain에 저장할 값은 단일 행이어야 합니다".to_owned(),
-        ));
-    }
-    let output = run_macos_security_with_executable(
-        executable,
-        &[
-            "add-generic-password",
-            "-U",
-            "-s",
-            service,
-            "-a",
-            account,
-            "-w",
-            secret,
-        ],
-        None,
-        KEYCHAIN_COMMAND_TIMEOUT,
-    )?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(macos_keychain_failure("저장이", &output))
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn write_os_keychain_password(
-    service: &str,
-    account: &str,
-    secret: &str,
-) -> Result<(), CoreError> {
-    Entry::new(service, account)
-        .map_err(vault_error("OS 보안 저장소를 열지 못했습니다"))?
-        .set_password(secret)
-        .map_err(vault_error("OS 보안 저장소에 저장하지 못했습니다"))
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn delete_os_keychain_password(service: &str, account: &str) -> Result<(), CoreError> {
-    validate_keychain_target(service, account)?;
-    let output = run_macos_security(
-        &["delete-generic-password", "-s", service, "-a", account],
-        None,
-        KEYCHAIN_COMMAND_TIMEOUT,
-    )?;
-    if output.status.success() || macos_keychain_item_not_found(&output) {
-        Ok(())
-    } else {
-        Err(macos_keychain_failure("삭제가", &output))
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn delete_os_keychain_password(service: &str, account: &str) -> Result<(), CoreError> {
-    match Entry::new(service, account)
-        .map_err(vault_error("OS 보안 저장소를 열지 못했습니다"))?
-        .delete_credential()
-    {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(CoreError::Runtime(format!(
-            "OS 보안 저장소에서 삭제하지 못했습니다: {error}"
-        ))),
-    }
-}
-
 fn restore_vault_value(
     vault: &dyn CredentialVault,
     key: &str,
@@ -1530,6 +1089,9 @@ struct AccountInner {
     home_dir: PathBuf,
     codex_home_dir: PathBuf,
     claude_config_dir: PathBuf,
+    /// Antigravity 공유 홈. CLI가 홈 아래 `.gemini`만 보고 이 경로를 옮기는 문서화된
+    /// 변수가 없어, 사용자 홈에서 그대로 유도한다(G8).
+    antigravity_gemini_dir: PathBuf,
     claude_keychain_profile: Option<PathBuf>,
     inspect_external_processes: bool,
     vault: Arc<dyn CredentialVault>,
@@ -1537,6 +1099,7 @@ struct AccountInner {
     credential_probe: Arc<CredentialProbe>,
     codex_switch_lock: Mutex<()>,
     claude_switch_lock: Mutex<()>,
+    antigravity_switch_lock: Mutex<()>,
     /// 계정별 사용량 갱신 락. 같은 계정의 수동·자동 새로고침이 같은 일회성 갱신
     /// 토큰을 동시에 소비하지 않게 막되, 서로 다른 계정은 동시에 조회한다.
     usage_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -1596,7 +1159,7 @@ fn probe_executable(provider: ProviderId) -> Option<PathBuf> {
         .into_iter()
         .find(|status| status.provider == provider)
         .and_then(|status| status.cli.path)
-        .and_then(|path| fs::canonicalize(path).ok())
+        .and_then(|path| crate::path_guard::canonical_child_facing(path).ok())
         .filter(|path| path.is_file())
 }
 
@@ -1676,18 +1239,12 @@ impl AccountSupervisor {
         vault: Arc<dyn CredentialVault>,
         credential_probe: Arc<CredentialProbe>,
     ) -> Result<Self, CoreError> {
-        Self::open_resolved(
+        Self::open_with_probe_and_claude_identity_resolver(
             app_data_dir,
             home_dir,
             vault,
-            AccountOpenConfig {
-                codex_home_dir: home_dir.join(".codex"),
-                claude_config_dir: home_dir.join(".claude"),
-                claude_keychain_profile: None,
-                inspect_external_processes: false,
-                claude_identity_resolver: Arc::new(claude_identity_from_secret),
-                credential_probe,
-            },
+            credential_probe,
+            Arc::new(claude_identity_from_secret),
         )
     }
 
@@ -1698,23 +1255,23 @@ impl AccountSupervisor {
         vault: Arc<dyn CredentialVault>,
         claude_identity_resolver: Arc<ClaudeIdentityResolver>,
     ) -> Result<Self, CoreError> {
-        Self::open_resolved(
+        Self::open_with_probe_and_claude_identity_resolver(
             app_data_dir,
             home_dir,
             vault,
-            AccountOpenConfig {
-                codex_home_dir: home_dir.join(".codex"),
-                claude_config_dir: home_dir.join(".claude"),
-                claude_keychain_profile: None,
-                inspect_external_processes: false,
-                claude_identity_resolver,
-                credential_probe: Arc::new(unavailable_credential_probe),
-            },
+            Arc::new(unavailable_credential_probe),
+            claude_identity_resolver,
         )
     }
 
     /// 프로브와 신원 조회를 함께 끼운 테스트 감독자. 재시작 복구는 프로필 자격증명의
     /// 신원 증명과 격리 확인을 둘 다 거치므로, 두 자리를 한 구성에서 정해야 한다.
+    ///
+    /// 테스트 감독자의 구성은 이 한 자리에서만 조립한다. 홈 아래 기본 공급자 경로·저장소
+    /// 프로필 없음·외부 프로세스 미조사는 네 생성자가 모두 같은 값을 쓰는데, 그 값을 각자
+    /// 적어 두면 칸이 하나 늘 때 네 자리를 함께 고쳐야 하고 한 자리를 빠뜨려도 컴파일은
+    /// 통과한다. 생성자마다 갈리는 것은 프로브와 신원 조회 둘뿐이라 그 둘만 인자로 받고,
+    /// 나머지 생성자는 기본값을 이 자리에 맡긴 채 자기 인자만 채워 넘긴다.
     #[cfg(test)]
     fn open_with_probe_and_claude_identity_resolver(
         app_data_dir: &Path,
@@ -1769,6 +1326,7 @@ impl AccountSupervisor {
         let supervisor = Self {
             inner: Arc::new(AccountInner {
                 app_data_dir,
+                antigravity_gemini_dir: home_dir.join(".gemini"),
                 home_dir,
                 codex_home_dir: config.codex_home_dir,
                 claude_config_dir: config.claude_config_dir,
@@ -1779,6 +1337,7 @@ impl AccountSupervisor {
                 credential_probe: config.credential_probe,
                 codex_switch_lock: Mutex::new(()),
                 claude_switch_lock: Mutex::new(()),
+                antigravity_switch_lock: Mutex::new(()),
                 usage_locks: Mutex::new(HashMap::new()),
                 auto_switch_tx: Mutex::new(None),
                 credential_profiles: Mutex::new(HashMap::new()),
@@ -1829,6 +1388,7 @@ impl AccountSupervisor {
                     credential_isolated: self
                         .credential_profile_isolated(account.provider, &account.id),
                     credential_isolation_note: self.credential_profile_fallback_reason(&account.id),
+                    credential_expires_at: account.credential_expires_at,
                     runtime_count: state
                         .runtime_account_counts
                         .get(&account.id)
@@ -1893,7 +1453,9 @@ impl AccountSupervisor {
     /// 조회는 저장소 값이 바뀌었을 때만 한다. 실패하면 저장소가 그대로인 동안 재시도
     /// 대기를 지킨다. 여기서 읽은 토큰은 절대 갱신하지 않는다.
     pub fn observe_home_credentials(&self, force: bool) -> Result<(), CoreError> {
-        for provider in [ProviderId::Codex, ProviderId::Claude] {
+        // 공급자 목록을 여기 적어 두면 계정 관리를 새로 지원하는 공급자의 홈 계정 카드가
+        // "아직 읽지 않았습니다"에서 영영 멈춘다.
+        for provider in managed_providers() {
             self.observe_home_credential(provider, force)?;
         }
         Ok(())
@@ -1911,14 +1473,7 @@ impl AccountSupervisor {
         {
             return Ok(());
         }
-        let secret = read_active_credentials(
-            self.provider_root(provider)?,
-            provider,
-            None,
-            self.inner.claude_keychain_profile.as_deref(),
-            self.inner.inspect_external_processes,
-        )
-        .ok();
+        let secret = self.read_credentials(provider, None).ok();
         let observation = match secret {
             None => HomeObservation {
                 fingerprint: None,
@@ -1957,11 +1512,14 @@ impl AccountSupervisor {
                 observation.view.usage.clone(),
             )
         });
-        let access_token_expires_at = match provider {
-            ProviderId::Claude => claude_access_token_expires_at(secret),
-            _ => None,
+        let context = HomeObserveContext {
+            access_token_expires_at: match provider {
+                ProviderId::Claude => claude_access_token_expires_at(secret),
+                _ => None,
+            },
+            next_read_at: now.saturating_add(HOME_OBSERVE_INTERVAL_MS),
+            now,
         };
-        let next_read_at = now.saturating_add(HOME_OBSERVE_INTERVAL_MS);
         let unchanged = previous.as_ref().is_some_and(|observation| {
             observation.fingerprint.as_deref() == Some(fingerprint.as_str())
         });
@@ -1975,47 +1533,68 @@ impl AccountSupervisor {
         };
         if unchanged {
             let previous = previous.expect("unchanged implies a previous observation");
-            match previous.view.state {
-                // 같은 값이면 신원도 같다. 만료 시각만 다시 계산해 둔다.
-                HomeCredentialState::Verified | HomeCredentialState::Expired => {
-                    return HomeObservation {
-                        view: ProviderHomeView {
-                            access_token_expires_at,
-                            checked_at: Some(now),
-                            ..previous.view
-                        },
-                        next_read_at,
-                        ..previous
-                    };
-                }
-                HomeCredentialState::Error
-                    if previous
-                        .view
-                        .retry_at
-                        .is_some_and(|retry_at| retry_at > now) =>
-                {
-                    return HomeObservation {
-                        next_read_at,
-                        ..previous
-                    };
-                }
-                _ => {}
+            // 이어 쓸 수 없는 관측은 그대로 돌려받고, 아래에서 신원을 다시 묻는다.
+            if let ControlFlow::Break(reused) = reuse_home_observation(previous, &context) {
+                return reused;
             }
         }
-        // 신원은 자격증명 안에서 먼저 찾고, Claude만 없을 때 프로필 API로 묻는다. 만료된
-        // Claude 토큰은 묻지 않는다 — 401이 뻔하고, 갱신은 다른 로그인의 사슬을 끊을 수 있다.
-        let identity = match provider {
+        let identity = self.home_identity(provider, secret, now);
+        let (view, error_streak) = self.home_view_from_identity(
+            provider,
+            identity,
+            previous_usage,
+            previous_streak,
+            &context,
+        );
+        HomeObservation {
+            fingerprint: Some(fingerprint),
+            view,
+            next_read_at: context.next_read_at,
+            error_streak,
+        }
+    }
+
+    /// 신원은 자격증명 안에서 먼저 찾고, Claude만 없을 때 프로필 API로 묻는다. 만료된
+    /// Claude 토큰은 묻지 않는다 — 401이 뻔하고, 갱신은 다른 로그인의 사슬을 끊을 수 있다.
+    fn home_identity(
+        &self,
+        provider: ProviderId,
+        secret: &str,
+        now: i64,
+    ) -> Result<Option<AccountIdentity>, CoreError> {
+        match provider {
             ProviderId::Codex => codex_identity(secret).map(Some),
             ProviderId::Claude => match claude_identity_from_secret(secret) {
                 Ok(identity) => Ok(Some(identity)),
                 Err(_) if claude_access_token_expired(secret, now) => Ok(None),
                 Err(_) => (self.inner.claude_identity_resolver)(secret).map(Some),
             },
-            ProviderId::Antigravity => Err(CoreError::InvalidInput(
-                "Antigravity 자격증명은 지원하지 않습니다".to_owned(),
-            )),
-        };
-        let (view, error_streak) = match identity {
+            // 공유 홈 자격증명이 키체인에만 있으면 토큰에 신원이 없다. 그때는 공식 CLI가
+            // 자기 로그에 남긴 계정 이메일로 알아본다. 그것도 없으면 오류가 아니라 미상이다 —
+            // 홈 관측은 "누가 로그인돼 있는지"를 알아보는 자리다.
+            ProviderId::Antigravity => Ok(antigravity_identity(secret)
+                .ok()
+                .or_else(|| antigravity_identity_from_home(&self.inner.home_dir).ok())),
+            ProviderId::Local => Err(unmanaged_provider_error(provider)),
+        }
+    }
+
+    /// 신원 조회 결과를 관측 뷰와 이어진 실패 횟수로 옮긴다. 사용량은 신원이 그대로일
+    /// 때만 넘겨받은 값을 이어 쓴다.
+    fn home_view_from_identity(
+        &self,
+        provider: ProviderId,
+        identity: Result<Option<AccountIdentity>, CoreError>,
+        previous_usage: Option<(Option<String>, AccountUsageView)>,
+        previous_streak: u32,
+        context: &HomeObserveContext,
+    ) -> (ProviderHomeView, u32) {
+        let HomeObserveContext {
+            access_token_expires_at,
+            now,
+            ..
+        } = *context;
+        match identity {
             Ok(Some(identity)) => {
                 let usage = previous_usage
                     .filter(|(provider_account_id, _)| {
@@ -2063,12 +1642,6 @@ impl AccountSupervisor {
                     streak,
                 )
             }
-        };
-        HomeObservation {
-            fingerprint: Some(fingerprint),
-            view,
-            next_read_at,
-            error_streak,
         }
     }
 
@@ -2140,13 +1713,7 @@ impl AccountSupervisor {
         {
             return Ok(());
         }
-        let Ok(secret) = read_active_credentials(
-            self.provider_root(provider)?,
-            provider,
-            None,
-            self.inner.claude_keychain_profile.as_deref(),
-            self.inner.inspect_external_processes,
-        ) else {
+        let Ok(secret) = self.read_credentials(provider, None) else {
             return Ok(());
         };
         let fresh = fetch_home_usage(provider, &secret, now);
@@ -2208,11 +1775,24 @@ impl AccountSupervisor {
         fs::create_dir_all(&auth_root)?;
         let profile_path = auth_root.join(&id);
         fs::create_dir(&profile_path)?;
+        // 홈을 가르는 공급자는 로그인도 그 홈 안에서 끝나야 한다. 키체인을 먼저 만들지
+        // 않으면 공식 CLI가 토큰을 저장하는 순간 모달에 걸려 로그인이 멈춘다(`C12`).
+        if provider == ProviderId::Antigravity {
+            ensure_profile_keychain(&profile_path)?;
+            // C12-11 1단계. 로그인이 기계 전역 항목에 들어가는 플랫폼에서는 그 항목이 있는 한
+            // 로그인 터미널이 브라우저에 닿지 못한다 — CLI가 기존 항목을 찾아 그 계정의 잔량을
+            // 찍고 성공으로 끝내서 다른 구글 계정을 고를 자리가 없다(계정 추가 화면에서 실측).
+            // 항목을 비워야 CLI가 대화형 OAuth로 넘어간다. 등록된 계정의 토큰은 이미 볼트에
+            // 있고 매 실행 시작마다 볼트에서 프로필로 다시 쓰이므로 여기서 잃는 것은 없다.
+            self.clear_antigravity_global_login_for_start("로그인 시작")?;
+        }
         let login = AccountLoginSession {
             id: id.clone(),
             provider,
             account_id: account_id.map(str::to_owned),
-            profile_path: fs::canonicalize(profile_path)?,
+            // 이 경로는 로그인 CLI의 작업 경로이자 `CODEX_HOME`·`CLAUDE_CONFIG_DIR` 값이
+            // 되므로 자식이 읽을 수 있는 모양이어야 한다.
+            profile_path: crate::path_guard::canonical_child_facing(profile_path)?,
         };
         let view = login_view(&login);
         lock(&self.inner.state, "계정 로그인 상태")?
@@ -2250,6 +1830,11 @@ impl AccountSupervisor {
             display_name,
             captured,
         )?;
+        // C12-11 1단계. 방금 CLI가 전역 항목에 놓은 로그인은 볼트로 들어올렸다. 항목을 그대로
+        // 두면 다음에 뜨는 어느 계정의 실행이든 이 계정으로 인증된다.
+        if login.provider == ProviderId::Antigravity {
+            self.clear_antigravity_global_login_for_start("로그인 회수")?;
+        }
         self.remove_login(login_id)?;
         self.snapshot()
     }
@@ -2263,31 +1848,131 @@ impl AccountSupervisor {
         self.set_active(account_id)
     }
 
+    /// 계정 레지스트리 한 자리를 바꾸고 새 스냅숏을 돌려준다. 설정 손잡이가 모두 같은
+    /// 순서를 밟는다 — 상태 잠금, 값 변경, 바뀌었을 때만 저장, 잠금 해제 뒤 스냅숏.
+    /// 마지막 두 단계의 순서가 중요해서 한곳에 모았다. `snapshot`이 같은 잠금을 다시
+    /// 잡으므로 먼저 놓지 않으면 손잡이마다 교착이 된다.
+    ///
+    /// `change`가 `false`를 돌려주면 값이 그대로라는 뜻이라 저장을 건너뛴다.
+    fn update_registry(
+        &self,
+        change: impl FnOnce(&mut AccountRegistry) -> Result<bool, CoreError>,
+    ) -> Result<AccountSnapshot, CoreError> {
+        self.update_registry_quiet(change)?;
+        self.snapshot()
+    }
+
+    /// [`Self::update_registry`]에서 스냅숏을 뺀 것. 바꿨는지만 답한다 — 백그라운드 루프처럼
+    /// 화면에 줄 것이 없고 거절로 끝나는 일이 잦은 자리가 쓴다. 잠금·변경·저장 순서는 하나다.
+    ///
+    /// 저장에 실패하면 메모리도 바꾸기 전으로 되돌린다. 메모리만 바뀐 채 `Err`를 돌려주면
+    /// 호출자는 "안 바뀌었다"로 처리하는데 새 대화는 이미 바뀐 값으로 열리고, 재기동하면 옛
+    /// 값으로 돌아간다 — 두 상태가 어긋난 채 실패가 조용히 묻힌다.
+    fn update_registry_quiet(
+        &self,
+        change: impl FnOnce(&mut AccountRegistry) -> Result<bool, CoreError>,
+    ) -> Result<bool, CoreError> {
+        let mut state = lock(&self.inner.state, "계정 상태")?;
+        let before = state.registry.clone();
+        let changed = match change(&mut state.registry) {
+            Ok(changed) => changed,
+            Err(error) => {
+                state.registry = before;
+                return Err(error);
+            }
+        };
+        if changed {
+            if let Err(error) = save_registry(&self.inner.app_data_dir, &state.registry) {
+                state.registry = before;
+                return Err(error);
+            }
+        }
+        Ok(changed)
+    }
+
+    /// 계정 id들의 표시 이름(사용자 라벨이 있으면 그것, 없으면 공급자가 준 이름). 스냅숏
+    /// 전체를 만들지 않고 잠금 안에서 읽는다 — 이름 두어 개를 위해 계정마다 자격증명 프로필을
+    /// 디스크에서 확인할 이유가 없다. 없는 id는 빠진다.
+    pub fn display_names(
+        &self,
+        account_ids: &[&str],
+    ) -> Result<HashMap<String, String>, CoreError> {
+        let state = lock(&self.inner.state, "계정 상태")?;
+        Ok(state
+            .registry
+            .accounts
+            .iter()
+            .filter(|account| account_ids.contains(&account.id.as_str()))
+            .map(|account| {
+                (
+                    account.id.clone(),
+                    account
+                        .label
+                        .clone()
+                        .unwrap_or_else(|| account.display_name.clone()),
+                )
+            })
+            .collect())
+    }
+
+    /// [`Self::update_registry`]를 계정 레코드 하나로 좁힌 것. `change`가 바꿨다고
+    /// 답하면 `updated_at`을 함께 올린다 — 계정 값을 고치면서 이 갱신 시각을 빠뜨리면
+    /// 화면이 옛 시각을 계속 보여 준다.
+    fn update_account(
+        &self,
+        account_id: &str,
+        change: impl FnOnce(&mut AccountRecord) -> Result<bool, CoreError>,
+    ) -> Result<AccountSnapshot, CoreError> {
+        self.update_registry(|registry| {
+            let account = account_by_id_mut(registry, account_id)?;
+            if !change(account)? {
+                return Ok(false);
+            }
+            account.updated_at = now_ms();
+            Ok(true)
+        })
+    }
+
+    /// 설정 손잡이 하나가 값을 갈아 끼우고 저장 여부를 답한다. [`Self::update_registry`]와
+    /// [`Self::update_account`]의 `change`가 그대로 쓸 수 있는 모양이다.
+    ///
+    /// "같으면 `Ok(false)`, 다르면 대입하고 `Ok(true)`"를 손잡이마다 손으로 적으면 비교
+    /// 대상과 대입 대상이 어긋나거나 비교를 통째로 빠뜨려도 컴파일은 통과한다. 빠뜨린
+    /// 쪽은 값이 그대로인 저장을 계속 일으키고, 계정 손잡이에서는 [`Self::update_account`]가
+    /// `updated_at`까지 올려 화면이 바뀌지 않은 계정을 방금 바뀐 것으로 보여 준다.
+    fn replace_if_changed<T: PartialEq>(slot: &mut T, value: T) -> Result<bool, CoreError> {
+        if *slot == value {
+            return Ok(false);
+        }
+        *slot = value;
+        Ok(true)
+    }
+
     /// 기본 계정을 바꾼다. 새 채팅·터미널의 기본 실행 계정, 헤더의 사용량 표시, 이어가기
-    /// 정책의 "기본 계정으로", 반복 요청의 "실행 시점 기본 계정"이 이 값을 따른다.
+    /// 정책의 "활성 계정으로", 반복 요청의 "실행 시점 활성 계정"이 이 값을 따른다.
     /// 자격증명은 건드리지 않는다 — 모든 계정은 자기 격리 프로필로 실행되고 앱은 공유 CLI
     /// 홈에 쓰지 않으므로, 전환은 포인터 변경일 뿐이라 실행 중 런타임을 종료할 이유가 없다.
     pub fn set_active(&self, account_id: &str) -> Result<AccountSnapshot, CoreError> {
-        let mut state = lock(&self.inner.state, "계정 상태")?;
-        let account = account_by_id(&state.registry, account_id)?;
-        if account.disabled {
-            return Err(CoreError::Conflict(
-                "비활성화된 계정은 기본 계정으로 선택할 수 없습니다".to_owned(),
-            ));
-        }
-        if account.auth_status != AccountAuthStatus::Ready {
-            return Err(CoreError::Conflict(
-                "재인증이 필요한 계정은 기본 계정으로 선택할 수 없습니다".to_owned(),
-            ));
-        }
-        let provider = account.provider;
-        let provider_state = state.registry.provider_mut(provider)?;
-        if provider_state.active_account_id.as_deref() != Some(account_id) {
+        self.update_registry(|registry| {
+            let account = account_by_id(registry, account_id)?;
+            if account.disabled {
+                return Err(CoreError::Conflict(
+                    "비활성화된 계정은 활성 계정으로 선택할 수 없습니다".to_owned(),
+                ));
+            }
+            if account.auth_status != AccountAuthStatus::Ready {
+                return Err(CoreError::Conflict(
+                    "재인증이 필요한 계정은 활성 계정으로 선택할 수 없습니다".to_owned(),
+                ));
+            }
+            let provider = account.provider;
+            let provider_state = registry.provider_mut(provider)?;
+            if provider_state.active_account_id.as_deref() == Some(account_id) {
+                return Ok(false);
+            }
             provider_state.active_account_id = Some(account_id.to_owned());
-            save_registry(&self.inner.app_data_dir, &state.registry)?;
-        }
-        drop(state);
-        self.snapshot()
+            Ok(true)
+        })
     }
 
     /// 등록된 계정 ID의 소속 공급자를 조회한다.
@@ -2314,28 +1999,24 @@ impl AccountSupervisor {
         account_id: &str,
         disabled: bool,
     ) -> Result<AccountSnapshot, CoreError> {
-        let mut state = lock(&self.inner.state, "계정 상태")?;
-        let is_active = {
-            let account = account_by_id(&state.registry, account_id)?;
-            state
-                .registry
+        self.update_registry(|registry| {
+            let account = account_by_id(registry, account_id)?;
+            let is_active = registry
                 .provider(account.provider)?
                 .active_account_id
                 .as_deref()
-                == Some(account_id)
-        };
-        if disabled && is_active {
-            return Err(CoreError::Conflict(
-                "기본 계정은 비활성화할 수 없습니다. 먼저 다른 계정을 기본으로 선택하세요"
-                    .to_owned(),
-            ));
-        }
-        let account = account_by_id_mut(&mut state.registry, account_id)?;
-        account.disabled = disabled;
-        account.updated_at = now_ms();
-        save_registry(&self.inner.app_data_dir, &state.registry)?;
-        drop(state);
-        self.snapshot()
+                == Some(account_id);
+            if disabled && is_active {
+                return Err(CoreError::Conflict(
+                    "활성 계정은 비활성화할 수 없습니다. 먼저 다른 계정을 활성으로 선택하세요"
+                        .to_owned(),
+                ));
+            }
+            let account = account_by_id_mut(registry, account_id)?;
+            account.disabled = disabled;
+            account.updated_at = now_ms();
+            Ok(true)
+        })
     }
 
     pub fn set_auto_switch(
@@ -2343,13 +2024,10 @@ impl AccountSupervisor {
         account_id: &str,
         auto_switch: bool,
     ) -> Result<AccountSnapshot, CoreError> {
-        let mut state = lock(&self.inner.state, "계정 상태")?;
-        let account = account_by_id_mut(&mut state.registry, account_id)?;
-        account.auto_switch = auto_switch;
-        account.updated_at = now_ms();
-        save_registry(&self.inner.app_data_dir, &state.registry)?;
-        drop(state);
-        self.snapshot()
+        self.update_account(account_id, |account| {
+            account.auto_switch = auto_switch;
+            Ok(true)
+        })
     }
 
     /// 계정별 사용자 메모를 계정 레지스트리에 저장한다. 앞뒤 공백을 정리한 뒤 빈
@@ -2361,15 +2039,9 @@ impl AccountSupervisor {
         note: Option<&str>,
     ) -> Result<AccountSnapshot, CoreError> {
         let normalized = normalize_account_note(note)?;
-        let mut state = lock(&self.inner.state, "계정 상태")?;
-        let account = account_by_id_mut(&mut state.registry, account_id)?;
-        if account.note != normalized {
-            account.note = normalized;
-            account.updated_at = now_ms();
-            save_registry(&self.inner.app_data_dir, &state.registry)?;
-        }
-        drop(state);
-        self.snapshot()
+        self.update_account(account_id, |account| {
+            Self::replace_if_changed(&mut account.note, normalized)
+        })
     }
 
     /// 계정 표시 이름을 사용자가 직접 정한 값으로 바꾼다. 앞뒤 공백을 정리한 뒤 빈
@@ -2381,15 +2053,9 @@ impl AccountSupervisor {
         label: Option<&str>,
     ) -> Result<AccountSnapshot, CoreError> {
         let normalized = normalize_account_label(label)?;
-        let mut state = lock(&self.inner.state, "계정 상태")?;
-        let account = account_by_id_mut(&mut state.registry, account_id)?;
-        if account.label != normalized {
-            account.label = normalized;
-            account.updated_at = now_ms();
-            save_registry(&self.inner.app_data_dir, &state.registry)?;
-        }
-        drop(state);
-        self.snapshot()
+        self.update_account(account_id, |account| {
+            Self::replace_if_changed(&mut account.label, normalized)
+        })
     }
 
     /// 자동전환 후 세션 복원 옵션 값. 자동전환 실행기가 전환 직전에 조회한다.
@@ -2412,13 +2078,9 @@ impl AccountSupervisor {
         &self,
         policy: ResumeAccountPolicy,
     ) -> Result<AccountSnapshot, CoreError> {
-        let mut state = lock(&self.inner.state, "계정 상태")?;
-        if state.registry.resume_account_policy != policy {
-            state.registry.resume_account_policy = policy;
-            save_registry(&self.inner.app_data_dir, &state.registry)?;
-        }
-        drop(state);
-        self.snapshot()
+        self.update_registry(|registry| {
+            Self::replace_if_changed(&mut registry.resume_account_policy, policy)
+        })
     }
 
     /// 페일오버 후보 선택 방식을 바꾼다.
@@ -2426,13 +2088,9 @@ impl AccountSupervisor {
         &self,
         policy: AutoSwitchPolicy,
     ) -> Result<AccountSnapshot, CoreError> {
-        let mut state = lock(&self.inner.state, "계정 상태")?;
-        if state.registry.auto_switch_policy != policy {
-            state.registry.auto_switch_policy = policy;
-            save_registry(&self.inner.app_data_dir, &state.registry)?;
-        }
-        drop(state);
-        self.snapshot()
+        self.update_registry(|registry| {
+            Self::replace_if_changed(&mut registry.auto_switch_policy, policy)
+        })
     }
 
     /// 사용량 분산 교체 폭. 사용량을 보고한 계정이 가장 덜 쓴 후보보다 이 폭(%p)만큼
@@ -2447,27 +2105,46 @@ impl AccountSupervisor {
                 "사용량 분산 교체 폭은 1~99 사이여야 합니다".to_owned(),
             ));
         }
-        let mut state = lock(&self.inner.state, "계정 상태")?;
-        if state.registry.auto_switch_usage_gap_percent != percent {
-            state.registry.auto_switch_usage_gap_percent = percent;
-            save_registry(&self.inner.app_data_dir, &state.registry)?;
-        }
-        drop(state);
-        self.snapshot()
+        self.update_registry(|registry| {
+            Self::replace_if_changed(&mut registry.auto_switch_usage_gap_percent, percent)
+        })
     }
 
-    /// 자동전환이 기본 계정을 대상 계정으로 옮긴다. 이미 기본이거나 쓸 수 없는 계정이면
-    /// 아무것도 하지 않고 `false`를 돌려준다.
-    pub fn request_active_account_rotation(&self, account_id: &str) -> Result<bool, CoreError> {
-        let provider = self.account_provider(account_id)?;
-        if !self.account_is_enabled_for_provider(provider, account_id)? {
-            return Ok(false);
-        }
-        if self.active_account_id(provider)?.as_deref() == Some(account_id) {
-            return Ok(false);
-        }
-        self.set_active(account_id)?;
-        Ok(true)
+    /// 자동전환이 기본 계정을 `expected_from`에서 대상 계정으로 옮긴다. 대상이 이미 기본이거나
+    /// 쓸 수 없는 계정이면 아무것도 하지 않고 `false`를 돌려준다.
+    ///
+    /// 지금 기본 계정이 `expected_from`이 아니면 옮기지 않고 로그를 남긴다. 계획이 "지정 계정이
+    /// 기본 계정이다"라고 본 뒤 세션 복구와 격리 프로브(최대 20초)가 지나는 사이 사용자가
+    /// 설정에서 기본 계정을 바꿨을 수 있다 — 그 선택을 자동전환이 덮어쓰면 안 된다. 확인과
+    /// 교체를 한 잠금 안에서 하므로 그 사이에 끼어들 틈이 없다. 쓸 수 있는지는 실행 게이트와
+    /// 같은 판정(`account_readiness`)이다.
+    pub fn request_active_account_rotation(
+        &self,
+        expected_from: &str,
+        account_id: &str,
+    ) -> Result<bool, CoreError> {
+        let now = now_ms();
+        self.update_registry_quiet(|registry| {
+            let account = account_by_id(registry, account_id)?;
+            // 기본 계정을 옮기는 자리는 어떤 모델로 쓸지 모른다. 계정 전체 판정으로 본다.
+            if account_readiness(account, account.provider, None, now) != RunReadiness::Ready {
+                return Ok(false);
+            }
+            let provider_state = registry.provider_mut(account.provider)?;
+            let active = provider_state.active_account_id.as_deref();
+            if active != Some(expected_from) {
+                eprintln!(
+                    "[auto-switch] 기본 계정이 {expected_from}에서 {}로 바뀌어 {account_id}로의 회전을 건너뜁니다",
+                    active.unwrap_or("(없음)")
+                );
+                return Ok(false);
+            }
+            if active == Some(account_id) {
+                return Ok(false);
+            }
+            provider_state.active_account_id = Some(account_id.to_owned());
+            Ok(true)
+        })
     }
 
     /// 계정의 페일오버 우선순위를 저장한다. None이면 지정을 해제해 우선순위 정책에서
@@ -2477,23 +2154,16 @@ impl AccountSupervisor {
         account_id: &str,
         priority: Option<u32>,
     ) -> Result<AccountSnapshot, CoreError> {
-        let mut state = lock(&self.inner.state, "계정 상태")?;
-        let account = account_by_id_mut(&mut state.registry, account_id)?;
-        if account.auto_switch_priority != priority {
-            account.auto_switch_priority = priority;
-            account.updated_at = now_ms();
-            save_registry(&self.inner.app_data_dir, &state.registry)?;
-        }
-        drop(state);
-        self.snapshot()
+        self.update_account(account_id, |account| {
+            Self::replace_if_changed(&mut account.auto_switch_priority, priority)
+        })
     }
 
     pub fn set_auto_switch_resume(&self, enabled: bool) -> Result<AccountSnapshot, CoreError> {
-        let mut state = lock(&self.inner.state, "계정 상태")?;
-        state.registry.auto_switch_resume = enabled;
-        save_registry(&self.inner.app_data_dir, &state.registry)?;
-        drop(state);
-        self.snapshot()
+        self.update_registry(|registry| {
+            registry.auto_switch_resume = enabled;
+            Ok(true)
+        })
     }
 
     /// 자동전환 실행기로 트리거 신호를 전달할 채널을 등록한다.
@@ -2527,6 +2197,7 @@ impl AccountSupervisor {
         &self,
         account_id: &str,
         chat_id: Option<&str>,
+        model: Option<&str>,
     ) -> Result<(), CoreError> {
         let now = now_ms();
         let (provider, first_signal) = {
@@ -2553,6 +2224,7 @@ impl AccountSupervisor {
             account_id: account_id.to_owned(),
             reason: AutoSwitchReason::AgentLimited,
             chat_id: chat_id.map(str::to_owned),
+            models: model.map(str::to_owned).into_iter().collect(),
         });
         // 첫 신호에만 조회를 띄운다. 조회가 성공하면 표시가 지워져 다음 신호가 다시
         // 첫 신호가 되므로, 조회 횟수는 사용자의 재시도 횟수를 넘지 않는다. 이 함수는
@@ -2569,20 +2241,99 @@ impl AccountSupervisor {
         Ok(())
     }
 
-    /// 자동전환 트리거를 검증하고 전환할 다음 후보 계정을 고른다. 전환하지 않아야
-    /// 하면 None을 반환한다. 실제 전환(세션 정리·자격증명 교체)은 호출자가 수행한다.
-    pub fn plan_auto_switch(&self, signal: &AutoSwitchSignal) -> Result<Option<String>, CoreError> {
-        let now = now_ms();
+    /// 이 신호로 전환을 따져 볼 자격이 있는지 — 쿨다운 안이 아니고 지정 계정의 자동전환이
+    /// 켜져 있어야 한다. 후보를 고르기 전에 이것만 먼저 보면, 전환 루프가 살아 있는 채팅을
+    /// 훑고 고정 세션마다 로그를 남기는 일을 거절될 신호에는 하지 않게 된다.
+    pub fn auto_switch_admissible(&self, signal: &AutoSwitchSignal) -> Result<bool, CoreError> {
         let state = lock(&self.inner.state, "계정 상태")?;
+        Self::auto_switch_admissible_in(&state, signal, now_ms())
+    }
+
+    fn auto_switch_admissible_in(
+        state: &AccountState,
+        signal: &AutoSwitchSignal,
+        now: i64,
+    ) -> Result<bool, CoreError> {
         if let Some(event) = state.auto_switch_events.get(&signal.provider) {
             if now - event.at < AUTO_SWITCH_COOLDOWN_MS {
-                return Ok(None);
+                return Ok(false);
             }
         }
         let limited = account_by_id(&state.registry, &signal.account_id)?;
-        if !limited.auto_switch {
+        Ok(limited.auto_switch)
+    }
+
+    /// 세션 재바인딩 목적으로 후보 하나를 고른다. 전환 루프는 두 질문을 함께 묻는
+    /// [`Self::plan_auto_switches`]를 쓰고, 이것은 자격 규칙을 하나씩 확인하는 시험의 진입점이다.
+    #[cfg(test)]
+    pub fn plan_auto_switch(&self, signal: &AutoSwitchSignal) -> Result<Option<String>, CoreError> {
+        let now = now_ms();
+        let state = lock(&self.inner.state, "계정 상태")?;
+        if !Self::auto_switch_admissible_in(&state, signal, now)? {
             return Ok(None);
         }
+        Ok(Self::plan_switch_in(
+            &state,
+            signal,
+            &signal.models,
+            SwitchIntent::Rebind,
+            now,
+        ))
+    }
+
+    /// 두 질문을 한 잠금 안에서 함께 답한다. `rebind_models`가 `None`이면 옮길 세션이 없어
+    /// 재바인딩은 묻지 않는다. 기본 계정 회전은 지정 계정이 지금 기본 계정일 때만 묻는다 —
+    /// 실제 교체는 [`Self::request_active_account_rotation`]이 그 사실을 다시 확인한 뒤 한다.
+    /// 입장 판정([`Self::auto_switch_admissible`])도 여기서 한 번 더 한다 — 전환 루프가 먼저
+    /// 묻고 세션을 훑는 사이에 다른 전환이 기록됐으면 둘 다 비어 나온다.
+    pub fn plan_auto_switches(
+        &self,
+        signal: &AutoSwitchSignal,
+        rebind_models: Option<&[String]>,
+    ) -> Result<AutoSwitchPlan, CoreError> {
+        let now = now_ms();
+        let state = lock(&self.inner.state, "계정 상태")?;
+        let empty = AutoSwitchPlan {
+            rebind_target: None,
+            rotate_target: None,
+        };
+        if !Self::auto_switch_admissible_in(&state, signal, now)? {
+            return Ok(empty);
+        }
+        let rebind_target = rebind_models.and_then(|models| {
+            Self::plan_switch_in(&state, signal, models, SwitchIntent::Rebind, now)
+        });
+        let limited_is_active = state
+            .registry
+            .provider(signal.provider)?
+            .active_account_id
+            .as_deref()
+            == Some(signal.account_id.as_str());
+        let rotate_target = limited_is_active
+            .then(|| {
+                Self::plan_switch_in(
+                    &state,
+                    signal,
+                    &signal.models,
+                    SwitchIntent::DefaultRotation,
+                    now,
+                )
+            })
+            .flatten();
+        Ok(AutoSwitchPlan {
+            rebind_target,
+            rotate_target,
+        })
+    }
+
+    /// 한 의도로 후보 하나를 고른다. 입장 판정은 부르는 쪽이 이미 했다.
+    fn plan_switch_in(
+        state: &AccountState,
+        signal: &AutoSwitchSignal,
+        models: &[String],
+        intent: SwitchIntent,
+        now: i64,
+    ) -> Option<String> {
         // 분산 교체는 이만큼 뒤처진 계정으로만 옮긴다. 아무도 그만큼 뒤처져 있지
         // 않으면 이미 균형이 맞은 것이므로 전환하지 않고, 계속 쓰다 보면 격차가
         // 벌어져 다음 갱신에서 다시 후보가 생긴다.
@@ -2592,17 +2343,25 @@ impl AccountSupervisor {
             }
             AutoSwitchReason::UsageExhausted | AutoSwitchReason::AgentLimited => None,
         };
-        Ok(select_auto_switch_target(
+        select_auto_switch_target(
             &state.registry.accounts,
             signal.provider,
             &signal.account_id,
+            &SwitchPurpose {
+                models,
+                reason: signal.reason,
+                intent,
+            },
             now,
             state.registry.auto_switch_policy,
             min_usage_gap_percent,
-        ))
+        )
     }
 
-    /// 자동전환이 실행된 사실을 기록해 스냅샷(UI)과 쿨다운 판정에 노출한다.
+    /// 자동전환이 실행된 사실을 기록해 스냅샷(UI)과 쿨다운 판정에 노출하고, 기록한 이벤트를
+    /// 돌려준다 — 알림은 이 값 하나로 말한다. 기록하지 못하면(잠금 오염) 실패를 돌려주어
+    /// 기록 없는 알림이 나가지 않게 한다.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_auto_switch(
         &self,
         provider: ProviderId,
@@ -2610,19 +2369,24 @@ impl AccountSupervisor {
         to_account_id: &str,
         reason: AutoSwitchReason,
         resumed_session_count: usize,
-    ) {
-        if let Ok(mut state) = self.inner.state.lock() {
-            state.auto_switch_events.insert(
-                provider,
-                AutoSwitchEventView {
-                    from_account_id: from_account_id.to_owned(),
-                    to_account_id: to_account_id.to_owned(),
-                    reason,
-                    at: now_ms(),
-                    resumed_session_count,
-                },
-            );
-        }
+        default_rotated: bool,
+        sessions_to_account_id: Option<&str>,
+    ) -> Result<AutoSwitchEventView, CoreError> {
+        let event = AutoSwitchEventView {
+            from_account_id: from_account_id.to_owned(),
+            to_account_id: to_account_id.to_owned(),
+            reason,
+            at: now_ms(),
+            resumed_session_count,
+            default_rotated,
+            // 옮긴 세션이 없거나 기본 계정과 같은 곳으로 갔으면 따로 말할 것이 없다.
+            sessions_to_account_id: sessions_to_account_id
+                .filter(|sessions_to| resumed_session_count > 0 && *sessions_to != to_account_id)
+                .map(str::to_owned),
+        };
+        let mut state = lock(&self.inner.state, "계정 상태")?;
+        state.auto_switch_events.insert(provider, event.clone());
+        Ok(event)
     }
 
     pub fn delete_account(
@@ -2640,7 +2404,7 @@ impl AccountSupervisor {
         let provider = state.registry.provider(account.provider)?;
         if provider.active_account_id.as_deref() == Some(account_id) {
             return Err(CoreError::Conflict(
-                "기본 계정은 삭제할 수 없습니다. 먼저 다른 계정을 기본으로 선택하세요".to_owned(),
+                "활성 계정은 삭제할 수 없습니다. 먼저 다른 계정을 활성으로 선택하세요".to_owned(),
             ));
         }
         if state
@@ -2754,10 +2518,7 @@ impl AccountSupervisor {
         &self,
         account_id: &str,
     ) -> Result<(ResetCreditOutcome, AccountSnapshot), CoreError> {
-        let account = {
-            let state = lock(&self.inner.state, "계정 상태")?;
-            account_by_id(&state.registry, account_id)?.clone()
-        };
+        let account = self.account_record(account_id)?;
         if account.provider != ProviderId::Codex {
             return Err(CoreError::InvalidInput(
                 "한도 리셋 크레딧은 Codex 계정만 지원합니다".to_owned(),
@@ -2793,10 +2554,7 @@ impl AccountSupervisor {
     }
 
     pub fn refresh_usage(&self, account_id: &str) -> Result<AccountSnapshot, CoreError> {
-        let account = {
-            let state = lock(&self.inner.state, "계정 상태")?;
-            account_by_id(&state.registry, account_id)?.clone()
-        };
+        let account = self.account_record(account_id)?;
         // 계정별로 사용량 조회와 토큰 회전을 직렬화해 수동·자동 새로고침이 같은
         // 일회성 갱신 토큰을 동시에 소비하지 않도록 한다. 계정이 다르면 서로 막지
         // 않으므로 여러 계정을 동시에 조회할 수 있다.
@@ -2821,9 +2579,8 @@ impl AccountSupervisor {
         let (fresh_usage, credential_rejected) = match account.provider {
             ProviderId::Codex => self.fetch_codex_usage_with_cli(&account),
             ProviderId::Claude => self.fetch_claude_usage_with_refresh(&account),
-            ProviderId::Antigravity => Err(CoreError::InvalidInput(
-                "Antigravity 계정 사용량은 지원하지 않습니다".to_owned(),
-            )),
+            ProviderId::Antigravity => self.fetch_antigravity_usage(&account),
+            ProviderId::Local => Err(unmanaged_provider_error(account.provider)),
         }
         .unwrap_or_else(|error| (usage_error_result(error), false));
         let auth_status = reconciled_auth_status_after_usage(
@@ -2832,13 +2589,17 @@ impl AccountSupervisor {
             credential_rejected,
         );
         let usage = apply_usage_stale_policy(fresh_usage, &account.usage);
+        // 사슬 만료 시각은 조회가 끝난 뒤에 읽는다. 이번 조회가 토큰을 회전시켰거나
+        // 프로필의 새 사슬을 채택했으면 그 값이 저장된 뒤라야 지금 사슬의 만료가 잡힌다.
+        // 볼트 읽기 한 번이 늘지만, 이 경로는 이미 공급자 API를 왕복한 뒤다.
+        let credential_expires_at = self.stored_credential_expires_at(&account);
         let usage_exhausted = usage_indicates_exhaustion(&usage);
         let usage_sample = usage.clone();
         let mut state = lock(&self.inner.state, "계정 상태")?;
         // 분산 교체는 소진보다 약한 트리거라 소진이 있으면 그쪽이 이긴다. 격차 판정은
         // 다른 계정의 사용량을 함께 봐야 해서 여기서 끝낼 수 없다. 설정이 켜져 있고
         // 이번 조회가 성공했으면 신호만 보내고, 실제 격차는 후보를 고르는
-        // `select_auto_switch_target`이 판정한다(후보가 없으면 `plan_auto_switch`가
+        // `select_auto_switch_target`이 판정한다(후보가 없으면 `plan_auto_switches`가
         // 곧바로 None이라 부작용이 없다).
         let usage_spread_candidate = !usage_exhausted
             && state.registry.auto_switch_usage_gap_percent.is_some()
@@ -2847,6 +2608,11 @@ impl AccountSupervisor {
             let account = account_by_id_mut(&mut state.registry, account_id)?;
             account.auth_status = auth_status;
             account.usage = usage;
+            // 읽지 못했으면 기록을 지우지 않는다. 볼트 읽기 실패는 사슬이 사라졌다는
+            // 뜻이 아니고, 지우면 남은 기간을 아는 계정의 만료 예고가 조용히 꺼진다.
+            if credential_expires_at.is_some() {
+                account.credential_expires_at = credential_expires_at;
+            }
             account.updated_at = now_ms();
             (account.provider, account.auto_switch)
         };
@@ -2876,8 +2642,10 @@ impl AccountSupervisor {
                 account_id: account_id.to_owned(),
                 reason,
                 // 사용량 조회에서 온 트리거는 채팅을 특정할 수 없으므로 이 계정에
-                // 묶인 세션 전체가 대상이다.
+                // 묶인 세션 전체가 대상이다. 모델은 여기서 모른다 — 전환 루프가 묶인
+                // 세션들에서 채운다.
                 chat_id: None,
+                models: Vec::new(),
             });
         }
         self.snapshot()
@@ -2959,7 +2727,7 @@ impl AccountSupervisor {
         // 대상이고, 조회는 읽기 전용이라 공유 홈을 건드리지 않는다. 스냅샷 경로가
         // 아니라 여기에 두는 이유는 네트워크 호출이 계정 목록 폴링을 막지 않게 하기
         // 위해서다.
-        for target in [ProviderId::Codex, ProviderId::Claude] {
+        for target in managed_providers() {
             if provider.is_some_and(|provider| provider != target) {
                 continue;
             }
@@ -2980,10 +2748,7 @@ impl AccountSupervisor {
         &self,
         account_id: &str,
     ) -> Result<AccountSnapshot, CoreError> {
-        let account = {
-            let state = lock(&self.inner.state, "계정 상태")?;
-            account_by_id(&state.registry, account_id)?.clone()
-        };
+        let account = self.account_record(account_id)?;
         let _switch = self.credential_switch_guard(account.provider)?;
         let secret = match self.inner.vault.get(&vault_key(&account)) {
             Ok(secret) => secret,
@@ -2998,13 +2763,30 @@ impl AccountSupervisor {
             Err(error) => return Err(error),
         };
         validate_captured_provider_credential(account.provider, &secret)?;
+        // Antigravity 토큰에는 신원이 들어 있지 않고 계정을 묻는 명령도 없다. 자격증명이
+        // 온전한지만 보고, 신원은 등록된 값을 그대로 확인값으로 쓴다 — 이 값은 그 계정의
+        // 격리 프로필 로그인에서 온 것이라 자리 자체가 계정을 말한다(`C12-4a`).
+        if account.provider == ProviderId::Antigravity
+            && !credential_is_complete(account.provider, &secret)
+        {
+            return Err(CoreError::Conflict(
+                "저장된 자격증명에 로그인 토큰이 없습니다. 이 계정을 재인증하세요".to_owned(),
+            ));
+        }
         let identity = match account.provider {
-            ProviderId::Codex => codex_identity(&secret),
-            ProviderId::Claude => (self.inner.claude_identity_resolver)(&secret),
-            ProviderId::Antigravity => Err(CoreError::InvalidInput(
-                "Antigravity 계정 자격증명은 지원하지 않습니다".to_owned(),
-            )),
-        }?;
+            ProviderId::Codex => codex_identity(&secret)?,
+            ProviderId::Claude => (self.inner.claude_identity_resolver)(&secret)?,
+            ProviderId::Antigravity => {
+                antigravity_identity(&secret).unwrap_or_else(|_| AccountIdentity {
+                    provider_account_id: account.provider_account_id.clone(),
+                    legacy_provider_account_id: None,
+                    email: account.email.clone(),
+                    organization: account.organization.clone(),
+                    display_name: None,
+                })
+            }
+            ProviderId::Local => return Err(unmanaged_provider_error(account.provider)),
+        };
         if !identity_matches_account(&identity, &account) {
             return Err(CoreError::Conflict(
                 "저장된 자격증명의 신원이 등록된 계정과 일치하지 않습니다".to_owned(),
@@ -3024,6 +2806,50 @@ impl AccountSupervisor {
     /// Codex 공식 app-server가 제공하는 `account/rateLimits/read`로 사용량을 읽는다.
     /// app-server가 액세스 토큰을 갱신하면 C4 프로필에 기록된 새 사슬을 Vault로 다시
     /// 채택한다. 공식 API가 없는 구버전 CLI에서만 기존 읽기 전용 HTTP 조회로 폴백한다.
+    /// 이 계정의 홈으로 `/usage`를 묻는다. Antigravity에는 계정을 인자로 받는 조회가 없어
+    /// 홈을 바꾸는 것이 곧 계정을 고르는 일이다(C12-7).
+    ///
+    /// 프로필을 준비하지 않는다. 준비 경로는 프로브로 CLI를 한 번 더 띄우는데, 그 프로브가
+    /// 쓰는 명령이 바로 이 `/usage`라 조회 한 번이 두 번이 된다. 자리만 계산해 넘긴다.
+    fn fetch_antigravity_usage(
+        &self,
+        account: &AccountRecord,
+    ) -> Result<(AccountUsageView, bool), CoreError> {
+        // 조회만 하러 와도 프로필을 먼저 세운다. 자리가 없으면 자격증명이 볼트에 멀쩡히
+        // 있는데도 "토큰 없음"으로 판정돼 계정 카드가 재인증을 요구한다.
+        let home = credential_profiles::ensure_profile_dir(
+            &self.inner.app_data_dir,
+            ProviderId::Antigravity,
+            &account.id,
+        )?;
+        credential_profiles::prepare_antigravity_profile(
+            &home,
+            self.provider_root(ProviderId::Antigravity)?,
+            &self.inner.home_dir,
+        )?;
+        ensure_profile_keychain(&home)?;
+        self.sync_profile_credential(account, &home)?;
+        // 토큰이 없으면 CLI가 브라우저 로그인 창을 띄우고 기다린다. 조회 실패가 아니라
+        // 자격증명 문제로 알려, 계정 카드가 재인증을 안내하게 한다.
+        if !antigravity_credentials_present(&home) {
+            return Ok((
+                usage_error_result(CoreError::Runtime(
+                    "Antigravity 계정 홈에 로그인 토큰이 없습니다".to_owned(),
+                )),
+                true,
+            ));
+        }
+        let env = credential_profiles::profile_env(
+            ProviderId::Antigravity,
+            &home,
+            self.provider_root(ProviderId::Antigravity)?,
+        )?;
+        // C12-11 2단계. 사용량 조회도 프로필 HOME으로 뜨는 실행이다. 항목을 비우지 않으면 CLI가
+        // 그 항목의 계정으로 답해 카드가 다른 로그인의 잔량을 보인다(C12-5가 기록한 증상).
+        self.clear_antigravity_global_login_for_start("사용량 조회")?;
+        Ok((crate::antigravity_usage::account_usage(&home, &env), false))
+    }
+
     fn fetch_codex_usage_with_cli(
         &self,
         account: &AccountRecord,
@@ -3049,9 +2875,8 @@ impl AccountSupervisor {
             CodexCliUsageResponse::Usage(usage) => Ok((usage, false)),
             CodexCliUsageResponse::Unsupported => direct(),
             CodexCliUsageResponse::CredentialRejected => Ok((
-                usage_retry_result(
+                usage_retry_soon(
                     "Codex 공식 CLI가 자격증명을 갱신하지 못했습니다. 이 계정을 다시 인증해 주세요",
-                    now_ms().saturating_add(USAGE_ERROR_RETRY_MS),
                 ),
                 true,
             )),
@@ -3067,18 +2892,9 @@ impl AccountSupervisor {
         let key = vault_key(account);
         let secret = self.inner.vault.get(&key)?;
         if !claude_access_token_expired(&secret, now_ms()) {
-            match request_claude_usage(&secret)? {
-                ClaudeUsageResponse::Usage(usage) => return Ok((usage, false)),
-                ClaudeUsageResponse::Unauthorized => {}
-                ClaudeUsageResponse::RateLimited { retry_at } => {
-                    return Ok((
-                        rate_limited_usage_result(
-                            "Claude 사용량 조회가 제한되었습니다 (HTTP 429)",
-                            retry_at,
-                        ),
-                        false,
-                    ));
-                }
+            // 401만 여기서 흘려보낸다 — 아래 갱신 경로가 이어받는다.
+            if let Some(usage) = request_claude_usage(&secret)?.into_usage_or_unauthorized() {
+                return Ok((usage, false));
             }
         }
         if let Some(retry_at) = token_refresh_retry_pending(&account.usage, now_ms()) {
@@ -3096,10 +2912,7 @@ impl AccountSupervisor {
             ));
         }
         if let Some(reason) = self.claude_refresh_deferred(&account.id)? {
-            return Ok((
-                usage_retry_result(reason, now_ms().saturating_add(USAGE_ERROR_RETRY_MS)),
-                false,
-            ));
+            return Ok((usage_retry_soon(reason), false));
         }
         let refreshed = match refresh_claude_oauth_secret(
             &secret,
@@ -3117,30 +2930,19 @@ impl AccountSupervisor {
                 ));
             }
             ClaudeTokenRefresh::Rejected(message) => {
-                return Ok((
-                    usage_retry_result(message, now_ms().saturating_add(USAGE_ERROR_RETRY_MS)),
-                    true,
-                ));
+                return Ok((usage_retry_soon(message), true));
             }
         };
         let refreshed = self.commit_refreshed_claude_credential(account, refreshed)?;
-        match request_claude_usage(&refreshed)? {
-            ClaudeUsageResponse::Usage(usage) => Ok((usage, false)),
+        match request_claude_usage(&refreshed)?.into_usage_or_unauthorized() {
+            Some(usage) => Ok((usage, false)),
             // 갱신까지 마친 토큰이 401이면 자격증명이 거부된 것이다. 오류로 올리면
             // 계정은 `ready`로 남으므로, 거부 신호를 붙여 재인증으로 내린다.
-            ClaudeUsageResponse::Unauthorized => Ok((
-                usage_retry_result(
+            None => Ok((
+                usage_retry_soon(
                     "Claude 사용량 조회가 실패했습니다 (HTTP 401 Unauthorized). 토큰을 갱신해도 인증이 거부되어 계정을 다시 인증해야 합니다",
-                    now_ms().saturating_add(USAGE_ERROR_RETRY_MS),
                 ),
                 true,
-            )),
-            ClaudeUsageResponse::RateLimited { retry_at } => Ok((
-                rate_limited_usage_result(
-                    "Claude 사용량 조회가 제한되었습니다 (HTTP 429)",
-                    retry_at,
-                ),
-                false,
             )),
         }
     }
@@ -3168,77 +2970,21 @@ impl AccountSupervisor {
         requested_account_id: Option<&str>,
     ) -> Result<AccountRuntimeLease, CoreError> {
         if !provider.manages_accounts() {
-            return Ok(AccountRuntimeLease {
-                accounts: self.clone(),
-                provider,
-                account_id: None,
-                released: false,
-            });
+            return Ok(self.lease(provider, None));
         }
         // 귀속 계정을 먼저 정한다. 격리 준비는 공급자 CLI 프로브까지 돌리므로(최대 20초)
         // 잠금 밖에서 끝낸다. 전환 잠금이나 계정 상태 잠금을 쥔 채 프로브를 돌리면 그
         // 시간 동안 같은 공급자의 다른 채팅 시작이 전부 멈춘다.
-        let account_id = {
-            let state = lock(&self.inner.state, "계정 상태")?;
-            if state
-                .registry
-                .accounts
-                .iter()
-                .all(|account| account.provider != provider)
-            {
-                if requested_account_id.is_some() {
-                    return Err(CoreError::NotFound(
-                        "실행 계정을 찾을 수 없습니다".to_owned(),
-                    ));
-                }
-                None
-            } else {
-                let account_id = requested_account_id
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        state
-                            .registry
-                            .provider(provider)
-                            .ok()
-                            .and_then(|provider_state| provider_state.active_account_id.clone())
-                    })
-                    .ok_or_else(|| {
-                        CoreError::Conflict("이 공급자의 기본 계정을 선택해야 합니다".to_owned())
-                    })?;
-                let account = account_by_id(&state.registry, &account_id)?;
-                if account.provider != provider || account.disabled {
-                    return Err(CoreError::Conflict(
-                        "선택한 실행 계정을 사용할 수 없습니다".to_owned(),
-                    ));
-                }
-                Some(account_id)
-            }
-        };
+        let account_id = self.runtime_account_id(provider, requested_account_id)?;
         if let Some(account_id) = account_id.as_deref() {
             self.prepare_runtime_isolation(provider, account_id);
         }
         let _switch = self.credential_switch_guard(provider)?;
         let mut state = lock(&self.inner.state, "계정 상태")?;
         if let Some(account_id) = account_id.as_deref() {
-            let account = account_by_id(&state.registry, account_id)?;
-            if account.provider != provider || account.disabled {
-                return Err(CoreError::Conflict(
-                    "선택한 실행 계정을 사용할 수 없습니다".to_owned(),
-                ));
-            }
-            // 판정은 위에서 캐시에 남긴 결과만 읽는다(잠금 순서: 계정 상태 → 프로필).
-            // 격리를 못 쓴 이유를 함께 알린다. 사유는 고정 문구라 자격증명을 담지 않는다.
-            if !self.credential_profile_active(account_id) {
-                return Err(CoreError::Conflict(
-                    match self.credential_profile_fallback_reason(account_id) {
-                        Some(reason) => format!(
-                            "자격증명 격리를 준비하지 못해 이 계정으로 실행할 수 없습니다: {reason}"
-                        ),
-                        None => "자격증명 격리를 준비하지 못해 이 계정으로 실행할 수 없습니다"
-                            .to_owned(),
-                    },
-                ));
-            }
+            // 계정 상태는 잠금 밖에서 프로브를 도는 사이에 바뀔 수 있으므로 다시 확인한다.
+            ensure_account_runnable(&state.registry, account_id, provider)?;
+            self.ensure_runtime_isolation_ready(account_id)?;
         }
         *state.runtime_counts.entry(provider).or_default() += 1;
         if let Some(account_id) = account_id.as_deref() {
@@ -3247,12 +2993,73 @@ impl AccountSupervisor {
                 .entry(account_id.to_owned())
                 .or_default() += 1;
         }
-        Ok(AccountRuntimeLease {
+        Ok(self.lease(provider, account_id))
+    }
+
+    /// 이 런타임이 귀속될 계정. 등록 계정이 없는 공급자는 `None`(공유 홈 실행)이고,
+    /// 있으면 요청 계정이나 활성 계정이 실행 가능한지까지 확인해 돌려준다. 계정 상태
+    /// 잠금은 이 판정 동안만 쥔다 — 이어지는 격리 준비가 공급자 CLI를 띄우기 때문이다.
+    fn runtime_account_id(
+        &self,
+        provider: ProviderId,
+        requested_account_id: Option<&str>,
+    ) -> Result<Option<String>, CoreError> {
+        let state = lock(&self.inner.state, "계정 상태")?;
+        if state
+            .registry
+            .accounts
+            .iter()
+            .all(|account| account.provider != provider)
+        {
+            if requested_account_id.is_some() {
+                return Err(CoreError::NotFound(
+                    "실행 계정을 찾을 수 없습니다".to_owned(),
+                ));
+            }
+            return Ok(None);
+        }
+        let account_id = requested_account_id
+            .map(str::to_owned)
+            .or_else(|| {
+                state
+                    .registry
+                    .provider(provider)
+                    .ok()
+                    .and_then(|provider_state| provider_state.active_account_id.clone())
+            })
+            .ok_or_else(|| {
+                CoreError::Conflict("이 공급자의 활성 계정을 선택해야 합니다".to_owned())
+            })?;
+        ensure_account_runnable(&state.registry, &account_id, provider)?;
+        Ok(Some(account_id))
+    }
+
+    /// 격리 프로필이 준비됐는지. 판정은 [`Self::prepare_runtime_isolation`]이 캐시에 남긴
+    /// 결과만 읽는다(잠금 순서: 계정 상태 → 프로필). 격리를 못 쓴 이유를 함께 알리되,
+    /// 사유는 고정 문구라 자격증명을 담지 않는다.
+    fn ensure_runtime_isolation_ready(&self, account_id: &str) -> Result<(), CoreError> {
+        if self.credential_profile_active(account_id) {
+            return Ok(());
+        }
+        Err(CoreError::Conflict(
+            match self.credential_profile_fallback_reason(account_id) {
+                Some(reason) => format!(
+                    "자격증명 격리를 준비하지 못해 이 계정으로 실행할 수 없습니다: {reason}"
+                ),
+                None => "자격증명 격리를 준비하지 못해 이 계정으로 실행할 수 없습니다".to_owned(),
+            },
+        ))
+    }
+
+    /// 런타임 한 벌의 임대 발급. 실행 수 증가는 호출부가 이미 끝냈고, 반납은
+    /// [`AccountRuntimeLease::release`]가 맡는다.
+    fn lease(&self, provider: ProviderId, account_id: Option<String>) -> AccountRuntimeLease {
+        AccountRuntimeLease {
             accounts: self.clone(),
             provider,
             account_id,
             released: false,
-        })
+        }
     }
 
     /// 계정에 귀속되지 않는 관리 터미널(CLI 설정·격리 로그인)도 provider runtimeCount에
@@ -3266,12 +3073,7 @@ impl AccountSupervisor {
         let _switch = self.credential_switch_guard(provider)?;
         let mut state = lock(&self.inner.state, "계정 상태")?;
         *state.runtime_counts.entry(provider).or_default() += 1;
-        Ok(AccountRuntimeLease {
-            accounts: self.clone(),
-            provider,
-            account_id: None,
-            released: false,
-        })
+        Ok(self.lease(provider, None))
     }
 
     pub fn active_account_id(&self, provider: ProviderId) -> Result<Option<String>, CoreError> {
@@ -3283,8 +3085,9 @@ impl AccountSupervisor {
         &self,
         provider: ProviderId,
         account_id: &str,
+        model: Option<&str>,
     ) -> Result<bool, CoreError> {
-        Ok(self.run_readiness(provider, account_id)? == RunReadiness::Ready)
+        Ok(self.run_readiness(provider, account_id, model)? == RunReadiness::Ready)
     }
 
     /// 이 계정으로 지금 실행할 수 있는지, 못 한다면 그 이유가 되돌아올 수 있는
@@ -3300,24 +3103,11 @@ impl AccountSupervisor {
         &self,
         provider: ProviderId,
         account_id: &str,
+        model: Option<&str>,
     ) -> Result<RunReadiness, CoreError> {
         let state = lock(&self.inner.state, "계정 상태")?;
         let account = account_by_id(&state.registry, account_id)?;
-        if account.provider != provider || account.disabled {
-            return Ok(RunReadiness::Disabled);
-        }
-        if let Some(readiness) = auth_readiness(account.auth_status, &account.usage) {
-            return Ok(readiness);
-        }
-        // 한도에 걸린 계정으로 실행을 시작하면 CLI를 띄워 놓고 곧바로 한도 오류를 받는다.
-        // 자동전환 후보에서 빼는 것과 같은 기준으로 미리 걸러, 리셋될 때까지 대기시킨다.
-        let now = now_ms();
-        if usage_blocks_auto_switch(&account.usage, now) {
-            return Ok(RunReadiness::UsageExhausted {
-                resume_at: usage_resume_at(&account.usage, now),
-            });
-        }
-        Ok(RunReadiness::Ready)
+        Ok(account_readiness(account, provider, model, now_ms()))
     }
 
     pub fn provider_runtime_count(&self, provider: ProviderId) -> Result<usize, CoreError> {
@@ -3387,6 +3177,10 @@ impl AccountSupervisor {
         let credential_changed = old_secret
             .as_ref()
             .is_none_or(|old| !same_secret(old.as_str(), captured.secret.as_str()));
+        // 방금 받은 사슬의 만료를 그 자리에서 적는다. 사용량 조회를 기다리면 재인증
+        // 직후의 계정만 만료를 모르는 상태로 남아, 정작 새로 인증한 계정에서 예고가
+        // 늦게 켜진다.
+        let credential_expires_at = credential_chain_expires_at(provider, &captured.secret);
         if let Some(account) = state
             .registry
             .accounts
@@ -3407,6 +3201,9 @@ impl AccountSupervisor {
             account.email = captured.identity.email;
             account.organization = captured.identity.organization;
             account.auth_status = AccountAuthStatus::Ready;
+            if credential_expires_at.is_some() {
+                account.credential_expires_at = credential_expires_at;
+            }
             account.updated_at = now;
         } else {
             let name = normalized_display_name(display_name, &captured.identity, provider.as_str());
@@ -3424,6 +3221,7 @@ impl AccountSupervisor {
                 usage: AccountUsageView::default(),
                 note: None,
                 label: None,
+                credential_expires_at,
                 created_at: now,
                 updated_at: now,
             });
@@ -3473,14 +3271,21 @@ impl AccountSupervisor {
         provider: ProviderId,
         profile: Option<&Path>,
     ) -> Result<CapturedCredentials, CoreError> {
-        let keychain_profile = profile.or(self.inner.claude_keychain_profile.as_deref());
-        let secret = read_active_credentials(
-            self.provider_root(provider)?,
-            provider,
-            profile,
-            keychain_profile,
-            self.inner.inspect_external_processes,
-        )?;
+        let secret = match self.read_credentials(provider, profile) {
+            Ok(secret) => secret,
+            // C12-11 1단계. 로그인이 기계 전역 항목에 들어가는 플랫폼에서는 임시 프로필 HOME에
+            // 토큰 파일이 남지 않는다 — CLI는 항목에 쓰고 파일 고리는 건너뛴다. 그 항목이
+            // 곧 이 로그인이므로 거기서 회수한다. 항목의 값은 토큰 파일 하나의 내용과 같은
+            // 모양이라 봉투의 파일 자리에 그대로 들어간다(두 파일 자리에 같은 값을 심어
+            // 실행에 성공한 2026-09-24 실측).
+            Err(error) if provider == ProviderId::Antigravity => {
+                match credential_profiles::read_antigravity_global_login()? {
+                    Some(login) => antigravity_envelope_from_global_login(&login)?,
+                    None => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
         validate_captured_provider_credential(provider, &secret)?;
         let identity = match read_identity(
             &self.inner.home_dir,
@@ -3506,6 +3311,13 @@ impl AccountSupervisor {
         Ok(CapturedCredentials { secret, identity })
     }
 
+    /// 잠금 밖에서 쓸 계정 한 벌. 계정 상태 잠금은 이 호출 안에서만 잡았다 놓는다 —
+    /// 잠금을 쥔 채 볼트·프로필·CLI를 건드리면 스냅샷 경로와 순서가 엇갈린다.
+    fn account_record(&self, account_id: &str) -> Result<AccountRecord, CoreError> {
+        let state = lock(&self.inner.state, "계정 상태")?;
+        Ok(account_by_id(&state.registry, account_id)?.clone())
+    }
+
     /// 이 계정으로 CLI를 띄울 때 넣을 자격증명 프로필. 격리를 지원하지 않는
     /// 공급자거나 프로브가 실패하면 `None`을 주고, 호출자는 지금까지처럼 공유 홈
     /// 자격증명으로 실행한다.
@@ -3518,73 +3330,192 @@ impl AccountSupervisor {
         provider: ProviderId,
         account_id: &str,
     ) -> Result<Option<RuntimeCredentialProfile>, CoreError> {
-        if !credential_profiles::provider_supports_isolation(provider) {
-            return Ok(None);
-        }
-        // 캐시는 값만 꺼내고 잠금을 그 자리에서 놓는다. 프로필 잠금을 쥔 채 계정
-        // 상태 잠금을 잡으면 스냅샷 경로(계정 상태 → 프로필)와 순서가 엇갈려
-        // 교착에 빠진다. 잠금 순서는 항상 계정 상태 → 프로필 하나로 유지한다.
-        // 실패 캐시는 재시도 시각까지만 유효하다. 지난 항목은 없는 것처럼 두고
-        // 아래에서 프로필과 프로브를 다시 준비한다.
-        let now = now_ms();
-        let cached = lock(&self.inner.credential_profiles, "자격증명 프로필")?
-            .get(account_id)
-            .and_then(|entry| match entry {
-                CredentialProfileEntry::Unsupported { retry_at, .. } => {
-                    (*retry_at > now).then_some(None)
+        match self.cached_credential_profile(account_id, now_ms())? {
+            Some(CachedCredentialProfile::Unsupported) => return Ok(None),
+            Some(CachedCredentialProfile::Ready { dir, env }) => {
+                let account = self.account_record(account_id)?;
+                self.sync_profile_credential(&account, &dir)?;
+                if provider == ProviderId::Antigravity {
+                    self.clear_antigravity_global_login_for_start("실행 시작")?;
                 }
-                CredentialProfileEntry::Ready {
+                return Ok(Some(RuntimeCredentialProfile {
+                    provider,
+                    account_id: account_id.to_owned(),
                     dir,
                     env,
-                    verified_at,
-                } => (verified_at.saturating_add(CREDENTIAL_PROFILE_READY_TTL_MS) > now)
-                    .then(|| Some((dir.clone(), env.clone()))),
-            });
-        if let Some(entry) = cached {
-            let Some((dir, env)) = entry else {
-                return Ok(None);
-            };
-            let account = {
-                let state = lock(&self.inner.state, "계정 상태")?;
-                account_by_id(&state.registry, account_id)?.clone()
-            };
-            self.sync_profile_credential(&account, &dir)?;
-            return Ok(Some(RuntimeCredentialProfile {
-                provider,
-                account_id: account_id.to_owned(),
-                dir,
-                env,
-            }));
+                }));
+            }
+            None => {}
         }
-        let account = {
-            let state = lock(&self.inner.state, "계정 상태")?;
-            account_by_id(&state.registry, account_id)?.clone()
-        };
+        let account = self.account_record(account_id)?;
         if account.provider != provider {
             return Err(CoreError::InvalidInput(
                 "계정과 공급자가 일치하지 않습니다".to_owned(),
             ));
         }
+        let (dir, env) = self.prepare_credential_profile(provider, account_id)?;
+        self.sync_profile_credential(&account, &dir)?;
+        // C12-11 2단계. 프로브도 실행이다 — 항목이 남아 있으면 프로브가 그 계정으로 통과해
+        // 격리가 된 것처럼 보인다. 프로브 자체가 갱신하면 항목을 되살리므로 반환 직전에 한 번
+        // 더 비운다.
+        if provider == ProviderId::Antigravity {
+            self.clear_antigravity_global_login_for_start("격리 프로브")?;
+        }
+        let outcome = self.probe_prepared_profile(provider, &account, &dir, &env);
+        let profile = self.record_credential_probe(provider, account_id, dir, env, outcome)?;
+        if profile.is_some() && provider == ProviderId::Antigravity {
+            self.clear_antigravity_global_login_for_start("실행 시작")?;
+        }
+        Ok(profile)
+    }
+
+    /// C12-11 1·2단계. 기계 전역 로그인 항목을 계정 전환 잠금 안에서 비운다. 그 항목이 있는
+    /// 동안 어느 HOME에서 뜬 CLI든 그 계정 하나로 인증되므로, 로그인 터미널이 브라우저에 닿기
+    /// 전과 계정별 실행이 뜨기 직전에 부른다. 잠금은 시작 구간만 줄 세운다 — 실행은 겹친다.
+    /// 전역 저장소가 아닌 플랫폼에서는 아무것도 하지 않는다(`credential_profiles`가 판정).
+    fn clear_antigravity_global_login_for_start(&self, stage: &str) -> Result<(), CoreError> {
+        if !credential_profiles::antigravity_login_is_machine_global() {
+            return Ok(());
+        }
+        let _switch = self.credential_switch_guard(ProviderId::Antigravity)?;
+        if credential_profiles::clear_antigravity_global_login()? {
+            eprintln!(
+                "[credential-profile] antigravity {stage} 전에 기계 전역 로그인 항목을 비웠습니다(C12-11)"
+            );
+        }
+        Ok(())
+    }
+
+    /// C12-11 3단계. 시작 직후 CLI가 자기 로그에 남긴 계정 이메일이 요청한 계정과 같은지.
+    /// 전역 항목을 비운 뒤 이 프로세스가 인증을 읽기까지의 틈에 다른 실행의 갱신이 항목을
+    /// 되살리면 CLI는 그 계정으로 조용히 성공한다(C12-8이 재개에서 겪은 것과 같은 모양).
+    /// 공급자 자신의 신호로 확인해 그 실패를 검출되는 거부로 바꾼다. 전역 저장소가 아닌
+    /// 플랫폼에서는 그 틈 자체가 없어 `NotApplicable`이다.
+    pub fn antigravity_runtime_identity_check(&self, account_id: &str) -> AntigravityIdentityCheck {
+        if !credential_profiles::antigravity_login_is_machine_global() {
+            return AntigravityIdentityCheck::NotApplicable;
+        }
+        let Ok(account) = self.account_record(account_id) else {
+            return AntigravityIdentityCheck::Pending;
+        };
+        let expected = account
+            .email
+            .as_deref()
+            .unwrap_or(account.provider_account_id.as_str());
+        let Some(dir) = self.validated_profile_dir(ProviderId::Antigravity, account_id) else {
+            return AntigravityIdentityCheck::Pending;
+        };
+        match antigravity_authenticated_email_from_cli_log(&dir) {
+            None => AntigravityIdentityCheck::Pending,
+            Some(observed) => compare_antigravity_identity(expected, &observed),
+        }
+    }
+
+    /// 캐시가 이미 답하는 준비 결과. 값만 꺼내고 프로필 잠금을 그 자리에서 놓는다.
+    /// 프로필 잠금을 쥔 채 계정 상태 잠금을 잡으면 스냅샷 경로(계정 상태 → 프로필)와
+    /// 순서가 엇갈려 교착에 빠지므로, 잠금 순서는 항상 계정 상태 → 프로필 하나로
+    /// 유지한다. 실패 캐시는 재시도 시각까지만, 성공 캐시는 재확인 시한까지만
+    /// 유효하다. 지난 항목은 없는 것처럼 둬 호출자가 프로필과 프로브를 다시 준비한다.
+    fn cached_credential_profile(
+        &self,
+        account_id: &str,
+        now: i64,
+    ) -> Result<Option<CachedCredentialProfile>, CoreError> {
+        Ok(lock(&self.inner.credential_profiles, "자격증명 프로필")?
+            .get(account_id)
+            .and_then(|entry| match entry {
+                CredentialProfileEntry::Unsupported { retry_at, .. } => {
+                    (*retry_at > now).then_some(CachedCredentialProfile::Unsupported)
+                }
+                CredentialProfileEntry::Ready {
+                    dir,
+                    env,
+                    verified_at,
+                } => {
+                    (verified_at.saturating_add(CREDENTIAL_PROFILE_READY_TTL_MS) > now).then(|| {
+                        CachedCredentialProfile::Ready {
+                            dir: dir.clone(),
+                            env: env.clone(),
+                        }
+                    })
+                }
+            }))
+    }
+
+    /// 프로필 자리와 환경변수를 만들고 공급자별 준비까지 끝낸다. 자격증명을 볼트와
+    /// 맞추는 일은 호출자가 이어서 한다 — 여기는 "어떤 자리에 무엇을 걸어 두는가"만 안다.
+    fn prepare_credential_profile(
+        &self,
+        provider: ProviderId,
+        account_id: &str,
+    ) -> Result<(PathBuf, Vec<(String, String)>), CoreError> {
         let dir = credential_profiles::ensure_profile_dir(
             &self.inner.app_data_dir,
             provider,
             account_id,
         )?;
         let env = credential_profiles::profile_env(provider, &dir, self.provider_root(provider)?)?;
-        if provider == ProviderId::Codex {
-            credential_profiles::link_shared_codex_entries(&dir, self.provider_root(provider)?)?;
+        match provider {
+            ProviderId::Codex => {
+                credential_profiles::link_shared_codex_entries(
+                    &dir,
+                    self.provider_root(provider)?,
+                )?;
+            }
+            ProviderId::Antigravity => {
+                credential_profiles::prepare_antigravity_profile(
+                    &dir,
+                    self.provider_root(provider)?,
+                    &self.inner.home_dir,
+                )?;
+                ensure_profile_keychain(&dir)?;
+            }
+            ProviderId::Claude => {}
+            ProviderId::Local => return Err(unmanaged_provider_error(provider)),
         }
-        self.sync_profile_credential(&account, &dir)?;
-        // 계정 확인, 사용 가능 확인, 격리 확인을 나눈다. 어느 계정인지는 프로필에 쓴
-        // 자격증명으로 보고, 그 자격증명으로 요청을 보낼 수 있는지는 값 자체로 보며,
-        // CLI 프로브는 그 저장소를 실제로 읽는지만 본다.
-        let outcome = match self.profile_credential_mismatch(&account, &dir) {
-            Some(reason) => ProbeOutcome::NotAuthenticated(reason),
-            None => match self.profile_credential_unusable(&account, &dir) {
-                Some(reason) => ProbeOutcome::NotAuthenticated(reason),
-                None => (self.inner.credential_probe)(provider, &env),
-            },
-        };
+        Ok((dir, env))
+    }
+
+    /// 준비된 프로필이 실제로 쓸 수 있는지 판정한다. 계정 확인, 사용 가능 확인, 격리
+    /// 확인을 나눈다. 어느 계정인지는 프로필에 쓴 자격증명으로 보고, 그 자격증명으로
+    /// 요청을 보낼 수 있는지는 값 자체로 보며, CLI 프로브는 그 저장소를 실제로 읽는지만
+    /// 본다.
+    fn probe_prepared_profile(
+        &self,
+        provider: ProviderId,
+        account: &AccountRecord,
+        dir: &Path,
+        env: &[(String, String)],
+    ) -> ProbeOutcome {
+        if provider == ProviderId::Antigravity {
+            // 토큰이 없으면 CLI가 print 모드에서도 브라우저 로그인 창을 띄우고 기다리므로
+            // 프로브를 돌리기 전에 거른다(C12-7).
+            if !antigravity_credentials_present(dir) {
+                return ProbeOutcome::NotAuthenticated(
+                    "프로필 홈에 공식 CLI 로그인 토큰이 없습니다".to_owned(),
+                );
+            }
+            return (self.inner.credential_probe)(provider, env);
+        }
+        if let Some(reason) = self
+            .profile_credential_mismatch(account, dir)
+            .or_else(|| self.profile_credential_unusable(account, dir))
+        {
+            return ProbeOutcome::NotAuthenticated(reason);
+        }
+        (self.inner.credential_probe)(provider, env)
+    }
+
+    /// 프로브 판정을 캐시에 남기고 런타임에 넘길 프로필을 정한다. 격리를 쓰지 못하는
+    /// 판정은 오류가 아니다 — 호출자는 `None`을 받아 공유 홈 자격증명으로 실행한다.
+    fn record_credential_probe(
+        &self,
+        provider: ProviderId,
+        account_id: &str,
+        dir: PathBuf,
+        env: Vec<(String, String)>,
+        outcome: ProbeOutcome,
+    ) -> Result<Option<RuntimeCredentialProfile>, CoreError> {
         let mut profiles = lock(&self.inner.credential_profiles, "자격증명 프로필")?;
         match outcome {
             ProbeOutcome::Ready => {
@@ -3646,9 +3577,6 @@ impl AccountSupervisor {
     /// 띄우므로(최대 20초) 잠금 밖에서 돌리고, [`Self::acquire_runtime`]은 캐시만 읽는다.
     /// 준비 실패는 여기서 오류로 올리지 않는다. 거부 문구는 `acquire_runtime` 한 곳에서 나온다.
     fn prepare_runtime_isolation(&self, provider: ProviderId, account_id: &str) {
-        if !credential_profiles::provider_supports_isolation(provider) {
-            return;
-        }
         if let Err(error) = self.runtime_credential_profile(provider, account_id) {
             eprintln!(
                 "[credential-profile] {provider} 계정 {account_id} 격리 준비에 실패했습니다: {error}",
@@ -3682,8 +3610,7 @@ impl AccountSupervisor {
     /// 프로세스라, 스냅샷마다 계정 수만큼 돌릴 수 없다는 이유도 있다 — 화면의
     /// `credentialIsolated`가 이 판정을 그대로 쓴다.
     fn credential_profile_on_disk(&self, provider: ProviderId, account_id: &str) -> bool {
-        credential_profiles::provider_supports_isolation(provider)
-            && self.validated_profile_dir(provider, account_id).is_some()
+        self.validated_profile_dir(provider, account_id).is_some()
     }
 
     /// 캐시가 격리 여부를 이미 답하는가. 프로브가 성공했으면 참, 실패가 아직 유효하면
@@ -3742,19 +3669,8 @@ impl AccountSupervisor {
     /// 있는데, 그 경우 남는 신원 출처는 공유 `~/.claude.json`뿐이라 계정별 프로필을
     /// 구분하지 못한다. 같은 이유로 CLI가 보고하는 이메일도 쓰지 않는다.
     fn profile_credential_mismatch(&self, account: &AccountRecord, dir: &Path) -> Option<String> {
-        let secret = read_active_credentials(
-            dir,
-            account.provider,
-            None,
-            Some(dir),
-            self.inner.inspect_external_processes,
-        )
-        .ok()?;
-        let identity = match account.provider {
-            ProviderId::Codex => codex_identity(secret.as_str()).ok()?,
-            ProviderId::Claude => claude_identity_from_secret(secret.as_str()).ok()?,
-            ProviderId::Antigravity => return None,
-        };
+        let secret = self.read_profile_credentials(account.provider, dir).ok()?;
+        let identity = embedded_identity(account.provider, secret.as_str())?;
         if identity_matches_account(&identity, account) {
             return None;
         }
@@ -3776,14 +3692,7 @@ impl AccountSupervisor {
     /// 자격증명을 읽지 못하면 판정하지 않는다. 저장소 접근 실패는 프로브가 따로
     /// 걸러 내며, 여기서 막으면 원인이 다른 실패가 같은 문구로 뭉개진다.
     fn profile_credential_unusable(&self, account: &AccountRecord, dir: &Path) -> Option<String> {
-        let secret = read_active_credentials(
-            dir,
-            account.provider,
-            None,
-            Some(dir),
-            self.inner.inspect_external_processes,
-        )
-        .ok()?;
+        let secret = self.read_profile_credentials(account.provider, dir).ok()?;
         if credential_can_authenticate(account.provider, secret.as_str(), now_ms()) {
             return None;
         }
@@ -3804,8 +3713,7 @@ impl AccountSupervisor {
         let key = vault_key(account);
         let vault_secret = self.inner.vault.get(&key)?;
         let use_keychain = self.inner.inspect_external_processes;
-        let profile_secret =
-            read_active_credentials(dir, account.provider, None, Some(dir), use_keychain).ok();
+        let profile_secret = self.read_profile_credentials(account.provider, dir).ok();
         let write_from_vault = || -> Result<(), CoreError> {
             write_active_credentials(
                 dir,
@@ -3907,18 +3815,8 @@ impl AccountSupervisor {
     /// 확인한다. 만료 시각이 없는 값은 "아직 유효하다"는 증거가 아니라 증거가 없는
     /// 것이므로 복구 근거로 쓰지 않는다.
     fn recoverable_profile_credential(&self, account: &AccountRecord) -> Option<Zeroizing<String>> {
-        if !credential_profiles::provider_supports_isolation(account.provider) {
-            return None;
-        }
         let dir = self.validated_profile_dir(account.provider, &account.id)?;
-        let secret = read_active_credentials(
-            &dir,
-            account.provider,
-            None,
-            Some(&dir),
-            self.inner.inspect_external_processes,
-        )
-        .ok()?;
+        let secret = self.read_profile_credentials(account.provider, &dir).ok()?;
         if !credential_is_complete(account.provider, &secret) {
             return None;
         }
@@ -3951,9 +3849,6 @@ impl AccountSupervisor {
         account: &AccountRecord,
         secret: &str,
     ) -> Result<(), CoreError> {
-        if !credential_profiles::provider_supports_isolation(account.provider) {
-            return Ok(());
-        }
         let Some(dir) = self.validated_profile_dir(account.provider, &account.id) else {
             return Ok(());
         };
@@ -3964,6 +3859,13 @@ impl AccountSupervisor {
             self.inner.inspect_external_processes,
             secret,
         )
+    }
+
+    /// 저장된 자격증명이 밝힌 사슬 만료 시각. 읽지 못하면 `None`이고, 호출부는 그때
+    /// 이전에 읽어 둔 값을 지우지 않는다.
+    fn stored_credential_expires_at(&self, account: &AccountRecord) -> Option<i64> {
+        let secret = self.inner.vault.get(&vault_key(account)).ok()?;
+        credential_chain_expires_at(account.provider, &secret)
     }
 
     /// 자격증명의 액세스 토큰이 만료됐는지. 만료 판정이 있는 공급자는 Claude뿐이고,
@@ -3993,13 +3895,14 @@ impl AccountSupervisor {
         secret: &str,
         allow_live_lookup: bool,
     ) -> bool {
-        let embedded = match account.provider {
-            ProviderId::Codex => codex_identity(secret).ok(),
-            ProviderId::Claude => claude_identity_from_secret(secret).ok(),
-            ProviderId::Antigravity => None,
-        };
-        if let Some(identity) = embedded {
+        if let Some(identity) = embedded_identity(account.provider, secret) {
             return identity_matches_account(&identity, account);
+        }
+        // Antigravity 토큰에는 신원이 없다. 대신 이 자격증명을 읽은 자리가 그 계정 전용
+        // 프로필이고 키체인도 그 안에 있으므로, 온전한 값이면 계정이 증명된 것으로 본다.
+        // 공유 홈을 함께 쓰는 다른 두 공급자와 달리 섞일 자리가 없다(`C12`).
+        if account.provider == ProviderId::Antigravity {
+            return antigravity_has_keyring_token(secret);
         }
         if account.provider != ProviderId::Claude || !allow_live_lookup {
             return false;
@@ -4008,13 +3911,49 @@ impl AccountSupervisor {
             .is_ok_and(|identity| identity_matches_account(&identity, account))
     }
 
+    /// 공급자 루트(공유 홈)에서 자격증명을 읽는다. `profile`이 있으면 그 프로필의
+    /// 자격증명 파일을 읽고 Keychain 서비스명도 그 프로필로 만든다.
+    ///
+    /// 감독자가 자격증명을 읽는 자리마다 공급자 루트·Keychain 프로필·Keychain 사용
+    /// 여부 세 인자를 각자 조립하고 있었다. 세 값은 모두 감독자 상태에서 나오므로
+    /// 호출부가 고를 것은 프로필 하나뿐인데, 조립을 베껴 두면 Keychain 프로필 기본값
+    /// 규칙(프로필이 없을 때만 `claude_keychain_profile`)이 자리마다 따로 산다.
+    fn read_credentials(
+        &self,
+        provider: ProviderId,
+        profile: Option<&Path>,
+    ) -> Result<Zeroizing<String>, CoreError> {
+        read_active_credentials(
+            self.provider_root(provider)?,
+            provider,
+            profile,
+            profile.or(self.inner.claude_keychain_profile.as_deref()),
+            self.inner.inspect_external_processes,
+        )
+    }
+
+    /// 격리 프로필 디렉터리 하나를 그 자체의 공급자 루트로 삼아 자격증명을 읽는다.
+    /// 프로필 점검·동기화·복구가 모두 같은 모양으로 읽으므로 한 자리에 둔다.
+    fn read_profile_credentials(
+        &self,
+        provider: ProviderId,
+        dir: &Path,
+    ) -> Result<Zeroizing<String>, CoreError> {
+        read_active_credentials(
+            dir,
+            provider,
+            None,
+            Some(dir),
+            self.inner.inspect_external_processes,
+        )
+    }
+
     fn provider_root(&self, provider: ProviderId) -> Result<&Path, CoreError> {
         match provider {
             ProviderId::Codex => Ok(&self.inner.codex_home_dir),
             ProviderId::Claude => Ok(&self.inner.claude_config_dir),
-            ProviderId::Antigravity => Err(CoreError::InvalidInput(
-                "Antigravity 인증 경로는 지원하지 않습니다".to_owned(),
-            )),
+            ProviderId::Antigravity => Ok(&self.inner.antigravity_gemini_dir),
+            ProviderId::Local => Err(unmanaged_provider_error(provider)),
         }
     }
 
@@ -4025,11 +3964,8 @@ impl AccountSupervisor {
         let mutex = match provider {
             ProviderId::Codex => &self.inner.codex_switch_lock,
             ProviderId::Claude => &self.inner.claude_switch_lock,
-            ProviderId::Antigravity => {
-                return Err(CoreError::InvalidInput(
-                    "Antigravity 계정 전환은 지원하지 않습니다".to_owned(),
-                ));
-            }
+            ProviderId::Antigravity => &self.inner.antigravity_switch_lock,
+            ProviderId::Local => return Err(unmanaged_provider_error(provider)),
         };
         lock(mutex, "계정 전환")
     }
@@ -4199,6 +4135,14 @@ fn claude_refresh_deferral(account_runtime_running: bool) -> Option<&'static str
         .then_some("실행 중인 Claude 세션이 이 계정 자격증명을 쥐고 있어 토큰 갱신을 미룹니다")
 }
 
+/// 계정을 관리하지 않는 공급자가 계정·자격증명 경로에 닿은 경우. 진입점의
+/// [`ensure_managed_provider`]와 `manages_accounts()` 필터가 먼저 걸러 내므로 여기까지
+/// 오면 배선 실수다. 조용히 빈 값을 돌려주면 그 실수가 "계정이 없다"로 위장되므로
+/// 오류로 드러낸다.
+fn unmanaged_provider_error(provider: ProviderId) -> CoreError {
+    CoreError::InvalidInput(format!("{provider} 공급자는 계정 관리를 지원하지 않습니다"))
+}
+
 fn ensure_managed_provider(provider: ProviderId) -> Result<(), CoreError> {
     if provider.manages_accounts() {
         Ok(())
@@ -4240,7 +4184,9 @@ fn login_view(login: &AccountLoginSession) -> AccountLoginSessionView {
         environment_variable: match login.provider {
             ProviderId::Codex => "CODEX_HOME",
             ProviderId::Claude => "CLAUDE_CONFIG_DIR",
-            ProviderId::Antigravity => "",
+            // 자격증명만 옮기는 변수가 없어 홈 전체를 임시 프로필로 가둔다(C12).
+            ProviderId::Antigravity => credential_profiles::ANTIGRAVITY_HOME,
+            ProviderId::Local => "",
         }
         .to_owned(),
         profile_path: login.profile_path.to_string_lossy().into_owned(),
@@ -4250,9 +4196,20 @@ fn login_view(login: &AccountLoginSession) -> AccountLoginSessionView {
             ProviderId::Codex => "codex login",
             ProviderId::Claude => "claude auth login --claudeai",
             ProviderId::Antigravity => "",
+            ProviderId::Local => "",
         }
         .to_owned(),
     }
+}
+
+/// 앞뒤 공백을 버리고, 남은 것이 없으면 값이 없는 것으로 본다.
+///
+/// 공급자가 주는 계정 ID·이메일·조직 이름은 비어 있는 대신 공백 한 칸으로 오기도 한다.
+/// 일곱 자리가 각자 `trim` 뒤에 `is_empty` 검사를 붙여 왔고, 어떤 자리는 `&str`로 어떤
+/// 자리는 `String`으로 같은 규칙을 다시 적어 한쪽만 고치면 "값 없음" 판정이 갈라졌다.
+/// JSON 칸을 읽는 [`json_field::trimmed_str`]도 이 규칙을 그대로 쓴다.
+fn trimmed(value: &str) -> Option<&str> {
+    Some(value.trim()).filter(|value| !value.is_empty())
 }
 
 fn normalized_display_name(
@@ -4261,8 +4218,9 @@ fn normalized_display_name(
     fallback: &str,
 ) -> String {
     requested
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+        .as_deref()
+        .and_then(trimmed)
+        .map(str::to_owned)
         .or_else(|| identity.display_name.clone())
         .or_else(|| identity.email.clone())
         .unwrap_or_else(|| fallback.to_owned())
@@ -4290,6 +4248,23 @@ fn provider_vault_key(provider: ProviderId, account_id: &str) -> String {
 
 fn vault_key(account: &AccountRecord) -> String {
     provider_vault_key(account.provider, &account.id)
+}
+
+/// 이 계정으로 지금 이 공급자의 런타임을 띄울 수 있는가. 런타임 취득은 격리 프로브를
+/// 잠금 밖에서 돌리느라 이 판정을 프로브 전후로 두 번 하는데, 두 자리가 각자 조건을
+/// 적으면 한쪽만 고쳐져 "꺼 둔 계정이 실행된다"가 되기 쉽다.
+fn ensure_account_runnable(
+    registry: &AccountRegistry,
+    account_id: &str,
+    provider: ProviderId,
+) -> Result<(), CoreError> {
+    let account = account_by_id(registry, account_id)?;
+    if account.provider != provider || account.disabled {
+        return Err(CoreError::Conflict(
+            "선택한 실행 계정을 사용할 수 없습니다".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn account_by_id<'a>(
@@ -4327,7 +4302,7 @@ fn validate_registry(registry: &AccountRegistry) -> Result<(), CoreError> {
             "지원하지 않는 자격증명 저장소 버전입니다".to_owned(),
         ));
     }
-    for provider in [ProviderId::Codex, ProviderId::Claude] {
+    for provider in managed_providers() {
         registry.provider(provider)?;
     }
     Ok(())
@@ -4393,11 +4368,40 @@ fn load_registry(app_data_dir: &Path) -> Result<AccountRegistry, CoreError> {
     }
     let mut registry: AccountRegistry = serde_json::from_slice(&fs::read(path)?)?;
     migrate_default_account_into_active(&mut registry);
+    ensure_provider_states(&mut registry);
     Ok(registry)
 }
 
 /// 기본 계정과 활성 계정이 하나로 합쳐졌다. 이전 레지스트리의 `defaultAccountId`는 활성
 /// 계정이 비어 있을 때만 그 자리를 채우고, 어느 쪽이든 다시 저장하지 않는다.
+/// 레지스트리가 담는 공급자. 계정 관리를 지원하는 공급자와 언제나 같아야 한다 —
+/// 어긋나면 그 공급자의 활성 계정 조회가 "지원하지 않는 계정 공급자입니다"로 실패한다.
+fn managed_providers() -> Vec<ProviderId> {
+    ProviderId::ALL
+        .into_iter()
+        .filter(|provider| provider.manages_accounts())
+        .collect()
+}
+
+/// 저장된 레지스트리에 없는 공급자 자리를 채운다. 공급자가 계정 관리를 새로 지원하게 되면
+/// 이전 설치의 저장본에는 그 자리가 없어, 채우지 않으면 활성 계정 조회부터 실패한다.
+fn ensure_provider_states(registry: &mut AccountRegistry) {
+    for provider in managed_providers() {
+        if registry
+            .providers
+            .iter()
+            .any(|state| state.provider == provider)
+        {
+            continue;
+        }
+        registry.providers.push(ProviderAccountState {
+            provider,
+            active_account_id: None,
+            legacy_default_account_id: None,
+        });
+    }
+}
+
 fn migrate_default_account_into_active(registry: &mut AccountRegistry) {
     for provider in &mut registry.providers {
         let legacy = provider.legacy_default_account_id.take();
@@ -4409,6 +4413,418 @@ fn migrate_default_account_into_active(registry: &mut AccountRegistry) {
 
 fn save_registry(app_data_dir: &Path, registry: &AccountRegistry) -> Result<(), CoreError> {
     write_private_json(&app_data_dir.join(REGISTRY_FILE), registry)
+}
+
+/// Antigravity 자격증명이 놓이는 홈. 공급자 루트(`~/.gemini`)를 받으면 그 부모가 홈이고,
+/// 프로필 디렉터리를 받으면 그 자리가 곧 홈이다 — 프로필은 홈 전체를 가르므로 `.gemini`가
+/// 그 안에 생긴다(C12-2). 다른 두 공급자는 프로필이 곧 공급자 홈이라 이 구분이 없다.
+fn antigravity_home_for(root_or_profile: &Path) -> &Path {
+    if root_or_profile.file_name() == Some(std::ffi::OsStr::new(".gemini")) {
+        root_or_profile.parent().unwrap_or(root_or_profile)
+    } else {
+        root_or_profile
+    }
+}
+
+/// 볼트에 담는 Antigravity 자격증명 봉투의 키. CLI가 로그인 토큰을 두 파일로 나눠 두므로
+/// 한 덩이로 묶어 다룬다. 순서는 [`credential_profiles::ANTIGRAVITY_TOKEN_RELATIVE_PATHS`]와
+/// 짝이다.
+const ANTIGRAVITY_SECRET_KEYS: [&str; 2] = ["antigravityOauthToken", "jetskiStandaloneOauthToken"];
+
+/// 공식 CLI가 로그인 토큰을 두는 키체인 항목. 홈을 가른 프로필에서는 그 프로필의 키체인에
+/// 들어간다(`C12-4a`). 키체인을 쓸 수 있으면 CLI는 **파일을 남기지 않으므로**, 봉투가 이
+/// 값을 함께 담지 않으면 로그인 결과를 하나도 회수하지 못한다(2026-09-17 실측).
+///
+/// 이름은 토큰 파일 목록과 같은 자리(`credential_profiles`)에 둔다. 사용량 조회의 사전
+/// 점검도 같은 항목을 보므로, 두 벌로 적어 두면 한쪽만 고쳐질 자리다.
+#[cfg(target_os = "macos")]
+use credential_profiles::{ANTIGRAVITY_KEYCHAIN_ACCOUNT, ANTIGRAVITY_KEYCHAIN_SERVICE};
+/// 봉투에서 그 값을 담는 키.
+const ANTIGRAVITY_KEYRING_KEY: &str = "keyringToken";
+
+/// 이 홈에 공식 CLI 로그인 자격증명이 있는가. 토큰은 파일이나 키체인 중 한쪽에만 있을 수
+/// 있다 — 키체인을 쓸 수 있는 설치에서는 CLI가 파일을 남기지 않는다(`C12-4a`). 한쪽만 보면
+/// 로그인된 계정을 "자격증명 없음"으로 판정해 재인증을 요구하게 된다.
+fn antigravity_credentials_present(home: &Path) -> bool {
+    credential_profiles::antigravity_login_present(home)
+        || read_antigravity_keyring_token(home)
+            .ok()
+            .flatten()
+            .is_some()
+}
+
+/// 프로필 홈이 소유한 키체인 파일.
+#[cfg(target_os = "macos")]
+fn antigravity_profile_keychain(home: &Path) -> PathBuf {
+    home.join("Library/Keychains/login.keychain-db")
+}
+
+/// 프로필 키체인에 든 로그인 토큰. 키체인이 없으면 이 설치는 파일만 쓴다는 뜻이다.
+#[cfg(target_os = "macos")]
+fn read_antigravity_keyring_token(home: &Path) -> Result<Option<Zeroizing<String>>, CoreError> {
+    let keychain = antigravity_profile_keychain(home);
+    if !keychain.exists() {
+        return Ok(None);
+    }
+    let path = keychain.to_string_lossy().into_owned();
+    let output = run_macos_security(
+        &[
+            "find-generic-password",
+            "-s",
+            ANTIGRAVITY_KEYCHAIN_SERVICE,
+            "-a",
+            ANTIGRAVITY_KEYCHAIN_ACCOUNT,
+            "-w",
+            &path,
+        ],
+        None,
+        KEYCHAIN_COMMAND_TIMEOUT,
+    )?;
+    if !output.status.success() {
+        if macos_keychain_item_not_found(&output) {
+            return Ok(None);
+        }
+        return Err(macos_keychain_failure("읽기가", &output));
+    }
+    let mut stdout = output.stdout;
+    if stdout.last() == Some(&b'\n') {
+        stdout.pop();
+    }
+    let bytes = std::mem::take(stdout.as_mut());
+    match String::from_utf8(bytes) {
+        Ok(value) => Ok(Some(Zeroizing::new(value))),
+        Err(error) => {
+            let mut bytes = error.into_bytes();
+            bytes.zeroize();
+            Err(CoreError::Runtime(
+                "Antigravity Keychain 값이 UTF-8이 아닙니다".to_owned(),
+            ))
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_antigravity_keyring_token(_home: &Path) -> Result<Option<Zeroizing<String>>, CoreError> {
+    Ok(None)
+}
+
+/// 프로필 키체인에 로그인 토큰을 되돌려 놓는다. CLI가 키체인을 먼저 읽으므로, 볼트에서
+/// 프로필을 복원할 때 이 값이 빠지면 CLI가 옛 값을 계속 쓴다.
+#[cfg(target_os = "macos")]
+fn write_antigravity_keyring_token(home: &Path, value: &str) -> Result<(), CoreError> {
+    ensure_profile_keychain(home)?;
+    let path = antigravity_profile_keychain(home)
+        .to_string_lossy()
+        .into_owned();
+    let output = run_macos_security(
+        &[
+            "add-generic-password",
+            "-U",
+            "-s",
+            ANTIGRAVITY_KEYCHAIN_SERVICE,
+            "-a",
+            ANTIGRAVITY_KEYCHAIN_ACCOUNT,
+            "-w",
+            value,
+            &path,
+        ],
+        None,
+        KEYCHAIN_COMMAND_TIMEOUT,
+    )?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(macos_keychain_failure("저장이", &output))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_antigravity_keyring_token(_home: &Path, _value: &str) -> Result<(), CoreError> {
+    Ok(())
+}
+
+/// 홈에 놓인 두 토큰 파일을 봉투 하나로 읽는다. 둘 다 없으면 로그인이 없는 것이다.
+/// 한쪽만 있는 설치도 있어(구버전 CLI) 있는 것만 담는다.
+fn read_antigravity_credentials(home: &Path) -> Result<Zeroizing<String>, CoreError> {
+    let mut envelope = serde_json::Map::new();
+    for (key, relative) in ANTIGRAVITY_SECRET_KEYS
+        .iter()
+        .zip(credential_profiles::ANTIGRAVITY_TOKEN_RELATIVE_PATHS)
+    {
+        let path = home.join(relative);
+        if !path.is_file() {
+            continue;
+        }
+        let raw = read_secret_file(&path)?;
+        let value = serde_json::from_str::<Value>(&raw).map_err(|_| {
+            CoreError::Runtime("Antigravity 인증 파일을 해석하지 못했습니다".to_owned())
+        })?;
+        envelope.insert((*key).to_owned(), value);
+    }
+    if let Some(token) = read_antigravity_keyring_token(home)? {
+        envelope.insert(
+            ANTIGRAVITY_KEYRING_KEY.to_owned(),
+            Value::String(token.to_string()),
+        );
+    }
+    if envelope.is_empty() {
+        return Err(CoreError::NotFound(
+            "Antigravity 로그인 토큰을 찾지 못했습니다".to_owned(),
+        ));
+    }
+    Ok(Zeroizing::new(Value::Object(envelope).to_string()))
+}
+
+/// Antigravity 자격증명 봉투를 읽는 자리.
+///
+/// 봉투 안쪽 모양(OAuth 토큰이 `ANTIGRAVITY_SECRET_KEYS[0]` 아래 있고, 갱신·만료 값은 그
+/// 안의 `token` 객체에 있다)을 호출부마다 `get("token")`으로 따라 내려가면, 키 하나가
+/// 바뀔 때 일부만 고쳐져 어떤 값은 읽히고 어떤 값은 조용히 `None`이 된다. 경로를 아는
+/// 자리를 여기 하나로 둔다. 값은 비밀정보라 이 타입은 밖으로 나가지 않는다(`G4`).
+struct AntigravityEnvelope(Value);
+
+impl AntigravityEnvelope {
+    /// 해석하지 못하면 봉투가 아닌 것으로 본다. 판정만 하는 호출부가 쓴다.
+    fn parse(secret: &str) -> Option<Self> {
+        serde_json::from_str::<Value>(secret).ok().map(Self)
+    }
+
+    /// 해석 실패를 그대로 올린다. 봉투를 펼쳐 쓰는 호출부가 쓴다.
+    fn parse_required(secret: &str) -> Result<Self, CoreError> {
+        Ok(Self(serde_json::from_str::<Value>(secret)?))
+    }
+
+    /// 봉투에 담긴 토큰 파일 하나의 내용.
+    fn token_file(&self, key: &str) -> Option<&Value> {
+        self.0.get(key)
+    }
+
+    /// OAuth 토큰 파일 안의 `token` 객체 필드. 갱신 토큰과 만료 시각이 여기 있다.
+    fn oauth_token_field(&self, name: &str) -> Option<&str> {
+        self.token_file(ANTIGRAVITY_SECRET_KEYS[0])?
+            .get("token")?
+            .get(name)?
+            .as_str()
+    }
+
+    /// OAuth 토큰 파일에 실린 신원 토큰. 키체인에만 로그인이 있으면 없다.
+    fn id_token(&self) -> Option<&str> {
+        self.token_file(ANTIGRAVITY_SECRET_KEYS[0])?
+            .get("id_token")?
+            .as_str()
+    }
+
+    /// 키체인 항목에서 회수해 봉투에 함께 담은 토큰.
+    fn keyring_token(&self) -> Option<&str> {
+        self.0.get(ANTIGRAVITY_KEYRING_KEY)?.as_str()
+    }
+}
+
+/// C12-11 3단계의 판정.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AntigravityIdentityCheck {
+    /// 이 플랫폼에는 전역 항목 경합이 없다.
+    NotApplicable,
+    /// CLI가 아직 인증 결과를 로그에 남기지 않았다. 다음 신호에서 다시 본다.
+    Pending,
+    /// 요청한 계정으로 인증됐다.
+    Matched,
+    /// 다른 계정으로 인증됐다. `observed`는 계정 이메일이라 비밀이 아니다(G5).
+    Mismatch { observed: String },
+}
+
+/// 기계 전역 로그인 항목의 값을 계정 봉투로 만든다. 항목의 값은 토큰 파일 하나의 내용과 같은
+/// 모양(`{auth_method, id_token, token:{…}}`)이라 두 파일 자리에 같은 값을 둔다 — CLI는 두
+/// 파일 어느 쪽이든 읽고, 신원은 `id_token`에서 나온다.
+fn antigravity_envelope_from_global_login(login: &str) -> Result<Zeroizing<String>, CoreError> {
+    let value = serde_json::from_str::<Value>(login).map_err(|_| {
+        CoreError::Runtime("Antigravity 전역 로그인 항목을 해석하지 못했습니다".to_owned())
+    })?;
+    if !value.is_object() {
+        return Err(CoreError::Runtime(
+            "Antigravity 전역 로그인 항목이 토큰 객체가 아닙니다".to_owned(),
+        ));
+    }
+    let mut envelope = serde_json::Map::new();
+    for key in ANTIGRAVITY_SECRET_KEYS {
+        envelope.insert(key.to_owned(), value.clone());
+    }
+    Ok(Zeroizing::new(Value::Object(envelope).to_string()))
+}
+
+/// 시작 직후 CLI가 `cli.log`에 남기는 인증 결과 줄의 표식. 대화형 로그인의
+/// `authenticated as `(`antigravity_identity_from_home`)와 달리 키체인·파일 인증에도 찍힌다.
+const ANTIGRAVITY_AUTH_RESULT_MARKER: &str = "applyAuthResult: email=";
+/// `cli.log`에서 뒤에서부터 볼 최대 바이트. 프로필 하나에 로그가 계속 쌓이므로 상한을 둔다.
+const ANTIGRAVITY_CLI_LOG_TAIL_BYTES: u64 = 256 * 1024;
+
+/// 프로필 홈의 `cli.log`에서 **마지막** 인증 결과의 이메일. 프로브와 실행이 같은 프로필에
+/// 잇달아 찍으므로 마지막 줄이 가장 최근 프로세스의 것이다. 공급자가 쓴 파일을 계정 파악
+/// 목적으로 읽기만 한다(`G1`); 이메일은 비밀이 아니다(`G5`).
+fn antigravity_authenticated_email_from_cli_log(home: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = home.join(".gemini/antigravity-cli/cli.log");
+    let mut file = fs::File::open(&path).ok()?;
+    let length = file.metadata().ok()?.len();
+    if length > ANTIGRAVITY_CLI_LOG_TAIL_BYTES {
+        file.seek(SeekFrom::Start(length - ANTIGRAVITY_CLI_LOG_TAIL_BYTES))
+            .ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    antigravity_authenticated_email_from_log_text(&String::from_utf8_lossy(&bytes))
+}
+
+fn antigravity_authenticated_email_from_log_text(text: &str) -> Option<String> {
+    text.rmatch_indices(ANTIGRAVITY_AUTH_RESULT_MARKER)
+        .find_map(|(index, _)| {
+            let rest = &text[index + ANTIGRAVITY_AUTH_RESULT_MARKER.len()..];
+            let email = rest
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .next()?
+                .trim();
+            email.contains('@').then(|| email.to_owned())
+        })
+}
+
+/// 이메일 비교는 대소문자를 가리지 않는다 — 구글은 로컬 파트 대소문자를 구분하지 않고, 로그와
+/// `id_token`이 같은 표기를 쓴다는 보장이 없다.
+fn compare_antigravity_identity(expected: &str, observed: &str) -> AntigravityIdentityCheck {
+    if expected.eq_ignore_ascii_case(observed) {
+        AntigravityIdentityCheck::Matched
+    } else {
+        AntigravityIdentityCheck::Mismatch {
+            observed: observed.to_owned(),
+        }
+    }
+}
+
+/// 봉투를 다시 두 파일로 펼친다. 프로필 홈은 이 호출에서 처음 만들어질 수 있으므로
+/// 상위 디렉터리까지 연다.
+fn write_antigravity_credentials(home: &Path, secret: &str) -> Result<(), CoreError> {
+    let envelope = AntigravityEnvelope::parse_required(secret)?;
+    let mut written = false;
+    for (key, relative) in ANTIGRAVITY_SECRET_KEYS
+        .iter()
+        .zip(credential_profiles::ANTIGRAVITY_TOKEN_RELATIVE_PATHS)
+    {
+        let Some(value) = envelope.token_file(key) else {
+            continue;
+        };
+        let path = home.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        atomic_write_secret(&path, &value.to_string())?;
+        written = true;
+    }
+    if let Some(token) = envelope.keyring_token() {
+        write_antigravity_keyring_token(home, token)?;
+        written = true;
+    }
+    if !written {
+        return Err(CoreError::Runtime(
+            "Antigravity 인증 봉투에 토큰이 없습니다".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// 봉투에 실린 `id_token`에서 계정 신원을 읽는다. Antigravity에는 계정을 묻는 공식
+/// 명령이 없고(`/usage`는 잔량만 준다) 토큰 자체가 유일한 근거다. 구글 subject는 계정마다
+/// 고정이라 그대로 공급자 계정 ID로 쓴다.
+fn antigravity_identity(secret: &str) -> Result<AccountIdentity, CoreError> {
+    let missing = || CoreError::Runtime("Antigravity 계정 ID를 확인하지 못했습니다".to_owned());
+    let envelope = AntigravityEnvelope::parse_required(secret)?;
+    let id_token = envelope.id_token().ok_or_else(missing)?;
+    let claims = decode_jwt_claims(id_token)?;
+    let email = string_field(&claims, &["email"]);
+    // 계정 식별자는 이메일로 통일한다. 토큰이 키체인에만 있는 설치에서는 신원을 CLI 로그의
+    // 이메일에서 읽으므로(`antigravity_identity_from_home`), 여기서 구글 subject를 쓰면 같은
+    // 계정이 두 경로에서 다른 키를 얻어 공유 홈 관측이 등록 계정을 못 찾는다.
+    let provider_account_id = email
+        .clone()
+        .or_else(|| string_field(&claims, &["sub"]))
+        .ok_or_else(missing)?;
+    Ok(AccountIdentity {
+        provider_account_id,
+        legacy_provider_account_id: string_field(&claims, &["sub"]),
+        email,
+        organization: None,
+        display_name: None,
+    })
+}
+
+/// 신원을 찾으려고 훑을 최근 로그 파일 수. 프로필 하나에 로그가 계속 쌓이므로 상한을 둔다.
+const ANTIGRAVITY_IDENTITY_LOG_SCAN: usize = 5;
+
+/// 공식 CLI가 로그인 직후 자기 로그에 남긴 계정 이메일. 토큰이 키체인에만 있는 설치에서는
+/// 봉투에 `id_token`이 없고 계정을 묻는 명령도 없어(`/usage`는 잔량만 준다) 이것이 유일한
+/// 근거다. 공급자가 쓴 파일을 계정 파악 목적으로 읽기만 한다(`G1`).
+fn antigravity_identity_from_home(home: &Path) -> Result<AccountIdentity, CoreError> {
+    const MARKER: &str = "authenticated as ";
+    let missing = || CoreError::Runtime("Antigravity 계정 ID를 확인하지 못했습니다".to_owned());
+    let mut logs = fs::read_dir(home.join(".gemini/antigravity-cli/log"))
+        .map_err(|_| missing())?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            path.is_file().then_some((modified, path))
+        })
+        .collect::<Vec<_>>();
+    // 최근 로그부터 본다. 재인증하면 같은 프로필에 로그가 여럿 쌓이고, 마지막 로그인이
+    // 지금 등록하려는 계정이다.
+    logs.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, path) in logs.into_iter().take(ANTIGRAVITY_IDENTITY_LOG_SCAN) {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let found = text.rmatch_indices(MARKER).find_map(|(index, _)| {
+            text[index + MARKER.len()..]
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|value| value.contains('@') && !value.contains(char::is_whitespace))
+                .map(str::to_owned)
+        });
+        if let Some(email) = found {
+            return Ok(AccountIdentity {
+                provider_account_id: email.clone(),
+                legacy_provider_account_id: None,
+                email: Some(email),
+                organization: None,
+                display_name: None,
+            });
+        }
+    }
+    Err(missing())
+}
+
+/// 봉투가 키체인 토큰을 담고 있는가.
+fn antigravity_has_keyring_token(secret: &str) -> bool {
+    AntigravityEnvelope::parse(secret).is_some_and(|envelope| {
+        envelope
+            .keyring_token()
+            .is_some_and(|token| !token.is_empty())
+    })
+}
+
+/// 봉투의 리프레시 토큰. 이것이 있으면 액세스 토큰이 만료돼도 CLI가 스스로 사슬을 잇는다.
+fn antigravity_refresh_token(secret: &str) -> Option<String> {
+    let envelope = AntigravityEnvelope::parse(secret)?;
+    envelope
+        .oauth_token_field("refresh_token")
+        .map(str::to_owned)
+}
+
+/// 액세스 토큰 만료 시각. 수명이 고정이라 늦을수록 나중에 발급된 사슬이다.
+fn antigravity_access_token_expires_at(secret: &str) -> Option<i64> {
+    let envelope = AntigravityEnvelope::parse(secret)?;
+    let expiry = envelope.oauth_token_field("expiry")?;
+    chrono::DateTime::parse_from_rfc3339(expiry)
+        .ok()
+        .map(|value| value.timestamp_millis())
 }
 
 fn read_active_credentials(
@@ -4432,9 +4848,12 @@ fn read_active_credentials(
             let path = provider_auth_file(provider_root, provider, profile)?;
             read_secret_file(&path)
         }
-        ProviderId::Antigravity => Err(CoreError::InvalidInput(
-            "Antigravity 자격증명은 지원하지 않습니다".to_owned(),
-        )),
+        // 토큰이 두 파일로 나뉘어 있고 둘 다 홈 기준 상대 경로다. 프로필이 오면 그 자리가
+        // 곧 홈이고, 공급자 루트가 오면 그 부모가 홈이다.
+        ProviderId::Antigravity => {
+            read_antigravity_credentials(antigravity_home_for(profile.unwrap_or(provider_root)))
+        }
+        ProviderId::Local => Err(unmanaged_provider_error(provider)),
     }
 }
 
@@ -4501,9 +4920,10 @@ fn write_active_credentials(
                 atomic_write_secret(&path, &compact_secret)
             }
         }
-        ProviderId::Antigravity => Err(CoreError::InvalidInput(
-            "Antigravity 자격증명은 지원하지 않습니다".to_owned(),
-        )),
+        ProviderId::Antigravity => {
+            write_antigravity_credentials(antigravity_home_for(provider_root), &compact_secret)
+        }
+        ProviderId::Local => Err(unmanaged_provider_error(provider)),
     }
 }
 
@@ -4543,7 +4963,12 @@ fn atomic_write_secret(path: &Path, secret: &str) -> Result<(), CoreError> {
         file.sync_all()?;
         drop(file);
         replace_file(&temporary, &expected)?;
-        File::open(&trusted_parent)?.sync_all()?;
+        // 폴더 fsync는 폴더를 파일로 열 수 있는 플랫폼에서만 뜻이 있다. Windows에서
+        // `File::open`을 폴더에 걸면 `PermissionDenied`라, 자격증명은 이미 제자리에
+        // 놓였는데 쓰기가 실패로 돌아왔다. 앱 소유 저장본과 공급자 설정 파일이 쓰는
+        // 것과 같은 손잡이로 맞춘다 — 그쪽 `replace_file`은 Windows에서
+        // `MOVEFILE_WRITE_THROUGH`로 이름 바꾸기를 이미 디스크까지 내린다.
+        sync_dir(&trusted_parent)?;
         Ok(())
     })();
     if result.is_err() {
@@ -4565,9 +4990,28 @@ fn provider_auth_file(
     let file_name = match provider {
         ProviderId::Codex => "auth.json",
         ProviderId::Claude => ".credentials.json",
-        ProviderId::Antigravity => unreachable!(),
+        ProviderId::Antigravity | ProviderId::Local => unreachable!(),
     };
     Ok(root.join(file_name))
+}
+
+/// 자격증명 봉투가 스스로 말하는 신원만 읽는다. 공유 홈 설정도, CLI 로그도, 공급자
+/// 서버도 보지 않는다 — 여기서 나온 값은 그 자격증명을 읽은 자리와 무관하게 참이라,
+/// 계정 귀속을 증명하는 근거로 쓸 수 있다. 신원이 봉투에 없으면 `None`이고, 그건
+/// "다른 계정"이 아니라 "모른다"는 뜻이다.
+fn embedded_identity(provider: ProviderId, secret: &str) -> Option<AccountIdentity> {
+    match provider {
+        ProviderId::Codex => codex_identity(secret).ok(),
+        ProviderId::Claude => claude_identity_from_secret(secret).ok(),
+        ProviderId::Antigravity => antigravity_identity(secret).ok(),
+        ProviderId::Local => None,
+    }
+}
+
+/// 설정 파일 하나를 읽어 JSON으로 만든다. 없거나 깨졌으면 `None`이다 — 신원 후보를
+/// 훑는 자리는 다음 후보로 넘어가면 되므로 오류를 구분하지 않는다.
+fn read_json_file(path: &Path) -> Option<Value> {
+    serde_json::from_slice::<Value>(&fs::read(path).ok()?).ok()
 }
 
 fn read_identity(
@@ -4588,25 +5032,19 @@ fn read_identity(
                 .unwrap_or_else(|| provider_root.to_path_buf());
             let candidates = [config.join(".claude.json"), config.join(".config.json")];
             for path in candidates {
-                if let Ok(value) = fs::read(&path)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                    .ok_or(())
-                {
-                    if let Some(oauth) = value.get("oauthAccount").or(Some(&value)) {
-                        if let Ok(identity) = claude_identity(oauth) {
-                            return Ok(identity);
-                        }
+                // 계정별 설정 파일은 `oauthAccount`로 감싸기도 하고 그 내용만 담기도
+                // 한다. 둘 다 같은 후보로 보고, 읽히지 않으면 다음 후보로 넘어간다.
+                if let Some(value) = read_json_file(&path) {
+                    let oauth = value.get("oauthAccount").unwrap_or(&value);
+                    if let Ok(identity) = claude_identity(oauth) {
+                        return Ok(identity);
                     }
                 }
             }
             if profile.is_none() {
-                let path = home_dir.join(".claude.json");
-                if let Ok(value) = fs::read(&path)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                    .ok_or(())
-                {
+                // 공유 홈은 마지막 후보다. 여기에 `oauthAccount`가 있는데도 신원을
+                // 못 뽑으면 그 실패 사유를 그대로 돌려준다 — 더 볼 자리가 없다.
+                if let Some(value) = read_json_file(&home_dir.join(".claude.json")) {
                     if let Some(oauth) = value.get("oauthAccount") {
                         return claude_identity(oauth);
                     }
@@ -4616,9 +5054,13 @@ fn read_identity(
                 "Claude 로그인 계정 신원을 확인하지 못했습니다".to_owned(),
             ))
         }
-        ProviderId::Antigravity => Err(CoreError::InvalidInput(
-            "Antigravity 계정 신원은 지원하지 않습니다".to_owned(),
-        )),
+        // 토큰이 키체인에만 있으면 봉투에 `id_token`이 없다. 그때는 CLI가 로그인 직후
+        // 자기 로그에 남긴 계정 이메일로 확정한다.
+        ProviderId::Antigravity => antigravity_identity(secret).or_else(|error| {
+            antigravity_identity_from_home(antigravity_home_for(profile.unwrap_or(provider_root)))
+                .map_err(|_| error)
+        }),
+        ProviderId::Local => Err(unmanaged_provider_error(provider)),
     }
 }
 
@@ -4647,8 +5089,7 @@ fn codex_identity(secret: &str) -> Result<AccountIdentity, CoreError> {
         .as_ref()
         .and_then(|tokens| tokens.account_id)
         .or(value.account_id)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .and_then(trimmed)
         .map(str::to_owned);
     let id_token = value
         .tokens
@@ -4748,8 +5189,7 @@ fn claude_identity_from_secret(secret: &str) -> Result<AccountIdentity, CoreErro
     let fields = credentials.oauth.as_ref().unwrap_or(&credentials.root);
     let provider_account_id = fields
         .account_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .and_then(trimmed)
         .ok_or_else(|| CoreError::Runtime("Claude 계정 ID를 확인하지 못했습니다".to_owned()))?;
     Ok(AccountIdentity {
         provider_account_id: provider_account_id.to_owned(),
@@ -4771,35 +5211,96 @@ fn decode_jwt_claims(token: &str) -> Result<Value, CoreError> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| {
-        value
-            .get(*key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    })
-}
+/// 응답 JSON에서 같은 뜻의 칸을 이름 후보 순서대로 읽는 도우미들. 공급자와 버전에 따라
+/// 같은 값이 camelCase로도 snake_case로도 오기 때문에 어느 이름으로 왔든 같게 읽어야 한다.
+///
+/// 네 접근자가 각자 후보 목록을 훑고 있었고 그중 둘은 파일 반대편(사용량 응답 해석
+/// 근처)에 떨어져 있어, 한쪽만 고치면 다른 쪽이 조용히 값을 놓쳤다. 후보 순회를
+/// [`first`] 한 자리에만 적고 나머지는 "칸 하나를 어떻게 읽을지"만 정하게 한다.
+mod json_field {
+    use serde_json::Value;
 
-#[cfg(target_os = "macos")]
-fn claude_keychain_service(profile: Option<&Path>) -> String {
-    if let Some(profile) = profile {
-        let digest = Sha256::digest(profile.to_string_lossy().as_bytes());
-        format!("Claude Code-credentials-{}", hex_prefix(&digest, 4))
-    } else if let Some(config) = env::var_os("CLAUDE_CONFIG_DIR") {
-        let digest = Sha256::digest(PathBuf::from(config).to_string_lossy().as_bytes());
-        format!("Claude Code-credentials-{}", hex_prefix(&digest, 4))
-    } else {
-        "Claude Code-credentials".to_owned()
+    /// 이름 후보를 순서대로 훑어 `pick`이 값을 주는 첫 칸을 쓴다.
+    fn first<'a, T>(
+        value: &'a Value,
+        keys: &[&str],
+        pick: impl Fn(&'a Value) -> Option<T>,
+    ) -> Option<T> {
+        keys.iter().find_map(|key| pick(value.get(*key)?))
+    }
+
+    /// 이름만 맞으면 원시 값을 그대로 준다(값이 `null`이어도 "있는 칸"으로 본다).
+    pub(super) fn field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+        first(value, keys, Some)
+    }
+
+    /// 문자열 값에서 앞뒤 공백을 버리고, 남은 것이 없으면 값이 없는 것으로 본다.
+    pub(super) fn trimmed_str(value: &Value) -> Option<&str> {
+        value.as_str().and_then(super::trimmed)
+    }
+
+    pub(super) fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
+        first(value, keys, trimmed_str).map(str::to_owned)
+    }
+
+    /// Claude 사용량 응답은 리셋 시각을 ISO 8601 문자열로 반환하므로 숫자 파싱이
+    /// 실패하면 RFC 3339로 해석한다.
+    pub(super) fn timestamp_field(value: &Value, keys: &[&str]) -> Option<i64> {
+        first(value, keys, |value| {
+            chrono::DateTime::parse_from_rfc3339(value.as_str()?)
+                .ok()
+                .map(|date| date.timestamp_millis())
+        })
+    }
+
+    pub(super) fn number_field(value: &Value, keys: &[&str]) -> Option<f64> {
+        first(value, keys, |value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
     }
 }
 
+use json_field::{field, number_field, string_field, timestamp_field, trimmed_str};
+
+/// Claude 자격증명이 Keychain에서 차지하는 자리 — 서비스 이름과 계정 이름 한 쌍.
+///
+/// 읽기·쓰기·삭제 세 자리가 각자 `claude_keychain_service`와 `keychain_account`를
+/// 순서대로 불러 두 값을 맞춰 왔다. 한 자리에서 프로필을 넘기는 것을 빠뜨려도
+/// 컴파일은 통과하고, 그때 그 자리만 다른 Keychain 항목을 보게 된다 — 쓰기는 격리
+/// 프로필 항목에 넣었는데 삭제는 공유 항목을 지우는 식이라 증상이 값이 남는 쪽으로
+/// 나타나 알아채기 어렵다. 자리를 정하는 규칙을 한 타입에 두어 세 자리가 같은 한
+/// 쌍을 받게 한다.
 #[cfg(target_os = "macos")]
-fn keychain_account() -> String {
-    env::var("USER")
-        .or_else(|_| env::var("USERNAME"))
-        .unwrap_or_else(|_| "user".to_owned())
+struct ClaudeKeychainSlot {
+    service: String,
+    account: String,
+}
+
+#[cfg(target_os = "macos")]
+impl ClaudeKeychainSlot {
+    /// 프로필이 있으면 그 경로가, 없으면 `CLAUDE_CONFIG_DIR`이 항목을 가른다. 둘 다
+    /// 없으면 CLI 기본 항목이다 — 어느 쪽이든 경로 하나를 지문으로 접는 규칙은 같으므로
+    /// 접는 자리를 한 번만 적는다.
+    fn for_profile(profile: Option<&Path>) -> Self {
+        let scoped = profile
+            .map(Path::to_path_buf)
+            .or_else(|| env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from));
+        let service = match scoped {
+            Some(dir) => format!(
+                "Claude Code-credentials-{}",
+                hex_prefix(&Sha256::digest(dir.to_string_lossy().as_bytes()), 4)
+            ),
+            None => "Claude Code-credentials".to_owned(),
+        };
+        Self {
+            service,
+            account: env::var("USER")
+                .or_else(|_| env::var("USERNAME"))
+                .unwrap_or_else(|_| "user".to_owned()),
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -4813,9 +5314,8 @@ fn read_claude_keychain_credentials(
 fn read_claude_keychain_credentials(
     profile: Option<&Path>,
 ) -> Result<Option<Zeroizing<String>>, CoreError> {
-    let service = claude_keychain_service(profile);
-    let account = keychain_account();
-    match read_os_keychain_password(&service, &account)? {
+    let slot = ClaudeKeychainSlot::for_profile(profile);
+    match read_os_keychain_password(&slot.service, &slot.account)? {
         Some(secret) => compact_json_secret(&secret).map(Some).map_err(|_| {
             CoreError::Runtime("Claude Keychain 인증 JSON이 손상되었습니다".to_owned())
         }),
@@ -4842,11 +5342,10 @@ fn write_claude_keychain_credentials(
     profile: Option<&Path>,
     secret: &str,
 ) -> Result<(), CoreError> {
-    let service = claude_keychain_service(profile);
-    let account = keychain_account();
+    let slot = ClaudeKeychainSlot::for_profile(profile);
     let compact_secret = compact_json_secret(secret)
         .map_err(|_| CoreError::Runtime("Claude 인증 JSON이 손상되었습니다".to_owned()))?;
-    write_os_keychain_password(&service, &account, &compact_secret).map_err(|error| {
+    write_os_keychain_password(&slot.service, &slot.account, &compact_secret).map_err(|error| {
         CoreError::Runtime(format!(
             "Claude Keychain 자격증명을 교체하지 못했습니다: {error}"
         ))
@@ -4860,9 +5359,8 @@ fn delete_claude_keychain_credentials(_profile: Option<&Path>) -> Result<(), Cor
 
 #[cfg(target_os = "macos")]
 fn delete_claude_keychain_credentials(profile: Option<&Path>) -> Result<(), CoreError> {
-    let service = claude_keychain_service(profile);
-    let account = keychain_account();
-    delete_os_keychain_password(&service, &account).map_err(|error| {
+    let slot = ClaudeKeychainSlot::for_profile(profile);
+    delete_os_keychain_password(&slot.service, &slot.account).map_err(|error| {
         CoreError::Runtime(format!(
             "Claude 임시 Keychain 자격증명을 제거하지 못했습니다: {error}"
         ))
@@ -4901,91 +5399,254 @@ struct ClaudeProfileOrganization {
     uuid: String,
 }
 
+impl<'a> ClaudeUsageSecret<'a> {
+    /// 자격증명 JSON에서 쓸 수 있는 OAuth 액세스 토큰. 새 형식(`claudeAiOauth`)을 먼저
+    /// 보고 옛 최상위 키로 물러나며, 빈 문자열은 토큰이 없는 것과 같게 다룬다. 세 호출부가
+    /// 각자 같은 우선순위를 펼치고 있어 한쪽만 고치면 "토큰 있음" 판정이 갈라졌다.
+    fn oauth_access_token(&self) -> Option<&'a str> {
+        self.oauth
+            .as_ref()
+            .map(|oauth| oauth.access_token)
+            .or(self.access_token)
+            .filter(|token| !token.is_empty())
+    }
+}
+
+/// `Bearer <토큰>` 인증 헤더 값. 조립 문자열은 `Zeroizing`으로 감싸 헤더 값으로 옮긴
+/// 직후 지운다(G6). `provider`는 실패 메시지에만 쓰이며 토큰은 담지 않는다.
+fn bearer_header_value(token: &str, provider: &str) -> Result<HeaderValue, CoreError> {
+    let value = Zeroizing::new(format!("Bearer {token}"));
+    HeaderValue::from_str(&value)
+        .map_err(|_| CoreError::Runtime(format!("{provider} 인증 헤더를 만들지 못했습니다")))
+}
+
+/// 공급자 OAuth 엔드포인트 호출 하나의 규격.
+///
+/// 네 호출부(Claude 신원 조회·Claude 토큰 갱신·Claude 사용량·Codex 사용량)가 클라이언트
+/// 만들기와 "보내지 못했다 / 상태가 실패다 / 응답을 읽지 못했다" 네 문장을 각자 적고
+/// 있었다. 같은 실패가 자리마다 다른 낱말로 보고돼, 엔드포인트를 하나 더 붙일 때마다
+/// 문구를 베껴 쓰고 조사를 손으로 맞춰야 했다. 주어와 행동만 받아 문장을 한 벌로 세운다.
+struct OauthCall {
+    /// 실패 문구의 주어. "Claude 사용량", "Claude 계정 신원", "Claude 토큰".
+    subject: &'static str,
+    /// 주어 뒤에 붙는 행동. "조회"·"갱신".
+    action: &'static str,
+}
+
+impl OauthCall {
+    const fn new(subject: &'static str, action: &'static str) -> Self {
+        Self { subject, action }
+    }
+
+    /// blocking 클라이언트. 제한 시간은 네 호출부가 모두 `USAGE_TIMEOUT`을 쓴다.
+    fn client(&self, headers: HeaderMap) -> Result<Client, CoreError> {
+        Client::builder()
+            .timeout(USAGE_TIMEOUT)
+            .default_headers(headers)
+            .build()
+            .map_err(|error| {
+                CoreError::Runtime(format!(
+                    "{} 클라이언트를 만들지 못했습니다: {error}",
+                    self.subject
+                ))
+            })
+    }
+
+    fn send(&self, request: RequestBuilder) -> Result<Response, CoreError> {
+        request.send().map_err(|error| {
+            CoreError::Runtime(format!(
+                "{}을 {}하지 못했습니다: {error}",
+                self.subject, self.action
+            ))
+        })
+    }
+
+    /// 성공이 아닌 상태를 오류로 올린다. 인증 거부(401·403)는 기다려도 같은 결과라
+    /// 문구를 갈라, 재시도할 일과 다시 인증할 일을 호출자가 로그에서 구분할 수 있게 한다.
+    /// 응답 본문을 따로 읽어야 하는 상태(429, Codex의 401)는 호출부가 여기에 닿기 전에
+    /// 처리한다.
+    fn require_success(&self, response: Response) -> Result<Response, CoreError> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(CoreError::Runtime(format!(
+                "{} {} 인증이 거부되었습니다 (HTTP {status})",
+                self.subject, self.action
+            )));
+        }
+        Err(CoreError::Runtime(format!(
+            "{} {}가 실패했습니다 (HTTP {status})",
+            self.subject, self.action
+        )))
+    }
+
+    fn read_json<T: DeserializeOwned>(&self, response: Response) -> Result<T, CoreError> {
+        response.json::<T>().map_err(|error| {
+            CoreError::Runtime(format!(
+                "{} {} 응답을 읽지 못했습니다: {error}",
+                self.subject, self.action
+            ))
+        })
+    }
+}
+
+/// 저장된 Claude 자격증명에서 OAuth 액세스 토큰을 꺼내 인증 헤더로 만든다. 신원 조회와
+/// 사용량 조회가 같은 세 줄을 각자 적고 있었다 — 토큰이 비어 있을 때의 문구까지 같다.
+fn claude_bearer_header(secret: &str) -> Result<HeaderValue, CoreError> {
+    let credentials: ClaudeUsageSecret<'_> = serde_json::from_str(secret)?;
+    let token = credentials
+        .oauth_access_token()
+        .ok_or_else(|| CoreError::Runtime("Claude OAuth 토큰이 없습니다".to_owned()))?;
+    bearer_header_value(token, "Claude")
+}
+
 fn claude_secret_has_oauth_access_token(secret: &str) -> bool {
     serde_json::from_str::<ClaudeUsageSecret<'_>>(secret)
         .ok()
-        .and_then(|credentials| {
-            credentials
-                .oauth
-                .map(|oauth| oauth.access_token)
-                .or(credentials.access_token)
-        })
-        .is_some_and(|token| !token.is_empty())
+        .and_then(|credentials| credentials.oauth_access_token())
+        .is_some()
+}
+
+/// Claude 자격증명 JSON이 OAuth 항목을 담는 키. 여섯 자리가 각자 문자열 리터럴을 적고
+/// 있어 한 곳만 고치면 나머지가 조용히 다른 칸을 보게 된다.
+const CLAUDE_OAUTH_FIELD: &str = "claudeAiOauth";
+
+/// Claude 자격증명 봉투를 읽는 자리.
+///
+/// 봉투 안쪽 모양(OAuth 항목이 `claudeAiOauth` 아래 있고, 갱신 토큰·만료 시각·스코프가
+/// 모두 그 안에 있다)을 호출부마다 `serde_json::from_str`부터 다시 하고 각자 칸 이름을
+/// 적어 내려가면, 키 하나가 바뀔 때 일부만 고쳐져 어떤 값은 읽히고 어떤 값은 조용히
+/// `None`이 된다. 경로를 아는 자리를 여기 하나로 둔다 — 이미 같은 이유로 모아 둔
+/// [`AntigravityEnvelope`]와 같은 방침이다. 값은 비밀정보라 이 타입은 밖으로 나가지
+/// 않는다(G4).
+///
+/// 액세스 토큰만은 [`ClaudeUsageSecret`]이 계속 맡는다. 인증 헤더를 만드는 자리라 빌려
+/// 쓰는 무복사 읽기가 필요하고(G6), 옛 최상위 형식으로 물러나는 폴백도 거기 한 벌뿐이다.
+struct ClaudeOauthEnvelope(Value);
+
+impl ClaudeOauthEnvelope {
+    /// 해석하지 못하면 봉투가 아닌 것으로 본다. 판정만 하는 호출부가 쓴다.
+    fn parse(secret: &str) -> Option<Self> {
+        serde_json::from_str::<Value>(secret).ok().map(Self)
+    }
+
+    /// 해석 실패를 그대로 올린다. 봉투를 펼쳐 쓰는 호출부가 쓴다.
+    fn parse_required(secret: &str) -> Result<Self, CoreError> {
+        Ok(Self(serde_json::from_str::<Value>(secret)?))
+    }
+
+    /// 자격증명 JSON의 OAuth 항목. 항목 자체가 없으면(옛 최상위 형식) `None`이다.
+    fn entry(&self) -> Option<&Value> {
+        self.0.get(CLAUDE_OAUTH_FIELD)
+    }
+
+    /// 새 형식의 OAuth 항목을 달고 있는가. 로그인이 중간에 끊긴 값을 가려내는 데 쓴다.
+    fn has_entry(&self) -> bool {
+        self.entry().is_some()
+    }
+
+    /// OAuth 항목의 문자열 칸. 빈 문자열은 값이 없는 것과 같게 다룬다 — 로그인이 중간에
+    /// 끊긴 자격증명은 칸을 비운 채로 저장되고, 그 값을 그대로 쓰면 토큰 없는 요청이 나간다.
+    fn str_field(&self, field: &str) -> Option<&str> {
+        self.entry()?
+            .get(field)?
+            .as_str()
+            .filter(|text| !text.is_empty())
+    }
+
+    /// 저장된 리프레시 토큰. "있는지"만 보는 쪽과 실제로 갱신에 쓰는 쪽이 같은 판정을
+    /// 쓰게 한다 — 갈라지면 토큰이 있다고 보고 갱신에 들어가 빈 토큰을 제출한다.
+    fn refresh_token(&self) -> Option<&str> {
+        self.str_field("refreshToken")
+    }
+
+    /// 액세스 토큰 만료 시각(epoch ms).
+    fn access_token_expires_at(&self) -> Option<i64> {
+        self.entry()?.get("expiresAt")?.as_i64()
+    }
+
+    /// 리프레시 토큰 만료 시각(epoch ms) — 이 사슬 전체의 절대 수명이다.
+    ///
+    /// 회전해도 늘어나지 않는다(2026-09-23 실측: 같은 날 회전된 자격증명이 보름 전
+    /// 로그인 기준 값을 그대로 들고 있었다). 그래서 이 시각을 넘기면 갱신 요청이
+    /// `HTTP 400`으로 거부되고, 어느 사본도 살아 있지 않아 재인증 외에는 길이 없다.
+    fn refresh_token_expires_at(&self) -> Option<i64> {
+        self.entry()?.get("refreshTokenExpiresAt")?.as_i64()
+    }
+
+    /// 저장된 자격증명이 들고 있는 스코프를 OAuth `scope` 파라미터 형태로 잇는다.
+    /// 값이 없으면 파라미터를 빼고 보낸다 — 갱신은 스코프 없이도 받아들여진다.
+    fn scope(&self) -> Option<String> {
+        let joined = self
+            .entry()?
+            .get("scopes")?
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        (!joined.is_empty()).then_some(joined)
+    }
+
+    /// 갱신 응답을 합칠 수 있게 OAuth 항목을 고칠 자리로 연다.
+    fn entry_object_mut(&mut self) -> Option<&mut serde_json::Map<String, Value>> {
+        self.0.get_mut(CLAUDE_OAUTH_FIELD)?.as_object_mut()
+    }
+
+    /// 고친 봉투를 다시 자격증명 JSON으로. 비밀정보라 `Zeroizing`으로 감싸 돌려준다.
+    fn into_secret(self) -> Result<Zeroizing<String>, CoreError> {
+        serde_json::to_string(&self.0)
+            .map(Zeroizing::new)
+            .map_err(CoreError::from)
+    }
 }
 
 /// 현재 Claude OAuth 자격증명으로 공식 Claude Code가 사용하는 프로필 API를 조회한다.
 /// 응답에서는 비밀정보가 아닌 계정·조직 식별 정보만 추출하며 토큰이나 원문 응답은
 /// 오류, 로그, 레지스트리 또는 IPC로 내보내지 않는다.
 fn request_claude_profile_identity(secret: &str) -> Result<AccountIdentity, CoreError> {
-    let credentials: ClaudeUsageSecret<'_> = serde_json::from_str(secret)?;
-    let token = credentials
-        .oauth
-        .as_ref()
-        .map(|oauth| oauth.access_token)
-        .or(credentials.access_token)
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| CoreError::Runtime("Claude OAuth 토큰이 없습니다".to_owned()))?;
-    let authorization_value = Zeroizing::new(format!("Bearer {token}"));
-    let authorization = HeaderValue::from_str(&authorization_value)
-        .map_err(|_| CoreError::Runtime("Claude 인증 헤더를 만들지 못했습니다".to_owned()))?;
-    let response = Client::builder()
-        .timeout(USAGE_TIMEOUT)
-        .build()
-        .map_err(|error| {
-            CoreError::Runtime(format!(
-                "Claude 신원 조회 클라이언트를 만들지 못했습니다: {error}"
-            ))
-        })?
-        .get(CLAUDE_OAUTH_PROFILE_URL)
-        .header(AUTHORIZATION, authorization)
-        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-        .header(CACHE_CONTROL, HeaderValue::from_static("no-cache"))
-        .header(USER_AGENT, HeaderValue::from_static("claude-code/2.1.0"))
-        .send()
-        .map_err(|error| {
-            CoreError::Runtime(format!("Claude 계정 신원을 조회하지 못했습니다: {error}"))
-        })?;
-    let status = response.status();
-    if !status.is_success() {
-        let message = if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-            format!("Claude 계정 신원 조회 인증이 거부되었습니다 (HTTP {status})")
-        } else {
-            format!("Claude 계정 신원 조회가 실패했습니다 (HTTP {status})")
-        };
-        return Err(CoreError::Runtime(message));
-    }
-    let profile: ClaudeProfileResponse = response.json().map_err(|error| {
-        CoreError::Runtime(format!("Claude 계정 신원 응답을 읽지 못했습니다: {error}"))
-    })?;
+    let call = OauthCall::new("Claude 계정 신원", "조회");
+    let authorization = claude_bearer_header(secret)?;
+    let response = call.send(
+        call.client(HeaderMap::new())?
+            .get(CLAUDE_OAUTH_PROFILE_URL)
+            .header(AUTHORIZATION, authorization)
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .header(CACHE_CONTROL, HeaderValue::from_static("no-cache"))
+            .header(USER_AGENT, HeaderValue::from_static("claude-code/2.1.0")),
+    )?;
+    let profile: ClaudeProfileResponse = call.read_json(call.require_success(response)?)?;
     claude_identity_from_profile(profile)
 }
 
 fn claude_identity_from_profile(
     profile: ClaudeProfileResponse,
 ) -> Result<AccountIdentity, CoreError> {
-    let provider_account_id = profile.account.uuid.trim().to_owned();
-    if provider_account_id.is_empty() {
-        return Err(CoreError::Runtime(
-            "Claude 계정 신원 응답에 계정 ID가 없습니다".to_owned(),
-        ));
-    }
+    let provider_account_id = trimmed(&profile.account.uuid)
+        .ok_or_else(|| CoreError::Runtime("Claude 계정 신원 응답에 계정 ID가 없습니다".to_owned()))?
+        .to_owned();
     Ok(AccountIdentity {
         provider_account_id,
         legacy_provider_account_id: None,
         email: profile
             .account
             .email
-            .map(|email| email.trim().to_owned())
-            .filter(|email| !email.is_empty()),
+            .as_deref()
+            .and_then(trimmed)
+            .map(str::to_owned),
         organization: profile
             .organization
-            .map(|organization| organization.uuid.trim().to_owned())
-            .filter(|organization| !organization.is_empty()),
+            .as_ref()
+            .and_then(|organization| trimmed(&organization.uuid))
+            .map(str::to_owned),
         display_name: profile
             .account
             .display_name
-            .map(|name| name.trim().to_owned())
-            .filter(|name| !name.is_empty()),
+            .as_deref()
+            .and_then(trimmed)
+            .map(str::to_owned),
     })
 }
 
@@ -4996,8 +5657,8 @@ fn validate_captured_provider_credential(
     if provider != ProviderId::Claude {
         return Ok(());
     }
-    let value: Value = serde_json::from_str(secret)?;
-    if value.get("claudeAiOauth").is_some() && !claude_secret_has_oauth_access_token(secret) {
+    let envelope = ClaudeOauthEnvelope::parse_required(secret)?;
+    if envelope.has_entry() && !claude_secret_has_oauth_access_token(secret) {
         return Err(CoreError::Conflict(
             "Claude 로그인이 아직 완료되지 않았습니다. 공식 Claude CLI로 다시 로그인하고, 브라우저 인증 후 표시된 코드를 로그인 터미널에 붙여넣어 전송한 다음 CLI가 정상 종료될 때까지 기다려 주세요"
                 .to_owned(),
@@ -5017,7 +5678,14 @@ fn credential_is_complete(provider: ProviderId, secret: &str) -> bool {
         ProviderId::Claude => claude_secret_has_oauth_access_token(secret),
         // Codex 신원은 자격증명 안의 토큰에서만 나오므로 신원 확인이 온전성 확인을 겸한다.
         ProviderId::Codex => serde_json::from_str::<Value>(secret).is_ok(),
-        ProviderId::Antigravity => false,
+        // 리프레시 토큰이 있어야 CLI가 액세스 토큰을 스스로 다시 받는다. 이 값은 회전하지
+        // 않으므로 프로필 사본이 여러 개여도 서로를 무효화하지 않는다.
+        // 파일 사슬이 없으면 키체인 토큰이 그 자리를 대신한다.
+        ProviderId::Antigravity => {
+            antigravity_refresh_token(secret).is_some() || antigravity_has_keyring_token(secret)
+        }
+        // 자격증명 자체가 없는 공급자다. 온전한 값이 존재할 수 없다.
+        ProviderId::Local => false,
     }
 }
 
@@ -5025,6 +5693,25 @@ enum ClaudeUsageResponse {
     Usage(AccountUsageView),
     Unauthorized,
     RateLimited { retry_at: i64 },
+}
+
+/// 429 응답이 남기는 문구. 세 호출부가 같은 사건을 다르게 부르지 않도록 한곳에 둔다.
+const CLAUDE_USAGE_RATE_LIMITED_MESSAGE: &str = "Claude 사용량 조회가 제한되었습니다 (HTTP 429)";
+
+impl ClaudeUsageResponse {
+    /// 성공과 429는 어느 호출부에서나 같은 뷰가 된다. 401만 부르는 쪽마다 다르게
+    /// 다뤄야 하므로(갱신 재시도·재인증 요구·공유 홈 안내) 그 갈래만 `None`으로
+    /// 남기고 나머지를 여기서 접는다.
+    fn into_usage_or_unauthorized(self) -> Option<AccountUsageView> {
+        match self {
+            Self::Usage(usage) => Some(usage),
+            Self::RateLimited { retry_at } => Some(rate_limited_usage_result(
+                CLAUDE_USAGE_RATE_LIMITED_MESSAGE,
+                retry_at,
+            )),
+            Self::Unauthorized => None,
+        }
+    }
 }
 
 enum ClaudeTokenRefresh {
@@ -5042,9 +5729,16 @@ enum ClaudeTokenRefresh {
 /// 저장된 Claude 자격증명의 액세스 토큰이 만료됐는지 확인한다.
 /// 만료 시각이 없으면 판단할 수 없으므로 일단 유효한 것으로 보고 호출 결과(401)로 가른다.
 fn claude_access_token_expires_at(secret: &str) -> Option<i64> {
-    serde_json::from_str::<Value>(secret)
-        .ok()
-        .and_then(|value| value.get("claudeAiOauth")?.get("expiresAt")?.as_i64())
+    ClaudeOauthEnvelope::parse(secret)?.access_token_expires_at()
+}
+
+/// 자격증명이 스스로 밝힌 사슬 만료 시각. 밝히지 않는 공급자·형식은 `None`이고, 그때
+/// 화면은 만료 예고를 하지 않는다 — 모르는 것을 모른다고 두는 편이, 없는 값을 추정해
+/// 잘못된 시각으로 재인증을 재촉하는 것보다 낫다.
+fn credential_chain_expires_at(provider: ProviderId, secret: &str) -> Option<i64> {
+    (provider == ProviderId::Claude)
+        .then(|| ClaudeOauthEnvelope::parse(secret)?.refresh_token_expires_at())
+        .flatten()
 }
 
 /// 자격증명 값을 로그에 남기지 않고도 같은 값인지 비교할 수 있게 하는 지문.
@@ -5139,7 +5833,8 @@ fn credential_chain_issued_at(provider: ProviderId, secret: &str) -> Option<i64>
         // 액세스 토큰 수명은 고정이라 만료 시각이 늦을수록 나중에 발급된 값이다.
         ProviderId::Claude => claude_access_token_expires_at(secret),
         ProviderId::Codex => codex_last_refresh_ms(secret),
-        ProviderId::Antigravity => None,
+        ProviderId::Antigravity => antigravity_access_token_expires_at(secret),
+        ProviderId::Local => None,
     }
 }
 
@@ -5203,35 +5898,18 @@ fn credential_can_authenticate(provider: ProviderId, secret: &str, now_ms: i64) 
         }
         // Codex 자격증명에는 만료 시각이 없어 온전성 확인이 곧 사용 가능 판정이다.
         ProviderId::Codex => true,
-        ProviderId::Antigravity => false,
+        // 액세스 토큰이 만료됐어도 리프레시 토큰이 있으면 CLI가 갱신해 쓴다.
+        ProviderId::Antigravity => {
+            antigravity_access_token_expires_at(secret).is_none_or(|expires_at| expires_at > now_ms)
+                || antigravity_refresh_token(secret).is_some()
+                || antigravity_has_keyring_token(secret)
+        }
+        ProviderId::Local => false,
     }
 }
 
-/// 저장된 자격증명이 들고 있는 스코프를 OAuth `scope` 파라미터 형태로 잇는다.
-/// 값이 없으면 파라미터를 빼고 보낸다 — 갱신은 스코프 없이도 받아들여진다.
-fn claude_credential_scope(value: &Value) -> Option<String> {
-    let joined = value
-        .get("claudeAiOauth")?
-        .get("scopes")?
-        .as_array()?
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>()
-        .join(" ");
-    (!joined.is_empty()).then_some(joined)
-}
-
 fn claude_secret_has_oauth_refresh_token(secret: &str) -> bool {
-    serde_json::from_str::<Value>(secret)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("claudeAiOauth")?
-                .get("refreshToken")?
-                .as_str()
-                .map(str::to_owned)
-        })
-        .is_some_and(|token| !token.is_empty())
+    ClaudeOauthEnvelope::parse(secret).is_some_and(|envelope| envelope.refresh_token().is_some())
 }
 
 /// 보관된 리프레시 토큰으로 Claude OAuth 토큰을 갱신한다. 429는 기존 자격증명을
@@ -5240,12 +5918,9 @@ fn refresh_claude_oauth_secret(
     secret: &str,
     throttle_streak: u32,
 ) -> Result<ClaudeTokenRefresh, CoreError> {
-    let value: Value = serde_json::from_str(secret)?;
-    let refresh_token = value
-        .get("claudeAiOauth")
-        .and_then(|oauth| oauth.get("refreshToken"))
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty())
+    let envelope = ClaudeOauthEnvelope::parse_required(secret)?;
+    let refresh_token = envelope
+        .refresh_token()
         .ok_or_else(|| {
             CoreError::Conflict(
                 "Claude 액세스 토큰이 만료됐지만 저장된 갱신 토큰이 없습니다. 계정을 다시 인증해 주세요"
@@ -5272,21 +5947,15 @@ fn refresh_claude_oauth_secret(
         "refresh_token": refresh_token,
         "client_id": CLAUDE_OAUTH_CLIENT_ID,
     });
-    if let Some(scope) = claude_credential_scope(&value) {
+    if let Some(scope) = envelope.scope() {
         refresh_body["scope"] = Value::String(scope);
     }
-    let response = Client::builder()
-        .timeout(USAGE_TIMEOUT)
-        .build()
-        .map_err(|error| {
-            CoreError::Runtime(format!("토큰 갱신 클라이언트를 만들지 못했습니다: {error}"))
-        })?
-        .post(CLAUDE_OAUTH_TOKEN_URL)
-        .json(&refresh_body)
-        .send()
-        .map_err(|error| {
-            CoreError::Runtime(format!("Claude 토큰을 갱신하지 못했습니다: {error}"))
-        })?;
+    let call = OauthCall::new("Claude 토큰", "갱신");
+    let response = call.send(
+        call.client(HeaderMap::new())?
+            .post(CLAUDE_OAUTH_TOKEN_URL)
+            .json(&refresh_body),
+    )?;
     let status = response.status();
     if status == StatusCode::TOO_MANY_REQUESTS {
         let retry_after = response
@@ -5339,9 +6008,7 @@ fn refresh_claude_oauth_secret(
             "Claude 토큰 갱신이 일시적으로 실패했습니다 (HTTP {status}). 기존 자격증명을 유지합니다"
         )));
     }
-    let granted: Value = response.json().map_err(|error| {
-        CoreError::Runtime(format!("Claude 토큰 갱신 응답을 읽지 못했습니다: {error}"))
-    })?;
+    let granted: Value = call.read_json(response)?;
     // 회전이 실제로 일어났는지 지문으로 남긴다. 429가 이어질 때 같은 토큰을 계속
     // 재제출하는 상황인지 판별할 기준점이 된다.
     eprintln!(
@@ -5369,13 +6036,10 @@ fn merge_refreshed_claude_oauth(
         .ok_or_else(|| {
             CoreError::Runtime("Claude 토큰 갱신 응답에 액세스 토큰이 없습니다".to_owned())
         })?;
-    let mut value: Value = serde_json::from_str(secret)?;
-    let oauth = value
-        .get_mut("claudeAiOauth")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| {
-            CoreError::Runtime("Claude 자격증명에 claudeAiOauth 항목이 없습니다".to_owned())
-        })?;
+    let mut envelope = ClaudeOauthEnvelope::parse_required(secret)?;
+    let oauth = envelope.entry_object_mut().ok_or_else(|| {
+        CoreError::Runtime("Claude 자격증명에 claudeAiOauth 항목이 없습니다".to_owned())
+    })?;
     oauth.insert("accessToken".to_owned(), Value::from(access_token));
     if let Some(refresh_token) = granted
         .get("refresh_token")
@@ -5390,42 +6054,22 @@ fn merge_refreshed_claude_oauth(
             Value::from(now_ms.saturating_add(expires_in.saturating_mul(1000))),
         );
     }
-    serde_json::to_string(&value)
-        .map(Zeroizing::new)
-        .map_err(CoreError::from)
+    envelope.into_secret()
 }
 
 fn request_claude_usage(secret: &str) -> Result<ClaudeUsageResponse, CoreError> {
-    let credentials: ClaudeUsageSecret<'_> = serde_json::from_str(secret)?;
-    let token = credentials
-        .oauth
-        .as_ref()
-        .map(|oauth| oauth.access_token)
-        .or(credentials.access_token)
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| CoreError::Runtime("Claude OAuth 토큰이 없습니다".to_owned()))?;
+    let call = OauthCall::new("Claude 사용량", "조회");
     let mut headers = HeaderMap::new();
-    let authorization_value = Zeroizing::new(format!("Bearer {token}"));
-    let authorization = HeaderValue::from_str(&authorization_value)
-        .map_err(|_| CoreError::Runtime("Claude 인증 헤더를 만들지 못했습니다".to_owned()))?;
-    headers.insert(AUTHORIZATION, authorization);
+    headers.insert(AUTHORIZATION, claude_bearer_header(secret)?);
     headers.insert(
         "anthropic-beta",
         HeaderValue::from_static("oauth-2025-04-20"),
     );
     headers.insert(USER_AGENT, HeaderValue::from_static("claude-code/2.1.0"));
-    let response = Client::builder()
-        .timeout(USAGE_TIMEOUT)
-        .default_headers(headers)
-        .build()
-        .map_err(|error| {
-            CoreError::Runtime(format!("사용량 클라이언트를 만들지 못했습니다: {error}"))
-        })?
-        .get("https://api.anthropic.com/api/oauth/usage")
-        .send()
-        .map_err(|error| {
-            CoreError::Runtime(format!("Claude 사용량을 조회하지 못했습니다: {error}"))
-        })?;
+    let response = call.send(
+        call.client(headers)?
+            .get("https://api.anthropic.com/api/oauth/usage"),
+    )?;
     if response.status() == StatusCode::UNAUTHORIZED {
         return Ok(ClaudeUsageResponse::Unauthorized);
     }
@@ -5434,36 +6078,15 @@ fn request_claude_usage(secret: &str) -> Result<ClaudeUsageResponse, CoreError> 
             retry_at: retry_at_from_headers(response.headers(), now_ms()),
         });
     }
-    if !response.status().is_success() {
-        return Err(CoreError::Runtime(format!(
-            "Claude 사용량 조회가 실패했습니다 (HTTP {})",
-            response.status()
-        )));
-    }
-    let value: Value = response.json().map_err(|error| {
-        CoreError::Runtime(format!("Claude 사용량 응답을 읽지 못했습니다: {error}"))
-    })?;
+    let value: Value = call.read_json(call.require_success(response)?)?;
     Ok(ClaudeUsageResponse::Usage(usage_result(
         claude_usage_windows(&value),
     )))
 }
 
-/// 모델별 주간 창 라벨에 붙는 창 길이. `limits[]`의 `weekly_scoped` 항목은 길이를 따로
-/// 주지 않고 종류 이름으로만 주 단위임을 알린다.
-const CLAUDE_WEEKLY_SCOPED_LABEL_SUFFIX: &str = " 7일";
-/// 모델별 주간 창의 라벨. 모델 이름은 서버가 주는 문자열이라 길이를 보장하지 않으므로,
-/// 예산 정책이 저장할 수 있는 라벨 길이([`crate::usage_budget_policy::MAX_LABEL_CHARS`])
-/// 안에 들어오도록 자른다 — 잘림 표시와 창 길이 접미사까지 셈에 넣는다.
-fn claude_model_window_label(model: &str) -> String {
-    let budget = crate::usage_budget_policy::MAX_LABEL_CHARS.saturating_sub(
-        CLAUDE_WEEKLY_SCOPED_LABEL_SUFFIX.chars().count()
-            + crate::text_limit::ELLIPSIS.chars().count(),
-    );
-    format!(
-        "{}{CLAUDE_WEEKLY_SCOPED_LABEL_SUFFIX}",
-        crate::text_limit::truncate_chars(model, budget)
-    )
-}
+/// 모델별 주간 창의 창 길이. `limits[]`의 `weekly_scoped` 항목은 길이를 따로 주지 않고
+/// 종류 이름으로만 주 단위임을 알린다.
+const CLAUDE_WEEKLY_SCOPED_LABEL_LENGTH: &str = "7일";
 
 /// `GET /api/oauth/usage` 응답에서 창 목록을 만든다.
 ///
@@ -5488,18 +6111,13 @@ fn claude_usage_windows(value: &Value) -> Vec<AccountUsageWindow> {
         .iter()
         .filter(|entry| entry.get("kind").and_then(Value::as_str) == Some("weekly_scoped"))
         .filter_map(|entry| {
-            let model = entry
-                .get("scope")?
-                .get("model")?
-                .get("display_name")?
-                .as_str()?
-                .trim();
-            if model.is_empty() {
-                return None;
-            }
+            let model = trimmed_str(entry.get("scope")?.get("model")?.get("display_name")?)?;
             Some(AccountUsageWindow {
                 model_scoped: true,
-                ..usage_window(&claude_model_window_label(model), entry)?
+                ..usage_window(
+                    &scoped_window_label(model, CLAUDE_WEEKLY_SCOPED_LABEL_LENGTH),
+                    entry,
+                )?
             })
         })
         .collect::<Vec<_>>();
@@ -5805,16 +6423,15 @@ fn codex_usage_401_rejection(body: &str) -> Option<String> {
 /// 사용량과 함께 자격증명 거부 여부를 준다. 거부는 401 본문이 회복 불가를 밝힌
 /// 경우뿐이며, 그때 호출자는 인증 상태를 내려 재인증을 요구한다.
 fn fetch_codex_usage(secret: &str) -> Result<(AccountUsageView, bool), CoreError> {
+    let call = OauthCall::new("Codex 사용량", "조회");
     let credentials: CodexUsageSecret<'_> = serde_json::from_str(secret)?;
     if credentials.tokens.access_token.is_empty() {
         return Err(CoreError::Runtime("Codex OAuth 토큰이 없습니다".to_owned()));
     }
     let mut headers = HeaderMap::new();
-    let authorization_value = Zeroizing::new(format!("Bearer {}", credentials.tokens.access_token));
     headers.insert(
         AUTHORIZATION,
-        HeaderValue::from_str(&authorization_value)
-            .map_err(|_| CoreError::Runtime("Codex 인증 헤더를 만들지 못했습니다".to_owned()))?,
+        bearer_header_value(credentials.tokens.access_token, "Codex")?,
     );
     headers.insert(USER_AGENT, HeaderValue::from_static("codex-cli"));
     headers.insert("openai-beta", HeaderValue::from_static("codex-1"));
@@ -5831,18 +6448,10 @@ fn fetch_codex_usage(secret: &str) -> Result<(AccountUsageView, bool), CoreError
             })?,
         );
     }
-    let response = Client::builder()
-        .timeout(USAGE_TIMEOUT)
-        .default_headers(headers)
-        .build()
-        .map_err(|error| {
-            CoreError::Runtime(format!("사용량 클라이언트를 만들지 못했습니다: {error}"))
-        })?
-        .get("https://chatgpt.com/backend-api/wham/usage")
-        .send()
-        .map_err(|error| {
-            CoreError::Runtime(format!("Codex 사용량을 조회하지 못했습니다: {error}"))
-        })?;
+    let response = call.send(
+        call.client(headers)?
+            .get("https://chatgpt.com/backend-api/wham/usage"),
+    )?;
     if response.status() == StatusCode::UNAUTHORIZED {
         // Codex는 조회용 액세스 토큰을 앱이 갱신하지 않는다. 갱신 주체가 CLI라서,
         // 활성 계정이 아닌 계정의 보관 사본은 만료되면 그대로 401이 된다(`token_expired`).
@@ -5851,24 +6460,13 @@ fn fetch_codex_usage(secret: &str) -> Result<(AccountUsageView, bool), CoreError
         // 반면 본문이 무효화를 밝히면 기다려도 돌아오지 않으므로 거부로 올린다.
         let body = response.text().unwrap_or_default();
         if let Some(reason) = codex_usage_401_rejection(&body) {
-            return Ok((
-                usage_retry_result(reason, now_ms().saturating_add(USAGE_ERROR_RETRY_MS)),
-                true,
-            ));
+            return Ok((usage_retry_soon(reason), true));
         }
         return Err(CoreError::Runtime(
             "Codex 사용량 조회 토큰이 만료되었습니다 (HTTP 401). 계정 인증은 유효하며 이 계정으로 CLI를 실행하면 갱신됩니다".to_owned(),
         ));
     }
-    if !response.status().is_success() {
-        return Err(CoreError::Runtime(format!(
-            "Codex 사용량 조회가 실패했습니다 (HTTP {})",
-            response.status()
-        )));
-    }
-    let response: Value = response.json().map_err(|error| {
-        CoreError::Runtime(format!("Codex 사용량 응답을 읽지 못했습니다: {error}"))
-    })?;
+    let response: Value = call.read_json(call.require_success(response)?)?;
     let limits = response
         .get("rate_limit")
         .ok_or_else(|| CoreError::Runtime("Codex 사용량 응답에 한도 정보가 없습니다".to_owned()))?;
@@ -5882,25 +6480,15 @@ fn fetch_codex_usage(secret: &str) -> Result<(AccountUsageView, bool), CoreError
 /// `model_scoped`로 표시한다.
 fn codex_limit_windows(limits: &Value, scope: Option<&str>) -> Vec<AccountUsageWindow> {
     [
-        (
-            "5시간",
-            limits
-                .get("primary")
-                .or_else(|| limits.get("primary_window")),
-        ),
-        (
-            "7일",
-            limits
-                .get("secondary")
-                .or_else(|| limits.get("secondary_window")),
-        ),
+        ("5시간", field(limits, &["primary", "primary_window"])),
+        ("7일", field(limits, &["secondary", "secondary_window"])),
     ]
     .into_iter()
     .filter_map(|(fallback_label, value)| {
         value.and_then(|value| {
             let length = window_duration_label(value).unwrap_or_else(|| fallback_label.to_owned());
             let label = match scope {
-                Some(scope) => codex_scoped_window_label(scope, &length),
+                Some(scope) => scoped_window_label(scope, &length),
                 None => length,
             };
             usage_window(&label, value)
@@ -5914,10 +6502,13 @@ fn codex_limit_windows(limits: &Value, scope: Option<&str>) -> Vec<AccountUsageW
     .collect()
 }
 
-/// 범위별 창의 라벨(`GPT-6 7일`). 범위 이름은 서버가 주는 문자열이라 길이를 보장하지
-/// 않으므로, 예산 정책이 저장할 수 있는 라벨 길이([`crate::usage_budget_policy::MAX_LABEL_CHARS`])
-/// 안에 들어오도록 자른다 — [`claude_model_window_label`]과 같은 처리다.
-fn codex_scoped_window_label(scope: &str, length: &str) -> String {
+/// 계정 전체가 아닌 범위 하나에만 걸리는 창의 라벨(`Fable 7일`, `GPT-6 7일`). 범위
+/// 이름은 모델 표시명이든 한도 이름이든 서버가 주는 문자열이라 길이를 보장하지 않으므로,
+/// 예산 정책이 저장할 수 있는 라벨 길이([`crate::usage_budget_policy::MAX_LABEL_CHARS`])
+/// 안에 들어오도록 자른다 — 잘림 표시와 뒤에 붙는 창 길이까지 셈에 넣는다. Claude와
+/// Codex가 각자 같은 셈을 하던 것을 한 자리로 모았다: 라벨이 한도를 넘으면 그 창을
+/// 예산 가드로 지정할 수 없게 되므로 두 공급자가 어긋나면 한쪽만 조용히 지정 불가가 된다.
+fn scoped_window_label(scope: &str, length: &str) -> String {
     let budget = crate::usage_budget_policy::MAX_LABEL_CHARS
         .saturating_sub(length.chars().count() + 1 + crate::text_limit::ELLIPSIS.chars().count());
     format!(
@@ -5936,41 +6527,39 @@ fn codex_scoped_window_label(scope: &str, length: &str) -> String {
 /// 다루는 방식([`claude_usage_windows`])과 같은 방침이다.
 fn codex_scoped_windows(envelope: &Value, limits: &Value) -> Vec<AccountUsageWindow> {
     let primary_limit_id = codex_limit_id(limits);
-    envelope
-        .get("rateLimitsByLimitId")
-        .or_else(|| envelope.get("rate_limits_by_limit_id"))
-        .and_then(Value::as_object)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter(|(key, entry)| {
-                    let id = codex_limit_id(entry).unwrap_or(key.as_str());
-                    primary_limit_id != Some(id) && *entry != limits
-                })
-                .flat_map(|(key, entry)| {
-                    let id = codex_limit_id(entry).unwrap_or(key.as_str());
-                    let scope = entry
-                        .get("limitName")
-                        .or_else(|| entry.get("limit_name"))
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or(id)
-                        .to_owned();
-                    codex_limit_windows(entry, Some(&scope))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    field(
+        envelope,
+        &["rateLimitsByLimitId", "rate_limits_by_limit_id"],
+    )
+    .and_then(Value::as_object)
+    .map(|entries| {
+        entries
+            .iter()
+            .filter(|(key, entry)| {
+                let id = codex_limit_id(entry).unwrap_or(key.as_str());
+                primary_limit_id != Some(id) && *entry != limits
+            })
+            .flat_map(|(key, entry)| {
+                let id = codex_limit_id(entry).unwrap_or(key.as_str());
+                let scope = field(entry, &["limitName", "limit_name"])
+                    .and_then(trimmed_str)
+                    .unwrap_or(id)
+                    .to_owned();
+                codex_limit_windows(entry, Some(&scope))
+            })
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 fn codex_limit_id(limits: &Value) -> Option<&str> {
-    limits
-        .get("limitId")
-        .or_else(|| limits.get("limit_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
+    field(limits, &["limitId", "limit_id"]).and_then(trimmed_str)
+}
+
+/// 크레딧 한 장의 만료 시각(초). 크레딧을 고르고 정렬하고 내보내는 세 자리가 같은
+/// 이름 후보를 각자 적고 있어 한곳만 고치면 순번과 표시가 서로 다른 장을 가리킨다.
+fn credit_expires_at(credit: &Value) -> Option<f64> {
+    number_field(credit, &["expiresAt", "expires_at"])
 }
 
 /// 사용량 응답의 `rateLimitResetCredits`에서 쓸 수 있는 크레딧만 추린다.
@@ -5980,9 +6569,10 @@ fn codex_limit_id(limits: &Value) -> Option<&str> {
 /// 쓸 수 있다고 알리고 소비는 `noCredit`으로 실패한다. 공급자가 주는 `availableCount`는
 /// 참고만 하고, 목록을 직접 세어 상태와 어긋나지 않게 한다.
 fn codex_reset_credits(envelope: &Value) -> Option<AccountResetCredits> {
-    let credits = envelope
-        .get("rateLimitResetCredits")
-        .or_else(|| envelope.get("rate_limit_reset_credits"))?;
+    let credits = field(
+        envelope,
+        &["rateLimitResetCredits", "rate_limit_reset_credits"],
+    )?;
     let available = credits
         .get("credits")
         .and_then(Value::as_array)
@@ -6000,18 +6590,18 @@ fn codex_reset_credits(envelope: &Value) -> Option<AccountResetCredits> {
     // 가장 먼저 만료되는 크레딧. 공급자가 다음 순번으로 고르는 장이기도 하다.
     let earliest = available
         .iter()
-        .filter(|credit| number_field(credit, &["expiresAt", "expires_at"]).is_some())
+        .filter(|credit| credit_expires_at(credit).is_some())
         .min_by(|a, b| {
-            number_field(a, &["expiresAt", "expires_at"])
+            credit_expires_at(a)
                 .unwrap_or(f64::MAX)
-                .total_cmp(&number_field(b, &["expiresAt", "expires_at"]).unwrap_or(f64::MAX))
+                .total_cmp(&credit_expires_at(b).unwrap_or(f64::MAX))
         })
         .or(available.first())
         .copied();
     Some(AccountResetCredits {
         available_count,
         next_expires_at: earliest
-            .and_then(|credit| number_field(credit, &["expiresAt", "expires_at"]))
+            .and_then(credit_expires_at)
             .map(|seconds| (seconds as i64).saturating_mul(1000)),
         next_credit_id: earliest
             .and_then(|credit| credit.get("id"))
@@ -6019,11 +6609,7 @@ fn codex_reset_credits(envelope: &Value) -> Option<AccountResetCredits> {
             .map(str::to_owned),
         title: available
             .first()
-            .and_then(|credit| credit.get("title"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|title| !title.is_empty())
-            .map(str::to_owned),
+            .and_then(|credit| string_field(credit, &["title"])),
     })
 }
 
@@ -6110,28 +6696,6 @@ fn usage_window(label: &str, value: &Value) -> Option<AccountUsageWindow> {
     })
 }
 
-/// Claude 사용량 응답은 리셋 시각을 ISO 8601 문자열로 반환하므로 숫자 파싱이
-/// 실패하면 RFC 3339로 해석한다.
-fn timestamp_field(value: &Value, keys: &[&str]) -> Option<i64> {
-    keys.iter().find_map(|key| {
-        value.get(*key).and_then(Value::as_str).and_then(|text| {
-            chrono::DateTime::parse_from_rfc3339(text)
-                .ok()
-                .map(|date| date.timestamp_millis())
-        })
-    })
-}
-
-fn number_field(value: &Value, keys: &[&str]) -> Option<f64> {
-    keys.iter().find_map(|key| {
-        value.get(*key).and_then(|value| {
-            value
-                .as_f64()
-                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
-        })
-    })
-}
-
 /// 연속 제한 횟수에 맞춘 재시도 간격. 15분에서 시작해 두 배씩 늘리고 6시간에서 멈춘다.
 ///
 /// 같은 간격으로 계속 재제출하면 서버에는 제한을 풀 근거가 생기지 않는다. 2026-08-27
@@ -6181,18 +6745,30 @@ fn retry_at_from_headers(headers: &HeaderMap, now: i64) -> i64 {
         )
 }
 
-fn usage_retry_result(message: impl Into<String>, retry_at: i64) -> AccountUsageView {
+/// 사용량 값 없이 상태와 사유만 돌려주는 결과의 공통 바탕. 재시도 가능한 오류와
+/// 조회 불가 상태는 `status`·`retry_at`만 다르고 나머지 초기화 규칙은 같다.
+fn usage_problem_result(
+    status: AccountUsageStatus,
+    message: impl Into<String>,
+    retry_at: Option<i64>,
+) -> AccountUsageView {
     AccountUsageView {
-        status: AccountUsageStatus::Error,
-        windows: Vec::new(),
+        status,
         updated_at: Some(now_ms()),
         error: Some(message.into()),
-        retry_at: Some(retry_at),
-        rate_limited: false,
-        token_refresh_limited: false,
-        token_refresh_throttle_streak: 0,
-        reset_credits: None,
+        retry_at,
+        ..Default::default()
     }
+}
+
+fn usage_retry_result(message: impl Into<String>, retry_at: i64) -> AccountUsageView {
+    usage_problem_result(AccountUsageStatus::Error, message, Some(retry_at))
+}
+
+/// 조회가 실패했지만 사정이 바뀔 수 있는 상태. 재시도 시각은 어느 갈래나 같은 표준
+/// 대기라, 호출부마다 `now_ms()`에 상수를 더하던 여섯 벌을 여기로 모았다.
+fn usage_retry_soon(message: impl Into<String>) -> AccountUsageView {
+    usage_retry_result(message, now_ms().saturating_add(USAGE_ERROR_RETRY_MS))
 }
 
 fn rate_limited_usage_result(message: impl Into<String>, retry_at: i64) -> AccountUsageView {
@@ -6219,12 +6795,7 @@ fn token_refresh_limited_usage_result(
 /// 조회를 시도조차 할 수 없어 값이 없는 상태. 재시도 대기가 아니므로 `retry_at`을
 /// 두지 않는다 — 사정이 바뀌면(공유 홈에서 CLI가 토큰을 갱신하면) 다음 주기에 그냥 된다.
 fn usage_unavailable_result(message: impl Into<String>) -> AccountUsageView {
-    AccountUsageView {
-        status: AccountUsageStatus::Unavailable,
-        updated_at: Some(now_ms()),
-        error: Some(message.into()),
-        ..AccountUsageView::default()
-    }
+    usage_problem_result(AccountUsageStatus::Unavailable, message, None)
 }
 
 /// 공유 CLI 홈의 자격증명으로 사용량을 조회한다. 읽기 전용 HTTP 요청만 보내고
@@ -6238,32 +6809,35 @@ fn fetch_home_usage(provider: ProviderId, secret: &str, now: i64) -> AccountUsag
                     "공유 홈의 액세스 토큰이 만료돼 조회할 수 없습니다. Agent Manager는 이 토큰을 갱신하지 않습니다 — 데스크탑 앱이나 터미널에서 이 로그인을 쓰면 CLI가 갱신하고, 그 뒤에 조회됩니다",
                 );
             }
-            match request_claude_usage(secret) {
-                Ok(ClaudeUsageResponse::Usage(usage)) => Ok(usage),
-                Ok(ClaudeUsageResponse::Unauthorized) => {
+            match request_claude_usage(secret).map(ClaudeUsageResponse::into_usage_or_unauthorized)
+            {
+                Ok(Some(usage)) => Ok(usage),
+                Ok(None) => {
                     return usage_unavailable_result(
                         "공유 홈의 자격증명이 거부됐습니다 (HTTP 401). 데스크탑 앱이나 터미널에서 다시 로그인하면 조회됩니다",
-                    );
-                }
-                Ok(ClaudeUsageResponse::RateLimited { retry_at }) => {
-                    return rate_limited_usage_result(
-                        "Claude 사용량 조회가 제한되었습니다 (HTTP 429)",
-                        retry_at,
                     );
                 }
                 Err(error) => Err(error),
             }
         }
+        // 공유 홈의 로그인은 그 홈에서 묻는다. 계정을 인자로 받는 조회가 없어 홈이 곧 계정이다.
         ProviderId::Antigravity => {
-            return usage_unavailable_result("Antigravity 사용량 조회는 지원하지 않습니다");
+            let Some(home) = crate::user_home::optional_home_dir() else {
+                return usage_unavailable_result(
+                    "사용자 홈을 확인하지 못해 공유 홈 사용량을 조회할 수 없습니다",
+                );
+            };
+            return crate::antigravity_usage::account_usage(&home, &[]);
+        }
+        ProviderId::Local => {
+            return usage_unavailable_result("로컬 LLM은 사용량 한도가 없어 조회하지 않습니다")
         }
     };
     fetched.unwrap_or_else(usage_error_result)
 }
 
 fn usage_error_result(error: CoreError) -> AccountUsageView {
-    let now = now_ms();
-    usage_retry_result(error.to_string(), now.saturating_add(USAGE_ERROR_RETRY_MS))
+    usage_retry_soon(error.to_string())
 }
 
 /// 계정 메모 입력을 저장 형태로 정리한다. 앞뒤 공백을 제거하고 빈 값은 삭제로
@@ -6272,17 +6846,16 @@ fn normalize_account_note(note: Option<&str>) -> Result<Option<String>, CoreErro
     let Some(note) = note else {
         return Ok(None);
     };
-    let trimmed = note.replace("\r\n", "\n");
-    let trimmed = trimmed.trim();
-    if trimmed.is_empty() {
+    let normalized = note.replace("\r\n", "\n");
+    let Some(note) = trimmed(&normalized) else {
         return Ok(None);
-    }
-    if trimmed.chars().count() > ACCOUNT_NOTE_MAX_CHARS {
+    };
+    if note.chars().count() > ACCOUNT_NOTE_MAX_CHARS {
         return Err(CoreError::InvalidInput(format!(
             "계정 메모는 {ACCOUNT_NOTE_MAX_CHARS}자까지 저장할 수 있습니다"
         )));
     }
-    Ok(Some(trimmed.to_owned()))
+    Ok(Some(note.to_owned()))
 }
 
 /// 사용자가 붙인 계정 표시 이름을 정리한다. 목록 한 줄에 들어가야 하므로 줄바꿈은
@@ -6304,8 +6877,86 @@ fn normalize_account_label(label: Option<&str>) -> Result<Option<String>, CoreEr
 }
 
 /// 방금 저장한 사용량이 100% 도달(=자동전환 트리거)인지 판정한다.
+///
+/// "전환을 고려할 만한가"는 "계정이 통째로 막혔는가"([`account_exhausted`])와 다른 질문이라
+/// 대표 창 하나로 느슨하게 본다. 모델군 쿼터를 가진 계정에서 대표 창은 빡빡한 모델군의
+/// 복사본이므로, 한 모델군만 차도 신호가 뜬다 — 그 모델군 실행은 여기서 더 못 돌고,
+/// 게이트가 모델군을 알아본 뒤로는 한도 오류(`AgentLimited`)조차 나지 않아 이 신호가
+/// 아니면 활성 계정이 리셋까지 그대로 앉아 있게 된다. 실제로 옮길지는 후보가 정한다.
 fn usage_indicates_exhaustion(usage: &AccountUsageView) -> bool {
     governing_windows(&usage.windows).any(|window| window.used_percent >= 100.0)
+}
+
+/// 창 라벨에서 모델군 이름을 뗀다(`Claude and GPT models · 7일` → `Claude and GPT models`).
+/// 라벨은 `{그룹 이름} · {창}`으로 만들어지므로([`crate::antigravity_usage`]) 이 한 규칙으로
+/// 모든 모델군 창이 갈린다. 구분자가 없는 모델 한정 창(Claude의 `Fable 7일`)은 라벨 전체가
+/// 그룹이 되어 저 혼자 한 그룹을 이룬다.
+fn model_group_of(label: &str) -> &str {
+    label.split_once(" · ").map_or(label, |(group, _)| group)
+}
+
+/// 이 계정을 **통째로** 막는 소진인지. `full`은 창 하나가 다 찼는지 보는 규칙이며, 부르는
+/// 쪽이 리셋 시각까지 볼지 정한다.
+///
+/// 대표 창을 모델군에서 합쳐 내는 공급자(Antigravity)만 모델군 규칙을 쓴다. 그때는
+/// **모든 모델군이 찼을 때만** 계정이 막힌 것이다 — 한 모델군이 소진됐다고 계정을 빼면
+/// 다른 모델군의 쿼터를 통째로 버리게 되고, 페이싱은 그 창으로 계정을 뽑는데 실행 게이트가
+/// 거부해 예약만 쌓인다.
+///
+/// 그 밖의 공급자는 종전 그대로 [`governing_windows`] 하나로 판정한다. 갈래를 "대표 창이
+/// 남았는가"로 가르면, 대표 한도 없이 모델 한정 창만 오는 응답(Claude `limits[]`)이 모델군
+/// 규칙으로 넘어가 한 모델의 소진이 계정 전체를 막는다 — `model_scoped`가 막으려던 바로
+/// 그 구멍이다.
+fn account_exhausted(
+    windows: &[AccountUsageWindow],
+    full: impl Fn(&AccountUsageWindow) -> bool,
+) -> bool {
+    if !windows.iter().any(|window| window.aggregate) {
+        return governing_windows(windows).any(&full);
+    }
+    let mut groups: BTreeMap<&str, bool> = BTreeMap::new();
+    for window in windows.iter().filter(|window| window.model_scoped) {
+        let exhausted = groups.entry(model_group_of(&window.label)).or_insert(false);
+        *exhausted |= full(window);
+    }
+    // 창을 하나도 읽지 못한 계정은 소진이 아니다 — 모르는 것과 다 쓴 것은 다르다.
+    !groups.is_empty() && groups.into_values().all(|exhausted| exhausted)
+}
+
+/// 이 창들이 **모두** 풀리는 시각. 리셋 시각을 알려 주지 않은 창은 셈에서 빠지고, 찬 창이
+/// 없으면 기다릴 것도 없다.
+fn windows_clear_at<'a>(
+    windows: impl Iterator<Item = &'a AccountUsageWindow>,
+    full: impl Fn(&AccountUsageWindow) -> bool,
+) -> Option<i64> {
+    windows
+        .filter(|window| full(window))
+        .filter_map(|window| window.resets_at)
+        .max()
+}
+
+/// 계정이 다시 열리는 시각. 모델군 규칙을 쓰는 계정은 **가장 먼저 풀리는 모델군**이 계정을
+/// 여는 시각이다 — 그룹 안에서는 찬 창이 모두 풀려야 하므로 `max`, 그룹 사이에서는 하나만
+/// 풀려도 쓸 수 있으므로 `min`이다. 여기서 늦은 쪽을 말하면 이미 받아들여질 회차를 몇십
+/// 시간 더 기다리라고 안내하게 된다.
+fn account_clear_at(windows: &[AccountUsageWindow], now: i64) -> Option<i64> {
+    let full = |window: &AccountUsageWindow| {
+        window.used_percent >= 100.0 && window.resets_at.is_none_or(|resets_at| resets_at > now)
+    };
+    if !windows.iter().any(|window| window.aggregate) {
+        return windows_clear_at(governing_windows(windows), full);
+    }
+    let mut groups: BTreeMap<&str, Vec<&AccountUsageWindow>> = BTreeMap::new();
+    for window in windows.iter().filter(|window| window.model_scoped) {
+        groups
+            .entry(model_group_of(&window.label))
+            .or_default()
+            .push(window);
+    }
+    groups
+        .into_values()
+        .filter_map(|group| windows_clear_at(group.into_iter(), full))
+        .min()
 }
 
 /// 계정 전체의 가용성을 대표하는 창만 남긴다.
@@ -6390,6 +7041,17 @@ fn usage_refresh_deferred(usage: &AccountUsageView, now: i64) -> bool {
 /// 캐시된 사용량 기준으로 계정이 아직 제한 상태로 보여 자동전환 후보에서
 /// 제외해야 하는지 판정한다. 리셋 시각이 지났으면 다시 후보가 된다.
 fn usage_blocks_auto_switch(usage: &AccountUsageView, now: i64) -> bool {
+    usage_blocks_run(usage, &[], now)
+}
+
+/// 이 사용량이 지금 실행을 막는지. `model_windows`가 비어 있지 않으면 이번 실행이 쓸
+/// 모델군 창이며, 그 창만 본다 — 계정의 다른 모델군이 소진됐어도 이 모델군의 쿼터는
+/// 그대로 남아 있다([`model_scoped_windows`]). 비어 있으면 계정 전체 판정이다.
+fn usage_blocks_run(
+    usage: &AccountUsageView,
+    model_windows: &[&AccountUsageWindow],
+    now: i64,
+) -> bool {
     // 토큰 갱신 엔드포인트의 429는 남은 사용량을 말해 주지 않는다. 이걸 한도로
     // 취급하면 갱신이 막힌 계정이 페일오버 후보에서 영구 제외된다.
     if usage.rate_limited
@@ -6398,23 +7060,64 @@ fn usage_blocks_auto_switch(usage: &AccountUsageView, now: i64) -> bool {
     {
         return true;
     }
-    governing_windows(&usage.windows).any(|window| {
+    let full = |window: &AccountUsageWindow| {
         window.used_percent >= 100.0 && window.resets_at.is_none_or(|resets_at| resets_at > now)
-    })
+    };
+    if !model_windows.is_empty() {
+        return model_windows.iter().copied().any(full);
+    }
+    account_exhausted(&usage.windows, full)
+}
+
+/// 이번 실행이 소비할 모델군 창. 공급자가 모델군마다 쿼터를 따로 들고 있고 이번 실행의
+/// 모델을 알 때만 값이 있다. 모델군이 없는 공급자에서는 비어 있어, 판정이 종전 그대로
+/// 계정 전체 창을 본다.
+fn model_scoped_windows<'a>(
+    provider: ProviderId,
+    model: Option<&str>,
+    windows: &'a [AccountUsageWindow],
+) -> Vec<&'a AccountUsageWindow> {
+    let (ProviderId::Antigravity, Some(model)) = (provider, model) else {
+        return Vec::new();
+    };
+    // 모델군을 가릴 수 없는 이름은 계정 전체 판정에 맡긴다. `model_consumes_window`는
+    // 모르는 모델을 모든 창에 걸리게 하는데(점유를 셀 때는 그래야 겹쳐 띄우지 않는다),
+    // 게이트에서 그대로 쓰면 한 모델군만 차도 막혀 모델을 아예 밝히지 않은 실행보다
+    // 엄격해진다 — 모델을 적었다고 더 막히는 것은 뒤집힌 결과다.
+    if crate::antigravity_usage::pacing_resource_id_for_model(model).is_err() {
+        return Vec::new();
+    }
+    windows
+        .iter()
+        .filter(|window| {
+            window.model_scoped
+                && crate::antigravity_usage::model_consumes_window(model, &window.label)
+        })
+        .collect()
 }
 
 /// 한도에 걸린 계정을 다시 시도해 볼 만한 가장 이른 시각. 캐시된 백오프와 소진된
 /// 사용량 창의 리셋 시각 중 늦은 쪽을 쓴다 — 둘 중 이른 쪽을 고르면 아직 리셋되지
 /// 않은 창을 두고 다시 CLI를 띄우게 된다. 공급자가 시각을 알려주지 않았으면 `None`이고,
 /// 그때는 다음 사용량 조회가 상태를 풀 때까지 기다린다.
-fn usage_resume_at(usage: &AccountUsageView, now: i64) -> Option<i64> {
+fn usage_resume_at(
+    usage: &AccountUsageView,
+    model_windows: &[&AccountUsageWindow],
+    now: i64,
+) -> Option<i64> {
     let backoff = usage
         .retry_at
         .filter(|_| usage.rate_limited && !usage.token_refresh_limited);
-    let exhausted_window = governing_windows(&usage.windows)
-        .filter(|window| window.used_percent >= 100.0)
-        .filter_map(|window| window.resets_at)
-        .max();
+    // 이번 실행이 기다리는 창만 본다. 모델군을 아는 실행에서 계정의 다른 모델군 리셋을
+    // 함께 세면, 이 모델군이 먼저 풀려도 그때까지 기다리라고 말하게 된다. 그 모델군이
+    // 열리려면 그 안에서 찬 창이 모두 풀려야 하므로 그룹 안에서는 늦은 쪽이다.
+    let exhausted_window = if model_windows.is_empty() {
+        account_clear_at(&usage.windows, now)
+    } else {
+        windows_clear_at(model_windows.iter().copied(), |window| {
+            window.used_percent >= 100.0 && window.resets_at.is_none_or(|resets_at| resets_at > now)
+        })
+    };
     [backoff, exhausted_window]
         .into_iter()
         .flatten()
@@ -6433,89 +7136,415 @@ fn select_auto_switch_target(
     accounts: &[AccountRecord],
     provider: ProviderId,
     active_account_id: &str,
+    purpose: &SwitchPurpose<'_>,
     now: i64,
     policy: AutoSwitchPolicy,
     min_usage_gap_percent: Option<f64>,
 ) -> Option<String> {
-    // 격차를 재려면 기준이 되는 계정의 사용량을 알아야 한다. 모르면 분산 교체는
-    // 판단 근거가 없으므로 전환하지 않는다.
-    let limited_used_percent = match min_usage_gap_percent {
-        Some(_) => Some(
-            accounts
-                .iter()
-                .find(|account| account.id == active_account_id)
-                .and_then(|account| usage_used_percent(&account.usage))?,
-        ),
-        None => None,
+    let limited = accounts
+        .iter()
+        .find(|account| account.id == active_account_id);
+    let groups = PurposeGroups::of(provider, purpose.models, limited);
+    let pick = |relax_open: bool| {
+        let eligibility = AutoSwitchEligibility::new(
+            limited,
+            provider,
+            active_account_id,
+            purpose,
+            &groups,
+            relax_open,
+            now,
+            min_usage_gap_percent,
+        )?;
+        match policy {
+            AutoSwitchPolicy::Registration => {
+                select_next_in_registration_order(accounts, &eligibility)
+            }
+            AutoSwitchPolicy::Priority => select_by_auto_switch_priority(accounts, &eligibility),
+            AutoSwitchPolicy::MaxHeadroom => select_by_max_headroom(accounts, &eligibility),
+        }
     };
-    let eligible = |account: &AccountRecord| {
-        account.provider == provider
-            && account.id != active_account_id
+    // 한도 응답인데 모델군을 가릴 수 없으면 먼저 열린 모델군을 잃지 않는 자리를 찾고, 그런
+    // 자리가 없을 때만 어디든 살아 있는 곳으로 간다 — 한 번에 풀어 버리면 막힌 실행이 쓸
+    // 모델군까지 찬 계정을 등록 순으로 집어 쿨다운 안에 다시 막힌다. 모델군을 가렸으면
+    // 두 번째 시도는 같은 답을 낼 뿐이라 하지 않는다.
+    pick(false).or_else(|| {
+        (purpose.intent == SwitchIntent::Rebind
+            && purpose.reason == AutoSwitchReason::AgentLimited
+            && groups.wanted.is_empty())
+        .then(|| pick(true))
+        .flatten()
+    })
+}
+
+/// 전환 목적을 모델군으로 옮긴 것. 지정 계정이 보고한 창에서 그 모델의 창을 찾아 그룹
+/// 이름을 얻고, 창을 아직 보고하지 않은 계정에서는 모델 자체를 들고 간다 — 후보 쪽 창은
+/// 모델로도 가릴 수 있다([`model_scoped_windows`]).
+struct PurposeGroups {
+    /// 실행들이 쓰는 모델군 이름(지정 계정의 창 라벨 기준).
+    wanted: BTreeSet<String>,
+    /// 모델군을 가릴 수 있는 모델들. 후보에서 이 모델의 창이 막혀 있으면 그 후보는 그 실행을
+    /// 못 받는다. 창 라벨 없이도 판정할 수 있어, 새로 등록해 창이 없는 계정의 한도 응답도
+    /// 목적을 잃지 않는다.
+    classified_models: Vec<String>,
+}
+
+impl PurposeGroups {
+    fn of(provider: ProviderId, models: &[String], limited: Option<&AccountRecord>) -> Self {
+        let mut wanted = BTreeSet::new();
+        let mut classified_models = Vec::new();
+        for model in models {
+            if provider != ProviderId::Antigravity
+                || crate::antigravity_usage::pacing_resource_id_for_model(model).is_err()
+            {
+                continue;
+            }
+            classified_models.push(model.clone());
+            if let Some(limited) = limited {
+                for window in model_scoped_windows(provider, Some(model), &limited.usage.windows) {
+                    wanted.insert(model_group_of(&window.label).to_owned());
+                }
+            }
+        }
+        Self {
+            wanted,
+            classified_models,
+        }
+    }
+}
+
+/// 이 계정의 모델군을 **막힌 것 / 열린 것**으로 가른다.
+///
+/// 모델군마다 쿼터가 따로인 계정에서 전환이 필요해진 까닭은 어느 한 모델군이 찼기 때문이다.
+/// 어느 모델군인지는 신호가 모델을 실어 오면 그것으로, 아니면 사용량으로 짚는다 — 한도
+/// 응답을 받은 계정은 곧바로 조회가 따라붙어 그 모델군이 100%로 채워진다
+/// ([`AccountSupervisor::report_agent_usage_limit`]). 다만 그 조회는 별도 스레드라 한도 응답
+/// **직후**의 신호는 아직 갱신 전 수치를 읽는다. 그래서 한도 응답은 실행의 모델을 신호에
+/// 싣고, 이 함수는 모델을 모를 때의 폴백이다.
+///
+/// 모델군 쿼터를 쓰지 않는 공급자는 두 집합이 모두 비어 있고, 그때 후보 자격은 종전 그대로
+/// 계정 전체 판정이다.
+fn model_group_partition(
+    usage: &AccountUsageView,
+    now: i64,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    if !usage.windows.iter().any(|window| window.aggregate) {
+        return (BTreeSet::new(), BTreeSet::new());
+    }
+    let mut blocked = BTreeSet::new();
+    let mut all = BTreeSet::new();
+    for window in usage.windows.iter().filter(|window| window.model_scoped) {
+        let group = model_group_of(&window.label).to_owned();
+        if window.used_percent >= 100.0 && window.resets_at.is_none_or(|resets_at| resets_at > now)
+        {
+            blocked.insert(group.clone());
+        }
+        all.insert(group);
+    }
+    let open = all.difference(&blocked).cloned().collect();
+    (blocked, open)
+}
+
+/// 이 계정에서 그 모델군이 막혀 있는지. 그 모델군 창을 아예 보고하지 않는 계정은 막힌
+/// 것으로 보지 않는다 — 없는 창을 소진으로 읽으면 멀쩡한 후보를 버린다.
+fn model_group_blocked(usage: &AccountUsageView, group: &str, now: i64) -> bool {
+    usage.windows.iter().any(|window| {
+        window.model_scoped
+            && model_group_of(&window.label) == group
+            && window.used_percent >= 100.0
+            && window.resets_at.is_none_or(|resets_at| resets_at > now)
+    })
+}
+
+/// 이번 전환이 무엇을 살리려는 것인지. 후보 자격은 여기서 갈린다.
+struct SwitchPurpose<'a> {
+    /// 살려야 하는 실행들의 모델([`AutoSwitchSignal::models`]).
+    models: &'a [String],
+    reason: AutoSwitchReason,
+    intent: SwitchIntent,
+}
+
+/// 한 신호가 답해야 하는 두 질문. 후보 자격이 여기서 갈린다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchIntent {
+    /// 이 계정에 묶인 세션들을 어디로 옮기나. 그 세션들이 쓰는 모델군만 보고, 한도 응답인데
+    /// 모델군을 가릴 수 없으면 "어디든 살아 있는 곳으로" 완화할 수 있다.
+    Rebind,
+    /// 기본 계정을 어디로 옮기나. 앞으로 열릴 **모든** 대화의 자리라 계정 전체 목적으로 —
+    /// 지정 계정에서 열려 있던 모델군을 잃지 않는 곳만 — 고르고 완화하지 않는다. 한도에 걸린
+    /// 실행의 모델은 안전망으로만 든다: 그 모델의 창이 막힌 계정을 기본으로 앉히지 않는다.
+    DefaultRotation,
+}
+
+/// 두 질문의 답과, 두 번째 질문을 물을 조건이었던 사실. 한 잠금 안에서 함께 정해
+/// 사용자가 그 사이 기본 계정을 바꾼 것을 덮어쓰지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoSwitchPlan {
+    /// 묶인 세션들을 옮길 계정. 옮길 세션이 없어 묻지 않았으면 None.
+    pub rebind_target: Option<String>,
+    /// 기본 계정을 옮길 계정. 지정 계정이 기본 계정이 아니면 묻지 않는다.
+    pub rotate_target: Option<String>,
+}
+
+/// 세 정책이 공유하는 후보 자격 조건. 격차 기준값은 만들 때 한 번만 정해진다.
+struct AutoSwitchEligibility<'a> {
+    provider: ProviderId,
+    active_account_id: &'a str,
+    now: i64,
+    /// 분산 교체일 때만 있는 (요구 격차 %p, 지정 계정의 사용률).
+    usage_gap: Option<(f64, f64)>,
+    /// 옮겨 가는 실행들이 쓰는 모델군 중 지정 계정에서 **막힌** 것. 후보는 이 중 하나라도
+    /// 남아 있어야 하고, 여유도 이 모델군 기준으로 잰다. 모델을 모르면 사용량으로 짚은
+    /// 값이다. 비어 있으면 계정 전체를 본다.
+    blocked_groups: BTreeSet<String>,
+    /// 옮겨 가는 실행들이 쓰는 모델군 중 지정 계정에서 **아직 열려 있는** 것. 후보가 이
+    /// 모델군을 막고 있으면 옮겨서 잃는 쪽이 있으므로 고르지 않는다([`Self::permits`]).
+    /// 모델을 모르는 사용량 트리거는 계정의 열린 모델군 전부를 여기 둔다 — 그 계정이
+    /// 무엇을 하려던 참인지 모르니 어느 쪽도 잃지 않는 자리만 고른다. 모델을 모르는 한도
+    /// 응답도 먼저 그렇게 찾고, 그런 자리가 없을 때만 비운다(`relax_open`).
+    open_groups: BTreeSet<String>,
+    /// 한도에 걸린 실행의 모델. 후보에서 이 모델의 창이 막혀 있으면 그 후보는 뺀다 — 지정
+    /// 계정이 창을 보고하지 않아 모델군 이름을 못 얻었을 때의 안전망이다.
+    must_serve_models: &'a [String],
+}
+
+impl<'a> AutoSwitchEligibility<'a> {
+    /// 격차를 재려면 기준이 되는 계정의 사용량을 알아야 한다. 모르면 분산 교체는
+    /// 판단 근거가 없으므로 아무 후보도 세우지 않는다(`None`).
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        limited: Option<&AccountRecord>,
+        provider: ProviderId,
+        active_account_id: &'a str,
+        purpose: &SwitchPurpose<'_>,
+        groups: &'a PurposeGroups,
+        relax_open: bool,
+        now: i64,
+        min_usage_gap_percent: Option<f64>,
+    ) -> Option<Self> {
+        let usage_gap = match min_usage_gap_percent {
+            Some(gap) => Some((
+                gap,
+                limited.and_then(|account| usage_used_percent(&account.usage))?,
+            )),
+            None => None,
+        };
+        let wanted = &groups.wanted;
+        let (blocked_groups, open_groups) = match limited {
+            None => (BTreeSet::new(), BTreeSet::new()),
+            Some(limited) => {
+                let (blocked, open) = model_group_partition(&limited.usage, now);
+                if purpose.intent == SwitchIntent::DefaultRotation {
+                    // 기본 계정은 세션이 아니라 앞으로의 모든 대화를 위한 자리다. 세션들의
+                    // 모델군으로 좁히지도, 한도 응답이라고 완화하지도 않는다 — 열린 모델군을
+                    // 잃지 않는 곳만 고르고, 한도에 걸린 모델의 창은 아래 `must_serve_models`가
+                    // 안전망으로 본다.
+                    (blocked, open)
+                } else {
+                    match purpose.reason {
+                        AutoSwitchReason::AgentLimited if !wanted.is_empty() => {
+                            // 한도 응답이 그 모델군이 막혔다는 증거다. 사용량은 뒤따르는 조회가
+                            // 끝나기 전이라 아직 100%가 아닐 수 있으므로 창 수치로 판정하지 않는다.
+                            // 그 실행 하나를 살리는 전환이라 다른 모델군은 상관없다.
+                            (wanted.clone(), BTreeSet::new())
+                        }
+                        AutoSwitchReason::UsageSpread if !wanted.is_empty() => {
+                            // 분산 교체는 소진이 아니라 균형이 목적이다. 막힌 것은 없고, 유휴
+                            // 세션들이 쓰는 모델군을 잃지 않는 자리로만 간다. 격차 조건은 아래
+                            // `usage_gap`이 본다.
+                            (
+                                BTreeSet::new(),
+                                open.intersection(wanted).cloned().collect(),
+                            )
+                        }
+                        AutoSwitchReason::UsageExhausted if !wanted.is_empty() => {
+                            // 묶인 세션들의 모델군 중 실제로 막힌 것이 있어야 옮길 이유가 있다 —
+                            // 전부 열려 있으면 그 세션들은 이 계정에서 멀쩡히 돌고 있으니 옮기지
+                            // 않는다(도중인 턴을 끊어 다른 계정에 다시 묶는 것은 비용이다). 기본
+                            // 계정 회전은 다른 질문이라 전환 루프가 계정 전체 목적으로 따로 묻는다.
+                            let blocked: BTreeSet<String> =
+                                blocked.intersection(wanted).cloned().collect();
+                            if blocked.is_empty() {
+                                return None;
+                            }
+                            (blocked, open.intersection(wanted).cloned().collect())
+                        }
+                        AutoSwitchReason::AgentLimited if relax_open => {
+                            // 막힌 실행이 확실히 있는데 모델군을 가릴 수 없고, 열린 모델군을 지키는
+                            // 자리도 없었다. 어디든 아직 살아 있는 곳으로 옮기는 편이 리셋까지
+                            // 세우는 것보다 낫다.
+                            (blocked, BTreeSet::new())
+                        }
+                        _ => {
+                            // 무엇을 하려던 참인지 모르는 전환. 상보적으로 소진된 두 계정이 서로를
+                            // 고르지 않게, 열린 모델군을 잃는 자리는 뺀다. 정말로 다 막힌 계정은
+                            // 열린 것이 없어 멀쩡한 계정으로 그대로 회전한다.
+                            (blocked, open)
+                        }
+                    }
+                }
+            }
+        };
+        let must_serve_models: &[String] = if purpose.reason == AutoSwitchReason::AgentLimited {
+            &groups.classified_models
+        } else {
+            &[]
+        };
+        Some(Self {
+            provider,
+            active_account_id,
+            now,
+            usage_gap,
+            blocked_groups,
+            open_groups,
+            must_serve_models,
+        })
+    }
+
+    fn permits(&self, account: &AccountRecord) -> bool {
+        account.provider == self.provider
+            && account.id != self.active_account_id
             && account.auto_switch
             && !account.disabled
             && account.auth_status == AccountAuthStatus::Ready
-            && !usage_blocks_auto_switch(&account.usage, now)
-            && match (min_usage_gap_percent, limited_used_percent) {
-                (Some(gap), Some(limited)) => usage_used_percent(&account.usage)
-                    .is_some_and(|candidate| limited - candidate >= gap),
-                _ => true,
-            }
-    };
-    match policy {
-        AutoSwitchPolicy::Registration => {
-            if accounts.is_empty() {
-                return None;
-            }
-            let start = accounts
-                .iter()
-                .position(|account| account.id == active_account_id)
-                .map(|index| index + 1)
-                .unwrap_or(0);
-            (0..accounts.len())
-                .map(|offset| &accounts[(start + offset) % accounts.len()])
-                .find(|account| eligible(account))
-                .map(|account| account.id.clone())
-        }
-        AutoSwitchPolicy::Priority => accounts
-            .iter()
-            .enumerate()
-            .filter(|(_, account)| eligible(account))
-            // 우선순위가 없는 계정은 지정된 계정 뒤로 밀고, 같은 순위끼리는 등록 순.
-            .min_by_key(|(index, account)| {
-                (
-                    account.auto_switch_priority.is_none(),
-                    account.auto_switch_priority.unwrap_or(u32::MAX),
-                    *index,
-                )
+            && !usage_blocks_auto_switch(&account.usage, self.now)
+            && self.serves_blocked_groups(&account.usage)
+            && self.keeps_open_groups(&account.usage)
+            && self.serves_models(&account.usage)
+            && self.usage_gap.is_none_or(|(gap, limited)| {
+                usage_used_percent(&account.usage)
+                    .is_some_and(|candidate| limited - candidate >= gap)
             })
-            .map(|(_, account)| account.id.clone()),
-        AutoSwitchPolicy::MaxHeadroom => accounts
-            .iter()
-            .enumerate()
-            .filter(|(_, account)| eligible(account))
-            .min_by(|(left_index, left), (right_index, right)| {
-                let key = |account: &AccountRecord, index: usize| {
-                    // 사용량을 아직 읽지 못한 계정은 여유를 알 수 없으므로, 여유를
-                    // 아는 계정 다음 순서로 밀고 그 안에서는 등록 순으로 본다.
-                    // 보존된 수치만 있는 계정은 그 사이에 둔다.
-                    let headroom = usage_headroom_for_selection(&account.usage);
-                    (
-                        headroom.is_none(),
-                        headroom.is_none_or(|(stale, _)| stale),
-                        -headroom.map_or(0.0, |(_, value)| value),
-                        index,
-                    )
-                };
-                let left = key(left, *left_index);
-                let right = key(right, *right_index);
-                left.0
-                    .cmp(&right.0)
-                    .then_with(|| left.1.cmp(&right.1))
-                    .then_with(|| left.2.total_cmp(&right.2))
-                    .then_with(|| left.3.cmp(&right.3))
-            })
-            .map(|(_, account)| account.id.clone()),
     }
+
+    /// 옮겨 가는 실행들이 쓰는 모델군 중 지정 계정에서 열려 있던 것이 후보에서도 열려
+    /// 있는지.
+    ///
+    /// 이 조건이 없으면 상보적으로 소진된 두 계정이 서로를 계속 고른다 — A는 Gemini가
+    /// 막히고 C는 Claude·GPT가 막혔을 때, A에서 보면 C가 Gemini에서 낫고 C에서 보면 A가
+    /// Claude·GPT에서 나으므로 사용량 폴링마다(활성 계정 5분) 상대에게 넘기고 되받으며
+    /// 세션을 다시 묶는다. 쿨다운 60초는 그 주기를 막지 못한다.
+    ///
+    /// 지정 계정이 정말로 다 막혔으면 열린 모델군이 없어 이 조건은 비고, 멀쩡한 계정으로의
+    /// 회전은 그대로 일어난다 — 기본 계정이 소진된 채 묶이지 않는다.
+    fn keeps_open_groups(&self, usage: &AccountUsageView) -> bool {
+        self.open_groups
+            .iter()
+            .all(|group| !model_group_blocked(usage, group, self.now))
+    }
+
+    /// 한도에 걸린 실행의 모델 창이 후보에서 열려 있는지. 모델군 이름을 못 얻어 위 두 판정이
+    /// 비었을 때도 이것은 남는다.
+    fn serves_models(&self, usage: &AccountUsageView) -> bool {
+        self.must_serve_models.iter().all(|model| {
+            model_scoped_windows(self.provider, Some(model), &usage.windows)
+                .iter()
+                .all(|window| {
+                    !(window.used_percent >= 100.0
+                        && window
+                            .resets_at
+                            .is_none_or(|resets_at| resets_at > self.now))
+                })
+        })
+    }
+
+    /// 옮겨 갈 계정에서 막힌 모델군이 **하나라도** 남아 있는지.
+    ///
+    /// 계정 전체 판정만 보면 Gemini가 찬 계정에서 Gemini가 똑같이 찬 계정으로 옮기게 된다.
+    /// 옮긴 실행은 모델군을 아는 게이트가 다시 거부하고([`AccountSupervisor::run_readiness`]),
+    /// `AUTO_SWITCH_COOLDOWN_MS`가 두 번째 전환을 막아 한 회차가 통째로 갇힌다.
+    ///
+    /// 반대로 막힌 모델군을 **전부** 요구하면 너무 좁다. 지정 계정의 모델군이 둘 다 찼을 때
+    /// 이번 전환이 어느 쪽을 위한 것인지는 알 수 없는데, 그때 한 모델군만 비어 있는 계정을
+    /// 빼면 그 계정에서 돌 수 있었을 회차까지 버린다. 막힌 모델군이 하나뿐이면 두 규칙이
+    /// 같으므로, 단일 모델군 동작은 그대로다.
+    fn serves_blocked_groups(&self, usage: &AccountUsageView) -> bool {
+        self.blocked_groups.is_empty()
+            || self
+                .blocked_groups
+                .iter()
+                .any(|group| !model_group_blocked(usage, group, self.now))
+    }
+}
+
+/// 등록 순: 지정된 계정 바로 다음부터 한 바퀴 돌아 처음 만나는 후보.
+fn select_next_in_registration_order(
+    accounts: &[AccountRecord],
+    eligibility: &AutoSwitchEligibility,
+) -> Option<String> {
+    if accounts.is_empty() {
+        return None;
+    }
+    let start = accounts
+        .iter()
+        .position(|account| account.id == eligibility.active_account_id)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    (0..accounts.len())
+        .map(|offset| &accounts[(start + offset) % accounts.len()])
+        .find(|account| eligibility.permits(account))
+        .map(|account| account.id.clone())
+}
+
+/// 우선순위 순. 우선순위가 없는 계정은 지정된 계정 뒤로 밀고, 같은 순위끼리는 등록 순.
+fn select_by_auto_switch_priority(
+    accounts: &[AccountRecord],
+    eligibility: &AutoSwitchEligibility,
+) -> Option<String> {
+    accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, account)| eligibility.permits(account))
+        .min_by_key(|(index, account)| {
+            (
+                account.auto_switch_priority.is_none(),
+                account.auto_switch_priority.unwrap_or(u32::MAX),
+                *index,
+            )
+        })
+        .map(|(_, account)| account.id.clone())
+}
+
+/// 남은 여유가 가장 많은 계정.
+fn select_by_max_headroom(
+    accounts: &[AccountRecord],
+    eligibility: &AutoSwitchEligibility,
+) -> Option<String> {
+    accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, account)| eligibility.permits(account))
+        .min_by(|(left_index, left), (right_index, right)| {
+            let left = max_headroom_rank(left, *left_index, &eligibility.blocked_groups);
+            let right = max_headroom_rank(right, *right_index, &eligibility.blocked_groups);
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.total_cmp(&right.2))
+                .then_with(|| left.3.cmp(&right.3))
+        })
+        .map(|(_, account)| account.id.clone())
+}
+
+/// 여유가 많을수록 앞서는 정렬 키(작은 쪽이 먼저). 사용량을 아직 읽지 못한 계정은 여유를
+/// 알 수 없으므로 여유를 아는 계정 다음 순서로 밀고 그 안에서는 등록 순으로 본다.
+/// 보존된 수치만 있는 계정은 그 사이에 둔다.
+///
+/// 막힌 모델군이 있으면 그 모델군의 여유로 줄을 세운다. 계정 대표 여유는 가장 빡빡한
+/// 모델군의 것이라, Gemini가 90%고 Claude/GPT가 비어 있는 계정은 Claude/GPT 회차를 옮길
+/// 자리인데도 여유 10%로 읽혀 뒤로 밀린다.
+fn max_headroom_rank(
+    account: &AccountRecord,
+    index: usize,
+    blocked_groups: &BTreeSet<String>,
+) -> (bool, bool, f64, usize) {
+    let headroom = usage_headroom_for_selection(&account.usage, blocked_groups);
+    (
+        headroom.is_none(),
+        headroom.is_none_or(|(stale, _)| stale),
+        -headroom.map_or(0.0, |(_, value)| value),
+        index,
+    )
 }
 
 /// 페일오버 대상을 고를 때 쓸 여유(%)와, 그 값이 마지막 성공 조회에서 보존된
@@ -6529,11 +7558,46 @@ fn select_auto_switch_target(
 /// 옮길지 말지를 정하는 능동적 판단이라 낡은 수치로 하면 안 되지만, 이 자리는 이미
 /// 한도에 걸려 어디로든 옮겨야 하는 상황에서 목적지를 고르는 문제다. 그때는 낡은
 /// 정보가 무정보보다 낫다. 다만 신선한 값을 아는 계정을 항상 앞에 둔다.
-fn usage_headroom_for_selection(usage: &AccountUsageView) -> Option<(bool, f64)> {
-    if let Some(headroom) = usage_headroom_percent(usage) {
-        return Some((false, headroom));
+fn usage_headroom_for_selection(
+    usage: &AccountUsageView,
+    blocked_groups: &BTreeSet<String>,
+) -> Option<(bool, f64)> {
+    let headroom = |usage: &AccountUsageView| {
+        if blocked_groups.is_empty() {
+            tightest_window_headroom(&usage.windows)
+        } else {
+            model_group_headroom(&usage.windows, blocked_groups)
+        }
+    };
+    if usage.status == AccountUsageStatus::Ok {
+        if let Some(value) = headroom(usage) {
+            return Some((false, value));
+        }
     }
-    Some((true, tightest_window_headroom(&usage.windows)?))
+    Some((true, headroom(usage)?))
+}
+
+/// 이 모델군들에 남은 여유(%). 그 모델군 창을 하나도 보고하지 않는 계정은 여유를 알 수
+/// 없다(None).
+///
+/// 한 모델군 안에서는 창이 **모두** 여유가 있어야 돌므로 가장 빡빡한 창이 그 모델군의
+/// 여유다. 모델군 사이에서는 하나만 돌아도 옮길 값어치가 있으므로([`AutoSwitchEligibility::
+/// serves_blocked_groups`]) 가장 여유 있는 모델군이 이 계정의 값이다. 반대로 잡으면 막힌
+/// 모델군 중 하나가 소진된 계정이 곧바로 여유 0으로 읽혀, 실제로 돌 수 있는 목적지가 줄 맨
+/// 뒤로 밀린다.
+fn model_group_headroom(
+    windows: &[AccountUsageWindow],
+    blocked_groups: &BTreeSet<String>,
+) -> Option<f64> {
+    let mut groups: BTreeMap<&str, f64> = BTreeMap::new();
+    for window in windows.iter().filter(|window| {
+        window.model_scoped && blocked_groups.contains(model_group_of(&window.label))
+    }) {
+        let used = groups.entry(model_group_of(&window.label)).or_insert(0.0);
+        *used = used.max(window.used_percent);
+    }
+    let loosest = groups.into_values().reduce(f64::min)?;
+    Some((100.0 - loosest).clamp(0.0, 100.0))
 }
 
 /// 이 계정이 쓴 사용량(%). 창이 여러 개면 가장 빡빡한 창을 기준으로 본다 — 실제로
@@ -6559,6 +7623,34 @@ fn tightest_window_headroom(windows: &[AccountUsageWindow]) -> Option<f64> {
         .map(|window| window.used_percent)
         .reduce(f64::max)?;
     Some((100.0 - tightest).clamp(0.0, 100.0))
+}
+
+/// 이 계정으로 지금 실행할 수 있는지의 순수 판정. [`AccountSupervisor::run_readiness`]와
+/// 자동전환의 기본 계정 회전([`AccountSupervisor::request_active_account_rotation`])이 같은
+/// 규칙을 쓴다 — 한쪽에만 조건을 더하면 실행은 막히는데 기본 계정으로는 앉히는 어긋남이 생긴다.
+///
+/// 한도에 걸린 계정으로 실행을 시작하면 CLI를 띄워 놓고 곧바로 한도 오류를 받으므로 미리
+/// 걸러 리셋될 때까지 대기시킨다. 이번 실행의 모델을 알면 그 모델군 창만 본다 — 다른 모델군의
+/// 소진은 이 실행과 상관이 없고, 계정 전체로 막으면 페이싱이 뽑은 계정을 여기서 거부하게 된다.
+fn account_readiness(
+    account: &AccountRecord,
+    provider: ProviderId,
+    model: Option<&str>,
+    now: i64,
+) -> RunReadiness {
+    if account.provider != provider || account.disabled {
+        return RunReadiness::Disabled;
+    }
+    if let Some(readiness) = auth_readiness(account.auth_status, &account.usage) {
+        return readiness;
+    }
+    let model_windows = model_scoped_windows(provider, model, &account.usage.windows);
+    if usage_blocks_run(&account.usage, &model_windows, now) {
+        return RunReadiness::UsageExhausted {
+            resume_at: usage_resume_at(&account.usage, &model_windows, now),
+        };
+    }
+    RunReadiness::Ready
 }
 
 /// 인증 상태가 실행을 막는지, 막는다면 어떤 이유인지. `Ready`면 `None`을 준다.
@@ -6660,8 +7752,6 @@ fn lock<'a, T>(mutex: &'a Mutex<T>, label: &str) -> Result<MutexGuard<'a, T>, Co
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
-    use std::os::unix::fs::PermissionsExt;
 
     #[derive(Default)]
     struct MemoryVault(Mutex<HashMap<String, String>>);
@@ -7000,10 +8090,13 @@ mod tests {
     /// 그 창을 가드로 지정할 수 없게 되므로 만들 때 자른다.
     #[test]
     fn long_model_names_stay_within_the_policy_label_limit() {
-        let label = claude_model_window_label(&"가".repeat(200));
+        let label = scoped_window_label(&"가".repeat(200), CLAUDE_WEEKLY_SCOPED_LABEL_LENGTH);
         assert!(label.chars().count() <= crate::usage_budget_policy::MAX_LABEL_CHARS);
         assert!(label.ends_with(" 7일"));
-        assert_eq!(claude_model_window_label("Fable"), "Fable 7일");
+        assert_eq!(
+            scoped_window_label("Fable", CLAUDE_WEEKLY_SCOPED_LABEL_LENGTH),
+            "Fable 7일"
+        );
     }
 
     /// 모델별 창이 하나도 없는 응답(그 버킷을 받지 않는 플랜)에서도 계정 전체 창은
@@ -7035,6 +8128,7 @@ mod tests {
                     used_percent: 100.0,
                     resets_at: Some(9_000),
                     model_scoped: true,
+                    aggregate: false,
                 },
             ],
             updated_at: Some(0),
@@ -7042,7 +8136,7 @@ mod tests {
         };
         assert!(!usage_indicates_exhaustion(&usage));
         assert!(!usage_blocks_auto_switch(&usage, 1_000));
-        assert_eq!(usage_resume_at(&usage, 1_000), None);
+        assert_eq!(usage_resume_at(&usage, &[], 1_000), None);
         assert_eq!(usage_used_percent(&usage), Some(20.0));
     }
 
@@ -7062,7 +8156,7 @@ mod tests {
             ..AccountUsageView::default()
         };
         assert_eq!(usage_used_percent(&usage), None);
-        assert_eq!(usage_headroom_for_selection(&usage), None);
+        assert_eq!(usage_headroom_for_selection(&usage, &BTreeSet::new()), None);
     }
 
     #[test]
@@ -7389,6 +8483,7 @@ mod tests {
                 },
                 note: None,
                 label: None,
+                credential_expires_at: None,
                 created_at: now_ms(),
                 updated_at: now_ms(),
             });
@@ -7440,83 +8535,6 @@ mod tests {
             keyring::default::default_credential_builder().persistence(),
             keyring::credential::CredentialPersistence::UntilDelete
         ));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_keychain_fields_allow_official_claude_service_names() {
-        assert!(validate_keychain_field("Claude Code-credentials", "service").is_ok());
-        assert!(validate_keychain_field("Claude Code-credentials-15fa340b", "service").is_ok());
-        assert!(validate_keychain_field("Claude\nCode-credentials", "service").is_err());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_security_writer_supports_large_structured_arguments() {
-        let temp = tempfile::tempdir().unwrap();
-        let executable = temp.path().join("security-stub");
-        fs::write(
-            &executable,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0}.args\"\ncat > \"${0}.stdin\"\n",
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&executable, permissions).unwrap();
-        let secret = format!(r#"{{"token":"{}"}}"#, "x".repeat(16 * 1024));
-
-        write_macos_keychain_password_with_executable(
-            &executable,
-            "com.shinc.agentmanager.test",
-            "test-account",
-            &secret,
-        )
-        .unwrap();
-
-        let arguments = fs::read_to_string(format!("{}.args", executable.display())).unwrap();
-        let lines = arguments.lines().collect::<Vec<_>>();
-        assert_eq!(
-            &lines[..7],
-            [
-                "add-generic-password",
-                "-U",
-                "-s",
-                "com.shinc.agentmanager.test",
-                "-a",
-                "test-account",
-                "-w"
-            ]
-        );
-        assert_eq!(lines[7], secret);
-        assert!(
-            fs::read_to_string(format!("{}.stdin", executable.display()))
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_security_failure_does_not_expose_secret_in_error() {
-        let temp = tempfile::tempdir().unwrap();
-        let executable = temp.path().join("security-stub");
-        fs::write(&executable, "#!/bin/sh\ncat >&2\nexit 9\n").unwrap();
-        let mut permissions = fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&executable, permissions).unwrap();
-        let secret = r#"{"token":"must-not-leak"}"#;
-
-        let error = write_macos_keychain_password_with_executable(
-            &executable,
-            "com.shinc.agentmanager.test",
-            "test-account",
-            secret,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(!error.contains(secret));
-        assert!(error.contains("종료 코드 9"));
     }
 
     #[test]
@@ -7602,6 +8620,7 @@ mod tests {
             usage: AccountUsageView::default(),
             note: None,
             label: None,
+            credential_expires_at: None,
             created_at: now_ms(),
             updated_at: now_ms(),
         }
@@ -7734,6 +8753,31 @@ mod tests {
             );
             // 같은 값에 대한 요청 시도 판정은 지금까지처럼 "만료 아님"으로 남는다.
             assert!(!claude_access_token_expired(&secret, now));
+        }
+    }
+
+    /// 사슬 만료는 액세스 토큰 만료와 다른 칸에서 읽는다. 둘을 섞으면 몇 시간짜리
+    /// 액세스 만료를 재인증 예고로 띄워 매일 재인증을 재촉하게 된다.
+    #[test]
+    fn credential_chain_expiry_reads_the_refresh_token_field_for_claude_only() {
+        let secret = r#"{"claudeAiOauth":{"accessToken":"live","expiresAt":111,"refreshToken":"r","refreshTokenExpiresAt":999}}"#;
+        assert_eq!(
+            credential_chain_expires_at(ProviderId::Claude, secret),
+            Some(999)
+        );
+        // 만료를 밝히지 않는 공급자·형식은 값이 없다 — 추정하지 않는다.
+        assert_eq!(credential_chain_expires_at(ProviderId::Codex, secret), None);
+        for secret in [
+            r#"{"claudeAiOauth":{"accessToken":"live","expiresAt":111}}"#,
+            r#"{"claudeAiOauth":{"refreshTokenExpiresAt":"999"}}"#,
+            r#"{"tokens":{"refresh_token":"r"}}"#,
+            "not json",
+        ] {
+            assert_eq!(
+                credential_chain_expires_at(ProviderId::Claude, secret),
+                None,
+                "만료를 밝히지 않은 값에서 시각을 지어냈습니다: {secret}"
+            );
         }
     }
 
@@ -8012,17 +9056,17 @@ mod tests {
             }
         });
         assert_eq!(
-            claude_credential_scope(&secret).as_deref(),
+            ClaudeOauthEnvelope(secret).scope().as_deref(),
             Some("user:inference user:profile")
         );
         // 스코프가 없으면 파라미터를 아예 빼야 한다. 빈 문자열을 보내면 스코프를
         // 지우라는 요청으로 읽힐 수 있다.
         assert_eq!(
-            claude_credential_scope(&serde_json::json!({"claudeAiOauth": {"scopes": []}})),
+            ClaudeOauthEnvelope(serde_json::json!({"claudeAiOauth": {"scopes": []}})).scope(),
             None
         );
         assert_eq!(
-            claude_credential_scope(&serde_json::json!({"claudeAiOauth": {}})),
+            ClaudeOauthEnvelope(serde_json::json!({"claudeAiOauth": {}})).scope(),
             None
         );
     }
@@ -8225,6 +9269,196 @@ mod tests {
         assert!(usage_blocks_auto_switch(&usage_limit, now));
     }
 
+    const HOUR_MS: i64 = 60 * 60_000;
+
+    /// 모델군마다 쿼터가 따로인 공급자의 사용량. 계정 대표 창은 빡빡한 쪽의 복사본이다
+    /// (`antigravity_usage::combined_usage`와 같은 모양).
+    fn model_group_usage(gemini: f64, third_party: f64, resets_at: i64) -> AccountUsageView {
+        let window = |label: &str, used: f64, scoped: bool, aggregate: bool| AccountUsageWindow {
+            label: label.to_owned(),
+            used_percent: used,
+            resets_at: (used > 0.0).then_some(resets_at),
+            model_scoped: scoped,
+            aggregate,
+        };
+        AccountUsageView {
+            status: AccountUsageStatus::Ok,
+            windows: vec![
+                window("7일", gemini.max(third_party), false, true),
+                window("Gemini Models · 7일", gemini, true, false),
+                window("Claude and GPT models · 7일", third_party, true, false),
+            ],
+            updated_at: Some(0),
+            ..Default::default()
+        }
+    }
+
+    /// 한 모델군이 다 찼다고 계정을 통째로 빼면 다른 모델군의 쿼터를 버리게 된다. 계정
+    /// 대표 창은 빡빡한 모델군의 복사본이라, 그 창을 소진 판정에 세면 `model_scoped`를
+    /// 빼 둔 방어가 대표 창을 통해 되살아난다.
+    #[test]
+    fn one_exhausted_model_group_does_not_exhaust_the_account() {
+        let now = 1_000_000;
+        let resets_at = now + HOUR_MS;
+        let gemini_gone = model_group_usage(100.0, 0.0, resets_at);
+        assert!(!usage_blocks_auto_switch(&gemini_gone, now));
+        // 다만 자동전환을 **고려할** 값어치는 있다. 그 모델군 실행은 이 계정에서 더 돌지
+        // 못하고, 게이트가 모델군을 알아본 뒤로는 한도 오류조차 나지 않아 이 신호가
+        // 아니면 활성 계정이 리셋까지 그대로 앉아 있는다.
+        assert!(usage_indicates_exhaustion(&gemini_gone));
+
+        // 모든 모델군이 차야 계정이 막힌 것이다.
+        let both_gone = model_group_usage(100.0, 100.0, resets_at);
+        assert!(usage_blocks_auto_switch(&both_gone, now));
+        assert!(usage_indicates_exhaustion(&both_gone));
+
+        // 창을 하나도 읽지 못한 계정은 소진이 아니다 — 모르는 것과 다 쓴 것은 다르다.
+        assert!(!usage_blocks_auto_switch(&AccountUsageView::default(), now));
+
+        // 자기 대표 창을 가진 공급자는 종전 그대로 그 창 하나로 판정한다.
+        let plain = AccountUsageView {
+            status: AccountUsageStatus::Ok,
+            windows: vec![AccountUsageWindow {
+                label: "7일".to_owned(),
+                used_percent: 100.0,
+                resets_at: Some(resets_at),
+                ..Default::default()
+            }],
+            updated_at: Some(0),
+            ..Default::default()
+        };
+        assert!(usage_blocks_auto_switch(&plain, now));
+
+        // 대표 한도 없이 모델 한정 창만 오는 응답(Claude `limits[]`)은 모델군 규칙으로
+        // 넘어가지 않는다. 넘어가면 모델 하나의 소진이 계정 전체를 막아, `model_scoped`가
+        // 막으려던 구멍이 그대로 다시 열린다.
+        let model_only = AccountUsageView {
+            status: AccountUsageStatus::Ok,
+            windows: vec![AccountUsageWindow {
+                label: "Fable 7일".to_owned(),
+                used_percent: 100.0,
+                resets_at: Some(resets_at),
+                model_scoped: true,
+                aggregate: false,
+            }],
+            updated_at: Some(0),
+            ..Default::default()
+        };
+        assert!(!usage_blocks_auto_switch(&model_only, now));
+        assert!(!usage_indicates_exhaustion(&model_only));
+    }
+
+    /// 계정이 다시 열리는 시각은 **가장 먼저 풀리는 모델군**이다. 그룹 안에서는 찬 창이
+    /// 모두 풀려야 하므로 늦은 쪽을 본다. 뭉뚱그려 가장 이른 시각을 말하면 아직 거부되는
+    /// 시각을, 가장 늦은 시각을 말하면 이미 받아들여질 회차를 더 기다리라고 안내한다.
+    #[test]
+    fn an_exhausted_account_reopens_when_its_first_model_group_clears() {
+        let now = 1_000_000;
+        let gemini_five_hour = now + HOUR_MS;
+        let gemini_weekly = now + 100 * HOUR_MS;
+        let third_party_weekly = now + 50 * HOUR_MS;
+        let window =
+            |label: &str, resets_at: i64, scoped: bool, aggregate: bool| AccountUsageWindow {
+                label: label.to_owned(),
+                used_percent: 100.0,
+                resets_at: Some(resets_at),
+                model_scoped: scoped,
+                aggregate,
+            };
+        let usage = AccountUsageView {
+            status: AccountUsageStatus::Ok,
+            windows: vec![
+                window("5시간", gemini_five_hour, false, true),
+                window("7일", gemini_weekly, false, true),
+                window("Gemini Models · 5시간", gemini_five_hour, true, false),
+                window("Gemini Models · 7일", gemini_weekly, true, false),
+                window(
+                    "Claude and GPT models · 7일",
+                    third_party_weekly,
+                    true,
+                    false,
+                ),
+            ],
+            updated_at: Some(0),
+            ..Default::default()
+        };
+        assert!(usage_blocks_run(&usage, &[], now));
+        // Gemini는 100시간 뒤에야 다 풀리고 Claude/GPT는 50시간 뒤다 — 계정은 그때 열린다.
+        assert_eq!(
+            usage_resume_at(&usage, &[], now),
+            Some(third_party_weekly),
+            "먼저 풀리는 모델군이 계정을 연다"
+        );
+        // 모델을 밝힌 실행은 그 모델군만 기다린다.
+        let gemini = model_scoped_windows(
+            ProviderId::Antigravity,
+            Some("gemini-3.8-flash-high"),
+            &usage.windows,
+        );
+        assert_eq!(usage_resume_at(&usage, &gemini, now), Some(gemini_weekly));
+    }
+
+    /// 이번 실행의 모델을 알면 그 모델군 창만 본다. 재개 시각도 그 창의 리셋이어야 한다 —
+    /// 다른 모델군이 더 늦게 풀린다고 이 실행까지 그때까지 기다릴 이유가 없다.
+    #[test]
+    fn a_declared_model_is_gated_by_its_own_group_window() {
+        let now = 1_000_000;
+        let gemini_reset = now + HOUR_MS;
+        let mut usage = model_group_usage(100.0, 0.0, gemini_reset);
+        let third_party_reset = now + 50 * HOUR_MS;
+        usage.windows.push(AccountUsageWindow {
+            label: "Claude and GPT models · 5시간".to_owned(),
+            used_percent: 100.0,
+            resets_at: Some(third_party_reset),
+            model_scoped: true,
+            aggregate: false,
+        });
+
+        let windows_for =
+            |model| model_scoped_windows(ProviderId::Antigravity, model, &usage.windows);
+        let claude = windows_for(Some("claude-opus-4-6-thinking"));
+        assert!(usage_blocks_run(&usage, &claude, now));
+        assert_eq!(
+            usage_resume_at(&usage, &claude, now),
+            Some(third_party_reset)
+        );
+
+        let gemini = windows_for(Some("gemini-3.8-flash-high"));
+        assert!(usage_blocks_run(&usage, &gemini, now));
+        assert_eq!(usage_resume_at(&usage, &gemini, now), Some(gemini_reset));
+
+        // 판정을 가르는 자리: Gemini만 소진된 계정이다. 계정은 쓸 수 있지만(Claude/GPT가
+        // 비어 있다) Gemini 모델로는 띄울 수 없다 — 계정 전체 판정만으로는 CLI를 띄워
+        // 놓고 곧바로 한도 오류를 받는다.
+        let one_group_gone = model_group_usage(100.0, 0.0, gemini_reset);
+        let of =
+            |model| model_scoped_windows(ProviderId::Antigravity, model, &one_group_gone.windows);
+        assert!(!usage_blocks_run(&one_group_gone, &[], now));
+        assert!(!usage_blocks_run(
+            &one_group_gone,
+            &of(Some("claude-opus-4-6-thinking")),
+            now
+        ));
+        assert!(usage_blocks_run(
+            &one_group_gone,
+            &of(Some("gemini-3.8-flash-high")),
+            now
+        ));
+
+        // 모델군을 가릴 수 없는 이름은 계정 전체 판정으로 둔다. 모델을 적었다고 밝히지
+        // 않은 실행보다 더 막히면 뒤집힌 결과다.
+        assert!(
+            model_scoped_windows(ProviderId::Antigravity, Some("auto"), &usage.windows).is_empty()
+        );
+
+        // 모델군이 없는 공급자와 모델을 밝히지 않은 실행은 계정 전체 판정 그대로다.
+        assert!(
+            model_scoped_windows(ProviderId::Claude, Some("claude-opus-5"), &usage.windows)
+                .is_empty()
+        );
+        assert!(model_scoped_windows(ProviderId::Antigravity, None, &usage.windows).is_empty());
+    }
+
     #[test]
     fn bulk_usage_refresh_skips_accounts_whose_retry_window_has_not_arrived() {
         let now = 1_000_000;
@@ -8290,7 +9524,7 @@ mod tests {
                 ..AccountUsageView::default()
             };
         }
-        supervisor.report_agent_usage_limit(&a, None).unwrap();
+        supervisor.report_agent_usage_limit(&a, None, None).unwrap();
         let state = supervisor.inner.state.lock().unwrap();
         let usage = &account_by_id(&state.registry, &a).unwrap().usage;
         assert!(usage.rate_limited);
@@ -10021,6 +11255,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "active",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::Priority,
                 None,
@@ -10038,6 +11273,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "active",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::Priority,
                 None,
@@ -10072,6 +11308,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "active",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::MaxHeadroom,
                 None,
@@ -10089,6 +11326,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "active",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::MaxHeadroom,
                 None,
@@ -10191,6 +11429,30 @@ mod tests {
         assert!(snapshot.accounts[0].is_active);
         assert!(snapshot.accounts[0].is_active);
         assert_eq!(snapshot.accounts[0].display_name, "추가 계정");
+    }
+
+    /// 로그인 프로필 경로는 로그인 CLI의 작업 경로이자 `CODEX_HOME` 값이 된다.
+    /// Windows 확장 경로(`\\?\C:\…`)를 그대로 주면 npm 배치 셈(`codex.cmd`)을
+    /// 도는 `cmd.exe`가 `UNC 경로는 지원되지 않습니다`로 물러난 뒤 `지정된 경로를 찾을
+    /// 수 없습니다`로 끝나, 계정 추가가 `CLI 종료: 1`로 돌아왔다.
+    #[test]
+    fn login_profile_path_is_shaped_for_the_provider_cli() {
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let supervisor = AccountSupervisor::open_with(
+            data.path(),
+            home.path(),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+        let login = supervisor.begin_login(ProviderId::Codex, None).unwrap();
+        assert!(
+            !login.profile_path.starts_with(r"\\?\"),
+            "로그인 프로필 경로에 확장 경로 접두어가 남았습니다: {}",
+            login.profile_path
+        );
+        assert!(PathBuf::from(&login.profile_path).is_dir());
+        supervisor.cancel_login(&login.id).unwrap();
     }
 
     #[test]
@@ -10731,6 +11993,7 @@ mod tests {
             usage,
             note: None,
             label: None,
+            credential_expires_at: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -10772,6 +12035,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "a",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::Registration,
                 None,
@@ -10784,6 +12048,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "f",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::Registration,
                 None,
@@ -10796,6 +12061,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "a",
+                &no_purpose(),
                 now + 120_000,
                 AutoSwitchPolicy::Registration,
                 None,
@@ -10808,6 +12074,695 @@ mod tests {
                 &only_active,
                 ProviderId::Codex,
                 "a",
+                &no_purpose(),
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            ),
+            None
+        );
+    }
+
+    /// 무엇을 하려던 참인지 모르는 사용량 트리거의 전환 목적.
+    fn no_purpose() -> SwitchPurpose<'static> {
+        SwitchPurpose {
+            models: &[],
+            reason: AutoSwitchReason::UsageExhausted,
+            intent: SwitchIntent::Rebind,
+        }
+    }
+
+    /// 모델군마다 쿼터가 따로인 계정. 대표 창은 빡빡한 모델군의 복사본이다.
+    fn model_group_account(id: &str, gemini: f64, third_party: f64) -> AccountRecord {
+        let window = |label: &str, used: f64, scoped: bool, aggregate: bool| AccountUsageWindow {
+            label: label.to_owned(),
+            used_percent: used,
+            resets_at: (used >= 100.0).then_some(i64::MAX),
+            model_scoped: scoped,
+            aggregate,
+        };
+        let usage = AccountUsageView {
+            status: AccountUsageStatus::Ok,
+            windows: vec![
+                window("7일", gemini.max(third_party), false, true),
+                window("Gemini Models · 7일", gemini, true, false),
+                window("Claude and GPT models · 7일", third_party, true, false),
+            ],
+            updated_at: Some(0),
+            ..Default::default()
+        };
+        AccountRecord {
+            provider: ProviderId::Antigravity,
+            ..auto_switch_record(id, true, usage)
+        }
+    }
+
+    /// 전환은 막힌 **모델군**을 쓸 수 있는 계정으로 가야 한다. 계정 전체 판정만 보면 같은
+    /// 모델군이 똑같이 찬 계정으로 옮기고, 옮긴 실행은 모델군을 아는 게이트가 다시 거부하며
+    /// 쿨다운이 두 번째 전환을 막아 한 회차가 통째로 갇힌다.
+    #[test]
+    fn auto_switch_target_serves_the_model_group_that_was_blocked() {
+        let now = 1_000_000;
+        let accounts = vec![
+            // 활성 계정: Gemini가 찼다.
+            model_group_account("a", 100.0, 10.0),
+            // Gemini가 똑같이 찬 계정 — 옮겨 봐야 같은 자리다.
+            model_group_account("b", 100.0, 0.0),
+            // Gemini가 남아 있는 계정.
+            model_group_account("c", 20.0, 90.0),
+        ];
+        for policy in [
+            AutoSwitchPolicy::Registration,
+            AutoSwitchPolicy::Priority,
+            AutoSwitchPolicy::MaxHeadroom,
+        ] {
+            assert_eq!(
+                select_auto_switch_target(
+                    &accounts,
+                    ProviderId::Antigravity,
+                    "a",
+                    &no_purpose(),
+                    now,
+                    policy,
+                    None
+                ),
+                Some("c".to_owned()),
+                "{policy:?}"
+            );
+        }
+
+        // 여유 정책은 막힌 모델군의 여유로 줄을 세운다. 계정 대표 여유로 보면 Claude/GPT가
+        // 90%인 c(대표 여유 10%)가 Gemini 80%인 d(대표 여유 20%)에 밀리지만, 이번에 옮겨야
+        // 하는 것은 Gemini 회차다.
+        let mut with_d = accounts.clone();
+        with_d.push(model_group_account("d", 80.0, 0.0));
+        assert_eq!(
+            select_auto_switch_target(
+                &with_d,
+                ProviderId::Antigravity,
+                "a",
+                &no_purpose(),
+                now,
+                AutoSwitchPolicy::MaxHeadroom,
+                None,
+            ),
+            Some("c".to_owned())
+        );
+
+        // 막힌 모델군을 가릴 수 없으면(모델군 쿼터가 아닌 공급자) 종전 그대로 계정 전체
+        // 판정으로 고른다.
+        let codex = vec![
+            auto_switch_record("a", true, exhausted_usage(Some(now + 60_000))),
+            auto_switch_record("b", true, AccountUsageView::default()),
+        ];
+        assert_eq!(
+            select_auto_switch_target(
+                &codex,
+                ProviderId::Codex,
+                "a",
+                &no_purpose(),
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            ),
+            Some("b".to_owned())
+        );
+    }
+
+    /// 상보적으로 소진된 두 계정은 서로를 고르지 않는다. 모델을 모르는 전환에서 한쪽만
+    /// 나아지고 다른 쪽이 나빠지는 자리로 옮기면, 사용량 폴링마다 상대에게 넘기고 되받으며
+    /// 세션을 다시 묶는다(쿨다운 60초는 5분 폴링 주기를 막지 못한다).
+    #[test]
+    fn complementary_exhaustion_does_not_hand_the_account_back_and_forth() {
+        let now = 1_000_000;
+        // A는 Gemini가 막혔고 C는 Claude·GPT가 막혔다.
+        let swap = vec![
+            model_group_account("a", 100.0, 30.0),
+            model_group_account("c", 20.0, 100.0),
+        ];
+        for (from, to) in [("a", "c"), ("c", "a")] {
+            assert_eq!(
+                select_auto_switch_target(
+                    &swap,
+                    ProviderId::Antigravity,
+                    from,
+                    &no_purpose(),
+                    now,
+                    AutoSwitchPolicy::Registration,
+                    None,
+                ),
+                None,
+                "{from} → {to}는 한쪽을 잃는 자리다"
+            );
+        }
+
+        // 기본 계정 회전은 그대로 일어난다 — 멀쩡한 계정이 놀고 있는데 소진된 계정에
+        // 묶여 있으면 그 계정을 쓰는 회차가 통째로 멈춘다.
+        let healthy = vec![
+            model_group_account("a", 100.0, 100.0),
+            model_group_account("c", 10.0, 10.0),
+        ];
+        assert_eq!(
+            select_auto_switch_target(
+                &healthy,
+                ProviderId::Antigravity,
+                "a",
+                &no_purpose(),
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            ),
+            Some("c".to_owned())
+        );
+
+        // 모델이 실려 오면 목적이 분명하므로 그 모델군만 본다 — 다른 모델군을 잃더라도
+        // 지금 막힌 쪽을 쓸 수 있는 계정으로 간다.
+        assert_eq!(
+            select_auto_switch_target(
+                &swap,
+                ProviderId::Antigravity,
+                "a",
+                &SwitchPurpose {
+                    models: &["gemini-3.8-flash-high".to_owned()],
+                    reason: AutoSwitchReason::AgentLimited,
+                    intent: SwitchIntent::Rebind,
+                },
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            ),
+            Some("c".to_owned())
+        );
+    }
+
+    /// 옮겨 갈 실행들의 모델이 후보 자격을 정한다. 같은 사용량이라도 붙은 세션이 Gemini면
+    /// Gemini가 남은 계정으로 가고, Claude·GPT면 아직 멀쩡한 자리라 옮기지 않는다.
+    #[test]
+    fn bound_session_models_decide_which_group_must_survive() {
+        let now = 1_000_000;
+        // a는 Gemini가 막혔고 c는 Claude·GPT가 막혔다.
+        let accounts = vec![
+            model_group_account("a", 100.0, 30.0),
+            model_group_account("c", 20.0, 100.0),
+        ];
+        let pick = |models: &[String]| {
+            select_auto_switch_target(
+                &accounts,
+                ProviderId::Antigravity,
+                "a",
+                &SwitchPurpose {
+                    models,
+                    reason: AutoSwitchReason::UsageExhausted,
+                    intent: SwitchIntent::Rebind,
+                },
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            )
+        };
+        // Gemini 세션이 묶여 있다 — 막힌 쪽이 필요하니 Gemini가 남은 c로 간다. c의 Claude·GPT가
+        // 막힌 것은 이 세션들과 상관없다.
+        assert_eq!(
+            pick(&["gemini-3.8-flash-high".to_owned()]),
+            Some("c".to_owned())
+        );
+        // Claude 세션만 묶여 있다 — a에서 아직 멀쩡히 돌고 있고 c로 가면 막히므로 옮기지 않는다.
+        assert_eq!(pick(&["claude-opus-4-6-thinking".to_owned()]), None);
+        // 둘 다 묶여 있다 — Gemini는 살려야 하고 Claude·GPT는 잃으면 안 되는데 c는 둘을 다
+        // 못 채운다.
+        assert_eq!(
+            pick(&[
+                "gemini-3.8-flash-high".to_owned(),
+                "claude-opus-4-6-thinking".to_owned(),
+            ]),
+            None
+        );
+    }
+
+    /// 한도 응답인데 모델군을 가릴 수 없으면(모델 미상·카탈로그에 없는 이름) 막힌 실행이
+    /// 확실히 있는 쪽을 택한다 — 열린 모델군을 지키느라 유일한 목적지를 버리면 그 세션은
+    /// 주간 리셋까지 선다.
+    #[test]
+    fn an_agent_limit_with_an_unknown_model_still_moves_somewhere_alive() {
+        let now = 1_000_000;
+        let accounts = vec![
+            model_group_account("a", 10.0, 90.0),
+            model_group_account("b", 100.0, 20.0),
+        ];
+        for models in [Vec::new(), vec!["auto".to_owned()]] {
+            assert_eq!(
+                select_auto_switch_target(
+                    &accounts,
+                    ProviderId::Antigravity,
+                    "a",
+                    &SwitchPurpose {
+                        models: &models,
+                        reason: AutoSwitchReason::AgentLimited,
+                        intent: SwitchIntent::Rebind,
+                    },
+                    now,
+                    AutoSwitchPolicy::Registration,
+                    None,
+                ),
+                Some("b".to_owned()),
+                "{models:?}"
+            );
+        }
+    }
+
+    /// 상보적인 후보를 건너뛰고 뒤에 있는 멀쩡한 계정을 고른다. 첫 후보에서 멈추거나 막힌
+    /// 모델군만 보고 줄을 세우면 b를 고르거나 아무도 못 고른다.
+    #[test]
+    fn a_complementary_candidate_is_skipped_for_a_healthy_one_behind_it() {
+        let now = 1_000_000;
+        let accounts = vec![
+            model_group_account("a", 100.0, 30.0),
+            model_group_account("b", 20.0, 100.0),
+            model_group_account("c", 10.0, 10.0),
+        ];
+        for policy in [
+            AutoSwitchPolicy::Registration,
+            AutoSwitchPolicy::Priority,
+            AutoSwitchPolicy::MaxHeadroom,
+        ] {
+            assert_eq!(
+                select_auto_switch_target(
+                    &accounts,
+                    ProviderId::Antigravity,
+                    "a",
+                    &no_purpose(),
+                    now,
+                    policy,
+                    None,
+                ),
+                Some("c".to_owned()),
+                "{policy:?}"
+            );
+        }
+    }
+
+    /// 신호가 모델을 싣고 오면 그 모델군이 이번 전환의 이유다. 사용량에서 거꾸로 짚는 것은
+    /// 한 박자 늦다 — 한도 응답 직후에는 그 모델군이 아직 100%로 보이지 않아, 사용량만 보면
+    /// 막힌 모델군을 못 가리고 계정 전체 판정으로 떨어진다.
+    #[test]
+    fn a_signalled_model_picks_the_group_before_the_usage_catches_up() {
+        let now = 1_000_000;
+        let accounts = vec![
+            // 활성 계정: Claude/GPT로 한도를 받았지만 조회가 아직 그 값을 채우지 못했다.
+            model_group_account("a", 10.0, 90.0),
+            // Claude/GPT는 넉넉하지만 Gemini가 다 찬 계정.
+            model_group_account("b", 100.0, 20.0),
+        ];
+        // 사용량만 보면 막힌 모델군이 없다(100%인 창이 없다). 그러면 두 모델군을 다 지키려
+        // 들고, Gemini를 잃는 b는 후보가 되지 못해 아무 데도 가지 못한다.
+        assert_eq!(
+            select_auto_switch_target(
+                &accounts,
+                ProviderId::Antigravity,
+                "a",
+                &no_purpose(),
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            ),
+            None
+        );
+        // 신호가 모델을 실으면 목적이 분명해진다 — 지금 막힌 Claude/GPT를 쓸 수 있는 곳으로
+        // 가고, 그 대가로 Gemini를 잃는 것은 감수한다.
+        assert_eq!(
+            select_auto_switch_target(
+                &accounts,
+                ProviderId::Antigravity,
+                "a",
+                &SwitchPurpose {
+                    models: &["claude-opus-4-6-thinking".to_owned()],
+                    reason: AutoSwitchReason::AgentLimited,
+                    intent: SwitchIntent::Rebind,
+                },
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            ),
+            Some("b".to_owned())
+        );
+        // 모델군 쿼터를 쓰지 않는 공급자에서는 모델이 실려도 판정이 바뀌지 않는다.
+        let codex = vec![
+            auto_switch_record("a", true, usage_at(90.0)),
+            auto_switch_record("b", true, usage_at(10.0)),
+        ];
+        assert_eq!(
+            select_auto_switch_target(
+                &codex,
+                ProviderId::Codex,
+                "a",
+                &SwitchPurpose {
+                    models: &["gpt-5.6-sol".to_owned()],
+                    reason: AutoSwitchReason::AgentLimited,
+                    intent: SwitchIntent::Rebind,
+                },
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            ),
+            Some("b".to_owned())
+        );
+    }
+
+    /// 한도 응답은 그 모델군이 막혔다는 증거다. 뒤따르는 사용량 조회가 끝나기 전이라 창은
+    /// 아직 90%를 가리키지만, 여유 순위는 그 모델군으로 매겨야 한다 — 계정 대표 창으로
+    /// 매기면 막힌 실행을 그 모델군이 20% 남은 계정에 앉힌다.
+    #[test]
+    fn a_limit_response_ranks_candidates_by_the_limited_group_before_usage_catches_up() {
+        let now = 1_000_000;
+        let accounts = vec![
+            model_group_account("a", 10.0, 90.0),
+            // Claude·GPT가 비어 있지만 Gemini가 90%라 대표 여유는 10%.
+            model_group_account("b", 90.0, 0.0),
+            // Claude·GPT가 80%지만 대표 여유는 20%.
+            model_group_account("c", 10.0, 80.0),
+        ];
+        assert_eq!(
+            select_auto_switch_target(
+                &accounts,
+                ProviderId::Antigravity,
+                "a",
+                &SwitchPurpose {
+                    models: &["claude-opus-4-6-thinking".to_owned()],
+                    reason: AutoSwitchReason::AgentLimited,
+                    intent: SwitchIntent::Rebind,
+                },
+                now,
+                AutoSwitchPolicy::MaxHeadroom,
+                None,
+            ),
+            Some("b".to_owned())
+        );
+    }
+
+    /// 묶인 세션들이 쓰는 모델군이 하나도 막히지 않았으면 옮길 이유가 없다. 멀쩡한 계정이
+    /// 있어도 도중인 턴을 끊어 다시 묶지 않는다.
+    #[test]
+    fn sessions_whose_groups_are_all_open_are_not_moved_even_to_a_healthy_account() {
+        let now = 1_000_000;
+        let accounts = vec![
+            // Gemini는 막혔지만 묶인 세션은 Claude·GPT만 쓴다.
+            model_group_account("a", 100.0, 30.0),
+            model_group_account("d", 10.0, 10.0),
+        ];
+        assert_eq!(
+            select_auto_switch_target(
+                &accounts,
+                ProviderId::Antigravity,
+                "a",
+                &SwitchPurpose {
+                    models: &["claude-opus-4-6-thinking".to_owned()],
+                    reason: AutoSwitchReason::UsageExhausted,
+                    intent: SwitchIntent::Rebind,
+                },
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            ),
+            None
+        );
+    }
+
+    /// 모델군을 가릴 수 없는 한도 응답은 먼저 열린 모델군을 잃지 않는 자리를 찾고, 그런 자리가
+    /// 없을 때만 어디든 살아 있는 곳으로 간다. 한 번에 풀면 등록 순 첫 후보가 막힌 실행이 쓸
+    /// 모델군까지 찬 계정일 수 있다.
+    #[test]
+    fn an_unknown_model_limit_prefers_a_candidate_that_keeps_every_open_group() {
+        let now = 1_000_000;
+        let accounts = vec![
+            model_group_account("a", 10.0, 90.0),
+            model_group_account("b", 100.0, 20.0),
+            model_group_account("d", 40.0, 60.0),
+        ];
+        let purpose = SwitchPurpose {
+            models: &["auto".to_owned()],
+            reason: AutoSwitchReason::AgentLimited,
+            intent: SwitchIntent::Rebind,
+        };
+        assert_eq!(
+            select_auto_switch_target(
+                &accounts,
+                ProviderId::Antigravity,
+                "a",
+                &purpose,
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            ),
+            Some("d".to_owned()),
+            "b는 Gemini를 잃는 자리라 d를 먼저 본다"
+        );
+        // d가 없으면 그때 b로 간다 — 세워 두는 것보다 낫다.
+        assert_eq!(
+            select_auto_switch_target(
+                &accounts[..2],
+                ProviderId::Antigravity,
+                "a",
+                &purpose,
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            ),
+            Some("b".to_owned())
+        );
+    }
+
+    /// 분산 교체는 소진이 아니라 균형이 목적이다. 유휴 세션들의 모델을 알아도 "막힌 것이
+    /// 없으니 옮기지 않는다"로 떨어지면 안 되고, 그 모델군을 잃지 않는 자리 중 격차 조건을
+    /// 만족하는 계정으로 간다.
+    #[test]
+    fn usage_spread_still_rebalances_when_the_idle_sessions_name_their_model() {
+        let now = 1_000_000;
+        let accounts = vec![
+            model_group_account("a", 50.0, 10.0),
+            model_group_account("b", 10.0, 10.0),
+        ];
+        assert_eq!(
+            select_auto_switch_target(
+                &accounts,
+                ProviderId::Antigravity,
+                "a",
+                &SwitchPurpose {
+                    models: &["gemini-3.8-flash-high".to_owned()],
+                    reason: AutoSwitchReason::UsageSpread,
+                    intent: SwitchIntent::Rebind,
+                },
+                now,
+                AutoSwitchPolicy::Registration,
+                Some(20.0),
+            ),
+            Some("b".to_owned())
+        );
+    }
+
+    /// 지정 계정이 창을 아직 보고하지 않았어도(새로 등록한 계정) 한도 응답의 모델은 목적을
+    /// 잃지 않는다 — 후보 쪽 창을 모델로 가려, 그 모델군이 다 찬 계정은 뺀다.
+    #[test]
+    fn a_limit_response_keeps_its_model_when_the_limited_account_has_no_windows() {
+        let now = 1_000_000;
+        let mut fresh = auto_switch_record("a", true, AccountUsageView::default());
+        fresh.provider = ProviderId::Antigravity;
+        let accounts = vec![
+            fresh,
+            // 등록 순 첫 후보인데 Claude·GPT가 다 찼다.
+            model_group_account("b", 20.0, 100.0),
+            model_group_account("c", 20.0, 20.0),
+        ];
+        assert_eq!(
+            select_auto_switch_target(
+                &accounts,
+                ProviderId::Antigravity,
+                "a",
+                &SwitchPurpose {
+                    models: &["claude-opus-4-6-thinking".to_owned()],
+                    reason: AutoSwitchReason::AgentLimited,
+                    intent: SwitchIntent::Rebind,
+                },
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            ),
+            Some("c".to_owned())
+        );
+    }
+
+    /// 기본 계정 회전은 세션 재바인딩과 다른 질문이다. 한도 응답이 모델군을 못 가려도 회전은
+    /// "어디든 살아 있는 곳으로" 완화하지 않는다 — Gemini 실행을 살리려는 신호가 Claude·GPT가
+    /// 다 찬 계정을 기본으로 앉히면 그 뒤의 Claude 대화가 전부 막힌 계정에서 열린다.
+    #[test]
+    fn default_rotation_never_relaxes_the_open_group_guard() {
+        let now = 1_000_000;
+        let accounts = vec![
+            model_group_account("a", 100.0, 30.0),
+            model_group_account("c", 20.0, 100.0),
+        ];
+        let rebind = SwitchPurpose {
+            models: &[],
+            reason: AutoSwitchReason::AgentLimited,
+            intent: SwitchIntent::Rebind,
+        };
+        let rotation = SwitchPurpose {
+            intent: SwitchIntent::DefaultRotation,
+            ..rebind
+        };
+        // 재바인딩 목적(완화 허용): 막힌 실행이 있으니 c로라도 간다.
+        assert_eq!(
+            select_auto_switch_target(
+                &accounts,
+                ProviderId::Antigravity,
+                "a",
+                &rebind,
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            ),
+            Some("c".to_owned())
+        );
+        // 회전 목적(완화 없음): c는 Claude·GPT를 잃는 자리라 기본 계정은 a에 남는다.
+        assert_eq!(
+            select_auto_switch_target(
+                &accounts,
+                ProviderId::Antigravity,
+                "a",
+                &rotation,
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            ),
+            None
+        );
+    }
+
+    /// 기본 계정 회전도 한도에 걸린 실행의 모델은 안전망으로 든다. 지정 계정이 창을 보고한 적
+    /// 없어 모델군을 못 가려도, 그 모델의 창이 막힌 계정을 기본으로 앉히지 않는다 — 앉히면
+    /// 그 모델의 새 대화가 전부 막힌 계정에서 열리고 쿨다운이 되돌리기를 막는다.
+    #[test]
+    fn default_rotation_keeps_the_limited_model_as_a_safety_net() {
+        let now = 1_000_000;
+        let mut fresh = auto_switch_record("a", true, AccountUsageView::default());
+        fresh.provider = ProviderId::Antigravity;
+        let accounts = vec![
+            fresh,
+            // 등록 순 첫 후보인데 Gemini가 다 찼다(대표 창은 100%가 아니다).
+            model_group_account("b", 100.0, 20.0),
+            model_group_account("c", 20.0, 20.0),
+        ];
+        assert_eq!(
+            select_auto_switch_target(
+                &accounts,
+                ProviderId::Antigravity,
+                "a",
+                &SwitchPurpose {
+                    models: &["gemini-3.8-flash-high".to_owned()],
+                    reason: AutoSwitchReason::AgentLimited,
+                    intent: SwitchIntent::DefaultRotation,
+                },
+                now,
+                AutoSwitchPolicy::Registration,
+                None,
+            ),
+            Some("c".to_owned())
+        );
+    }
+
+    /// 두 질문은 한 번에, 한 잠금 안에서 답한다. 옮길 세션이 없으면 재바인딩은 묻지 않고,
+    /// 지정 계정이 기본 계정이 아니면 회전은 묻지 않는다.
+    #[test]
+    fn both_switch_questions_are_answered_together() {
+        let (_data, _home, supervisor, a, b) = two_account_supervisor();
+        supervisor.set_auto_switch(&a, true).unwrap();
+        supervisor.set_auto_switch(&b, true).unwrap();
+        let active = supervisor
+            .active_account_id(ProviderId::Codex)
+            .unwrap()
+            .expect("기본 계정");
+        let other = if active == a { b.clone() } else { a.clone() };
+        let signal = |account: &str| AutoSwitchSignal {
+            provider: ProviderId::Codex,
+            account_id: account.to_owned(),
+            reason: AutoSwitchReason::AgentLimited,
+            chat_id: None,
+            models: Vec::new(),
+        };
+        // 기본 계정의 신호: 세션이 없으면 회전만.
+        let plan = supervisor
+            .plan_auto_switches(&signal(&active), None)
+            .unwrap();
+        assert_eq!(plan.rebind_target, None);
+        assert_eq!(plan.rotate_target, Some(other.clone()));
+        // 세션이 있으면 둘 다.
+        let plan = supervisor
+            .plan_auto_switches(&signal(&active), Some(&[]))
+            .unwrap();
+        assert_eq!(plan.rebind_target, Some(other.clone()));
+        assert_eq!(plan.rotate_target, Some(other.clone()));
+        // 기본 계정이 아닌 계정의 신호는 회전을 묻지 않는다.
+        let plan = supervisor
+            .plan_auto_switches(&signal(&other), Some(&[]))
+            .unwrap();
+        assert_eq!(plan.rebind_target, Some(active.clone()));
+        assert_eq!(plan.rotate_target, None);
+    }
+
+    /// 지정 계정의 모델군이 둘 다 찼으면 이번 전환이 어느 쪽을 위한 것인지 알 수 없다.
+    /// 그때 막힌 모델군을 전부 요구하면 한쪽만 비어 있는 계정을 버리게 된다 — 그 계정에서
+    /// 비어 있는 모델군 회차는 실제로 돈다.
+    #[test]
+    fn a_candidate_serving_one_of_several_blocked_groups_is_still_a_target() {
+        let now = 1_000_000;
+        let accounts = vec![
+            // 활성 계정: 두 모델군이 모두 찼다.
+            model_group_account("a", 100.0, 100.0),
+            // Gemini만 남은 계정. 옮기면 Gemini 회차는 돈다.
+            model_group_account("b", 30.0, 100.0),
+            // Claude/GPT가 더 많이 남은 계정.
+            model_group_account("c", 100.0, 10.0),
+        ];
+        for policy in [AutoSwitchPolicy::Registration, AutoSwitchPolicy::Priority] {
+            assert_eq!(
+                select_auto_switch_target(
+                    &accounts,
+                    ProviderId::Antigravity,
+                    "a",
+                    &no_purpose(),
+                    now,
+                    policy,
+                    None
+                ),
+                Some("b".to_owned()),
+                "{policy:?}"
+            );
+        }
+        // 여유 정책은 살아 있는 모델군의 여유로 고른다 — c의 Claude/GPT 90%p가 b의 Gemini
+        // 70%p보다 넉넉하다. 막힌 모델군 중 빡빡한 쪽을 값으로 삼으면 둘 다 여유 0이 되어
+        // 등록 순으로 떨어졌다.
+        assert_eq!(
+            select_auto_switch_target(
+                &accounts,
+                ProviderId::Antigravity,
+                "a",
+                &no_purpose(),
+                now,
+                AutoSwitchPolicy::MaxHeadroom,
+                None,
+            ),
+            Some("c".to_owned())
+        );
+        // 두 모델군이 모두 찬 계정은 여전히 후보가 아니다.
+        let all_gone = vec![
+            model_group_account("a", 100.0, 100.0),
+            model_group_account("b", 100.0, 100.0),
+        ];
+        assert_eq!(
+            select_auto_switch_target(
+                &all_gone,
+                ProviderId::Antigravity,
+                "a",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::Registration,
                 None,
@@ -10865,6 +12820,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "active",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::MaxHeadroom,
                 None,
@@ -10885,6 +12841,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "active",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::MaxHeadroom,
                 None,
@@ -10904,6 +12861,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "active",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::MaxHeadroom,
                 None,
@@ -11063,6 +13021,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "active",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::Registration,
                 Some(10.0),
@@ -11085,6 +13044,7 @@ mod tests {
                 &balanced,
                 ProviderId::Codex,
                 "active",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::MaxHeadroom,
                 Some(10.0),
@@ -11103,6 +13063,7 @@ mod tests {
                 &widened,
                 ProviderId::Codex,
                 "active",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::MaxHeadroom,
                 Some(10.0),
@@ -11126,6 +13087,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "active",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::MaxHeadroom,
                 Some(10.0),
@@ -11147,6 +13109,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "active",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::Registration,
                 Some(10.0),
@@ -11160,6 +13123,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "active",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::Registration,
                 None,
@@ -11181,6 +13145,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "active",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::Registration,
                 Some(10.0),
@@ -11206,6 +13171,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "a",
+                &no_purpose(),
                 now,
                 AutoSwitchPolicy::Registration,
                 None,
@@ -11217,6 +13183,7 @@ mod tests {
                 &accounts,
                 ProviderId::Codex,
                 "a",
+                &no_purpose(),
                 now + 60_000,
                 AutoSwitchPolicy::Registration,
                 None,
@@ -11245,6 +13212,7 @@ mod tests {
             account_id: active.clone(),
             reason: AutoSwitchReason::UsageExhausted,
             chat_id: None,
+            models: Vec::new(),
         };
         // 활성 계정의 자동전환이 꺼져 있으면 전환하지 않는다.
         assert_eq!(supervisor.plan_auto_switch(&signal).unwrap(), None);
@@ -11263,19 +13231,24 @@ mod tests {
             account_id: other.clone(),
             reason: AutoSwitchReason::AgentLimited,
             chat_id: None,
+            models: Vec::new(),
         };
         assert_eq!(
             supervisor.plan_auto_switch(&other_limited).unwrap(),
             Some(active.clone())
         );
         // 직전 자동전환 기록이 있으면 쿨다운 동안 전환하지 않고 스냅샷에 노출된다.
-        supervisor.record_auto_switch(
-            ProviderId::Codex,
-            &active,
-            &other,
-            AutoSwitchReason::UsageExhausted,
-            2,
-        );
+        supervisor
+            .record_auto_switch(
+                ProviderId::Codex,
+                &active,
+                &other,
+                AutoSwitchReason::UsageExhausted,
+                2,
+                true,
+                None,
+            )
+            .expect("기록");
         assert_eq!(supervisor.plan_auto_switch(&signal).unwrap(), None);
         let recorded = supervisor.snapshot().unwrap();
         let event = recorded
@@ -11290,6 +13263,205 @@ mod tests {
         assert_eq!(event.to_account_id, other);
         assert_eq!(event.reason, AutoSwitchReason::UsageExhausted);
         assert_eq!(event.resumed_session_count, 2);
+    }
+
+    /// 한도 응답은 런타임이 남아 있지 않아도 기본 계정을 옮긴다. 회차의 채팅들이 리스를
+    /// 놓은 뒤에 도착한 신호로도 소진된 기본 계정을 멀쩡한 계정으로 바꿔야, 활성 계정을 쓰는
+    /// 다음 회차가 창 리셋까지 서 있지 않는다.
+    #[test]
+    fn an_agent_limit_rotates_even_without_a_leased_runtime() {
+        let (_data, _home, supervisor, a, b) = two_account_supervisor();
+        supervisor.set_auto_switch(&a, true).unwrap();
+        supervisor.set_auto_switch(&b, true).unwrap();
+        let signal = AutoSwitchSignal {
+            provider: ProviderId::Codex,
+            account_id: a.clone(),
+            reason: AutoSwitchReason::AgentLimited,
+            chat_id: None,
+            models: Vec::new(),
+        };
+        assert_eq!(supervisor.plan_auto_switch(&signal).unwrap(), Some(b));
+    }
+
+    /// 입장 판정은 후보를 고르기 전에 따로 물을 수 있다. 쿨다운 안이거나 자동전환이 꺼진
+    /// 계정의 신호는 거절되고, 그 뒤에야 전환 루프가 살아 있는 채팅을 훑는다.
+    #[test]
+    fn admissibility_is_decided_before_candidates_are_looked_at() {
+        let (_data, _home, supervisor, a, b) = two_account_supervisor();
+        let signal = AutoSwitchSignal {
+            provider: ProviderId::Codex,
+            account_id: a.clone(),
+            reason: AutoSwitchReason::AgentLimited,
+            chat_id: None,
+            models: Vec::new(),
+        };
+        assert!(
+            !supervisor.auto_switch_admissible(&signal).unwrap(),
+            "자동전환이 꺼진 계정"
+        );
+        supervisor.set_auto_switch(&a, true).unwrap();
+        assert!(supervisor.auto_switch_admissible(&signal).unwrap());
+        supervisor
+            .record_auto_switch(
+                ProviderId::Codex,
+                &a,
+                &b,
+                AutoSwitchReason::AgentLimited,
+                1,
+                true,
+                None,
+            )
+            .expect("기록");
+        assert!(
+            !supervisor.auto_switch_admissible(&signal).unwrap(),
+            "쿨다운 안"
+        );
+    }
+
+    /// 저장에 실패한 갱신은 메모리에도 남지 않는다. 메모리만 바뀐 채 실패를 돌려주면 새 대화는
+    /// 바뀐 기본 계정으로 열리고 재기동하면 옛 값으로 돌아가 두 상태가 어긋난다.
+    #[test]
+    fn a_registry_update_that_cannot_be_saved_is_rolled_back() {
+        let (data, _home, supervisor, a, b) = two_account_supervisor();
+        let active = supervisor
+            .active_account_id(ProviderId::Codex)
+            .unwrap()
+            .expect("기본 계정");
+        let other = if active == a { b.clone() } else { a.clone() };
+        // 저장 파일 자리에 비어 있지 않은 폴더를 두면 원자적 교체(rename)가 실패한다.
+        let registry_path = data.path().join(REGISTRY_FILE);
+        std::fs::remove_file(&registry_path).unwrap();
+        std::fs::create_dir(&registry_path).unwrap();
+        std::fs::write(registry_path.join("occupied"), b"x").unwrap();
+        assert!(
+            supervisor.set_active(&other).is_err(),
+            "저장 실패는 오류로 드러난다"
+        );
+        assert_eq!(
+            supervisor.active_account_id(ProviderId::Codex).unwrap(),
+            Some(active),
+            "저장하지 못한 변경은 메모리에서도 되돌린다"
+        );
+    }
+
+    /// 회전은 계획이 본 기본 계정이 아직 그대로일 때만 한다. 그 사이 사용자가 기본 계정을
+    /// 바꿨으면 자동전환이 그 선택을 덮어쓰지 않는다.
+    #[test]
+    fn a_rotation_only_moves_the_default_it_was_planned_from() {
+        let (_data, _home, supervisor, a, b) =
+            two_account_supervisor_with_probe(Arc::new(ready_credential_probe));
+        supervisor.set_auto_switch(&a, true).unwrap();
+        supervisor.set_auto_switch(&b, true).unwrap();
+        let active = supervisor
+            .active_account_id(ProviderId::Codex)
+            .unwrap()
+            .expect("기본 계정");
+        let other = if active == a { b.clone() } else { a.clone() };
+        // 계획은 `active`에서 `other`로 옮기려 했는데, 그 사이 기본 계정이 이미 `other`다.
+        supervisor.set_active(&other).unwrap();
+        assert!(!supervisor
+            .request_active_account_rotation(&active, &other)
+            .unwrap());
+        // 이미 기본인 계정으로의 회전은 출발점이 맞아도 아무 일도 하지 않는다.
+        assert!(!supervisor
+            .request_active_account_rotation(&other, &other)
+            .unwrap());
+        // 기대한 출발점이 맞으면 옮긴다.
+        assert!(supervisor
+            .request_active_account_rotation(&other, &active)
+            .unwrap());
+        assert_eq!(
+            supervisor.active_account_id(ProviderId::Codex).unwrap(),
+            Some(active)
+        );
+    }
+
+    /// 기록은 저장한 이벤트를 그대로 돌려준다 — 알림이 스냅숏과 다른 말을 할 수 없다. 옮긴
+    /// 세션이 없으면 행방도 비고, 기본 계정이 그대로였다는 사실도 그대로 실린다.
+    #[test]
+    fn record_returns_the_stored_event_and_blanks_sessions_to_without_resumed_sessions() {
+        let (_data, _home, supervisor, a, b) = two_account_supervisor();
+        let recorded = supervisor
+            .record_auto_switch(
+                ProviderId::Codex,
+                &a,
+                &b,
+                AutoSwitchReason::AgentLimited,
+                0,
+                false,
+                Some("x"),
+            )
+            .expect("기록");
+        assert_eq!(
+            recorded.sessions_to_account_id, None,
+            "옮긴 세션이 없으면 행방도 없다"
+        );
+        assert!(!recorded.default_rotated);
+        let snapshot_event = supervisor
+            .snapshot()
+            .unwrap()
+            .providers
+            .iter()
+            .find(|p| p.provider == ProviderId::Codex)
+            .unwrap()
+            .last_auto_switch
+            .clone()
+            .unwrap();
+        assert_eq!(
+            snapshot_event, recorded,
+            "돌려준 이벤트와 스냅숏의 이벤트가 같다"
+        );
+    }
+
+    /// 세션과 기본 계정이 다른 곳으로 갔으면 이벤트가 세션의 행방을 따로 담는다. 같은 곳이면
+    /// 비워 둔다 — 화면이 두 번 말할 필요가 없다. 이 규칙의 주인은 기록 하나다.
+    #[test]
+    fn the_event_names_where_sessions_went_only_when_it_differs() {
+        let (_data, _home, supervisor, a, b) = two_account_supervisor();
+        supervisor
+            .record_auto_switch(
+                ProviderId::Codex,
+                &a,
+                &b,
+                AutoSwitchReason::AgentLimited,
+                2,
+                true,
+                Some("x"),
+            )
+            .expect("기록");
+        let event = supervisor
+            .snapshot()
+            .unwrap()
+            .providers
+            .iter()
+            .find(|p| p.provider == ProviderId::Codex)
+            .unwrap()
+            .last_auto_switch
+            .clone()
+            .unwrap();
+        assert_eq!(event.sessions_to_account_id.as_deref(), Some("x"));
+        supervisor
+            .record_auto_switch(
+                ProviderId::Codex,
+                &a,
+                &b,
+                AutoSwitchReason::AgentLimited,
+                2,
+                true,
+                Some(&b),
+            )
+            .expect("기록");
+        let event = supervisor
+            .snapshot()
+            .unwrap()
+            .providers
+            .iter()
+            .find(|p| p.provider == ProviderId::Codex)
+            .unwrap()
+            .last_auto_switch
+            .clone()
+            .unwrap();
+        assert_eq!(event.sessions_to_account_id, None);
     }
 
     #[test]
@@ -11313,7 +13485,7 @@ mod tests {
     #[test]
     fn report_agent_usage_limit_marks_account_without_deferring_the_usage_fetch() {
         let (_data, _home, supervisor, a, _b) = two_account_supervisor();
-        supervisor.report_agent_usage_limit(&a, None).unwrap();
+        supervisor.report_agent_usage_limit(&a, None, None).unwrap();
         let snapshot = supervisor.snapshot().unwrap();
         let usage = &snapshot
             .accounts
@@ -11329,16 +13501,19 @@ mod tests {
         assert!(!usage_refresh_deferred(usage, now));
     }
 
+    /// Antigravity가 계정 공급자가 되면서 레지스트리에 자리가 생겼다. 등록된 계정이
+    /// 없어도 조회는 성공해야 하고(없음을 답한다), 계정을 고르지 않은 일반 채팅은
+    /// 그대로 계정 귀속 없이 런타임을 확보할 수 있어야 한다.
     #[test]
-    fn antigravity_runtime_lease_bypasses_account_registry() {
-        // Antigravity는 레지스트리에 공급자 항목이 없다. 일반 채팅은 계정 귀속 없이
-        // 런타임을 확보할 수 있어야 하고, 계정 전환 경계는 그대로 거부되어야 한다.
+    fn antigravity_runtime_lease_works_without_a_registered_account() {
         let (_data, _home, supervisor, _a, _b) = two_account_supervisor();
 
-        // 근본 원인: 레지스트리에 항목이 없어 활성 계정 조회는 계속 거부된다.
-        assert!(supervisor
-            .active_account_id(ProviderId::Antigravity)
-            .is_err());
+        assert_eq!(
+            supervisor
+                .active_account_id(ProviderId::Antigravity)
+                .expect("공급자 자리가 있어야 조회가 성공한다"),
+            None
+        );
 
         let lease = supervisor
             .acquire_runtime(ProviderId::Antigravity, None)
@@ -11376,6 +13551,27 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// 계정을 두지 않는 공급자에는 임차가 없다. 자격증명 전환 락 자체가 없어
+    /// `credential_switch_guard`가 거절하므로, 호출자(설정 터미널)는 임차를 청하기 전에
+    /// 걸러야 한다. 이 확인이 없어 로컬 공급자 연결 드로워의 설정 터미널이
+    /// "계정 관리를 지원하지 않습니다"로 열리지 않았다.
+    #[test]
+    fn unscoped_runtime_is_refused_for_a_provider_without_accounts() {
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let supervisor = AccountSupervisor::open_with(
+            data.path(),
+            home.path(),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+
+        assert!(!ProviderId::Local.manages_accounts());
+        assert!(supervisor
+            .acquire_unscoped_runtime(ProviderId::Local, UnscopedRuntimeKind::SharedHome)
+            .is_err());
     }
 
     #[test]
@@ -11582,5 +13778,330 @@ mod tests {
             "invalid".parse::<AutoSwitchReason>(),
             Err(crate::CoreError::InvalidInput(_))
         ));
+    }
+
+    /// Antigravity 공유 홈은 사용자 홈에서 유도한다. 이 값이 없으면 프로필 조립이
+    /// 공유 설정(MCP·훅·스킬)을 어디에 이어야 할지 모른다.
+    #[test]
+    fn antigravity_provider_root_is_the_gemini_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let supervisor = AccountSupervisor::open_with(
+            temp.path(),
+            home.path(),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            supervisor.provider_root(ProviderId::Antigravity).unwrap(),
+            fs::canonicalize(home.path()).unwrap().join(".gemini")
+        );
+    }
+
+    /// 등록된 계정은 활성 계정이라도 자기 프로필로 돈다. 활성 계정만 공유 CLI 홈을 쓰게
+    /// 두면, 그 홈의 로그인은 앱이 바꾸지 않으므로(`set_active`는 레지스트리만 고친다)
+    /// 계정 카드가 남의 잔량을 보여 주고 실행도 남의 쿼터를 쓴다(2026-09-18 실측).
+    #[test]
+    fn every_registered_account_runs_in_its_own_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let supervisor = AccountSupervisor::open_with(
+            temp.path(),
+            home.path(),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+        // 계정을 관리하는 공급자마다 프로필을 가리키는 환경변수가 있어야 등록 계정이 자기
+        // 저장소로 돈다. 한 공급자라도 빈 벌이면 그 계정은 조용히 공유 홈으로 되돌아간다.
+        // 계정을 두지 않는 공급자는 프로필 자체를 만들지 않으므로 대상이 아니다.
+        for provider in ProviderId::ALL
+            .into_iter()
+            .filter(|provider| provider.manages_accounts())
+        {
+            let dir = credential_profiles::profile_dir(temp.path(), provider, "acct").unwrap();
+            assert!(
+                !credential_profiles::profile_env(provider, &dir, home.path())
+                    .unwrap()
+                    .is_empty(),
+                "{provider}"
+            );
+        }
+        // 활성 계정이 없어도 공급자 자리는 있어 조회가 성공한다.
+        assert_eq!(
+            supervisor
+                .active_account_id(ProviderId::Antigravity)
+                .expect("공급자 자리"),
+            None
+        );
+    }
+
+    /// 토큰이 없는 프로필 홈으로 실행하면 CLI가 print 모드에서도 브라우저 로그인 창을
+    /// 띄우고 기다린다. 프로브를 돌리기 전에 걸러야 한다(C12-7).
+    #[test]
+    fn antigravity_profile_without_a_login_token_is_refused_before_the_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = credential_profiles::ensure_profile_dir(
+            temp.path(),
+            ProviderId::Antigravity,
+            "antigravity-1",
+        )
+        .unwrap();
+        assert!(!credential_profiles::antigravity_login_present(&dir));
+        let token = dir.join(credential_profiles::ANTIGRAVITY_TOKEN_RELATIVE_PATHS[0]);
+        fs::create_dir_all(token.parent().unwrap()).unwrap();
+        fs::write(&token, "token").unwrap();
+        assert!(credential_profiles::antigravity_login_present(&dir));
+    }
+
+    /// C12-11 1단계. 전역 항목의 값은 토큰 파일 하나의 모양이라 두 파일 자리에 그대로 들어가고,
+    /// 신원은 그 안의 `id_token`에서 나온다.
+    #[test]
+    fn c12_11_global_login_envelope_fills_both_token_files_and_carries_identity() {
+        let blob = serde_json::json!({
+            "auth_method": "consumer",
+            "id_token": antigravity_id_token("sub-1", "person@example.com"),
+            "token": {"access_token": "a", "refresh_token": "r", "expiry": "2030-01-01T00:00:00Z", "token_type": "Bearer"},
+        })
+        .to_string();
+        let envelope = antigravity_envelope_from_global_login(&blob).expect("envelope");
+        let parsed = AntigravityEnvelope::parse_required(&envelope).expect("parse");
+        for key in ANTIGRAVITY_SECRET_KEYS {
+            assert_eq!(
+                parsed
+                    .token_file(key)
+                    .and_then(|v| v.get("auth_method"))
+                    .and_then(Value::as_str),
+                Some("consumer"),
+                "{key}"
+            );
+        }
+        let identity = antigravity_identity(&envelope).expect("identity");
+        assert_eq!(identity.email.as_deref(), Some("person@example.com"));
+        assert!(antigravity_envelope_from_global_login("[1,2]").is_err());
+        assert!(antigravity_envelope_from_global_login("not json").is_err());
+    }
+
+    /// C12-11 3단계. 프로브와 실행이 같은 프로필에 잇달아 찍으므로 마지막 줄이 이 프로세스의 것.
+    #[test]
+    fn c12_11_cli_log_yields_the_last_auth_result_email() {
+        let text = "I0924 13:19:23 server_oauth.go:196] applyAuthResult: email=first@example.com, authMethod=consumer, quotaProject=\n\
+                    I0924 13:19:24 cache.go:135] Cache(userInfo): refresh\n\
+                    I0924 13:20:01 server_oauth.go:196] applyAuthResult: email=second@example.com, authMethod=consumer, quotaProject=\n";
+        assert_eq!(
+            antigravity_authenticated_email_from_log_text(text).as_deref(),
+            Some("second@example.com")
+        );
+        assert_eq!(
+            antigravity_authenticated_email_from_log_text("no auth here"),
+            None
+        );
+        assert_eq!(
+            antigravity_authenticated_email_from_log_text(
+                "applyAuthResult: email=, authMethod=consumer"
+            ),
+            None
+        );
+    }
+
+    /// C12-11 3단계. 구글 이메일은 대소문자를 가리지 않고, 다른 계정은 관측값을 그대로 보고한다.
+    #[test]
+    fn c12_11_identity_compare_ignores_case_and_reports_the_observed_account() {
+        assert_eq!(
+            compare_antigravity_identity("Person@Example.com", "person@example.com"),
+            AntigravityIdentityCheck::Matched
+        );
+        assert_eq!(
+            compare_antigravity_identity("a@example.com", "b@example.com"),
+            AntigravityIdentityCheck::Mismatch {
+                observed: "b@example.com".to_owned()
+            }
+        );
+    }
+
+    /// C12-11. 전역 저장소가 아닌 플랫폼에서는 비우기가 아무것도 하지 않고, 검사는 적용 대상이 아니다.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn c12_11_global_login_protocol_is_inert_off_windows() {
+        assert!(!credential_profiles::antigravity_login_is_machine_global());
+        assert!(!credential_profiles::clear_antigravity_global_login().expect("clear"));
+        assert!(credential_profiles::read_antigravity_global_login()
+            .expect("read")
+            .is_none());
+    }
+
+    fn antigravity_id_token(subject: &str, email: &str) -> String {
+        let claims = serde_json::json!({"sub": subject, "email": email});
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("claims"));
+        format!("header.{payload}.signature")
+    }
+
+    fn antigravity_secret(subject: &str, email: &str, expiry: &str) -> String {
+        serde_json::json!({
+            "antigravityOauthToken": {
+                "auth_method": "consumer",
+                "id_token": antigravity_id_token(subject, email),
+                "token": {
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "expiry": expiry,
+                    "token_type": "Bearer",
+                },
+            },
+            "jetskiStandaloneOauthToken": {"auth_method": "consumer", "token": "jetski"},
+        })
+        .to_string()
+    }
+
+    /// 프로필은 홈 전체를 가르므로 그 자리가 곧 홈이고, 공급자 루트를 받으면 `.gemini`의
+    /// 부모가 홈이다. 이 구분이 틀어지면 토큰이 `.gemini/.gemini` 아래로 들어간다.
+    #[test]
+    fn antigravity_home_is_resolved_from_either_shape() {
+        assert_eq!(
+            antigravity_home_for(Path::new("/Users/x/.gemini")),
+            Path::new("/Users/x")
+        );
+        assert_eq!(
+            antigravity_home_for(Path::new("/data/credential-profiles/antigravity/acct-b")),
+            Path::new("/data/credential-profiles/antigravity/acct-b")
+        );
+    }
+
+    /// CLI는 로그인 토큰을 두 파일로 나눠 둔다. 볼트에는 한 덩이로 담고 홈에는 다시
+    /// 두 파일로 펼쳐야 CLI가 그대로 읽는다.
+    #[test]
+    fn antigravity_credentials_round_trip_through_the_two_token_files() {
+        let home = tempfile::tempdir().expect("home");
+        let secret =
+            antigravity_secret("sub-b", "b@example.com", "2026-09-17T13:19:23.742496+09:00");
+        write_antigravity_credentials(home.path(), &secret).expect("write");
+
+        for relative in credential_profiles::ANTIGRAVITY_TOKEN_RELATIVE_PATHS {
+            let path = home.path().join(relative);
+            assert!(path.is_file(), "{relative}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "{relative}");
+            }
+        }
+        let read = read_antigravity_credentials(home.path()).expect("read");
+        assert!(same_secret(read.as_str(), &secret));
+    }
+
+    #[test]
+    fn antigravity_credentials_are_missing_when_no_token_file_exists() {
+        let home = tempfile::tempdir().expect("home");
+        assert!(matches!(
+            read_antigravity_credentials(home.path()),
+            Err(CoreError::NotFound(_))
+        ));
+    }
+
+    /// 계정을 묻는 공식 명령이 없어 토큰 안의 id_token이 유일한 근거다. 식별자는 이메일로
+    /// 통일한다 — 토큰이 키체인에만 있는 설치에서는 신원을 CLI 로그의 이메일에서 읽으므로,
+    /// 여기서 구글 subject를 쓰면 같은 계정이 두 경로에서 다른 키를 얻는다.
+    #[test]
+    fn antigravity_identity_comes_from_the_id_token() {
+        let secret = antigravity_secret("sub-b", "b@example.com", "2026-09-17T13:19:23+09:00");
+        let identity = antigravity_identity(&secret).expect("identity");
+        assert_eq!(identity.provider_account_id, "b@example.com");
+        assert_eq!(
+            identity.legacy_provider_account_id.as_deref(),
+            Some("sub-b")
+        );
+        assert_eq!(identity.email.as_deref(), Some("b@example.com"));
+
+        let without_token = serde_json::json!({"antigravityOauthToken": {"token": {}}}).to_string();
+        assert!(antigravity_identity(&without_token).is_err());
+    }
+
+    /// 리프레시 토큰이 사슬을 잇는다. 액세스 토큰이 만료돼도 실행은 가능해야 하고,
+    /// 리프레시 토큰이 없으면 온전하지 않은 값이다.
+    #[test]
+    fn antigravity_credential_health_follows_the_refresh_token() {
+        let secret = antigravity_secret("sub-b", "b@example.com", "2020-01-01T00:00:00+00:00");
+        assert!(credential_is_complete(ProviderId::Antigravity, &secret));
+        assert!(credential_can_authenticate(
+            ProviderId::Antigravity,
+            &secret,
+            now_ms()
+        ));
+
+        let no_refresh = serde_json::json!({
+            "antigravityOauthToken": {
+                "id_token": antigravity_id_token("sub-b", "b@example.com"),
+                "token": {"access_token": "access", "expiry": "2020-01-01T00:00:00+00:00"},
+            }
+        })
+        .to_string();
+        assert!(!credential_is_complete(
+            ProviderId::Antigravity,
+            &no_refresh
+        ));
+    }
+
+    /// 두 사슬의 선후는 액세스 토큰 만료 시각으로 가린다. 읽지 못하면 프로필 사본이
+    /// 볼트 정본을 덮어쓸 자격을 얻는다.
+    #[test]
+    fn antigravity_chain_order_uses_the_access_token_expiry() {
+        let older = antigravity_secret("sub-b", "b@example.com", "2026-09-17T13:00:00+09:00");
+        let newer = antigravity_secret("sub-b", "b@example.com", "2026-09-17T14:00:00+09:00");
+        assert!(credential_chain_is_newer(
+            ProviderId::Antigravity,
+            &newer,
+            &older
+        ));
+        assert!(!credential_chain_is_newer(
+            ProviderId::Antigravity,
+            &older,
+            &newer
+        ));
+    }
+
+    /// 공식 CLI는 키체인을 쓸 수 있으면 로그인 토큰을 **파일로 남기지 않는다**. 봉투가
+    /// 키체인 값을 함께 담지 않으면 로그인 결과를 하나도 회수하지 못한다(`C12-4a`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_antigravity_envelope_carries_the_profile_keychain_token() {
+        let home = tempfile::tempdir().expect("home");
+        // 파일은 하나도 없고 키체인에만 토큰이 있는, 방금 로그인한 프로필과 같은 배치다.
+        write_antigravity_keyring_token(home.path(), "keychain-only-token").expect("키체인 저장");
+        let secret = read_antigravity_credentials(home.path()).expect("봉투 읽기");
+        assert!(antigravity_has_keyring_token(&secret));
+        // 파일 사슬이 없어도 등록과 실행이 막히지 않아야 한다.
+        assert!(credential_is_complete(ProviderId::Antigravity, &secret));
+        assert!(credential_can_authenticate(
+            ProviderId::Antigravity,
+            &secret,
+            now_ms()
+        ));
+
+        // 볼트에서 프로필로 되돌릴 때도 키체인으로 들어가야 CLI가 그 값을 읽는다.
+        let restored = tempfile::tempdir().expect("restored");
+        write_antigravity_credentials(restored.path(), &secret).expect("복원");
+        let again = read_antigravity_credentials(restored.path()).expect("복원본 읽기");
+        assert!(same_secret(&again, &secret));
+    }
+
+    /// 키체인 값은 해석할 수 없는 덩어리라 신원이 들어 있지 않고, 계정을 묻는 명령도 없다.
+    /// 공식 CLI가 로그인 직후 자기 로그에 남긴 이메일이 유일한 근거다.
+    #[test]
+    fn antigravity_identity_falls_back_to_the_login_log() {
+        let home = tempfile::tempdir().expect("home");
+        let logs = home.path().join(".gemini/antigravity-cli/log");
+        fs::create_dir_all(&logs).expect("log dir");
+        fs::write(
+            logs.join("cli-20260917_000000.log"),
+            "I0917 00:00:00.0 browser.go:167] consumerOAuth: authenticated as old@example.com\n",
+        )
+        .expect("old log");
+        let identity = antigravity_identity_from_home(home.path()).expect("신원");
+        assert_eq!(identity.provider_account_id, "old@example.com");
+        assert_eq!(identity.email.as_deref(), Some("old@example.com"));
+
+        // 로그가 없으면 신원을 지어내지 않는다.
+        let empty = tempfile::tempdir().expect("empty");
+        assert!(antigravity_identity_from_home(empty.path()).is_err());
     }
 }

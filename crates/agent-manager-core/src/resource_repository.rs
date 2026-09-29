@@ -9,9 +9,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::app_data_file::write_private_json;
+use crate::domain::wire_enum;
 use crate::file_kind::{ensure_directory, ensure_not_symlink};
 use crate::path_guard::{self, CurDirPolicy, MissingTail};
 use crate::staged_replace::{StagedKind, StagedReplace};
@@ -23,7 +25,16 @@ const DEFAULT_DIRECTORY: &str = "resource-repository";
 const LEGACY_SKILLS_RELATIVE: &str = ".agents/skills";
 const SKILLS_DIRECTORY: &str = "skills";
 const INSTRUCTIONS_DIRECTORY: &str = "instructions";
+const WORKFLOWS_DIRECTORY: &str = "workflows";
 const MIGRATION_MARKER: &str = ".legacy-skills-imported-v1";
+const MIGRATED_DIRECTORIES: [&str; 2] = [SKILLS_DIRECTORY, INSTRUCTIONS_DIRECTORY];
+const REPOSITORY_STAGE_PREFIX: &str = ".agent-manager-repository-stage-";
+const REPOSITORY_BACKUP_PREFIX: &str = ".agent-manager-repository-backup-";
+const REPOSITORY_SUBDIRECTORIES: [&str; 3] = [
+    SKILLS_DIRECTORY,
+    INSTRUCTIONS_DIRECTORY,
+    WORKFLOWS_DIRECTORY,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,8 +44,15 @@ pub enum HostPlatform {
     Linux,
 }
 
+wire_enum!(trimmed HostPlatform, "지원하지 않는 OS 플랫폼입니다", {
+    Macos => "macos",
+    Windows => "windows",
+    Linux => "linux",
+});
+
 impl HostPlatform {
-    pub const ALL: [Self; 3] = [Self::Macos, Self::Windows, Self::Linux];
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 3] = [Self::Macos, Self::Windows, Self::Linux];
 
     pub fn current() -> Self {
         #[cfg(target_os = "macos")]
@@ -43,35 +61,6 @@ impl HostPlatform {
         return Self::Windows;
         #[cfg(target_os = "linux")]
         return Self::Linux;
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Macos => "macos",
-            Self::Windows => "windows",
-            Self::Linux => "linux",
-        }
-    }
-}
-
-impl std::fmt::Display for HostPlatform {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for HostPlatform {
-    type Err = CoreError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim() {
-            "macos" => Ok(Self::Macos),
-            "windows" => Ok(Self::Windows),
-            "linux" => Ok(Self::Linux),
-            other => Err(CoreError::InvalidInput(format!(
-                "지원하지 않는 OS 플랫폼입니다: {other}"
-            ))),
-        }
     }
 }
 
@@ -163,11 +152,18 @@ fn settings_path(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join(SETTINGS_FILE)
 }
 
-fn stored_settings(app_data_dir: &Path) -> StoredRepositorySettings {
-    fs::read(settings_path(app_data_dir))
+fn read_json_or_default<T>(path: &Path) -> T
+where
+    T: DeserializeOwned + Default,
+{
+    fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
+}
+
+fn stored_settings(app_data_dir: &Path) -> StoredRepositorySettings {
+    read_json_or_default(&settings_path(app_data_dir))
 }
 
 pub(crate) fn repository_root(app_data_dir: &Path) -> PathBuf {
@@ -184,6 +180,10 @@ pub(crate) fn repository_skills_root(app_data_dir: &Path) -> PathBuf {
 
 pub(crate) fn repository_instructions_root(app_data_dir: &Path) -> PathBuf {
     repository_root(app_data_dir).join(INSTRUCTIONS_DIRECTORY)
+}
+
+pub(crate) fn repository_workflows_root(app_data_dir: &Path) -> PathBuf {
+    repository_root(app_data_dir).join(WORKFLOWS_DIRECTORY)
 }
 
 pub fn load_resource_repository_settings(
@@ -219,7 +219,7 @@ pub(crate) fn initialize_resource_repository(app_data_dir: &Path) -> Result<(), 
         return Ok(());
     }
     let legacy = home_dir()?.join(LEGACY_SKILLS_RELATIVE);
-    copy_missing_directory_children(&legacy, &root.join(SKILLS_DIRECTORY))?;
+    adopt_child_directories(&legacy, &root.join(SKILLS_DIRECTORY), ExistingChild::Keep)?;
     fs::write(marker, b"1\n")?;
     Ok(())
 }
@@ -229,38 +229,11 @@ pub fn set_resource_repository(
     request: &SetResourceRepositoryRequest,
 ) -> Result<ResourceRepositorySettings, CoreError> {
     let previous = repository_root(app_data_dir);
-    let requested = request.root_path.as_deref().map(str::trim).unwrap_or("");
-    let target = if requested.is_empty() {
-        default_repository_root(app_data_dir)
-    } else {
-        let path = PathBuf::from(requested);
-        if !path.is_absolute() {
-            return Err(CoreError::InvalidInput(
-                "저장소 경로는 절대 경로여야 합니다".to_owned(),
-            ));
-        }
-        path
-    };
-    let target = prepare_repository_root(&target)?;
+    let target = requested_repository_root(app_data_dir, request.root_path.as_deref())?;
     let previous = fs::canonicalize(&previous).unwrap_or(previous);
 
     if request.migrate_existing && previous != target {
-        validate_merge_directory_children(
-            &previous.join(SKILLS_DIRECTORY),
-            &target.join(SKILLS_DIRECTORY),
-        )?;
-        validate_merge_directory_children(
-            &previous.join(INSTRUCTIONS_DIRECTORY),
-            &target.join(INSTRUCTIONS_DIRECTORY),
-        )?;
-        merge_directory_children(
-            &previous.join(SKILLS_DIRECTORY),
-            &target.join(SKILLS_DIRECTORY),
-        )?;
-        merge_directory_children(
-            &previous.join(INSTRUCTIONS_DIRECTORY),
-            &target.join(INSTRUCTIONS_DIRECTORY),
-        )?;
+        migrate_repository_contents(&previous, &target)?;
     }
 
     let default = fs::canonicalize(default_repository_root(app_data_dir))
@@ -272,10 +245,47 @@ pub fn set_resource_repository(
     load_resource_repository_settings(app_data_dir)
 }
 
-fn validate_merge_directory_children(source: &Path, destination: &Path) -> Result<(), CoreError> {
-    if !source.is_dir() {
-        return Ok(());
+/// 비어 있는 요청은 기본 저장소로 되돌리고, 사용자 지정 요청은 절대 경로만 허용한 뒤
+/// 공통 저장소 루트의 안전성 검사와 준비를 한곳에서 수행한다.
+fn requested_repository_root(
+    app_data_dir: &Path,
+    requested: Option<&str>,
+) -> Result<PathBuf, CoreError> {
+    let requested = requested.map(str::trim).unwrap_or("");
+    let target = if requested.is_empty() {
+        default_repository_root(app_data_dir)
+    } else {
+        let path = PathBuf::from(requested);
+        if !path.is_absolute() {
+            return Err(CoreError::InvalidInput(
+                "저장소 경로는 절대 경로여야 합니다".to_owned(),
+            ));
+        }
+        path
+    };
+    prepare_repository_root(&target)
+}
+
+/// 모든 충돌 검증을 끝낸 뒤에만 스킬·지침 원본을 복사한다. 두 순회를 합치면 뒤쪽
+/// 디렉터리의 충돌을 발견하기 전에 앞쪽 디렉터리가 일부 복사될 수 있다.
+fn migrate_repository_contents(previous: &Path, target: &Path) -> Result<(), CoreError> {
+    for dir in MIGRATED_DIRECTORIES {
+        validate_merge_directory_children(&previous.join(dir), &target.join(dir))?;
     }
+    for dir in MIGRATED_DIRECTORIES {
+        adopt_child_directories(&previous.join(dir), &target.join(dir), ExistingChild::Merge)?;
+    }
+    Ok(())
+}
+
+/// 마이그레이션 대상이 되는 자식 디렉터리(숨김 디렉터리·비디렉터리 제외) 목록을 수집한다.
+fn visible_child_directories(
+    source: &Path,
+) -> Result<Vec<(std::ffi::OsString, PathBuf)>, CoreError> {
+    if !source.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut dirs = Vec::new();
     for entry in fs::read_dir(source)?.flatten() {
         let name = entry.file_name();
         if name.to_string_lossy().starts_with('.') {
@@ -285,9 +295,37 @@ fn validate_merge_directory_children(source: &Path, destination: &Path) -> Resul
         if !fs::symlink_metadata(&source_path).is_ok_and(|metadata| metadata.is_dir()) {
             continue;
         }
-        validate_merge_directory(&source_path, &destination.join(name))?;
+        dirs.push((name, source_path));
+    }
+    Ok(dirs)
+}
+
+fn validate_merge_directory_children(source: &Path, destination: &Path) -> Result<(), CoreError> {
+    for (name, source_path) in visible_child_directories(source)? {
+        walk_merge(&source_path, &destination.join(name), MergeWalk::Validate)?;
     }
     Ok(())
+}
+
+/// 마이그레이션 대상 파일이 대상 위치에 이미 존재할 때 유형과 내용 호환성을 검증한다.
+/// 대상 파일이 존재하면 Ok(true), 존재하지 않으면 Ok(false)를 반환한다.
+fn ensure_compatible_file_target(source: &Path, target: &Path) -> Result<bool, CoreError> {
+    if !target.exists() {
+        return Ok(false);
+    }
+    if !fs::symlink_metadata(target).is_ok_and(|metadata| metadata.is_file()) {
+        return Err(CoreError::Conflict(format!(
+            "새 저장소 경로 유형이 다릅니다: {}",
+            target.display()
+        )));
+    }
+    if fs::read(source)? != fs::read(target)? {
+        return Err(CoreError::Conflict(format!(
+            "새 저장소에 내용이 다른 파일이 있습니다: {}",
+            target.display()
+        )));
+    }
+    Ok(true)
 }
 
 /// 마이그레이션이 심볼릭 링크를 거부할 때 쓰는 문구. 네 군데가 같은 문장에 경로만
@@ -299,17 +337,38 @@ fn migration_symlink_rejection(path: &Path) -> String {
     )
 }
 
-fn validate_merge_directory(source: &Path, destination: &Path) -> Result<(), CoreError> {
+/// 저장소 병합 순회가 지켜야 할 규칙(심볼릭 링크 거부·대상 유형 일치·같은 이름 파일의 내용
+/// 일치)은 한 벌인데, 검사만 하는 사전 통과와 실제로 복사하는 본 통과가 따로 적어 두고 있었다.
+/// 한쪽만 고치면 사전 통과가 허용한 것을 본 통과가 거부하는 어긋남이 생긴다.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MergeWalk {
+    /// 대상과 충돌하는지만 본다. 아무것도 쓰지 않는다.
+    Validate,
+    /// 검사를 통과한 항목을 대상으로 복사한다.
+    Apply,
+}
+
+fn walk_merge(source: &Path, destination: &Path, walk: MergeWalk) -> Result<(), CoreError> {
     let source_metadata = fs::symlink_metadata(source)?;
-    ensure_directory(&source_metadata, &migration_symlink_rejection(source))?;
-    if !destination.exists() {
-        return Ok(());
-    }
-    if !fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.is_dir()) {
-        return Err(CoreError::Conflict(format!(
-            "새 저장소 경로 유형이 다릅니다: {}",
-            destination.display()
-        )));
+    let source_rejection = migration_symlink_rejection(source);
+    match walk {
+        MergeWalk::Validate => {
+            ensure_directory(&source_metadata, &source_rejection)?;
+            if !destination.exists() {
+                // 대상이 없으면 충돌할 상대도 없다. 아래 항목의 심볼릭 링크는 Apply가 거른다.
+                return Ok(());
+            }
+            if !fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.is_dir()) {
+                return Err(CoreError::Conflict(format!(
+                    "새 저장소 경로 유형이 다릅니다: {}",
+                    destination.display()
+                )));
+            }
+        }
+        MergeWalk::Apply => {
+            ensure_not_symlink(&source_metadata, &source_rejection)?;
+            fs::create_dir_all(destination)?;
+        }
     }
     for entry in fs::read_dir(source)?.flatten() {
         let source_path = entry.path();
@@ -317,19 +376,11 @@ fn validate_merge_directory(source: &Path, destination: &Path) -> Result<(), Cor
         let metadata = fs::symlink_metadata(&source_path)?;
         ensure_not_symlink(&metadata, &migration_symlink_rejection(&source_path))?;
         if metadata.is_dir() {
-            validate_merge_directory(&source_path, &target)?;
-        } else if metadata.is_file() && target.exists() {
-            if !fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_file()) {
-                return Err(CoreError::Conflict(format!(
-                    "새 저장소 경로 유형이 다릅니다: {}",
-                    target.display()
-                )));
-            }
-            if fs::read(&source_path)? != fs::read(&target)? {
-                return Err(CoreError::Conflict(format!(
-                    "새 저장소에 내용이 다른 파일이 있습니다: {}",
-                    target.display()
-                )));
+            walk_merge(&source_path, &target, walk)?;
+        } else if metadata.is_file() {
+            let already_present = ensure_compatible_file_target(&source_path, &target)?;
+            if walk == MergeWalk::Apply && !already_present {
+                fs::copy(&source_path, &target)?;
             }
         }
     }
@@ -358,8 +409,9 @@ fn prepare_repository_root(root: &Path) -> Result<PathBuf, CoreError> {
     fs::create_dir_all(&resolved)?;
     let resolved = fs::canonicalize(&resolved)?;
     reject_unsafe_root(&resolved)?;
-    fs::create_dir_all(resolved.join(SKILLS_DIRECTORY))?;
-    fs::create_dir_all(resolved.join(INSTRUCTIONS_DIRECTORY))?;
+    for dir in REPOSITORY_SUBDIRECTORIES {
+        fs::create_dir_all(resolved.join(dir))?;
+    }
     Ok(resolved)
 }
 
@@ -386,50 +438,65 @@ fn resolve_without_creating(path: &Path) -> Result<PathBuf, CoreError> {
     path_guard::resolve_existing_ancestor(path, MissingTail::SkipNotFound, "저장소 경로")
 }
 
-fn merge_directory_children(source: &Path, destination: &Path) -> Result<(), CoreError> {
-    if !source.is_dir() {
+/// 대상에 같은 이름의 자식이 이미 있을 때 어떻게 할지.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExistingChild {
+    /// 기존 항목과 병합한다(경로 이전).
+    Merge,
+    /// 기존 항목을 그대로 두고 건너뛴다(초기 가져오기).
+    Keep,
+}
+
+fn adopt_child_directories(
+    source: &Path,
+    destination: &Path,
+    existing: ExistingChild,
+) -> Result<(), CoreError> {
+    let children = visible_child_directories(source)?;
+    if children.is_empty() {
         return Ok(());
     }
     fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)?.flatten() {
-        let name = entry.file_name();
-        let name_text = name.to_string_lossy();
-        if name_text.starts_with('.') {
-            continue;
-        }
-        let source_path = entry.path();
-        if !fs::symlink_metadata(&source_path).is_ok_and(|metadata| metadata.is_dir()) {
-            continue;
-        }
+    for (name, source_path) in children {
         let target = destination.join(name);
+        // 다른 PC가 이미 공유 저장소에 만든 원본은 authoritative하다. 초기 가져오기는
+        // 기존 항목을 비교·병합하지 않고 비어 있는 키만 복사한다.
+        if existing == ExistingChild::Keep && fs::symlink_metadata(&target).is_ok() {
+            continue;
+        }
         merge_directory_atomically(&source_path, &target)?;
     }
     Ok(())
 }
 
-fn copy_missing_directory_children(source: &Path, destination: &Path) -> Result<(), CoreError> {
-    if !source.is_dir() {
-        return Ok(());
+/// 저장소 디렉터리 원자적 병합에 쓰는 임시 스테이징·백업 경로를 묶는다.
+struct RepositoryStagePaths {
+    stage: PathBuf,
+    backup: PathBuf,
+}
+
+impl RepositoryStagePaths {
+    fn new(parent: &Path, name: &str) -> Self {
+        let nonce = publish_nonce();
+        Self {
+            stage: parent.join(format!("{REPOSITORY_STAGE_PREFIX}{name}-{nonce}")),
+            backup: parent.join(format!("{REPOSITORY_BACKUP_PREFIX}{name}-{nonce}")),
+        }
     }
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)?.flatten() {
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with('.') {
-            continue;
-        }
-        let source_path = entry.path();
-        if !fs::symlink_metadata(&source_path).is_ok_and(|metadata| metadata.is_dir()) {
-            continue;
-        }
-        let target = destination.join(name);
-        // 다른 PC가 이미 공유 저장소에 만든 원본은 authoritative하다. 초기 가져오기는
-        // 기존 항목을 비교·병합하지 않고 비어 있는 키만 복사한다.
-        if fs::symlink_metadata(&target).is_ok() {
-            continue;
-        }
-        merge_directory_atomically(&source_path, &target)?;
+
+    fn cleanup_stage(&self) {
+        let _ = fs::remove_dir_all(&self.stage);
     }
-    Ok(())
+
+    fn cleanup_backup(&self) {
+        let _ = fs::remove_dir_all(&self.backup);
+    }
+
+    fn restore_backup(&self, destination: &Path) {
+        if !destination.exists() && self.backup.exists() {
+            let _ = fs::rename(&self.backup, destination);
+        }
+    }
 }
 
 fn merge_directory_atomically(source: &Path, destination: &Path) -> Result<(), CoreError> {
@@ -441,68 +508,52 @@ fn merge_directory_atomically(source: &Path, destination: &Path) -> Result<(), C
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .ok_or_else(|| CoreError::InvalidInput("저장소 리소스 이름이 없습니다".to_owned()))?;
-    let nonce = uuid::Uuid::new_v4().simple().to_string();
-    let stage = parent.join(format!(".agent-manager-repository-stage-{name}-{nonce}"));
-    let backup = parent.join(format!(".agent-manager-repository-backup-{name}-{nonce}"));
+    let paths = RepositoryStagePaths::new(parent, &name);
     let existed = fs::symlink_metadata(destination).is_ok();
     let result = (|| -> Result<(), CoreError> {
         if existed {
-            merge_directory(destination, &stage)?;
+            walk_merge(destination, &paths.stage, MergeWalk::Apply)?;
         }
-        merge_directory(source, &stage)?;
+        walk_merge(source, &paths.stage, MergeWalk::Apply)?;
         StagedReplace {
             kind: StagedKind::Directory,
-            stage: &stage,
+            stage: &paths.stage,
             target: destination,
-            backup: existed.then_some(backup.as_path()),
+            backup: existed.then_some(paths.backup.as_path()),
         }
         .commit()?;
         if existed {
-            let _ = fs::remove_dir_all(&backup);
+            paths.cleanup_backup();
         }
         Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_dir_all(&stage);
-        if !destination.exists() && backup.exists() {
-            let _ = fs::rename(&backup, destination);
-        }
+        paths.cleanup_stage();
+        paths.restore_backup(destination);
     }
     result
 }
 
-fn merge_directory(source: &Path, destination: &Path) -> Result<(), CoreError> {
-    ensure_not_symlink(
-        &fs::symlink_metadata(source)?,
-        &migration_symlink_rejection(source),
-    )?;
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)?.flatten() {
-        let source_path = entry.path();
-        let target = destination.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&source_path)?;
-        ensure_not_symlink(&metadata, &migration_symlink_rejection(&source_path))?;
-        if metadata.is_dir() {
-            merge_directory(&source_path, &target)?;
-        } else if metadata.is_file() {
-            if target.is_file() {
-                if fs::read(&source_path)? != fs::read(&target)? {
-                    return Err(CoreError::Conflict(format!(
-                        "새 저장소에 내용이 다른 파일이 있습니다: {}",
-                        target.display()
-                    )));
-                }
-            } else if target.exists() {
-                return Err(CoreError::Conflict(format!(
-                    "새 저장소 경로 유형이 다릅니다: {}",
-                    target.display()
-                )));
-            } else {
-                fs::copy(&source_path, &target)?;
-            }
-        }
-    }
-    Ok(())
+/// 스킬·지침 키가 Windows 예약 장치 이름과 겹치는지 본다. 확장자를 뗀 첫
+/// 구성요소만 보는 것은 Windows가 `con.md`도 `CON`으로 다루기 때문이다. 공통
+/// 원본은 세 플랫폼이 함께 쓰므로 macOS에서 만든 이름도 여기서 막는다.
+pub(crate) fn is_windows_reserved_stem(value: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = value
+        .split('.')
+        .next()
+        .unwrap_or(value)
+        .to_ascii_uppercase();
+    RESERVED.contains(&stem.as_str())
+}
+
+/// 스테이징·백업 이름에 쓰는 충돌 방지 값. 같은 프로세스 안에서 동시에 두 번
+/// 게시해도 이름이 겹치지 않는다.
+pub(crate) fn publish_nonce() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 pub(crate) fn resource_manifest_path(directory: &Path) -> PathBuf {
@@ -510,10 +561,7 @@ pub(crate) fn resource_manifest_path(directory: &Path) -> PathBuf {
 }
 
 pub(crate) fn load_resource_manifest(directory: &Path) -> ResourcePlatformManifest {
-    fs::read(resource_manifest_path(directory))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    read_json_or_default(&resource_manifest_path(directory))
 }
 
 pub(crate) fn validate_variant_relative_path(path: &str) -> Result<PathBuf, CoreError> {
@@ -731,5 +779,34 @@ mod tests {
             "unknown".parse::<HostPlatform>(),
             Err(CoreError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn repository_stage_paths_naming_and_cleanup() {
+        let temp = tempfile::tempdir().expect("temp");
+        let parent = temp.path();
+        let paths = RepositoryStagePaths::new(parent, "my-skill");
+        let stage_name = paths.stage.file_name().unwrap().to_string_lossy();
+        let backup_name = paths.backup.file_name().unwrap().to_string_lossy();
+        assert!(stage_name.starts_with(".agent-manager-repository-stage-my-skill-"));
+        assert!(backup_name.starts_with(".agent-manager-repository-backup-my-skill-"));
+
+        fs::create_dir_all(&paths.stage).expect("create stage");
+        fs::create_dir_all(&paths.backup).expect("create backup");
+        assert!(paths.stage.exists());
+        assert!(paths.backup.exists());
+
+        paths.cleanup_stage();
+        assert!(!paths.stage.exists());
+
+        paths.cleanup_backup();
+        assert!(!paths.backup.exists());
+
+        // 백업 복구 검증: 목적지 파일이 없고 백업이 있으면 이동 복구
+        let destination = parent.join("my-skill");
+        fs::create_dir_all(&paths.backup).expect("create backup again");
+        paths.restore_backup(&destination);
+        assert!(destination.exists());
+        assert!(!paths.backup.exists());
     }
 }

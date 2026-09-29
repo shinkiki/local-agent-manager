@@ -3,13 +3,12 @@
  * `hidden`으로 숨겨지므로, 요소가 DOM에 있는 것만으로는 부족하고 실제로 크기를 가져야 한다.
  * 탭 전환처럼 다음 커밋에야 나타나는 요소까지 한 루프로 덮기 위해 프레임마다 다시 본다.
  */
-import { isElementVisible } from "./uiElements.ts";
+import { isElementVisible } from "./uiElementDom.ts";
 
-export interface VisibleElementProbe {
+interface VisibleElementProbe {
   query(selector: string): Element | null;
   isVisible(element: Element): boolean;
   requestFrame(callback: () => void): number;
-  cancelFrame(handle: number): void;
   now(): number;
 }
 
@@ -17,7 +16,6 @@ const browserProbe: VisibleElementProbe = {
   query: (selector) => document.querySelector(selector),
   isVisible: isElementVisible,
   requestFrame: (callback) => window.requestAnimationFrame(callback),
-  cancelFrame: (handle) => window.cancelAnimationFrame(handle),
   now: () => performance.now(),
 };
 

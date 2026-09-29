@@ -68,10 +68,32 @@ test("only opening controls may be clicked without approval", () => {
   assert.match(uiClickRefusal(fakeElement({ ancestors: [".modal-backdrop"] }), "click"), /확인 모달/);
   assert.match(uiClickRefusal(fakeElement({ ancestors: [".aia-chat-popup"] }), "click"), /AIA 팝업/);
   assert.match(uiClickRefusal(fakeElement({ disabled: true, attrs: { role: "tab" } }), "open"), /비활성화/);
+  // C9-17. 승인 카드는 클릭 권한이 '모든 클릭'이어도 AIA가 누르지 않는다. 자기 요청의
+  // 승인 버튼을 누를 수 있으면 승인이라는 개념이 남지 않는다.
+  assert.match(uiClickRefusal(fakeElement({ ancestors: [".chat-approval"] }), "click"), /승인 카드/);
+  assert.match(
+    uiClickRefusal(fakeElement({ ancestors: [".chat-approval"], attrs: { role: "tab" } }), "open"),
+    /승인 카드/,
+  );
 });
 
 test("text normalization collapses whitespace and caps length", () => {
   assert.equal(normalizeUiText("  저장\n  후   닫기 "), "저장 후 닫기");
   assert.equal(normalizeUiText("a".repeat(80)).length, 60);
   assert.equal(uiRefSelector('r"1'), '[data-ui-ref="r\\"1"]');
+});
+
+// 스캔 결과는 `find_ui_elements`로 백엔드를 거쳐 AIA에게 간다. 60자 경계가 서로게이트 쌍
+// 한가운데에 놓일 때 `slice`(UTF-16 코드 단위)로 자르면 반쪽 글자가 그 응답에 실린다.
+test("화면 스캔 글자는 코드 포인트 단위로 줄이고 반쪽 글자를 남기지 않는다", () => {
+  const long = `a${"\u{1F600}".repeat(80)}`;
+  const shortened = normalizeUiText(long);
+  assert.equal([...shortened].length, 60);
+  assert.equal(shortened.endsWith("…"), true);
+  assert.equal(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(shortened),
+    false,
+  );
+  // 한도 안이면 그대로 둔다.
+  assert.equal(normalizeUiText("  저장   버튼 "), "저장 버튼");
 });

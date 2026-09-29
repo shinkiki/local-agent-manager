@@ -74,14 +74,3 @@ export function excludedProjectPaths(entries: ProjectRegistryEntry[]): Set<strin
 export function projectRegistrySummary(entries: ProjectRegistryEntry[]): ProjectRegistrySummary {
   return partitionProjectRegistry(entries).summary;
 }
-
-/**
- * 결정 대기 집합의 식별 키. "나중에"로 닫은 집합을 기억해 같은 집합이면 다시 띄우지 않고,
- * 프로젝트가 더 감지되면(키가 바뀌면) 다시 띄우기 위해 순서에 무관하게 만든다.
- */
-export function pendingProjectsKey(entries: ProjectRegistryEntry[]): string {
-  return entries
-    .map((entry) => entry.path)
-    .sort()
-    .join("\n");
-}

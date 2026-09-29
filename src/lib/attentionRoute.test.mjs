@@ -9,6 +9,7 @@ const deps = (overrides = {}) => ({
   findIndexedSession: () => null,
   syncSessionCatalog: () => Promise.resolve(),
   findActiveChatId: () => Promise.resolve(null),
+  findProviderSession: () => Promise.resolve(null),
   ...overrides,
 });
 
@@ -68,7 +69,22 @@ test("런타임이 없으면 색인 예산을 끝까지 기다려 세션으로 �
   assert.deepEqual(route, { kind: "session", session });
 });
 
-test("런타임도 색인도 없으면 실행 종료로 안내한다", async () => {
+test("색인이 올리지 못한 세션도 공급자 원본에서 찾으면 세션 화면으로 연다", async () => {
+  const session = { id: "sess-1" };
+  const route = await resolveAttentionRoute(item, deps({
+    findProviderSession: () => Promise.resolve(session),
+  }));
+  assert.deepEqual(route, { kind: "session", session });
+});
+
+test("공급자 원본 조회가 실패해도 실행 종료 안내로 떨어진다", async () => {
+  const route = await resolveAttentionRoute(item, deps({
+    findProviderSession: () => Promise.reject(new Error("세션을 찾을 수 없습니다")),
+  }));
+  assert.deepEqual(route, { kind: "ended" });
+});
+
+test("런타임도 색인도 원본도 없으면 실행 종료로 안내한다", async () => {
   const route = await resolveAttentionRoute(item, deps());
   assert.deepEqual(route, { kind: "ended" });
 });

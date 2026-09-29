@@ -11,11 +11,14 @@ import {
   usageRetryBlockedUntil,
   nextUsageReset,
   usageWindowValueUnavailable,
-  remainingUsagePercent,
+  governingUsageWindows,
+  accountExhaustionWindows,
+  accountExhaustionResetAt,
   usageLevel,
   BUSY_USAGE_REFRESH_INTERVAL_MS,
   IDLE_USAGE_REFRESH_INTERVAL_MS,
 } from "./accountUsage.ts";
+import { accountUsageView, usageWindow } from "./usageViewFixtures.mjs";
 
 const NOW = 1_000_000;
 
@@ -38,29 +41,34 @@ function account(overrides = {}) {
     credentialIsolated: true,
     credentialIsolationNote: null,
     runtimeCount: 0,
-    usage: {
-      status: "ok",
-      windows: [{ label: "7일", usedPercent: 25, resetsAt: null }],
-      updatedAt: 123,
-      error: null,
-      retryAt: null,
-      rateLimited: false,
-    },
+    usage: accountUsageView([usageWindow("7일", 25)], { updatedAt: 123 }),
     ...overrides,
   };
 }
 
-function rateLimited(retryAt, overrides = {}) {
+/** 마지막 조회가 사용량 한도로 막힌 계정. 시험마다 다른 것은 재시도 허용 시각뿐이다. */
+function rateLimited(retryAt) {
   return account({
-    usage: {
+    usage: accountUsageView([usageWindow("5시간", 100)], {
       status: "error",
-      windows: [{ label: "5시간", usedPercent: 100, resetsAt: null }],
       updatedAt: NOW - 10_000,
       error: "HTTP 429",
       retryAt,
       rateLimited: true,
+    }),
+  });
+}
+
+/** 마지막 조회가 한도가 아닌 사유로 실패한 계정. 보관 수치가 있으면 창 목록을 넘긴다. */
+function refreshFailed(windows, error, retryAt, overrides = {}) {
+  return account({
+    usage: accountUsageView(windows, {
+      status: "error",
+      updatedAt: windows.length > 0 ? NOW - 600_000 : null,
+      error,
+      retryAt,
       ...overrides,
-    },
+    }),
   });
 }
 
@@ -83,31 +91,17 @@ test("a rate limit with a future retry time blocks the manual refresh and report
 });
 
 test("a failed refresh keeps the last usage instead of replacing it with the error", () => {
-  const kept = accountUsageDisplayState(account({
-    usage: {
-      status: "error",
-      windows: [{ label: "5시간", usedPercent: 62, resetsAt: null }],
-      updatedAt: NOW - 600_000,
-      error: "Codex 사용량을 조회하지 못했습니다: error sending request",
-      retryAt: NOW + 300_000,
-      rateLimited: false,
-    },
-  }), NOW);
+  const failure = "Codex 사용량을 조회하지 못했습니다: error sending request";
+  const kept = accountUsageDisplayState(
+    refreshFailed([usageWindow("5시간", 62)], failure, NOW + 300_000),
+    NOW,
+  );
   assert.equal(kept.error, null);
-  assert.equal(kept.staleError, "Codex 사용량을 조회하지 못했습니다: error sending request");
+  assert.equal(kept.staleError, failure);
 
   // 보여줄 마지막 값이 없으면 오류 문구가 유일한 정보라 그대로 띄운다.
-  const nothingToKeep = accountUsageDisplayState(account({
-    usage: {
-      status: "error",
-      windows: [],
-      updatedAt: null,
-      error: "Codex 사용량을 조회하지 못했습니다: error sending request",
-      retryAt: NOW + 300_000,
-      rateLimited: false,
-    },
-  }), NOW);
-  assert.equal(nothingToKeep.error, "Codex 사용량을 조회하지 못했습니다: error sending request");
+  const nothingToKeep = accountUsageDisplayState(refreshFailed([], failure, NOW + 300_000), NOW);
+  assert.equal(nothingToKeep.error, failure);
   assert.equal(nothingToKeep.staleError, null);
 });
 
@@ -136,16 +130,10 @@ test("a rate limit without a retry time does not block the manual refresh", () =
 });
 
 test("other error states with a future retry time still allow a user-initiated refresh", () => {
-  const state = accountUsageDisplayState(account({
-    usage: {
-      status: "error",
-      windows: [],
-      updatedAt: NOW - 10_000,
-      error: "usage endpoint unavailable",
-      retryAt: NOW + 60_000,
-      rateLimited: false,
-    },
-  }), NOW);
+  const state = accountUsageDisplayState(
+    refreshFailed([], "usage endpoint unavailable", NOW + 60_000, { updatedAt: NOW - 10_000 }),
+    NOW,
+  );
 
   assert.equal(state.canRefresh, true);
   assert.equal(state.retryBlockedUntil, null);
@@ -177,14 +165,12 @@ test("manual refresh protection never outlives the automatic refresh protection"
 test("accounts that cannot refresh keep cached meters without exposing an old refresh error", () => {
   const state = accountUsageDisplayState(account({
     disabled: true,
-    usage: {
+    usage: accountUsageView([usageWindow("7일", 80)], {
       status: "error",
-      windows: [{ label: "7일", usedPercent: 80, resetsAt: null }],
       updatedAt: 456,
       error: "inactive refresh deferred",
       retryAt: 789,
-      rateLimited: false,
-    },
+    }),
   }), NOW);
 
   assert.equal(state.cached, true);
@@ -196,22 +182,22 @@ test("accounts that cannot refresh keep cached meters without exposing an old re
 test("windows whose stored reset time has passed display as 0% without a refetch", () => {
   const now = 1_000_000;
   const windows = displayUsageWindows([
-    { label: "5시간", usedPercent: 100, resetsAt: now - 1 },
-    { label: "7일", usedPercent: 23, resetsAt: now + 1 },
-    { label: "무제한", usedPercent: 140, resetsAt: null },
+    usageWindow("5시간", 100, now - 1),
+    usageWindow("7일", 23, now + 1),
+    usageWindow("무제한", 140),
   ], now);
 
   assert.deepEqual(windows, [
-    { label: "5시간", usedPercent: 0, resetsAt: now - 1, resetElapsed: true, modelScoped: false },
-    { label: "7일", usedPercent: 23, resetsAt: now + 1, resetElapsed: false, modelScoped: false },
-    { label: "무제한", usedPercent: 100, resetsAt: null, resetElapsed: false, modelScoped: false },
+    { label: "5시간", usedPercent: 0, resetsAt: now - 1, resetElapsed: true, modelScoped: false, aggregate: false },
+    { label: "7일", usedPercent: 23, resetsAt: now + 1, resetElapsed: false, modelScoped: false, aggregate: false },
+    { label: "무제한", usedPercent: 100, resetsAt: null, resetElapsed: false, modelScoped: false, aggregate: false },
   ]);
 });
 
 test("a reset window is unknown when the real refresh failed", () => {
   const [elapsed, current] = displayUsageWindows([
-    { label: "5시간", usedPercent: 75, resetsAt: NOW - 1 },
-    { label: "7일", usedPercent: 20, resetsAt: NOW + 1 },
+    usageWindow("5시간", 75, NOW - 1),
+    usageWindow("7일", 20, NOW + 1),
   ], NOW);
   const failed = { status: "error" };
 
@@ -221,14 +207,7 @@ test("a reset window is unknown when the real refresh failed", () => {
 });
 
 test("a reset elapsed after the last successful fetch requires a real usage recheck", () => {
-  const usage = (updatedAt, resetsAt) => ({
-    status: "ok",
-    windows: [{ label: "5시간", usedPercent: 100, resetsAt }],
-    updatedAt,
-    error: null,
-    retryAt: null,
-    rateLimited: false,
-  });
+  const usage = (updatedAt, resetsAt) => accountUsageView([usageWindow("5시간", 100, resetsAt)], { updatedAt });
 
   assert.equal(usageResetElapsedSinceUpdate(usage(100, 200), 300), true);
   // 조회 이후 초기화 시각이 아직 오지 않았으면 재조회를 강제하지 않는다.
@@ -242,14 +221,7 @@ test("the elapsed-reset signature changes exactly when a stored reset time passe
   const snapshot = {
     providers: [],
     accounts: [account({
-      usage: {
-        status: "ok",
-        windows: [{ label: "5시간", usedPercent: 100, resetsAt: 500 }],
-        updatedAt: 100,
-        error: null,
-        retryAt: null,
-        rateLimited: false,
-      },
+      usage: accountUsageView([usageWindow("5시간", 100, 500)], { updatedAt: 100 }),
     })],
   };
 
@@ -293,18 +265,68 @@ test("usage level thresholds match the settings meters", () => {
   assert.equal(usageLevel(90), "critical");
 });
 
-test("remaining usage ignores model-scoped windows and is unknown without a governing one", () => {
-  const windows = (list) => account({ usage: { status: "ok", windows: list, updatedAt: NOW, error: null } });
-  assert.equal(remainingUsagePercent(windows([
-    { label: "5시간", usedPercent: 30, resetsAt: null },
-    { label: "Fable 7일", usedPercent: 100, resetsAt: null, modelScoped: true },
-  ]), NOW), 70);
-  // 대표할 창이 모델별 창뿐이면 여유를 알 수 없다 — 100%로 단정하면 안 된다.
-  assert.equal(remainingUsagePercent(windows([
-    { label: "Fable 7일", usedPercent: 10, resetsAt: null, modelScoped: true },
-  ]), NOW), null);
-  assert.equal(remainingUsagePercent(windows([]), NOW), null);
-  assert.equal(remainingUsagePercent(null, NOW), null);
+test("대표 창 판정은 모델별 창을 빼고, 남은 것이 없으면 빈 목록이다", () => {
+  const governing = (list) => governingUsageWindows(displayUsageWindows(list, NOW)).map((window) => window.label);
+  assert.deepEqual(governing([
+    usageWindow("5시간", 30),
+    usageWindow("Fable 7일", 100, null, { modelScoped: true }),
+  ]), ["5시간"]);
+  // 대표할 창이 모델별 창뿐이면 여유를 알 수 없다 — 빈 목록이지 "모두 찼다"가 아니다.
+  assert.deepEqual(governing([
+    usageWindow("Fable 7일", 10, null, { modelScoped: true }),
+  ]), []);
+  assert.deepEqual(governing([]), []);
+});
+
+test("계정 소진 판정은 대표 창 복사본을 빼고 모델군이 모두 찼을 때만 참이다", () => {
+  const exhausted = (list) =>
+    accountExhaustionWindows(displayUsageWindows(list, NOW)).map((window) => window.label);
+  // Antigravity 모양: 대표 창은 빡빡한 모델군의 복사본이다.
+  const antigravity = (gemini, thirdParty) => [
+    usageWindow("7일", Math.max(gemini, thirdParty), null, { aggregate: true }),
+    usageWindow("Gemini Models · 7일", gemini, null, { modelScoped: true }),
+    usageWindow("Claude and GPT models · 7일", thirdParty, null, { modelScoped: true }),
+  ];
+  // 한 모델군이 찼다고 계정을 못 쓰는 것이 아니다 — 실행은 다른 모델군으로 그대로 돈다.
+  assert.deepEqual(exhausted(antigravity(100, 0)), []);
+  assert.deepEqual(exhausted(antigravity(100, 100)).sort(), [
+    "Claude and GPT models · 7일",
+    "Gemini Models · 7일",
+  ]);
+  // 자기 대표 창을 가진 공급자는 종전 그대로 그 창으로 판정한다.
+  assert.deepEqual(exhausted([usageWindow("7일", 100), usageWindow("5시간", 10)]), ["7일"]);
+  assert.deepEqual(
+    exhausted([usageWindow("7일", 10), usageWindow("Fable 7일", 100, null, { modelScoped: true })]),
+    [],
+  );
+  assert.deepEqual(exhausted([]), []);
+});
+
+test("소진 계정이 다시 열리는 시각은 가장 먼저 풀리는 모델군이다", () => {
+  const resetAt = (list) => accountExhaustionResetAt(displayUsageWindows(list, NOW));
+  const fiveHour = NOW + 3_600_000;
+  const geminiWeekly = NOW + 100 * 3_600_000;
+  const thirdPartyWeekly = NOW + 50 * 3_600_000;
+  // 소진이 아니면 경고할 것도 없다.
+  assert.equal(resetAt([usageWindow("7일", 10)]), null);
+  // 그룹 안에서는 찬 창이 모두 풀려야 하고(늦은 쪽), 그룹 사이에서는 하나만 풀리면 된다.
+  assert.equal(
+    resetAt([
+      usageWindow("5시간", 100, fiveHour, { aggregate: true }),
+      usageWindow("7일", 100, geminiWeekly, { aggregate: true }),
+      usageWindow("Gemini Models · 5시간", 100, fiveHour, { modelScoped: true }),
+      usageWindow("Gemini Models · 7일", 100, geminiWeekly, { modelScoped: true }),
+      usageWindow("Claude and GPT models · 7일", 100, thirdPartyWeekly, { modelScoped: true }),
+    ]),
+    thirdPartyWeekly,
+  );
+  // 자기 대표 창을 가진 공급자는 찬 창이 모두 풀리는 시각이다.
+  assert.equal(
+    resetAt([usageWindow("5시간", 100, fiveHour), usageWindow("7일", 100, geminiWeekly)]),
+    geminiWeekly,
+  );
+  // 소진인데 시각을 모르면 0 — 경고는 띄우되 언제 풀리는지는 말하지 않는다.
+  assert.equal(resetAt([usageWindow("7일", 100)]), 0);
 });
 
 test("다음 초기화 시각은 아직 오지 않은 것 중 가장 이른 하나다", () => {

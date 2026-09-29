@@ -23,6 +23,9 @@ struct ProviderSpec {
     history_paths: &'static [&'static str],
 }
 
+/// 하네스 세션 DB의 홈 기준 경로. `catalog::opencode_session_db`와 같은 파일을 가리킨다.
+pub(crate) const OPENCODE_SESSION_DB_RELATIVE: &str = ".local/share/opencode/opencode.db";
+
 const PROVIDERS: &[ProviderSpec] = &[
     ProviderSpec {
         id: ProviderId::Claude,
@@ -48,6 +51,15 @@ const PROVIDERS: &[ProviderSpec] = &[
             ".gemini/antigravity/conversations",
         ],
     },
+    ProviderSpec {
+        id: ProviderId::Local,
+        display_name: "Ollama",
+        // 자기 CLI가 없다. ACP 하네스를 빌려 쓰므로 탐지 대상은 그 실행 파일이다.
+        executable_names: &["opencode"],
+        // 기록은 하네스의 세션 DB에 있다. 카탈로그가 `opencode_session_db`로 읽는
+        // 바로 그 파일이라, 여기가 비어 있으면 대화가 목록에 있어도 카드는 "데이터 없음"이 된다.
+        history_paths: &[OPENCODE_SESSION_DB_RELATIVE],
+    },
 ];
 
 fn provider_spec(provider: ProviderId) -> &'static ProviderSpec {
@@ -65,10 +77,8 @@ pub(crate) fn provider_display_name(provider: ProviderId) -> &'static str {
 /// 다시 찾기 위해 매번 PATH를 새로 읽는다.
 pub(crate) fn detect_provider_cli(provider: ProviderId) -> Result<Option<PathBuf>, CoreError> {
     let context = DetectionContext::from_environment()?;
-    Ok(
-        find_executable(provider_spec(provider).executable_names, &context)
-            .map(|path| fs::canonicalize(&path).unwrap_or(path)),
-    )
+    Ok(find_provider_executable(provider_spec(provider), &context)
+        .map(|path| crate::path_guard::child_facing(&fs::canonicalize(&path).unwrap_or(path))))
 }
 
 #[derive(Debug, Clone)]
@@ -88,8 +98,7 @@ impl DetectionContext {
             .map(|value| env::split_paths(&value).collect::<Vec<_>>())
             .unwrap_or_default();
 
-        search_dirs.extend(login_shell_path_dirs().iter().cloned());
-        search_dirs.extend(fallback_executable_dirs(&home));
+        search_dirs.extend(supplemental_executable_dirs(&home));
         deduplicate_paths(&mut search_dirs);
 
         Ok(Self {
@@ -121,7 +130,7 @@ fn inspect_provider(spec: &ProviderSpec, context: &DetectionContext) -> Provider
     ProviderStatus {
         provider: spec.id,
         display_name: spec.display_name.to_owned(),
-        cli: find_executable(spec.executable_names, context)
+        cli: find_provider_executable(spec, context)
             .map(resource_from_path)
             .unwrap_or_else(DetectedResource::missing),
         history: spec
@@ -134,8 +143,54 @@ fn inspect_provider(spec: &ProviderSpec, context: &DetectionContext) -> Provider
     }
 }
 
+fn find_provider_executable(spec: &ProviderSpec, context: &DetectionContext) -> Option<PathBuf> {
+    let executable = find_executable(spec.executable_names, context)?;
+    Some(native_npm_executable(&executable).unwrap_or(executable))
+}
+
+/// `.cmd` 셈 옆에 같은 패키지가 까는 네이티브 실행 파일. 셈 이름으로 고른다.
+///
+/// 공급자가 아니라 파일 이름으로 가르는 것은, 같은 CLI를 여러 공급자가 빌려 쓸 수 있고
+/// (로컬 공급자가 하네스를 빌리는 것처럼) 셈이 어느 패키지 것인지는 이름이 말해 주기
+/// 때문이다.
+#[cfg(windows)]
+const NATIVE_NPM_TARGETS: &[(&str, &str)] = &[
+    (
+        "claude",
+        "node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+    ),
+    ("opencode", "node_modules/opencode-ai/bin/opencode.exe"),
+];
+
+/// Rust intentionally rejects batch-file arguments that cannot be escaped safely for `cmd.exe`.
+/// These CLIs ship a `.cmd` shim next to `node_modules` while the package also ships a native
+/// executable that accepts the original argument vector without shell reparsing. Prefer only that
+/// fixed package-relative target when it exists; other launchers keep their detected path.
+#[cfg(windows)]
+fn native_npm_executable(executable: &Path) -> Option<PathBuf> {
+    if !executable
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
+    {
+        return None;
+    }
+    let stem = executable.file_stem()?.to_str()?.to_ascii_lowercase();
+    let relative = NATIVE_NPM_TARGETS
+        .iter()
+        .find_map(|(name, relative)| (*name == stem).then_some(*relative))?;
+    let native = executable.parent()?.join(relative);
+    is_executable_file(&native).then_some(native)
+}
+
+#[cfg(not(windows))]
+fn native_npm_executable(_executable: &Path) -> Option<PathBuf> {
+    None
+}
+
 fn resource_from_path(path: PathBuf) -> DetectedResource {
-    let display_path = fs::canonicalize(&path).unwrap_or(path);
+    // 이 문자열은 화면에 그대로 보이고 `cli.path`로 스냅숏에도 실려, 그대로 자식
+    // 실행 파일 경로가 된다. 접두어를 달고 나가면 사용자가 복사해 쓸 수도 없다.
+    let display_path = crate::path_guard::child_facing(&fs::canonicalize(&path).unwrap_or(path));
     DetectedResource::found(display_path.to_string_lossy().into_owned())
 }
 
@@ -159,7 +214,7 @@ pub(crate) fn resolve_named_executable(names: &[&str]) -> Result<PathBuf, CoreEr
     let context = DetectionContext::from_environment()?;
     let path = find_executable(names, &context)
         .ok_or_else(|| CoreError::NotFound(format!("{} 실행 파일을 찾을 수 없습니다", names[0])))?;
-    let path = fs::canonicalize(path)?;
+    let path = crate::path_guard::canonical_child_facing(path)?;
     if !is_executable_file(&path) {
         return Err(CoreError::InvalidInput(format!(
             "{} 경로가 실행 파일이 아닙니다",
@@ -184,8 +239,10 @@ pub(crate) fn resolve_named_executable(names: &[&str]) -> Result<PathBuf, CoreEr
 pub(crate) fn command_search_path(executable: &Path) -> Option<OsString> {
     let context = DetectionContext::from_environment().ok()?;
     let mut directories = Vec::with_capacity(context.search_dirs.len() + 1);
+    // 확장 경로 항목은 Windows 탐색이 쓰지 않는다. 접두어를 달고 넣으면 이 함수가
+    // 있는 이유(셔뱅 인터프리터 해석)가 그 항목에서만 조용히 사라진다.
     if let Some(parent) = executable.parent() {
-        directories.push(parent.to_path_buf());
+        directories.push(crate::path_guard::child_facing(parent));
     }
     directories.extend(context.search_dirs);
     deduplicate_paths(&mut directories);
@@ -206,13 +263,10 @@ pub(crate) fn appended_search_path() -> Option<OsString> {
     let home = user_home::optional_home_dir()?;
     let inherited = env::var_os("PATH").unwrap_or_default();
     let known = env::split_paths(&inherited).collect::<HashSet<_>>();
-    let mut missing = login_shell_path_dirs()
-        .iter()
-        .cloned()
-        .chain(fallback_executable_dirs(&home))
+    let missing = supplemental_executable_dirs(&home)
+        .into_iter()
         .filter(|directory| !known.contains(directory))
         .collect::<Vec<_>>();
-    deduplicate_paths(&mut missing);
     if missing.is_empty() {
         return None;
     }
@@ -291,6 +345,7 @@ fn login_shell_path_dirs() -> &'static [PathBuf] {
 
 #[cfg(unix)]
 const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(unix)]
 const LOGIN_SHELL_PATH_MARKER: &str = "__AGENT_MANAGER_PATH_PROBE__";
 
 #[cfg(unix)]
@@ -352,6 +407,7 @@ fn login_shell_executable() -> Option<PathBuf> {
 
 /// 표식 사이의 `env` 출력에서 `PATH=` 줄만 읽는다. 표식 앞의 프로필 잡음과 표식이
 /// 하나뿐인 잘린 출력은 모두 무시한다.
+#[cfg(unix)]
 fn parse_login_shell_path(output: &str) -> Option<Vec<PathBuf>> {
     let begin = output.find(LOGIN_SHELL_PATH_MARKER)? + LOGIN_SHELL_PATH_MARKER.len();
     let end = begin + output[begin..].find(LOGIN_SHELL_PATH_MARKER)?;
@@ -377,6 +433,16 @@ fn fallback_executable_dirs(home: &Path) -> Vec<PathBuf> {
     directories
 }
 
+/// 로그인 셸과 설치 방식별 폴백에서 찾은 추가 실행 경로를 우선순위대로 합친다.
+/// CLI 탐지와 장기 실행 자식의 PATH 보강이 같은 후보 집합을 보도록 한 자리에서
+/// 중복을 제거한다.
+fn supplemental_executable_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut directories = login_shell_path_dirs().to_vec();
+    directories.extend(fallback_executable_dirs(home));
+    deduplicate_paths(&mut directories);
+    directories
+}
+
 fn common_executable_dirs(home: &Path) -> Vec<PathBuf> {
     let mut directories = vec![
         home.join(".local/bin"),
@@ -393,6 +459,7 @@ fn common_executable_dirs(home: &Path) -> Vec<PathBuf> {
     }
 
     if cfg!(windows) {
+        directories.extend(windows_system_dirs(env::var_os("SystemRoot")));
         if let Some(app_data) = env::var_os("APPDATA") {
             directories.push(PathBuf::from(app_data).join("npm"));
         }
@@ -402,6 +469,30 @@ fn common_executable_dirs(home: &Path) -> Vec<PathBuf> {
     }
 
     directories
+}
+
+/// Windows 기본 명령이 놓인 디렉터리. 설치 드라이브를 가정하지 않고 관련 시스템 변수만
+/// 읽으며, 상대 값은 PATH에 넣지 않는다(G8, G9).
+///
+/// System32만으로는 모자란다. 셸 내장처럼 보이는 `chcp`는 거기 있지만, Cypress가 Windows에서
+/// 설치된 브라우저와 버전을 조회할 때 띄우는 `powershell.exe`는 System32가 아니라 그 아래
+/// `WindowsPowerShell\v1.0`에 있다. GUI로 뜬 앱이 짧은 PATH를 물려받으면 그 조회가
+/// `spawn powershell.exe ENOENT`로 죽어 Cypress가 기동조차 못 했다. 기본 명령이 놓이는
+/// 네 곳을 모두, 물려받은 PATH 상태와 무관하게 넣는다. 순서는 Windows 기본 PATH와 같다.
+fn windows_system_dirs(system_root: Option<OsString>) -> Vec<PathBuf> {
+    let Some(root) = system_root
+        .map(PathBuf::from)
+        .filter(|root| root.is_absolute())
+    else {
+        return Vec::new();
+    };
+    let system32 = root.join("System32");
+    vec![
+        system32.clone(),
+        root,
+        system32.join("Wbem"),
+        system32.join("WindowsPowerShell").join("v1.0"),
+    ]
 }
 
 /// 노드 버전 관리자·대안 패키지 관리자가 전역 CLI를 두는 디렉터리 중 존재하는 것.
@@ -484,6 +575,60 @@ fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    mod native_npm {
+        use super::super::*;
+
+        /// 셈과 네이티브 실행 파일을 함께 깐 npm 설치를 흉내낸다.
+        fn install(dir: &std::path::Path, shim: &str, relative: &str) -> PathBuf {
+            let native = dir.join(relative);
+            fs::create_dir_all(native.parent().expect("부모")).expect("네이티브 디렉터리");
+            fs::write(&native, b"MZ").expect("네이티브 파일");
+            let shim = dir.join(shim);
+            fs::write(&shim, b"@ECHO off").expect("셈 파일");
+            shim
+        }
+
+        #[test]
+        fn a_cmd_shim_resolves_to_the_native_executable_beside_it() {
+            let dir = tempfile::tempdir().expect("임시 디렉터리");
+            for (shim, relative) in NATIVE_NPM_TARGETS {
+                let shim_path = install(dir.path(), &format!("{shim}.cmd"), relative);
+                assert_eq!(
+                    native_npm_executable(&shim_path),
+                    Some(dir.path().join(relative)),
+                    "{shim}",
+                );
+            }
+        }
+
+        #[test]
+        fn a_shim_without_its_native_file_keeps_the_detected_path() {
+            // 패키지가 네이티브를 깔지 않은 설치도 있다. 없는 경로를 돌려주면 기동이 죽는다.
+            let dir = tempfile::tempdir().expect("임시 디렉터리");
+            let shim = dir.path().join("opencode.cmd");
+            fs::write(&shim, b"@ECHO off").expect("셈 파일");
+            assert_eq!(native_npm_executable(&shim), None);
+        }
+
+        #[test]
+        fn only_cmd_shims_are_redirected() {
+            // 네이티브 실행 파일을 직접 찾은 경우까지 다시 옮기면 엉뚱한 곳을 가리킨다.
+            let dir = tempfile::tempdir().expect("임시 디렉터리");
+            let exe = dir.path().join("opencode.exe");
+            fs::write(&exe, b"MZ").expect("실행 파일");
+            assert_eq!(native_npm_executable(&exe), None);
+        }
+
+        #[test]
+        fn an_unknown_shim_is_left_alone() {
+            let dir = tempfile::tempdir().expect("임시 디렉터리");
+            let shim = dir.path().join("codex.cmd");
+            fs::write(&shim, b"@ECHO off").expect("셈 파일");
+            assert_eq!(native_npm_executable(&shim), None);
+        }
+    }
+
     use super::*;
     fn temporary_directory() -> PathBuf {
         tempfile::Builder::new()
@@ -503,6 +648,38 @@ mod tests {
             .permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).expect("fixture permissions must be set");
+    }
+
+    /// `provider_spec`은 표에서 찾지 못하면 panic한다. 공급자를 늘리고 이 표에 행을
+    /// 빠뜨리면 컴파일은 통과한 채 실행 중에 죽으므로, 전수 순회로 그 구멍을 막는다.
+    #[test]
+    fn every_provider_has_a_detection_spec() {
+        for provider in ProviderId::ALL {
+            let spec = provider_spec(provider);
+            assert_eq!(spec.id, provider);
+            assert!(
+                !provider_display_name(provider).is_empty(),
+                "{provider} 표시명"
+            );
+            assert!(
+                !spec.executable_names.is_empty(),
+                "{provider} 실행 파일 이름"
+            );
+        }
+    }
+
+    /// 로컬 공급자는 자기 CLI 없이 ACP 하네스를 빌려 쓴다. 기록 경로는 하네스의 세션 DB
+    /// 하나뿐이고, 카탈로그가 읽는 파일과 같아야 카드의 "채팅 탐지"와 목록이 어긋나지 않는다.
+    #[test]
+    fn the_local_provider_borrows_the_acp_harness_and_its_session_db() {
+        let local = provider_spec(ProviderId::Local);
+        assert_eq!(local.executable_names, &["opencode"]);
+        assert_eq!(local.history_paths, &[OPENCODE_SESSION_DB_RELATIVE]);
+        // Codex 것을 빌리던 시절의 흔적이 남아 있으면 두 공급자가 같은 rollout을 훑는다.
+        assert_ne!(
+            local.executable_names,
+            provider_spec(ProviderId::Codex).executable_names,
+        );
     }
 
     #[test]
@@ -609,6 +786,49 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn claude_npm_shim_resolves_to_the_package_native_executable() {
+        let root = temporary_directory();
+        let cmd_launcher = root.join("claude.CMD");
+        let native = root.join("node_modules/@anthropic-ai/claude-code/bin/claude.exe");
+        fs::create_dir_all(native.parent().expect("native parent")).expect("native directory");
+        fs::write(&cmd_launcher, "@echo off\r\n").expect("cmd launcher fixture");
+        fs::write(&native, "fixture").expect("native executable fixture");
+        let context = DetectionContext {
+            home: root.clone(),
+            search_dirs: vec![root.clone()],
+            executable_extensions: vec![OsString::from(".EXE"), OsString::from(".CMD")],
+        };
+
+        assert_eq!(
+            find_provider_executable(provider_spec(ProviderId::Claude), &context),
+            Some(native)
+        );
+
+        fs::remove_dir_all(root).expect("temporary directory must be removed");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn claude_npm_shim_remains_the_fallback_without_a_native_executable() {
+        let root = temporary_directory();
+        let cmd_launcher = root.join("claude.CMD");
+        fs::write(&cmd_launcher, "@echo off\r\n").expect("cmd launcher fixture");
+        let context = DetectionContext {
+            home: root.clone(),
+            search_dirs: vec![root.clone()],
+            executable_extensions: vec![OsString::from(".EXE"), OsString::from(".CMD")],
+        };
+
+        assert_eq!(
+            find_provider_executable(provider_spec(ProviderId::Claude), &context),
+            Some(cmd_launcher)
+        );
+
+        fs::remove_dir_all(root).expect("temporary directory must be removed");
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn antigravity_ide_launcher_is_not_detected_as_the_cli() {
         let root = temporary_directory();
         let ide_bin = root.join("ide");
@@ -628,7 +848,9 @@ mod tests {
             .into_iter()
             .find(|provider| provider.provider == ProviderId::Antigravity)
             .expect("Antigravity status");
-        let expected_cli = fs::canonicalize(cli_bin.join("agy.EXE")).expect("canonical CLI path");
+        // 탐지 결과는 그대로 자식 실행 파일 경로가 되므로 접두어를 달고 나오지 않는다.
+        let expected_cli = crate::path_guard::canonical_child_facing(cli_bin.join("agy.EXE"))
+            .expect("canonical CLI path");
         assert_eq!(
             antigravity.cli.path,
             Some(expected_cli.to_string_lossy().into_owned())
@@ -663,6 +885,73 @@ mod tests {
         assert_eq!(unique.len(), directories.len(), "PATH에 중복 항목이 있다");
     }
 
+    /// Windows 기본 명령은 System32 한 곳에만 있지 않다. `SystemRoot` 하나에서 네 곳을
+    /// 모두 만들고, 상대 경로는 앱의 작업 디렉터리에 따라 다른 파일을 가리키므로 버린다.
+    #[test]
+    fn windows_system_dirs_are_the_four_default_command_locations() {
+        assert!(windows_system_dirs(Some(OsString::from("Windows"))).is_empty());
+        assert!(windows_system_dirs(None).is_empty());
+
+        let root = if cfg!(windows) {
+            r"C:\Windows"
+        } else {
+            "/Windows"
+        };
+        let dirs = windows_system_dirs(Some(OsString::from(root)));
+        let root = PathBuf::from(root);
+        let system32 = root.join("System32");
+        assert_eq!(
+            dirs,
+            vec![
+                system32.clone(),
+                root,
+                system32.join("Wbem"),
+                // Cypress의 브라우저 탐지가 띄우는 `powershell.exe`는 System32가 아니라 여기 있다.
+                system32.join("WindowsPowerShell").join("v1.0"),
+            ]
+        );
+    }
+
+    /// Windows 자식은 사용자 PATH 순서를 그대로 둔 채 실제 SystemRoot의 기본 명령 디렉터리를
+    /// 폴백으로 받는다. 그래야 `chcp`·`powershell.exe` 같은 시스템 실행 파일을 설치 드라이브와
+    /// 물려받은 PATH 상태에 무관하게 찾는다.
+    #[test]
+    #[cfg(windows)]
+    fn command_search_path_appends_the_actual_windows_system_dirs() {
+        // 같은 디렉터리가 PATH에 두 번 적혀 있으면 자식에는 한 번만 남는다. 중복을 먼저
+        // 걷어내지 않으면 "첫 위치"가 되감겨 순서가 깨진 것처럼 보인다.
+        let mut inherited = env::var_os("PATH")
+            .map(|value| env::split_paths(&value).collect::<Vec<_>>())
+            .unwrap_or_default();
+        deduplicate_paths(&mut inherited);
+        let path = command_search_path(Path::new(r"C:\tools\node.exe")).expect("child PATH");
+        let directories = env::split_paths(&path).collect::<Vec<_>>();
+        let system_dirs = windows_system_dirs(env::var_os("SystemRoot"));
+        assert!(!system_dirs.is_empty(), "SystemRoot");
+
+        let home = env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .expect("USERPROFILE");
+        let common = common_executable_dirs(&home);
+        for expected in &system_dirs {
+            assert!(directories.contains(expected), "{}", expected.display());
+            assert!(common.contains(expected), "{}", expected.display());
+        }
+        assert!(
+            system_dirs
+                .iter()
+                .any(|dir| dir.join("powershell.exe").is_file()),
+            "자식 PATH에서 powershell.exe를 찾을 수 있어야 한다"
+        );
+        let inherited_positions = inherited
+            .iter()
+            .filter_map(|entry| directories.iter().position(|candidate| candidate == entry))
+            .collect::<Vec<_>>();
+        assert!(inherited_positions
+            .windows(2)
+            .all(|pair| pair[0] <= pair[1]));
+    }
+
     /// 오래 사는 자식은 손자까지 PATH를 물려주므로 우선순위가 바뀌면 안 된다.
     /// 상속한 문자열이 접두사로 그대로 남고, 뒤에 덧붙은 것만 새 디렉터리인지 확인한다.
     #[test]
@@ -695,6 +984,7 @@ mod tests {
     /// 로그인 셸 출력에서 표식 사이의 `PATH=` 줄만 읽는다. 프로필이 표식 앞에 찍는
     /// 배너와, 표식이 하나뿐인 잘린 출력, 상대 경로 항목은 무시해야 한다.
     #[test]
+    #[cfg(unix)]
     fn login_shell_path_is_read_between_markers_only() {
         let output = format!(
             "Welcome back!\nPATH=/from/banner\n{m}\nHOME=/Users/me\nPATH=/Users/me/.nvm/versions/node/v22.1.0/bin:/opt/homebrew/bin::.:~/.dotnet/tools:/usr/bin\nSHELL=/bin/zsh\n{m}\n",

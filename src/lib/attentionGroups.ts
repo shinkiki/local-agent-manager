@@ -29,9 +29,17 @@ export interface AttentionGroup {
   folders: string[];
 }
 
+interface AttentionGroupScope {
+  reason: AttentionGroupReason;
+  scope: string;
+}
+
 /** 묶음의 범위. 공급자와 종류는 아이콘·배지가 묶음마다 하나뿐이라 늘 키에 함께 넣는다. */
-function groupScope(item: ChatAttentionItem): { reason: AttentionGroupReason; scope: string } {
+function groupScope(item: ChatAttentionItem): AttentionGroupScope {
   if (item.kind === "accountSwitch") return { reason: "account", scope: "account" };
+  // 페이싱 제안은 회차가 아니라 페이싱 전체에 대한 것이라 소비자별로 나누지 않는다.
+  // 같은 key끼리는 백엔드가 이미 교체하므로 여기서는 한 묶음으로만 모은다.
+  if (item.kind === "pacingSuggestion") return { reason: "workflow", scope: "pacing-suggestion" };
   const origin = item.origin;
   const consumerId = origin?.consumerId ?? origin?.scheduleId ?? null;
   if (consumerId) {
@@ -43,6 +51,46 @@ function groupScope(item: ChatAttentionItem): { reason: AttentionGroupReason; sc
   }
   if (origin?.workflowId) return { reason: "workflow", scope: `workflow:${origin.workflowId}` };
   return { reason: "chat", scope: `chat:${item.chatId}` };
+}
+
+/** 묶음 맵에서 사용할 고유 키를 조립한다. */
+function attentionGroupKey(scope: string, source: string, kind: string): string {
+  return `${scope}\u0000${source}\u0000${kind}`;
+}
+
+/** 승인 대기는 읽음 여부와 무관하게 항상 미확인으로 센다. */
+function isUnreadAttention(item: ChatAttentionItem): boolean {
+  return !item.read || item.kind === "approval";
+}
+
+/** 승인 대기 항목은 통째로 삭제할 수 없다. */
+function isDismissableAttention(item: ChatAttentionItem): boolean {
+  return item.kind !== "approval";
+}
+
+/**
+ * 묶음의 빈 자리. 집계값은 모두 "아직 아무것도 넣지 않은" 값으로 두고, 첫 항목도
+ * `accumulateAttentionItem`을 지나 채운다. 묶음을 열 때와 이어 붙일 때가 각자 미확인
+ * 건수·삭제 가능·폴더를 계산하던 때는 규칙 셋이 두 벌로 있어, 한쪽만 고치면 첫 항목과
+ * 나머지 항목의 판정이 갈렸다.
+ */
+function emptyAttentionGroup(key: string, reason: AttentionGroupReason, lead: ChatAttentionItem): AttentionGroup {
+  return { key, reason, lead, items: [], unreadCount: 0, dismissable: true, folders: [] };
+}
+
+/** 묶음에 새 작업 경로 조각을 중복 없이 순서대로 덧붙인다. */
+function appendUniqueFolder(folders: string[], folder: string): void {
+  if (folder && !folders.includes(folder)) {
+    folders.push(folder);
+  }
+}
+
+/** 항목 하나를 묶음에 누적한다. 대표 항목도 이 한 벌을 지난다. */
+function accumulateAttentionItem(group: AttentionGroup, item: ChatAttentionItem): void {
+  group.items.push(item);
+  if (isUnreadAttention(item)) group.unreadCount += 1;
+  group.dismissable &&= isDismissableAttention(item);
+  appendUniqueFolder(group.folders, attentionFolderName(item.cwd));
 }
 
 /** 경로의 마지막 조각. 알림 줄에 이미 쓰는 표기와 같다. */
@@ -60,28 +108,14 @@ export function groupAttentionItems(items: ChatAttentionItem[]): AttentionGroup[
   const byKey = new Map<string, AttentionGroup>();
   for (const item of items) {
     const { reason, scope } = groupScope(item);
-    const key = `${scope}\u0000${item.source}\u0000${item.kind}`;
-    const unread = !item.read || item.kind === "approval" ? 1 : 0;
-    const folder = attentionFolderName(item.cwd);
-    const existing = byKey.get(key);
-    if (!existing) {
-      const group: AttentionGroup = {
-        key,
-        reason,
-        lead: item,
-        items: [item],
-        unreadCount: unread,
-        dismissable: item.kind !== "approval",
-        folders: folder ? [folder] : [],
-      };
+    const key = attentionGroupKey(scope, item.source, item.kind);
+    let group = byKey.get(key);
+    if (!group) {
+      group = emptyAttentionGroup(key, reason, item);
       byKey.set(key, group);
       groups.push(group);
-      continue;
     }
-    existing.items.push(item);
-    existing.unreadCount += unread;
-    existing.dismissable &&= item.kind !== "approval";
-    if (folder && !existing.folders.includes(folder)) existing.folders.push(folder);
+    accumulateAttentionItem(group, item);
   }
   return groups;
 }
@@ -95,6 +129,6 @@ export function groupAttentionItems(items: ChatAttentionItem[]): AttentionGroup[
  */
 export function attentionFolderSummary(folders: string[], more: (count: number) => string = (count) => `외 ${count}곳`): string {
   if (folders.length === 0) return "";
-  if (folders.length <= 2) return folders.join(", ");
-  return `${folders.slice(0, 2).join(", ")} ${more(folders.length - 2)}`;
+  const head = folders.slice(0, 2).join(", ");
+  return folders.length <= 2 ? head : `${head} ${more(folders.length - 2)}`;
 }

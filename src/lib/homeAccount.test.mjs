@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { homeAccountSummary, homeUsageNote, homeUsageRefreshDue } from "./homeAccount.ts";
+import { homeAccountSummary, homeUsageCanRefresh, homeUsageNote, homeUsageRefreshDue } from "./homeAccount.ts";
 
 const text = (ko) => ko;
 const now = 1_700_000_000_000;
@@ -120,6 +120,13 @@ test("등록 계정과 겹치는 홈은 사용량 조회 대상이 아니다", (
   assert.equal(homeUsageRefreshDue(home({ accountId: "claude-1" }), now), false);
   assert.equal(homeUsageRefreshDue(home({ state: "expired" }), now), false);
   assert.equal(homeUsageRefreshDue(undefined, now), false);
+});
+
+test("등록 계정이 없어도 검증된 공유 홈은 수동 사용량 새로고침 대상이다", () => {
+  assert.equal(homeUsageCanRefresh(home({}), now), true);
+  assert.equal(homeUsageCanRefresh(home({ accountId: "claude-1" }), now), false);
+  assert.equal(homeUsageCanRefresh(home({ state: "expired" }), now), false);
+  assert.equal(homeUsageCanRefresh(home({ usage: usage({ retryAt: now + 60_000 }) }), now), false);
 });
 
 test("미등록 홈은 느린 주기로 읽고 재시도 대기는 지킨다", () => {

@@ -21,7 +21,7 @@ use crate::domain::{
 };
 use crate::path_guard::{self, CurDirPolicy, RelativePathIssue};
 use crate::store::{is_restricted_doc_root, load_metadata};
-use crate::{linked_file, CoreError, LinkedFile, LinkedFileDownload};
+use crate::{linked_file, CoreError, LinkedFile, LinkedFileDownload, LinkedFileSource};
 
 const MAX_DOC_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_DOCUMENT_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
@@ -52,7 +52,7 @@ pub fn list_document_entries(
     };
     if !parent.is_dir() {
         return Err(CoreError::InvalidInput(
-            "문서 목록 기준 경로가 폴더가 아닙니다".to_owned(),
+            "파일 목록 기준 경로가 폴더가 아닙니다".to_owned(),
         ));
     }
     let (offset, limit) = document_page_window(cursor, limit)?;
@@ -85,8 +85,7 @@ pub fn read_document_file(
     root_id: &str,
     relative_path: &str,
 ) -> Result<DocumentFile, CoreError> {
-    let root = resolve_root(app_data_dir, root_id)?;
-    let path = resolve_doc_path(&root, relative_path, true)?;
+    let (root, path) = resolve_root_entry(app_data_dir, root_id, relative_path, true)?;
     let metadata = fs::metadata(&path)?;
     if !metadata.is_file() {
         return Err(CoreError::InvalidInput(
@@ -131,18 +130,44 @@ pub fn read_document_file_download(
     )
 }
 
+/// 문서 파일을 읽지 않고 자리만 확인한다. 내려받기를 데스크톱 셸에서 이어 복사로
+/// 처리하는 경로가 쓴다 — 바이트가 메모리를 지나지 않으므로
+/// [`MAX_DOCUMENT_DOWNLOAD_BYTES`]가 막던 크기 제한이 여기에는 없다.
+pub fn read_document_file_source(
+    app_data_dir: &Path,
+    root_id: &str,
+    relative_path: &str,
+) -> Result<LinkedFileSource, CoreError> {
+    let root = resolve_root(app_data_dir, root_id)?;
+    linked_file::read_linked_file_source_from(&root, &root, relative_path, u64::MAX)
+}
+
+/// 문서 안 링크가 가리키는 파일의 자리만 확인한다. 링크 해석 규칙은 미리보기·내려받기와
+/// 같은 [`read_doc_link`]를 지난다.
+pub fn read_doc_linked_file_source(
+    app_data_dir: &Path,
+    root_id: &str,
+    current_path: &str,
+    href: &str,
+) -> Result<LinkedFileSource, CoreError> {
+    read_doc_link(
+        app_data_dir,
+        root_id,
+        current_path,
+        href,
+        |root, base, href| linked_file::read_linked_file_source_from(root, base, href, u64::MAX),
+    )
+}
+
 pub fn read_doc(
     app_data_dir: &Path,
     root_id: &str,
     relative_path: &str,
 ) -> Result<DocFile, CoreError> {
-    let root = resolve_root(app_data_dir, root_id)?;
-    let path = resolve_doc_path(&root, relative_path, true)?;
+    let (root, path) = resolve_root_entry(app_data_dir, root_id, relative_path, true)?;
     validate_markdown_file(&path)?;
     let file_metadata = fs::metadata(&path)?;
-    if file_metadata.len() > MAX_DOC_BYTES {
-        return Err(CoreError::TooLarge(MAX_DOC_BYTES));
-    }
+    ensure_doc_size(file_metadata.len())?;
     Ok(DocFile {
         root_id: root_id.to_owned(),
         relative_path: normalized_relative(&root, &path)?,
@@ -192,12 +217,11 @@ fn read_doc_link<T>(
     href: &str,
     read: impl Fn(&Path, &Path, &str) -> Result<T, CoreError>,
 ) -> Result<T, CoreError> {
-    let doc_root = resolve_root(app_data_dir, root_id)?;
-    let current_doc = resolve_doc_path(&doc_root, current_path, true)?;
+    let (doc_root, current_doc) = resolve_root_entry(app_data_dir, root_id, current_path, true)?;
     validate_markdown_file(&current_doc)?;
     let workspace_root = nearest_repository_root(&doc_root).unwrap_or(&doc_root);
     let current_dir = current_doc.parent().ok_or_else(|| {
-        CoreError::InvalidInput("현재 문서의 기준 경로를 확인할 수 없습니다".to_owned())
+        CoreError::InvalidInput("현재 파일의 기준 경로를 확인할 수 없습니다".to_owned())
     })?;
 
     match read(workspace_root, current_dir, href) {
@@ -213,6 +237,56 @@ fn nearest_repository_root(path: &Path) -> Option<&Path> {
         .find(|ancestor| ancestor.join(".git").exists())
 }
 
+/// 새 문서 전용 입구. **이미 있는 경로는 절대 덮어쓰지 않는다.**
+///
+/// QA #65 — 새 문서 만들기는 `save_doc`을 `expected_modified_at: None`으로 불렀다. 그 값은
+/// "변경 검사를 하지 않는다"는 뜻이라, 같은 이름의 문서가 이미 있으면 아무 확인 없이 본문이
+/// `# 새 문서` 한 줄로 날아갔다. 만들기와 저장은 다른 계약이므로 입구를 나눈다. 존재 검사와
+/// 쓰기 사이의 틈이 없도록 `create_new`로 연다 — 먼저 `exists()`를 보고 쓰면 그 사이에 생긴
+/// 파일을 다시 덮어쓴다.
+pub fn create_doc(
+    app_data_dir: &Path,
+    root_id: &str,
+    relative_path: &str,
+    content: &str,
+) -> Result<DocFile, CoreError> {
+    ensure_doc_size(content.len() as u64)?;
+    let (root, path) = resolve_root_entry(app_data_dir, root_id, relative_path, false)?;
+    validate_markdown_file(&path)?;
+    prepare_doc_parent(&root, &path)?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(content.as_bytes())?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(CoreError::Conflict(
+                "같은 이름의 파일이 이미 있습니다. 다른 이름을 쓰거나 그 파일을 열어 편집하세요."
+                    .to_owned(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+    read_doc(app_data_dir, root_id, relative_path)
+}
+
+/// 저장·생성이 함께 쓰는 준비. 상위 폴더를 만들고, 그 실체가 등록 폴더 밖으로 새지 않는지 본다.
+fn prepare_doc_parent(root: &Path, path: &Path) -> Result<(), CoreError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    fs::create_dir_all(parent)?;
+    let parent_real = fs::canonicalize(parent)?;
+    if !parent_real.starts_with(root) {
+        return Err(path_outside_root());
+    }
+    Ok(())
+}
+
 pub fn save_doc(
     app_data_dir: &Path,
     root_id: &str,
@@ -220,30 +294,40 @@ pub fn save_doc(
     content: &str,
     expected_modified_at: Option<i64>,
 ) -> Result<DocFile, CoreError> {
-    if content.len() as u64 > MAX_DOC_BYTES {
-        return Err(CoreError::TooLarge(MAX_DOC_BYTES));
-    }
-    let root = resolve_root(app_data_dir, root_id)?;
-    let path = resolve_doc_path(&root, relative_path, false)?;
+    ensure_doc_size(content.len() as u64)?;
+    let (root, path) = resolve_root_entry(app_data_dir, root_id, relative_path, false)?;
     validate_markdown_file(&path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-        let parent_real = fs::canonicalize(parent)?;
-        if !parent_real.starts_with(&root) {
-            return Err(CoreError::InvalidInput(
-                "허용된 경로를 벗어났습니다".to_owned(),
-            ));
-        }
-    }
+    prepare_doc_parent(&root, &path)?;
     if let (Some(expected), Ok(current)) = (expected_modified_at, fs::metadata(&path)) {
         if modified_ms(&current) != expected {
             return Err(CoreError::Conflict(
-                "다른 프로그램에서 문서가 변경되었습니다. 다시 불러온 뒤 저장하세요.".to_owned(),
+                "다른 프로그램에서 파일이 변경되었습니다. 다시 불러온 뒤 저장하세요.".to_owned(),
             ));
         }
     }
     fs::write(&path, content)?;
     read_doc(app_data_dir, root_id, relative_path)
+}
+
+/// 읽기·생성·저장이 공유하는 Markdown 본문 크기 상한.
+fn ensure_doc_size(size_bytes: u64) -> Result<(), CoreError> {
+    if size_bytes > MAX_DOC_BYTES {
+        return Err(CoreError::TooLarge(MAX_DOC_BYTES));
+    }
+    Ok(())
+}
+
+/// 문서 루트를 열고 그 안의 상대 경로까지 해석하는 진입점 공통 준비. 진입점마다 두 줄로
+/// 펼쳐 두면 루트 검사와 경로 검사 중 하나만 빠뜨려도 컴파일은 지나가므로 한 벌로 묶는다.
+fn resolve_root_entry(
+    app_data_dir: &Path,
+    root_id: &str,
+    relative_path: &str,
+    must_exist: bool,
+) -> Result<(PathBuf, PathBuf), CoreError> {
+    let root = resolve_root(app_data_dir, root_id)?;
+    let path = resolve_doc_path(&root, relative_path, must_exist)?;
+    Ok((root, path))
 }
 
 fn resolve_root(app_data_dir: &Path, root_id: &str) -> Result<PathBuf, CoreError> {
@@ -252,16 +336,16 @@ fn resolve_root(app_data_dir: &Path, root_id: &str) -> Result<PathBuf, CoreError
         .doc_roots
         .into_iter()
         .find(|root| root.id == root_id)
-        .ok_or_else(|| CoreError::NotFound("문서 폴더를 찾을 수 없습니다".to_owned()))?;
+        .ok_or_else(|| CoreError::NotFound("등록 폴더를 찾을 수 없습니다".to_owned()))?;
     let canonical = fs::canonicalize(root.path)?;
     if !canonical.is_dir() {
         return Err(CoreError::NotFound(
-            "문서 폴더 경로가 존재하지 않습니다".to_owned(),
+            "등록 폴더 경로가 존재하지 않습니다".to_owned(),
         ));
     }
     if is_restricted_doc_root(app_data_dir, &canonical) {
         return Err(CoreError::InvalidInput(
-            "보호된 경로와 겹치는 문서 폴더에는 접근할 수 없습니다".to_owned(),
+            "보호된 경로와 겹치는 등록 폴더에는 접근할 수 없습니다".to_owned(),
         ));
     }
     Ok(canonical)
@@ -282,8 +366,7 @@ fn build_doc_nodes(
         }
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() || entry.file_name().to_string_lossy().starts_with('.')
-        {
+        if is_hidden_document_child(&entry.file_name().to_string_lossy(), &metadata) {
             continue;
         }
         if metadata.is_file()
@@ -293,9 +376,6 @@ fn build_doc_nodes(
                 .map(str::to_ascii_lowercase)
                 != Some("md".to_owned())
         {
-            continue;
-        }
-        if !metadata.is_dir() && !metadata.is_file() {
             continue;
         }
         *remaining -= 1;
@@ -325,13 +405,13 @@ fn document_cursor_offset(cursor: Option<&str>) -> Result<usize, CoreError> {
         None => Ok(0),
         Some(value) => value
             .parse::<usize>()
-            .map_err(|_| CoreError::InvalidInput("문서 목록 커서가 올바르지 않습니다".to_owned())),
+            .map_err(|_| CoreError::InvalidInput("파일 목록 커서가 올바르지 않습니다".to_owned())),
     }
 }
 
 /// 문서 목록·검색이 공유하는 페이지 창. 커서는 항목을 읽기 전에 해석해,
 /// 잘못된 커서가 디렉터리 오류에 가려지지 않게 한다.
-fn document_page_window(
+pub(crate) fn document_page_window(
     cursor: Option<&str>,
     limit: Option<usize>,
 ) -> Result<(usize, usize), CoreError> {
@@ -345,7 +425,7 @@ fn document_page_window(
 
 /// 정렬이 끝난 항목을 한 페이지로 자르고 다음 커서를 붙인다. 정렬 기준은 목록과
 /// 검색이 서로 달라 호출부에 남긴다.
-fn document_entry_page(
+pub(crate) fn document_entry_page(
     entries: Vec<DocumentEntry>,
     offset: usize,
     limit: usize,
@@ -370,12 +450,14 @@ fn visible_document_children(parent: &Path) -> Result<Vec<(PathBuf, fs::Metadata
     let mut children = Vec::new();
     for item in fs::read_dir(parent)? {
         let item = item?;
-        if item.file_name().to_string_lossy().starts_with('.') {
+        let name = item.file_name().to_string_lossy().into_owned();
+        // 숨김 이름은 상태 조회 없이 먼저 걸러 낸다. 나머지 판정은 트리 훑기와 같은 자리를 쓴다.
+        if name.starts_with('.') {
             continue;
         }
         let path = item.path();
         let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
+        if is_hidden_document_child(&name, &metadata) {
             continue;
         }
         children.push((path, metadata));
@@ -383,15 +465,34 @@ fn visible_document_children(parent: &Path) -> Result<Vec<(PathBuf, fs::Metadata
     Ok(children)
 }
 
+/// 문서 트리·목록·검색이 함께 감추는 항목: 숨김 이름, 심볼릭 링크, 그리고 폴더도 파일도
+/// 아닌 것(소켓·장치 등). 판정이 경로마다 따로 적혀 있으면 트리에는 뜨는데 목록에는
+/// 없는 항목이 생기므로 한 자리에만 둔다.
+fn is_hidden_document_child(name: &str, metadata: &fs::Metadata) -> bool {
+    name.starts_with('.')
+        || metadata.file_type().is_symlink()
+        || (!metadata.is_dir() && !metadata.is_file())
+}
+
 /// 폴더를 앞세우고 주어진 키를 대소문자 구분 없이 견주는 문서 목록 정렬. 목록은
 /// 이름을, 검색은 상대 경로를 키로 쓴다.
 fn sort_document_entries(entries: &mut [DocumentEntry], key: fn(&DocumentEntry) -> &str) {
     entries.sort_by(|left, right| {
-        right
-            .is_directory
-            .cmp(&left.is_directory)
-            .then_with(|| key(left).to_lowercase().cmp(&key(right).to_lowercase()))
+        directory_first_order(
+            (left.is_directory, key(left)),
+            (right.is_directory, key(right)),
+        )
     });
+}
+
+/// 문서 트리와 목록이 함께 쓰는 차례: 폴더가 먼저고, 같은 종류끼리는 주어진 키를
+/// 대소문자 구분 없이 견준다. 비교가 두 벌로 적혀 있으면 한쪽만 고쳐도 같은 폴더가
+/// 트리와 목록에서 다른 자리에 놓이므로 이 자리 하나만 둔다.
+pub(crate) fn directory_first_order(left: (bool, &str), right: (bool, &str)) -> std::cmp::Ordering {
+    right
+        .0
+        .cmp(&left.0)
+        .then_with(|| left.1.to_lowercase().cmp(&right.1.to_lowercase()))
 }
 
 fn read_document_directory(root: &Path, parent: &Path) -> Result<Vec<DocumentEntry>, CoreError> {
@@ -427,8 +528,7 @@ fn document_entry(
     let relative_path = normalized_relative(root, path)?;
     let parent_path = path
         .parent()
-        .and_then(|parent| parent.strip_prefix(root).ok())
-        .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+        .and_then(|parent| normalized_relative(root, parent).ok())
         .unwrap_or_default();
     Ok(DocumentEntry {
         name: path
@@ -449,7 +549,7 @@ fn document_entry(
 
 /// 문서 본문을 UTF-8 텍스트로 읽는다. 표본 판정을 통과했더라도 뒤쪽에 잘못된 UTF-8이나
 /// NUL 바이트가 있으면 `None`을 돌려 호출부가 바이너리로 격하하게 한다. 입출력 오류만 오류다.
-fn read_document_text(path: &Path) -> Result<Option<String>, CoreError> {
+pub(crate) fn read_document_text(path: &Path) -> Result<Option<String>, CoreError> {
     let bytes = fs::read(path)?;
     if bytes.contains(&0) {
         return Ok(None);
@@ -457,7 +557,7 @@ fn read_document_text(path: &Path) -> Result<Option<String>, CoreError> {
     Ok(String::from_utf8(bytes).ok())
 }
 
-fn preview_kind_for_path(
+pub(crate) fn preview_kind_for_path(
     path: &Path,
     metadata: &fs::Metadata,
 ) -> Result<DocumentPreviewKind, CoreError> {
@@ -466,6 +566,18 @@ fn preview_kind_for_path(
     }
     if is_markdown_file(path) {
         return Ok(DocumentPreviewKind::Markdown);
+    }
+    // OneDrive 같은 온디맨드 자리표시자는 8KB만 읽으려 해도 여는 순간 파일 전체가
+    // 내려받아진다. 목록과 검색은 폴더를 훑기만 하는데도 이 표본 판정 때문에 5MB 이하
+    // 파일을 모조리 로컬로 끌어와 디스크를 채운다. 그래서 자리표시자는 열지 않고
+    // 확장자만으로 가르고, 본문을 정말 보여 줘야 하는 미리보기·다운로드에서만 내려받게
+    // 남긴다 — 그때는 사용자가 그 파일 하나를 고른 것이다.
+    if is_cloud_placeholder(metadata) {
+        return Ok(if has_text_extension(path) {
+            DocumentPreviewKind::Text
+        } else {
+            DocumentPreviewKind::Binary
+        });
     }
     let mut sample = vec![0_u8; usize::try_from(metadata.len().min(8 * 1024)).unwrap_or(8 * 1024)];
     let read = File::open(path)?.read(&mut sample)?;
@@ -480,10 +592,10 @@ fn preview_kind_for_path(
 }
 
 fn node_order(left: &FileNode, right: &FileNode) -> std::cmp::Ordering {
-    right
-        .is_directory
-        .cmp(&left.is_directory)
-        .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    directory_first_order(
+        (left.is_directory, &left.name),
+        (right.is_directory, &right.name),
+    )
 }
 
 fn resolve_doc_path(root: &Path, relative: &str, must_exist: bool) -> Result<PathBuf, CoreError> {
@@ -493,9 +605,7 @@ fn resolve_doc_path(root: &Path, relative: &str, must_exist: bool) -> Result<Pat
         path_guard::classify_relative_path(relative, CurDirPolicy::Reject),
         None | Some(RelativePathIssue::Empty)
     ) {
-        return Err(CoreError::InvalidInput(
-            "허용된 경로를 벗어났습니다".to_owned(),
-        ));
+        return Err(path_outside_root());
     }
     let joined = root.join(relative);
     let path = if must_exist {
@@ -504,11 +614,14 @@ fn resolve_doc_path(root: &Path, relative: &str, must_exist: bool) -> Result<Pat
         joined
     };
     if path != root && !path.starts_with(root) {
-        return Err(CoreError::InvalidInput(
-            "허용된 경로를 벗어났습니다".to_owned(),
-        ));
+        return Err(path_outside_root());
     }
     Ok(path)
+}
+
+/// 문서 루트 경계 밖을 가리키는 모든 경로 판정이 공유하는 오류.
+fn path_outside_root() -> CoreError {
+    CoreError::InvalidInput("허용된 경로를 벗어났습니다".to_owned())
 }
 
 fn is_markdown_file(path: &Path) -> bool {
@@ -519,10 +632,86 @@ fn is_markdown_file(path: &Path) -> bool {
         })
 }
 
+/// 표본을 읽지 않고도 텍스트로 볼 파일인지 확장자로 어림잡는다. 클라우드 자리표시자
+/// 판정에만 쓴다 — 이미 내려받은 파일은 지금까지처럼 앞 8KB를 실제로 보고 가른다.
+fn has_text_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "txt"
+                    | "log"
+                    | "csv"
+                    | "tsv"
+                    | "json"
+                    | "jsonl"
+                    | "yaml"
+                    | "yml"
+                    | "toml"
+                    | "ini"
+                    | "cfg"
+                    | "conf"
+                    | "env"
+                    | "xml"
+                    | "html"
+                    | "htm"
+                    | "css"
+                    | "scss"
+                    | "js"
+                    | "jsx"
+                    | "mjs"
+                    | "cjs"
+                    | "ts"
+                    | "tsx"
+                    | "rs"
+                    | "py"
+                    | "rb"
+                    | "go"
+                    | "java"
+                    | "kt"
+                    | "c"
+                    | "h"
+                    | "cpp"
+                    | "hpp"
+                    | "cs"
+                    | "sh"
+                    | "bash"
+                    | "zsh"
+                    | "ps1"
+                    | "sql"
+            )
+        })
+}
+
+/// 클라우드 공급자가 자리만 남겨 둔 파일인지 본다. Windows는 파일 속성의 OFFLINE과
+/// 두 RECALL 비트로 알 수 있고, 이 비트가 선 파일을 여는 것은 곧 내려받기다.
+#[cfg(windows)]
+fn is_cloud_placeholder(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
+    const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+
+    metadata.file_attributes()
+        & (FILE_ATTRIBUTE_OFFLINE
+            | FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+        != 0
+}
+
+/// macOS의 iCloud 자리표시자는 별도 이름으로 보여 여는 것만으로 내려받지 않는다.
+/// 알아볼 방법이 없는 플랫폼에서는 지금까지 하던 표본 판정을 그대로 둔다.
+#[cfg(not(windows))]
+fn is_cloud_placeholder(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
 fn validate_markdown_file(path: &Path) -> Result<(), CoreError> {
     if !is_markdown_file(path) {
         return Err(CoreError::InvalidInput(
-            "Markdown(.md, .markdown) 문서만 허용됩니다".to_owned(),
+            "Markdown(.md, .markdown) 파일만 허용됩니다".to_owned(),
         ));
     }
     Ok(())
@@ -531,10 +720,10 @@ fn validate_markdown_file(path: &Path) -> Result<(), CoreError> {
 fn normalized_relative(root: &Path, path: &Path) -> Result<String, CoreError> {
     path.strip_prefix(root)
         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-        .map_err(|_| CoreError::InvalidInput("허용된 경로를 벗어났습니다".to_owned()))
+        .map_err(|_| path_outside_root())
 }
 
-fn modified_ms(metadata: &fs::Metadata) -> i64 {
+pub(crate) fn modified_ms(metadata: &fs::Metadata) -> i64 {
     metadata
         .modified()
         .ok()
@@ -552,6 +741,40 @@ mod tests {
     fn document_path_rejects_parent_traversal() {
         let temp = tempfile::tempdir().expect("temp directory must exist");
         assert!(resolve_doc_path(temp.path(), "../secret.md", false).is_err());
+    }
+
+    /// QA #65. 새 문서 만들기가 같은 이름의 문서를 조용히 덮어써 본문이 사라졌다.
+    /// 생성 전용 입구는 이미 있는 경로를 거절하고 원본을 그대로 둔다.
+    #[test]
+    fn create_doc_refuses_an_existing_path_and_keeps_its_content() {
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        let app_data = temp.path().join("app-data");
+        let docs = temp.path().join("docs");
+        fs::create_dir_all(&docs).expect("document directory must exist");
+        let root = add_doc_root(&app_data, "docs", docs.to_string_lossy().as_ref(), false)
+            .expect("doc root must register");
+        let root_id = root.root.id;
+
+        let created = create_doc(&app_data, &root_id, "메모-2.md", "# 새 문서\n")
+            .expect("first create must succeed");
+        assert_eq!(created.relative_path, "메모-2.md");
+        save_doc(
+            &app_data,
+            &root_id,
+            "메모-2.md",
+            "# 지키고 싶은 본문\n",
+            None,
+        )
+        .expect("save must succeed");
+
+        let conflict = create_doc(&app_data, &root_id, "메모-2.md", "# 새 문서\n")
+            .expect_err("an existing path must be refused");
+        assert!(matches!(conflict, CoreError::Conflict(_)));
+        assert_eq!(
+            fs::read_to_string(docs.join("메모-2.md")).expect("read"),
+            "# 지키고 싶은 본문\n",
+            "거절된 만들기는 원본을 건드리지 않는다"
+        );
     }
 
     #[test]
@@ -632,6 +855,40 @@ mod tests {
         assert!(second.next_cursor.is_none());
     }
 
+    /// 내려받기 상한(100MB)은 바이트를 메모리에 올리는 경로만의 제약이다. 자리만
+    /// 확인하는 경로는 같은 파일을 그대로 돌려줘야 데스크톱 셸이 이어 복사할 수 있다.
+    #[test]
+    fn document_source_resolves_files_the_buffered_download_refuses() {
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        let app_data = temp.path().join("app-data");
+        let docs = temp.path().join("docs");
+        fs::create_dir_all(&docs).expect("document directory must exist");
+        let huge = fs::File::create(docs.join("archive.zip")).expect("large file");
+        huge.set_len(MAX_DOCUMENT_DOWNLOAD_BYTES + 1)
+            .expect("large file length");
+        let root = add_doc_root(&app_data, "docs", docs.to_string_lossy().as_ref(), false)
+            .expect("doc root must register");
+
+        assert!(
+            !read_document_file(&app_data, &root.root.id, "archive.zip")
+                .expect("file metadata")
+                .downloadable
+        );
+        assert!(matches!(
+            read_document_file_download(&app_data, &root.root.id, "archive.zip"),
+            Err(CoreError::TooLarge(MAX_DOCUMENT_DOWNLOAD_BYTES))
+        ));
+
+        let source = read_document_file_source(&app_data, &root.root.id, "archive.zip")
+            .expect("resolve source");
+        assert_eq!(source.relative_path, "archive.zip");
+        assert_eq!(source.size_bytes, MAX_DOCUMENT_DOWNLOAD_BYTES + 1);
+        assert!(matches!(
+            read_document_file_source(&app_data, &root.root.id, "../outside.zip"),
+            Err(CoreError::InvalidInput(_)) | Err(CoreError::NotFound(_))
+        ));
+    }
+
     #[test]
     fn document_file_preview_keeps_markdown_text_and_binary_distinct() {
         let temp = tempfile::tempdir().expect("temp directory must exist");
@@ -692,6 +949,59 @@ mod tests {
         assert!(opened.content.is_none());
         assert!(opened.downloadable);
         assert_eq!(opened.size_bytes, bytes.len() as u64);
+    }
+
+    #[test]
+    fn text_extensions_decide_placeholder_preview_without_opening() {
+        assert!(has_text_extension(Path::new("note.txt")));
+        assert!(has_text_extension(Path::new("REPORT.CSV")));
+        assert!(has_text_extension(Path::new("tsconfig.json")));
+        assert!(!has_text_extension(Path::new("설계서.pptx")));
+        assert!(!has_text_extension(Path::new("사진.jpg")));
+        assert!(!has_text_extension(Path::new("no-extension")));
+    }
+
+    /// 목록 한 번에 OneDrive 폴더가 통째로 내려받아지던 자리. 자리표시자 비트가 선
+    /// 파일은 열지 않고 확장자로만 갈라야 한다.
+    #[cfg(windows)]
+    #[test]
+    fn cloud_placeholders_are_classified_without_being_opened() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_OFFLINE};
+
+        fn mark_offline(path: &Path) -> bool {
+            let wide = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            // SAFETY: 방금 만든 파일 경로 하나에만 속성을 세운다.
+            unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_OFFLINE) != 0 }
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let binary = temp.path().join("placeholder.docx");
+        fs::write(&binary, b"not really a document").expect("write");
+        if !mark_offline(&binary) {
+            // 볼륨이 OFFLINE 비트를 받아 주지 않으면 이 테스트로 확인할 것이 없다.
+            return;
+        }
+        let metadata = fs::symlink_metadata(&binary).expect("metadata");
+        assert!(is_cloud_placeholder(&metadata));
+        assert_eq!(
+            preview_kind_for_path(&binary, &metadata).expect("preview kind"),
+            DocumentPreviewKind::Binary,
+            "자리표시자는 표본을 읽지 않고 확장자로 갈린다"
+        );
+
+        let text = temp.path().join("placeholder.txt");
+        fs::write(&text, b"hello").expect("write");
+        assert!(mark_offline(&text));
+        let text_metadata = fs::symlink_metadata(&text).expect("metadata");
+        assert_eq!(
+            preview_kind_for_path(&text, &text_metadata).expect("preview kind"),
+            DocumentPreviewKind::Text
+        );
     }
 
     #[test]

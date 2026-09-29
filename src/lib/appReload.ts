@@ -33,27 +33,33 @@ export const STALE_SHELL_RELOAD_WINDOW_MS = 60_000;
 
 type ReloadStore = Pick<Storage, "getItem" | "setItem"> | null;
 
+type ReloadStoreAttempt<T> =
+  | { ok: true; value: T }
+  | { ok: false };
+
+/** 저장소 접근 실패를 새로고침 포기로 바꾸는 공통 경계. */
+function attemptReloadStore<T>(operation: () => T): ReloadStoreAttempt<T> {
+  try {
+    return { ok: true, value: operation() };
+  } catch {
+    return { ok: false };
+  }
+}
+
 /**
  * 새로고침해도 자산이 여전히 없으면 같은 404가 다시 나므로, 가드 없이는 무한 새로고침이
  * 된다. 세션 저장소에 마지막 시도 시각을 남겨 창 안에서 한 번만 허용한다.
  */
 export function shouldReloadForStaleShell(store: ReloadStore, now: number): boolean {
   if (!store) return false;
-  let previous: string | null = null;
-  try {
-    previous = store.getItem(STALE_SHELL_RELOAD_KEY);
-  } catch {
+  const read = attemptReloadStore(() => store.getItem(STALE_SHELL_RELOAD_KEY));
+  if (!read.ok) {
     // 저장소를 못 읽으면 반복 여부를 알 수 없다. 새로고침을 포기하고 오류 화면을 남긴다.
     return false;
   }
-  const last = previous === null ? Number.NaN : Number(previous);
+  const last = read.value === null ? Number.NaN : Number(read.value);
   if (Number.isFinite(last) && now - last < STALE_SHELL_RELOAD_WINDOW_MS) return false;
-  try {
-    store.setItem(STALE_SHELL_RELOAD_KEY, String(now));
-  } catch {
-    return false;
-  }
-  return true;
+  return attemptReloadStore(() => store.setItem(STALE_SHELL_RELOAD_KEY, String(now))).ok;
 }
 
 function sessionStoreOrNull(): ReloadStore {

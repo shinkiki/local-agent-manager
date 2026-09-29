@@ -5,6 +5,8 @@
 //! 실패했을 때의 오류 문구·중단 여부는 모듈마다 다르므로, 여기서는 커널 호출과 errno 해석만
 //! 담당하고 판단은 호출부에 남긴다.
 
+use std::time::Duration;
+
 /// 신호를 실제로 전달했는지, 대상이 이미 사라져 있었는지.
 ///
 /// `Gone`은 `ESRCH`뿐이다. 권한이 없어 보내지 못한 `EPERM`은 대상이 살아 있다는 뜻이므로
@@ -13,6 +15,59 @@
 pub(crate) enum SignalDelivery {
     Delivered,
     Gone,
+}
+
+impl SignalDelivery {
+    pub(crate) fn was_delivered(self) -> bool {
+        self == Self::Delivered
+    }
+}
+
+/// 종료 사다리가 어디까지 올라가 끝났는지.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopEscalation {
+    /// 첫 신호를 보내려 할 때 대상이 이미 사라져 있었다.
+    AlreadyGone,
+    /// 정상 종료 신호만으로 시한 안에 끝났다.
+    Graceful,
+    /// 강제 종료까지 올린 뒤 끝났다.
+    Forced,
+    /// 강제 종료 신호를 보낸 뒤에도 종료를 확인하지 못했다.
+    Stuck,
+}
+
+/// 정상 종료를 먼저 청하고, 시한 안에 끝나지 않으면 강제 종료로 올리는 종료 사다리.
+///
+/// 채팅 런타임(`chat`)과 터미널 런타임(`terminal`)이 "보내고 기다리고, 안 죽으면 올려
+/// 보내고 다시 기다린다"는 같은 순서를 각자 펼쳐 두고 있었다. 단계마다 어떤 신호를 어떻게
+/// 보내는지(그룹이냐 단일 PID냐, 보내기 실패를 실패로 볼 것이냐)와 종료를 무엇으로
+/// 확인하는지는 호출부마다 다르므로 그 셋만 받는다. 결말을 오류 문구로 옮기는 것도
+/// 호출부 몫이다 — 여기서는 어디까지 올라갔는지만 돌려준다.
+pub(crate) fn escalate_stop<E>(
+    graceful: (impl FnOnce() -> Result<SignalDelivery, E>, Duration),
+    forced: (impl FnOnce() -> Result<SignalDelivery, E>, Duration),
+    mut exited_within: impl FnMut(Duration) -> Result<bool, E>,
+) -> Result<StopEscalation, E> {
+    let (send_graceful, graceful_timeout) = graceful;
+    let (send_forced, forced_timeout) = forced;
+    if send_graceful()? == SignalDelivery::Gone {
+        return Ok(StopEscalation::AlreadyGone);
+    }
+    if exited_within(graceful_timeout)? {
+        return Ok(StopEscalation::Graceful);
+    }
+    send_forced()?;
+    if exited_within(forced_timeout)? {
+        Ok(StopEscalation::Forced)
+    } else {
+        Ok(StopEscalation::Stuck)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SignalTarget {
+    Process(u32),
+    ProcessGroup(u32),
 }
 
 /// `ps` 실행 파일 경로. macOS는 `/bin/ps`, 데비안 계열은 `/usr/bin/ps`에 둔다.
@@ -35,9 +90,7 @@ pub(crate) fn ps_executable() -> Result<&'static std::path::Path, std::io::Error
 
 /// 단일 PID에 신호를 보낸다. `signal`이 0이면 전달 없이 존재 여부만 확인한다.
 pub(crate) fn signal_pid(pid: u32, signal: libc::c_int) -> Result<SignalDelivery, std::io::Error> {
-    // SAFETY: kill은 신호만 보낼 뿐 메모리를 건드리지 않는다.
-    let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
-    delivery(result)
+    signal_target(SignalTarget::Process(pid), signal)
 }
 
 /// PID를 그룹 ID로 삼아 프로세스 그룹 전체에 신호를 보낸다.
@@ -45,9 +98,7 @@ pub(crate) fn signal_process_group(
     pid: u32,
     signal: libc::c_int,
 ) -> Result<SignalDelivery, std::io::Error> {
-    // SAFETY: killpg도 신호만 보낸다. 자식을 process_group(0)으로 띄우면 그 PID가 곧 그룹 ID다.
-    let result = unsafe { libc::killpg(pid as libc::pid_t, signal) };
-    delivery(result)
+    signal_target(SignalTarget::ProcessGroup(pid), signal)
 }
 
 /// PID가 아직 존재하는지 확인한다. 신호 권한이 없어도(`EPERM`) 프로세스 자체는 존재한다.
@@ -69,6 +120,21 @@ pub(crate) fn reap_zombie_child(pid: u32) {
     }
 }
 
+fn signal_target(
+    target: SignalTarget,
+    signal: libc::c_int,
+) -> Result<SignalDelivery, std::io::Error> {
+    // SAFETY: kill과 killpg는 신호만 보낼 뿐 메모리를 건드리지 않는다. 자식을
+    // process_group(0)으로 띄우면 그 PID가 곧 그룹 ID다.
+    let result = unsafe {
+        match target {
+            SignalTarget::Process(pid) => libc::kill(pid as libc::pid_t, signal),
+            SignalTarget::ProcessGroup(pid) => libc::killpg(pid as libc::pid_t, signal),
+        }
+    };
+    delivery(result)
+}
+
 fn delivery(result: libc::c_int) -> Result<SignalDelivery, std::io::Error> {
     if result == 0 {
         return Ok(SignalDelivery::Delivered);
@@ -83,8 +149,7 @@ fn delivery(result: libc::c_int) -> Result<SignalDelivery, std::io::Error> {
 
 fn existence(probe: Result<SignalDelivery, std::io::Error>) -> Result<bool, std::io::Error> {
     match probe {
-        Ok(SignalDelivery::Delivered) => Ok(true),
-        Ok(SignalDelivery::Gone) => Ok(false),
+        Ok(delivery) => Ok(delivery.was_delivered()),
         Err(error) if error.raw_os_error() == Some(libc::EPERM) => Ok(true),
         Err(error) => Err(error),
     }
@@ -124,6 +189,51 @@ mod tests {
             "시스템 경로여야 한다: {}",
             path.display()
         );
+    }
+
+    /// 사다리의 네 결말을 신호·확인을 흉내 낸 닫힘으로 돌려본다. 실제 신호를 쓰면
+    /// 강제 종료 단계까지 버티는 프로세스를 만들어야 해서 확인할 수 없는 분기다.
+    #[test]
+    fn escalation_reports_how_far_the_ladder_had_to_climb() {
+        let ladder = |graceful_delivery, exits_after: usize| {
+            let mut waits = 0usize;
+            escalate_stop::<()>(
+                (|| Ok(graceful_delivery), Duration::ZERO),
+                (|| Ok(SignalDelivery::Delivered), Duration::ZERO),
+                |_| {
+                    waits += 1;
+                    Ok(waits >= exits_after)
+                },
+            )
+        };
+        assert_eq!(
+            ladder(SignalDelivery::Gone, 1),
+            Ok(StopEscalation::AlreadyGone)
+        );
+        assert_eq!(
+            ladder(SignalDelivery::Delivered, 1),
+            Ok(StopEscalation::Graceful)
+        );
+        assert_eq!(
+            ladder(SignalDelivery::Delivered, 2),
+            Ok(StopEscalation::Forced)
+        );
+        assert_eq!(
+            ladder(SignalDelivery::Delivered, 3),
+            Ok(StopEscalation::Stuck)
+        );
+    }
+
+    /// 강제 종료 신호를 보내지 못하면 그 오류가 그대로 올라온다 — 더 올릴 단계가 없어
+    /// 호출부가 실패로 다뤄야 하는 자리다.
+    #[test]
+    fn escalation_surfaces_a_failed_forced_signal() {
+        let outcome = escalate_stop(
+            (|| Ok(SignalDelivery::Delivered), Duration::ZERO),
+            (|| Err("강제 종료 실패"), Duration::ZERO),
+            |_| Ok(false),
+        );
+        assert_eq!(outcome, Err("강제 종료 실패"));
     }
 
     fn pid_group_leader() -> u32 {

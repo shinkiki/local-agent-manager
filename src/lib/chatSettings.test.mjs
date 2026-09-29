@@ -1,13 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  approvalModeLabel,
-  effectiveApprovalMode,
   fallbackSettingFields,
   normalizeExtraSettings,
   normalizeSettingValue,
-  permissionModeLabel,
-  reasoningLabel,
+  sameChatSettings,
   settingFieldsFor,
 } from "./chatSettings.ts";
 
@@ -56,31 +53,6 @@ test("Codex 기본 승인 처리는 정규화 후에도 자동 검토로 남는�
   assert.equal(normalizeSettingValue(fallbackSettingFields("claude"), "approvalMode", "autoReview"), "manual");
 });
 
-test("공급자별 내장 실행·승인 선택지가 CLI 지원 범위를 포함한다", () => {
-  assert.deepEqual(
-    fallbackSettingFields("claude").find((item) => item.key === "mode").options.map((item) => item.value),
-    ["plan", "workspace", "fullAccess", "auto", "dontAsk", "manual"],
-  );
-  assert.deepEqual(
-    fallbackSettingFields("codex").find((item) => item.key === "approvalMode").options.map((item) => item.value),
-    ["manual", "autoReview", "granular", "onFailure", "never"],
-  );
-  // Codex 전용 승인은 다른 공급자 목록에서 빠지고, 자동 검토만 비활성으로 남는다.
-  const claudeApprovals = fallbackSettingFields("claude").find((item) => item.key === "approvalMode").options;
-  assert.deepEqual(claudeApprovals.map((item) => item.value), ["manual", "autoReview", "never"]);
-  assert.deepEqual(claudeApprovals.map((item) => Boolean(item.disabled)), [false, true, false]);
-  assert.equal(effectiveApprovalMode("claude", "granular"), "manual");
-  assert.equal(effectiveApprovalMode("antigravity", "onFailure"), "manual");
-  assert.equal(approvalModeLabel("granular"), "세분화 승인");
-  assert.equal(approvalModeLabel("onFailure"), "실패 시 승인");
-  assert.equal(permissionModeLabel("dontAsk"), "추가 권한 차단");
-});
-
-test("Codex none 추론은 공급자 기본값 미지정과 다른 별도 표시값이다", () => {
-  assert.equal(reasoningLabel("none"), "없음");
-  assert.notEqual(reasoningLabel("none"), "기본");
-});
-
 test("추가 실행설정은 스키마에 남은 항목과 허용값만 통과한다", () => {
   const fields = [
     { key: "fallbackModel", label: "예비 모델", detail: null, kind: "text", options: [], defaultValue: null },
@@ -97,4 +69,16 @@ test("추가 실행설정은 스키마에 남은 항목과 허용값만 통과�
   );
   // 비활성 선택지 값은 떨어낸다.
   assert.deepEqual(normalizeExtraSettings(fields, { reviewer: "off" }), {});
+});
+
+test("빈 실행설정 값은 정규화와 동등성 비교에서 같은 기준으로 제외한다", () => {
+  assert.equal(sameChatSettings({ model: "codex", reviewer: "  " }, { model: "codex" }), true);
+  assert.equal(sameChatSettings({ model: "codex" }, { model: "claude" }), false);
+  // 한쪽에만 있는 비지 않은 항목은 키 순서와 무관하게 다르다고 본다.
+  assert.equal(sameChatSettings({ model: "codex" }, { model: "codex", reviewer: "auto" }), false);
+  assert.equal(sameChatSettings({ model: "codex", reviewer: "auto" }, { model: "codex" }), false);
+  assert.equal(
+    sameChatSettings({ reviewer: "auto", model: "codex" }, { model: "codex", reviewer: "auto" }),
+    true,
+  );
 });

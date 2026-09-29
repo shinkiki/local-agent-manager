@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::ProviderId;
+use crate::domain::{wire_enum, ProviderId};
 use crate::trash_store::{self, RestoreTarget};
 use crate::CoreError;
 
@@ -27,44 +27,18 @@ pub enum InstructionTrashItemKind {
     File,
 }
 
+wire_enum!(trimmed InstructionTrashItemKind, "알 수 없는 지침 휴지통 항목 종류입니다", {
+    Directory => "directory",
+    File => "file",
+});
+
 impl InstructionTrashItemKind {
-    pub const ALL: [Self; 2] = [Self::Directory, Self::File];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Directory => "directory",
-            Self::File => "file",
-        }
-    }
-
-    /// 디렉터리 실체인지 여부.
-    pub fn is_directory(self) -> bool {
-        matches!(self, Self::Directory)
-    }
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 2] = [Self::Directory, Self::File];
 
     /// 파일 실체인지 여부.
     pub fn is_file(self) -> bool {
         matches!(self, Self::File)
-    }
-}
-
-impl std::fmt::Display for InstructionTrashItemKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for InstructionTrashItemKind {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "directory" => Ok(Self::Directory),
-            "file" => Ok(Self::File),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 지침 휴지통 항목 종류입니다: {s}"
-            ))),
-        }
     }
 }
 
@@ -121,51 +95,19 @@ pub enum InstructionTrashRestoreOutcome {
     Failed,
 }
 
-impl InstructionTrashRestoreOutcome {
-    pub const ALL: [Self; 3] = [Self::Restored, Self::Skipped, Self::Failed];
+wire_enum!(trimmed InstructionTrashRestoreOutcome, "알 수 없는 지침 휴지통 복구 결과입니다", {
+    Restored => "restored",
+    Skipped => "skipped",
+    Failed => "failed",
+});
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Restored => "restored",
-            Self::Skipped => "skipped",
-            Self::Failed => "failed",
-        }
-    }
+impl InstructionTrashRestoreOutcome {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 3] = [Self::Restored, Self::Skipped, Self::Failed];
 
     /// 성공적으로 복구되었는지 여부.
     pub fn is_restored(self) -> bool {
         matches!(self, Self::Restored)
-    }
-
-    /// 대상 경로 충돌 등으로 건너뛰었는지 여부.
-    pub fn is_skipped(self) -> bool {
-        matches!(self, Self::Skipped)
-    }
-
-    /// 복구에 실패했는지 여부.
-    pub fn is_failed(self) -> bool {
-        matches!(self, Self::Failed)
-    }
-}
-
-impl std::fmt::Display for InstructionTrashRestoreOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for InstructionTrashRestoreOutcome {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "restored" => Ok(Self::Restored),
-            "skipped" => Ok(Self::Skipped),
-            "failed" => Ok(Self::Failed),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 지침 휴지통 복구 결과입니다: {s}"
-            ))),
-        }
     }
 }
 
@@ -177,6 +119,22 @@ pub struct InstructionTrashRestoreResult {
     pub original_path: String,
     pub outcome: InstructionTrashRestoreOutcome,
     pub message: Option<String>,
+}
+
+impl InstructionTrashRestoreResult {
+    fn from_item(
+        item: &InstructionTrashItem,
+        outcome: InstructionTrashRestoreOutcome,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            id: item.id.clone(),
+            key: item.key.clone(),
+            original_path: item.original_path.clone(),
+            outcome,
+            message,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -319,30 +277,29 @@ fn restore_single_item(
     item: &InstructionTrashItem,
 ) -> InstructionTrashRestoreResult {
     let original = PathBuf::from(&item.original_path);
-    let result = |outcome, message: Option<String>| InstructionTrashRestoreResult {
-        id: item.id.clone(),
-        key: item.key.clone(),
-        original_path: item.original_path.clone(),
-        outcome,
-        message,
-    };
 
     match trash_store::prepare_restore_target(&original) {
         RestoreTarget::Ready => {}
         RestoreTarget::Occupied => {
-            return result(
+            return InstructionTrashRestoreResult::from_item(
+                item,
                 InstructionTrashRestoreOutcome::Skipped,
                 Some("원래 경로에 이미 항목이 있어 덮어쓰지 않았습니다".to_owned()),
             )
         }
         RestoreTarget::ParentFailed(message) => {
-            return result(InstructionTrashRestoreOutcome::Failed, Some(message))
+            return InstructionTrashRestoreResult::from_item(
+                item,
+                InstructionTrashRestoreOutcome::Failed,
+                Some(message),
+            )
         }
     }
 
     let (entry_dir, content) = trash_store::entry_paths(trash_root, &item.id);
     if fs::symlink_metadata(&content).is_err() {
-        return result(
+        return InstructionTrashRestoreResult::from_item(
+            item,
             InstructionTrashRestoreOutcome::Failed,
             Some("휴지통에 실체가 없어 복구할 수 없습니다".to_owned()),
         );
@@ -350,9 +307,14 @@ fn restore_single_item(
     match trash_store::move_path(&content, &original) {
         Ok(()) => {
             let _ = fs::remove_dir_all(&entry_dir);
-            result(InstructionTrashRestoreOutcome::Restored, None)
+            InstructionTrashRestoreResult::from_item(
+                item,
+                InstructionTrashRestoreOutcome::Restored,
+                None,
+            )
         }
-        Err(error) => result(
+        Err(error) => InstructionTrashRestoreResult::from_item(
+            item,
             InstructionTrashRestoreOutcome::Failed,
             Some(error.to_string()),
         ),
@@ -403,10 +365,6 @@ mod tests {
             "invalid".parse::<InstructionTrashItemKind>(),
             Err(CoreError::InvalidInput(_))
         ));
-        assert!(InstructionTrashItemKind::Directory.is_directory());
-        assert!(!InstructionTrashItemKind::Directory.is_file());
-        assert!(InstructionTrashItemKind::File.is_file());
-        assert!(!InstructionTrashItemKind::File.is_directory());
     }
 
     #[test]
@@ -458,14 +416,8 @@ mod tests {
             Err(CoreError::InvalidInput(_))
         ));
         assert!(InstructionTrashRestoreOutcome::Restored.is_restored());
-        assert!(!InstructionTrashRestoreOutcome::Restored.is_skipped());
-        assert!(!InstructionTrashRestoreOutcome::Restored.is_failed());
-        assert!(InstructionTrashRestoreOutcome::Skipped.is_skipped());
         assert!(!InstructionTrashRestoreOutcome::Skipped.is_restored());
-        assert!(!InstructionTrashRestoreOutcome::Skipped.is_failed());
-        assert!(InstructionTrashRestoreOutcome::Failed.is_failed());
         assert!(!InstructionTrashRestoreOutcome::Failed.is_restored());
-        assert!(!InstructionTrashRestoreOutcome::Failed.is_skipped());
     }
 
     #[test]
@@ -496,7 +448,6 @@ mod tests {
         let item =
             store_instruction_trash_item(&app_data, &policy_dir, draft).expect("지침 휴지통 보관");
         assert_eq!(item.kind, InstructionTrashItemKind::Directory);
-        assert!(item.kind.is_directory());
         assert!(!policy_dir.exists());
 
         let list = list_instruction_trash(&app_data).expect("지침 휴지통 목록");
@@ -541,7 +492,10 @@ mod tests {
         let receipt_conflict =
             restore_instruction_trash(&app_data, &file_item.id).expect("복구 시도");
         assert_eq!(receipt_conflict.results.len(), 1);
-        assert!(receipt_conflict.results[0].outcome.is_skipped());
+        assert_eq!(
+            receipt_conflict.results[0].outcome,
+            InstructionTrashRestoreOutcome::Skipped
+        );
 
         // 휴지통 비우기
         let purged = purge_instruction_trash(&app_data, None).expect("휴지통 비우기");

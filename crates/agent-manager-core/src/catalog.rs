@@ -4,7 +4,10 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, TryLockError};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    TryLockError,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 use crate::app_data_file::write_private_bytes;
@@ -21,11 +25,12 @@ use crate::catalog_health::{self, CatalogHealth, ScanKind};
 use crate::chat_settings::identifier_value_is_valid;
 use crate::domain::{
     AgentDefinition, AgentDetail, AppStatus, ArtifactDetail, ArtifactGroup, ArtifactSummary,
-    ContentBlock, DashboardStats, FileNode, ManagerSnapshot, ModelCount, ProjectCount,
-    ProjectRegistryEntry, ProviderId, SessionCatalogUpdate, SessionDetail, SessionInfoBlock,
-    SessionLastFailure, SessionMeta, SessionRuntimeFailure, SessionSummary, SessionTranscriptLimit,
-    SkillDetail, SkillSummary, SourceCounts, SourceTotals, StorageOverview, StorageUsageItem,
-    TokenUsage, TranscriptImageBlock, TranscriptItem, WeeklyCount,
+    ContentBlock, DashboardStats, FileNode, ManagerSnapshot, ManagerSnapshotDelta,
+    ManagerSnapshotSync, ModelCount, ProjectCount, ProjectRegistryEntry, ProviderId,
+    SessionCatalogUpdate, SessionDetail, SessionInfoBlock, SessionLastFailure, SessionMeta,
+    SessionRef, SessionRuntimeFailure, SessionSummary, SessionTranscriptLimit, SkillDetail,
+    SkillSummary, SourceCounts, SourceTotals, StorageOverview, StorageUsageItem, TokenUsage,
+    TranscriptImageBlock, TranscriptItem, WeeklyCount,
 };
 use crate::identifier::validate_identifier;
 use crate::project_registry::{build_project_registry, ProjectPathResolver, ProjectPolicy};
@@ -42,6 +47,46 @@ const ALL_AG_ROOTS: &[&str] = &[
     "antigravity-ide",
     "antigravity-backup",
 ];
+
+/// Antigravity 대화 파일의 확장자. `db`는 읽을 수 있는 SQLite 대화, `pb`는 내용을 읽지
+/// 못하는 protobuf 덤프다.
+const AG_CONVERSATION_EXTENSIONS: [&str; 2] = ["db", "pb"];
+
+/// 세션 요약 색인. 활성 루트 셋 중 `antigravity-cli` 하나만 들고 있다.
+fn ag_summary_index_path(gemini: &Path) -> PathBuf {
+    gemini.join("antigravity-cli/conversation_summaries.db")
+}
+
+/// 홈 하나가 대화 파일을 두는 자리 전부.
+fn ag_conversation_dirs(gemini: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    ACTIVE_AG_ROOTS
+        .iter()
+        .map(move |root_name| gemini.join(root_name).join("conversations"))
+}
+
+/// 홈 하나에 실제로 놓여 있는 대화 파일. 자리와 확장자 규칙을 여기 한 곳에만 둬,
+/// 목록 훑기·지문 뜨기·저장소 용량이 각자 적어 두다 어긋나는 일을 없앤다.
+fn ag_conversation_entries(gemini: &Path) -> impl Iterator<Item = fs::DirEntry> + '_ {
+    ag_conversation_dirs(gemini)
+        .filter_map(|conversations| fs::read_dir(conversations).ok())
+        .flatten()
+        .flatten()
+        .filter(|entry| is_ag_conversation_file(&entry.path()))
+}
+
+/// 저장소 용량이 Antigravity 몫으로 세는 자리. 대화 디렉터리 전부와 요약 색인이다.
+fn antigravity_storage_paths(gemini: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = ag_conversation_dirs(gemini).collect();
+    paths.push(ag_summary_index_path(gemini));
+    paths
+}
+
+fn is_ag_conversation_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| AG_CONVERSATION_EXTENSIONS.contains(&extension))
+}
+
 const MAX_BLOCK_TEXT: usize = 100_000;
 /// 보완 저장 결과가 원본 기록에 이미 있는지 견줄 때 쓰는 비교 문자열의 최대 길이.
 const MAX_TEXT_PROBE_BYTES: usize = 8_192;
@@ -63,7 +108,9 @@ const RUNTIME_FAILURE_TWIN_TOLERANCE_MS: i64 = 5_000;
 // v5: Antigravity 제목을 대화 DB에서 직접 뽑도록 바뀌어 기존 "(제목 없음)" 항목을 재스캔해야 한다.
 // v7: 슬래시 명령 세션의 제목 폴백(firstCommand)과 명령 출력 레코드 집계 제외로 재스캔해야 한다.
 // v8: 마지막 요청의 실패(lastFailure)를 스캔에서 추적하므로 예전 항목도 다시 읽어야 한다.
-const SESSION_CATALOG_SCHEMA_VERSION: u32 = 8;
+// v9: Antigravity 작업 경로를 `file:///C:/...`에서 딸 때 앞 슬래시를 떼도록 바뀌어, 이미
+//     `/C:/...`로 저장된 cwd를 다시 읽어야 한다(제외가 막히던 경로).
+const SESSION_CATALOG_SCHEMA_VERSION: u32 = 9;
 /// Codex 롤아웃 꼬리에서 마지막 턴의 끝맺음을 찾을 때 읽는 바이트 수. 끝맺음 뒤에는 토큰
 /// 집계 몇 줄만 따르고, `task_complete`는 마지막 답 본문을 함께 담으므로 이 정도가 필요하다.
 const CODEX_ROLLOUT_TAIL_BYTES: u64 = 64 * 1024;
@@ -122,6 +169,11 @@ struct PersistedSessionCatalog {
     antigravity_fingerprint: BTreeMap<String, FileFingerprint>,
     #[serde(default)]
     antigravity_sessions: Vec<SessionSummary>,
+    /// ACP 하네스가 들고 있는 세션. 파일이 아니라 SQLite 하나라 지문도 한 칸이다.
+    #[serde(default)]
+    local_fingerprint: BTreeMap<String, FileFingerprint>,
+    #[serde(default)]
+    local_sessions: Vec<SessionSummary>,
 }
 
 impl Default for PersistedSessionCatalog {
@@ -134,14 +186,146 @@ impl Default for PersistedSessionCatalog {
             codex_sessions: Vec::new(),
             antigravity_fingerprint: BTreeMap::new(),
             antigravity_sessions: Vec::new(),
+            local_fingerprint: BTreeMap::new(),
+            local_sessions: Vec::new(),
         }
     }
+}
+
+/// 델타로 답할 수 있는 최대 개정 수. 조정은 20초에 한 번 개정을 올리므로 32회차면 10분 넘게
+/// 끊겼던 창도 델타로 따라잡는다. 그보다 오래 뒤처진 창은 전체 스냅숏을 받는다.
+const SESSION_CHANGE_HISTORY_LIMIT: usize = 32;
+
+/// 세션 하나를 가리키는 비교 키.
+type SessionChangeKey = (ProviderId, String);
+
+/// 개정 한 회차에서 내용이 달라진(또는 생기거나 사라진) 세션들.
+///
+/// 요약본 자체가 아니라 키만 남긴다. 델타를 만들 때 현재 스냅숏에서 다시 찾으므로 이력이
+/// 세션 본문을 중복으로 들고 있지 않고, 키가 현재 목록에 없으면 그대로 "사라진 세션"이 된다.
+#[derive(Debug, Clone)]
+struct SessionRevisionChange {
+    revision: u64,
+    touched: Vec<SessionChangeKey>,
 }
 
 struct SessionCatalogState {
     persisted: PersistedSessionCatalog,
     snapshot: ManagerSnapshot,
     resource_revision: u64,
+    /// 세션 개정이 오를 때마다 한 항목씩 쌓이는 최근 변경 이력. 개정은 1씩만 오르고 오를
+    /// 때마다 반드시 한 항목을 넣으므로, 남아 있는 항목의 개정 번호는 빈틈 없이 이어진다.
+    session_changes: VecDeque<SessionRevisionChange>,
+}
+
+impl SessionCatalogState {
+    /// 개정 한 회차의 변경 이력을 남긴다. 바뀐 세션이 없어도(폴더·프로젝트만 바뀐 회차) 항목을
+    /// 넣어야 개정 번호가 끊기지 않고, 그래야 뒤처진 창이 델타로 따라잡을 수 있는지 판정된다.
+    fn record_change(&mut self, revision: u64, touched: Vec<SessionChangeKey>) {
+        self.session_changes
+            .push_back(SessionRevisionChange { revision, touched });
+        while self.session_changes.len() > SESSION_CHANGE_HISTORY_LIMIT {
+            self.session_changes.pop_front();
+        }
+    }
+
+    /// 이력 항목의 개정 번호가 빈틈 없이 이어져 `since` 시점 이후의 변경을 모두 담고 있는지 판정한다.
+    fn covers_revision(&self, since: u64, current: u64) -> bool {
+        since == current
+            || self
+                .session_changes
+                .front()
+                .is_some_and(|oldest| oldest.revision <= since + 1)
+    }
+
+    /// `since` 이후 변경되거나 삭제된 세션 목록을 집계한다.
+    fn diff_sessions_since(&self, since: u64) -> (Vec<SessionSummary>, Vec<SessionRef>) {
+        let mut seen: HashSet<&SessionChangeKey> = HashSet::new();
+        let mut touched: Vec<&SessionChangeKey> = Vec::new();
+        for entry in self
+            .session_changes
+            .iter()
+            .filter(|entry| entry.revision > since)
+        {
+            for key in &entry.touched {
+                if seen.insert(key) {
+                    touched.push(key);
+                }
+            }
+        }
+        let index: HashMap<(ProviderId, &str), &SessionSummary> = self
+            .snapshot
+            .sessions
+            .iter()
+            .map(|session| ((session.source, session.id.as_str()), session))
+            .collect();
+        let mut changed_sessions = Vec::new();
+        let mut removed_sessions = Vec::new();
+        for (source, id) in touched {
+            match index.get(&(*source, id.as_str())) {
+                Some(session) => changed_sessions.push((*session).clone()),
+                None => removed_sessions.push(SessionRef {
+                    source: *source,
+                    id: id.clone(),
+                }),
+            }
+        }
+        (changed_sessions, removed_sessions)
+    }
+
+    /// 화면이 들고 있는 개정(`since`) 이후의 동기화 응답을 구성한다.
+    ///
+    /// 변경 이력이 `since`를 덮지 못하면(첫 기동, 오래 끊겼던 창, 백엔드 재기동으로 번호가
+    /// 되감긴 경우) 판단을 미루지 않고 전체 스냅숏을 돌려준다.
+    fn snapshot_sync(&self, since: u64) -> ManagerSnapshotSync {
+        let snapshot = &self.snapshot;
+        let current = snapshot.session_catalog_revision;
+        if since == 0 || since > current || !self.covers_revision(since, current) {
+            return ManagerSnapshotSync::Full(snapshot.clone());
+        }
+        let (changed_sessions, removed_sessions) = self.diff_sessions_since(since);
+        ManagerSnapshotSync::Delta(ManagerSnapshotDelta {
+            schema_version: snapshot.schema_version,
+            session_catalog_revision: current,
+            resource_catalog_revision: snapshot.resource_catalog_revision,
+            status: snapshot.status.clone(),
+            dashboard: snapshot.dashboard.clone(),
+            folders: snapshot.folders.clone(),
+            skills: snapshot.skills.clone(),
+            agents: snapshot.agents.clone(),
+            artifacts: snapshot.artifacts.clone(),
+            pending_projects: snapshot.pending_projects.clone(),
+            changed_sessions,
+            removed_sessions,
+        })
+    }
+}
+
+/// 두 목록을 견줘 달라진 세션 키를 모은다. 새로 생긴 것, 내용이 바뀐 것, 사라진 것 모두.
+fn touched_session_keys(
+    previous: &[SessionSummary],
+    next: &[SessionSummary],
+) -> Vec<SessionChangeKey> {
+    let before: HashMap<SessionChangeKey, &SessionSummary> = previous
+        .iter()
+        .map(|session| ((session.source, session.id.clone()), session))
+        .collect();
+    let mut touched = Vec::new();
+    let mut seen = HashSet::with_capacity(next.len());
+    for session in next {
+        let key = (session.source, session.id.clone());
+        seen.insert(key.clone());
+        match before.get(&key) {
+            Some(previous) if *previous == session => {}
+            _ => touched.push(key),
+        }
+    }
+    for key in before.into_keys() {
+        if !seen.contains(&key) {
+            touched.push(key);
+        }
+    }
+    touched
 }
 
 #[derive(Clone)]
@@ -157,6 +341,24 @@ pub struct SessionCatalog {
 }
 
 impl SessionCatalog {
+    fn read_state(
+        &self,
+        catalog_name: &str,
+    ) -> Result<RwLockReadGuard<'_, SessionCatalogState>, CoreError> {
+        self.state
+            .read()
+            .map_err(|_| state_lock_error(catalog_name))
+    }
+
+    fn write_state(
+        &self,
+        catalog_name: &str,
+    ) -> Result<RwLockWriteGuard<'_, SessionCatalogState>, CoreError> {
+        self.state
+            .write()
+            .map_err(|_| state_lock_error(catalog_name))
+    }
+
     pub fn open(app_data_dir: PathBuf) -> Result<Self, CoreError> {
         let home = home_dir()?;
         Self::open_with_home(app_data_dir, home)
@@ -171,7 +373,7 @@ impl SessionCatalog {
             persisted = PersistedSessionCatalog::default();
         }
         if persisted.revision == 0 {
-            reconcile_provider_cache(&home, &mut persisted, None, None)?;
+            reconcile_provider_cache(&app_data_dir, &home, &mut persisted, None, None)?;
             persisted.revision = 1;
             persist_session_catalog(&cache_path, &persisted)?;
         }
@@ -190,15 +392,40 @@ impl SessionCatalog {
                 persisted,
                 snapshot,
                 resource_revision: 1,
+                session_changes: VecDeque::new(),
             })),
         })
     }
 
     pub fn manager_snapshot(&self) -> Result<ManagerSnapshot, CoreError> {
-        self.state
-            .read()
-            .map(|state| state.snapshot.clone())
-            .map_err(|_| CoreError::Runtime("세션 카탈로그 잠금이 손상되었습니다".to_owned()))
+        self.read_state("세션").map(|state| state.snapshot.clone())
+    }
+
+    /// 큰 관리 스냅숏을 복제하지 않고 리소스 개정 번호만 읽는다. 자동화 상태처럼
+    /// 개정 번호 하나만 필요한 짧은 폴링 경로에서 수천 건의 세션 복사를 피한다.
+    pub fn resource_catalog_revision(&self) -> Result<u64, CoreError> {
+        self.read_state("세션").map(|state| state.resource_revision)
+    }
+
+    /// HTTP 응답 캐시가 큰 스냅숏을 복제하지 않고 현재 버전을 비교하는 키.
+    pub fn snapshot_revisions(&self) -> Result<(u64, u64), CoreError> {
+        self.read_state("세션").map(|state| {
+            (
+                state.snapshot.session_catalog_revision,
+                state.resource_revision,
+            )
+        })
+    }
+
+    /// 화면이 들고 있는 개정(`since`) 이후의 변경분만 만든다.
+    ///
+    /// 세션 목록만 변경분으로 줄이고 나머지(상태·대시보드·폴더·스킬·에이전트·아티팩트·대기
+    /// 프로젝트)는 다 합쳐도 100KB가 안 되는 데다 세션과 함께 움직이므로 그대로 싣는다.
+    /// 변경 이력이 `since`를 덮지 못하면(첫 기동, 오래 끊겼던 창, 백엔드 재기동으로 번호가
+    /// 되감긴 경우) 판단을 미루지 않고 전체 스냅숏을 돌려준다.
+    pub fn snapshot_delta(&self, since: u64) -> Result<ManagerSnapshotSync, CoreError> {
+        let state = self.read_state("세션")?;
+        Ok(state.snapshot_sync(since))
     }
 
     /// 세션에서 확인한 프로젝트 전체와 이 장치의 활성 여부. 스냅샷은 제외 프로젝트의
@@ -217,15 +444,13 @@ impl SessionCatalog {
         id: &str,
     ) -> Result<SessionSummary, CoreError> {
         validate_identifier(id)?;
-        self.state
-            .read()
-            .map_err(|_| CoreError::Runtime("세션 카탈로그 잠금이 손상되었습니다".to_owned()))?
+        self.read_state("세션")?
             .snapshot
             .sessions
             .iter()
             .find(|session| session.source == source && session.id == id)
             .cloned()
-            .ok_or_else(|| CoreError::NotFound("세션을 찾을 수 없습니다".to_owned()))
+            .ok_or_else(session_not_found)
     }
 
     pub fn linked_file(
@@ -281,53 +506,26 @@ impl SessionCatalog {
     ) -> Result<SessionCatalogUpdate, CoreError> {
         // 1단계: 잠금 밖에서 공급자 색인을 읽는다. 여기가 초 단위로 길어질 수 있다.
         let mut scanned = self.read_persisted()?;
-        let provider_cache_changed =
-            reconcile_provider_cache(&self.home, &mut scanned, source, target_id)?;
+        let provider_cache_changed = reconcile_provider_cache(
+            &self.app_data_dir,
+            &self.home,
+            &mut scanned,
+            source,
+            target_id,
+        )?;
 
         // 2단계: 짧은 임계구역에서 최신 상태에 합친다. 1단계 도중 다른 갱신이 개정
         // 번호를 올렸을 수 있으므로 색인만 옮기고 개정 번호는 현재 값을 기준으로 삼는다.
         let _reconcile =
             lock_with_timeout(&self.reconcile_lock, CATALOG_LOCK_TIMEOUT, "세션 목록")?;
-        let (mut persisted, previous) = self
-            .state
-            .read()
-            .map(|state| (state.persisted.clone(), state.snapshot.clone()))
-            .map_err(|_| CoreError::Runtime("세션 카탈로그 잠금이 손상되었습니다".to_owned()))?;
+        let (mut persisted, previous) = self.read_session_state()?;
         adopt_scanned_caches(&mut persisted, scanned);
-        let mut next = compose_manager_snapshot(
-            &self.home,
-            &self.app_data_dir,
-            &persisted,
-            SnapshotResources::reuse(&previous),
-        )?;
-        let changed = next.sessions != previous.sessions
-            || next.folders != previous.folders
-            || next.pending_projects != previous.pending_projects;
-        if changed {
-            persisted.revision = persisted.revision.saturating_add(1);
-        }
-        next.session_catalog_revision = persisted.revision;
-        if provider_cache_changed || changed {
-            persist_session_catalog(
-                &self.app_data_dir.join(SESSION_CATALOG_FILE_NAME),
-                &persisted,
-            )?;
-        }
-        let revision = persisted.revision;
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| CoreError::Runtime("세션 카탈로그 잠금이 손상되었습니다".to_owned()))?;
-        state.persisted = persisted;
-        state.snapshot = next;
-        Ok(SessionCatalogUpdate { revision, changed })
+        // 스냅숏이 그대로여도 공급자 색인이 바뀌었으면 저장 파일은 다시 써야 한다.
+        self.recompose_sessions(persisted, &previous, provider_cache_changed)
     }
 
     fn read_persisted(&self) -> Result<PersistedSessionCatalog, CoreError> {
-        self.state
-            .read()
-            .map(|state| state.persisted.clone())
-            .map_err(|_| CoreError::Runtime("세션 카탈로그 잠금이 손상되었습니다".to_owned()))
+        self.read_state("세션").map(|state| state.persisted.clone())
     }
 
     pub fn refresh_session(
@@ -356,17 +554,13 @@ impl SessionCatalog {
                 Err(CoreError::Busy(_)) => return self.unchanged_resource_update(),
                 Err(error) => return Err(error),
             };
-        let (persisted, previous, previous_revision) = self
-            .state
-            .read()
-            .map(|state| {
-                (
-                    state.persisted.clone(),
-                    state.snapshot.clone(),
-                    state.resource_revision,
-                )
-            })
-            .map_err(|_| CoreError::Runtime("리소스 카탈로그 잠금이 손상되었습니다".to_owned()))?;
+        let (persisted, previous, previous_revision) = self.read_state("리소스").map(|state| {
+            (
+                state.persisted.clone(),
+                state.snapshot.clone(),
+                state.resource_revision,
+            )
+        })?;
         let mut next =
             compose_manager_snapshot(&self.home, &self.app_data_dir, &persisted, scanned)?;
         let changed = next.status != previous.status
@@ -380,10 +574,7 @@ impl SessionCatalog {
         };
         next.session_catalog_revision = previous.session_catalog_revision;
         next.resource_catalog_revision = revision;
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| CoreError::Runtime("리소스 카탈로그 잠금이 손상되었습니다".to_owned()))?;
+        let mut state = self.write_state("리소스")?;
         state.snapshot = next;
         state.resource_revision = revision;
         catalog_health::note_resource_scan(revision);
@@ -393,11 +584,7 @@ impl SessionCatalog {
     /// 이번 회차에 리소스를 다시 읽지 않았음을 알리는 응답. 개정 번호가 그대로라
     /// 호출자는 스냅샷을 다시 받지 않는다.
     fn unchanged_resource_update(&self) -> Result<SessionCatalogUpdate, CoreError> {
-        let revision = self
-            .state
-            .read()
-            .map(|state| state.resource_revision)
-            .map_err(|_| CoreError::Runtime("리소스 카탈로그 잠금이 손상되었습니다".to_owned()))?;
+        let revision = self.read_state("리소스")?.resource_revision;
         Ok(SessionCatalogUpdate {
             revision,
             changed: false,
@@ -416,6 +603,31 @@ impl SessionCatalog {
             return self.unchanged_resource_update();
         }
         self.refresh_resources()
+    }
+
+    /// 스냅숏의 CLI·이력 탐지 상태만 다시 읽는다. 바뀌었으면 `true`.
+    ///
+    /// 탐지 상태를 갱신하는 유일한 경로가 전체 리소스 스캔(`refresh_resources`)이었는데,
+    /// 그 스캔을 주기적으로 도는 것은 번역 워커뿐이고 번역 메뉴가 모두 꺼져 있으면 첫
+    /// 줄에서 돌아선다. 그래서 앱을 켠 뒤에 설치·로그인한 CLI는 프로세스 수명 내내
+    /// "연결 필요"로 남았다 — 계정 추가 버튼도, 실행설정 스키마 조사 대상도, 채팅
+    /// 공급자 목록도 앱을 다시 켜야 나타났다.
+    ///
+    /// 탐지는 PATH 조회와 이력 경로 존재 확인뿐이라 세션 조정 회차마다 같이 돌려도 된다.
+    /// 스킬·에이전트·아티팩트 스캔을 함께 돌리지 않는 이유가 그것이다 — 응답하지 않는
+    /// 스킬 루트 하나가 이 갱신까지 붙잡으면 안 된다. 그래서 조정 잠금도 잡지 않는다.
+    /// 마침 합성 중인 회차와 겹쳐 결과가 덮이더라도 다음 회차가 같은 값을 다시 넣는다.
+    pub fn refresh_cli_status(&self) -> Result<bool, CoreError> {
+        let status = inspect_local_environment()?;
+        let mut state = self.write_state("CLI 상태")?;
+        if state.snapshot.status == status {
+            return Ok(false);
+        }
+        let revision = state.resource_revision.saturating_add(1);
+        state.snapshot.status = status;
+        state.snapshot.resource_catalog_revision = revision;
+        state.resource_revision = revision;
+        Ok(true)
     }
 
     /// 화면이 "지금 보고 있는 목록이 언제 기준인지"를 표시하기 위한 갱신 상태.
@@ -439,6 +651,8 @@ impl SessionCatalog {
             .spawn(move || loop {
                 // `Busy`는 화면 요청이 이미 같은 조정을 돌리고 있다는 뜻이라 정상이다.
                 let _ = catalog.reconcile();
+                // 설치·연결된 CLI가 앱을 다시 켜야 보이던 것을 여기서 따라잡는다.
+                let _ = catalog.refresh_cli_status();
                 thread::sleep(interval);
             });
         if spawned.is_err() {
@@ -455,37 +669,69 @@ impl SessionCatalog {
             CATALOG_LOCK_TIMEOUT,
             "세션 메타데이터",
         )?;
-        let (mut persisted, previous) = self
-            .state
-            .read()
+        let (persisted, previous) = self.read_session_state()?;
+        self.recompose_sessions(persisted, &previous, false)
+    }
+
+    /// 세션 임계구역이 쓰는 현재 저장본과 스냅숏 사본.
+    fn read_session_state(&self) -> Result<(PersistedSessionCatalog, ManagerSnapshot), CoreError> {
+        self.read_state("세션")
             .map(|state| (state.persisted.clone(), state.snapshot.clone()))
-            .map_err(|_| CoreError::Runtime("세션 카탈로그 잠금이 손상되었습니다".to_owned()))?;
+    }
+
+    /// 세션 임계구역의 후반부: 스냅숏을 다시 합성하고, 바뀌었으면 개정 번호를 올려 저장하고,
+    /// 변경 이력과 함께 공유 상태에 반영한다. 조정(`run_reconcile`)과 메타데이터 갱신
+    /// (`refresh_metadata`)이 앞부분만 다르고 여기서부터는 같은 일을 한다.
+    ///
+    /// `force_persist`는 스냅숏이 그대로여도 저장 파일을 다시 써야 하는 경우를 위한 것이다
+    /// — 조정이 공급자 색인 캐시만 바꾼 회차가 그렇다.
+    ///
+    /// 반드시 `reconcile_lock`을 쥔 채로 호출한다.
+    fn recompose_sessions(
+        &self,
+        mut persisted: PersistedSessionCatalog,
+        previous: &ManagerSnapshot,
+        force_persist: bool,
+    ) -> Result<SessionCatalogUpdate, CoreError> {
         let mut next = compose_manager_snapshot(
             &self.home,
             &self.app_data_dir,
             &persisted,
-            SnapshotResources::reuse(&previous),
+            SnapshotResources::reuse(previous),
         )?;
         let changed = next.sessions != previous.sessions
             || next.folders != previous.folders
             || next.pending_projects != previous.pending_projects;
+        // 회차마다 달라지는 세션은 대개 한두 건이다. 그 목록을 여기서 뽑아 두면 화면이
+        // 개정 번호를 따라잡을 때 전체가 아니라 이 몇 건만 다시 받을 수 있다.
+        let touched = if changed {
+            touched_session_keys(&previous.sessions, &next.sessions)
+        } else {
+            Vec::new()
+        };
         if changed {
             persisted.revision = persisted.revision.saturating_add(1);
+        }
+        let revision = persisted.revision;
+        next.session_catalog_revision = revision;
+        if force_persist || changed {
             persist_session_catalog(
                 &self.app_data_dir.join(SESSION_CATALOG_FILE_NAME),
                 &persisted,
             )?;
         }
-        let revision = persisted.revision;
-        next.session_catalog_revision = revision;
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| CoreError::Runtime("세션 카탈로그 잠금이 손상되었습니다".to_owned()))?;
+        let mut state = self.write_state("세션")?;
         state.persisted = persisted;
         state.snapshot = next;
+        if changed {
+            state.record_change(revision, touched);
+        }
         Ok(SessionCatalogUpdate { revision, changed })
     }
+}
+
+fn state_lock_error(catalog_name: &str) -> CoreError {
+    CoreError::Runtime(format!("{catalog_name} 카탈로그 잠금이 손상되었습니다"))
 }
 
 /// 카탈로그 임계구역을 기다릴 최대 시간. 이 시간을 넘기면 `Busy`로 돌려보내
@@ -636,6 +882,8 @@ fn adopt_scanned_caches(current: &mut PersistedSessionCatalog, scanned: Persiste
     current.claude = scanned.claude;
     current.codex_fingerprint = scanned.codex_fingerprint;
     current.codex_sessions = scanned.codex_sessions;
+    current.local_fingerprint = scanned.local_fingerprint;
+    current.local_sessions = scanned.local_sessions;
     current.antigravity_fingerprint = scanned.antigravity_fingerprint;
     current.antigravity_sessions = scanned.antigravity_sessions;
 }
@@ -762,17 +1010,40 @@ fn catalog_sessions_with_metadata(
 ) -> Result<(Vec<SessionSummary>, store::AppMetadata), CoreError> {
     let metadata = store::load_metadata(app_data_dir)?;
     let mut sessions = dedupe_sessions_by_identity(raw_catalog_sessions(persisted));
-    let aia_workspace = canonical_aia_workspace(app_data_dir);
+    // 자동정리(`C11`)가 내린 세션은 목록에 올리지 않는다. 공유 공급자 홈 원문은 지우지
+    // 않으므로 스캔에는 계속 잡히고, 여기서 거르지 않으면 주기 재조사가 도로 담아 온다.
+    sessions.retain(|session| !metadata.is_cleaned_session(session.source, &session.id));
+    let workspaces = app_workspaces(app_data_dir);
     // 원문에 답이 남지 않은 실패(기동 실패·응답 시간 초과)는 Agent Manager 기록에만 있다.
     // 읽기에 실패해도 목록 자체를 막지 않고 태그만 빠진다.
     let runtime_failures = store::latest_runtime_failures(app_data_dir).unwrap_or_default();
     for session in &mut sessions {
-        apply_session_metadata(session, &metadata.sessions);
-        apply_session_working_directory(session, &metadata.session_working_directories);
-        mark_aia_workspace_session(session, &aia_workspace);
+        normalize_session_cwd(session);
+        apply_device_metadata(session, &metadata, &workspaces);
         apply_runtime_failure_tag(session, &runtime_failures);
     }
     Ok((sessions, metadata))
+}
+
+/// 세션 원문의 작업 경로를 NFC 한 형태로 모은다. macOS 파일시스템은 한글 이름을 NFD로
+/// 저장하고 공급자는 실행 당시 받은 문자열을 그대로 남기므로, 같은 디렉터리가 NFC·NFD 두
+/// 문자열로 갈라져 작업 경로 목록에 같은 이름이 두 번 뜬다. macOS는 두 형태를 같은 파일로
+/// 찾으니 목록·비교·실행에 NFC를 써도 안전하다. 다른 OS는 두 형태가 서로 다른 파일이라
+/// 정규화하면 없는 경로를 만들 수 있어 원문을 그대로 둔다.
+fn normalize_session_cwd(session: &mut SessionSummary) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    if let Some(cwd) = session.cwd.as_deref() {
+        let normalized: String = cwd.nfc().collect();
+        if normalized != cwd {
+            // 경로에서 딴 이름만 함께 고친다. AIA 작업공간처럼 따로 붙인 이름은 건드리지 않는다.
+            if session.project == path_name(cwd) {
+                session.project = path_name(&normalized);
+            }
+            session.cwd = Some(normalized);
+        }
+    }
 }
 
 /// Agent Manager가 남긴 마지막 실행 실패가 세션의 마지막 사건이면 실패 태그를 단다.
@@ -846,29 +1117,68 @@ fn seed_known_projects(
 /// (`aia-workspace`)을 그대로 쓰면 목록·필터에서 어떤 대화인지 알아보기 어렵다.
 const AIA_WORKSPACE_PROJECT: &str = "AIA 작업공간";
 
+/// 작업 경로 없이 시작한 세션의 프로젝트 이름. 경로 조각(`default-workspace`)은 사용자가
+/// 고른 적 없는 앱 데이터 경로라 이름으로 보여 줄 것이 아니다.
+const DEFAULT_WORKSPACE_PROJECT: &str = "작업 경로 없음";
+
 /// AIA 작업공간 세션도 목록에 남기되 어느 대화가 AIA와 나눈 것인지 표시한다.
 /// 화면은 이 표시로 목록에서 빼거나 배지를 붙이고, 새 채팅 프로젝트 후보에서는 제외한다.
 fn mark_aia_workspace_session(session: &mut SessionSummary, aia_workspace: &Path) {
-    if !is_aia_workspace_session(session, aia_workspace) {
+    if !is_workspace_session(session, aia_workspace) {
         return;
     }
     session.aia_workspace = true;
     session.project = Some(AIA_WORKSPACE_PROJECT.to_owned());
 }
 
-/// 앱 데이터 아래 AIA 작업공간의 정규 경로. 채팅은 정규화한 경로를 세션 cwd로 남기므로
+/// 작업 경로를 비우고 시작한 세션도 같은 방식으로 표시한다. 화면은 이 표시로 새 채팅의
+/// 프로젝트 후보에서 빼고, 목록에는 고정 이름으로 남긴다.
+fn mark_default_workspace_session(session: &mut SessionSummary, default_workspace: &Path) {
+    if !is_workspace_session(session, default_workspace) {
+        return;
+    }
+    session.default_workspace = true;
+    session.project = Some(DEFAULT_WORKSPACE_PROJECT.to_owned());
+}
+
+/// 공급자 색인이 모르는 장치별 덧입힘(메타·실행 경로·AIA 작업공간 표시)을 한 벌로 적용한다.
+/// 목록과 단건 조회가 같은 순서로 같은 값을 얹어야 화면이 두 경로에서 같은 세션을 본다.
+fn apply_device_metadata(
+    session: &mut SessionSummary,
+    metadata: &store::AppMetadata,
+    workspaces: &AppWorkspaces,
+) {
+    apply_session_metadata(session, &metadata.sessions);
+    apply_session_working_directory(session, &metadata.session_working_directories);
+    mark_aia_workspace_session(session, &workspaces.aia);
+    mark_default_workspace_session(session, &workspaces.default);
+}
+
+/// 앱 데이터 아래 앱 소유 작업공간들의 정규 경로. 채팅은 정규화한 경로를 세션 cwd로 남기므로
 /// (macOS `/var` → `/private/var`처럼) 양쪽을 같은 기준으로 맞춰야 비교가 어긋나지 않는다.
-fn canonical_aia_workspace(app_data_dir: &Path) -> PathBuf {
-    let workspace = app_data_dir.join("aia-workspace");
+struct AppWorkspaces {
+    aia: PathBuf,
+    default: PathBuf,
+}
+
+fn app_workspaces(app_data_dir: &Path) -> AppWorkspaces {
+    AppWorkspaces {
+        aia: canonical_workspace(app_data_dir, crate::chat::AIA_WORKSPACE_DIR),
+        default: canonical_workspace(app_data_dir, crate::chat::DEFAULT_WORKSPACE_DIR),
+    }
+}
+
+fn canonical_workspace(app_data_dir: &Path, name: &str) -> PathBuf {
+    let workspace = app_data_dir.join(name);
     fs::canonicalize(&workspace).unwrap_or(workspace)
 }
 
-fn is_aia_workspace_session(session: &SessionSummary, aia_workspace: &Path) -> bool {
+fn is_workspace_session(session: &SessionSummary, workspace: &Path) -> bool {
     let Some(cwd) = session.cwd.as_deref() else {
         return false;
     };
     let cwd = Path::new(cwd);
-    cwd == aia_workspace || fs::canonicalize(cwd).is_ok_and(|cwd| cwd == aia_workspace)
+    cwd == workspace || fs::canonicalize(cwd).is_ok_and(|cwd| cwd == workspace)
 }
 
 fn raw_catalog_sessions(persisted: &PersistedSessionCatalog) -> Vec<SessionSummary> {
@@ -879,6 +1189,7 @@ fn raw_catalog_sessions(persisted: &PersistedSessionCatalog) -> Vec<SessionSumma
         .collect::<Vec<_>>();
     sessions.extend(persisted.codex_sessions.clone());
     sessions.extend(persisted.antigravity_sessions.clone());
+    sessions.extend(persisted.local_sessions.clone());
     sessions
 }
 
@@ -936,6 +1247,62 @@ fn session_completeness(session: &SessionSummary) -> (i64, u64, u64) {
     )
 }
 
+fn session_not_found() -> CoreError {
+    CoreError::NotFound("세션을 찾을 수 없습니다".to_owned())
+}
+
+/// 공급자 원본에서 세션 하나를 찾는다. 목록과 달리 저장된 색인을 거치지 않으므로
+/// 카탈로그가 아직 훑지 못한 세션도 열 수 있다.
+fn find_provider_session(
+    app_data_dir: &Path,
+    home: &Path,
+    source: ProviderId,
+    id: &str,
+) -> Option<SessionSummary> {
+    match source {
+        ProviderId::Claude => find_claude_session(app_data_dir, home, id),
+        ProviderId::Codex => find_codex_session(home, id),
+        ProviderId::Antigravity => {
+            find_antigravity_session(&antigravity_homes(app_data_dir, home), id)
+        }
+        // 로컬 공급자의 기록은 ACP 하네스 DB에 있다.
+        ProviderId::Local => find_opencode_session(home, id),
+    }
+}
+
+/// 세션 하나를 찾아 장치별 덧입힘까지 마친 요약. 요약 조회와 상세 조회가 같은 값을 본다.
+fn resolve_session(
+    app_data_dir: &Path,
+    home: &Path,
+    source: ProviderId,
+    id: &str,
+    metadata: &store::AppMetadata,
+) -> Result<SessionSummary, CoreError> {
+    let mut session =
+        find_provider_session(app_data_dir, home, source, id).ok_or_else(session_not_found)?;
+    apply_device_metadata(&mut session, metadata, &app_workspaces(app_data_dir));
+    Ok(session)
+}
+
+/// 기록 파일 경로만 필요한 조회가 쓰는 경로 탐색. Claude는 요약을 만들려고 파일 전체를
+/// 다시 훑을 이유가 없으므로 경로만 찾는다.
+fn session_file_path(home: &Path, source: ProviderId, id: &str) -> Option<PathBuf> {
+    match source {
+        ProviderId::Claude => find_claude_session_path(home, id),
+        ProviderId::Codex => {
+            find_codex_session(home, id).map(|session| PathBuf::from(session.file_path))
+        }
+        // 이 경로는 기록 파일의 한 줄을 JSON으로 읽어 이미지를 꺼내는 데만 쓰인다.
+        // Antigravity 대화는 sqlite라 애초에 그 방식으로 열리지 않으므로, 프로필 홈까지
+        // 넓혀도 얻는 것이 없다. 공유 홈만 본다.
+        ProviderId::Antigravity => find_antigravity_session_in_home(home, id)
+            .map(|session| PathBuf::from(session.file_path)),
+        // 로컬 기록은 파일 한 줄이 아니라 하네스 DB 안에 있다. 이 경로로 열 수 있는
+        // 것이 없으므로 없다고 답한다 — Codex rollout 을 뒤지면 남의 대화를 집는다.
+        ProviderId::Local => None,
+    }
+}
+
 pub fn load_manager_snapshot(app_data_dir: &Path) -> Result<ManagerSnapshot, CoreError> {
     SessionCatalog::open(app_data_dir.to_path_buf())?.manager_snapshot()
 }
@@ -948,16 +1315,7 @@ pub fn load_session_summary(
     validate_identifier(id)?;
     let home = home_dir()?;
     let metadata = store::load_metadata(app_data_dir)?;
-    let mut session = match source {
-        ProviderId::Claude => find_claude_session(app_data_dir, &home, id),
-        ProviderId::Codex => find_codex_session(&home, id),
-        ProviderId::Antigravity => find_antigravity_session(&home, id),
-    }
-    .ok_or_else(|| CoreError::NotFound("세션을 찾을 수 없습니다".to_owned()))?;
-    apply_session_metadata(&mut session, &metadata.sessions);
-    apply_session_working_directory(&mut session, &metadata.session_working_directories);
-    mark_aia_workspace_session(&mut session, &canonical_aia_workspace(app_data_dir));
-    Ok(session)
+    resolve_session(app_data_dir, &home, source, id, &metadata)
 }
 
 /// 대화 기록에 base64로 저장된 이미지 한 장. 목록 응답을 가볍게 유지하려고
@@ -982,18 +1340,7 @@ pub fn load_session_transcript_image(
         ));
     }
     let home = home_dir()?;
-    // 이미지는 기록 파일의 위치만 있으면 읽는다. Claude는 요약을 만들려고 파일 전체를
-    // 다시 훑을 이유가 없으므로 경로만 찾는다.
-    let file_path = match source {
-        ProviderId::Claude => find_claude_session_path(&home, id),
-        ProviderId::Codex => {
-            find_codex_session(&home, id).map(|session| PathBuf::from(session.file_path))
-        }
-        ProviderId::Antigravity => {
-            find_antigravity_session(&home, id).map(|session| PathBuf::from(session.file_path))
-        }
-    }
-    .ok_or_else(|| CoreError::NotFound("세션을 찾을 수 없습니다".to_owned()))?;
+    let file_path = session_file_path(&home, source, id).ok_or_else(session_not_found)?;
     read_transcript_image(&file_path, offset, pointer)
 }
 
@@ -1067,15 +1414,7 @@ fn load_session_detail_window(
     validate_identifier(id)?;
     let home = home_dir()?;
     let metadata = store::load_metadata(app_data_dir)?;
-    let mut session = match source {
-        ProviderId::Claude => find_claude_session(app_data_dir, &home, id),
-        ProviderId::Codex => find_codex_session(&home, id),
-        ProviderId::Antigravity => find_antigravity_session(&home, id),
-    }
-    .ok_or_else(|| CoreError::NotFound("세션을 찾을 수 없습니다".to_owned()))?;
-    apply_session_metadata(&mut session, &metadata.sessions);
-    apply_session_working_directory(&mut session, &metadata.session_working_directories);
-    mark_aia_workspace_session(&mut session, &canonical_aia_workspace(app_data_dir));
+    let session = resolve_session(app_data_dir, &home, source, id, &metadata)?;
 
     let supplements = if before_index.is_none() {
         store::captured_turns_for(app_data_dir, source, id)?
@@ -1085,71 +1424,136 @@ fn load_session_detail_window(
     let runtime_failures = store::runtime_failures_for(app_data_dir, source, id)?;
 
     if !session.readable {
-        let (mut transcript, truncated) = apply_transcript_limit(
-            merge_captured_turns(Vec::new(), supplements, 0),
-            transcript_limit,
-        );
-        merge_runtime_failures(&mut transcript, runtime_failures);
-        return Ok(SessionDetail {
+        return Ok(unreadable_session_detail(
             session,
-            transcript: if before_index.is_some() {
-                Vec::new()
-            } else {
-                transcript
-            },
-            truncated: before_index.is_none() && truncated,
-            skipped_lines: 0,
-            unavailable_reason: Some(
-                "Antigravity가 암호화한 .pb 대화는 메타데이터와 아티팩트만 표시합니다.".to_owned(),
-            ),
-        });
+            supplements,
+            runtime_failures,
+            transcript_limit,
+            before_index,
+        ));
     }
 
-    // 보완 저장 결과와 견줄 원본 텍스트가 표시 범위 바로 앞 턴에 있을 수 있다. 판정에 쓸
-    // 만큼 더 읽고, 넘치는 앞부분은 병합 뒤 표시 범위로 다시 잘라낸다.
-    let parse_limit = transcript_limit.max_items().map(|limit| {
-        if supplements.is_empty() {
+    let parsed = parse_transcript(
+        source,
+        &home,
+        id,
+        Path::new(&session.file_path),
+        transcript_parse_limit(transcript_limit, supplements.len()),
+        before_index,
+    )?;
+
+    Ok(match before_index {
+        Some(before) => older_window_detail(session, parsed, runtime_failures, source, before),
+        None => latest_window_detail(
+            session,
+            parsed,
+            supplements,
+            runtime_failures,
+            transcript_limit,
+        ),
+    })
+}
+
+/// 원본을 읽을 수 없는 대화. 표시할 것은 보완 저장 결과뿐이라 이전 구간 요청에는 줄 것이 없다.
+fn unreadable_session_detail(
+    session: SessionSummary,
+    supplements: Vec<store::CapturedTranscriptTurn>,
+    runtime_failures: Vec<SessionRuntimeFailure>,
+    transcript_limit: SessionTranscriptLimit,
+    before_index: Option<usize>,
+) -> SessionDetail {
+    let (mut transcript, truncated) = apply_transcript_limit(
+        merge_captured_turns(Vec::new(), supplements, 0),
+        transcript_limit,
+    );
+    merge_runtime_failures(&mut transcript, runtime_failures);
+    SessionDetail {
+        session,
+        transcript: if before_index.is_some() {
+            Vec::new()
+        } else {
+            transcript
+        },
+        truncated: before_index.is_none() && truncated,
+        skipped_lines: 0,
+        unavailable_reason: Some(
+            "Antigravity가 암호화한 .pb 대화는 메타데이터와 아티팩트만 표시합니다.".to_owned(),
+        ),
+    }
+}
+
+/// 보완 저장 결과와 견줄 원본 텍스트가 표시 범위 바로 앞 턴에 있을 수 있다. 판정에 쓸
+/// 만큼 더 읽고, 넘치는 앞부분은 병합 뒤 표시 범위로 다시 잘라낸다.
+fn transcript_parse_limit(
+    transcript_limit: SessionTranscriptLimit,
+    supplement_count: usize,
+) -> Option<usize> {
+    transcript_limit.max_items().map(|limit| {
+        if supplement_count == 0 {
             limit
         } else {
-            limit.saturating_add(supplements.len() + TRANSCRIPT_DEDUP_LOOKBACK)
+            limit.saturating_add(supplement_count + TRANSCRIPT_DEDUP_LOOKBACK)
         }
-    });
-    let parsed = match source {
-        ProviderId::Claude => {
-            parse_claude_transcript(Path::new(&session.file_path), parse_limit, before_index)?
-        }
-        ProviderId::Codex => {
-            parse_codex_transcript(Path::new(&session.file_path), parse_limit, before_index)?
-        }
-        ProviderId::Antigravity => {
-            parse_antigravity_transcript(Path::new(&session.file_path), parse_limit, before_index)?
-        }
-    };
+    })
+}
 
-    if let Some(before) = before_index {
-        let mut transcript = parsed.items;
-        // 화면이 이미 들고 있는 첫 기록의 시각을 알아야 이 구간이 맡을 실패를 가를 수 있다.
-        // 경계를 못 읽으면 겹쳐 보이는 쪽보다 최신 구간에 맡기는 쪽이 안전하다.
-        if let Some(boundary) =
-            transcript_window_start(source, Path::new(&session.file_path), before)
-        {
-            let failures = failures_within(
-                runtime_failures,
-                &transcript,
-                parsed.truncated,
-                Some(boundary),
-            );
-            merge_runtime_failures(&mut transcript, failures);
-        }
-        return Ok(SessionDetail {
-            session,
-            transcript,
-            truncated: parsed.truncated,
-            skipped_lines: parsed.skipped_lines,
-            unavailable_reason: parsed.unavailable_reason,
-        });
+fn parse_transcript(
+    source: ProviderId,
+    home: &Path,
+    session_id: &str,
+    path: &Path,
+    parse_limit: Option<usize>,
+    before_index: Option<usize>,
+) -> Result<ParsedTranscript, CoreError> {
+    match source {
+        ProviderId::Claude => parse_claude_transcript(path, parse_limit, before_index),
+        ProviderId::Codex => parse_codex_transcript(path, parse_limit, before_index),
+        ProviderId::Antigravity => parse_antigravity_transcript(path, parse_limit, before_index),
+        // 로컬은 기록이 파일 하나가 아니라 하네스 DB의 두 표에 나뉘어 있다. 경로가 아니라
+        // 세션 id로 찾는다.
+        ProviderId::Local => parse_opencode_transcript(home, session_id, parse_limit, before_index),
     }
+}
 
+/// '이전 구간 더 보기'가 받아 가는 창. 보완 저장 결과는 최신 구간이 맡으므로 병합하지 않는다.
+fn older_window_detail(
+    session: SessionSummary,
+    parsed: ParsedTranscript,
+    runtime_failures: Vec<SessionRuntimeFailure>,
+    source: ProviderId,
+    before_index: usize,
+) -> SessionDetail {
+    let mut transcript = parsed.items;
+    // 화면이 이미 들고 있는 첫 기록의 시각을 알아야 이 구간이 맡을 실패를 가를 수 있다.
+    // 경계를 못 읽으면 겹쳐 보이는 쪽보다 최신 구간에 맡기는 쪽이 안전하다.
+    if let Some(boundary) =
+        transcript_window_start(source, Path::new(&session.file_path), before_index)
+    {
+        let failures = failures_within(
+            runtime_failures,
+            &transcript,
+            parsed.truncated,
+            Some(boundary),
+        );
+        merge_runtime_failures(&mut transcript, failures);
+    }
+    SessionDetail {
+        session,
+        transcript,
+        truncated: parsed.truncated,
+        skipped_lines: parsed.skipped_lines,
+        unavailable_reason: parsed.unavailable_reason,
+    }
+}
+
+/// 화면이 처음 받는 최신 구간. 보완 저장 결과를 병합한 뒤 표시 범위로 다시 자른다.
+fn latest_window_detail(
+    session: SessionSummary,
+    parsed: ParsedTranscript,
+    supplements: Vec<store::CapturedTranscriptTurn>,
+    runtime_failures: Vec<SessionRuntimeFailure>,
+    transcript_limit: SessionTranscriptLimit,
+) -> SessionDetail {
     let (mut transcript, merged_truncated) = apply_transcript_limit(
         merge_captured_turns(parsed.items, supplements, parsed.total_items),
         transcript_limit,
@@ -1158,13 +1562,13 @@ fn load_session_detail_window(
     let runtime_failures = failures_within(runtime_failures, &transcript, has_older, None);
     merge_runtime_failures(&mut transcript, runtime_failures);
 
-    Ok(SessionDetail {
+    SessionDetail {
         session,
         transcript,
         truncated: parsed.truncated || merged_truncated,
         skipped_lines: parsed.skipped_lines,
         unavailable_reason: parsed.unavailable_reason,
-    })
+    }
 }
 
 pub fn load_storage_overview(app_data_dir: &Path) -> Result<StorageOverview, CoreError> {
@@ -1190,12 +1594,7 @@ pub fn load_storage_overview(app_data_dir: &Path) -> Result<StorageOverview, Cor
             "antigravity",
             "Antigravity 대화 원본",
             "대화 단계와 세션 요약 DB · 읽기 전용",
-            &[
-                home.join(".gemini/antigravity/conversations"),
-                home.join(".gemini/antigravity-cli/conversations"),
-                home.join(".gemini/antigravity-ide/conversations"),
-                home.join(".gemini/antigravity-cli/conversation_summaries.db"),
-            ],
+            &antigravity_storage_paths(&home.join(".gemini")),
         ),
     ];
     let manager_items = vec![storage_usage_item(
@@ -1343,6 +1742,12 @@ fn merge_captured_turns(
     captured_turns: Vec<store::CapturedTranscriptTurn>,
     mut next_index: usize,
 ) -> Vec<TranscriptItem> {
+    // 런타임이 보낸 지시는 더하는 것이 아니라 표식이다 — 하네스가 사용자 턴으로 저장한
+    // 그 글을 system 으로 바꾼다(9.17).
+    let (prompts, captured_turns): (Vec<_>, Vec<_>) = captured_turns
+        .into_iter()
+        .partition(|turn| turn.origin == store::SupplementOrigin::SystemPrompt);
+    relabel_system_prompts(&mut transcript, &prompts);
     // 견줄 보완 기록이 없으면 사본을 만들지 않는다. 원본 텍스트를 한 번 더 들고 있게 되므로
     // 표시 범위가 '전체'인 긴 대화에서 헛되게 메모리를 쓰지 않도록 한다.
     let mut known_text = if captured_turns.is_empty() {
@@ -1368,6 +1773,8 @@ fn merge_captured_turns(
         let type_label = match turn.origin {
             store::SupplementOrigin::Chat => "보완 저장 결과",
             store::SupplementOrigin::Scheduled => "반복 실행 결과",
+            // 여기 오기 전에 갈라내지만, 갈라내지 못한 것이 있으면 출력이 아니라 지시로 보인다.
+            store::SupplementOrigin::SystemPrompt => "시스템 지시",
         };
         transcript.push(TranscriptItem {
             index: next_index,
@@ -1509,6 +1916,42 @@ fn apply_transcript_limit(
 
 /// 보완 저장 결과와 원본 텍스트를 견주기 위한 비교용 문자열. 줄바꿈·들여쓰기만 다른
 /// 같은 응답을 같게 보고, 저장 한도로 잘린 표시는 떼어낸다.
+/// 런타임이 보낸 지시와 글이 같은 사용자 항목을 system 으로 바꾼다. 지시 하나에 항목
+/// 하나만 — 같은 지시가 두 번 갔으면 기록도 두 번 있다.
+fn relabel_system_prompts(
+    transcript: &mut [TranscriptItem],
+    prompts: &[store::CapturedTranscriptTurn],
+) {
+    for prompt in prompts {
+        let wanted = collapsed_transcript_text(&prompt.text);
+        if wanted.is_empty() {
+            continue;
+        }
+        let found = transcript.iter_mut().find(|item| {
+            item.role == "user"
+                && item.type_label.is_none()
+                && item
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(collapsed_transcript_text(text)),
+                        _ => None,
+                    })
+                    .collect::<String>()
+                    == wanted
+        });
+        if let Some(item) = found {
+            item.role = "system".to_owned();
+            item.type_label = Some(
+                prompt
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| "시스템 지시".to_owned()),
+            );
+        }
+    }
+}
+
 fn collapsed_transcript_text(text: &str) -> String {
     let mut body = text;
     for mark in [TRANSCRIPT_TRUNCATION_MARK, SUPPLEMENT_TRUNCATION_MARK] {
@@ -1530,6 +1973,7 @@ fn text_probe(collapsed: &str) -> &str {
 }
 
 fn reconcile_provider_cache(
+    app_data_dir: &Path,
     home: &Path,
     persisted: &mut PersistedSessionCatalog,
     source: Option<ProviderId>,
@@ -1537,43 +1981,14 @@ fn reconcile_provider_cache(
 ) -> Result<bool, CoreError> {
     let mut changed = false;
 
-    if source.is_none() || source == Some(ProviderId::Claude) {
+    if scan_covers(source, ProviderId::Claude) {
         if let Some(id) = target_id {
             return reconcile_claude_target(home, persisted, id);
         }
-        let previous_entries = std::mem::take(&mut persisted.claude);
-        let mut previous_claude = previous_entries
-            .into_iter()
-            .map(|entry| (entry.path.clone(), entry))
-            .collect::<HashMap<_, _>>();
-        let mut next_claude = Vec::new();
-        let mut claude_changed = false;
-        for path in claude_session_paths(home) {
-            let path_text = path.to_string_lossy().into_owned();
-            let fingerprint = fingerprint_file(&path)?;
-            let previous = previous_claude.remove(&path_text);
-            let entry = if previous
-                .as_ref()
-                .is_some_and(|entry| entry.fingerprint == fingerprint)
-            {
-                previous.expect("checked above")
-            } else {
-                claude_changed = true;
-                scan_claude_catalog_entry(&path, fingerprint, previous.as_ref())?
-            };
-            next_claude.push(entry);
-        }
-        next_claude.sort_by(|left, right| left.path.cmp(&right.path));
-        if !previous_claude.is_empty() {
-            claude_changed = true;
-        }
-        if claude_changed {
-            changed = true;
-        }
-        persisted.claude = next_claude;
+        changed |= reconcile_claude_cache(home, persisted)?;
     }
 
-    if source.is_none() || source == Some(ProviderId::Codex) {
+    if scan_covers(source, ProviderId::Codex) {
         let codex_fingerprint = codex_provider_fingerprint(home)?;
         if codex_fingerprint != persisted.codex_fingerprint {
             persisted.codex_sessions = list_codex_sessions(home, &persisted.codex_sessions);
@@ -1582,15 +1997,73 @@ fn reconcile_provider_cache(
         }
     }
 
-    if source.is_none() || source == Some(ProviderId::Antigravity) {
-        let antigravity_fingerprint = antigravity_provider_fingerprint(home)?;
+    if scan_covers(source, ProviderId::Local) {
+        let local_fingerprint = opencode_provider_fingerprint(home)?;
+        if local_fingerprint != persisted.local_fingerprint {
+            persisted.local_sessions = list_opencode_sessions(home);
+            persisted.local_fingerprint = local_fingerprint;
+            changed = true;
+        }
+    }
+
+    if scan_covers(source, ProviderId::Antigravity) {
+        let homes = antigravity_homes(app_data_dir, home);
+        let antigravity_fingerprint = antigravity_provider_fingerprint(&homes)?;
         if antigravity_fingerprint != persisted.antigravity_fingerprint {
-            persisted.antigravity_sessions = list_antigravity_sessions(home);
+            persisted.antigravity_sessions = list_antigravity_sessions(&homes);
             persisted.antigravity_fingerprint = antigravity_fingerprint;
             changed = true;
         }
     }
     Ok(changed)
+}
+
+/// 이번 훑기가 이 공급자를 포함하는지. 대상을 지정하지 않은 훑기는 세 공급자를 모두 본다.
+fn scan_covers(source: Option<ProviderId>, provider: ProviderId) -> bool {
+    source.is_none_or(|id| id == provider)
+}
+
+/// Claude 기록 파일 전체를 훑어 캐시를 새로 만든다. 지문이 그대로인 파일은 저장본을 그대로
+/// 옮겨 담고, 사라진 파일이 있으면 그것만으로도 바뀐 것으로 센다.
+fn reconcile_claude_cache(
+    home: &Path,
+    persisted: &mut PersistedSessionCatalog,
+) -> Result<bool, CoreError> {
+    let mut stale = std::mem::take(&mut persisted.claude)
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut next = Vec::new();
+    let mut changed = false;
+    for path in claude_session_paths(home) {
+        let previous = stale.remove(&path.to_string_lossy().into_owned());
+        match rescan_claude_entry(&path, previous.as_ref())? {
+            Some(entry) => {
+                changed = true;
+                next.push(entry);
+            }
+            None => next.push(previous.expect("unchanged only happens with a stored entry")),
+        }
+    }
+    next.sort_by(|left, right| left.path.cmp(&right.path));
+    changed |= !stale.is_empty();
+    persisted.claude = next;
+    Ok(changed)
+}
+
+/// 파일 지문이 저장본과 같으면 `None`(다시 훑을 것이 없다), 다르면 새로 훑은 항목.
+///
+/// 전체 훑기와 세션 하나 갱신이 같은 판정을 써야 한다 — 한쪽만 지문 비교를 놓치면 그
+/// 경로에서만 캐시가 무의미해지거나, 반대로 바뀐 파일을 계속 옛 요약으로 보여 준다.
+fn rescan_claude_entry(
+    path: &Path,
+    previous: Option<&ClaudeCatalogEntry>,
+) -> Result<Option<ClaudeCatalogEntry>, CoreError> {
+    let fingerprint = fingerprint_file(path)?;
+    if previous.is_some_and(|entry| entry.fingerprint == fingerprint) {
+        return Ok(None);
+    }
+    scan_claude_catalog_entry(path, fingerprint, previous).map(Some)
 }
 
 fn reconcile_claude_target(
@@ -1612,15 +2085,10 @@ fn reconcile_claude_target(
         .claude
         .iter()
         .position(|entry| entry.path == path_text);
-    let fingerprint = fingerprint_file(&path)?;
     let previous = previous_index.map(|index| persisted.claude[index].clone());
-    if previous
-        .as_ref()
-        .is_some_and(|entry| entry.fingerprint == fingerprint)
-    {
+    let Some(entry) = rescan_claude_entry(&path, previous.as_ref())? else {
         return Ok(false);
-    }
-    let entry = scan_claude_catalog_entry(&path, fingerprint, previous.as_ref())?;
+    };
     if let Some(index) = previous_index {
         persisted.claude[index] = entry;
     } else {
@@ -1657,7 +2125,10 @@ fn claude_session_paths(home: &Path) -> Vec<PathBuf> {
 /// 같은 세션 기록이 여러 프로젝트 디렉터리(NFC/NFD 정규화 차이 등)에 남아 있어도
 /// 항상 같은 파일을 고르도록 최근 수정 → 큰 파일 → 앞선 경로 순으로 결정한다.
 /// 디렉터리 순회 순서에 기대면 목록과 상세 화면이 서로 다른 파일을 볼 수 있다.
-fn find_claude_session_path(home: &Path, id: &str) -> Option<PathBuf> {
+/// Claude 기록 파일(`~/.claude/projects/*/<id>.jsonl`)의 경로. 같은 ID가 여러 프로젝트에
+/// 있으면 가장 최근에 바뀐 큰 파일을 고른다. 채팅 런타임은 이 파일이 있을 때만 `--resume`을
+/// 붙인다.
+pub(crate) fn find_claude_session_path(home: &Path, id: &str) -> Option<PathBuf> {
     let projects = fs::read_dir(home.join(".claude/projects")).ok()?;
     let mut best: Option<((i64, u64), PathBuf)> = None;
     for project in projects.flatten() {
@@ -1738,26 +2209,31 @@ fn codex_provider_fingerprint(home: &Path) -> Result<BTreeMap<String, FileFinger
     ])
 }
 
-fn antigravity_provider_fingerprint(
+/// ACP 하네스 세션 DB의 지문. WAL 모드라 본체만 보면 새 대화를 놓친다.
+fn opencode_provider_fingerprint(
     home: &Path,
 ) -> Result<BTreeMap<String, FileFingerprint>, CoreError> {
-    let gemini = home.join(".gemini");
-    let mut paths = vec![gemini.join("antigravity-cli/conversation_summaries.db")];
-    for root_name in ACTIVE_AG_ROOTS {
-        let conversations = gemini.join(root_name).join("conversations");
-        let Ok(entries) = fs::read_dir(conversations) else {
-            continue;
-        };
-        paths.extend(entries.flatten().filter_map(|entry| {
-            let path = entry.path();
-            matches!(
-                path.extension().and_then(|value| value.to_str()),
-                Some("db" | "pb")
-            )
-            .then_some(path)
-        }));
+    let database = opencode_session_db(home);
+    fingerprint_paths([
+        database.clone(),
+        PathBuf::from(format!("{}-wal", database.to_string_lossy())),
+    ])
+}
+
+fn antigravity_provider_fingerprint(
+    homes: &[PathBuf],
+) -> Result<BTreeMap<String, FileFingerprint>, CoreError> {
+    let mut paths = Vec::new();
+    for home in homes {
+        collect_antigravity_fingerprint_paths(home, &mut paths);
     }
     fingerprint_paths(paths)
+}
+
+fn collect_antigravity_fingerprint_paths(home: &Path, paths: &mut Vec<PathBuf>) {
+    let gemini = home.join(".gemini");
+    paths.push(ag_summary_index_path(&gemini));
+    paths.extend(ag_conversation_entries(&gemini).map(|entry| entry.path()));
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -1893,7 +2369,24 @@ fn file_region_hash(path: &Path, offset: u64, length: usize) -> Result<u64, Core
     Ok(fnv1a(&bytes))
 }
 
+/// JSONL 레코드 하나를 훑어 세션 요약 상태에 반영한다. 레코드 종류와 무관한 항목(구간
+/// 시각·작업 경로·브랜치)을 먼저 적고, 종류별 해석은 각 처리기에 맡긴다.
 fn update_claude_scan(scan: &mut ClaudeScanState, record: &Value) {
+    update_claude_scan_envelope(scan, record);
+    match record.get("type").and_then(Value::as_str) {
+        Some("custom-title") => {
+            scan.custom_title = json_string(record, "customTitle").map(cap_provider_title)
+        }
+        Some("ai-title") => scan.ai_title = json_string(record, "aiTitle").map(cap_provider_title),
+        Some("user") => apply_claude_user_record(scan, record),
+        Some("assistant") => apply_claude_assistant_record(scan, record),
+        _ => {}
+    }
+}
+
+/// 어떤 종류의 레코드에나 붙어 있는 항목. 시각은 구간의 양 끝으로 넓히고, 경로와 브랜치는
+/// 처음 본 값을 지킨다.
+fn update_claude_scan_envelope(scan: &mut ClaudeScanState, record: &Value) {
     if let Some(timestamp) = record
         .get("timestamp")
         .and_then(Value::as_str)
@@ -1914,84 +2407,79 @@ fn update_claude_scan(scan: &mut ClaudeScanState, record: &Value) {
     if scan.git_branch.is_none() {
         scan.git_branch = json_string(record, "gitBranch");
     }
-    match record.get("type").and_then(Value::as_str) {
-        Some("custom-title") => {
-            scan.custom_title = json_string(record, "customTitle").map(cap_provider_title)
-        }
-        Some("ai-title") => scan.ai_title = json_string(record, "aiTitle").map(cap_provider_title),
-        Some("user") => {
-            // 중단 자리표시자와 CLI 자동 주입은 사용자가 보낸 요청이 아니고, 도구 결과와
-            // 슬래시 명령 출력은 사용자 턴 자리에 기록될 뿐 메시지가 아니다. 넷 다
-            // 메시지 수·제목에서 뺀다.
-            if record_interrupt_label(record).is_some()
-                || record.get("isMeta").and_then(Value::as_bool) == Some(true)
-                || user_record_is_tool_result(record)
-                || user_record_is_local_command_output(record)
-            {
-                return;
-            }
-            scan.message_count = scan.message_count.saturating_add(1);
-            // 새 요청이 들어왔으면 앞선 실패는 지난 일이다.
-            scan.last_failure = None;
-            if scan.first_user.is_none() {
-                scan.first_user = record
-                    .pointer("/message/content")
-                    .and_then(user_content_text)
-                    .map(clean_text)
-                    .filter(|text| !text.is_empty() && !text.starts_with('<'))
-                    .map(cap_provider_title);
-            }
-            if scan.first_command.is_none() {
-                scan.first_command = record
-                    .pointer("/message/content")
-                    .and_then(user_content_text)
-                    .and_then(slash_command_text)
-                    .map(cap_provider_title);
-            }
-        }
-        Some("assistant") => {
-            // 중단·오류 자리표시자 레코드는 모델이 "<synthetic>"이라 재개 요청에 쓸 수 없다.
-            let model = record
-                .pointer("/message/model")
-                .and_then(Value::as_str)
-                .filter(|value| identifier_value_is_valid(value));
-            if model.is_none() && record_interrupt_label(record).is_some() {
-                return;
-            }
-            // CLI가 답 자리에 남긴 실패 안내(한도·인증 만료·거절)는 이 세션의 마지막
-            // 사건으로 남기고, 정상 응답이 오면 지운다.
-            scan.last_failure = claude_api_error_text(record).map(|text| {
-                SessionLastFailure::new(
-                    &text,
-                    record
-                        .get("timestamp")
-                        .and_then(Value::as_str)
-                        .and_then(parse_time),
-                )
-            });
-            scan.message_count = scan.message_count.saturating_add(1);
-            if let Some(value) = model {
-                scan.model = Some(value.to_owned());
-            }
-            scan.tokens.input = scan
-                .tokens
-                .input
-                .saturating_add(json_u64_pointer(record, "/message/usage/input_tokens"));
-            scan.tokens.output = scan
-                .tokens
-                .output
-                .saturating_add(json_u64_pointer(record, "/message/usage/output_tokens"));
-            scan.tokens.cache_read = scan.tokens.cache_read.saturating_add(json_u64_pointer(
-                record,
-                "/message/usage/cache_read_input_tokens",
-            ));
-            scan.tokens.cache_write = scan.tokens.cache_write.saturating_add(json_u64_pointer(
-                record,
-                "/message/usage/cache_creation_input_tokens",
-            ));
-        }
-        _ => {}
+}
+
+fn apply_claude_user_record(scan: &mut ClaudeScanState, record: &Value) {
+    // 중단 자리표시자와 CLI 자동 주입은 사용자가 보낸 요청이 아니고, 도구 결과와
+    // 슬래시 명령 출력은 사용자 턴 자리에 기록될 뿐 메시지가 아니다. 넷 다
+    // 메시지 수·제목에서 뺀다.
+    if record_interrupt_label(record).is_some()
+        || record.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || user_record_is_tool_result(record)
+        || user_record_is_local_command_output(record)
+    {
+        return;
     }
+    scan.message_count = scan.message_count.saturating_add(1);
+    // 새 요청이 들어왔으면 앞선 실패는 지난 일이다.
+    scan.last_failure = None;
+    if scan.first_user.is_none() {
+        scan.first_user = record
+            .pointer("/message/content")
+            .and_then(user_content_text)
+            .map(clean_text)
+            .filter(|text| !text.is_empty() && !text.starts_with('<'))
+            .map(cap_provider_title);
+    }
+    if scan.first_command.is_none() {
+        scan.first_command = record
+            .pointer("/message/content")
+            .and_then(user_content_text)
+            .and_then(slash_command_text)
+            .map(cap_provider_title);
+    }
+}
+
+fn apply_claude_assistant_record(scan: &mut ClaudeScanState, record: &Value) {
+    // 중단·오류 자리표시자 레코드는 모델이 "<synthetic>"이라 재개 요청에 쓸 수 없다.
+    let model = record
+        .pointer("/message/model")
+        .and_then(Value::as_str)
+        .filter(|value| identifier_value_is_valid(value));
+    if model.is_none() && record_interrupt_label(record).is_some() {
+        return;
+    }
+    // CLI가 답 자리에 남긴 실패 안내(한도·인증 만료·거절)는 이 세션의 마지막
+    // 사건으로 남기고, 정상 응답이 오면 지운다.
+    scan.last_failure = claude_api_error_text(record).map(|text| {
+        SessionLastFailure::new(
+            &text,
+            record
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_time),
+        )
+    });
+    scan.message_count = scan.message_count.saturating_add(1);
+    if let Some(value) = model {
+        scan.model = Some(value.to_owned());
+    }
+    scan.tokens.input = scan
+        .tokens
+        .input
+        .saturating_add(json_u64_pointer(record, "/message/usage/input_tokens"));
+    scan.tokens.output = scan
+        .tokens
+        .output
+        .saturating_add(json_u64_pointer(record, "/message/usage/output_tokens"));
+    scan.tokens.cache_read = scan.tokens.cache_read.saturating_add(json_u64_pointer(
+        record,
+        "/message/usage/cache_read_input_tokens",
+    ));
+    scan.tokens.cache_write = scan.tokens.cache_write.saturating_add(json_u64_pointer(
+        record,
+        "/message/usage/cache_creation_input_tokens",
+    ));
 }
 
 /// 슬래시 명령의 출력은 isMeta 표시 없이 `type: "user"`로 남는 CLI 주입 레코드다.
@@ -2141,6 +2629,7 @@ fn claude_summary_from_entry(entry: &ClaudeCatalogEntry) -> SessionSummary {
         git_branch: entry.scan.git_branch.clone(),
         is_subagent: false,
         aia_workspace: false,
+        default_workspace: false,
         archived: false,
         readable: true,
         size_bytes: Some(entry.fingerprint.size_bytes),
@@ -2153,6 +2642,266 @@ fn claude_summary_from_entry(entry: &ClaudeCatalogEntry) -> SessionSummary {
 /// 상태 DB는 스레드가 하나만 바뀌어도 통째로 다시 읽으므로, 롤아웃 파일이 그대로인
 /// 세션은 지난 목록의 실패 판정을 물려받아 꼬리 읽기를 건너뛴다. 롤아웃은 덧붙이기만
 /// 하는 파일이라 크기가 같으면 내용도 같다.
+/// ACP 하네스가 자기 세션을 담아 두는 SQLite. 우리가 만든 것만 골라 읽는다.
+///
+/// Codex 경로에서는 rollout 헤더의 `model_provider`를 보고 우리 것을 가렸다. 하네스가
+/// 바뀌며 그 판별은 사라졌지만 귀속 자체가 없어진 것은 아니다 — 읽어 올 곳이 옮겨갔다.
+/// `agent` 칸이 우리 에이전트인 세션만 가져오므로, 사용자가 직접 쓰는 OpenCode 대화까지
+/// 앱 목록으로 끌어오지 않는다.
+fn opencode_session_db(home: &Path) -> PathBuf {
+    home.join(crate::providers::OPENCODE_SESSION_DB_RELATIVE)
+}
+
+/// 하네스가 세션에 적어 둔 모델. 문자열이 아니라 JSON 한 덩이로 들어 있다
+/// (`{"id":"qwen3.5-gpu:latest","providerID":"agent-manager-local",…}`). 화면에는 공급자를
+/// 뗀 이름만 보이면 된다 — 공급자는 이미 로컬로 가려져 있다.
+fn opencode_model_name(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let name = serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| value.get("id")?.as_str().map(ToOwned::to_owned))
+        // JSON이 아니면 적힌 그대로 쓴다. 하네스가 모양을 바꿔도 빈칸이 되지 않는다.
+        .unwrap_or_else(|| raw.to_owned());
+    let name = name
+        .rsplit_once('/')
+        .map(|(_, tail)| tail.to_owned())
+        .unwrap_or(name);
+    (!name.trim().is_empty()).then_some(name)
+}
+
+/// 하네스 DB에서 세션 하나를 찾는다. 목록과 같은 규칙으로 우리 에이전트 것만 본다.
+fn find_opencode_session(home: &Path, id: &str) -> Option<SessionSummary> {
+    list_opencode_sessions(home)
+        .into_iter()
+        .find(|session| session.id == id)
+}
+
+/// 하네스 DB에 쌓인 대화. 파일이 아니라 `message`·`part` 두 표에 나뉘어 있다.
+///
+/// `message.data`가 역할과 시각을 들고, 본문은 `part.data`의 `type`으로 갈린다. 아는 갈래만
+/// 옮기고 나머지(`step-start`·`step-finish` 같은 진행 표시)는 버린다 — 화면에 쌓아 봐야
+/// 읽을 것이 없다.
+fn parse_opencode_transcript(
+    home: &Path,
+    session_id: &str,
+    limit: Option<usize>,
+    before_index: Option<usize>,
+) -> Result<ParsedTranscript, CoreError> {
+    let path = opencode_session_db(home);
+    let connection = open_sqlite_readonly(&path).map_err(|error| {
+        CoreError::Runtime(format!("하네스 세션 기록을 열지 못했습니다: {error}"))
+    })?;
+    let mut statement = connection
+        .prepare(
+            "SELECT m.id, m.data, m.time_created FROM message m \
+             WHERE m.session_id = ?1 ORDER BY m.time_created, m.rowid",
+        )
+        .map_err(|error| CoreError::Runtime(format!("기록을 읽지 못했습니다: {error}")))?;
+    let messages = statement
+        .query_map([session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })
+        .map_err(|error| CoreError::Runtime(format!("기록을 읽지 못했습니다: {error}")))?
+        .flatten()
+        .collect::<Vec<_>>();
+
+    let mut parts = connection
+        .prepare(
+            "SELECT message_id, data FROM part WHERE session_id = ?1 ORDER BY time_created, rowid",
+        )
+        .map_err(|error| CoreError::Runtime(format!("기록을 읽지 못했습니다: {error}")))?;
+    let mut by_message: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    if let Ok(rows) = parts.query_map([session_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) {
+        for (message_id, data) in rows.flatten() {
+            if let Ok(value) = serde_json::from_str::<Value>(&data) {
+                by_message.entry(message_id).or_default().push(value);
+            }
+        }
+    }
+
+    let mut items = Vec::new();
+    for (index, (message_id, data, created)) in messages.into_iter().enumerate() {
+        let meta = serde_json::from_str::<Value>(&data).unwrap_or(Value::Null);
+        let role = meta
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("assistant")
+            .to_owned();
+        let blocks = by_message
+            .get(&message_id)
+            .map(|parts| opencode_blocks(parts))
+            .unwrap_or_default();
+        if blocks.is_empty() {
+            continue;
+        }
+        items.push(TranscriptItem {
+            index,
+            role,
+            timestamp: normalize_epoch(created),
+            model: meta
+                .pointer("/model/modelID")
+                .or_else(|| meta.pointer("/model/id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            type_label: None,
+            blocks,
+            usage: None,
+        });
+    }
+
+    let total_items = items.len();
+    // 목록 끝부터 보여 주고, 더 보기는 앞쪽으로 거슬러 간다. 파일 기반 갈래와 같은 규칙이다.
+    let end = before_index.unwrap_or(total_items).min(total_items);
+    let start = limit.map_or(0, |limit| end.saturating_sub(limit));
+    let truncated = start > 0;
+    items = items.into_iter().take(end).skip(start).collect();
+    Ok(ParsedTranscript {
+        items,
+        truncated,
+        total_items,
+        skipped_lines: 0,
+        unavailable_reason: None,
+    })
+}
+
+/// 한 메시지에 딸린 조각들을 화면 블록으로. 아는 갈래만 남긴다.
+fn opencode_blocks(parts: &[Value]) -> Vec<ContentBlock> {
+    parts
+        .iter()
+        .filter_map(|part| {
+            let kind = part.get("type").and_then(Value::as_str)?;
+            let text = || {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToOwned::to_owned)
+            };
+            match kind {
+                "text" => text().map(|text| ContentBlock::Text { text }),
+                "reasoning" => text().map(|text| ContentBlock::Thinking { text }),
+                "tool" => Some(ContentBlock::ToolUse {
+                    name: part
+                        .get("tool")
+                        .and_then(Value::as_str)
+                        .unwrap_or("도구")
+                        .to_owned(),
+                    input_json: part
+                        .pointer("/state/input")
+                        .map(pretty_json)
+                        .unwrap_or_default(),
+                }),
+                // 파일이 바뀐 기록. 버리면 무엇을 고쳤는지 화면에서 사라진다.
+                "patch" => Some(ContentBlock::ToolResult {
+                    text: part
+                        .get("files")
+                        .or_else(|| part.get("hash"))
+                        .map(pretty_json)
+                        .unwrap_or_else(|| "파일 변경".to_owned()),
+                    is_error: false,
+                }),
+                // step-start·step-finish 같은 진행 표시는 화면에 쌓아 봐야 읽을 것이 없다.
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn list_opencode_sessions(home: &Path) -> Vec<SessionSummary> {
+    let path = opencode_session_db(home);
+    let Ok(connection) = open_sqlite_readonly(&path) else {
+        return Vec::new();
+    };
+    let columns = sqlite_columns(&connection, "session");
+    if !columns.contains("id") || !columns.contains("agent") {
+        return Vec::new();
+    }
+    let optional = |name: &str| {
+        if columns.contains(name) {
+            name.to_owned()
+        } else {
+            format!("NULL AS {name}")
+        }
+    };
+    let sql = format!(
+        "SELECT id, agent, {}, {}, {}, {}, {}, {}, {}, {} FROM session          WHERE agent = ?1 OR agent LIKE ?2",
+        optional("title"),
+        optional("directory"),
+        optional("model"),
+        optional("time_created"),
+        optional("time_updated"),
+        optional("tokens_input"),
+        optional("tokens_output"),
+        optional("time_archived"),
+    );
+    let Ok(mut statement) = connection.prepare(&sql) else {
+        return Vec::new();
+    };
+    // 도구 묶음을 갈아 끼우면 세션의 agent 가 그 묶음 이름으로 바뀐다. 한쪽만 거르면 그
+    // 대화가 목록에서 사라지고 재개도 안 된다. 묶음은 플러그인 수만큼 늘어나므로 이름을
+    // 박지 않고 우리가 소유한 앞머리로 거른다.
+    let rows = statement.query_map(
+        [
+            crate::opencode_config::AGENT_ID.to_owned(),
+            crate::opencode_config::owned_agent_like_pattern(),
+        ],
+        |row| {
+            let id = row.get::<_, String>(0)?;
+            let title = clean_option(row.get::<_, Option<String>>(2)?);
+            let cwd = clean_option(row.get::<_, Option<String>>(3)?);
+            let model = clean_option(row.get::<_, Option<String>>(4)?);
+            let created = row.get::<_, Option<i64>>(5)?;
+            let updated = row.get::<_, Option<i64>>(6)?;
+            let input = row.get::<_, Option<u64>>(7)?;
+            let output = row.get::<_, Option<u64>>(8)?;
+            let archived = row.get::<_, Option<i64>>(9)?;
+            Ok(SessionSummary {
+                source: ProviderId::Local,
+                id,
+                title: String::new(),
+                source_title: title.map(cap_provider_title),
+                project: cwd.as_deref().and_then(path_name),
+                cwd,
+                started_at: normalize_epoch(created),
+                updated_at: normalize_epoch(updated),
+                message_count: None,
+                // 입력과 출력을 더한다. 로컬은 한도가 없어 창 계산에 쓰이지 않고, 대화가 얼마나
+                // 길어졌는지 가늠하는 값으로만 쓰인다.
+                token_total: match (input, output) {
+                    (None, None) => None,
+                    (left, right) => Some(left.unwrap_or(0) + right.unwrap_or(0)),
+                },
+                token_usage: None,
+                model: model.as_deref().and_then(opencode_model_name),
+                git_branch: None,
+                is_subagent: false,
+                aia_workspace: false,
+                default_workspace: false,
+                archived: archived.is_some_and(|value| value > 0),
+                readable: true,
+                size_bytes: None,
+                // 파일 하나로 떨어지지 않는다. 기록은 하네스의 DB 안에 있다.
+                file_path: path.to_string_lossy().into_owned(),
+                meta: SessionMeta::default(),
+                last_failure: None,
+            })
+        },
+    );
+    let Ok(rows) = rows else {
+        return Vec::new();
+    };
+    rows.flatten().collect()
+}
+
 fn list_codex_sessions(home: &Path, previous: &[SessionSummary]) -> Vec<SessionSummary> {
     let previous_failures = previous
         .iter()
@@ -2344,6 +3093,7 @@ fn codex_session_from_row(
         git_branch,
         is_subagent: thread_source.as_deref() == Some("subagent"),
         aia_workspace: false,
+        default_workspace: false,
         archived,
         readable: resolved_path.is_file(),
         size_bytes: file_metadata.as_ref().map(fs::Metadata::len),
@@ -2372,48 +3122,95 @@ struct AgIndexEntry {
     workspace: Option<String>,
 }
 
-fn list_antigravity_sessions(home: &Path) -> Vec<SessionSummary> {
-    let gemini = home.join(".gemini");
-    let index = read_ag_summary_index(&gemini);
+/// 공유 홈과 계정 프로필 홈을 함께 훑는다. 공유 홈이 언제나 먼저다.
+///
+/// Antigravity는 Codex의 `CODEX_SQLITE_HOME` 같은 공유 색인이 없어, 계정을 가르면 대화가
+/// 그 계정의 홈에만 남는다. 여기서 모아 주지 않으면 활성 계정이 아닌 계정의 대화는
+/// 세션 목록에서 통째로 사라진다.
+fn antigravity_homes(app_data_dir: &Path, home: &Path) -> Vec<PathBuf> {
+    let mut homes = vec![home.to_path_buf()];
+    homes.extend(crate::credential_profiles::antigravity_profile_homes(
+        app_data_dir,
+    ));
+    homes
+}
+
+/// 이 Antigravity 세션이 어느 계정의 프로필 홈에 있는지. 공유 홈에 있으면 `None`이다.
+///
+/// Antigravity에는 계정을 적어 두는 공유 색인이 없어, 세션이 어느 계정 것인지는 파일이
+/// 놓인 자리가 답한다. 앱 밖에서 돌린 CLI가 만든 대화도 같은 기준으로 귀속된다.
+pub fn antigravity_session_account(app_data_dir: &Path, id: &str) -> Option<String> {
+    antigravity_session_account_with_home(app_data_dir, &home_dir().ok()?, id)
+}
+
+/// 이 Antigravity 대화가 실제로 놓인 파일. 공유 홈이 먼저고 계정 프로필이 뒤따른다.
+pub fn antigravity_session_location(app_data_dir: &Path, id: &str) -> Option<PathBuf> {
+    let home = home_dir().ok()?;
+    find_antigravity_session(&antigravity_homes(app_data_dir, &home), id)
+        .map(|session| PathBuf::from(session.file_path))
+}
+
+fn antigravity_session_account_with_home(
+    app_data_dir: &Path,
+    home: &Path,
+    id: &str,
+) -> Option<String> {
+    let session = find_antigravity_session(&antigravity_homes(app_data_dir, home), id)?;
+    crate::credential_profiles::antigravity_account_for_path(
+        app_data_dir,
+        Path::new(&session.file_path),
+    )
+}
+
+fn list_antigravity_sessions(homes: &[PathBuf]) -> Vec<SessionSummary> {
     let mut seen = HashSet::new();
     let mut sessions = Vec::new();
-    for root_name in ACTIVE_AG_ROOTS {
-        let conversations = gemini.join(root_name).join("conversations");
-        let Ok(files) = fs::read_dir(conversations) else {
-            continue;
-        };
-        for entry in files.flatten() {
-            let path = entry.path();
-            let extension = path.extension().and_then(|value| value.to_str());
-            if extension != Some("db") && extension != Some("pb") {
-                continue;
-            }
-            let id = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default()
-                .to_owned();
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            let indexed = index.get(&id).cloned().unwrap_or_default();
-            sessions.push(antigravity_session_from_path(id, path, metadata, indexed));
-        }
+    for home in homes {
+        collect_antigravity_sessions(home, &mut seen, &mut sessions);
     }
     sessions
 }
 
-fn find_antigravity_session(home: &Path, id: &str) -> Option<SessionSummary> {
+/// 홈 하나에서 대화를 모은다. `seen`은 홈 사이에서도 이어져, 같은 id가 두 홈에 있으면
+/// 먼저 훑은 홈이 이긴다(공유 홈 우선).
+fn collect_antigravity_sessions(
+    home: &Path,
+    seen: &mut HashSet<String>,
+    sessions: &mut Vec<SessionSummary>,
+) {
+    let gemini = home.join(".gemini");
+    let index = read_ag_summary_index(&gemini);
+    for entry in ag_conversation_entries(&gemini) {
+        let path = entry.path();
+        let id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let indexed = index.get(&id).cloned().unwrap_or_default();
+        sessions.push(antigravity_session_from_path(id, path, metadata, indexed));
+    }
+}
+
+fn find_antigravity_session(homes: &[PathBuf], id: &str) -> Option<SessionSummary> {
+    homes
+        .iter()
+        .find_map(|home| find_antigravity_session_in_home(home, id))
+}
+
+fn find_antigravity_session_in_home(home: &Path, id: &str) -> Option<SessionSummary> {
     let gemini = home.join(".gemini");
     let indexed = read_ag_summary_index(&gemini)
         .remove(id)
         .unwrap_or_default();
-    for root_name in ACTIVE_AG_ROOTS {
-        let conversations = gemini.join(root_name).join("conversations");
-        for extension in ["db", "pb"] {
+    for conversations in ag_conversation_dirs(&gemini) {
+        for extension in AG_CONVERSATION_EXTENSIONS {
             let path = conversations.join(format!("{id}.{extension}"));
             if let Ok(metadata) = fs::metadata(&path) {
                 return Some(antigravity_session_from_path(
@@ -2461,6 +3258,7 @@ fn antigravity_session_from_path(
         git_branch: None,
         is_subagent: false,
         aia_workspace: false,
+        default_workspace: false,
         archived: false,
         readable,
         size_bytes: Some(metadata.len()),
@@ -2471,7 +3269,7 @@ fn antigravity_session_from_path(
 }
 
 fn read_ag_summary_index(gemini: &Path) -> HashMap<String, AgIndexEntry> {
-    let path = gemini.join("antigravity-cli/conversation_summaries.db");
+    let path = ag_summary_index_path(gemini);
     let Ok(connection) = open_sqlite_readonly(&path) else {
         return HashMap::new();
     };
@@ -2493,9 +3291,7 @@ fn read_ag_summary_index(gemini: &Path) -> HashMap<String, AgIndexEntry> {
     };
     rows.flatten()
         .map(|(id, title, preview, step_count, updated, workspaces)| {
-            let workspace = workspaces
-                .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
-                .and_then(|mut paths| (!paths.is_empty()).then(|| paths.remove(0)));
+            let workspace = ag_index_workspace(workspaces);
             (
                 id,
                 AgIndexEntry {
@@ -2507,6 +3303,20 @@ fn read_ag_summary_index(gemini: &Path) -> HashMap<String, AgIndexEntry> {
             )
         })
         .collect()
+}
+
+/// 색인의 `workspace_uris`를 세션 cwd로 쓸지 정한다.
+///
+/// Antigravity는 이 열에 실행 디렉터리가 아니라 그 대화가 접근을 허가받은 신뢰 폴더
+/// **목록**을 넣는다. 항목이 여럿이면 맨 앞은 목록의 첫 줄일 뿐 작업 경로가 아니다 —
+/// 2026-09-19 기준 CLI로 띄운 대화 43건이 실제로는 agent-manager-tauri·Documents/test에서
+/// 돌았는데도 전부 목록 첫 항목인 스마트팜 경로를 달고 있었고, 그 경로를 믿은 세션 폴더
+/// 자동 분류가 회차 세션 27건을 엉뚱한 프로젝트로 보냈다. 그래서 여럿일 때는 비워 두고,
+/// 채팅 런타임이 남긴 실제 실행 경로를 `apply_session_working_directory`가 채우게 한다.
+/// 항목이 하나뿐인 대화(IDE에서 연 대화)는 그 경로가 곧 작업 경로이므로 그대로 쓴다.
+fn ag_index_workspace(workspaces: Option<String>) -> Option<String> {
+    let mut paths = serde_json::from_str::<Vec<String>>(&workspaces?).ok()?;
+    (paths.len() == 1).then(|| paths.remove(0))
 }
 
 /// Antigravity 대화 DB의 사용자 스텝 배치. `(스텝 종류, 메시지 필드, 생성 제목 필드, 사용자 입력 필드)`
@@ -2793,6 +3603,60 @@ struct ScanGuard<T> {
     state: Mutex<ScanGuardState<T>>,
 }
 
+/// 감시 상태를 읽고 쓰는 네 갈래를 여기에 모은다. 잠금이 깨졌을 때 무엇을 돌려줄지가
+/// 갈래마다 흩어져 있으면 한 곳만 고쳐도 나머지가 다르게 굴러간다.
+impl<T> ScanGuard<T>
+where
+    T: Default + Clone,
+{
+    /// 쿨다운 중이면 그동안 돌려줄 값을 낸다. 지나간 쿨다운은 여기서 지운다.
+    /// 잠금이 깨졌으면 스캔을 띄우지 않고 기본값으로 끝낸다.
+    fn cooldown_result(&self) -> Option<T> {
+        let Ok(mut state) = self.state.lock() else {
+            return Some(T::default());
+        };
+        match state.retry_at {
+            Some(retry_at) if Instant::now() < retry_at => {
+                Some(state.last_good.clone().unwrap_or_default())
+            }
+            Some(_) => {
+                state.retry_at = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// 마지막으로 성공한 결과. 성공한 적이 없거나 잠금이 깨졌으면 기본값.
+    fn last_good(&self) -> T {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.last_good.clone())
+            .unwrap_or_default()
+    }
+
+    /// 스캔이 성공했다. 다음 회차가 되돌릴 수 있게 남기고 걸려 있던 쿨다운을 푼다.
+    fn note_success(&self, scanned: &T) {
+        if let Ok(mut state) = self.state.lock() {
+            state.last_good = Some(scanned.clone());
+            state.retry_at = None;
+        }
+    }
+
+    /// 스캔이 멈췄다. 쿨다운을 걸고 그동안 돌려줄 값을 낸다.
+    fn start_cooldown(&self, cooldown: Duration) -> T {
+        self.state
+            .lock()
+            .ok()
+            .map(|mut state| {
+                state.retry_at = Some(Instant::now() + cooldown);
+                state.last_good.clone().unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+}
+
 type SkillScanGuard = ScanGuard<Vec<SkillSummary>>;
 
 fn skill_scan_guard() -> &'static SkillScanGuard {
@@ -2895,17 +3759,8 @@ fn guarded_scan<T>(
 where
     T: Default + Clone + Send + 'static,
 {
-    {
-        let Ok(mut state) = guard.state.lock() else {
-            return T::default();
-        };
-        match state.retry_at {
-            Some(retry_at) if Instant::now() < retry_at => {
-                return state.last_good.clone().unwrap_or_default();
-            }
-            Some(_) => state.retry_at = None,
-            None => {}
-        }
+    if let Some(result) = guard.cooldown_result() {
+        return result;
     }
     let (sender, receiver) = mpsc::channel();
     if thread::Builder::new()
@@ -2915,19 +3770,11 @@ where
         })
         .is_err()
     {
-        return guard
-            .state
-            .lock()
-            .ok()
-            .and_then(|state| state.last_good.clone())
-            .unwrap_or_default();
+        return guard.last_good();
     }
     match receiver.recv_timeout(timeout) {
         Ok(scanned) => {
-            if let Ok(mut state) = guard.state.lock() {
-                state.last_good = Some(scanned.clone());
-                state.retry_at = None;
-            }
+            guard.note_success(&scanned);
             catalog_health::note_scan_ok(kind);
             scanned
         }
@@ -2941,23 +3788,10 @@ where
                     timeout.as_secs().max(1)
                 ),
             );
-            guard
-                .state
-                .lock()
-                .ok()
-                .map(|mut state| {
-                    state.retry_at = Some(Instant::now() + cooldown);
-                    state.last_good.clone().unwrap_or_default()
-                })
-                .unwrap_or_default()
+            guard.start_cooldown(cooldown)
         }
         // 스캔 스레드가 패닉으로 끝난 경우다. 쿨다운을 걸지 않고 다음 회차에 다시 시도한다.
-        Err(RecvTimeoutError::Disconnected) => guard
-            .state
-            .lock()
-            .ok()
-            .and_then(|state| state.last_good.clone())
-            .unwrap_or_default(),
+        Err(RecvTimeoutError::Disconnected) => guard.last_good(),
     }
 }
 
@@ -3343,6 +4177,117 @@ fn artifact_from_file(
     })
 }
 
+const DASHBOARD_WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// 주간 그래프가 보여 주는 구간 수. 현재 주를 포함한다.
+const DASHBOARD_WEEKS: i64 = 12;
+
+/// 제공자별로 칸이 나뉜 합계에서 이 세션이 쌓일 칸 하나를 고른다.
+fn source_total_slot(totals: &mut SourceTotals, source: ProviderId) -> &mut u64 {
+    match source {
+        ProviderId::Claude => &mut totals.claude,
+        ProviderId::Codex => &mut totals.codex,
+        ProviderId::Antigravity => &mut totals.antigravity,
+        ProviderId::Local => &mut totals.local,
+    }
+}
+
+/// 주간 막대 하나에서 이 세션이 쌓일 칸을 고른다.
+fn weekly_count_slot(week: &mut WeeklyCount, source: ProviderId) -> &mut usize {
+    match source {
+        ProviderId::Claude => &mut week.claude,
+        ProviderId::Codex => &mut week.codex,
+        ProviderId::Antigravity => &mut week.antigravity,
+        ProviderId::Local => &mut week.local,
+    }
+}
+
+/// 제공자별 칸을 다 채운 합계에 총합을 적어 마무리한다.
+fn sealed_totals(mut totals: SourceTotals) -> SourceTotals {
+    totals.total = totals.claude + totals.codex + totals.antigravity + totals.local;
+    totals
+}
+
+/// 대시보드 집계 한 번 분량의 누적기.
+///
+/// 세션 한 줄이 여섯 곳(제공자별 세션 수·토큰·디스크·모델·프로젝트·주간)에 동시에
+/// 쌓이므로 순회는 한 번으로 유지하고, 쌓는 규칙만 여기 모은다.
+#[derive(Default)]
+struct DashboardAccumulator {
+    sessions_by_source: SourceCounts,
+    tokens: SourceTotals,
+    disk: SourceTotals,
+    models: BTreeMap<String, usize>,
+    projects: HashMap<String, (String, usize)>,
+    weekly: Vec<WeeklyCount>,
+}
+
+impl DashboardAccumulator {
+    fn new(now: i64) -> Self {
+        let current_week = now - now.rem_euclid(DASHBOARD_WEEK_MS);
+        Self {
+            weekly: (0..DASHBOARD_WEEKS)
+                .rev()
+                .map(|offset| WeeklyCount {
+                    week_start: current_week - offset * DASHBOARD_WEEK_MS,
+                    claude: 0,
+                    codex: 0,
+                    antigravity: 0,
+                    local: 0,
+                })
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    fn absorb(&mut self, session: &SessionSummary) {
+        self.sessions_by_source.increment(session.source);
+        if let Some(value) = session.token_total {
+            *source_total_slot(&mut self.tokens, session.source) += value;
+        }
+        if let Some(value) = session.size_bytes {
+            *source_total_slot(&mut self.disk, session.source) += value;
+        }
+        if let Some(model) = &session.model {
+            *self.models.entry(model.clone()).or_default() += 1;
+        }
+        if let Some(path) = &session.cwd {
+            let name = session.project.clone().unwrap_or_else(|| path.clone());
+            self.projects.entry(path.clone()).or_insert((name, 0)).1 += 1;
+        }
+        if let Some(updated_at) = session.updated_at {
+            let bucket = updated_at - updated_at.rem_euclid(DASHBOARD_WEEK_MS);
+            if let Some(week) = self
+                .weekly
+                .iter_mut()
+                .find(|week| week.week_start == bucket)
+            {
+                *weekly_count_slot(week, session.source) += 1;
+            }
+        }
+    }
+}
+
+/// 많이 쓰인 순으로 모델 목록을 낸다.
+fn ranked_models(models: BTreeMap<String, usize>) -> Vec<ModelCount> {
+    let mut counts = models
+        .into_iter()
+        .map(|(model, count)| ModelCount { model, count })
+        .collect::<Vec<_>>();
+    counts.sort_by_key(|model| Reverse(model.count));
+    counts
+}
+
+/// 세션이 많은 순으로 상위 프로젝트만 남긴다.
+fn ranked_projects(projects: HashMap<String, (String, usize)>) -> Vec<ProjectCount> {
+    let mut counts = projects
+        .into_iter()
+        .map(|(path, (name, count))| ProjectCount { name, path, count })
+        .collect::<Vec<_>>();
+    counts.sort_by_key(|project| Reverse(project.count));
+    counts.truncate(10);
+    counts
+}
+
 fn build_dashboard(
     sessions: &[SessionSummary],
     skill_count: usize,
@@ -3352,83 +4297,21 @@ fn build_dashboard(
         .iter()
         .filter(|session| !session.meta.hidden)
         .collect();
-    let mut sessions_by_source = SourceCounts::default();
-    let mut tokens = SourceTotals::default();
-    let mut disk = SourceTotals::default();
-    let mut models: BTreeMap<String, usize> = BTreeMap::new();
-    let mut projects: HashMap<String, (String, usize)> = HashMap::new();
-    let week_ms = 7 * 24 * 60 * 60 * 1000_i64;
-    let now = clock::now_ms();
-    let current_week = now - now.rem_euclid(week_ms);
-    let mut weekly = (0..12)
-        .rev()
-        .map(|offset| WeeklyCount {
-            week_start: current_week - offset * week_ms,
-            claude: 0,
-            codex: 0,
-            antigravity: 0,
-        })
-        .collect::<Vec<_>>();
-
+    let mut accumulator = DashboardAccumulator::new(clock::now_ms());
     for session in &visible {
-        sessions_by_source.increment(session.source);
-        if let Some(value) = session.token_total {
-            match session.source {
-                ProviderId::Claude => tokens.claude += value,
-                ProviderId::Codex => tokens.codex += value,
-                ProviderId::Antigravity => tokens.antigravity += value,
-            }
-        }
-        if let Some(value) = session.size_bytes {
-            match session.source {
-                ProviderId::Claude => disk.claude += value,
-                ProviderId::Codex => disk.codex += value,
-                ProviderId::Antigravity => disk.antigravity += value,
-            }
-        }
-        if let Some(model) = &session.model {
-            *models.entry(model.clone()).or_default() += 1;
-        }
-        if let Some(path) = &session.cwd {
-            let name = session.project.clone().unwrap_or_else(|| path.clone());
-            let entry = projects.entry(path.clone()).or_insert((name, 0));
-            entry.1 += 1;
-        }
-        if let Some(updated_at) = session.updated_at {
-            let bucket = updated_at - updated_at.rem_euclid(week_ms);
-            if let Some(item) = weekly.iter_mut().find(|item| item.week_start == bucket) {
-                match session.source {
-                    ProviderId::Claude => item.claude += 1,
-                    ProviderId::Codex => item.codex += 1,
-                    ProviderId::Antigravity => item.antigravity += 1,
-                }
-            }
-        }
+        accumulator.absorb(session);
     }
-    tokens.total = tokens.claude + tokens.codex + tokens.antigravity;
-    disk.total = disk.claude + disk.codex + disk.antigravity;
-    let mut model_counts = models
-        .into_iter()
-        .map(|(model, count)| ModelCount { model, count })
-        .collect::<Vec<_>>();
-    model_counts.sort_by_key(|model| Reverse(model.count));
-    let mut top_projects = projects
-        .into_iter()
-        .map(|(path, (name, count))| ProjectCount { name, path, count })
-        .collect::<Vec<_>>();
-    top_projects.sort_by_key(|project| Reverse(project.count));
-    top_projects.truncate(10);
 
     DashboardStats {
         session_count: visible.len(),
-        sessions_by_source,
-        tokens,
-        disk,
+        sessions_by_source: accumulator.sessions_by_source,
+        tokens: sealed_totals(accumulator.tokens),
+        disk: sealed_totals(accumulator.disk),
         skill_count,
         agent_count,
-        models: model_counts,
-        top_projects,
-        weekly,
+        models: ranked_models(accumulator.models),
+        top_projects: ranked_projects(accumulator.projects),
+        weekly: accumulator.weekly,
         // AIA 작업공간 대화는 사용자가 직접 만든 세션이 아니라 앱이 자기 자신을 조작한 기록이라
         // 최근 세션 목록에서는 뺀다. 집계(세션 수·토큰·프로젝트)에는 그대로 포함한다.
         recent: visible
@@ -3577,16 +4460,16 @@ fn read_previous_line(
     }
 }
 
-fn parse_claude_transcript(
+/// JSONL 전사 파일을 앞에서부터 훑어 항목을 모은다. 공급자마다 다른 것은 레코드 한 줄을
+/// 항목으로 바꾸는 방법뿐이라 그 갈래만 호출자가 넘긴다. 인덱스는 수집 순서, 오프셋은 줄의
+/// 시작 바이트다.
+fn parse_jsonl_transcript(
     path: &Path,
-    limit: Option<usize>,
     before_index: Option<usize>,
+    mut to_item: impl FnMut(&Value, usize, usize) -> Option<TranscriptItem>,
 ) -> Result<ParsedTranscript, CoreError> {
-    if let Some(limit) = limit {
-        return parse_claude_transcript_tail(path, limit, before_index);
-    }
     let mut reader = BufReader::new(File::open(path)?);
-    let mut collector = TranscriptCollector::new(limit, before_index);
+    let mut collector = TranscriptCollector::new(None, before_index);
     let mut skipped = 0;
     let mut lines = TranscriptLineReader::default();
     while let Some((offset, line)) = lines.next_line(&mut reader)? {
@@ -3597,7 +4480,7 @@ fn parse_claude_transcript(
             skipped += 1;
             continue;
         };
-        if let Some(item) = claude_transcript_item(&record, collector.next_index(), offset) {
+        if let Some(item) = to_item(&record, collector.next_index(), offset) {
             collector.push(item);
         }
     }
@@ -3611,10 +4494,13 @@ fn parse_claude_transcript(
     })
 }
 
-fn parse_claude_transcript_tail(
+/// 같은 파일을 뒤에서부터 `limit`개만 읽는다. 이 경로의 인덱스는 줄의 바이트 오프셋이라
+/// 다음 페이지가 같은 파일을 처음부터 다시 훑지 않고 그 자리부터 이어 읽는다.
+fn parse_jsonl_transcript_tail(
     path: &Path,
     limit: usize,
     before_index: Option<usize>,
+    mut to_item: impl FnMut(&Value, usize, usize) -> Option<TranscriptItem>,
 ) -> Result<ParsedTranscript, CoreError> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
@@ -3631,7 +4517,7 @@ fn parse_claude_transcript_tail(
             skipped += 1;
             continue;
         };
-        let Some(item) = claude_transcript_item(&record, offset, offset) else {
+        let Some(item) = to_item(&record, offset, offset) else {
             continue;
         };
         if items.len() >= limit {
@@ -3650,6 +4536,29 @@ fn parse_claude_transcript_tail(
     })
 }
 
+fn parse_claude_transcript(
+    path: &Path,
+    limit: Option<usize>,
+    before_index: Option<usize>,
+) -> Result<ParsedTranscript, CoreError> {
+    match limit {
+        Some(limit) => {
+            parse_jsonl_transcript_tail(path, limit, before_index, claude_transcript_item)
+        }
+        None => parse_jsonl_transcript(path, before_index, claude_transcript_item),
+    }
+}
+
+/// 레코드 종류별 갈래가 채우는 전사 항목 초안. 역할이 정해지고 블록이 남아야 항목이 된다.
+#[derive(Default)]
+struct ClaudeItemDraft {
+    role: Option<&'static str>,
+    type_label: Option<String>,
+    model: Option<String>,
+    usage: Option<TokenUsage>,
+    blocks: Vec<ContentBlock>,
+}
+
 fn claude_transcript_item(
     record: &Value,
     index: usize,
@@ -3659,115 +4568,142 @@ fn claude_transcript_item(
         .get("timestamp")
         .and_then(Value::as_str)
         .and_then(parse_time);
-    let mut blocks = Vec::new();
-    let mut role = None;
-    let mut model = None;
-    let mut usage = None;
-    let mut type_label = None;
     let interrupt = record_interrupt_label(record);
-    match record.get("type").and_then(Value::as_str) {
-        Some("user") => {
-            // 슬래시 명령 출력은 isMeta 표시가 없어도 CLI 주입이다. 사용자 말풍선으로
-            // 두면 명령 출력이 요청처럼 보인다.
-            let meta_label = claude_meta_user_label(record).or_else(|| {
-                user_record_is_local_command_output(record).then(|| "로컬 명령 출력".to_owned())
-            });
-            // 중단 자리표시자는 턴 구분선으로, CLI가 주입한 메타 레코드는 작업 로그
-            // 컨텍스트로 보여준다. 둘 다 실제 사용자 요청 말풍선이 아니다.
-            role = Some(
-                if meta_label.is_some() {
-                    "meta"
-                } else {
-                    interrupt.map_or("user", |_| INTERRUPTED_ROLE)
-                }
-                .to_owned(),
-            );
-            type_label = meta_label
-                .clone()
-                .or_else(|| interrupt.map(ToOwned::to_owned));
-            blocks = claude_content_blocks(record.pointer("/message/content"), true, line_offset);
-            if let Some(label) = meta_label {
-                for block in &mut blocks {
-                    if let ContentBlock::Text { text } = block {
-                        let text = std::mem::take(text);
-                        *block = ContentBlock::Context {
-                            label: label.clone(),
-                            text,
-                        };
-                    }
-                }
-            }
-        }
-        Some("assistant") => {
-            role = Some("assistant".to_owned());
-            blocks = claude_content_blocks(record.pointer("/message/content"), false, line_offset);
-            model = record
-                .pointer("/message/model")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            // 일부 CLI 판은 중단 자리표시자를 model "<synthetic>" 응답으로 남긴다.
-            if let Some(label) =
-                interrupt.filter(|_| !model.as_deref().is_some_and(identifier_value_is_valid))
-            {
-                role = Some(INTERRUPTED_ROLE.to_owned());
-                type_label = Some(label.to_owned());
-                model = None;
-            }
-            // CLI가 답 자리에 남긴 실패 안내(레이트리밋 등)는 model이 "<synthetic>"인 합성
-            // 응답이다. 일반 말풍선으로 두면 진짜 답과 구분되지 않아 실패 표식으로 바꾼다.
-            if record.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
-                let text = blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !text.trim().is_empty() {
-                    role = Some(RUNTIME_FAILURE_ROLE.to_owned());
-                    model = None;
-                    blocks = vec![ContentBlock::RuntimeFailure {
-                        status: "failed".to_owned(),
-                        code: record
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .unwrap_or("apiError")
-                            .to_owned(),
-                        text,
-                    }];
-                }
-            }
-            let value = TokenUsage {
-                input: json_u64_pointer(record, "/message/usage/input_tokens"),
-                output: json_u64_pointer(record, "/message/usage/output_tokens"),
-                cache_read: json_u64_pointer(record, "/message/usage/cache_read_input_tokens"),
-                cache_write: json_u64_pointer(record, "/message/usage/cache_creation_input_tokens"),
-            };
-            let failed = role.as_deref() == Some(RUNTIME_FAILURE_ROLE);
-            usage = (!failed && value.total() > 0).then_some(value);
-        }
+    let draft = match record.get("type").and_then(Value::as_str) {
+        Some("user") => claude_user_draft(record, interrupt, line_offset),
+        Some("assistant") => claude_assistant_draft(record, interrupt, line_offset),
         Some("system") if record.get("isMeta").and_then(Value::as_bool) != Some(true) => {
-            if let Some((label, text)) = claude_system_context(record) {
-                role = Some("system".to_owned());
-                blocks.push(ContentBlock::Context {
-                    label,
-                    text: cap_text(text, MAX_BLOCK_TEXT),
-                });
+            claude_system_draft(record)
+        }
+        _ => ClaudeItemDraft::default(),
+    };
+    let role = draft.role.filter(|_| !draft.blocks.is_empty())?;
+    Some(TranscriptItem {
+        index,
+        role: role.to_owned(),
+        timestamp,
+        model: draft.model,
+        type_label: draft.type_label,
+        blocks: draft.blocks,
+        usage: draft.usage,
+    })
+}
+
+fn claude_user_draft(
+    record: &Value,
+    interrupt: Option<&'static str>,
+    line_offset: usize,
+) -> ClaudeItemDraft {
+    // 슬래시 명령 출력은 isMeta 표시가 없어도 CLI 주입이다. 사용자 말풍선으로
+    // 두면 명령 출력이 요청처럼 보인다.
+    let meta_label = claude_meta_user_label(record).or_else(|| {
+        user_record_is_local_command_output(record).then(|| "로컬 명령 출력".to_owned())
+    });
+    // 중단 자리표시자는 턴 구분선으로, CLI가 주입한 메타 레코드는 작업 로그
+    // 컨텍스트로 보여준다. 둘 다 실제 사용자 요청 말풍선이 아니다.
+    let role = if meta_label.is_some() {
+        "meta"
+    } else {
+        interrupt.map_or("user", |_| INTERRUPTED_ROLE)
+    };
+    let mut blocks = claude_content_blocks(record.pointer("/message/content"), true, line_offset);
+    if let Some(label) = &meta_label {
+        for block in &mut blocks {
+            if let ContentBlock::Text { text } = block {
+                let text = std::mem::take(text);
+                *block = ContentBlock::Context {
+                    label: label.clone(),
+                    text,
+                };
             }
         }
-        _ => {}
     }
-    role.filter(|_| !blocks.is_empty())
-        .map(|role| TranscriptItem {
-            index,
-            role,
-            timestamp,
-            model,
-            type_label,
-            blocks,
-            usage,
+    ClaudeItemDraft {
+        role: Some(role),
+        type_label: meta_label.or_else(|| interrupt.map(ToOwned::to_owned)),
+        blocks,
+        ..ClaudeItemDraft::default()
+    }
+}
+
+fn claude_assistant_draft(
+    record: &Value,
+    interrupt: Option<&'static str>,
+    line_offset: usize,
+) -> ClaudeItemDraft {
+    let mut draft = ClaudeItemDraft {
+        role: Some("assistant"),
+        model: record
+            .pointer("/message/model")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        blocks: claude_content_blocks(record.pointer("/message/content"), false, line_offset),
+        ..ClaudeItemDraft::default()
+    };
+    // 일부 CLI 판은 중단 자리표시자를 model "<synthetic>" 응답으로 남긴다.
+    if let Some(label) = interrupt.filter(|_| {
+        !draft
+            .model
+            .as_deref()
+            .is_some_and(identifier_value_is_valid)
+    }) {
+        draft.role = Some(INTERRUPTED_ROLE);
+        draft.type_label = Some(label.to_owned());
+        draft.model = None;
+    }
+    if let Some(failure) = claude_api_failure_block(record, &draft.blocks) {
+        draft.role = Some(RUNTIME_FAILURE_ROLE);
+        draft.model = None;
+        draft.blocks = vec![failure];
+    }
+    let usage = TokenUsage {
+        input: json_u64_pointer(record, "/message/usage/input_tokens"),
+        output: json_u64_pointer(record, "/message/usage/output_tokens"),
+        cache_read: json_u64_pointer(record, "/message/usage/cache_read_input_tokens"),
+        cache_write: json_u64_pointer(record, "/message/usage/cache_creation_input_tokens"),
+    };
+    draft.usage = (draft.role != Some(RUNTIME_FAILURE_ROLE) && usage.total() > 0).then_some(usage);
+    draft
+}
+
+/// CLI가 답 자리에 남긴 실패 안내(레이트리밋 등)는 model이 "<synthetic>"인 합성 응답이다.
+/// 일반 말풍선으로 두면 진짜 답과 구분되지 않아 실패 표식으로 바꾼다. 문장이 없으면
+/// 바꿀 것이 없으므로 그대로 둔다.
+fn claude_api_failure_block(record: &Value, blocks: &[ContentBlock]) -> Option<ContentBlock> {
+    if record.get("isApiErrorMessage").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let text = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
         })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then(|| ContentBlock::RuntimeFailure {
+        status: "failed".to_owned(),
+        code: record
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("apiError")
+            .to_owned(),
+        text,
+    })
+}
+
+fn claude_system_draft(record: &Value) -> ClaudeItemDraft {
+    let Some((label, text)) = claude_system_context(record) else {
+        return ClaudeItemDraft::default();
+    };
+    ClaudeItemDraft {
+        role: Some("system"),
+        blocks: vec![ContentBlock::Context {
+            label,
+            text: cap_text(text, MAX_BLOCK_TEXT),
+        }],
+        ..ClaudeItemDraft::default()
+    }
 }
 
 /// system 레코드는 종류마다 내용을 담는 자리가 다르다. `content`만 읽던 때에는
@@ -3969,90 +4905,21 @@ fn parse_codex_transcript(
     limit: Option<usize>,
     before_index: Option<usize>,
 ) -> Result<ParsedTranscript, CoreError> {
-    if let Some(limit) = limit {
-        return parse_codex_transcript_tail(path, limit, before_index);
-    }
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut collector = TranscriptCollector::new(limit, before_index);
-    let mut skipped = 0;
+    // session_meta는 파일당 한 번만 항목이 된다. 훑는 방향이 달라도 "먼저 만난 것만
+    // 남긴다"는 규칙은 같으므로 그 상태를 갈래 안에 둔다.
     let mut session_meta_seen = false;
-    let mut lines = TranscriptLineReader::default();
-    while let Some((offset, line)) = lines.next_line(&mut reader)? {
-        if collector.done() {
-            break;
-        }
-        let Ok(record) = serde_json::from_slice::<Value>(line) else {
-            skipped += 1;
-            continue;
-        };
+    let to_item = move |record: &Value, index: usize, offset: usize| {
         let record_type = record.get("type").and_then(Value::as_str);
         let include_session_meta = record_type == Some("session_meta") && !session_meta_seen;
         if record_type == Some("session_meta") {
             session_meta_seen = true;
         }
-        if let Some(value) = codex_transcript_item(
-            &record,
-            collector.next_index(),
-            include_session_meta,
-            offset,
-        ) {
-            collector.push(value);
-        }
+        codex_transcript_item(record, index, include_session_meta, offset)
+    };
+    match limit {
+        Some(limit) => parse_jsonl_transcript_tail(path, limit, before_index, to_item),
+        None => parse_jsonl_transcript(path, before_index, to_item),
     }
-    let (items, truncated, total_items) = collector.finish();
-    Ok(ParsedTranscript {
-        items,
-        truncated,
-        total_items,
-        skipped_lines: skipped,
-        unavailable_reason: None,
-    })
-}
-
-fn parse_codex_transcript_tail(
-    path: &Path,
-    limit: usize,
-    before_index: Option<usize>,
-) -> Result<ParsedTranscript, CoreError> {
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
-    let mut cursor = before_index
-        .and_then(|index| u64::try_from(index).ok())
-        .unwrap_or(file_len)
-        .min(file_len);
-    let mut items = VecDeque::new();
-    let mut skipped = 0;
-    let mut truncated = false;
-    let mut session_meta_seen = false;
-
-    while let Some((offset, line)) = read_previous_line(&mut file, &mut cursor)? {
-        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
-            skipped += 1;
-            continue;
-        };
-        let record_type = record.get("type").and_then(Value::as_str);
-        let include_session_meta = record_type == Some("session_meta") && !session_meta_seen;
-        if record_type == Some("session_meta") {
-            session_meta_seen = true;
-        }
-        let Some(item) = codex_transcript_item(&record, offset, include_session_meta, offset)
-        else {
-            continue;
-        };
-        if items.len() >= limit {
-            truncated = true;
-            break;
-        }
-        items.push_front(item);
-    }
-
-    Ok(ParsedTranscript {
-        items: items.into(),
-        truncated,
-        total_items: usize::try_from(file_len).unwrap_or(usize::MAX),
-        skipped_lines: skipped,
-        unavailable_reason: None,
-    })
 }
 
 fn codex_transcript_item(
@@ -4067,82 +4934,18 @@ fn codex_transcript_item(
         .and_then(parse_time);
     let record_type = record.get("type").and_then(Value::as_str);
     let payload = record.get("payload").unwrap_or(&Value::Null);
-    let payload_type = payload.get("type").and_then(Value::as_str);
-    if record_type == Some("session_meta") && include_session_meta {
-        return Some(transcript_item(
-            index,
-            "meta",
-            timestamp,
-            Some("세션 정보"),
-            codex_session_info(payload),
-        ));
-    }
-    if record_type == Some("compacted") {
-        return Some(transcript_item(
-            index,
-            "meta",
-            timestamp,
-            Some("컨텍스트 압축"),
-            ContentBlock::Context {
-                label: "컨텍스트 압축".to_owned(),
-                text: "이전 대화가 압축되었습니다.".to_owned(),
-            },
-        ));
-    }
     if record_type != Some("response_item") {
-        return None;
+        return codex_session_record_item(
+            record_type,
+            payload,
+            index,
+            timestamp,
+            include_session_meta,
+        );
     }
+    let payload_type = payload.get("type").and_then(Value::as_str);
     match payload_type {
-        Some("message") => {
-            let source_role = payload
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("system");
-            let text = content_value_to_text(payload.get("content"));
-            let images =
-                transcript_image_blocks(payload.get("content"), line_offset, "/payload/content");
-            if text.trim().is_empty() && images.is_empty() {
-                return None;
-            }
-            let context_label = if source_role == "user" {
-                automatic_context_label(&text)
-            } else if source_role == "assistant" {
-                None
-            } else {
-                Some(role_context_label(source_role))
-            };
-            let role = if context_label.is_some() {
-                "meta"
-            } else {
-                source_role
-            };
-            let mut blocks = Vec::new();
-            if !text.trim().is_empty() {
-                if let Some(label) = context_label {
-                    blocks.push(ContentBlock::Context {
-                        label: label.to_owned(),
-                        text: cap_text(text, MAX_BLOCK_TEXT),
-                    });
-                } else if let Some(pasted) = (source_role == "user")
-                    .then(|| pasted_files_blocks(&text))
-                    .flatten()
-                {
-                    blocks.extend(pasted);
-                } else {
-                    blocks.push(ContentBlock::Text {
-                        text: cap_text(text, MAX_BLOCK_TEXT),
-                    });
-                }
-            }
-            blocks.extend(images);
-            Some(transcript_item_with_blocks(
-                index,
-                role,
-                timestamp,
-                context_label,
-                blocks,
-            ))
-        }
+        Some("message") => codex_message_item(payload, index, timestamp, line_offset),
         Some("reasoning") => {
             let text = content_value_to_text(payload.get("summary"));
             Some(transcript_item(
@@ -4182,25 +4985,120 @@ fn codex_transcript_item(
             },
         )),
         Some("function_call_output") | Some("custom_tool_call_output") => {
-            let mut blocks = vec![ContentBlock::ToolResult {
-                text: cap_text(content_value_to_text(payload.get("output")), MAX_BLOCK_TEXT),
-                is_error: false,
-            }];
-            blocks.extend(transcript_image_blocks(
-                payload.get("output"),
-                line_offset,
-                "/payload/output",
-            ));
-            Some(transcript_item_with_blocks(
-                index,
-                "meta",
-                timestamp,
-                Some("도구 결과"),
-                blocks,
-            ))
+            codex_tool_output_item(payload, index, timestamp, line_offset)
         }
         _ => None,
     }
+}
+
+/// 대화 항목이 아닌 세션 레코드(머리말·압축 표식)를 메타 항목으로. 그 밖은 항목이 아니다.
+fn codex_session_record_item(
+    record_type: Option<&str>,
+    payload: &Value,
+    index: usize,
+    timestamp: Option<i64>,
+    include_session_meta: bool,
+) -> Option<TranscriptItem> {
+    match record_type {
+        Some("session_meta") if include_session_meta => Some(transcript_item(
+            index,
+            "meta",
+            timestamp,
+            Some("세션 정보"),
+            codex_session_info(payload),
+        )),
+        Some("compacted") => Some(transcript_item(
+            index,
+            "meta",
+            timestamp,
+            Some("컨텍스트 압축"),
+            ContentBlock::Context {
+                label: "컨텍스트 압축".to_owned(),
+                text: "이전 대화가 압축되었습니다.".to_owned(),
+            },
+        )),
+        _ => None,
+    }
+}
+
+/// message 페이로드를 말풍선 또는 컨텍스트 항목으로. 자동 주입된 사용자 메시지와
+/// 사용자·어시스턴트가 아닌 역할은 말풍선이 아니라 라벨 붙은 컨텍스트로 남는다.
+fn codex_message_item(
+    payload: &Value,
+    index: usize,
+    timestamp: Option<i64>,
+    line_offset: usize,
+) -> Option<TranscriptItem> {
+    let source_role = payload
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("system");
+    let text = content_value_to_text(payload.get("content"));
+    let images = transcript_image_blocks(payload.get("content"), line_offset, "/payload/content");
+    if text.trim().is_empty() && images.is_empty() {
+        return None;
+    }
+    let context_label = match source_role {
+        "user" => automatic_context_label(&text),
+        "assistant" => None,
+        other => Some(role_context_label(other)),
+    };
+    let role = if context_label.is_some() {
+        "meta"
+    } else {
+        source_role
+    };
+    let mut blocks = Vec::new();
+    if !text.trim().is_empty() {
+        if let Some(label) = context_label {
+            blocks.push(ContentBlock::Context {
+                label: label.to_owned(),
+                text: cap_text(text, MAX_BLOCK_TEXT),
+            });
+        } else if let Some(pasted) = (source_role == "user")
+            .then(|| pasted_files_blocks(&text))
+            .flatten()
+        {
+            blocks.extend(pasted);
+        } else {
+            blocks.push(ContentBlock::Text {
+                text: cap_text(text, MAX_BLOCK_TEXT),
+            });
+        }
+    }
+    blocks.extend(images);
+    Some(transcript_item_with_blocks(
+        index,
+        role,
+        timestamp,
+        context_label,
+        blocks,
+    ))
+}
+
+/// 도구 결과 페이로드를 본문 + 딸린 이미지 블록으로.
+fn codex_tool_output_item(
+    payload: &Value,
+    index: usize,
+    timestamp: Option<i64>,
+    line_offset: usize,
+) -> Option<TranscriptItem> {
+    let mut blocks = vec![ContentBlock::ToolResult {
+        text: cap_text(content_value_to_text(payload.get("output")), MAX_BLOCK_TEXT),
+        is_error: false,
+    }];
+    blocks.extend(transcript_image_blocks(
+        payload.get("output"),
+        line_offset,
+        "/payload/output",
+    ));
+    Some(transcript_item_with_blocks(
+        index,
+        "meta",
+        timestamp,
+        Some("도구 결과"),
+        blocks,
+    ))
 }
 
 /// `<command-name>` 묶음 안에서 한 태그의 값을 꺼낸다.
@@ -4551,73 +5449,93 @@ pub(crate) fn split_frontmatter(text: &str) -> (&str, &str) {
     ("", text)
 }
 
-pub(crate) fn frontmatter_value(frontmatter: &str, key: &str) -> Option<String> {
+/// 앞 줄의 값이 이어지는 줄인지. 블록 스칼라 본문과 `-` 목록 항목이 같은 모양으로 이어진다.
+fn frontmatter_continues(line: &str) -> bool {
+    line.starts_with(' ') || line.starts_with('\t')
+}
+
+/// 프런트매터 값에서 YAML 인용부호를 벗긴다.
+fn frontmatter_unquoted(value: &str) -> &str {
+    value.trim().trim_matches(['\'', '"'])
+}
+
+/// `key:` 줄을 위에서부터 찾아 (줄 번호, 같은 줄에 적힌 값)을 낸다. 값이 비어 있는 줄도
+/// 그대로 내므로, 거기서 멈출지 같은 키를 더 볼지는 부르는 쪽이 정한다.
+fn frontmatter_entries<'a>(
+    lines: &'a [&'a str],
+    key: &str,
+) -> impl Iterator<Item = (usize, &'a str)> + 'a {
     let prefix = format!("{key}:");
-    let lines: Vec<&str> = frontmatter.lines().collect();
-    for (index, line) in lines.iter().enumerate() {
-        let Some(raw) = line.trim_start().strip_prefix(&prefix) else {
-            continue;
-        };
-        let raw = raw.trim();
-        // YAML 블록 스칼라(`>-`, `|` 등)는 마커 다음의 들여쓰기 줄들이 실제 값이다.
-        // 마커를 값으로 돌려주면 스킬 설명이 ">-" 두 글자로 저장되고 번역까지
-        // 그 쓰레기 값을 대상으로 하게 된다.
-        if matches!(raw, ">" | ">-" | ">+" | "|" | "|-" | "|+") {
-            let folded = raw.starts_with('>');
-            let mut collected: Vec<String> = Vec::new();
-            for follow in &lines[index + 1..] {
-                let trimmed = follow.trim();
-                if trimmed.is_empty() {
-                    if collected.is_empty() {
-                        break;
-                    }
-                    continue;
-                }
-                if !follow.starts_with(' ') && !follow.starts_with('\t') {
-                    break;
-                }
-                collected.push(trimmed.to_owned());
+    lines.iter().enumerate().filter_map(move |(index, line)| {
+        line.trim_start()
+            .strip_prefix(&prefix)
+            .map(|raw| (index, raw.trim()))
+    })
+}
+
+/// YAML 블록 스칼라(`>-`, `|` 등)의 본문. 마커 다음의 들여쓰기 줄들이 실제 값이라, 마커를
+/// 값으로 돌려주면 스킬 설명이 ">-" 두 글자로 저장되고 번역까지 그 쓰레기 값을 대상으로
+/// 하게 된다. 마커가 아니면 `None`이고, 본문이 비었을 때는 빈 문자열이다.
+fn frontmatter_block_scalar(marker: &str, rest: &[&str]) -> Option<String> {
+    if !matches!(marker, ">" | ">-" | ">+" | "|" | "|-" | "|+") {
+        return None;
+    }
+    let mut collected: Vec<&str> = Vec::new();
+    for follow in rest {
+        let trimmed = follow.trim();
+        if trimmed.is_empty() {
+            // 값이 시작되기 전의 빈 줄은 블록이 없는 것으로 보고, 시작한 뒤의 빈 줄은
+            // 문단 사이 여백으로 보고 건너뛴다.
+            if collected.is_empty() {
+                break;
             }
-            let joined = collected.join(if folded { " " } else { "\n" });
-            return if joined.is_empty() {
-                None
-            } else {
-                Some(joined)
-            };
+            continue;
         }
-        let value = raw.trim_matches(['\'', '"']).trim().to_owned();
+        if !frontmatter_continues(follow) {
+            break;
+        }
+        collected.push(trimmed);
+    }
+    Some(collected.join(if marker.starts_with('>') { " " } else { "\n" }))
+}
+
+pub(crate) fn frontmatter_value(frontmatter: &str, key: &str) -> Option<String> {
+    let lines: Vec<&str> = frontmatter.lines().collect();
+    for (index, raw) in frontmatter_entries(&lines, key) {
+        if let Some(block) = frontmatter_block_scalar(raw, &lines[index + 1..]) {
+            return (!block.is_empty()).then_some(block);
+        }
+        // 인용부호 안쪽 여백까지 버리는 것은 스칼라만의 규칙이다. 목록 항목은 따옴표 안을
+        // 적은 그대로 둔다.
+        let value = frontmatter_unquoted(raw).trim();
         if value.is_empty() {
             continue;
         }
-        return Some(value);
+        return Some(value.to_owned());
     }
     None
 }
 
 fn frontmatter_list(frontmatter: &str, key: &str) -> Vec<String> {
-    let prefix = format!("{key}:");
-    let lines = frontmatter.lines().collect::<Vec<_>>();
-    for (index, line) in lines.iter().enumerate() {
-        let Some(value) = line.trim_start().strip_prefix(&prefix).map(str::trim) else {
-            continue;
-        };
-        if !value.is_empty() {
-            return value
-                .trim_matches(['[', ']'])
-                .split(',')
-                .map(|item| item.trim().trim_matches(['\'', '"']).to_owned())
-                .filter(|item| !item.is_empty())
-                .collect();
-        }
-        return lines[index + 1..]
+    let lines: Vec<&str> = frontmatter.lines().collect();
+    let Some((index, inline)) = frontmatter_entries(&lines, key).next() else {
+        return Vec::new();
+    };
+    let items: Vec<&str> = if inline.is_empty() {
+        lines[index + 1..]
             .iter()
-            .take_while(|next| next.starts_with(' ') || next.starts_with('\t'))
+            .take_while(|next| frontmatter_continues(next))
             .filter_map(|next| next.trim().strip_prefix('-'))
-            .map(|item| item.trim().trim_matches(['\'', '"']).to_owned())
-            .filter(|item| !item.is_empty())
-            .collect();
-    }
-    Vec::new()
+            .collect()
+    } else {
+        inline.trim_matches(['[', ']']).split(',').collect()
+    };
+    items
+        .into_iter()
+        .map(frontmatter_unquoted)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 pub(crate) fn child_directories(parent: &Path) -> Vec<PathBuf> {
@@ -4858,8 +5776,27 @@ fn path_name(value: &str) -> Option<String> {
 
 fn file_uri_to_path(value: &str) -> Option<String> {
     let raw = value.strip_prefix("file://").unwrap_or(value);
-    let decoded = percent_decode(raw);
+    let decoded = strip_uri_drive_root(&percent_decode(raw));
     (!decoded.is_empty()).then_some(decoded)
+}
+
+/// `file:///C:/Users/me`의 경로부는 `/C:/Users/me`다. 이 앞의 슬래시는 URI 문법이지 경로가
+/// 아니라서 그대로 두면 Windows가 절대경로로 보지 않는다(`Path::is_absolute`는 드라이브
+/// 접두사를 요구한다). 그러면 정규화가 실패해 프로젝트 레지스트리에 원문이 그대로 남고,
+/// 그 원문을 받은 `store::set_project_active`가 "프로젝트 경로는 절대 경로여야 합니다"로
+/// 거절해 감지된 프로젝트를 제외할 수 없게 된다. 드라이브 문자가 뒤따르는 형태에서만
+/// 슬래시를 떼므로 POSIX 경로(`/home/me`)는 그대로 남는다.
+fn strip_uri_drive_root(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let drive_root = bytes.first() == Some(&b'/')
+        && bytes.get(1).is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(2) == Some(&b':')
+        && matches!(bytes.get(3), None | Some(b'/') | Some(b'\\'));
+    if drive_root {
+        value[1..].to_owned()
+    } else {
+        value.to_owned()
+    }
 }
 
 fn percent_decode(value: &str) -> String {
@@ -4941,6 +5878,82 @@ fn mine_printable_strings(bytes: &[u8]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 하네스가 세션에 적는 모델은 문자열이 아니라 JSON 한 덩이다. 실측 모양으로 고정한다.
+    #[test]
+    fn the_harness_model_json_yields_the_bare_name() {
+        assert_eq!(
+            opencode_model_name(
+                r#"{"id":"qwen3.5-gpu:latest","providerID":"agent-manager-local","variant":"default"}"#
+            )
+            .as_deref(),
+            Some("qwen3.5-gpu:latest"),
+        );
+    }
+
+    #[test]
+    fn a_qualified_model_keeps_only_the_tail() {
+        // 공급자는 이미 로컬로 가려져 있어 화면에 두 번 나올 이유가 없다.
+        assert_eq!(
+            opencode_model_name(r#"{"id":"agent-manager-local/qwen3.5-gpu"}"#).as_deref(),
+            Some("qwen3.5-gpu"),
+        );
+    }
+
+    #[test]
+    fn a_plain_string_model_is_used_as_written() {
+        // 하네스가 모양을 바꿔도 빈칸이 되지 않아야 한다.
+        assert_eq!(
+            opencode_model_name("qwen3.5-gpu:latest").as_deref(),
+            Some("qwen3.5-gpu:latest"),
+        );
+        assert!(opencode_model_name("   ").is_none());
+    }
+
+    /// 사용자가 직접 쓰는 OpenCode 대화까지 앱 목록으로 끌어오면 안 된다. 우리 에이전트로
+    /// 만든 세션만 가져온다.
+    #[test]
+    fn only_our_agent_sessions_are_listed() {
+        let home = tempfile::tempdir().expect("홈");
+        let path = opencode_session_db(home.path());
+        fs::create_dir_all(path.parent().expect("부모")).expect("디렉터리");
+        let connection = rusqlite::Connection::open(&path).expect("DB");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT, agent TEXT, title TEXT, directory TEXT, model TEXT,
+                    time_created INTEGER, time_updated INTEGER,
+                    tokens_input INTEGER, tokens_output INTEGER, time_archived INTEGER
+                );",
+            )
+            .expect("스키마");
+        connection
+            .execute_batch(
+                "INSERT INTO session VALUES
+                 ('ses_ours','agent-manager-local','우리 것','F:/work',
+                  '{\"id\":\"qwen3.5-gpu:latest\"}',1000,2000,10,5,NULL),
+                 ('ses_theirs','build','사용자 것','F:/work','{\"id\":\"x\"}',1000,2000,1,1,NULL);",
+            )
+            .expect("자료");
+        drop(connection);
+
+        let sessions = list_opencode_sessions(home.path());
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.id, "ses_ours");
+        assert_eq!(session.source, ProviderId::Local);
+        assert_eq!(session.source_title.as_deref(), Some("우리 것"));
+        assert_eq!(session.model.as_deref(), Some("qwen3.5-gpu:latest"));
+        // 입력과 출력을 더해 대화가 얼마나 길어졌는지 가늠한다.
+        assert_eq!(session.token_total, Some(15));
+    }
+
+    #[test]
+    fn a_missing_harness_database_yields_no_sessions() {
+        // 하네스를 쓰지 않는 설치도 있다. 없는 파일 때문에 훑기가 죽으면 안 된다.
+        let home = tempfile::tempdir().expect("홈");
+        assert!(list_opencode_sessions(home.path()).is_empty());
+    }
     use super::*;
     use crate::domain::SessionFailureKind;
     use serde_json::json;
@@ -4984,6 +5997,7 @@ mod tests {
             git_branch: None,
             is_subagent: false,
             aia_workspace: false,
+            default_workspace: false,
             archived: false,
             readable: true,
             size_bytes: None,
@@ -4991,6 +6005,39 @@ mod tests {
             meta: SessionMeta::default(),
             last_failure: None,
         }
+    }
+
+    /// 같은 디렉터리를 NFD로 적은 세션도 목록에서는 NFC 한 경로로 모여야 작업 경로
+    /// 선택 목록에 같은 이름이 두 번 뜨지 않는다.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn normalizes_decomposed_cwd_to_composed_form() {
+        let composed = "/Users/tester/Documents/스마트팜";
+        let decomposed: String = composed.nfd().collect();
+        assert_ne!(decomposed, composed);
+
+        let mut session = session_with_cwd("s1", PathBuf::from(&decomposed));
+        normalize_session_cwd(&mut session);
+
+        assert_eq!(session.cwd.as_deref(), Some(composed));
+        assert_eq!(session.project.as_deref(), Some("스마트팜"));
+    }
+
+    /// 경로에서 따오지 않은 이름(AIA 작업공간 등)은 정규화가 건드리지 않는다.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keeps_custom_project_name_while_normalizing_cwd() {
+        let decomposed: String = "/Users/tester/Documents/스마트팜".nfd().collect();
+        let mut session = session_with_cwd("s1", PathBuf::from(&decomposed));
+        session.project = Some("AIA 작업공간".to_owned());
+
+        normalize_session_cwd(&mut session);
+
+        assert_eq!(session.project.as_deref(), Some("AIA 작업공간"));
+        assert_eq!(
+            session.cwd.as_deref(),
+            Some("/Users/tester/Documents/스마트팜")
+        );
     }
 
     fn claude_session_file_in(home: &Path, project_name: &str, id: &str) -> PathBuf {
@@ -5072,6 +6119,50 @@ mod tests {
             Some("/provider/authoritative-project")
         );
         assert_eq!(session.project.as_deref(), Some("authoritative-project"));
+    }
+
+    #[test]
+    fn antigravity_index_workspace_is_a_cwd_only_when_the_conversation_has_one() {
+        assert_eq!(
+            ag_index_workspace(Some(r#"["file:///workspace/project"]"#.to_owned())).as_deref(),
+            Some("file:///workspace/project")
+        );
+        // 신뢰 폴더 목록은 작업 경로가 아니다. 첫 항목을 고르면 서로 다른 프로젝트에서 돈
+        // 대화가 모두 같은 경로를 달고 나온다.
+        assert_eq!(
+            ag_index_workspace(Some(
+                r#"["file:///trusted/first","file:///workspace/project"]"#.to_owned()
+            )),
+            None
+        );
+        assert_eq!(ag_index_workspace(Some("[]".to_owned())), None);
+        assert_eq!(ag_index_workspace(Some("not json".to_owned())), None);
+        assert_eq!(ag_index_workspace(None), None);
+    }
+
+    /// Windows 대화의 `workspace_uris`는 `file:///C:/...` 형태라, 앞 슬래시를 그대로 두면
+    /// 경로가 절대경로로 판정되지 않아 정규화가 실패하고, 그 원문이 프로젝트 레지스트리에
+    /// 남아 `store::set_project_active`의 절대경로 검사에 걸려 제외가 막힌다.
+    #[test]
+    fn antigravity_workspace_uri_drops_the_slash_before_a_windows_drive() {
+        assert_eq!(
+            file_uri_to_path("file:///C:/Users/me/project").as_deref(),
+            Some("C:/Users/me/project")
+        );
+        assert_eq!(file_uri_to_path("file:///C:/").as_deref(), Some("C:/"));
+        assert_eq!(file_uri_to_path("file:///C:").as_deref(), Some("C:"));
+        assert_eq!(
+            file_uri_to_path("file:///C:%5CUsers%5Cme").as_deref(),
+            Some("C:\\Users\\me")
+        );
+        // POSIX 경로와 드라이브 문자가 아닌 첫 조각은 그대로 둔다.
+        assert_eq!(
+            file_uri_to_path("file:///home/me/project").as_deref(),
+            Some("/home/me/project")
+        );
+        assert_eq!(file_uri_to_path("file:///CD:/x").as_deref(), Some("/CD:/x"));
+        #[cfg(windows)]
+        assert!(Path::new(file_uri_to_path("file:///C:/Users/me").unwrap().as_str()).is_absolute());
     }
 
     #[test]
@@ -5193,7 +6284,8 @@ mod tests {
         write_json_lines(&latest, &claude_turns(4, 10));
 
         let mut persisted = PersistedSessionCatalog::default();
-        reconcile_provider_cache(&home, &mut persisted, None, None).expect("initial scan");
+        reconcile_provider_cache(root.path(), &home, &mut persisted, None, None)
+            .expect("initial scan");
         assert_eq!(
             persisted.claude.len(),
             2,
@@ -5633,14 +6725,17 @@ mod tests {
         let home = root.path().join("home");
         let data = root.path().join("data");
         let aia_workspace = data.join("aia-workspace");
+        let default_workspace = data.join("default-workspace");
         let project = root.path().join("project");
         fs::create_dir_all(&home).expect("home directory");
         fs::create_dir_all(&aia_workspace).expect("AIA workspace");
+        fs::create_dir_all(&default_workspace).expect("default workspace");
         fs::create_dir_all(&project).expect("project directory");
 
         let persisted = PersistedSessionCatalog {
             codex_sessions: vec![
                 session_with_cwd("aia-session", aia_workspace),
+                session_with_cwd("default-session", default_workspace),
                 session_with_cwd("project-session", project),
             ],
             ..PersistedSessionCatalog::default()
@@ -5650,20 +6745,30 @@ mod tests {
         let resources = SnapshotResources::scan(&home, &data, &projects, 1).expect("resource scan");
         let snapshot = compose_manager_snapshot(&home, &data, &persisted, resources)
             .expect("manager snapshot");
-        assert_eq!(snapshot.sessions.len(), 2);
+        assert_eq!(snapshot.sessions.len(), 3);
         let aia = snapshot
             .sessions
             .iter()
             .find(|session| session.id == "aia-session")
             .expect("AIA 작업공간 세션도 목록에 남는다");
         assert!(aia.aia_workspace);
+        assert!(!aia.default_workspace);
         assert_eq!(aia.project.as_deref(), Some(AIA_WORKSPACE_PROJECT));
+        let default = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == "default-session")
+            .expect("작업 경로 없는 세션도 목록에 남는다");
+        assert!(default.default_workspace);
+        assert!(!default.aia_workspace);
+        assert_eq!(default.project.as_deref(), Some(DEFAULT_WORKSPACE_PROJECT));
         let project = snapshot
             .sessions
             .iter()
             .find(|session| session.id == "project-session")
             .expect("프로젝트 세션");
         assert!(!project.aia_workspace);
+        assert!(!project.default_workspace);
         assert_eq!(project.project.as_deref(), Some("project"));
     }
 
@@ -7275,6 +8380,7 @@ mod tests {
                 custom_title: Some(Some("custom title".to_owned())),
                 folder_ids: Some(vec![folder.id.clone()]),
                 pinned_account_id: None,
+                bookmarks: None,
             },
         )
         .expect("metadata update");
@@ -7286,6 +8392,121 @@ mod tests {
         assert_eq!(snapshot.sessions[0].title, "custom title");
         assert!(snapshot.sessions[0].meta.favorite);
         assert_eq!(snapshot.folders[0].session_count, 1);
+    }
+
+    /// 조정 한 회차에서 실제로 달라진 세션만 델타에 실린다. 바뀌지 않은 세션까지 실으면
+    /// 화면이 전체를 다시 받던 때와 같은 비용이 된다.
+    #[test]
+    fn snapshot_delta_carries_only_the_sessions_that_changed() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let data = root.path().join("data");
+        let steady = claude_session_file_in(&home, "delta-project", "session-1111111111111111");
+        let moving = claude_session_file_in(&home, "delta-project", "session-2222222222222222");
+        write_json_lines(&steady, &claude_turns(2, 0));
+        write_json_lines(&moving, &claude_turns(2, 10));
+        let catalog = SessionCatalog::open_with_home(data, home).expect("session catalog");
+        let base = catalog
+            .manager_snapshot()
+            .expect("base snapshot")
+            .session_catalog_revision;
+
+        write_json_lines(&moving, &claude_turns(4, 10));
+        let update = catalog.reconcile().expect("reconcile");
+        assert!(update.changed);
+
+        let ManagerSnapshotSync::Delta(delta) = catalog.snapshot_delta(base).expect("delta") else {
+            panic!("이력이 덮는 개정이면 델타를 줘야 한다");
+        };
+        assert_eq!(delta.session_catalog_revision, update.revision);
+        assert_eq!(
+            delta
+                .changed_sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session-2222222222222222"],
+        );
+        assert!(delta.removed_sessions.is_empty());
+    }
+
+    #[test]
+    fn snapshot_delta_is_empty_when_the_catalog_did_not_move() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let data = root.path().join("data");
+        write_json_lines(&claude_session_file(&home), &claude_turns(2, 0));
+        let catalog = SessionCatalog::open_with_home(data, home).expect("session catalog");
+        let current = catalog
+            .manager_snapshot()
+            .expect("snapshot")
+            .session_catalog_revision;
+
+        let ManagerSnapshotSync::Delta(delta) = catalog.snapshot_delta(current).expect("delta")
+        else {
+            panic!("같은 개정이면 빈 델타를 줘야 한다");
+        };
+        assert!(delta.changed_sessions.is_empty());
+        assert!(delta.removed_sessions.is_empty());
+        assert_eq!(delta.session_catalog_revision, current);
+    }
+
+    /// 기준으로 삼을 개정이 없으면(첫 기동) 또는 화면이 앞선 개정을 들고 있으면(백엔드가
+    /// 다시 떠서 번호가 되감겼다) 변경분을 만들 수 없다. 그때는 전체를 준다.
+    #[test]
+    fn snapshot_delta_falls_back_to_the_full_snapshot_without_a_usable_base() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let data = root.path().join("data");
+        write_json_lines(&claude_session_file(&home), &claude_turns(2, 0));
+        let catalog = SessionCatalog::open_with_home(data, home).expect("session catalog");
+        let current = catalog
+            .manager_snapshot()
+            .expect("snapshot")
+            .session_catalog_revision;
+
+        assert!(matches!(
+            catalog.snapshot_delta(0).expect("first load"),
+            ManagerSnapshotSync::Full(_)
+        ));
+        assert!(matches!(
+            catalog
+                .snapshot_delta(current + 5)
+                .expect("rewound backend"),
+            ManagerSnapshotSync::Full(_)
+        ));
+    }
+
+    #[test]
+    fn snapshot_delta_reports_a_session_that_left_the_list_as_removed() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let data = root.path().join("data");
+        let kept = claude_session_file_in(&home, "delta-project", "session-3333333333333333");
+        let dropped = claude_session_file_in(&home, "delta-project", "session-4444444444444444");
+        write_json_lines(&kept, &claude_turns(2, 0));
+        write_json_lines(&dropped, &claude_turns(2, 10));
+        let catalog = SessionCatalog::open_with_home(data, home).expect("session catalog");
+        let base = catalog
+            .manager_snapshot()
+            .expect("base snapshot")
+            .session_catalog_revision;
+
+        fs::remove_file(&dropped).expect("remove session file");
+        assert!(catalog.reconcile().expect("reconcile").changed);
+
+        let ManagerSnapshotSync::Delta(delta) = catalog.snapshot_delta(base).expect("delta") else {
+            panic!("이력이 덮는 개정이면 델타를 줘야 한다");
+        };
+        assert!(delta.changed_sessions.is_empty());
+        assert_eq!(
+            delta
+                .removed_sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session-4444444444444444"],
+        );
     }
 
     #[test]
@@ -7318,6 +8539,86 @@ mod tests {
         assert_eq!(stable.revision, changed.revision);
     }
 
+    /// 앱을 켠 뒤에 설치·연결한 CLI는 전체 리소스 스캔을 기다리지 않고 따라잡아야 한다.
+    /// 기동 시점 상태를 지워 그 상황을 만든 뒤, 탐지만 다시 읽는 갱신이 스냅숏을 맞추고
+    /// 개정 번호를 올리는지 본다. 바뀐 것이 없는 회차는 번호를 흔들지 않아야 한다 —
+    /// 조정 회차마다 도는 갱신이라 매번 올리면 화면이 끝없이 스냅숏을 다시 받는다.
+    #[test]
+    fn cli_detection_refresh_updates_the_snapshot_without_a_resource_scan() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let data = root.path().join("data");
+        fs::create_dir_all(&home).expect("home directory");
+        let catalog = SessionCatalog::open_with_home(data, home).expect("session catalog");
+        let initial = catalog
+            .manager_snapshot()
+            .expect("initial snapshot")
+            .resource_catalog_revision;
+
+        catalog
+            .write_state("시험")
+            .expect("state")
+            .snapshot
+            .status
+            .providers
+            .clear();
+
+        assert!(catalog.refresh_cli_status().expect("detection refresh"));
+        let refreshed = catalog.manager_snapshot().expect("refreshed snapshot");
+        assert_eq!(
+            refreshed.status,
+            inspect_local_environment().expect("app status"),
+        );
+        assert_eq!(refreshed.resource_catalog_revision, initial + 1);
+
+        assert!(!catalog.refresh_cli_status().expect("second refresh"));
+        assert_eq!(
+            catalog
+                .manager_snapshot()
+                .expect("stable snapshot")
+                .resource_catalog_revision,
+            initial + 1,
+        );
+    }
+
+    // 9.17: 런타임이 보낸 단계 지시는 사용자 말이 아니다. 하네스가 사용자 턴으로 저장해도
+    // 전사에서는 system 으로 보인다(ses_f1ed2883b 의 index 6·9·21).
+    #[test]
+    fn a_runtime_prompt_recorded_as_system_relabels_the_matching_user_item() {
+        let prompt_text = "이제 1단계다: 목록을 받는다\n열려 있는 도구로 이 단계를 끝내라.";
+        let item = |index: usize, role: &str, text: &str| TranscriptItem {
+            index,
+            role: role.to_owned(),
+            timestamp: Some(10),
+            model: None,
+            type_label: None,
+            blocks: vec![ContentBlock::Text {
+                text: text.to_owned(),
+            }],
+            usage: None,
+        };
+        let transcript = vec![
+            item(0, "user", "살아있니"),
+            item(1, "user", prompt_text),
+            item(2, "assistant", "네"),
+        ];
+        let turns = vec![store::CapturedTranscriptTurn {
+            source: ProviderId::Local,
+            session_id: "session-1234567890".to_owned(),
+            turn_id: "sysprompt-00000007".to_owned(),
+            completed_at: 9,
+            text: prompt_text.to_owned(),
+            origin: store::SupplementOrigin::SystemPrompt,
+            label: Some("단계 지시".to_owned()),
+        }];
+        let merged = merge_captured_turns(transcript, turns, 3);
+        assert_eq!(merged.len(), 3, "지시는 더해지지 않는다");
+        assert_eq!(merged[0].role, "user");
+        assert_eq!(merged[1].role, "system");
+        assert_eq!(merged[1].type_label.as_deref(), Some("단계 지시"));
+        assert_eq!(merged[2].role, "assistant");
+    }
+
     #[test]
     fn captured_turn_is_merged_once_and_keeps_its_origin_label() {
         let source_item = TranscriptItem {
@@ -7339,6 +8640,7 @@ mod tests {
                 completed_at: 20,
                 text: "already in provider history".to_owned(),
                 origin: store::SupplementOrigin::Chat,
+                label: None,
             },
             store::CapturedTranscriptTurn {
                 source: ProviderId::Claude,
@@ -7347,6 +8649,7 @@ mod tests {
                 completed_at: 30,
                 text: "stored scheduled result".to_owned(),
                 origin: store::SupplementOrigin::Scheduled,
+                label: None,
             },
         ];
 
@@ -7390,6 +8693,7 @@ mod tests {
                 completed_at: 20,
                 text: "먼저 파일을 읽습니다:정리했습니다.\n\n## 결과끝입니다.".to_owned(),
                 origin: store::SupplementOrigin::Chat,
+                label: None,
             },
             store::CapturedTranscriptTurn {
                 source: ProviderId::Claude,
@@ -7398,6 +8702,7 @@ mod tests {
                 completed_at: 30,
                 text: "원본에 없는 응답".to_owned(),
                 origin: store::SupplementOrigin::Chat,
+                label: None,
             },
         ];
 
@@ -7430,6 +8735,7 @@ mod tests {
             completed_at: 20,
             text: "정리했습니다.\n- 첫째\n\n- 둘째\n".to_owned(),
             origin: store::SupplementOrigin::Chat,
+            label: None,
         }];
 
         assert_eq!(merge_captured_turns(vec![source_item], turns, 1).len(), 1);
@@ -7484,6 +8790,7 @@ mod tests {
             completed_at: 15,
             text: "중간에 끼울 보완 기록".to_owned(),
             origin: store::SupplementOrigin::Chat,
+            label: None,
         }];
 
         let merged = merge_captured_turns(items, turns, 2);
@@ -7682,5 +8989,105 @@ mod tests {
 
         assert_eq!(session.message_count, Some(3));
         assert_eq!(session.source_title.as_deref(), Some("살아있니"));
+    }
+
+    /// 계정을 가르면 대화가 그 계정의 홈에만 남는다. 공유 홈만 훑으면 활성 계정이 아닌
+    /// 계정의 대화가 세션 목록에서 통째로 사라진다.
+    #[test]
+    fn antigravity_scan_covers_profile_homes_and_attributes_them() {
+        let data = tempfile::tempdir().expect("app data");
+        let home = tempfile::tempdir().expect("home");
+        let shared = home.path().join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&shared).expect("shared conversations");
+        fs::write(shared.join("11111111-1111-4111-8111-111111111111.db"), b"").expect("shared db");
+
+        let profile = crate::credential_profiles::ensure_profile_dir(
+            data.path(),
+            ProviderId::Antigravity,
+            "antigravity-b",
+        )
+        .expect("profile dir");
+        let owned = profile.join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&owned).expect("profile conversations");
+        fs::write(owned.join("22222222-2222-4222-8222-222222222222.db"), b"").expect("profile db");
+
+        let homes = antigravity_homes(data.path(), home.path());
+        let ids = list_antigravity_sessions(&homes)
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"11111111-1111-4111-8111-111111111111".to_owned()));
+        assert!(ids.contains(&"22222222-2222-4222-8222-222222222222".to_owned()));
+
+        assert_eq!(
+            antigravity_session_account_with_home(
+                data.path(),
+                home.path(),
+                "22222222-2222-4222-8222-222222222222"
+            )
+            .as_deref(),
+            Some("antigravity-b")
+        );
+        // 공유 홈 대화는 어느 프로필에도 속하지 않는다.
+        assert_eq!(
+            antigravity_session_account_with_home(
+                data.path(),
+                home.path(),
+                "11111111-1111-4111-8111-111111111111"
+            ),
+            None
+        );
+    }
+
+    /// 같은 대화 id가 두 홈에 있으면 공유 홈이 이긴다. 순서가 디렉터리 읽기에 따라
+    /// 흔들리면 목록이 갱신 때마다 달라진다.
+    #[test]
+    fn antigravity_scan_prefers_the_shared_home_for_a_duplicate_id() {
+        let data = tempfile::tempdir().expect("app data");
+        let home = tempfile::tempdir().expect("home");
+        let id = "33333333-3333-4333-8333-333333333333";
+        let shared = home.path().join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&shared).expect("shared conversations");
+        fs::write(shared.join(format!("{id}.db")), b"").expect("shared db");
+        let profile = crate::credential_profiles::ensure_profile_dir(
+            data.path(),
+            ProviderId::Antigravity,
+            "antigravity-b",
+        )
+        .expect("profile dir");
+        let owned = profile.join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&owned).expect("profile conversations");
+        fs::write(owned.join(format!("{id}.db")), b"").expect("profile db");
+
+        let homes = antigravity_homes(data.path(), home.path());
+        let sessions = list_antigravity_sessions(&homes);
+        assert_eq!(sessions.iter().filter(|item| item.id == id).count(), 1);
+        assert_eq!(
+            antigravity_session_account_with_home(data.path(), home.path(), id),
+            None
+        );
+    }
+
+    /// 지문이 프로필 홈을 보지 않으면 그 계정에서 새 대화가 생겨도 목록이 갱신되지 않는다.
+    #[test]
+    fn antigravity_fingerprint_follows_profile_homes() {
+        let data = tempfile::tempdir().expect("app data");
+        let home = tempfile::tempdir().expect("home");
+        fs::create_dir_all(home.path().join(".gemini/antigravity-cli/conversations"))
+            .expect("shared conversations");
+        let profile = crate::credential_profiles::ensure_profile_dir(
+            data.path(),
+            ProviderId::Antigravity,
+            "antigravity-b",
+        )
+        .expect("profile dir");
+        let owned = profile.join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&owned).expect("profile conversations");
+
+        let homes = antigravity_homes(data.path(), home.path());
+        let before = antigravity_provider_fingerprint(&homes).expect("fingerprint");
+        fs::write(owned.join("44444444-4444-4444-8444-444444444444.db"), b"x").expect("profile db");
+        let after = antigravity_provider_fingerprint(&homes).expect("fingerprint");
+        assert_ne!(before, after);
     }
 }

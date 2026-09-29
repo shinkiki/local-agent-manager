@@ -1,24 +1,61 @@
 /**
- * 한 줄 안의 인라인 표기 규칙 — 강조·코드 스팬·링크·`<…>`·백슬래시 이스케이프.
+ * 한 줄을 토큰으로 쪼개는 규칙 — 강조·코드 스팬·링크·백슬래시 이스케이프.
  *
  * 블록 구조(목록·코드 펜스·덩어리 분할)와 같은 파일에 있었지만 둘은 공유하는 값이 없다.
  * 여기 있는 것은 "한 줄을 토큰으로 어떻게 쪼개는가"뿐이고, 블록 쪽을 고칠 때 이스케이프
- * 문자 집합이나 HTML 태그 허용목록을 함께 읽을 필요가 없도록 파일을 나눠 둔다.
+ * 문자 집합을 함께 읽을 필요가 없도록 파일을 나눠 둔다.
+ *
+ * `<…>` 덩이의 정체를 가르는 일(`markdownAngle`)도 같은 이유로 여기 있지 않다. 이 파일이
+ * 정하는 것은 **갈래 사이의 우선순위**라 표기가 겹쳐 잘못 잡힐 때 손대고, 그쪽이 정하는
+ * 것은 걷어내도 되는 HTML 태그의 허용목록이라 에이전트가 보내는 표기를 보고 손댄다.
+ * 토큰 표는 `<…>`를 한 덩이로만 잡고 안을 들여다보지 않으므로 두 규칙은 서로를 모른다.
  */
 
 /**
- * 인라인 표기 토큰. `matchAll`은 정규식을 복제해 쓰므로 `lastIndex`가 공유되지 않는다.
- * 호출마다 리터럴을 다시 만들지 않도록 모듈 수준에 둔다.
+ * CommonMark가 백슬래시 이스케이프를 인정하는 글자 — ASCII 문장부호 전부.
  *
- * 백슬래시 이스케이프가 **맨 앞** 갈래인 것이 중요하다. 같은 자리에서는 먼저 적은 갈래가
- * 이기므로, `\*`는 기울임을 열지 못하고 두 글자짜리 토큰으로 먼저 소비된다.
- *
- * 같은 글자를 쓰는 갈래는 긴 것부터 적는다. `***`가 `**`보다 뒤에 있으면 `***중요***`가
- * 안쪽 `**중요**`만 잡혀 양옆 별표가 글자로 남는다. `!`를 링크 갈래 앞에 붙인 것도
- * 같은 이유로, 이미지 표기의 느낌표만 화면에 남던 것을 막는다.
+ * 이 집합이 이스케이프 규칙의 유일한 자리다. 아래 토큰의 이스케이프 갈래와
+ * `unescapeMarkdown`의 되돌림이 각자 같은 범위를 손으로 적고 있었는데, 그 둘은 반드시
+ * 같아야 한다 — 한쪽만 넓어지면 본문에서는 사라진 백슬래시가 링크 주소에만 남는다.
+ * 범위를 눈으로 대조해야 알 수 있는 어긋남이라 주석으로 묶어 둘 수 없고, 한 곳에서
+ * 파생되면 그 어긋남이 생길 자리가 없다.
  */
-export const MARKDOWN_INLINE_TOKEN =
-  /(\\[\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]|`[^`\n]+`|\*\*\*[^*\n]+\*\*\*|\*\*[^*\n]+\*\*|~~[^~\n]+~~|___[^_\n]+___|__[^_\n]+__|_[^_\n]+_|!?\[[^\]\n]+\]\([^)\n]+\)|<[^<>\s][^<>\n]*>|\*[^*\n]+\*)/g;
+const ASCII_PUNCTUATION = String.raw`[\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]`;
+
+/**
+ * 인라인 표기 갈래. **적힌 순서가 규칙이다** — 같은 자리에서는 먼저 적은 갈래가 이긴다.
+ * 한 줄짜리 정규식 리터럴은 그 순서가 왜 이런지 갈래마다 적어 둘 자리가 없어서, 이유가
+ * 위쪽 주석에 뭉쳐 있고 어느 줄이 어느 규칙인지는 세어 봐야 알 수 있었다. 갈래마다 한
+ * 줄을 주면 순서를 옮기려는 사람이 그 자리에서 이유를 읽는다.
+ */
+const INLINE_TOKEN_ALTERNATIVES: readonly string[] = [
+  // 이스케이프는 **맨 앞**이어야 한다. `\*`가 기울임을 열지 못하고 두 글자 토큰으로
+  // 먼저 소비되는 것이 이 자리에서 나온다.
+  String.raw`\\${ASCII_PUNCTUATION}`,
+  // 코드 스팬. 안쪽은 어떤 표기도 열지 않으므로 강조보다 먼저 본다.
+  // 백틱은 템플릿 리터럴에 그대로 담을 수 없어 이 줄만 보통 문자열이다.
+  "`[^`\\n]+`",
+  // 같은 글자를 쓰는 강조는 긴 것부터. `***`가 `**`보다 뒤면 `***중요***`가 안쪽만
+  // 잡혀 양옆 별표가 글자로 남는다. 밑줄 세 갈래도 같은 이유로 이 순서다.
+  String.raw`\*\*\*[^*\n]+\*\*\*`,
+  String.raw`\*\*[^*\n]+\*\*`,
+  String.raw`~~[^~\n]+~~`,
+  String.raw`___[^_\n]+___`,
+  String.raw`__[^_\n]+__`,
+  String.raw`_[^_\n]+_`,
+  // 이미지의 `!`를 링크 갈래에 붙여 잡는다. 떼어 놓으면 느낌표만 화면에 남는다.
+  String.raw`!?\[[^\]\n]+\]\([^)\n]+\)`,
+  // `<…>` 한 덩이. 자동 링크·HTML 태그·부등호를 가르는 일은 markdownAngle이 한다.
+  String.raw`<[^<>\s][^<>\n]*>`,
+  // 별표 하나짜리 기울임은 위의 별표 갈래가 모두 지나간 뒤에 본다.
+  String.raw`\*[^*\n]+\*`,
+];
+
+/**
+ * 인라인 표기 토큰. `matchAll`은 정규식을 복제해 쓰므로 `lastIndex`가 공유되지 않는다.
+ * 호출마다 다시 조립하지 않도록 모듈 수준에 둔다.
+ */
+export const MARKDOWN_INLINE_TOKEN = new RegExp(`(${INLINE_TOKEN_ALTERNATIVES.join("|")})`, "g");
 
 /** 낱말 안의 글자. `_`는 식별자에 흔해 이 글자에 붙어 있으면 표기로 보지 않는다. */
 const WORD_CHARACTER = /[\p{L}\p{N}_]/u;
@@ -32,48 +69,11 @@ export function markdownUnderscoreIsIntraword(text: string, start: number, end: 
 }
 
 /**
- * 미리보기에서 걷어낼 HTML 태그 이름. 목록에 없는 태그는 글자로 남긴다. 모르는 표기를
- * 조용히 숨기면 공급자가 답변에 섞어 보낸 XML이 흔적 없이 사라져, 무엇이 지워졌는지
- * 화면만 보고는 알 수 없다.
- */
-const HTML_MARKUP_TAGS = new Set([
-  "a", "b", "big", "blockquote", "br", "code", "del", "details", "div", "em", "font",
-  "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i", "img", "ins", "kbd", "li", "mark",
-  "ol", "p", "pre", "s", "small", "span", "strong", "sub", "summary", "sup", "table",
-  "tbody", "td", "tfoot", "th", "thead", "tr", "u", "ul",
-]);
-
-/** 태그 이름과 속성 표기. 속성 없이 `<b>`도, `<img src="x" />`도 받는다. */
-const HTML_TAG_TOKEN =
-  /^<\/?([a-zA-Z][a-zA-Z0-9-]*)((?:\s+[a-zA-Z_:][\w:.-]*(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'`=<>]+))?)*)\s*\/?>$/;
-
-/** 스킴이 있고 공백이 없는 `<주소>`. CommonMark의 자동 링크 조건과 같다. */
-const AUTOLINK_TOKEN = /^<[a-zA-Z][\w+.-]*:[^\s<>]*>$/;
-
-export type MarkdownAngleToken =
-  /** `<https://…>` 자동 링크. 주소를 그대로 링크로 그린다. */
-  | { kind: "autolink"; href: string }
-  /** `<br>`. 줄바꿈으로 그린다. */
-  | { kind: "break" }
-  /** 그 밖의 표시용 HTML 태그. 태그만 버리고 안쪽 글자는 그대로 둔다. */
-  | { kind: "markup" }
-  /** 표기가 아니라 부등호. `a <b 비교`처럼 글자로 그린다. */
-  | null;
-
-/** `<…>` 토큰의 정체를 가른다. 아는 표기가 아니면 null이라 글자로 남는다. */
-export function markdownAngleToken(token: string): MarkdownAngleToken {
-  if (AUTOLINK_TOKEN.test(token)) return { kind: "autolink", href: token.slice(1, -1) };
-  const tag = token.match(HTML_TAG_TOKEN);
-  if (!tag || !HTML_MARKUP_TAGS.has(tag[1].toLowerCase())) return null;
-  return tag[1].toLowerCase() === "br" ? { kind: "break" } : { kind: "markup" };
-}
-
-/**
  * CommonMark는 ASCII 문장부호 앞의 백슬래시만 이스케이프로 보고, 그 밖의 글자 앞이면
- * 백슬래시를 글자 그대로 남긴다. 위 토큰과 **같은 문자 집합**을 봐야 본문에서는 사라진
- * 백슬래시가 링크 주소에만 남는 어긋남이 생기지 않는다.
+ * 백슬래시를 글자 그대로 남긴다. 문자 집합은 토큰의 이스케이프 갈래와 같은
+ * `ASCII_PUNCTUATION`에서 나온다.
  */
-const MARKDOWN_ESCAPE = /\\([\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e])/g;
+const MARKDOWN_ESCAPE = new RegExp(String.raw`\\(${ASCII_PUNCTUATION})`, "g");
 
 /** 이스케이프를 실제 글자로 되돌린다. 마크다운으로 그리지 않는 링크 주소에 쓴다. */
 export function unescapeMarkdown(text: string): string {

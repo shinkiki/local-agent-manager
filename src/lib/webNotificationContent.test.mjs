@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { attentionNotificationDetail, attentionNotifications } from "./webNotificationContent.ts";
+import { attentionNotificationDetail, attentionNotifications, projectNotifications } from "./webNotificationContent.ts";
+import { setRuntimeLocale } from "./i18nRuntime.ts";
 
 const item = {
   source: "codex",
@@ -79,4 +80,30 @@ test("같은 묶음의 다음 회차는 같은 tag로 앞 알림을 갈아 끼�
 
 test("진행 중은 기기 알림 대상이 아니라 묶음에서도 빠진다", () => {
   assert.deepEqual(attentionNotifications([{ ...round("a"), kind: "running" }], []), []);
+});
+
+test("새로 감지된 프로젝트는 이름과 경로 태그를 갖는 기기 알림으로 변환된다", () => {
+  const notifications = projectNotifications([
+    { name: "내 프로젝트", path: "/Users/example/my-project" },
+  ]);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].title, "새 프로젝트 감지");
+  assert.equal(notifications[0].body, "내 프로젝트 · 활성 유지 또는 제외를 정하세요");
+  assert.equal(notifications[0].tag, "new-project:/Users/example/my-project");
+});
+
+test("기기 알림 제목과 본문은 DOM 밖에서도 선택한 언어를 따른다", () => {
+  setRuntimeLocale("en", {});
+  try {
+    const [notification] = attentionNotifications([round("a"), round("b")], []);
+    assert.equal(notification.title, "Task completed (2)");
+    assert.equal(notification.body, "에이전트 작업 완료 · a and 1 more");
+    assert.deepEqual(projectNotifications([{ name: "Project", path: "/tmp/project" }])[0], {
+      title: "New project detected",
+      body: "Project · Keep active or exclude it",
+      tag: "new-project:/tmp/project",
+    });
+  } finally {
+    setRuntimeLocale("ko", {});
+  }
 });

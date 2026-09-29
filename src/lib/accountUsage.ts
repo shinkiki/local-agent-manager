@@ -7,6 +7,12 @@ export interface DisplayUsageWindow {
   resetElapsed: boolean;
   /** 특정 모델에만 걸린 창인지. 표시에는 남기고 대표 소진율에서는 뺀다. */
   modelScoped: boolean;
+  /**
+   * 모델군 창들을 합쳐 만든 계정 대표 창인지(Antigravity). 가장 빡빡한 모델군의
+   * 복사본이라 대표 소진율에는 쓰지만 소진 판정에서는 뺀다
+   * (`accountExhaustionWindows`).
+   */
+  aggregate: boolean;
 }
 
 /**
@@ -30,19 +36,30 @@ function pendingAt(at: number | null | undefined, now: number): number | null {
   return at !== null && at !== undefined && at > now ? at : null;
 }
 
+/** 시각이 이미 지났는지 여부. 값이 없으면 거짓이다. */
+function isElapsed(at: number | null | undefined, now: number): boolean {
+  return elapsedAt(at, now) !== null;
+}
+
+/** 아직 오지 않은 시각인지 여부. 값이 없거나 지났으면 거짓이다. */
+function isPending(at: number | null | undefined, now: number): boolean {
+  return pendingAt(at, now) !== null;
+}
+
 /**
  * 저장된 초기화 시각이 지난 창은 재조회 전이라도 0%로 표시한다. 실제 수치는
  * 계정 활성화 직후 전환 경로의 사용량 재조회가 다시 맞춘다.
  */
 export function displayUsageWindows(windows: AccountUsageWindow[], now: number): DisplayUsageWindow[] {
   return windows.map((window) => {
-    const resetElapsed = elapsedAt(window.resetsAt, now) !== null;
+    const resetElapsed = isElapsed(window.resetsAt, now);
     return {
       label: window.label,
       usedPercent: resetElapsed ? 0 : Math.min(100, Math.max(0, window.usedPercent)),
       resetsAt: window.resetsAt,
       resetElapsed,
       modelScoped: window.modelScoped === true,
+      aggregate: window.aggregate === true,
     };
   });
 }
@@ -104,7 +121,21 @@ export function usageRetryBlockedUntil(usage: AccountUsageView, now: number): nu
  * 이 조건의 부분집합이라 자동·수동 보호가 어긋나지 않는다.
  */
 export function usageRefreshDeferred(usage: AccountUsageView, now: number): boolean {
-  return pendingAt(usage.retryAt, now) !== null;
+  return isPending(usage.retryAt, now);
+}
+
+/** 계정 하나에서 초기화·재시도 시각이 지난 항목의 서명 토큰을 모은다. */
+function accountResetTokens(account: ProviderAccountView, now: number): string[] {
+  const tokens: string[] = [];
+  for (const window of account.usage.windows) {
+    if (isElapsed(window.resetsAt, now)) {
+      tokens.push(`${account.id}:${window.label}`);
+    }
+  }
+  if (isElapsed(account.usage.retryAt, now)) {
+    tokens.push(`${account.id}:retryAt`);
+  }
+  return tokens;
 }
 
 /**
@@ -113,24 +144,7 @@ export function usageRefreshDeferred(usage: AccountUsageView, now: number): bool
  * 재시도 허용 시각을 함께 담아, 재시도 시각이 지나면 갱신 버튼도 다시 열린다.
  */
 export function elapsedResetSignature(snapshot: AccountSnapshot, now: number): string {
-  return snapshot.accounts.flatMap((account) => {
-    const elapsed = account.usage.windows
-      .filter((window) => elapsedAt(window.resetsAt, now) !== null)
-      .map((window) => `${account.id}:${window.label}`);
-    return elapsedAt(account.usage.retryAt, now) !== null ? [...elapsed, `${account.id}:retryAt`] : elapsed;
-  }).join("|");
-}
-
-/**
- * 계정에 남은 사용량 여유(%). 가장 빡빡한 창을 기준으로 본다. 모델별 창은 그 모델을
- * 쓰는 실행에만 걸리므로 빼고 본다 — Fable 주간 한도가 찼다고 이 계정 전체를 쓸 수
- * 없다고 보면 실제로 남은 한도를 버리게 된다. 백엔드의 `governing_windows`와 같은 기준이다.
- */
-export function remainingUsagePercent(account: ProviderAccountView | null, now: number): number | null {
-  if (!account) return null;
-  const windows = governingUsageWindows(displayUsageWindows(account.usage.windows, now));
-  if (windows.length === 0) return null;
-  return Math.max(0, 100 - Math.max(...windows.map((window) => window.usedPercent)));
+  return snapshot.accounts.flatMap((account) => accountResetTokens(account, now)).join("|");
 }
 
 /**
@@ -139,15 +153,88 @@ export function remainingUsagePercent(account: ProviderAccountView | null, now: 
  * 다음 초기화가 아니므로 버린다.
  */
 export function nextUsageReset(windows: DisplayUsageWindow[], now: number): number | null {
-  return windows
-    .map((window) => pendingAt(window.resetsAt, now))
-    .filter((value): value is number => value !== null)
-    .sort((left, right) => left - right)[0] ?? null;
+  let earliest: number | null = null;
+  for (const window of windows) {
+    const at = pendingAt(window.resetsAt, now);
+    if (at !== null && (earliest === null || at < earliest)) {
+      earliest = at;
+    }
+  }
+  return earliest;
 }
 
-/** 계정 전체의 가용성을 대표하는 창만 남긴다. 모델별 창은 표시 전용이다. */
+/**
+ * 계정 전체의 가용성을 대표하는 창만 남긴다. 모델별 창은 그 모델을 쓰는 실행에만
+ * 걸리므로 뺀다 — Fable 주간 한도가 찼다고 이 계정 전체를 쓸 수 없다고 보면 실제로
+ * 남은 한도를 버리게 된다. 백엔드의 `governing_windows`와 같은 기준이고, 남은 창이
+ * 없으면 이 계정의 여유를 알 수 없다는 뜻이다(모두 찼다는 뜻이 아니다).
+ */
 export function governingUsageWindows(windows: DisplayUsageWindow[]): DisplayUsageWindow[] {
   return windows.filter((window) => !window.modelScoped);
+}
+
+/**
+ * 이 계정을 **통째로** 막고 있는 소진 창. 백엔드 `accounts::account_exhausted`와 같은
+ * 규칙이고, 비어 있으면 계정은 아직 쓸 수 있다.
+ *
+ * 계정이 자기 것으로 보고하는 창이 있으면 그 창만 본다. 모델군 창을 합쳐 만든 대표
+ * 창(`aggregate`)은 가장 빡빡한 모델군의 복사본이라 소진 판정에 세면 안 된다 — 한
+ * 모델군이 찼다고 계정 전체를 못 쓴다고 말하면, 실행은 되는데 화면만 소진이라고 하는
+ * 어긋남이 생긴다. 대표 창뿐인 계정은 **모든 모델군이 찼을 때만** 막힌 것이다.
+ */
+export function accountExhaustionWindows(windows: DisplayUsageWindow[]): DisplayUsageWindow[] {
+  const full = (window: DisplayUsageWindow) => window.usedPercent >= 100;
+  const exhausted = exhaustionGroups(windows).map((group) => group.filter(full));
+  // 묶음이 하나도 없는 계정(창을 읽지 못했거나 모델군을 모르는 계정)은 소진이 아니다 —
+  // 모르는 것과 다 쓴 것은 다르므로 빈 묶음 목록은 아래 `every`에서 빈 결과가 된다.
+  if (exhausted.length === 0) return [];
+  return exhausted.every((group) => group.length > 0) ? exhausted.flat() : [];
+}
+
+/**
+ * 소진을 판정하는 단위. 이 묶음들이 **모두** 찼을 때만 계정이 막힌 것이고, 다시 열리는
+ * 시각도 같은 단위로 잰다. 계정이 자기 것으로 보고하는 창이 있으면 그 대표 창들이 한
+ * 묶음이고, 대표 창(`aggregate`)뿐이면 모델군 하나하나가 묶음이다.
+ */
+function exhaustionGroups(windows: DisplayUsageWindow[]): DisplayUsageWindow[][] {
+  return windows.some((window) => window.aggregate)
+    ? modelGroups(windows)
+    : [governingUsageWindows(windows)];
+}
+
+/** 모델군별 창 묶음. 라벨은 `{그룹 이름} · {창}`으로 만들어진다. */
+function modelGroups(windows: DisplayUsageWindow[]): DisplayUsageWindow[][] {
+  const groups = new Map<string, DisplayUsageWindow[]>();
+  for (const window of windows.filter((candidate) => candidate.modelScoped)) {
+    const [group] = window.label.split(" · ");
+    const key = group ?? window.label;
+    groups.set(key, [...(groups.get(key) ?? []), window]);
+  }
+  return [...groups.values()];
+}
+
+/** 이 창들이 **모두** 풀리는 시각. 시각을 모르는 창은 셈에서 빠진다. */
+function windowsClearAt(windows: DisplayUsageWindow[]): number | null {
+  const resets = windows
+    .filter((window) => window.usedPercent >= 100)
+    .map((window) => window.resetsAt)
+    .filter((value): value is number => value !== null);
+  return resets.length > 0 ? Math.max(...resets) : null;
+}
+
+/**
+ * 소진된 계정이 다시 열리는 시각. 소진이 아니면 `null`이고, 소진인데 시각을 모르면 `0`이다.
+ *
+ * 백엔드 `accounts::account_clear_at`과 같은 규칙이다 — 한 그룹 안에서는 찬 창이 **모두**
+ * 풀려야 하므로 늦은 쪽, 그룹 사이에서는 하나만 풀려도 쓸 수 있으므로 이른 쪽이다.
+ * 창을 뭉뚱그려 가장 이른 시각을 말하면 아직 거부되는 시각을 "그때 풀린다"고 알리게 된다.
+ */
+export function accountExhaustionResetAt(windows: DisplayUsageWindow[]): number | null {
+  if (accountExhaustionWindows(windows).length === 0) return null;
+  const clearAt = exhaustionGroups(windows)
+    .map(windowsClearAt)
+    .filter((value): value is number => value !== null);
+  return clearAt.length > 0 ? Math.min(...clearAt) : 0;
 }
 
 export interface AccountUsageDisplayState {

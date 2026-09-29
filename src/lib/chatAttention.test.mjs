@@ -45,6 +45,7 @@ test("marking all read without exclusions covers every profile", () => {
   ]));
   assert.deepEqual(next.items.map((item) => item.read), [true, true]);
   assert.equal(next.unreadCount, 0);
+  assert.equal(markAllAttentionReadLocally(next), next);
 });
 
 test("marking one read leaves the rest and returns the same snapshot when nothing changes", () => {
@@ -76,6 +77,9 @@ test("clearing read keeps unread, running and approval items", () => {
   assert.deepEqual(next.items.map((item) => item.id), ["read-running", "read-approval", "unread"]);
   assert.equal(next.unreadCount, 2);
   assert.equal(next.pendingCount, 1);
+
+  // 지울 것이 없으면 같은 스냅숏을 그대로 돌려준다(다른 갈래와 같은 규칙).
+  assert.equal(clearReadAttentionLocally(next), next);
 });
 
 test("dismiss removes one item but refuses approvals and unknown ids", () => {

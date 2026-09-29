@@ -11,22 +11,23 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::chat::{
-    configure_headless_command, effort_name_is_valid, normalize_model, read_rpc_result,
-    resolve_executable, write_json_line, ChatModelOption, ChatProviderOptions, ChatReasoningOption,
-    ChatSettingField, ChatSettingFieldKind, ChatSettingOption, ReasoningEffort,
-    ANTIGRAVITY_MODELS_TIMEOUT,
+    codex_app_server_initialize, configure_headless_command, effort_name_is_valid, normalize_model,
+    read_rpc_result, resolve_executable, take_child_stdin, take_child_stdout, write_json_line,
+    ChatApprovalMode, ChatMode, ChatModelOption, ChatProviderOptions, ChatReasoningOption,
+    ChatSettingField, ChatSettingFieldKind, ChatSettingOption, LocalConnectionOptions,
+    ReasoningEffort, ANTIGRAVITY_MODELS_TIMEOUT,
 };
 use crate::cli_interface::{probe_cli_interface, CliInterface};
 use crate::clock::now_ms;
 use crate::domain::ProviderId;
+use crate::local_llm;
 use crate::CoreError;
 
 /// 모델·추론 선택지와 실행설정 항목을 합쳐 프론트로 내려줄 형태로 만든다.
@@ -34,21 +35,142 @@ use crate::CoreError;
 /// 우선순위는 세 단계다. CLI가 모델 목록을 직접 내보내면 그것이 최우선이고(조사 실패나
 /// 환각이 실제 목록을 덮으면 안 된다), 목록을 못 얻었을 때만 AIA가 조사해 제안한
 /// 카탈로그로 채운다. 추론 수준은 내장 목록 → 도움말 조사 → AIA 제안 순으로 덧입힌다.
+///
+/// 저장본은 여기서 한 번만 읽고 필요한 자리로 넘긴다. 카탈로그·항목 목록·갱신 시각이
+/// 각자 같은 파일을 다시 읽고 있어, 한 응답 안에서 서로 다른 저장본을 볼 수 있었다.
 pub fn load_chat_provider_options(
     source: ProviderId,
     app_data_dir: Option<&std::path::Path>,
 ) -> ChatProviderOptions {
     let overrides = app_data_dir.map(load_schema_overrides).unwrap_or_default();
-    // 파일이 외부에서 바뀔 수 있으므로 저장 시점 검증과 별개로 읽을 때 다시 검증한다.
-    let proposed = overrides
-        .catalogs
-        .get(source.as_str())
-        .filter(|catalog| validate_provider_catalog(source, catalog).is_ok());
-    let settings = merged_setting_fields(source, app_data_dir);
-    let settings_updated_at = schema_overrides_updated_at(source, app_data_dir);
+    let proposed = overrides.trusted_catalog(source);
+    let settings = merged_setting_fields(source, &overrides);
+    let settings_updated_at = schema_overrides_updated_at(source, &overrides);
     let supported_reasoning_efforts = merged_reasoning_options(source, &overrides);
-    // CLI가 모델 목록을 내보내는 공급자만 실제 카탈로그를 읽는다.
-    let cli_models = match source {
+    let (mut models, mut catalog_error) = match load_cli_models(source) {
+        Some(Ok(models)) => (models, None),
+        Some(Err(error)) => (Vec::new(), Some(error.to_string())),
+        None => (Vec::new(), None),
+    };
+    // 로컬 공급자는 연결마다 목록이 있다(M7 7.3). 위 칸에는 기본 연결의 것을 그대로 두어
+    // 연결을 모르는 화면이 예전처럼 읽는다.
+    let mut local_connections = Vec::new();
+    if source == ProviderId::Local {
+        if let Some(app_data_dir) = app_data_dir {
+            match local_connection_options(app_data_dir) {
+                Ok(list) => {
+                    if let Some(default) = list.iter().find(|entry| entry.is_default) {
+                        models = default.models.clone();
+                        catalog_error = default.catalog_error.clone();
+                    }
+                    local_connections = list;
+                }
+                Err(error) => catalog_error = Some(error.to_string()),
+            }
+        }
+    }
+    if models.is_empty() {
+        if let Some(catalog) = proposed {
+            models = catalog.models.clone();
+        }
+    } else {
+        // CLI가 목록을 줬다. 제안은 목록을 덮지 않고 거르는 데만 쓴다.
+        models = apply_model_catalog_filter(source, models, proposed);
+    }
+    let default_reasoning_effort = models
+        .iter()
+        .find(|model| model.is_default)
+        .and_then(|model| model.default_reasoning_effort.clone());
+    ChatProviderOptions {
+        source,
+        models,
+        local_connections,
+        supported_reasoning_efforts,
+        default_reasoning_effort,
+        catalog_error,
+        settings,
+        settings_updated_at,
+        catalog_updated_at: proposed.map(|catalog| catalog.updated_at),
+        cli_version: overrides
+            .discovered_record(source)
+            .and_then(|record| record.cli_version.clone()),
+        catalog_stale: provider_catalog_is_stale(source, &overrides),
+    }
+}
+
+/// 제안이 없을 때 CLI 목록에서 덜어낼 모델. 공급자가 내부적으로만 쓰는 것이라
+/// 사람이 대화 모델로 고를 대상이 아니다. AIA가 명시적으로 제안하면 그쪽이 이기므로,
+/// 여기 적힌 것은 "기본값으로는 감춘다"는 뜻이지 금지 목록이 아니다.
+fn provider_default_hidden_models(source: ProviderId) -> &'static [&'static str] {
+    match source {
+        // Codex가 승인 검토에 쓰는 내부 모델.
+        ProviderId::Codex => &["codex-auto-review"],
+        ProviderId::Antigravity | ProviderId::Claude | ProviderId::Local => &[],
+    }
+}
+
+/// CLI가 내보낸 목록에 AIA 제안을 겹친다.
+///
+/// CLI 목록을 직접 내보내는 공급자에서 제안은 목록을 **대체**하지 않고 **거르기만** 한다.
+/// 표시명·추론 선택지 같은 메타는 CLI가 준 것이 정확하므로 그대로 두고, 어떤 식별자를
+/// 남길지만 제안을 따른다. 이렇게 하면 새 모델이 CLI를 따라 자동으로 들어오는 성질을
+/// 잃지 않으면서, 무엇을 감출지는 앱을 고치지 않고 바꿀 수 있다.
+///
+/// 제안이 CLI에 없는 식별자만 담아 결과가 비면 필터를 버린다. 선택할 모델이 하나도 없는
+/// 목록은 오래된 제안 하나로 실행설정 전체를 막아버리기 때문이다.
+fn apply_model_catalog_filter(
+    source: ProviderId,
+    models: Vec<ChatModelOption>,
+    proposed: Option<&ProposedProviderCatalog>,
+) -> Vec<ChatModelOption> {
+    let allowed = proposed
+        .map(|catalog| &catalog.models)
+        .filter(|models| !models.is_empty());
+    let filtered: Vec<ChatModelOption> = match allowed {
+        Some(allowed) => {
+            let keys: HashSet<&str> = allowed.iter().map(|model| model.model.as_str()).collect();
+            models
+                .iter()
+                .filter(|model| keys.contains(model.model.as_str()))
+                .cloned()
+                .collect()
+        }
+        None => {
+            let hidden = provider_default_hidden_models(source);
+            models
+                .iter()
+                .filter(|model| !hidden.contains(&model.model.as_str()))
+                .cloned()
+                .collect()
+        }
+    };
+    if filtered.is_empty() {
+        return models;
+    }
+    // 로컬 공급자의 목록은 서빙 서버가 주고, 기본 표시는 연결 설정의 저장값에만 건다
+    // (`local_model_options_from`). 저장값이 목록에 없을 때 첫 항목을 기본으로 올리면
+    // 화면은 그 모델로 돌 것처럼 보이지만 기동은 저장값으로 가서 거절된다 — 화면이
+    // 지키지 못할 약속이다. 그때는 기본 없는 목록을 그대로 내보낸다.
+    if source == ProviderId::Local {
+        return filtered;
+    }
+    promote_default_model(filtered)
+}
+
+/// 기본 모델이 필터에 걸려 빠졌으면 남은 첫 항목을 기본으로 올린다. 기본이 없는 목록은
+/// 공급자 기본 추론 수준까지 같이 잃어 화면이 빈 값을 들고 있게 된다.
+fn promote_default_model(mut models: Vec<ChatModelOption>) -> Vec<ChatModelOption> {
+    if !models.iter().any(|model| model.is_default) {
+        if let Some(first) = models.first_mut() {
+            first.is_default = true;
+        }
+    }
+    models
+}
+
+/// CLI가 모델 목록을 내보내는 공급자만 실제 카탈로그를 읽는다.
+fn load_cli_models(source: ProviderId) -> Option<Result<Vec<ChatModelOption>, CoreError>> {
+    match source {
         ProviderId::Codex => Some(
             resolve_executable(source)
                 .and_then(|executable| load_codex_model_catalog(&executable))
@@ -68,36 +190,92 @@ pub fn load_chat_provider_options(
                 .and_then(|executable| load_antigravity_model_catalog(&executable)),
         ),
         ProviderId::Claude => None,
-    };
-    let (mut models, catalog_error) = match cli_models {
-        Some(Ok(models)) => (models, None),
-        Some(Err(error)) => (Vec::new(), Some(error.to_string())),
-        None => (Vec::new(), None),
-    };
-    if models.is_empty() {
-        if let Some(catalog) = proposed {
-            models = catalog.models.clone();
-        }
+        // 로컬 공급자의 목록은 CLI가 아니라 서빙 서버가 들고 있고 연결마다 다르다.
+        // `load_chat_provider_options` 가 [`local_connection_options`] 로 연결별로 묻는다.
+        ProviderId::Local => None,
     }
-    let default_reasoning_effort = models
-        .iter()
-        .find(|model| model.is_default)
-        .and_then(|model| model.default_reasoning_effort.clone());
-    ChatProviderOptions {
-        source,
-        models,
-        supported_reasoning_efforts,
-        default_reasoning_effort,
-        catalog_error,
-        settings,
-        settings_updated_at,
-        catalog_updated_at: proposed.map(|catalog| catalog.updated_at),
-        cli_version: overrides
-            .discovered
-            .get(source.as_str())
-            .and_then(|record| record.cli_version.clone()),
-        catalog_stale: provider_catalog_is_stale(source, &overrides),
+}
+
+/// 연결마다 모델 목록(M7 7.3). 켜진 연결만 서버에 묻고, 병렬로 묻는다 — 원격 연결
+/// 하나가 닿지 않아도 다른 연결의 목록이 그만큼 늦어지지 않는다. probe 는 HTTP 왕복이라
+/// 꺼졌거나 주소가 빈 연결에는 걸지 않는다.
+fn local_connection_options(app_data_dir: &Path) -> Result<Vec<LocalConnectionOptions>, CoreError> {
+    let list = local_llm::get_local_llm_connections(app_data_dir)?;
+    let default_id = list.default_id.as_str();
+    let options = std::thread::scope(|scope| {
+        let handles: Vec<_> = list
+            .connections
+            .iter()
+            .map(|entry| {
+                scope.spawn(move || {
+                    let connection = &entry.connection;
+                    let usable = connection.enabled && !connection.base_url.trim().is_empty();
+                    let (models, catalog_error) = if usable {
+                        match local_model_options(connection) {
+                            Ok(models) => (models, None),
+                            Err(error) => (Vec::new(), Some(error.to_string())),
+                        }
+                    } else {
+                        (Vec::new(), None)
+                    };
+                    LocalConnectionOptions {
+                        id: entry.id.clone(),
+                        label: entry.label.clone(),
+                        is_default: entry.id == default_id,
+                        enabled: connection.enabled,
+                        base_url: connection.base_url.clone(),
+                        default_model: connection.default_model.clone(),
+                        models,
+                        catalog_error,
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("연결 조회 스레드"))
+            .collect::<Vec<_>>()
+    });
+    Ok(options)
+}
+
+/// 서빙 서버가 준 이름을 그대로 선택지로 만든다. 표시명을 꾸미지 않는 것은 서버가 주는
+/// 이름이 곧 사용자가 `ollama list`에서 보는 이름이기 때문이다.
+///
+/// 기본값은 연결 설정의 `defaultModel`과 같은 항목에만 건다. 목록에 없으면 아무데도
+/// 걸지 않는다 — 사용자가 목록 밖 이름을 자유 입력했을 수 있고, 그때 첫 항목을 기본으로
+/// 올리면 저장된 선택을 말없이 바꾸는 셈이 된다.
+fn local_model_options(
+    connection: &local_llm::LocalLlmConnection,
+) -> Result<Vec<ChatModelOption>, CoreError> {
+    let probe = local_llm::probe_local_llm(&connection.base_url)?;
+    // 서버에 닿지 못했거나 목록이 비면 오류로 올린다. 빈 목록을 성공으로 내려보내면
+    // 화면이 "모델 없음"과 "서버 못 찾음"을 구분하지 못한다.
+    if probe.models.is_empty() {
+        let message = probe
+            .error
+            .unwrap_or_else(|| "서버가 모델을 하나도 알려 주지 않았습니다".to_owned());
+        return Err(CoreError::Runtime(message));
     }
+    Ok(local_model_options_from(
+        probe.models,
+        &connection.default_model,
+    ))
+}
+
+/// 이름 목록을 선택지로 옮기는 자리. HTTP를 타지 않아 이 규칙만 따로 시험할 수 있다.
+fn local_model_options_from(names: Vec<String>, default_model: &str) -> Vec<ChatModelOption> {
+    names
+        .into_iter()
+        .map(|model| ChatModelOption {
+            is_default: model == default_model,
+            display_name: model.clone(),
+            model,
+            description: String::new(),
+            default_reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+        })
+        .collect()
 }
 
 /// 추론 수준 목록: 내장 → 도움말 조사 → AIA 제안 순으로 뒤에 오는 것이 이긴다.
@@ -108,17 +286,14 @@ fn merged_reasoning_options(
 ) -> Vec<ChatReasoningOption> {
     let mut options = provider_reasoning_options(source);
     if let Some(discovered) = overrides
-        .discovered
-        .get(source.as_str())
+        .discovered_record(source)
         .map(|record| &record.reasoning_efforts)
         .filter(|efforts| !efforts.is_empty())
     {
         options = discovered.clone();
     }
     if let Some(proposed) = overrides
-        .catalogs
-        .get(source.as_str())
-        .filter(|catalog| validate_provider_catalog(source, catalog).is_ok())
+        .trusted_catalog(source)
         .map(|catalog| &catalog.reasoning_efforts)
         .filter(|efforts| !efforts.is_empty())
     {
@@ -137,9 +312,11 @@ fn provider_catalog_is_stale(source: ProviderId, overrides: &ChatSettingsSchemaO
         return false;
     }
     let installed = overrides
-        .discovered
-        .get(source.as_str())
+        .discovered_record(source)
         .and_then(|record| record.cli_version.clone());
+    // 여기만 검증을 거치지 않은 원본을 본다. 묻는 것이 "이 제안이 지금 CLI 버전으로
+    // 만들어졌는가"라서, 검증에 걸린 제안을 없는 것으로 보면 조사 필요 여부가 아니라
+    // 제안의 유효성을 답하게 된다.
     match overrides.catalogs.get(source.as_str()) {
         Some(catalog) => catalog.cli_version != installed,
         None => true,
@@ -148,7 +325,12 @@ fn provider_catalog_is_stale(source: ProviderId, overrides: &ChatSettingsSchemaO
 
 /// CLI가 모델 목록을 스스로 내보내는 공급자인지. 이 목록은 조사·제안보다 우선한다.
 fn provider_publishes_model_catalog(source: ProviderId) -> bool {
-    matches!(source, ProviderId::Codex | ProviderId::Antigravity)
+    // 로컬도 여기 든다. 목록의 출처가 CLI가 아니라 서빙 서버일 뿐, 실제로 존재하는
+    // 모델을 그대로 받아오므로 조사·제안보다 우선해야 한다.
+    matches!(
+        source,
+        ProviderId::Codex | ProviderId::Antigravity | ProviderId::Local
+    )
 }
 
 fn provider_reasoning_options(source: ProviderId) -> Vec<ChatReasoningOption> {
@@ -173,14 +355,18 @@ fn provider_reasoning_options(source: ProviderId) -> Vec<ChatReasoningOption> {
             ReasoningEffort::Medium,
             ReasoningEffort::High,
         ],
+        // 서빙 서버가 추론 수준을 어떻게 받을지 모델마다 달라 v1은 빈 사다리다.
+        ProviderId::Local => &[],
     };
-    efforts
-        .iter()
-        .map(|effort| ChatReasoningOption {
-            description: effort_description(effort).to_owned(),
-            effort: effort.clone(),
-        })
-        .collect()
+    efforts.iter().cloned().map(reasoning_option).collect()
+}
+
+/// 공급자 내장값과 CLI 발견값이 같은 설명 규칙으로 선택지를 만들게 한다.
+fn reasoning_option(effort: ReasoningEffort) -> ChatReasoningOption {
+    ChatReasoningOption {
+        description: effort_description(&effort).to_owned(),
+        effort,
+    }
 }
 
 /// 내장 이름의 설명 문구. 조사·제안으로 들어온 새 이름은 설명을 알 수 없으므로 비우고,
@@ -208,30 +394,35 @@ fn setting_option(value: &str, label: &str, detail: &str, disabled: bool) -> Cha
     }
 }
 
-/// 동적 실행설정 값의 허용 규칙. 값은 이 규칙을 통과해야만 CLI 인자로 변환된다.
-enum DynamicValueRule {
-    /// 모델·에이전트 식별자 문자 집합(normalize_model과 동일)
-    Identifier,
-    /// 고정 선택지 중 하나
-    #[allow(dead_code)]
-    OneOf(&'static [&'static str]),
-}
-
-impl DynamicValueRule {
-    /// 값 하나가 이 규칙을 통과하는지. 시작 요청 검증·저장본 정리·스키마 항목 검증이
-    /// 각자 같은 `match`를 펼쳐 두고 있어 규칙 자신에게 물어보는 한 자리로 모았다.
-    fn accepts(&self, value: &str) -> bool {
-        match self {
-            DynamicValueRule::Identifier => identifier_value_is_valid(value),
-            DynamicValueRule::OneOf(allowed) => allowed.contains(&value),
-        }
+fn setting_field(
+    key: &str,
+    label: &str,
+    detail: &str,
+    kind: ChatSettingFieldKind,
+    options: Vec<ChatSettingOption>,
+    default_value: Option<&str>,
+) -> ChatSettingField {
+    ChatSettingField {
+        key: key.to_owned(),
+        label: label.to_owned(),
+        detail: Some(detail.to_owned()),
+        kind,
+        options,
+        default_value: default_value.map(str::to_owned),
     }
 }
 
 struct DynamicSettingSpec {
     key: &'static str,
     flag: &'static str,
-    rule: DynamicValueRule,
+}
+
+impl DynamicSettingSpec {
+    /// 동적 항목은 CLI에 넘길 모델·에이전트 식별자만 받는다. 시작 요청 검증·저장본
+    /// 정리·스키마 항목 검증이 같은 규칙을 쓰도록 항목 자신에게 판정을 맡긴다.
+    fn accepts(&self, value: &str) -> bool {
+        identifier_value_is_valid(value)
+    }
 }
 
 /// 공급자 화이트리스트에서 키 하나에 해당하는 항목을 찾는다. 네 곳이 각자
@@ -249,9 +440,8 @@ fn provider_dynamic_setting_specs(source: ProviderId) -> &'static [DynamicSettin
         ProviderId::Claude => &[DynamicSettingSpec {
             key: "fallbackModel",
             flag: "--fallback-model",
-            rule: DynamicValueRule::Identifier,
         }],
-        ProviderId::Codex | ProviderId::Antigravity => &[],
+        ProviderId::Codex | ProviderId::Antigravity | ProviderId::Local => &[],
     }
 }
 
@@ -290,7 +480,7 @@ pub(crate) fn validate_dynamic_settings(
                 "지원하지 않는 실행설정 항목입니다: {key}"
             )));
         };
-        if !spec.rule.accepts(value) {
+        if !spec.accepts(value) {
             return Err(CoreError::InvalidInput(format!(
                 "실행설정 값이 올바르지 않습니다: {key}"
             )));
@@ -311,7 +501,7 @@ pub(crate) fn retained_dynamic_settings(
         .filter_map(|(key, value)| {
             let value = value.trim();
             let spec = dynamic_setting_spec(source, key)?;
-            let valid = !value.is_empty() && spec.rule.accepts(value);
+            let valid = !value.is_empty() && spec.accepts(value);
             valid.then(|| (key.clone(), value.to_owned()))
         })
         .collect()
@@ -353,10 +543,14 @@ const MAX_OPTION_VALUE_LEN: usize = 128;
 /// 항목 키 길이 상한.
 const MAX_FIELD_KEY_LEN: usize = 40;
 
-/// 검증 실패 메시지를 한 형식으로 만든다. `<대상> 검증 실패: <사유>` 꼴을 세 곳에서
-/// 각자의 클로저로 조립하고 있어 한 곳으로 모았다.
+/// 검증 실패 메시지를 한 형식으로 만든다.
 fn validation_error(subject: &str, reason: &str) -> CoreError {
     CoreError::InvalidInput(format!("{subject} 검증 실패: {reason}"))
+}
+
+/// 카탈로그와 스키마 검증기가 되풀이하던 실패 결과 조립을 한 자리로 모은다.
+fn validation_failure(subject: &str, reason: &str) -> Result<(), CoreError> {
+    Err(validation_error(subject, reason))
 }
 
 const CATALOG_SUBJECT: &str = "모델·추론 카탈로그";
@@ -407,34 +601,59 @@ struct ProposedProviderCatalog {
     updated_at: i64,
 }
 
+/// 저장본에서 한 공급자의 칸을 꺼내는 세 갈래.
+///
+/// 읽는 자리 여덟 곳이 하나같이 `overrides.<맵>.get(source.as_str())`을 손으로 적고
+/// 있었고, 그중 제안 카탈로그를 꺼내는 두 자리는 `validate_provider_catalog`로 거르는
+/// 줄까지 똑같이 되풀이했다. 검증을 빠뜨린 조회가 하나라도 생기면 파일을 고쳐 넣은
+/// 카탈로그가 그대로 화면에 오르므로, 조회와 신뢰 경계를 떼어 놓지 않는다.
+///
+/// 쓰는 자리(`insert`·`remove`·`get_mut`)는 소유한 키가 필요해 그대로 둔다.
+impl ChatSettingsSchemaOverrides {
+    /// CLI `--help`를 읽어 만든 조사 결과.
+    fn discovered_record(&self, source: ProviderId) -> Option<&DiscoveredSettingsSchema> {
+        self.discovered.get(source.as_str())
+    }
+
+    /// AIA가 제안한 스키마 항목 목록. 검증은 항목을 덧입히는 자리가 맡는다 —
+    /// 실패해도 앞 단계 목록을 그대로 쓰는 폴백이 거기 있다.
+    fn proposed_fields(&self, source: ProviderId) -> Option<&Vec<ChatSettingField>> {
+        self.providers.get(source.as_str())
+    }
+
+    /// AIA가 제안한 모델·추론 카탈로그. 검증을 통과한 것만 돌려준다. 저장 시점에
+    /// 검증했더라도 파일이 외부에서 바뀔 수 있으므로 읽을 때마다 다시 본다.
+    fn trusted_catalog(&self, source: ProviderId) -> Option<&ProposedProviderCatalog> {
+        self.catalogs
+            .get(source.as_str())
+            .filter(|catalog| validate_provider_catalog(catalog).is_ok())
+    }
+}
+
 /// 제안 카탈로그의 신뢰 경계. 모델 식별자와 추론 이름은 CLI로 그대로 전달되므로
 /// 값 문법을 실행 경로와 같은 규칙으로 좁히고, 표시 문구 길이와 개수도 제한한다.
 /// 하나라도 규칙을 어기면 카탈로그 전체를 버린다 — 일부만 살리면 어떤 목록이
 /// 화면에 있는지 예측할 수 없다.
-fn validate_provider_catalog(
-    source: ProviderId,
-    catalog: &ProposedProviderCatalog,
-) -> Result<(), CoreError> {
-    let invalid = |reason: &str| Err(validation_error(CATALOG_SUBJECT, reason));
-    if provider_publishes_model_catalog(source) && !catalog.models.is_empty() {
-        return invalid("CLI가 모델 목록을 직접 내보내는 공급자입니다");
-    }
+fn validate_provider_catalog(catalog: &ProposedProviderCatalog) -> Result<(), CoreError> {
+    // CLI가 목록을 직접 내보내는 공급자에도 제안을 받는다. 다만 그쪽에서 제안은 목록을
+    // 대체하지 않고 거르는 데만 쓰이므로(`apply_model_catalog_filter`), 환각이 실제
+    // 목록에 없는 모델을 만들어내도 화면에는 나타나지 않는다.
     if catalog.models.len() > MAX_PROPOSED_MODELS {
-        return invalid("모델이 24개를 넘습니다");
+        return validation_failure(CATALOG_SUBJECT, "모델이 24개를 넘습니다");
     }
     let mut seen = HashSet::new();
     for model in &catalog.models {
         if normalize_model(Some(model.model.clone())).ok().flatten() != Some(model.model.clone()) {
-            return invalid("모델 식별자가 규칙에 어긋납니다");
+            return validation_failure(CATALOG_SUBJECT, "모델 식별자가 규칙에 어긋납니다");
         }
         if !seen.insert(model.model.clone()) {
-            return invalid("모델 식별자가 중복됩니다");
+            return validation_failure(CATALOG_SUBJECT, "모델 식별자가 중복됩니다");
         }
         if !label_is_valid(&model.display_name) {
-            return invalid("모델 표시명 길이가 잘못됐습니다");
+            return validation_failure(CATALOG_SUBJECT, "모델 표시명 길이가 잘못됐습니다");
         }
         if !detail_is_valid(Some(&model.description)) {
-            return invalid("모델 설명이 너무 깁니다");
+            return validation_failure(CATALOG_SUBJECT, "모델 설명이 너무 깁니다");
         }
         validate_reasoning_options(&model.supported_reasoning_efforts)
             .map_err(|_| validation_error(CATALOG_SUBJECT, "모델별 추론 목록이 잘못됐습니다"))?;
@@ -446,7 +665,7 @@ fn validate_provider_catalog(
         .count()
         > 1
     {
-        return invalid("기본 모델이 둘 이상입니다");
+        return validation_failure(CATALOG_SUBJECT, "기본 모델이 둘 이상입니다");
     }
     validate_reasoning_options(&catalog.reasoning_efforts)?;
     Ok(())
@@ -461,6 +680,22 @@ enum CatalogProposalOutcome {
     Cleared,
     /// 유지할 제안도 새 제안도 없었다. 확인으로 볼 수 없는 상태.
     Missing,
+}
+
+/// 카탈로그 목록 하나에 제안의 세 상태를 적용한다.
+///
+/// `None`은 기존 값을 유지하고, 값이 있으면(빈 목록 포함) 그대로 교체한다. 빈 목록을
+/// 넘긴 경우는 결과가 비었다는 사실만으로는 구분할 수 없는 명시적 삭제이므로 함께
+/// 돌려준다. 모델과 추론 목록이 이 규칙을 각각 펼쳐 쓰지 않게 한곳에 둔다.
+fn merge_catalog_values<T: Clone>(
+    proposed: Option<Vec<T>>,
+    existing: Option<&[T]>,
+) -> (Vec<T>, bool) {
+    let explicitly_cleared = proposed.as_ref().is_some_and(Vec::is_empty);
+    let values = proposed
+        .or_else(|| existing.map(<[T]>::to_vec))
+        .unwrap_or_default();
+    (values, explicitly_cleared)
 }
 
 /// 제안된 모델·추론 카탈로그를 오버라이드에 반영한다. 넘기지 않은 목록은 기존 값을
@@ -478,23 +713,21 @@ fn apply_catalog_proposal(
     reasoning_efforts: Option<Vec<ChatReasoningOption>>,
 ) -> Result<CatalogProposalOutcome, CoreError> {
     let key = source.as_str().to_owned();
+    let existing = overrides.catalogs.get(&key);
+    let (models, models_cleared) =
+        merge_catalog_values(models, existing.map(|catalog| catalog.models.as_slice()));
+    let (reasoning_efforts, reasoning_efforts_cleared) = merge_catalog_values(
+        reasoning_efforts,
+        existing.map(|catalog| catalog.reasoning_efforts.as_slice()),
+    );
     // 빈 목록은 '지워 달라'는 명시적 요청이다. 아무것도 넘기지 않아 비어 있는 것과 달리
     // 제안 없는 상태가 의도된 결과이므로, 재조사가 안 끝난 것으로 보고하지 않는다.
-    let cleared = models.as_ref().is_some_and(|models| models.is_empty())
-        || reasoning_efforts
-            .as_ref()
-            .is_some_and(|efforts| efforts.is_empty());
-    let existing = overrides.catalogs.get(&key);
+    let cleared = models_cleared || reasoning_efforts_cleared;
     let catalog = ProposedProviderCatalog {
-        models: models
-            .or_else(|| existing.map(|catalog| catalog.models.clone()))
-            .unwrap_or_default(),
-        reasoning_efforts: reasoning_efforts
-            .or_else(|| existing.map(|catalog| catalog.reasoning_efforts.clone()))
-            .unwrap_or_default(),
+        models,
+        reasoning_efforts,
         cli_version: overrides
-            .discovered
-            .get(&key)
+            .discovered_record(source)
             .and_then(|record| record.cli_version.clone()),
         updated_at: now_ms(),
     };
@@ -508,27 +741,26 @@ fn apply_catalog_proposal(
             CatalogProposalOutcome::Missing
         });
     }
-    validate_provider_catalog(source, &catalog)?;
+    validate_provider_catalog(&catalog)?;
     overrides.catalogs.insert(key, catalog);
     Ok(CatalogProposalOutcome::Recorded)
 }
 
 fn validate_reasoning_options(options: &[ChatReasoningOption]) -> Result<(), CoreError> {
-    let invalid = |reason: &str| Err(validation_error(CATALOG_SUBJECT, reason));
     if options.len() > MAX_PROPOSED_REASONING_OPTIONS {
-        return invalid("추론 수준이 12개를 넘습니다");
+        return validation_failure(CATALOG_SUBJECT, "추론 수준이 12개를 넘습니다");
     }
     let mut seen = HashSet::new();
     for option in options {
         // 역직렬화가 이미 문법을 걸렀지만, 코드에서 만든 값도 같은 규칙을 지나게 한다.
         if !effort_name_is_valid(option.effort.as_str()) {
-            return invalid("추론 수준 이름이 규칙에 어긋납니다");
+            return validation_failure(CATALOG_SUBJECT, "추론 수준 이름이 규칙에 어긋납니다");
         }
         if !seen.insert(option.effort.as_str().to_owned()) {
-            return invalid("추론 수준이 중복됩니다");
+            return validation_failure(CATALOG_SUBJECT, "추론 수준이 중복됩니다");
         }
         if !detail_is_valid(Some(&option.description)) {
-            return invalid("추론 수준 설명이 너무 깁니다");
+            return validation_failure(CATALOG_SUBJECT, "추론 수준 설명이 너무 깁니다");
         }
     }
     Ok(())
@@ -563,6 +795,20 @@ impl DiscoveredSettingsSchema {
             && self.cli_version.as_deref() == cli_version
             && self.probe_revision == CURRENT_PROBE_REVISION
     }
+
+    /// 화면에 내보낼 조사 결과가 같은지. 설치 경로·버전 같은 조사 메타데이터는
+    /// 달라도 항목과 추론 목록이 같으면 갱신 시각을 유지한다.
+    fn has_same_values(&self, other: &Self) -> bool {
+        self.fields == other.fields && self.reasoning_efforts == other.reasoning_efforts
+    }
+
+    /// 조사 결과가 같을 때 재조사를 건너뛸 수 있는 설치 메타데이터만 최신으로 맞춘다.
+    /// 값과 갱신 시각은 의도적으로 유지한다.
+    fn adopt_install_metadata(&mut self, other: Self) {
+        self.cli_version = other.cli_version;
+        self.executable_path = other.executable_path;
+        self.probe_revision = other.probe_revision;
+    }
 }
 
 fn schema_overrides_path(app_data_dir: &std::path::Path) -> PathBuf {
@@ -587,25 +833,29 @@ fn write_schema_overrides(
     Ok(())
 }
 
+/// 스키마 저장을 마친 갱신 경로의 공통 반환값.
+fn write_changed_schema_overrides(
+    app_data_dir: &std::path::Path,
+    overrides: &ChatSettingsSchemaOverrides,
+) -> Result<bool, CoreError> {
+    write_schema_overrides(app_data_dir, overrides)?;
+    Ok(true)
+}
+
 /// 해당 공급자의 실행설정 스키마가 마지막으로 바뀐 시각. AIA 제안(파일 단위)과
 /// 자동 조사(공급자 단위) 중 더 최근 것을 쓴다.
 fn schema_overrides_updated_at(
     source: ProviderId,
-    app_data_dir: Option<&std::path::Path>,
+    overrides: &ChatSettingsSchemaOverrides,
 ) -> Option<i64> {
-    let overrides = load_schema_overrides(app_data_dir?);
     let discovered = overrides
-        .discovered
-        .get(source.as_str())
+        .discovered_record(source)
         .map(|record| record.updated_at)
         .unwrap_or_default();
     let updated_at = overrides.updated_at.max(discovered);
     (updated_at > 0).then_some(updated_at)
 }
 
-/// 제안된 스키마 필드를 검증한다. 내장 항목은 선택지 값이 내장 값의 부분집합일 때만
-/// (재라벨·재배열·숨김) 허용하고, 새 항목은 동적 화이트리스트에 있어야 한다.
-/// AI가 생성한 스키마가 임의 CLI 플래그나 표시 폭주로 이어지지 않게 막는 신뢰 경계다.
 /// 스키마 항목 하나를 검증한다. 항목 자체의 표시 규칙을 먼저 보고, 선택지 값은
 /// 동적 화이트리스트 규칙과 내장 값 부분집합 규칙 중 해당하는 쪽으로 넘긴다.
 fn validate_schema_field(
@@ -613,15 +863,14 @@ fn validate_schema_field(
     field: &ChatSettingField,
     builtin: &[ChatSettingField],
 ) -> Result<(), CoreError> {
-    let invalid = |reason: &str| Err(validation_error(SCHEMA_SUBJECT, reason));
     if !label_is_valid(&field.label) {
-        return invalid("항목 라벨 길이가 잘못됐습니다");
+        return validation_failure(SCHEMA_SUBJECT, "항목 라벨 길이가 잘못됐습니다");
     }
     if !detail_is_valid(field.detail.as_deref()) {
-        return invalid("항목 설명이 너무 깁니다");
+        return validation_failure(SCHEMA_SUBJECT, "항목 설명이 너무 깁니다");
     }
     if field.options.len() > MAX_FIELD_OPTIONS {
-        return invalid("선택지가 12개를 넘습니다");
+        return validation_failure(SCHEMA_SUBJECT, "선택지가 12개를 넘습니다");
     }
     for option in &field.options {
         if option.value.is_empty()
@@ -629,7 +878,7 @@ fn validate_schema_field(
             || !label_is_valid(&option.label)
             || !detail_is_valid(option.detail.as_deref())
         {
-            return invalid("선택지 값 또는 라벨이 잘못됐습니다");
+            return validation_failure(SCHEMA_SUBJECT, "선택지 값 또는 라벨이 잘못됐습니다");
         }
     }
     // 동적 화이트리스트 항목(내장 여부와 무관)은 해당 값 규칙으로,
@@ -640,36 +889,22 @@ fn validate_schema_field(
     {
         validate_builtin_field_values(field, builtin_field)
     } else {
-        invalid("동적 화이트리스트에 없는 항목입니다")
+        validation_failure(SCHEMA_SUBJECT, "동적 화이트리스트에 없는 항목입니다")
     }
 }
 
-/// 화이트리스트 항목의 값 규칙(식별자 또는 정해진 목록)을 선택지와 기본값에 적용한다.
+/// 화이트리스트 항목의 식별자 규칙을 선택지와 기본값에 적용한다.
 fn validate_dynamic_field_values(
     field: &ChatSettingField,
     spec: &DynamicSettingSpec,
 ) -> Result<(), CoreError> {
-    if !field
-        .options
-        .iter()
-        .all(|option| spec.rule.accepts(&option.value))
-    {
-        return Err(validation_error(
-            SCHEMA_SUBJECT,
-            "동적 항목 선택지 값이 규칙에 어긋납니다",
-        ));
-    }
-    if field
-        .default_value
-        .as_deref()
-        .is_some_and(|default| !spec.rule.accepts(default))
-    {
-        return Err(validation_error(
-            SCHEMA_SUBJECT,
-            "동적 항목 기본값이 규칙에 어긋납니다",
-        ));
-    }
-    Ok(())
+    validate_field_values(
+        field,
+        |value| spec.accepts(value),
+        |value| spec.accepts(value),
+        "동적 항목 선택지 값이 규칙에 어긋납니다",
+        "동적 항목 기본값이 규칙에 어긋납니다",
+    )
 }
 
 /// 내장 enum 항목은 값 집합을 넓히지 못한다. 선택지는 내장 목록의 부분집합이어야 하고
@@ -678,9 +913,8 @@ fn validate_builtin_field_values(
     field: &ChatSettingField,
     builtin_field: &ChatSettingField,
 ) -> Result<(), CoreError> {
-    let invalid = |reason: &str| Err(validation_error(SCHEMA_SUBJECT, reason));
     if field.options.is_empty() {
-        return invalid("내장 항목의 선택지가 비었습니다");
+        return validation_failure(SCHEMA_SUBJECT, "내장 항목의 선택지가 비었습니다");
     }
     let allowed = |value: &str| {
         builtin_field
@@ -688,34 +922,55 @@ fn validate_builtin_field_values(
             .iter()
             .any(|allowed| allowed.value == value)
     };
-    if !field.options.iter().all(|option| allowed(&option.value)) {
-        return invalid("내장 항목에 허용되지 않은 선택지 값이 있습니다");
+    validate_field_values(
+        field,
+        allowed,
+        |default| field.options.iter().any(|option| option.value == default),
+        "내장 항목에 허용되지 않은 선택지 값이 있습니다",
+        "기본값이 선택지에 없습니다",
+    )
+}
+
+/// 선택지 전체와 기본값 하나에 각 허용 규칙을 적용하는 스키마 검증의 공통 뼈대.
+fn validate_field_values(
+    field: &ChatSettingField,
+    accepts_option: impl Fn(&str) -> bool,
+    accepts_default: impl Fn(&str) -> bool,
+    invalid_option: &str,
+    invalid_default: &str,
+) -> Result<(), CoreError> {
+    if !field
+        .options
+        .iter()
+        .all(|option| accepts_option(&option.value))
+    {
+        return validation_failure(SCHEMA_SUBJECT, invalid_option);
     }
     if field
         .default_value
         .as_deref()
-        .is_some_and(|default| !field.options.iter().any(|option| option.value == default))
+        .is_some_and(|default| !accepts_default(default))
     {
-        return invalid("기본값이 선택지에 없습니다");
+        return validation_failure(SCHEMA_SUBJECT, invalid_default);
     }
     Ok(())
 }
 
+/// 제안된 스키마 필드를 검증한다. 내장 항목은 선택지 값이 내장 값의 부분집합일 때만
+/// (재라벨·재배열·숨김) 허용하고, 새 항목은 동적 화이트리스트에 있어야 한다.
+/// AI가 생성한 스키마가 임의 CLI 플래그나 표시 폭주로 이어지지 않게 막는 신뢰 경계다.
 fn validate_schema_fields(
     source: ProviderId,
     fields: &[ChatSettingField],
 ) -> Result<(), CoreError> {
     if fields.len() > MAX_SCHEMA_FIELDS {
-        return Err(validation_error(SCHEMA_SUBJECT, "항목이 24개를 넘습니다"));
+        return validation_failure(SCHEMA_SUBJECT, "항목이 24개를 넘습니다");
     }
     let builtin = provider_setting_fields(source);
     let mut seen = HashSet::new();
     for field in fields {
         if field.key.is_empty() || field.key.len() > MAX_FIELD_KEY_LEN || !seen.insert(&field.key) {
-            return Err(validation_error(
-                SCHEMA_SUBJECT,
-                "항목 키가 비었거나 중복됩니다",
-            ));
+            return validation_failure(SCHEMA_SUBJECT, "항목 키가 비었거나 중복됩니다");
         }
         validate_schema_field(source, field, &builtin)?;
     }
@@ -726,9 +981,9 @@ fn validate_schema_fields(
 /// 파일이 외부에서 바뀔 수 있으므로 로드 때 다시 검증하고, 실패하면 이전 단계로 폴백한다.
 fn merged_setting_fields(
     source: ProviderId,
-    app_data_dir: Option<&std::path::Path>,
+    overrides: &ChatSettingsSchemaOverrides,
 ) -> Vec<ChatSettingField> {
-    let mut merged = overlaid_setting_fields(source, app_data_dir);
+    let mut merged = overlaid_setting_fields(source, overrides);
     // 어느 단계에서 온 항목이든, 그 공급자가 실행에 쓰지 못하는 항목은 내보내지 않는다.
     merged.retain(|field| provider_exposes_setting_field(source, &field.key));
     merged
@@ -736,15 +991,11 @@ fn merged_setting_fields(
 
 fn overlaid_setting_fields(
     source: ProviderId,
-    app_data_dir: Option<&std::path::Path>,
+    overrides: &ChatSettingsSchemaOverrides,
 ) -> Vec<ChatSettingField> {
     let base = provider_setting_fields(source);
-    let Some(app_data_dir) = app_data_dir else {
-        return base;
-    };
-    let overrides = load_schema_overrides(app_data_dir);
     // 조사 결과는 항목 추가·삭제까지 반영해야 하므로 목록 전체를 대체한다.
-    let mut merged = match overrides.discovered.get(source.as_str()) {
+    let mut merged = match overrides.discovered_record(source) {
         Some(record)
             if !record.fields.is_empty()
                 && validate_schema_fields(source, &record.fields).is_ok() =>
@@ -753,7 +1004,7 @@ fn overlaid_setting_fields(
         }
         _ => base.clone(),
     };
-    let Some(fields) = overrides.providers.get(source.as_str()) else {
+    let Some(fields) = overrides.proposed_fields(source) else {
         return merged;
     };
     if validate_schema_fields(source, fields).is_err() {
@@ -852,6 +1103,8 @@ fn provider_option_evidence(source: ProviderId) -> &'static [SettingOptionEviden
         ProviderId::Claude => CLAUDE_OPTION_EVIDENCE,
         ProviderId::Codex => CODEX_OPTION_EVIDENCE,
         ProviderId::Antigravity => ANTIGRAVITY_OPTION_EVIDENCE,
+        // 로컬 공급자는 Codex CLI를 띄우므로 같은 인터페이스 근거를 쓴다.
+        ProviderId::Local => CODEX_OPTION_EVIDENCE,
     }
 }
 
@@ -909,7 +1162,7 @@ fn discovered_setting_fields(
 fn provider_effort_flag(source: ProviderId) -> Option<&'static str> {
     match source {
         ProviderId::Claude | ProviderId::Antigravity => Some("--effort"),
-        ProviderId::Codex => None,
+        ProviderId::Codex | ProviderId::Local => None,
     }
 }
 
@@ -943,80 +1196,101 @@ fn discovered_reasoning_efforts(
             continue;
         }
         if let Some(effort) = ReasoningEffort::parse(value) {
-            options.push(ChatReasoningOption {
-                description: effort_description(&effort).to_owned(),
-                effort,
-            });
+            options.push(reasoning_option(effort));
         }
     }
     options
 }
 
+/// 실행 모드 선택지의 화면 문구. 어느 값이 존재하고 어느 공급자가 그 값을 받는지는
+/// `ChatMode`가 알고 있으므로(`ALL`·`as_str`·`is_supported_by`), 여기서는 문구만 적는다.
+fn mode_option_text(mode: ChatMode) -> (&'static str, &'static str) {
+    match mode {
+        ChatMode::Plan => ("읽기 전용", "분석·계획만"),
+        ChatMode::Workspace => ("작업공간 쓰기", "프로젝트 수정"),
+        ChatMode::FullAccess => ("전체 접근", "외부 경로 허용"),
+        ChatMode::Auto => ("자동 권한", "Claude auto 모드"),
+        ChatMode::DontAsk => ("추가 권한 차단", "Claude dontAsk 모드"),
+        ChatMode::Manual => ("수동 권한", "Claude manual 모드"),
+    }
+}
+
+fn mode_setting_field(source: ProviderId) -> ChatSettingField {
+    let options = ChatMode::ALL
+        .into_iter()
+        .filter(|mode| mode.is_supported_by(source))
+        .map(|mode| {
+            let (label, detail) = mode_option_text(mode);
+            setting_option(mode.as_str(), label, detail, false)
+        })
+        .collect();
+    setting_field(
+        "mode",
+        "실행 모드",
+        "권한 범위",
+        ChatSettingFieldKind::Enum,
+        options,
+        Some("workspace"),
+    )
+}
+
+/// 승인 처리 선택지의 화면 문구.
+fn approval_mode_option_text(mode: ChatApprovalMode) -> (&'static str, &'static str) {
+    match mode {
+        ChatApprovalMode::Manual => ("직접 승인", "사용자 확인"),
+        ChatApprovalMode::AutoReview => ("자동 검토", "위험도 판단"),
+        ChatApprovalMode::Granular => ("세분화 승인", "승인 종류별 제어"),
+        ChatApprovalMode::OnFailure => ("실패 시 승인", "샌드박스 실패 후 요청"),
+        ChatApprovalMode::Never => ("승인 없이 실행", "모드 범위 내"),
+    }
+}
+
+fn approval_mode_setting_field(source: ProviderId) -> ChatSettingField {
+    let codex = source == ProviderId::Codex;
+    let options = ChatApprovalMode::ALL
+        .into_iter()
+        .filter_map(|mode| {
+            let (label, detail) = approval_mode_option_text(mode);
+            if mode.is_supported_by(source) {
+                return Some(setting_option(mode.as_str(), label, detail, false));
+            }
+            // 자동 검토는 Codex의 기본값이라 쓰지 못하는 공급자에서도 회색으로 남겨
+            // 왜 고를 수 없는지 보이게 한다. 나머지 Codex 전용 값은 목록에서 뺀다.
+            (mode == ChatApprovalMode::AutoReview)
+                .then(|| setting_option(mode.as_str(), label, "Codex 전용", true))
+        })
+        .collect();
+    setting_field(
+        "approvalMode",
+        "승인 처리",
+        "명령 · 파일 · 추가 권한",
+        ChatSettingFieldKind::Enum,
+        options,
+        Some(if codex { "autoReview" } else { "manual" }),
+    )
+}
+
+fn fallback_model_setting_field() -> ChatSettingField {
+    setting_field(
+        "fallbackModel",
+        "예비 모델",
+        "기본 모델 과부하 시 자동 전환",
+        ChatSettingFieldKind::Text,
+        Vec::new(),
+        None,
+    )
+}
+
 /// 실행설정 항목 스키마. 프론트는 이 목록을 그대로 렌더링하므로,
 /// 항목·선택지를 바꾸면 UI가 함께 바뀐다. 프론트 fallbackSettingFields와 내용을 맞출 것.
 fn provider_setting_fields(source: ProviderId) -> Vec<ChatSettingField> {
-    let codex = source == ProviderId::Codex;
-    let claude = source == ProviderId::Claude;
-    let mut mode_options = vec![
-        setting_option("plan", "읽기 전용", "분석·계획만", false),
-        setting_option("workspace", "작업공간 쓰기", "프로젝트 수정", false),
-        setting_option("fullAccess", "전체 접근", "외부 경로 허용", false),
-    ];
-    if claude {
-        mode_options.extend([
-            setting_option("auto", "자동 권한", "Claude auto 모드", false),
-            setting_option("dontAsk", "추가 권한 차단", "Claude dontAsk 모드", false),
-            setting_option("manual", "수동 권한", "Claude manual 모드", false),
-        ]);
-    }
-    let mut approval_options = vec![
-        setting_option("manual", "직접 승인", "사용자 확인", false),
-        if codex {
-            setting_option("autoReview", "자동 검토", "위험도 판단", false)
-        } else {
-            setting_option("autoReview", "자동 검토", "Codex 전용", true)
-        },
-    ];
-    if codex {
-        approval_options.extend([
-            setting_option("granular", "세분화 승인", "승인 종류별 제어", false),
-            setting_option("onFailure", "실패 시 승인", "샌드박스 실패 후 요청", false),
-        ]);
-    }
-    approval_options.push(setting_option(
-        "never",
-        "승인 없이 실행",
-        "모드 범위 내",
-        false,
-    ));
     let mut fields = vec![
-        ChatSettingField {
-            key: "mode".to_owned(),
-            label: "실행 모드".to_owned(),
-            detail: Some("권한 범위".to_owned()),
-            kind: ChatSettingFieldKind::Enum,
-            options: mode_options,
-            default_value: Some("workspace".to_owned()),
-        },
-        ChatSettingField {
-            key: "approvalMode".to_owned(),
-            label: "승인 처리".to_owned(),
-            detail: Some("명령 · 파일 · 추가 권한".to_owned()),
-            kind: ChatSettingFieldKind::Enum,
-            options: approval_options,
-            default_value: Some(if codex { "autoReview" } else { "manual" }.to_owned()),
-        },
+        mode_setting_field(source),
+        approval_mode_setting_field(source),
     ];
     // 화이트리스트에 등록된 동적 항목을 스키마에 노출한다. Claude --fallback-model이 첫 사례.
     if source == ProviderId::Claude {
-        fields.push(ChatSettingField {
-            key: "fallbackModel".to_owned(),
-            label: "예비 모델".to_owned(),
-            detail: Some("기본 모델 과부하 시 자동 전환".to_owned()),
-            kind: ChatSettingFieldKind::Text,
-            options: Vec::new(),
-            default_value: None,
-        });
+        fields.push(fallback_model_setting_field());
     }
     fields
 }
@@ -1024,37 +1298,18 @@ fn provider_setting_fields(source: ProviderId) -> Vec<ChatSettingField> {
 fn load_codex_model_catalog(
     executable: &std::path::Path,
 ) -> Result<Vec<ChatModelOption>, CoreError> {
-    let mut command = Command::new(executable);
-    command
-        .args(["app-server", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    configure_headless_command(&mut command);
-    let mut child = command.spawn().map_err(|error| {
-        CoreError::Runtime(format!("Codex 모델 목록을 시작하지 못했습니다: {error}"))
+    let mut child = spawn_model_catalog_child(executable, CODEX_CATALOG_SUBJECT, |command| {
+        command
+            .args(["app-server", "--stdio"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
     })?;
     let result = (|| {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            CoreError::Runtime("Codex 모델 목록 stdin을 열지 못했습니다".to_owned())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            CoreError::Runtime("Codex 모델 목록 stdout을 열지 못했습니다".to_owned())
-        })?;
+        let mut stdin = take_child_stdin(&mut child, "Codex 모델 목록")?;
+        let stdout = take_child_stdout(&mut child, "Codex 모델 목록")?;
         let mut reader = BufReader::new(stdout);
-        write_json_line(
-            &mut stdin,
-            &json!({
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "clientInfo": {"name": "agent-manager", "title": "Agent Manager", "version": env!("CARGO_PKG_VERSION")},
-                    "capabilities": {"experimentalApi": true}
-                }
-            }),
-        )?;
-        read_rpc_result(&mut reader, 1)?;
-        write_json_line(&mut stdin, &json!({"method": "initialized"}))?;
+        codex_app_server_initialize(&mut stdin, &mut reader)?;
 
         let mut models = Vec::new();
         let mut cursor: Option<String> = None;
@@ -1064,7 +1319,11 @@ fn load_codex_model_catalog(
                 &json!({
                     "id": request_id,
                     "method": "model/list",
-                    "params": {"cursor": cursor, "includeHidden": false}
+                    // 숨김 모델도 받는다. `visibility:"hide"`라도 실행은 되고(2026-09-20 실측:
+                    // gpt-reserve로 222,631토큰 소비 확인) 별도 사용풀 없이 같은 한도를 깎는다.
+                    // 응답에는 visibility 필드가 없어 어느 쪽이 숨김인지 알 수 없으므로,
+                    // 사람이 고를 대상이 아닌 것은 parse_codex_model이 이름으로 거른다.
+                    "params": {"cursor": cursor, "includeHidden": true}
                 }),
             )?;
             let page = read_rpc_result(&mut reader, request_id)?;
@@ -1081,9 +1340,73 @@ fn load_codex_model_catalog(
         }
         Ok(models)
     })();
+    discard_model_catalog_child(&mut child);
+    result
+}
+
+/// 모델 카탈로그 조회에서 공급자를 가리키는 이름. 실패 문구가 모두 이 이름으로 시작한다.
+const CODEX_CATALOG_SUBJECT: &str = "Codex";
+const ANTIGRAVITY_CATALOG_SUBJECT: &str = "Antigravity";
+
+/// 조회 자식이 아직 사는지 다시 보기까지의 간격.
+const MODEL_CATALOG_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// 모델 카탈로그 조회용 자식을 띄운다. 두 공급자 조회가 같은 순서로 헤드리스 설정을
+/// 얹고 같은 모양의 기동 실패 문구를 적고 있어 한 자리로 모았다. 갈리는 것은 인자와
+/// 파이프 구성뿐이라 그것만 받는다.
+fn spawn_model_catalog_child(
+    executable: &std::path::Path,
+    subject: &str,
+    configure: impl FnOnce(&mut Command),
+) -> Result<Child, CoreError> {
+    let mut command = Command::new(executable);
+    configure(&mut command);
+    configure_headless_command(&mut command);
+    command.spawn().map_err(|error| {
+        CoreError::Runtime(format!(
+            "{subject} 모델 목록을 시작하지 못했습니다: {error}"
+        ))
+    })
+}
+
+/// 조회 자식이 마감 시한 안에 끝나기를 기다린다. 네트워크 조회라 응답이 없으면 멈출 수
+/// 있어 시한을 두고, 시한 초과와 상태 확인 실패 두 갈래가 각자 자식 회수를 되풀이하던
+/// 것을 여기로 모았다. 정상 종료한 자식은 `try_wait`이 이미 회수했으므로 그대로 돌려준다.
+fn wait_for_model_catalog_exit(
+    child: &mut Child,
+    subject: &str,
+    timeout: Duration,
+) -> Result<ExitStatus, CoreError> {
+    let mut exited = None;
+    let finished = crate::chat::poll_until(timeout, MODEL_CATALOG_POLL_INTERVAL, || {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exited = Some(status);
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(error) => Err(CoreError::Runtime(format!(
+                "{subject} 모델 목록 상태를 확인하지 못했습니다: {error}"
+            ))),
+        }
+    });
+    if let Some(status) = exited {
+        return Ok(status);
+    }
+    // 끝나지 않은 채 시한이 다했거나 상태 확인이 실패했다. 어느 쪽이든 자식은 회수한다.
+    discard_model_catalog_child(child);
+    Err(match finished {
+        Err(error) => error,
+        _ => CoreError::Runtime(format!("{subject} 모델 목록 조회 시간이 초과되었습니다")),
+    })
+}
+
+/// 모델 카탈로그 조회가 끝난 자식은 종료를 요청한 뒤 회수한다. Codex의 정상 조회와
+/// Antigravity의 실패 경로가 같은 두 단계를 쓰되, 본래처럼 정리 오류는 조회 결과를
+/// 덮지 않게 한다.
+fn discard_model_catalog_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
-    result
 }
 
 fn parse_codex_model(value: &Value) -> Option<ChatModelOption> {
@@ -1097,10 +1420,7 @@ fn parse_codex_model(value: &Value) -> Option<ChatModelOption> {
         // CLI가 주는 description은 영문이라 화면 문구가 섞이고 선택 박스 폭도 넘친다.
         .filter_map(|option| {
             let effort = ReasoningEffort::parse(option.get("reasoningEffort")?.as_str()?)?;
-            Some(ChatReasoningOption {
-                description: effort_description(&effort).to_owned(),
-                effort,
-            })
+            Some(reasoning_option(effort))
         })
         .collect();
     Some(ChatModelOption {
@@ -1132,41 +1452,21 @@ fn parse_codex_model(value: &Value) -> Option<ChatModelOption> {
 fn load_antigravity_model_catalog(
     executable: &std::path::Path,
 ) -> Result<Vec<ChatModelOption>, CoreError> {
-    let mut command = Command::new(executable);
-    command
-        .arg("models")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    configure_headless_command(&mut command);
-    let mut child = command.spawn().map_err(|error| {
-        CoreError::Runtime(format!(
-            "Antigravity 모델 목록을 시작하지 못했습니다: {error}"
-        ))
-    })?;
-    let deadline = Instant::now() + ANTIGRAVITY_MODELS_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(CoreError::Runtime(
-                        "Antigravity 모델 목록 조회 시간이 초과되었습니다".to_owned(),
-                    ));
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(CoreError::Runtime(format!(
-                    "Antigravity 모델 목록 상태를 확인하지 못했습니다: {error}"
-                )));
-            }
-        }
-    };
+    let mut child =
+        spawn_model_catalog_child(executable, ANTIGRAVITY_CATALOG_SUBJECT, |command| {
+            let (update_key, update_value) = crate::antigravity_usage::no_auto_update_env();
+            command
+                .arg("models")
+                .env(update_key, update_value)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+        })?;
+    let status = wait_for_model_catalog_exit(
+        &mut child,
+        ANTIGRAVITY_CATALOG_SUBJECT,
+        ANTIGRAVITY_MODELS_TIMEOUT,
+    )?;
     if !status.success() {
         return Err(CoreError::Runtime(
             "Antigravity CLI가 모델 목록 조회에 실패했습니다. 로그인 상태를 확인하세요".to_owned(),
@@ -1209,6 +1509,26 @@ fn parse_antigravity_models(stdout: &str) -> Vec<ChatModelOption> {
         .collect()
 }
 
+/// 검증을 마친 필드 제안을 저장본에 반영한다. `None`은 기존 제안을 유지하고,
+/// 빈 목록은 삭제하며, 값이 있으면 통째로 교체한다.
+fn apply_field_proposal(
+    source: ProviderId,
+    overrides: &mut ChatSettingsSchemaOverrides,
+    fields: Option<Vec<ChatSettingField>>,
+) -> bool {
+    let proposed = fields.is_some();
+    if let Some(fields) = fields {
+        if fields.is_empty() {
+            overrides.providers.remove(source.as_str());
+        } else {
+            overrides
+                .providers
+                .insert(source.as_str().to_owned(), fields);
+        }
+    }
+    proposed
+}
+
 /// AIA 디스커버리가 조사한 항목·모델·추론 카탈로그를 검증해 저장본에 반영한다.
 ///
 /// 진입점이 여기 하나뿐이라 저장 구조체와 검증 규칙이 모듈 밖으로 새지 않는다.
@@ -1223,16 +1543,7 @@ pub(crate) fn propose_schema(
         validate_schema_fields(source, fields)?;
     }
     let mut overrides = load_schema_overrides(app_data_dir);
-    let proposed_fields = fields.is_some();
-    if let Some(fields) = fields {
-        if fields.is_empty() {
-            overrides.providers.remove(source.as_str());
-        } else {
-            overrides
-                .providers
-                .insert(source.as_str().to_owned(), fields);
-        }
-    }
+    let proposed_fields = apply_field_proposal(source, &mut overrides, fields);
     // 목록을 넘기지 않은 호출도 카탈로그 단계를 지난다. 기존 제안을 그대로 둔 채
     // CLI 버전만 다시 새기지 않으면 `catalog_stale`이 계속 서서, 화면의 자동 재조사가
     // 같은 CLI 버전에서 같은 요청을 반복해 보낸다.
@@ -1269,8 +1580,7 @@ pub(crate) fn refresh_discovered_schema(
         if overrides.discovered.remove(&key).is_none() {
             return Ok(false);
         }
-        write_schema_overrides(app_data_dir, &overrides)?;
-        return Ok(true);
+        return write_changed_schema_overrides(app_data_dir, &overrides);
     };
     let executable_path = executable.to_string_lossy().into_owned();
     if !force
@@ -1294,30 +1604,86 @@ pub(crate) fn refresh_discovered_schema(
         probe_revision: CURRENT_PROBE_REVISION,
         updated_at: now_ms(),
     };
-    if overrides.discovered.get(&key).is_some_and(|previous| {
-        previous.fields == record.fields && previous.reasoning_efforts == record.reasoning_efforts
-    }) {
+    if overrides
+        .discovered
+        .get(&key)
+        .is_some_and(|previous| previous.has_same_values(&record))
+    {
         // 항목이 그대로면 갱신 시각을 흔들지 않고, 재조사를 건너뛸 수 있도록
         // 조사 대상 버전·경로만 최신으로 맞춘다.
         let previous = overrides.discovered.get_mut(&key).expect("직전에 확인함");
         if previous.matches_install(record.executable_path.as_deref(), cli_version) {
             return Ok(false);
         }
-        previous.cli_version = record.cli_version;
-        previous.executable_path = record.executable_path;
-        previous.probe_revision = record.probe_revision;
-        write_schema_overrides(app_data_dir, &overrides)?;
-        return Ok(true);
+        previous.adopt_install_metadata(record);
+        return write_changed_schema_overrides(app_data_dir, &overrides);
     }
     overrides.discovered.insert(key, record);
-    write_schema_overrides(app_data_dir, &overrides)?;
-    Ok(true)
+    write_changed_schema_overrides(app_data_dir, &overrides)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chat::ChatSupervisor;
+
+    #[test]
+    fn local_publishes_its_model_catalog() {
+        // 목록의 출처가 CLI가 아니라 서빙 서버일 뿐, 실제 존재하는 모델이라 제안보다 세다.
+        assert!(provider_publishes_model_catalog(ProviderId::Local));
+    }
+
+    #[test]
+    fn local_models_do_not_come_from_a_cli() {
+        // 목록은 CLI 가 아니라 연결마다 서빙 서버에 묻는다(M7 7.3).
+        assert!(load_cli_models(ProviderId::Local).is_none());
+    }
+
+    #[test]
+    fn local_connections_are_listed_but_an_off_connection_is_not_probed() {
+        // 저장본이 없으면 기본 연결 하나뿐이고 꺼져 있다(빈 주소). HTTP 를 걸지 않고
+        // 목록 항목으로만 나온다 — 화면이 "연결 없음"과 "서버 못 찾음"을 가른다.
+        let dir = schema_dir();
+        let list = local_connection_options(dir.path()).expect("목록");
+        assert_eq!(list.len(), 1);
+        assert!(list[0].is_default);
+        assert!(!list[0].enabled);
+        assert!(list[0].models.is_empty());
+        assert!(list[0].catalog_error.is_none());
+        let options = load_chat_provider_options(ProviderId::Local, Some(dir.path()));
+        assert_eq!(options.local_connections.len(), 1);
+        assert!(options.models.is_empty());
+        assert!(options.catalog_error.is_none());
+    }
+
+    #[test]
+    fn local_model_options_mark_only_the_saved_default() {
+        let options = local_model_options_from(
+            vec!["qwen3.5:9b".to_owned(), "gpt-oss:20b".to_owned()],
+            "gpt-oss:20b",
+        );
+        let defaults: Vec<&str> = options
+            .iter()
+            .filter(|option| option.is_default)
+            .map(|option| option.model.as_str())
+            .collect();
+        assert_eq!(defaults, vec!["gpt-oss:20b"]);
+        // 표시명은 서버가 준 이름 그대로다. `ollama list`에서 보는 이름과 같아야 한다.
+        assert_eq!(options[0].display_name, "qwen3.5:9b");
+    }
+
+    #[test]
+    fn local_model_options_leave_the_default_unset_when_it_is_not_listed() {
+        // 목록 밖 이름을 자유 입력했을 수 있다. 첫 항목을 올리면 저장된 선택을 말없이 바꾼다.
+        let options =
+            local_model_options_from(vec!["qwen3.5:9b".to_owned()], "직접-적은-다른-이름");
+        assert!(options.iter().all(|option| !option.is_default));
+        // 카탈로그 필터를 지나도 마찬가지다. 다른 공급자처럼 첫 항목을 기본으로 올리면
+        // 실행설정은 그 모델을 약속하고 기동은 저장값으로 거절한다.
+        let filtered = apply_model_catalog_filter(ProviderId::Local, options, None);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.iter().all(|option| !option.is_default));
+    }
 
     /// 시험용 앱 데이터 디렉터리. 열두 곳이 같은 한 줄을 손으로 되풀이했다.
     fn schema_dir() -> tempfile::TempDir {
@@ -1339,6 +1705,80 @@ mod tests {
     fn supervisor_at(dir: &tempfile::TempDir) -> ChatSupervisor {
         ChatSupervisor::with_app_data_dir(dir.path().to_path_buf())
             .expect("supervisor with app data dir")
+    }
+
+    /// 저장본을 읽어 그 공급자의 항목 목록을 만든다. 생산 경로는 저장본을 한 번만
+    /// 읽어 넘기므로, 시험도 같은 순서를 밟되 읽기만 여기서 대신한다.
+    fn stored_setting_fields(source: ProviderId, dir: &std::path::Path) -> Vec<ChatSettingField> {
+        merged_setting_fields(source, &load_schema_overrides(dir))
+    }
+
+    fn stored_updated_at(source: ProviderId, dir: &std::path::Path) -> Option<i64> {
+        schema_overrides_updated_at(source, &load_schema_overrides(dir))
+    }
+
+    /// 실행설정 시험이 필드 키를 찾을 때마다 같은 순회를 펼치지 않게 한다.
+    fn setting_field<'a>(fields: &'a [ChatSettingField], key: &str) -> &'a ChatSettingField {
+        fields
+            .iter()
+            .find(|field| field.key == key)
+            .unwrap_or_else(|| panic!("{key} field"))
+    }
+
+    /// 자식이 곧바로 끝나는 명령. 무엇이 도는지는 상관없고 종료 코드만 보지만, 실행
+    /// 파일 이름은 플랫폼마다 다르다.
+    fn finished_child_command() -> Command {
+        #[cfg(unix)]
+        {
+            Command::new("/usr/bin/true")
+        }
+        #[cfg(windows)]
+        {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "exit", "0"]);
+            command
+        }
+    }
+
+    /// 시한이 지나도록 살아 있는 자식. `sleep`은 Windows에 없어 `ping`의 간격을 쓴다.
+    fn long_running_child_command() -> Command {
+        #[cfg(unix)]
+        {
+            let mut command = Command::new("/bin/sleep");
+            command.arg("30");
+            command
+        }
+        #[cfg(windows)]
+        {
+            let mut command = Command::new("ping");
+            command.args(["-n", "31", "127.0.0.1"]);
+            command.stdout(std::process::Stdio::null());
+            command
+        }
+    }
+
+    #[test]
+    fn model_catalog_wait_returns_the_exit_status_of_a_finished_child() {
+        let mut child = finished_child_command().spawn().expect("조회 자식 기동");
+        let status = wait_for_model_catalog_exit(&mut child, "시험", Duration::from_secs(5))
+            .expect("자식 종료 대기");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn model_catalog_wait_reports_a_timeout_and_reclaims_the_child() {
+        let mut child = long_running_child_command()
+            .spawn()
+            .expect("조회 자식 기동");
+        let error = wait_for_model_catalog_exit(&mut child, "시험", Duration::from_millis(100))
+            .expect_err("시한 초과");
+        assert!(
+            matches!(&error, CoreError::Runtime(message) if message.contains("시한")
+                || message.contains("초과")),
+            "시한 초과 문구여야 한다: {error:?}"
+        );
+        // 시한을 넘긴 자식은 회수되어 다시 기다릴 것이 남지 않는다.
+        assert!(child.try_wait().expect("자식 상태 조회").is_some());
     }
 
     #[test]
@@ -1383,6 +1823,100 @@ mod tests {
     }
 
     #[test]
+    fn codex_catalog_keeps_hidden_models_it_can_run() {
+        // `includeHidden: true`로 받은 숨김 모델도 파서를 그대로 지난다. 무엇을 감출지는
+        // 파서가 아니라 조립 단계가 정한다.
+        let reserve = parse_codex_model(&json!({
+            "model": "gpt-reserve",
+            "displayName": "GPT-Reserve",
+            "description": "Fast and affordable agentic coding model.",
+            "isDefault": false,
+            "defaultReasoningEffort": "medium",
+            "supportedReasoningEfforts": [{"reasoningEffort": "low"}]
+        }))
+        .expect("숨김 모델도 카탈로그에 남아야 한다");
+        assert_eq!(reserve.model, "gpt-reserve");
+        assert_eq!(reserve.display_name, "GPT-Reserve");
+    }
+
+    /// CLI가 내보낸 모양을 흉내 낸 최소 모델.
+    fn cli_model(id: &str, is_default: bool) -> ChatModelOption {
+        ChatModelOption {
+            model: id.to_owned(),
+            display_name: id.to_ascii_uppercase(),
+            description: String::new(),
+            is_default,
+            default_reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+        }
+    }
+
+    fn proposed_catalog(ids: &[&str]) -> ProposedProviderCatalog {
+        ProposedProviderCatalog {
+            models: ids.iter().map(|id| cli_model(id, false)).collect(),
+            reasoning_efforts: Vec::new(),
+            cli_version: None,
+            updated_at: 0,
+        }
+    }
+
+    fn model_ids(models: &[ChatModelOption]) -> Vec<&str> {
+        models.iter().map(|model| model.model.as_str()).collect()
+    }
+
+    #[test]
+    fn codex_proposal_filters_the_cli_list_instead_of_replacing_it() {
+        let cli = || {
+            vec![
+                cli_model("gpt-5.6-sol", true),
+                cli_model("gpt-reserve", false),
+                cli_model("codex-auto-review", false),
+            ]
+        };
+
+        // 제안이 없으면 기본 제외 목록만 덜어낸다. 숨김이어도 고를 수 있는 것은 남는다.
+        let defaulted = apply_model_catalog_filter(ProviderId::Codex, cli(), None);
+        assert_eq!(model_ids(&defaulted), vec!["gpt-5.6-sol", "gpt-reserve"]);
+
+        // 제안이 있으면 그 식별자만 남는다. 기본 제외 목록보다 명시 제안이 우선이라
+        // 내부 모델도 부르면 나온다.
+        let catalog = proposed_catalog(&["gpt-5.6-sol", "codex-auto-review"]);
+        let filtered = apply_model_catalog_filter(ProviderId::Codex, cli(), Some(&catalog));
+        assert_eq!(
+            model_ids(&filtered),
+            vec!["gpt-5.6-sol", "codex-auto-review"]
+        );
+        // 표시 메타는 제안이 아니라 CLI가 준 것을 그대로 쓴다.
+        assert_eq!(filtered[0].display_name, "GPT-5.6-SOL");
+
+        // CLI에 없는 식별자는 제안에 있어도 만들어내지 않는다.
+        let ghost = proposed_catalog(&["gpt-5.6-sol", "gpt-9-ghost"]);
+        let filtered = apply_model_catalog_filter(ProviderId::Codex, cli(), Some(&ghost));
+        assert_eq!(model_ids(&filtered), vec!["gpt-5.6-sol"]);
+    }
+
+    #[test]
+    fn codex_proposal_never_empties_the_model_list() {
+        let cli = vec![
+            cli_model("gpt-5.6-sol", true),
+            cli_model("gpt-reserve", false),
+        ];
+        // 지금 CLI에 하나도 없는 옛 제안은 목록을 비우는 대신 통째로 무시된다.
+        let stale = proposed_catalog(&["gpt-5.4-mini"]);
+        let filtered = apply_model_catalog_filter(ProviderId::Codex, cli.clone(), Some(&stale));
+        assert_eq!(model_ids(&filtered), vec!["gpt-5.6-sol", "gpt-reserve"]);
+
+        // 기본 모델이 필터에 걸려 빠지면 남은 첫 항목이 기본을 잇는다.
+        let without_default = proposed_catalog(&["gpt-reserve"]);
+        let filtered = apply_model_catalog_filter(ProviderId::Codex, cli, Some(&without_default));
+        assert_eq!(model_ids(&filtered), vec!["gpt-reserve"]);
+        assert!(
+            filtered[0].is_default,
+            "기본 모델이 비면 추론 기본값도 잃는다"
+        );
+    }
+
+    #[test]
     fn schema_overrides_merge_from_disk_and_fall_back_when_invalid() {
         let dir = schema_dir();
 
@@ -1397,11 +1931,8 @@ mod tests {
             "updatedAt": 1
         });
         write_stored_schema(&dir, &overrides);
-        let fields = merged_setting_fields(ProviderId::Claude, Some(dir.path()));
-        let mode = fields
-            .iter()
-            .find(|field| field.key == "mode")
-            .expect("mode");
+        let fields = stored_setting_fields(ProviderId::Claude, dir.path());
+        let mode = setting_field(&fields, "mode");
         assert_eq!(mode.options.len(), 1);
         assert_eq!(mode.default_value.as_deref(), Some("plan"));
         assert!(fields
@@ -1416,11 +1947,8 @@ mod tests {
             ]}
         });
         write_stored_schema(&dir, &hostile);
-        let fields = merged_setting_fields(ProviderId::Claude, Some(dir.path()));
-        let mode = fields
-            .iter()
-            .find(|field| field.key == "mode")
-            .expect("mode");
+        let fields = stored_setting_fields(ProviderId::Claude, dir.path());
+        let mode = setting_field(&fields, "mode");
         assert_eq!(mode.options.len(), 6);
         assert_eq!(mode.default_value.as_deref(), Some("workspace"));
 
@@ -1447,10 +1975,7 @@ mod tests {
         let fields = discovered_setting_fields(ProviderId::Codex, &interface);
         validate_schema_fields(ProviderId::Codex, &fields).expect("조사 결과도 검증을 통과한다");
 
-        let mode = fields
-            .iter()
-            .find(|field| field.key == "mode")
-            .expect("mode field");
+        let mode = setting_field(&fields, "mode");
         assert_eq!(
             mode.options
                 .iter()
@@ -1462,10 +1987,7 @@ mod tests {
         assert_eq!(mode.default_value.as_deref(), Some("workspace"));
 
         // 도움말에 있는 선택지와 바이너리/API로 검증된 숨은 선택지를 함께 유지한다.
-        let approval = fields
-            .iter()
-            .find(|field| field.key == "approvalMode")
-            .expect("approvalMode field");
+        let approval = setting_field(&fields, "approvalMode");
         assert_eq!(
             approval
                 .options
@@ -1484,10 +2006,7 @@ mod tests {
         );
         assert!(interface.is_reliable());
         let fields = discovered_setting_fields(ProviderId::Claude, &interface);
-        let mode = fields
-            .iter()
-            .find(|field| field.key == "mode")
-            .expect("mode field");
+        let mode = setting_field(&fields, "mode");
         assert_eq!(mode.options.len(), 6);
         // --fallback-model이 없는 도움말에서는 화이트리스트 동적 항목을 노출하지 않는다.
         assert!(!fields.iter().any(|field| field.key == "fallbackModel"));
@@ -1721,8 +2240,9 @@ mod tests {
             entry.is_default = true;
         }
         assert!(propose(ProviderId::Claude, duplicated_default).is_err());
-        // CLI가 모델 목록을 직접 내보내는 공급자에는 제안하지 못한다.
-        assert!(propose(ProviderId::Codex, vec![model("gpt-5.6-sol")]).is_err());
+        // CLI가 목록을 직접 내보내는 공급자에도 제안할 수 있지만(필터로 쓰인다)
+        // 식별자 규칙은 똑같이 지나야 한다.
+        assert!(propose(ProviderId::Codex, vec![model("gpt 5.6 sol")]).is_err());
         // 거부된 제안은 파일에 남지 않는다.
         assert!(load_schema_overrides(dir.path()).catalogs.is_empty());
 
@@ -1883,7 +2403,7 @@ mod tests {
         write_stored_schema(&dir, &stored);
 
         // 조사 결과는 항목 삭제까지 반영한다 (fallbackModel이 사라짐).
-        let fields = merged_setting_fields(ProviderId::Claude, Some(dir.path()));
+        let fields = stored_setting_fields(ProviderId::Claude, dir.path());
         assert_eq!(
             fields
                 .iter()
@@ -1892,13 +2412,10 @@ mod tests {
             vec!["mode", "approvalMode"]
         );
         // 갱신 시각은 제안과 조사 중 더 최근 것.
-        assert_eq!(
-            schema_overrides_updated_at(ProviderId::Claude, Some(dir.path())),
-            Some(20)
-        );
+        assert_eq!(stored_updated_at(ProviderId::Claude, dir.path()), Some(20));
         // 조사 기록이 없는 공급자는 내장 스키마를 그대로 쓴다.
         assert_eq!(
-            merged_setting_fields(ProviderId::Codex, Some(dir.path())),
+            stored_setting_fields(ProviderId::Codex, dir.path()),
             provider_setting_fields(ProviderId::Codex)
         );
 
@@ -1915,11 +2432,7 @@ mod tests {
         let options = supervisor
             .propose_chat_settings_schema(ProviderId::Claude, Some(proposed), None, None)
             .expect("proposal is accepted");
-        let mode = options
-            .settings
-            .iter()
-            .find(|field| field.key == "mode")
-            .expect("mode field");
+        let mode = setting_field(&options.settings, "mode");
         assert_eq!(mode.options.len(), 1);
         assert!(options
             .settings
@@ -1968,16 +2481,7 @@ mod tests {
         let retained = supervisor
             .propose_chat_settings_schema(ProviderId::Claude, None, None, None)
             .expect("omitted fields retain the proposal");
-        assert_eq!(
-            retained
-                .settings
-                .iter()
-                .find(|field| field.key == "mode")
-                .expect("mode field")
-                .options
-                .len(),
-            1
-        );
+        assert_eq!(setting_field(&retained.settings, "mode").options.len(), 1);
         assert!(load_schema_overrides(dir.path())
             .providers
             .contains_key("claude"));
@@ -1985,16 +2489,7 @@ mod tests {
         let cleared = supervisor
             .propose_chat_settings_schema(ProviderId::Claude, Some(Vec::new()), None, None)
             .expect("empty fields remove the proposal");
-        assert_eq!(
-            cleared
-                .settings
-                .iter()
-                .find(|field| field.key == "mode")
-                .expect("mode field")
-                .options
-                .len(),
-            6
-        );
+        assert_eq!(setting_field(&cleared.settings, "mode").options.len(), 6);
         assert!(!load_schema_overrides(dir.path())
             .providers
             .contains_key("claude"));
@@ -2028,16 +2523,13 @@ mod tests {
             )
             .expect("probe succeeds"));
 
-        let fields = merged_setting_fields(ProviderId::Codex, Some(dir.path()));
-        let mode = fields
-            .iter()
-            .find(|field| field.key == "mode")
-            .expect("mode field");
+        let fields = stored_setting_fields(ProviderId::Codex, dir.path());
+        let mode = setting_field(&fields, "mode");
         assert!(!mode
             .options
             .iter()
             .any(|option| option.value == "fullAccess"));
-        assert!(schema_overrides_updated_at(ProviderId::Codex, Some(dir.path())).is_some());
+        assert!(stored_updated_at(ProviderId::Codex, dir.path()).is_some());
 
         // 같은 실행 파일·같은 버전이면 다시 조사하지 않는다.
         assert!(!supervisor
@@ -2081,7 +2573,7 @@ mod tests {
             .refresh_discovered_chat_settings_schema(ProviderId::Claude, None, None, false)
             .expect("clearing succeeds"));
         assert_eq!(
-            merged_setting_fields(ProviderId::Claude, Some(dir.path())),
+            stored_setting_fields(ProviderId::Claude, dir.path()),
             provider_setting_fields(ProviderId::Claude)
         );
         // 지울 것이 없으면 파일을 다시 쓰지 않는다.
@@ -2094,10 +2586,7 @@ mod tests {
     fn provider_setting_fields_gate_auto_review_to_codex() {
         for source in [ProviderId::Claude, ProviderId::Antigravity] {
             let fields = provider_setting_fields(source);
-            let approval = fields
-                .iter()
-                .find(|field| field.key == "approvalMode")
-                .expect("approvalMode field");
+            let approval = setting_field(&fields, "approvalMode");
             let auto_review = approval
                 .options
                 .iter()
@@ -2108,10 +2597,7 @@ mod tests {
         }
 
         let fields = provider_setting_fields(ProviderId::Codex);
-        let approval = fields
-            .iter()
-            .find(|field| field.key == "approvalMode")
-            .expect("approvalMode field");
+        let approval = setting_field(&fields, "approvalMode");
         let auto_review = approval
             .options
             .iter()
@@ -2120,17 +2606,12 @@ mod tests {
         assert!(!auto_review.disabled);
         assert_eq!(approval.default_value.as_deref(), Some("autoReview"));
 
-        let mode = fields
-            .iter()
-            .find(|field| field.key == "mode")
-            .expect("mode field");
+        let mode = setting_field(&fields, "mode");
         assert_eq!(mode.options.len(), 3);
         assert_eq!(mode.default_value.as_deref(), Some("workspace"));
 
-        let claude_mode = provider_setting_fields(ProviderId::Claude)
-            .into_iter()
-            .find(|field| field.key == "mode")
-            .expect("Claude mode field");
+        let claude_fields = provider_setting_fields(ProviderId::Claude);
+        let claude_mode = setting_field(&claude_fields, "mode");
         assert_eq!(
             claude_mode
                 .options
@@ -2192,12 +2673,12 @@ mod tests {
     #[test]
     fn antigravity_hides_the_approval_setting_it_cannot_deliver() {
         let dir = tempfile::tempdir().expect("app data");
-        let fields = merged_setting_fields(ProviderId::Antigravity, Some(dir.path()));
+        let fields = stored_setting_fields(ProviderId::Antigravity, dir.path());
         assert!(fields.iter().any(|field| field.key == "mode"));
         assert!(!fields.iter().any(|field| field.key == "approvalMode"));
 
         for source in [ProviderId::Claude, ProviderId::Codex] {
-            let fields = merged_setting_fields(source, Some(dir.path()));
+            let fields = stored_setting_fields(source, dir.path());
             assert!(fields.iter().any(|field| field.key == "approvalMode"));
         }
     }

@@ -1,7 +1,13 @@
+import type { ProviderId } from "../types";
+
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
 const RELATIVE_UNITS: readonly [number, string][] = [
-  [86_400_000, "일"],
-  [3_600_000, "시간"],
-  [60_000, "분"],
+  [DAY_MS, "일"],
+  [HOUR_MS, "시간"],
+  [MINUTE_MS, "분"],
 ];
 
 const DATE_FORMATTER = new Intl.DateTimeFormat("ko-KR", {
@@ -13,10 +19,26 @@ const DATE_FORMATTER = new Intl.DateTimeFormat("ko-KR", {
 });
 
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"] as const;
+const BYTES_PER_UNIT = 1024;
+const EMPTY_PLACEHOLDER = "–";
 
-export function formatRelative(timestamp: number | null): string {
-  if (!timestamp) return "–";
-  const delta = Date.now() - timestamp;
+/** 큰 토큰 수의 축약 단위. 큰 임계값부터 골라야 1M이 1000.0K로 표시되지 않는다. */
+const TOKEN_UNITS: readonly [threshold: number, suffix: string][] = [
+  [1_000_000, "M"],
+  [1_000, "K"],
+];
+
+/** 지원 공급자와 화면 표시 이름을 타입으로 맞춰 새 공급자가 빠지면 빌드에서 드러나게 한다. */
+const SOURCE_NAMES: Record<ProviderId, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  antigravity: "Antigravity",
+  local: "Ollama",
+};
+
+export function formatRelative(timestamp: number | null, now: number = Date.now()): string {
+  if (!timestamp) return EMPTY_PLACEHOLDER;
+  const delta = now - timestamp;
   const future = delta < 0;
   const absolute = Math.abs(delta);
   for (const [size, label] of RELATIVE_UNITS) {
@@ -35,39 +57,39 @@ export function formatRelative(timestamp: number | null): string {
  */
 export function formatCountdown(remainingMs: number): string | null {
   if (!Number.isFinite(remainingMs) || remainingMs <= 0) return null;
-  const days = Math.floor(remainingMs / 86_400_000);
-  const hours = Math.floor((remainingMs % 86_400_000) / 3_600_000);
-  const minutes = Math.floor((remainingMs % 3_600_000) / 60_000);
+  const days = Math.floor(remainingMs / DAY_MS);
+  const hours = Math.floor((remainingMs % DAY_MS) / HOUR_MS);
+  const minutes = Math.floor((remainingMs % HOUR_MS) / MINUTE_MS);
   if (days > 0) return `${days}d ${hours}h`;
   if (hours > 0) return `${hours}h ${minutes}m`;
   return minutes > 0 ? `${minutes}m` : "<1m";
 }
 
 export function formatDate(timestamp: number | null): string {
-  if (!timestamp) return "–";
+  if (!timestamp) return EMPTY_PLACEHOLDER;
   return DATE_FORMATTER.format(new Date(timestamp));
 }
 
 export function formatBytes(value: number | null): string {
-  if (value === null) return "–";
+  if (value === null) return EMPTY_PLACEHOLDER;
   let size = value;
   let index = 0;
-  while (size >= 1024 && index < BYTE_UNITS.length - 1) {
-    size /= 1024;
+  while (size >= BYTES_PER_UNIT && index < BYTE_UNITS.length - 1) {
+    size /= BYTES_PER_UNIT;
     index += 1;
   }
-  return `${size >= 100 || index === 0 ? size.toFixed(0) : size.toFixed(1)} ${BYTE_UNITS[index]}`;
+  const digits = size >= 100 || index === 0 ? 0 : 1;
+  return `${size.toFixed(digits)} ${BYTE_UNITS[index]}`;
 }
 
 export function formatTokens(value: number | null): string {
-  if (value === null) return "–";
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  if (value === null) return EMPTY_PLACEHOLDER;
+  for (const [threshold, suffix] of TOKEN_UNITS) {
+    if (value >= threshold) return `${(value / threshold).toFixed(1)}${suffix}`;
+  }
   return value.toLocaleString();
 }
 
-export function sourceName(source: string): string {
-  if (source === "claude") return "Claude";
-  if (source === "codex") return "Codex";
-  return "Antigravity";
+export function sourceName(source: ProviderId): string {
+  return SOURCE_NAMES[source];
 }

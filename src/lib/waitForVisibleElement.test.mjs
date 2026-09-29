@@ -18,7 +18,6 @@ function fakeProbe({ appearsAtFrame, visibleAtFrame = appearsAtFrame }) {
         queueMicrotask(callback);
         return frame;
       },
-      cancelFrame() {},
       now: () => frame * 16,
     },
   };

@@ -6,22 +6,74 @@ use crate::chat::{ChatApprovalMode, ChatMode, ReasoningEffort};
 /// `FromStr` 세 벌을 변이-문자열 표 하나에서 만든다. 세 벌이 각자 적혀 있으면 값을
 /// 하나 늘릴 때 한 곳을 빠뜨려도 컴파일은 지나가고 해석만 조용히 어긋난다.
 /// `trimmed`를 붙이면 해석 전에 앞뒤 공백을 버린다(붙이지 않으면 정확히 일치해야 한다).
+/// `choices`는 `trimmed`에 더해 해석 실패 문구 뒤에 "a|b|c 중 하나를 쓰세요"를 붙인다 —
+/// 그 목록을 같은 표에서 뽑으므로 값을 늘렸을 때 안내 문구만 낡는 일이 없다. 같은 목록을
+/// `WIRE_CHOICES` 상수로도 내보내므로, 화면이 고를 수 있는 값을 나열해야 하는 자리도
+/// 변이를 손으로 다시 적지 않는다.
 /// 문자열을 되읽을 일이 없는 enum은 `display_only`를 붙여 `as_str`·`Display` 두 벌만 만든다.
+///
+/// 표의 오른쪽은 `"정규값"` 또는 `"정규값" | "별칭" | ...`이다. 별칭은 해석할 때만 받아
+/// 주고 `as_str`과 선택지 안내에는 정규값만 나온다 — 같은 값을 snake_case로도 받던
+/// 옛 요청 본문을 표 한 줄로 흡수하기 위한 자리다.
 fn wire_exact(value: &str) -> &str {
     value
+}
+
+/// 표에 없는 문자열을 오류로 바꾼다. `raw`는 받은 그대로, `normalized`는 표와 맞춰 본
+/// 값이다 — 어느 쪽을 문구에 싣는지는 각 만듦새가 정한다.
+pub(crate) fn wire_unknown(
+    message: &str,
+    raw: &str,
+    _normalized: &str,
+    _choices: &[&str],
+) -> crate::CoreError {
+    crate::CoreError::InvalidInput(format!("{message}: {raw}"))
+}
+
+/// 선택지까지 알리는 만듦새. 공백을 버린 값을 되돌려 주는 편이 "무엇을 보냈길래
+/// 거절됐는지"를 더 정확히 말해 준다.
+pub(crate) fn wire_unknown_with_choices(
+    message: &str,
+    _raw: &str,
+    normalized: &str,
+    choices: &[&str],
+) -> crate::CoreError {
+    crate::CoreError::InvalidInput(format!(
+        "{message}: {normalized}. {} 중 하나를 쓰세요",
+        choices.join("|")
+    ))
 }
 
 macro_rules! wire_enum {
     (display_only $name:ident, { $($variant:ident => $wire:literal,)+ }) => {
         wire_enum!(@names $name, { $($variant => $wire,)+ });
     };
-    (trimmed $name:ident, $message:literal, { $($variant:ident => $wire:literal,)+ }) => {
-        wire_enum!(@build $name, $message, str::trim, { $($variant => $wire,)+ });
+    (choices $name:ident, $message:literal, { $($variant:ident => $wire:literal $(| $alias:literal)*,)+ }) => {
+        wire_enum!(
+            @build $name, $message, str::trim, crate::domain::wire_unknown_with_choices,
+            { $($variant => $wire $(| $alias)*,)+ }
+        );
+
+        impl $name {
+            /// 이 enum이 받아들이는 정규값 전부. 해석 실패 안내가 쓰는 목록과 같은 표에서
+            /// 나오므로, 화면 선택지를 이 값으로 채우면 변이를 늘렸을 때 목록만 낡는 일이
+            /// 없다. 별칭은 들어가지 않는다 — 새로 고를 수 있는 값은 정규값뿐이다.
+            pub(crate) const WIRE_CHOICES: &'static [&'static str] = &[$($wire),+];
+        }
     };
-    ($name:ident, $message:literal, { $($variant:ident => $wire:literal,)+ }) => {
-        wire_enum!(@build $name, $message, wire_exact, { $($variant => $wire,)+ });
+    (trimmed $name:ident, $message:literal, { $($variant:ident => $wire:literal $(| $alias:literal)*,)+ }) => {
+        wire_enum!(
+            @build $name, $message, str::trim, crate::domain::wire_unknown,
+            { $($variant => $wire $(| $alias)*,)+ }
+        );
     };
-    (@build $name:ident, $message:literal, $normalize:path, { $($variant:ident => $wire:literal,)+ }) => {
+    ($name:ident, $message:literal, { $($variant:ident => $wire:literal $(| $alias:literal)*,)+ }) => {
+        wire_enum!(
+            @build $name, $message, crate::domain::wire_exact, crate::domain::wire_unknown,
+            { $($variant => $wire $(| $alias)*,)+ }
+        );
+    };
+    (@build $name:ident, $message:literal, $normalize:path, $fail:path, { $($variant:ident => $wire:literal $(| $alias:literal)*,)+ }) => {
         wire_enum!(@names $name, { $($variant => $wire,)+ });
 
         impl std::str::FromStr for $name {
@@ -29,12 +81,11 @@ macro_rules! wire_enum {
 
             fn from_str(s: &str) -> Result<Self, Self::Err> {
                 let normalize: fn(&str) -> &str = $normalize;
-                match normalize(s) {
-                    $($wire => Ok(Self::$variant),)+
-                    _ => Err(crate::CoreError::InvalidInput(format!(
-                        concat!($message, ": {}"),
-                        s
-                    ))),
+                let fail: fn(&str, &str, &str, &[&str]) -> crate::CoreError = $fail;
+                let normalized = normalize(s);
+                match normalized {
+                    $($wire $(| $alias)* => Ok(Self::$variant),)+
+                    _ => Err(fail($message, s, normalized, &[$($wire),+])),
                 }
             }
         }
@@ -59,16 +110,37 @@ macro_rules! wire_enum {
 /// 같은 크레이트의 다른 모듈도 이 표 한 벌을 쓰도록 내보낸다.
 pub(crate) use wire_enum;
 
+/// 공급자를 실제로 실행하는 하네스. 공급자 하나가 곧 실행 방식 하나였던 동안에는
+/// 실행 배선이 `ProviderId`를 그대로 보고 갈라도 뜻이 같았다. 한 하네스를 여러 공급자가
+/// 나눠 쓰기 시작하면 그 둘이 갈라지므로, "누구의 사용량으로 어느 계정에 붙는가"(공급자)와
+/// "어떤 프로세스 규약으로 말하는가"(하네스)를 분리해 둔다.
+///
+/// 실행 규약(기동·턴 전송·중간 전달·승인·중단)을 가르는 자리는 `ProviderId`가 아니라
+/// 이 값을 봐야 한다. 계정·사용량·표시 이름처럼 공급자 정체성에 속하는 자리는 그대로
+/// `ProviderId`를 본다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Harness {
+    Claude,
+    Codex,
+    Antigravity,
+    /// ACP(Agent Client Protocol)를 말하는 하네스. 지금은 OpenCode가 그 구현이다.
+    /// 규격이 공개돼 있어 다른 구현으로 갈아끼울 자리가 여기다.
+    OpenCode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderId {
     Claude,
     Codex,
     Antigravity,
+    /// 사용자가 직접 띄운 OpenAI 호환 서버의 로컬 모델. 계정도 사용량 한도도 없고,
+    /// 실행은 Codex 하네스를 그대로 빌려 쓴다.
+    Local,
 }
 
 impl ProviderId {
-    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Antigravity];
+    pub const ALL: [Self; 4] = [Self::Claude, Self::Codex, Self::Antigravity, Self::Local];
 
     /// 시스템 에이전트로 고를 수 있는 공급자인지. 시스템 에이전트는 AIA 런타임을 겸하고
     /// AIA는 aia_system MCP로만 시스템을 조작하는데, Antigravity CLI에는 실행 단위 MCP
@@ -77,12 +149,54 @@ impl ProviderId {
         matches!(self, Self::Claude | Self::Codex)
     }
 
-    /// 계정 레지스트리가 이 공급자의 계정을 관리하는지. Antigravity CLI에는 계정별
-    /// 인증 홈을 가리키는 환경변수가 없어 자격증명 교체·계정 전환을 지원할 수 없고,
-    /// 레지스트리에도 공급자 항목이 없다. 그래서 계정 조회·전환 경로는 이 공급자를
-    /// 거부하고, 실행은 계정 미귀속으로 진행한다.
+    /// 앱이 실행마다 MCP 서버를 붙여 줄 수 있는 공급자인지.
+    ///
+    /// 시스템 에이전트로 돌 수 있느냐와는 다른 물음이다. 로컬은 시스템 에이전트가 아니지만
+    /// ACP `session/new`에 서버를 실어 보낼 수 있고, Antigravity는 그 자리가 없어 사용자가
+    /// CLI 전역 설정에 한 번 등록해 두는 길(`externalMcpConfig`)을 쓴다. 전자를 그대로
+    /// 후자의 답으로 쓰던 탓에 로컬 채팅에는 외부 플러그인이 한 번도 붙지 않았다.
+    pub fn supports_run_scoped_mcp(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex | Self::Local)
+    }
+
+    /// 계정 레지스트리가 이 공급자의 계정을 관리하는지. Antigravity는 레지스트리에
+    /// 공급자 항목이 없어 계정 조회·전환 경로가 이 공급자를 거부하고, 실행은 계정
+    /// 미귀속으로 진행한다.
+    ///
+    /// 자격증명을 가를 수 없어서가 아니다. `HOME`을 계정별로 주면 격리가 되고 그 길은
+    /// `credential_profiles`에 있다(`AGENTS.md` C12). 남은 것은 계정 등록·로그인·사용량
+    /// 귀속이며, 이 값은 그것이 갖춰질 때 함께 참이 된다.
     pub fn manages_accounts(self) -> bool {
-        matches!(self, Self::Claude | Self::Codex)
+        matches!(self, Self::Claude | Self::Codex | Self::Antigravity)
+    }
+
+    /// 이 공급자의 사용량에 공급자 쪽 한도가 걸리는지. 구독 창·리셋 시각·퍼센트가 있는
+    /// 공급자만 참이다. 거짓인 공급자는 사용량 창 자체가 없어 페이싱·예산·상태바 계산에서
+    /// 빼야 하며, 0%로 취급해 "여유가 가장 많은 계정"으로 뽑히게 두면 안 된다.
+    pub fn has_usage_quota(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex | Self::Antigravity)
+    }
+
+    /// 이 공급자를 실행하는 하네스. 실행 규약을 가르는 자리는 공급자가 아니라 이 값을 본다.
+    pub fn harness(self) -> Harness {
+        match self {
+            Self::Claude => Harness::Claude,
+            Self::Codex => Harness::Codex,
+            Self::Antigravity => Harness::Antigravity,
+            // 로컬 모델은 ACP 하네스로 돈다. Codex를 쓰지 않는 이유는 도구를 줄일 수
+            // 없어서다 — 26개를 그대로 받은 로컬 모델은 없는 도구 이름을 지어낸다.
+            Self::Local => Harness::OpenCode,
+        }
+    }
+
+    /// 이 공급자의 일반 채팅이 단계 계획 고리(`plan.rs`)로 도는가.
+    ///
+    /// 고리로 도는 공급자는 갈림길을 도구로 받는다(9.7). 그래서 결정정책은 AIA 프로필만의
+    /// 값이 아니라 그 일반 채팅에도 있어야 하는 값이 된다 — 정책이 없으면 갈림길에서
+    /// 멈출지 스스로 고를지가 정해지지 않는다. 하네스로 판단하는 것은 고리가 하네스의
+    /// 성질이기 때문이다: ACP 하네스를 다른 구현으로 갈아끼워도 고리는 그대로다.
+    pub fn plans_in_steps(self) -> bool {
+        matches!(self.harness(), Harness::OpenCode)
     }
 }
 
@@ -90,6 +204,7 @@ wire_enum!(ProviderId, "알 수 없는 공급자입니다", {
     Claude => "claude",
     Codex => "codex",
     Antigravity => "antigravity",
+    Local => "local",
 });
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -169,10 +284,6 @@ pub enum ChatOriginKind {
     User,
 }
 
-impl ChatOriginKind {
-    pub const ALL: [Self; 4] = [Self::Workflow, Self::Schedule, Self::Aia, Self::User];
-}
-
 wire_enum!(trimmed ChatOriginKind, "알 수 없는 채팅 출처 종류입니다", {
     Workflow => "workflow",
     Schedule => "schedule",
@@ -214,6 +325,33 @@ impl ChatOrigin {
     }
 }
 
+/// 긴 답변 본문 안의 한 지점. 스크롤 픽셀이 아니라 "어느 메시지의 어느 원문 줄"로
+/// 적는다 — 창 폭이 바뀌어도, 같은 대화를 라이브 채팅이 아니라 세션 원문으로 다시
+/// 읽어도 본문이 같으면 같은 문단에 선다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadingAnchor {
+    /// 어느 메시지인가. 라이브 채팅은 `live:<엔트리 id>:<kind>`, 세션 원문은 `item:<index>`.
+    pub message_key: String,
+    /// 그 메시지 본문 안 마크다운 블록의 원문 줄 번호. 블록을 짚지 못했으면 `None`.
+    pub markdown_line: Option<u32>,
+}
+
+/// 사용자가 남긴 읽던 자리 하나. 열쇠가 세션이므로 같은 대화를 채팅·세션 상세·AIA
+/// 어디서 열어도 같은 목록이 나온다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionBookmark {
+    pub id: String,
+    /// 사용자가 붙인 이름. 비어 있으면 화면이 `snippet`을 대신 보여준다.
+    pub label: String,
+    /// 앵커 블록 앞머리. 이름이 없을 때의 표시이자, 메시지 열쇠가 달라진 뒤
+    /// (라이브에서 남기고 원문에서 다시 여는 경우) 같은 자리를 되찾는 마지막 단서다.
+    pub snippet: String,
+    pub anchor: ReadingAnchor,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMeta {
@@ -245,6 +383,10 @@ pub struct SessionMeta {
     /// 않는다. 실행으로 자동 채워지지 않는 점이 `bound_account_id`와 다르다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_account_id: Option<String>,
+    /// 이 세션이 마지막으로 쓴 로컬 LLM 연결 id(M7 7.3). 로컬 공급자 세션에만 있고,
+    /// 값이 없는 옛 저장물은 기본 연결로 읽는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_connection_id: Option<String>,
     /// 다른 공급자에서 이 세션으로 인계한 원본. 공급자 세션 자체를 바꾸지 않고
     /// Agent Manager 메타데이터에서만 관계를 보존한다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -255,6 +397,9 @@ pub struct SessionMeta {
     /// 이 세션을 시작한 출처(워크플로 실행·반복 요청 등). 최초 한 번만 기록한다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<ChatOrigin>,
+    /// 이 대화에 남긴 읽던 자리. 만든 순서를 그대로 둔다 — 목록에서 시간순으로 읽힌다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bookmarks: Vec<SessionBookmark>,
 }
 
 /// 세션 정리폴더. `parent_id`로 상하위 트리를 이루며, 목록은 항상 트리 순서(부모 →
@@ -308,6 +453,11 @@ pub struct SessionSummary {
     /// 아니라 스냅샷을 만들 때 앱 데이터 경로로 다시 판정하므로, 저장본에 남은 값은 읽지 않는다.
     #[serde(default)]
     pub aia_workspace: bool,
+    /// 작업 경로 없이 시작해 앱이 마련한 기본 작업공간(`<app data>/default-workspace`)에서
+    /// 오간 대화. `aia_workspace`처럼 스냅샷마다 앱 데이터 경로로 다시 판정한다. 목록에는
+    /// 남기되 새 채팅의 프로젝트 후보에서는 뺀다 — 사용자가 고른 경로가 아니다.
+    #[serde(default)]
+    pub default_workspace: bool,
     pub archived: bool,
     pub readable: bool,
     pub size_bytes: Option<u64>,
@@ -331,8 +481,6 @@ pub enum SessionFailureKind {
 }
 
 impl SessionFailureKind {
-    pub const ALL: [Self; 2] = [Self::UsageLimit, Self::Error];
-
     /// 실패 문구가 한도 안내인지로 갈래를 정한다.
     pub fn classify(message: &str) -> Self {
         if crate::chat::is_usage_limit_message(message) {
@@ -384,6 +532,7 @@ pub struct SourceCounts {
     pub claude: usize,
     pub codex: usize,
     pub antigravity: usize,
+    pub local: usize,
 }
 
 impl SourceCounts {
@@ -392,6 +541,7 @@ impl SourceCounts {
             ProviderId::Claude => self.claude += 1,
             ProviderId::Codex => self.codex += 1,
             ProviderId::Antigravity => self.antigravity += 1,
+            ProviderId::Local => self.local += 1,
         }
     }
 }
@@ -402,6 +552,7 @@ pub struct SourceTotals {
     pub claude: u64,
     pub codex: u64,
     pub antigravity: u64,
+    pub local: u64,
     pub total: u64,
 }
 
@@ -450,6 +601,7 @@ pub struct WeeklyCount {
     pub claude: usize,
     pub codex: usize,
     pub antigravity: usize,
+    pub local: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -517,6 +669,9 @@ pub struct CommonSkillSource {
     pub content_digest: String,
     pub file_count: usize,
     pub total_bytes: u64,
+    /// 원본 내용을 마지막으로 고친 시각(밀리초). 갈라진 설치본이 원본보다 앞선
+    /// 수정인지 뒤처진 사본인지 가르는 기준이다.
+    pub modified_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -551,16 +706,26 @@ pub enum SkillProviderStatus {
     Unsupported,
 }
 
-impl SkillProviderStatus {
-    pub const ALL: [Self; 4] = [Self::Linked, Self::Copy, Self::Missing, Self::Unsupported];
-}
-
 wire_enum!(trimmed SkillProviderStatus, "알 수 없는 스킬 공급자 상태입니다", {
     Linked => "linked",
     Copy => "copy",
     Missing => "missing",
     Unsupported => "unsupported",
 });
+
+/// 갈라진 설치본이 원본의 어느 쪽에 있는지. 지문 비교는 "다르다"까지만 말해 주고,
+/// 뒤처진 사본과 손으로 고친 사본을 한 이름으로 부르면 사용자가 방향을 반대로 읽는다 —
+/// 뒤처진 쪽에 "외부 수정"이라 써 두면 그 사본을 원본으로 채택해 최신 내용을 덮는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillDivergence {
+    /// 설치본이 원본보다 오래됐다. 원본을 다시 배포하면 맞는다.
+    Behind,
+    /// 설치본이 원본보다 나중에 고쳐졌다. 채택할지 버릴지 사용자가 정해야 한다.
+    Edited,
+    /// 어느 한쪽의 수정 시각을 읽지 못해 방향을 가릴 수 없다.
+    Unknown,
+}
 
 /// 한 에이전트의 위치별 설치본. 개인 루트와 각 프로젝트를 구분한다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -577,6 +742,10 @@ pub struct SkillInstallView {
     pub content_digest: Option<String>,
     /// 보관 원본과 내용이 다른 상태.
     pub divergent: bool,
+    /// 갈라졌다면 어느 방향인지. 원본과 같으면 없다.
+    pub divergence: Option<SkillDivergence>,
+    /// 설치본 내용을 마지막으로 고친 시각(밀리초).
+    pub modified_at_ms: Option<i64>,
     pub read_only: bool,
 }
 
@@ -619,6 +788,10 @@ pub struct SkillProviderState {
     /// 공통 원본과 내용 지문이 달라 사본이 갈라진 상태. 게시본이 원본보다 오래되었거나
     /// 공급자 쪽에서 직접 편집된 경우를 모두 포함한다.
     pub divergent: bool,
+    /// 갈라졌다면 어느 방향인지. 두 경우는 조치가 반대라 화면·AIA가 구분해야 한다.
+    pub divergence: Option<SkillDivergence>,
+    /// 설치본 내용을 마지막으로 고친 시각(밀리초).
+    pub modified_at_ms: Option<i64>,
     pub note: Option<String>,
     /// 이 에이전트의 위치별 설치본 전체. 개인 루트와 프로젝트를 모두 담는다.
     pub installs: Vec<SkillInstallView>,
@@ -631,10 +804,6 @@ pub enum SkillOriginKind {
     Common,
     /// 공통 루트에는 없고 공급자 설치본만 있다.
     Provider,
-}
-
-impl SkillOriginKind {
-    pub const ALL: [Self; 2] = [Self::Common, Self::Provider];
 }
 
 wire_enum!(trimmed SkillOriginKind, "알 수 없는 스킬 원본 종류입니다", {
@@ -891,13 +1060,6 @@ pub enum SessionTranscriptLimit {
 }
 
 impl SessionTranscriptLimit {
-    pub const ALL: [Self; 4] = [
-        Self::Latest100,
-        Self::Latest500,
-        Self::Latest1000,
-        Self::All,
-    ];
-
     pub fn max_items(self) -> Option<usize> {
         match self {
             Self::Latest100 => Some(100),
@@ -960,6 +1122,47 @@ pub struct ManagerSnapshot {
     /// 처음 감지돼 활성 유지/제외 결정을 기다리는 프로젝트. 화면이 알림으로 띄운다.
     /// 전체 프로젝트 목록은 폴링 응답을 키우지 않도록 `get_project_registry`로만 준다.
     pub pending_projects: Vec<ProjectRegistryEntry>,
+}
+
+/// 세션 하나를 가리키는 키. 델타가 "이 세션은 목록에서 빠졌다"를 알릴 때 쓴다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRef {
+    pub source: ProviderId,
+    pub id: String,
+}
+
+/// 관리 스냅숏의 변경분. 세션 목록만 바뀐 것으로 줄이고 나머지는 그대로 싣는다.
+///
+/// 세션 2,500건 규모에서 전체 스냅숏은 3.4MB이고 그중 3.1MB가 세션 목록인데, 조정 한 회차에서
+/// 실제로 달라지는 세션은 대개 한두 건이다. 화면이 개정 번호를 따라잡으려고 전부 다시 받으면
+/// 그 한 건 때문에 3.4MB를 다시 파싱하고 목록 전체를 다시 그린다.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagerSnapshotDelta {
+    pub schema_version: u32,
+    pub session_catalog_revision: u64,
+    pub resource_catalog_revision: u64,
+    pub status: AppStatus,
+    pub dashboard: DashboardStats,
+    pub folders: Vec<SessionFolder>,
+    pub skills: Vec<SkillSummary>,
+    pub agents: Vec<AgentDefinition>,
+    pub artifacts: Vec<ArtifactGroup>,
+    pub pending_projects: Vec<ProjectRegistryEntry>,
+    /// 요청한 개정 이후 새로 생기거나 내용이 달라진 세션.
+    pub changed_sessions: Vec<SessionSummary>,
+    /// 요청한 개정 이후 목록에서 사라진 세션.
+    pub removed_sessions: Vec<SessionRef>,
+}
+
+/// 화면이 스냅숏을 따라잡는 두 가지 방법. 변경 이력이 요청한 개정을 덮지 못하면
+/// (첫 기동, 오래 끊겼던 창) 델타 대신 전체를 준다.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ManagerSnapshotSync {
+    Full(ManagerSnapshot),
+    Delta(ManagerSnapshotDelta),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1046,6 +1249,9 @@ impl TranslationMenuSettings {
 pub struct SystemAgentRuntime {
     #[serde(default)]
     pub model: Option<String>,
+    /// 로컬 공급자일 때 쓸 서빙 연결 id(M7). 비어 있으면 기본 연결. 옛 저장본에는 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_connection_id: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
@@ -1056,14 +1262,14 @@ pub struct SystemAgentRuntime {
     /// 비어 있으면 기존 동작(사용자에게 확인)으로 실행한다.
     #[serde(default)]
     pub decision_policy: Option<AiaDecisionPolicy>,
-    /// 아이아 커서가 승인 없이 누를 수 있는 범위. 비어 있으면 여는 동작만 누른다.
+    /// AIA 커서가 승인 없이 누를 수 있는 범위. 비어 있으면 여는 동작만 누른다.
     #[serde(default)]
     pub ui_click_policy: Option<AiaUiClickPolicy>,
     #[serde(default)]
     pub settings: std::collections::BTreeMap<String, String>,
 }
 
-/// 아이아 커서 클릭(open_ui_element)이 승인 없이 누를 수 있는 범위. `Openers`는 탭·주 메뉴·
+/// AIA 커서 클릭(open_ui_element)이 승인 없이 누를 수 있는 범위. `Openers`는 탭·주 메뉴·
 /// 드로워/패널 여닫기처럼 화면을 여는 버튼만, `All`은 확인 모달 안을 뺀 어떤 버튼이든 누른다.
 /// 프런트엔드 `AiaUiClickPolicy`와 같은 값이어야 한다.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1123,6 +1329,9 @@ pub const DEFAULT_AIA_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Mediu
 #[serde(rename_all = "camelCase")]
 pub struct AiaRuntimeSettings {
     pub model: Option<String>,
+    /// 로컬 공급자일 때 쓸 서빙 연결 id(M7). 비어 있으면 기본 연결.
+    #[serde(default)]
+    pub local_connection_id: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub mode: ChatMode,
     pub approval_mode: ChatApprovalMode,
@@ -1163,9 +1372,33 @@ pub struct SystemAutomationSettings {
     /// 이전 버전 설정 파일에는 없으므로 기본값은 켜진 상태다.
     #[serde(default = "default_catalog_auto_discovery")]
     pub catalog_auto_discovery: bool,
+    /// AIA와 나눈 대화를 공급자 기록으로 남길지. 끄면 Codex AIA 세션을 ephemeral로 띄워
+    /// rollout도 세션 색인도 남기지 않으므로 세션 목록에 나타나지 않는다. 켜면 일반 채팅과
+    /// 같이 기록되어 "AIA 대화 포함" 필터로 목록에서 볼 수 있다. 이전 버전 설정 파일에는
+    /// 없으므로 기본값은 켜진 상태이고, 정해지는 시점이 CLI 실행이라 새 대화부터 적용된다.
+    #[serde(default = "default_aia_session_recording")]
+    pub aia_session_recording: bool,
+    /// AIA 선제 제안 팩을 쓸지. 끄면 제안 팩이 만들어 내는 선제 제안 카드와 트리거 말풍선이
+    /// 뜨지 않는다(공통 스킬에 설치된 팩 자체와 그 관리 화면은 그대로 남는다). 이전 버전
+    /// 설정 파일에는 없으므로 기본값은 켜진 상태다.
+    #[serde(default = "default_aia_suggestions")]
+    pub aia_suggestions: bool,
+    /// 자동화 탭에서 사용자가 끈 온보딩 카드의 id. 번들 기본 팩의 카드는 파일이 앱 안에
+    /// 있어 삭제할 수 없으므로 끄기로 감춘다(공통 스킬로 설치한 팩은 그 스킬을 휴지통으로
+    /// 옮겨 지운다). 이전 버전 설정 파일에는 없으므로 기본값은 빈 목록이다.
+    #[serde(default)]
+    pub hidden_onboarding_cards: Vec<String>,
 }
 
 fn default_catalog_auto_discovery() -> bool {
+    true
+}
+
+fn default_aia_session_recording() -> bool {
+    true
+}
+
+fn default_aia_suggestions() -> bool {
     true
 }
 
@@ -1185,6 +1418,7 @@ impl SystemAutomationSettings {
         let stored = self.system_agent_runtimes.get(&provider);
         AiaRuntimeSettings {
             model: stored.and_then(|runtime| runtime.model.clone()),
+            local_connection_id: stored.and_then(|runtime| runtime.local_connection_id.clone()),
             reasoning_effort: match stored {
                 Some(runtime) => runtime.reasoning_effort.clone(),
                 None => Some(DEFAULT_AIA_REASONING_EFFORT),
@@ -1217,6 +1451,9 @@ impl Default for SystemAutomationSettings {
             translations: TranslationMenuSettings::default(),
             system_agent_runtimes: std::collections::BTreeMap::new(),
             catalog_auto_discovery: default_catalog_auto_discovery(),
+            aia_session_recording: default_aia_session_recording(),
+            aia_suggestions: default_aia_suggestions(),
+            hidden_onboarding_cards: Vec::new(),
         }
     }
 }
@@ -1234,6 +1471,12 @@ pub struct SystemAutomationSettingsInput {
     pub system_agent_runtimes: std::collections::BTreeMap<ProviderId, SystemAgentRuntime>,
     #[serde(default = "default_catalog_auto_discovery")]
     pub catalog_auto_discovery: bool,
+    #[serde(default = "default_aia_session_recording")]
+    pub aia_session_recording: bool,
+    #[serde(default = "default_aia_suggestions")]
+    pub aia_suggestions: bool,
+    #[serde(default)]
+    pub hidden_onboarding_cards: Vec<String>,
 }
 
 impl From<SystemAutomationSettingsInput> for SystemAutomationSettings {
@@ -1245,6 +1488,9 @@ impl From<SystemAutomationSettingsInput> for SystemAutomationSettings {
             translations: value.translations,
             system_agent_runtimes: value.system_agent_runtimes,
             catalog_auto_discovery: value.catalog_auto_discovery,
+            aia_session_recording: value.aia_session_recording,
+            aia_suggestions: value.aia_suggestions,
+            hidden_onboarding_cards: value.hidden_onboarding_cards,
         }
     }
 }
@@ -1394,11 +1640,7 @@ pub enum DocumentPreviewKind {
     TooLarge,
 }
 
-impl DocumentPreviewKind {
-    pub const ALL: [Self; 4] = [Self::Markdown, Self::Text, Self::Binary, Self::TooLarge];
-}
-
-wire_enum!(trimmed DocumentPreviewKind, "알 수 없는 문서 미리보기 방식입니다", {
+wire_enum!(trimmed DocumentPreviewKind, "알 수 없는 파일 미리보기 방식입니다", {
     Markdown => "markdown",
     Text => "text",
     Binary => "binary",
@@ -1437,7 +1679,7 @@ pub struct DocumentFile {
     pub downloadable: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMetaPatch {
     pub favorite: Option<bool>,
@@ -1450,6 +1692,9 @@ pub struct SessionMetaPatch {
     /// 실행 계정 고정. `Some(None)`이면 고정을 해제해 활성 계정을 따르게 한다.
     #[serde(default, deserialize_with = "deserialize_nullable_field")]
     pub pinned_account_id: Option<Option<String>>,
+    /// 읽던 자리 목록. `folder_ids`와 같은 통째 교체다 — 추가·이름변경·삭제가 모두
+    /// 목록 하나를 다시 보내는 일이라, 낱개 명령을 셋 두는 대신 이 한 자리로 모은다.
+    pub bookmarks: Option<Vec<SessionBookmark>>,
 }
 
 /// `Option<Option<T>>`는 기본 역직렬화로는 `null`과 미지정을 구분할 수 없어 둘 다
@@ -1551,6 +1796,7 @@ mod tests {
             ProviderId::Claude,
             SystemAgentRuntime {
                 model: Some("claude-opus-5".to_owned()),
+                local_connection_id: None,
                 // 저장된 항목이 있으면 추론 강도를 비워 공급자 기본값을 고를 수 있다.
                 reasoning_effort: None,
                 mode: Some(ChatMode::Plan),
@@ -1599,16 +1845,13 @@ mod tests {
 
     #[test]
     fn session_transcript_limit_display_and_from_str_round_trip() {
-        assert_eq!(
-            SessionTranscriptLimit::ALL,
-            [
-                SessionTranscriptLimit::Latest100,
-                SessionTranscriptLimit::Latest500,
-                SessionTranscriptLimit::Latest1000,
-                SessionTranscriptLimit::All,
-            ]
-        );
-        for limit in SessionTranscriptLimit::ALL {
+        let cases = [
+            SessionTranscriptLimit::Latest100,
+            SessionTranscriptLimit::Latest500,
+            SessionTranscriptLimit::Latest1000,
+            SessionTranscriptLimit::All,
+        ];
+        for limit in cases {
             assert_eq!(limit.to_string(), limit.as_str());
             assert_eq!(
                 limit.as_str().parse::<SessionTranscriptLimit>().unwrap(),
@@ -1641,8 +1884,47 @@ mod tests {
                 ProviderId::Claude,
                 ProviderId::Codex,
                 ProviderId::Antigravity,
+                ProviderId::Local,
             ]
         );
+    }
+
+    /// 와이어 문자열은 저장된 세션·설정·IPC가 함께 쓰는 값이라 이름을 바꾸면 기존
+    /// 데이터가 읽히지 않는다. 표를 못으로 박아 둔다.
+    #[test]
+    fn provider_id_wire_strings_are_pinned() {
+        assert_eq!(ProviderId::Claude.as_str(), "claude");
+        assert_eq!(ProviderId::Codex.as_str(), "codex");
+        assert_eq!(ProviderId::Antigravity.as_str(), "antigravity");
+        assert_eq!(ProviderId::Local.as_str(), "local");
+        assert_eq!("local".parse::<ProviderId>().unwrap(), ProviderId::Local);
+    }
+
+    /// 능력 술어는 공급자를 늘릴 때 한 자리만 고치고 나머지를 잊기 쉬운 표다. 네 술어를
+    /// 한 줄로 세워, 새 공급자가 어느 칸을 물려받는지 이 테스트에서 먼저 결정하게 한다.
+    #[test]
+    fn provider_capability_table_is_pinned() {
+        // (공급자, 시스템 에이전트, 계정 관리, 사용량 한도, 하네스)
+        let table = [
+            (ProviderId::Claude, true, true, true, Harness::Claude),
+            (ProviderId::Codex, true, true, true, Harness::Codex),
+            (
+                ProviderId::Antigravity,
+                false,
+                true,
+                true,
+                Harness::Antigravity,
+            ),
+            // 로컬 모델은 계정도 사용량 한도도 없고 실행은 ACP 하네스로 돈다.
+            (ProviderId::Local, false, false, false, Harness::OpenCode),
+        ];
+        assert_eq!(table.len(), ProviderId::ALL.len());
+        for (provider, system_agent, accounts, quota, harness) in table {
+            assert_eq!(provider.can_run_system_agent(), system_agent, "{provider}");
+            assert_eq!(provider.manages_accounts(), accounts, "{provider}");
+            assert_eq!(provider.has_usage_quota(), quota, "{provider}");
+            assert_eq!(provider.harness(), harness, "{provider}");
+        }
     }
 
     #[test]
@@ -1720,11 +2002,8 @@ mod tests {
 
     #[test]
     fn session_failure_kind_display_and_from_str_round_trip() {
-        assert_eq!(
-            SessionFailureKind::ALL,
-            [SessionFailureKind::UsageLimit, SessionFailureKind::Error]
-        );
-        for kind in SessionFailureKind::ALL {
+        let cases = [SessionFailureKind::UsageLimit, SessionFailureKind::Error];
+        for kind in cases {
             assert_eq!(kind.to_string(), kind.as_str());
             assert_eq!(kind.as_str().parse::<SessionFailureKind>().unwrap(), kind);
             let serialized = serde_json::to_string(&kind).unwrap();
@@ -1767,16 +2046,13 @@ mod tests {
 
     #[test]
     fn chat_origin_kind_display_and_from_str_round_trip() {
-        assert_eq!(
-            ChatOriginKind::ALL,
-            [
-                ChatOriginKind::Workflow,
-                ChatOriginKind::Schedule,
-                ChatOriginKind::Aia,
-                ChatOriginKind::User,
-            ]
-        );
-        for kind in ChatOriginKind::ALL {
+        let cases = [
+            ChatOriginKind::Workflow,
+            ChatOriginKind::Schedule,
+            ChatOriginKind::Aia,
+            ChatOriginKind::User,
+        ];
+        for kind in cases {
             assert_eq!(kind.to_string(), kind.as_str());
             assert_eq!(kind.as_str().parse::<ChatOriginKind>().unwrap(), kind);
             let serialized = serde_json::to_string(&kind).unwrap();
@@ -1790,11 +2066,8 @@ mod tests {
 
     #[test]
     fn skill_origin_kind_display_and_from_str_round_trip() {
-        assert_eq!(
-            SkillOriginKind::ALL,
-            [SkillOriginKind::Common, SkillOriginKind::Provider]
-        );
-        for kind in SkillOriginKind::ALL {
+        let cases = [SkillOriginKind::Common, SkillOriginKind::Provider];
+        for kind in cases {
             assert_eq!(kind.to_string(), kind.as_str());
             assert_eq!(kind.as_str().parse::<SkillOriginKind>().unwrap(), kind);
             let serialized = serde_json::to_string(&kind).unwrap();
@@ -1810,16 +2083,13 @@ mod tests {
 
     #[test]
     fn skill_provider_status_display_and_from_str_round_trip() {
-        assert_eq!(
-            SkillProviderStatus::ALL,
-            [
-                SkillProviderStatus::Linked,
-                SkillProviderStatus::Copy,
-                SkillProviderStatus::Missing,
-                SkillProviderStatus::Unsupported,
-            ]
-        );
-        for status in SkillProviderStatus::ALL {
+        let cases = [
+            SkillProviderStatus::Linked,
+            SkillProviderStatus::Copy,
+            SkillProviderStatus::Missing,
+            SkillProviderStatus::Unsupported,
+        ];
+        for status in cases {
             assert_eq!(status.to_string(), status.as_str());
             assert_eq!(
                 status.as_str().parse::<SkillProviderStatus>().unwrap(),
@@ -1838,16 +2108,13 @@ mod tests {
 
     #[test]
     fn document_preview_kind_display_and_from_str_round_trip() {
-        assert_eq!(
-            DocumentPreviewKind::ALL,
-            [
-                DocumentPreviewKind::Markdown,
-                DocumentPreviewKind::Text,
-                DocumentPreviewKind::Binary,
-                DocumentPreviewKind::TooLarge,
-            ]
-        );
-        for kind in DocumentPreviewKind::ALL {
+        let cases = [
+            DocumentPreviewKind::Markdown,
+            DocumentPreviewKind::Text,
+            DocumentPreviewKind::Binary,
+            DocumentPreviewKind::TooLarge,
+        ];
+        for kind in cases {
             assert_eq!(kind.to_string(), kind.as_str());
             assert_eq!(kind.as_str().parse::<DocumentPreviewKind>().unwrap(), kind);
             let serialized = serde_json::to_string(&kind).unwrap();

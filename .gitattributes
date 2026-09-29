@@ -1,0 +1,14 @@
+# 바이너리에 그대로 박히는 자산은 체크아웃 줄바꿈에 흔들리면 안 된다.
+#
+# 이 파일들은 `include_str!`로 실행 파일 안에 들어간다. `.gitattributes`가 없으면
+# `core.autocrlf=true`인 Windows 작업 트리가 CRLF로 받아 오고, 같은 커밋이 빌드한
+# 기계에 따라 다른 바이트를 담은 바이너리가 된다. 그 차이는 조용하지 않다 — 스킬
+# 본문 다이제스트(C3)가 갈리고, 프론트엔드와 백엔드가 같은 case 파일을 읽어 맞춰 보는
+# 검증(C5-7의 `markdownLinkCases.json`)도 한쪽만 줄바꿈이 달라진다.
+#
+# 저장소에는 이미 LF로 들어 있으므로 여기서 바뀌는 것은 작업 트리뿐이다.
+crates/agent-manager-core/skills/**    text eol=lf
+crates/agent-manager-core/assets/**    text eol=lf
+src/lib/markdownLinkCases.json         text eol=lf
+src/lib/sessionReadSummaryCases.json   text eol=lf
+src/lib/uiGuideTargets.json            text eol=lf

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isSoftKeyboardEnvironment, shouldSubmitOnEnter } from "./composerKeys.ts";
+import { enterSubmitsIn, isSoftKeyboardEnvironment, readComposerEnterMode, shouldSubmitOnEnter, writeComposerEnterMode } from "./composerKeys.ts";
 
 test("plain Enter sends the message", () => {
   assert.equal(shouldSubmitOnEnter({ key: "Enter" }), true);
@@ -43,4 +43,22 @@ test("narrow desktop windows still send on Enter", () => {
 test("touch laptop with a real keyboard sends on Enter at desktop width", () => {
   const touchLaptop = (query) => query === "(pointer: coarse)";
   assert.equal(isSoftKeyboardEnvironment(touchLaptop, 10), false);
+});
+
+test("Enter mode overrides the soft-keyboard guess in both directions", () => {
+  assert.equal(enterSubmitsIn("auto", true), false);
+  assert.equal(enterSubmitsIn("auto", false), true);
+  assert.equal(enterSubmitsIn("send", true), true, "iPad with a hardware keyboard still looks coarse");
+  assert.equal(enterSubmitsIn("newline", false), false);
+});
+
+test("stored Enter mode falls back to auto for unknown or missing values", () => {
+  const values = new Map();
+  const storage = { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, value) };
+  assert.equal(readComposerEnterMode(storage), "auto");
+  writeComposerEnterMode("send", storage);
+  assert.equal(readComposerEnterMode(storage), "send");
+  values.set("agent-manager.composer-enter-mode", "bogus");
+  assert.equal(readComposerEnterMode(storage), "auto");
+  assert.equal(readComposerEnterMode(null), "auto");
 });

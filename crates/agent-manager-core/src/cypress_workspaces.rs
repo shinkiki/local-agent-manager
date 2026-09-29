@@ -29,8 +29,14 @@ const REGISTRY_LOCK: &str = "cypress-workspaces-v1.lock";
 const SCHEMA_VERSION: u32 = 1;
 /// 비밀을 담는 유일한 파일. 원문은 전용 명령으로만 오간다.
 pub(crate) const ENV_FILE: &str = "cypress.env.json";
-const DEFAULT_WORKSPACE_ID: &str = "default";
-const DEFAULT_WORKSPACE_NAME: &str = "기본 작업공간";
+/// "그 파일이 없다"는 실패의 접두사. 화면이 이 문구로 "새 파일을 여는 것"과 "읽기에 실패한 것"을
+/// 가른다 — 가르지 못하면 있는 파일을 빈 내용으로 열어 저장 순간 원본을 지운다.
+/// 문구를 바꾸면 같은 상수를 들고 있는 `src/lib/cypressWorkspace.ts`도 함께 바꿔야 한다.
+pub(crate) const MISSING_FILE_PREFIX: &str = "파일이 없습니다: ";
+/// v1 저장본에서 앱이 자동으로 만들던 작업공간 ID. 새 버전은 암묵적인 작업공간을 만들지
+/// 않고, 이 레코드를 마이그레이션 때 등록부에서 제거한다.
+const LEGACY_DEFAULT_WORKSPACE_ID: &str = "default";
+const LEGACY_WORKSPACE_TRASH_DIR: &str = "cypress-workspace-trash";
 const MAX_FILES: usize = 2_000;
 const MAX_TEXT_BYTES: u64 = 512 * 1024;
 const CONFIG_CANDIDATES: [&str; 4] = [
@@ -39,11 +45,18 @@ const CONFIG_CANDIDATES: [&str; 4] = [
     "cypress.config.mjs",
     "cypress.config.ts",
 ];
-/// 편집기 목록과 파일 수 계산에서 빼는 폴더. 모듈·산출물·VCS 내부는 편집 대상이 아니다.
-const SKIPPED_DIRS: [&str; 3] = ["node_modules", "artifacts", ".git"];
+/// 편집을 막는 최상위 폴더. 모듈·실행 산출물·VCS 내부는 앱이 관리하는 자리라 사람이 고치면
+/// 다음 설치·실행·체크아웃에 덮이거나 저장소를 망가뜨린다.
+/// 목록을 바꾸면 같은 목록을 들고 있는 `src/lib/cypressWorkspace.ts`도 함께 바꿔야 한다.
+const DENIED_TOP_DIRS: [&str; 3] = ["node_modules", "artifacts", ".git"];
+/// 목록에서만 빼는 빌드 산출물 폴더. 막지는 않는다 — 고쳐도 다시 만들어질 뿐이라 편집 금지까지
+/// 걸 이유는 없고, 목록에 있으면 진짜 편집 대상을 덮어 버린다. 저장소를 그대로 작업공간으로
+/// 등록하면 `target/` 한 곳만 70만 개라 목록이 상한에 걸려 통째로 죽었다.
+const BUILD_OUTPUT_DIRS: [&str; 5] = ["target", "dist", "build", "out", "coverage"];
 const MASK: &str = "•••";
 /// 스크럽 대상 비밀값의 최소 길이. 더 짧은 값은 흔한 문자열과 겹쳐 출력을 망가뜨린다.
 const MIN_SECRET_CHARS: usize = 4;
+const MAX_WORKSPACE_NAME_CHARS: usize = 60;
 
 const TEMPLATE_FILES: &[(&str, &str)] = &[
     (
@@ -73,19 +86,37 @@ const TEMPLATE_FILES: &[(&str, &str)] = &[
 ];
 const TEMPLATE_ENV: &str = "{}\n";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CypressExecutionType {
+    /// 등록한 Cypress 프로젝트를 그대로 실행한다. 외부 사이트와 자체 개발 서버 QA에 쓴다.
+    #[default]
+    Standard,
+    /// Agent Manager 저장소의 `scripts/e2e.mjs` 생명주기로 임시 백엔드와 앱 데이터를 만든다.
+    AgentManagerIsolated,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CypressWorkspace {
     pub id: String,
     pub name: String,
-    /// Cypress 프로젝트 루트(정규 절대경로). `cypress.config.*`가 있는 폴더.
+    /// Cypress 프로젝트 루트(정규 절대경로). `cypress.config.*`가 있는 폴더. 등록할 때 없었으면
+    /// 템플릿을 깔아 만든다.
     pub path: String,
     /// `node_modules/cypress`가 있는 폴더. 없으면 `path` 자신.
     #[serde(default)]
     pub module_dir: Option<String>,
-    /// 앱이 만든 기본 작업공간. 제거할 수 없다.
+    /// 실행 생명주기. 옛 저장본은 일반 Cypress 실행으로 읽는다.
     #[serde(default)]
-    pub builtin: bool,
+    pub execution_type: CypressExecutionType,
+    /// 실행 장면을 영상으로 남긴다. 산출물이 커지고 실행도 느려져 기본은 꺼 둔다.
+    #[serde(default)]
+    pub record_video: bool,
+    /// 브라우저 창을 띄운 채 실행한다. 사람이 지켜볼 수 있는 대신 화면이 있는 호스트에서만
+    /// 뜨고, 무인 회차에서는 창이 튀어나오므로 기본은 꺼 둔다.
+    #[serde(default)]
+    pub headed: bool,
     pub created_at: i64,
 }
 
@@ -138,6 +169,18 @@ pub struct CypressWorkspaceFile {
     pub sensitive: bool,
 }
 
+/// 파일 목록과 그것이 온전한지 여부. 상한에 걸리면 목록을 거기서 끊고 `truncated`로 알린다 —
+/// 예전에는 오류를 돌려줘 목록 전체가 사라졌고, 그러면 화면은 편집할 파일을 하나도 고를 수
+/// 없었다(실행 탭의 스펙 목록까지 같이 비었다). 끊긴 뒤에도 경로를 직접 대는 읽기·쓰기·실행은
+/// 그대로 된다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CypressWorkspaceFileList {
+    pub files: Vec<CypressWorkspaceFile>,
+    pub truncated: bool,
+    pub limit: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CypressWorkspaceFileContent {
@@ -158,14 +201,7 @@ fn with_lock<T>(
     action(&canonical)
 }
 
-fn default_workspace_dir(app_data_dir: &Path) -> PathBuf {
-    app_data_dir
-        .join("aia-workspace")
-        .join("cypress")
-        .join(DEFAULT_WORKSPACE_ID)
-}
-
-/// 기본 작업공간의 템플릿 파일을 채운다. 이미 있는 파일은 건드리지 않는다 — 사용자·AIA가
+/// 새 작업공간의 템플릿 파일을 채운다. 이미 있는 파일은 건드리지 않는다 — 사용자·AIA가
 /// 고친 내용을 앱 업데이트가 덮어쓰면 안 된다.
 fn ensure_template_files(directory: &Path) -> Result<(), CoreError> {
     fs::create_dir_all(directory)?;
@@ -186,6 +222,34 @@ fn ensure_template_files(directory: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// 예전 기본 작업공간은 활성 경로에서 없애되, 그 안의 사용자 작성 스펙은 복구할 수 있게 앱
+/// 데이터의 전용 보관 폴더로 한 번 옮긴다. 저장본이 조작돼 다른 경로를 `default`라 부르는
+/// 경우에는 등록만 제거하고 그 폴더는 건드리지 않는다.
+fn archive_legacy_default_workspace(
+    app_data_dir: &Path,
+    workspace: &CypressWorkspace,
+) -> Result<(), CoreError> {
+    let expected = app_data_dir.join("aia-workspace/cypress/default");
+    let metadata = match fs::symlink_metadata(&expected) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(());
+    }
+    let expected = fs::canonicalize(expected)?;
+    let registered = fs::canonicalize(workspace.project_dir()).ok();
+    if registered.as_deref() != Some(expected.as_path()) {
+        return Ok(());
+    }
+    let trash = app_data_dir.join(LEGACY_WORKSPACE_TRASH_DIR);
+    fs::create_dir_all(&trash)?;
+    let destination = trash.join(format!("default-{}-{}", now_ms(), Uuid::new_v4().simple()));
+    fs::rename(expected, destination)?;
+    Ok(())
+}
+
 fn load_unlocked(app_data_dir: &Path) -> Result<StoredRegistry, CoreError> {
     let path = app_data_dir.join(REGISTRY_FILE);
     let mut registry = match read_private_json::<StoredRegistry>(&path)? {
@@ -202,34 +266,18 @@ fn load_unlocked(app_data_dir: &Path) -> Result<StoredRegistry, CoreError> {
             workspaces: Vec::new(),
         },
     };
-    let mut changed = false;
-    if !registry
-        .workspaces
-        .iter()
-        .any(|workspace| workspace.builtin)
-    {
-        let directory = default_workspace_dir(app_data_dir);
-        fs::create_dir_all(&directory)?;
-        registry.workspaces.insert(
-            0,
-            CypressWorkspace {
-                id: DEFAULT_WORKSPACE_ID.to_owned(),
-                name: DEFAULT_WORKSPACE_NAME.to_owned(),
-                path: fs::canonicalize(&directory)?.to_string_lossy().into_owned(),
-                module_dir: None,
-                builtin: true,
-                created_at: now_ms(),
-            },
-        );
-        changed = true;
-    }
     for workspace in registry
         .workspaces
         .iter()
-        .filter(|workspace| workspace.builtin)
+        .filter(|workspace| workspace.id == LEGACY_DEFAULT_WORKSPACE_ID)
     {
-        ensure_template_files(&workspace.project_dir())?;
+        archive_legacy_default_workspace(app_data_dir, workspace)?;
     }
+    let before = registry.workspaces.len();
+    registry
+        .workspaces
+        .retain(|workspace| workspace.id != LEGACY_DEFAULT_WORKSPACE_ID);
+    let changed = registry.workspaces.len() != before;
     if changed || !path.is_file() {
         save_unlocked(app_data_dir, &registry)?;
     }
@@ -270,6 +318,18 @@ fn registry_view(registry: &StoredRegistry) -> CypressRegistryView {
     }
 }
 
+fn mutate_registry(
+    app_data_dir: &Path,
+    mutate: impl FnOnce(&mut StoredRegistry) -> Result<(), CoreError>,
+) -> Result<CypressRegistryView, CoreError> {
+    with_lock(app_data_dir, |dir| {
+        let mut registry = load_unlocked(dir)?;
+        mutate(&mut registry)?;
+        save_unlocked(dir, &registry)?;
+        Ok(registry_view(&registry))
+    })
+}
+
 pub fn registry(app_data_dir: &Path) -> Result<CypressRegistryView, CoreError> {
     with_lock(app_data_dir, |dir| Ok(registry_view(&load_unlocked(dir)?)))
 }
@@ -279,11 +339,9 @@ pub fn is_enabled(app_data_dir: &Path) -> Result<bool, CoreError> {
 }
 
 pub fn set_enabled(app_data_dir: &Path, enabled: bool) -> Result<CypressRegistryView, CoreError> {
-    with_lock(app_data_dir, |dir| {
-        let mut registry = load_unlocked(dir)?;
+    mutate_registry(app_data_dir, |registry| {
         registry.enabled = enabled;
-        save_unlocked(dir, &registry)?;
-        Ok(registry_view(&registry))
+        Ok(())
     })
 }
 
@@ -305,8 +363,29 @@ fn has_config(directory: &Path) -> bool {
         .any(|name| directory.join(name).is_file())
 }
 
-/// 외부 폴더를 작업공간으로 등록할 때의 검증. 공급자 홈과 Agent Manager 데이터 안은 등록할 수
-/// 없고(기본 작업공간은 앱이 직접 만든다), 폴더에 Cypress 설정이 있어야 한다.
+/// 템플릿 파일 목록에서 지정한 상대 경로의 파일 내용을 찾는다.
+fn template_file_content(target_relative: &str) -> Option<&'static str> {
+    TEMPLATE_FILES
+        .iter()
+        .find(|(relative, _)| *relative == target_relative)
+        .map(|(_, content)| *content)
+}
+
+/// 모듈 위치에 `package.json`이 없으면 템플릿의 것을 둔다. `npm install --save-dev`는
+/// package.json이 없는 폴더에서 상위 폴더의 것을 찾아 올라가므로, 비워 두면 엉뚱한 프로젝트에
+/// cypress가 들어간다. 이미 있으면 사용자 프로젝트의 것이라 건드리지 않는다.
+pub(crate) fn ensure_module_package_json(module_dir: &Path) -> Result<bool, CoreError> {
+    let target = module_dir.join("package.json");
+    if target.is_file() {
+        return Ok(false);
+    }
+    let content = template_file_content("package.json").unwrap_or("{\n  \"private\": true\n}\n");
+    fs::create_dir_all(module_dir)?;
+    fs::write(&target, content)?;
+    Ok(true)
+}
+
+/// 폴더를 작업공간으로 등록할 때의 검증. 공급자 홈과 Agent Manager 데이터 안은 등록할 수 없다.
 fn validate_external_dir(
     app_data_dir: &Path,
     raw: &str,
@@ -329,28 +408,27 @@ pub fn add_workspace(
     module_dir: Option<&str>,
 ) -> Result<CypressRegistryView, CoreError> {
     let name = name.trim();
-    if name.is_empty() || name.chars().count() > 60 {
-        return Err(CoreError::InvalidInput(
-            "작업공간 이름은 1~60자여야 합니다".to_owned(),
-        ));
-    }
-    let project = validate_external_dir(app_data_dir, path, "작업공간 폴더")?;
-    if !has_config(&project) {
+    if name.is_empty() || name.chars().count() > MAX_WORKSPACE_NAME_CHARS {
         return Err(CoreError::InvalidInput(format!(
-            "cypress.config.js(.cjs/.mjs/.ts)가 없는 폴더입니다: {}",
-            project.display()
+            "작업공간 이름은 1~{MAX_WORKSPACE_NAME_CHARS}자여야 합니다"
         )));
     }
+    let project = validate_external_dir(app_data_dir, path, "작업공간 폴더")?;
+    // Cypress 설정이 없는 폴더는 빈 프로젝트로 보고 작업공간 템플릿을 깐다.
+    // 이미 있는 파일은 건드리지 않으므로 기존 프로젝트의 package.json은 그대로 남는다.
+    // 예전에는 여기서 거절했는데, 사용자는 새 폴더를 골라 "등록하면 설치까지 되는" 흐름을
+    // 기대했고 빈 폴더에 cypress.config.js를 손으로 만들어 오라는 요구가 됐다.
+    let scaffolded = !has_config(&project);
+    if scaffolded {
+        ensure_template_files(&project)?;
+    }
     let module_dir = match module_dir.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(raw) => Some(validate_external_dir(
-            app_data_dir,
-            raw,
-            "Cypress 모듈 위치",
-        )?),
+        // 모듈 위치는 없으면 만든다(있는 상위 아래 한 칸). 새 프로젝트에서 모듈만 따로 두려는
+        // 입력이 흔하고, 설치가 그 폴더에서 돌아야 하므로 등록 시점에 실재하게 한다.
+        Some(raw) => Some(crate::user_path::create_user_directory(app_data_dir, raw)?),
         None => None,
     };
-    with_lock(app_data_dir, |dir| {
-        let mut registry = load_unlocked(dir)?;
+    mutate_registry(app_data_dir, |registry| {
         let project_text = project.to_string_lossy().into_owned();
         if registry
             .workspaces
@@ -366,18 +444,18 @@ pub fn add_workspace(
             name: name.to_owned(),
             path: project_text,
             module_dir: module_dir.map(|value| value.to_string_lossy().into_owned()),
-            builtin: false,
+            execution_type: CypressExecutionType::Standard,
+            record_video: false,
+            headed: false,
             created_at: now_ms(),
         });
-        save_unlocked(dir, &registry)?;
-        Ok(registry_view(&registry))
+        Ok(())
     })
 }
 
 /// 등록만 지운다. 폴더와 파일은 사용자 소유라 건드리지 않는다.
 pub fn remove_workspace(app_data_dir: &Path, id: &str) -> Result<CypressRegistryView, CoreError> {
-    with_lock(app_data_dir, |dir| {
-        let mut registry = load_unlocked(dir)?;
+    mutate_registry(app_data_dir, |registry| {
         let Some(index) = registry
             .workspaces
             .iter()
@@ -387,14 +465,37 @@ pub fn remove_workspace(app_data_dir: &Path, id: &str) -> Result<CypressRegistry
                 "Cypress 작업공간을 찾을 수 없습니다: {id}"
             )));
         };
-        if registry.workspaces[index].builtin {
-            return Err(CoreError::InvalidInput(
-                "기본 작업공간은 제거할 수 없습니다".to_owned(),
-            ));
-        }
         registry.workspaces.remove(index);
-        save_unlocked(dir, &registry)?;
-        Ok(registry_view(&registry))
+        Ok(())
+    })
+}
+
+/// 작업공간마다 저장하는 실행 옵션(영상 저장·창 표시). 실행 요청이 아니라 작업공간에 두는
+/// 것은, 같은 작업공간을 사람이 눌러 돌리든 에이전트가 돌리든 같은 방식으로 보이길 바라는
+/// 설정이기 때문이다 — 에이전트가 실행할 때만 창이 안 뜨면 "왜 아무것도 안 보이나"가 된다.
+pub fn set_workspace_options(
+    app_data_dir: &Path,
+    id: &str,
+    record_video: bool,
+    headed: bool,
+    execution_type: Option<CypressExecutionType>,
+) -> Result<CypressRegistryView, CoreError> {
+    mutate_registry(app_data_dir, |registry| {
+        let Some(workspace) = registry
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == id)
+        else {
+            return Err(CoreError::NotFound(format!(
+                "Cypress 작업공간을 찾을 수 없습니다: {id}"
+            )));
+        };
+        workspace.record_video = record_video;
+        workspace.headed = headed;
+        if let Some(execution_type) = execution_type {
+            workspace.execution_type = execution_type;
+        }
+        Ok(())
     })
 }
 
@@ -415,13 +516,12 @@ pub(crate) fn validate_relative_path(raw: &str) -> Result<PathBuf, CoreError> {
             }
         }));
     }
-    if relative
-        .components()
-        .next()
-        .is_some_and(|first| SKIPPED_DIRS.contains(&first.as_os_str().to_string_lossy().as_ref()))
-    {
+    if relative.components().next().is_some_and(|first| {
+        DENIED_TOP_DIRS.contains(&first.as_os_str().to_string_lossy().as_ref())
+    }) {
         return Err(CoreError::InvalidInput(format!(
-            "node_modules·artifacts·.git 아래는 편집할 수 없습니다: {raw}"
+            "{} 아래는 편집할 수 없습니다: {raw}",
+            DENIED_TOP_DIRS.join("·")
         )));
     }
     Ok(relative.to_path_buf())
@@ -437,7 +537,8 @@ fn assert_within_root(root: &Path, candidate: &Path) -> Result<(), CoreError> {
     path_guard::assert_within_root(root, candidate, WORKSPACE_PATH_LABELS)
 }
 
-fn relative_text(path: &Path) -> String {
+/// 파일 경로의 구성 요소를 슬래시('/')로 연결한 상대 경로 문자열을 반환한다.
+pub(crate) fn relative_slash_path(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
@@ -445,7 +546,12 @@ fn relative_text(path: &Path) -> String {
 }
 
 fn is_sensitive(relative: &Path) -> bool {
-    relative_text(relative) == ENV_FILE
+    relative == Path::new(ENV_FILE)
+}
+
+/// 작업공간에서 삭제가 금지된 필수 파일인지 검사한다(환경 파일 또는 Cypress 설정 파일).
+fn is_protected_workspace_file(relative: &Path, slash_path: &str) -> bool {
+    is_sensitive(relative) || CONFIG_CANDIDATES.contains(&slash_path)
 }
 
 fn resolve_file(workspace: &CypressWorkspace, raw: &str) -> Result<(PathBuf, PathBuf), CoreError> {
@@ -456,7 +562,13 @@ fn resolve_file(workspace: &CypressWorkspace, raw: &str) -> Result<(PathBuf, Pat
     Ok((relative, target))
 }
 
-pub fn list_files(workspace: &CypressWorkspace) -> Result<Vec<CypressWorkspaceFile>, CoreError> {
+/// 편집기 목록에서 뺄 폴더 이름인지. 편집 금지 폴더와 빌드 산출물을 함께 거른다. 이름만 보므로
+/// 어느 깊이에 있든 걸린다.
+fn is_skipped_dir(name: &str) -> bool {
+    DENIED_TOP_DIRS.contains(&name) || BUILD_OUTPUT_DIRS.contains(&name)
+}
+
+pub fn list_files(workspace: &CypressWorkspace) -> Result<CypressWorkspaceFileList, CoreError> {
     let root = workspace.project_dir();
     if !root.is_dir() {
         return Err(CoreError::NotFound(format!(
@@ -465,42 +577,63 @@ pub fn list_files(workspace: &CypressWorkspace) -> Result<Vec<CypressWorkspaceFi
         )));
     }
     let mut files = Vec::new();
+    let mut truncated = false;
     let walker = WalkDir::new(&root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
-            entry.depth() == 0 || (!SKIPPED_DIRS.contains(&name.as_ref()) && !name.starts_with('.'))
+            entry.depth() == 0 || (!is_skipped_dir(name.as_ref()) && !name.starts_with('.'))
         });
     for entry in walker {
-        let entry = entry.map_err(|error| {
-            CoreError::Runtime(format!("작업공간 파일 목록을 읽지 못했습니다: {error}"))
-        })?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            // 순회 도중 사라지거나 막힌 항목 하나 때문에 목록 전체를 버리지 않는다. 작업공간은
+            // 사람과 다른 도구가 같이 쓰는 폴더라 읽는 사이에 파일이 바뀐다.
+            Err(error)
+                if error.io_error().is_some_and(|io| {
+                    matches!(
+                        io.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                    )
+                }) =>
+            {
+                continue
+            }
+            Err(error) => {
+                return Err(CoreError::Runtime(format!(
+                    "작업공간 파일 목록을 읽지 못했습니다: {error}"
+                )))
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
         if files.len() >= MAX_FILES {
-            return Err(CoreError::InvalidInput(format!(
-                "작업공간 파일이 {MAX_FILES}개를 넘습니다"
-            )));
+            truncated = true;
+            break;
         }
         let relative = entry
             .path()
             .strip_prefix(&root)
             .map_err(|_| CoreError::Runtime("작업공간 경로 계산 실패".to_owned()))?;
         files.push(CypressWorkspaceFile {
-            path: relative_text(relative),
+            path: relative_slash_path(relative),
             size_bytes: entry.metadata().map(|meta| meta.len()).unwrap_or(0),
             sensitive: is_sensitive(relative),
         });
     }
-    Ok(files)
+    Ok(CypressWorkspaceFileList {
+        files,
+        truncated,
+        limit: MAX_FILES,
+    })
 }
 
 fn read_text_limited(path: &Path) -> Result<String, CoreError> {
     let metadata = fs::metadata(path)
-        .map_err(|_| CoreError::NotFound(format!("파일이 없습니다: {}", path.display())))?;
+        .map_err(|_| CoreError::NotFound(format!("{MISSING_FILE_PREFIX}{}", path.display())))?;
     if !metadata.is_file() {
         return Err(CoreError::InvalidInput(format!(
             "파일이 아닙니다: {}",
@@ -513,19 +646,39 @@ fn read_text_limited(path: &Path) -> Result<String, CoreError> {
     Ok(String::from_utf8_lossy(&fs::read(path)?).into_owned())
 }
 
+/// JSON 값 트리를 순회하며 모든 문자열 노드를 가변 참조로 방문한다.
+fn walk_json_strings_mut(value: &mut Value, visitor: &mut impl FnMut(&mut String)) {
+    match value {
+        Value::String(text) => visitor(text),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| walk_json_strings_mut(item, visitor)),
+        Value::Object(map) => map
+            .values_mut()
+            .for_each(|item| walk_json_strings_mut(item, visitor)),
+        _ => {}
+    }
+}
+
+/// JSON 값 트리를 순회하며 모든 문자열 노드를 읽기 전용으로 방문한다.
+fn walk_json_strings(value: &Value, visitor: &mut impl FnMut(&str)) {
+    match value {
+        Value::String(text) => visitor(text),
+        Value::Array(items) => items
+            .iter()
+            .for_each(|item| walk_json_strings(item, visitor)),
+        Value::Object(map) => map
+            .values()
+            .for_each(|item| walk_json_strings(item, visitor)),
+        _ => {}
+    }
+}
+
 /// 문자열 값을 모두 가린 JSON. 구조와 키는 남겨 AIA가 어떤 키를 `Cypress.env`로 읽을지 알 수 있게 한다.
 pub(crate) fn mask_env_json(text: &str) -> String {
-    fn mask(value: &mut Value) {
-        match value {
-            Value::String(text) => *text = MASK.to_owned(),
-            Value::Array(items) => items.iter_mut().for_each(mask),
-            Value::Object(map) => map.values_mut().for_each(mask),
-            _ => {}
-        }
-    }
     match serde_json::from_str::<Value>(text) {
         Ok(mut value) => {
-            mask(&mut value);
+            walk_json_strings_mut(&mut value, &mut |text| *text = MASK.to_owned());
             serde_json::to_string_pretty(&value).unwrap_or_else(|_| MASK.to_owned())
         }
         Err(_) => MASK.to_owned(),
@@ -541,7 +694,7 @@ pub fn read_file(
     let sensitive = is_sensitive(&relative);
     let content = read_text_limited(&target)?;
     Ok(CypressWorkspaceFileContent {
-        path: relative_text(&relative),
+        path: relative_slash_path(&relative),
         content: if sensitive {
             mask_env_json(&content)
         } else {
@@ -570,6 +723,25 @@ pub fn read_env_file(
     })
 }
 
+fn validate_text_payload_size(content: &str) -> Result<(), CoreError> {
+    if content.len() as u64 > MAX_TEXT_BYTES {
+        return Err(CoreError::TooLarge(MAX_TEXT_BYTES));
+    }
+    Ok(())
+}
+
+fn workspace_file_receipt(
+    path: String,
+    content_len: usize,
+    sensitive: bool,
+) -> CypressWorkspaceFile {
+    CypressWorkspaceFile {
+        path,
+        size_bytes: content_len as u64,
+        sensitive,
+    }
+}
+
 pub fn write_file(
     workspace: &CypressWorkspace,
     raw: &str,
@@ -582,9 +754,7 @@ pub fn write_file(
                 .to_owned(),
         ));
     }
-    if content.len() as u64 > MAX_TEXT_BYTES {
-        return Err(CoreError::TooLarge(MAX_TEXT_BYTES));
-    }
+    validate_text_payload_size(content)?;
     if target.is_dir() {
         return Err(CoreError::InvalidInput(format!(
             "폴더에는 쓸 수 없습니다: {raw}"
@@ -594,11 +764,11 @@ pub fn write_file(
         fs::create_dir_all(parent)?;
     }
     fs::write(&target, content)?;
-    Ok(CypressWorkspaceFile {
-        path: relative_text(&relative),
-        size_bytes: content.len() as u64,
-        sensitive: false,
-    })
+    Ok(workspace_file_receipt(
+        relative_slash_path(&relative),
+        content.len(),
+        false,
+    ))
 }
 
 /// env 파일 저장. JSON 객체여야 하고 0600으로 쓴다.
@@ -606,9 +776,7 @@ pub fn write_env_file(
     workspace: &CypressWorkspace,
     content: &str,
 ) -> Result<CypressWorkspaceFile, CoreError> {
-    if content.len() as u64 > MAX_TEXT_BYTES {
-        return Err(CoreError::TooLarge(MAX_TEXT_BYTES));
-    }
+    validate_text_payload_size(content)?;
     match serde_json::from_str::<Value>(content) {
         Ok(Value::Object(_)) => {}
         Ok(_) => {
@@ -624,23 +792,23 @@ pub fn write_env_file(
     }
     let target = workspace.project_dir().join(ENV_FILE);
     write_private_bytes(&target, content.as_bytes())?;
-    Ok(CypressWorkspaceFile {
-        path: ENV_FILE.to_owned(),
-        size_bytes: content.len() as u64,
-        sensitive: true,
-    })
+    Ok(workspace_file_receipt(
+        ENV_FILE.to_owned(),
+        content.len(),
+        true,
+    ))
 }
 
 pub fn delete_file(workspace: &CypressWorkspace, raw: &str) -> Result<(), CoreError> {
     let (relative, target) = resolve_file(workspace, raw)?;
-    let text = relative_text(&relative);
-    if is_sensitive(&relative) || CONFIG_CANDIDATES.contains(&text.as_str()) {
+    let text = relative_slash_path(&relative);
+    if is_protected_workspace_file(&relative, &text) {
         return Err(CoreError::InvalidInput(format!(
             "{text}은(는) 작업공간의 필수 파일이라 지울 수 없습니다"
         )));
     }
     if !target.is_file() {
-        return Err(CoreError::NotFound(format!("파일이 없습니다: {text}")));
+        return Err(CoreError::NotFound(format!("{MISSING_FILE_PREFIX}{text}")));
     }
     fs::remove_file(&target)?;
     Ok(())
@@ -648,22 +816,14 @@ pub fn delete_file(workspace: &CypressWorkspace, raw: &str) -> Result<(), CoreEr
 
 /// 실행 출력에서 지울 비밀값. env 파일의 문자열 값 중 스크럽할 만큼 긴 것만.
 pub fn env_secret_values(workspace: &CypressWorkspace) -> Vec<String> {
-    fn collect(value: &Value, into: &mut BTreeSet<String>) {
-        match value {
-            Value::String(text) => {
-                if text.chars().count() >= MIN_SECRET_CHARS {
-                    into.insert(text.clone());
-                }
-            }
-            Value::Array(items) => items.iter().for_each(|item| collect(item, into)),
-            Value::Object(map) => map.values().for_each(|item| collect(item, into)),
-            _ => {}
-        }
-    }
     let mut values = BTreeSet::new();
     if let Ok(text) = fs::read_to_string(workspace.project_dir().join(ENV_FILE)) {
         if let Ok(value) = serde_json::from_str::<Value>(&text) {
-            collect(&value, &mut values);
+            walk_json_strings(&value, &mut |text| {
+                if text.chars().count() >= MIN_SECRET_CHARS {
+                    values.insert(text.to_owned());
+                }
+            });
         }
     }
     let mut result: Vec<String> = values.into_iter().collect();
@@ -676,18 +836,25 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn fixture() -> (TempDir, CypressWorkspace) {
+    fn fixture() -> (TempDir, TempDir, CypressWorkspace) {
         let data = TempDir::new().expect("temp app data");
         let registry = registry(data.path()).expect("registry");
         assert!(!registry.enabled, "기본은 꺼짐");
-        let workspace = workspace(data.path(), DEFAULT_WORKSPACE_ID).expect("default workspace");
-        (data, workspace)
+        assert!(
+            registry.workspaces.is_empty(),
+            "기본 작업공간을 만들지 않음"
+        );
+        let project = TempDir::new().expect("temp Cypress project");
+        let view = add_workspace(data.path(), "test", project.path().to_str().unwrap(), None)
+            .expect("add workspace");
+        let id = &view.workspaces[0].workspace.id;
+        let workspace = workspace(data.path(), id).expect("registered workspace");
+        (data, project, workspace)
     }
 
     #[test]
-    fn default_workspace_is_created_from_the_template_with_a_private_env_file() {
-        let (data, workspace) = fixture();
-        assert!(workspace.builtin);
+    fn added_empty_workspace_uses_the_template_with_a_private_env_file() {
+        let (data, _project, workspace) = fixture();
         let root = workspace.project_dir();
         assert!(root.join("cypress.config.js").is_file());
         assert!(root.join("support/commands.js").is_file());
@@ -714,7 +881,9 @@ mod tests {
             fs::read_to_string(root.join("e2e/example.cy.js")).unwrap(),
             "// edited"
         );
-        let files = list_files(&workspace).unwrap();
+        let listed = list_files(&workspace).unwrap();
+        assert!(!listed.truncated);
+        let files = listed.files;
         let env = files
             .iter()
             .find(|file| file.path == ENV_FILE)
@@ -725,9 +894,168 @@ mod tests {
             .all(|file| !file.path.starts_with("node_modules")));
     }
 
+    /// 실행 옵션은 작업공간에 저장돼 다시 읽어도 남는다. 없던 필드라 옛 저장본에서는 꺼진
+    /// 상태로 읽혀야 한다(serde 기본값).
+    #[test]
+    fn run_options_and_execution_type_are_stored_per_workspace_and_default_to_standard() {
+        let (data, _project, workspace) = fixture();
+        assert!(!workspace.record_video && !workspace.headed);
+        assert_eq!(workspace.execution_type, CypressExecutionType::Standard);
+
+        let view = set_workspace_options(
+            data.path(),
+            &workspace.id,
+            true,
+            true,
+            Some(CypressExecutionType::AgentManagerIsolated),
+        )
+        .unwrap();
+        let stored = view
+            .workspaces
+            .iter()
+            .find(|item| item.workspace.id == workspace.id)
+            .expect("workspace");
+        assert!(stored.workspace.record_video && stored.workspace.headed);
+        assert_eq!(
+            stored.workspace.execution_type,
+            CypressExecutionType::AgentManagerIsolated
+        );
+
+        let reloaded = super::workspace(data.path(), &workspace.id).unwrap();
+        assert!(reloaded.record_video && reloaded.headed);
+
+        set_workspace_options(
+            data.path(),
+            &workspace.id,
+            false,
+            false,
+            Some(CypressExecutionType::Standard),
+        )
+        .unwrap();
+        let off = super::workspace(data.path(), &workspace.id).unwrap();
+        assert!(!off.record_video && !off.headed);
+        assert!(matches!(
+            set_workspace_options(
+                data.path(),
+                "없는-작업공간",
+                true,
+                false,
+                Some(CypressExecutionType::Standard)
+            ),
+            Err(CoreError::NotFound(_))
+        ));
+    }
+
+    /// 상한을 넘으면 오류 대신 거기서 끊는다. 예전에는 오류였고, 그 바람에 상한을 넘긴
+    /// 작업공간은 편집기와 스펙 목록이 통째로 비어 아무 파일도 고를 수 없었다.
+    #[test]
+    fn a_workspace_over_the_cap_is_truncated_instead_of_failing() {
+        let (_data, _project, workspace) = fixture();
+        let root = workspace.project_dir();
+        let bulk = root.join("e2e/bulk");
+        fs::create_dir_all(&bulk).unwrap();
+        for index in 0..MAX_FILES {
+            fs::write(bulk.join(format!("{index:05}.cy.js")), "//").unwrap();
+        }
+        let listed = list_files(&workspace).unwrap();
+        assert!(listed.truncated);
+        assert_eq!(listed.files.len(), MAX_FILES);
+        assert_eq!(listed.limit, MAX_FILES);
+        // 끊겼어도 경로를 직접 댄 읽기·쓰기는 그대로 된다.
+        assert!(read_file(&workspace, "cypress.config.js").is_ok());
+    }
+
+    /// 작업공간은 사람과 다른 도구가 같이 쓰는 폴더다. 순회 중 막힌 항목 하나로 목록 전체를
+    /// 버리면, 실행이 산출물을 쓰는 동안에는 편집기를 열 수 없다.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_subdirectory_does_not_sink_the_whole_listing() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_data, _project, workspace) = fixture();
+        let blocked = workspace.project_dir().join("e2e/blocked");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::write(blocked.join("inside.cy.js"), "//").unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        let listed = list_files(&workspace);
+        // 임시 폴더를 지울 수 있게 되돌린 뒤에 판정한다.
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+        let listed = listed.expect("막힌 폴더가 있어도 목록은 나와야 한다");
+        assert!(listed
+            .files
+            .iter()
+            .any(|file| file.path == "e2e/example.cy.js"));
+        assert!(!listed
+            .files
+            .iter()
+            .any(|file| file.path == "e2e/blocked/inside.cy.js"));
+    }
+
+    /// 화면이 통과시킨 경로를 백엔드가 거절하면 사용자는 다 적고 나서야 못 쓴다는 걸 안다.
+    #[test]
+    fn denied_top_dirs_match_the_frontend_helper() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../src/lib/cypressWorkspace.ts")
+            .canonicalize()
+            .expect("frontend helper must exist");
+        let text = fs::read_to_string(source).expect("frontend helper must be readable");
+        let listed = DENIED_TOP_DIRS
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            text.contains(&format!("export const RESERVED_TOP_DIRS = [{listed}];")),
+            "src/lib/cypressWorkspace.ts의 편집 금지 폴더 목록이 Rust와 다릅니다"
+        );
+    }
+
+    /// 화면은 이 접두사로 "새 파일"과 "읽기 실패"를 가른다. 한쪽만 바꾸면 있는 파일을 빈
+    /// 내용으로 열어 저장 순간 원본이 지워진다.
+    #[test]
+    fn missing_file_prefix_matches_the_frontend_helper() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../src/lib/cypressWorkspace.ts")
+            .canonicalize()
+            .expect("frontend helper must exist");
+        let text = fs::read_to_string(source).expect("frontend helper must be readable");
+        assert!(
+            text.contains(&format!(
+                "export const MISSING_FILE_PREFIX = \"{MISSING_FILE_PREFIX}\";"
+            )),
+            "src/lib/cypressWorkspace.ts의 접두사가 Rust와 다릅니다"
+        );
+    }
+
+    /// 저장소를 그대로 작업공간으로 등록하면 빌드 산출물이 목록을 뒤덮어 상한에 걸렸다.
+    /// 목록에서는 빠지되 편집까지 막지는 않는다 — 두 규칙은 서로 다른 목적이다.
+    #[test]
+    fn build_output_dirs_are_hidden_from_the_list_but_not_blocked_from_editing() {
+        let (_data, _project, workspace) = fixture();
+        let root = workspace.project_dir();
+        for relative in ["target/debug/a.js", "dist/b.js", "e2e/deep/build/c.js"] {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "x").unwrap();
+        }
+        let files = list_files(&workspace).unwrap().files;
+        for hidden in ["target/debug/a.js", "dist/b.js", "e2e/deep/build/c.js"] {
+            assert!(
+                !files.iter().any(|file| file.path == hidden),
+                "{hidden} 는 목록에서 빠져야 한다"
+            );
+        }
+        assert!(files.iter().any(|file| file.path == "e2e/example.cy.js"));
+        // 막는 것은 모듈·산출물·VCS 뿐이고, 빌드 출력은 경로를 직접 대면 고칠 수 있다.
+        assert!(write_file(&workspace, "target/debug/a.js", "y").is_ok());
+        assert!(matches!(
+            write_file(&workspace, "node_modules/a.js", "y"),
+            Err(CoreError::InvalidInput(_))
+        ));
+    }
+
     #[test]
     fn env_file_is_masked_on_normal_reads_and_written_only_through_the_dedicated_path() {
-        let (_data, workspace) = fixture();
+        let (_data, _project, workspace) = fixture();
         write_env_file(
             &workspace,
             r#"{"accounts":{"drafter":{"HR_USER":"u@x.com","HR_PASS":"s3cret!"}},"n":1}"#,
@@ -773,7 +1101,7 @@ mod tests {
 
     #[test]
     fn workspace_files_stay_inside_the_project_root() {
-        let (_data, workspace) = fixture();
+        let (_data, _project, workspace) = fixture();
         for bad in [
             "../x.js",
             "/etc/passwd",
@@ -807,14 +1135,60 @@ mod tests {
         ));
     }
 
+    /// 설정이 없는 폴더는 거절하지 않고 템플릿을 깐다. 설정이 이미 있으면 그 프로젝트의 파일을
+    /// 덮지 않는다.
     #[test]
-    fn external_workspaces_need_a_config_and_stay_out_of_protected_roots() {
-        let (data, _workspace) = fixture();
+    fn a_folder_without_a_config_is_scaffolded_and_an_existing_project_is_left_alone() {
+        let (data, _project, _workspace) = fixture();
+        let empty = TempDir::new().unwrap();
+        let view = add_workspace(data.path(), "new", empty.path().to_str().unwrap(), None).unwrap();
+        assert!(empty.path().join("cypress.config.js").is_file());
+        let config = fs::read_to_string(empty.path().join("cypress.config.js")).unwrap();
+        assert!(config.contains("module.exports = {"));
+        assert!(!config.contains("require(\"cypress\")"));
+        assert!(!config.contains("defineConfig"));
+        assert!(empty.path().join("package.json").is_file());
+        assert!(empty.path().join("e2e/example.cy.js").is_file());
+        assert!(empty.path().join(ENV_FILE).is_file());
+        assert!(!view
+            .workspaces
+            .iter()
+            .any(|w| w.workspace.name == "new" && w.module_ready));
+
+        let existing = TempDir::new().unwrap();
+        fs::write(
+            existing.path().join("cypress.config.ts"),
+            "export default {};",
+        )
+        .unwrap();
+        fs::write(existing.path().join("package.json"), "{\"name\":\"mine\"}").unwrap();
+        add_workspace(data.path(), "mine", existing.path().to_str().unwrap(), None).unwrap();
+        assert!(!existing.path().join("cypress.config.js").exists());
+        assert_eq!(
+            fs::read_to_string(existing.path().join("package.json")).unwrap(),
+            "{\"name\":\"mine\"}"
+        );
+
+        // 모듈 위치는 없으면 한 칸 만들고, package.json이 없으면 템플릿 것을 둔다.
+        let with_module = TempDir::new().unwrap();
+        let module_dir = with_module.path().join("cypress-module");
+        add_workspace(
+            data.path(),
+            "mod",
+            with_module.path().to_str().unwrap(),
+            Some(module_dir.to_str().unwrap()),
+        )
+        .unwrap();
+        assert!(module_dir.is_dir());
+        assert!(ensure_module_package_json(&module_dir).unwrap());
+        assert!(!ensure_module_package_json(&module_dir).unwrap());
+        assert!(module_dir.join("package.json").is_file());
+    }
+
+    #[test]
+    fn external_workspaces_stay_out_of_protected_roots() {
+        let (data, _project, _workspace) = fixture();
         let external = TempDir::new().unwrap();
-        assert!(matches!(
-            add_workspace(data.path(), "kb", external.path().to_str().unwrap(), None),
-            Err(CoreError::InvalidInput(_))
-        ));
         fs::write(
             external.path().join("cypress.config.js"),
             "module.exports = {};",
@@ -826,7 +1200,7 @@ mod tests {
         let added = view
             .workspaces
             .iter()
-            .find(|w| !w.workspace.builtin)
+            .find(|w| w.workspace.name == "kb")
             .unwrap();
         assert!(!added.module_ready);
         assert!(matches!(
@@ -841,13 +1215,46 @@ mod tests {
             add_workspace(data.path(), "in", inside.to_str().unwrap(), None),
             Err(CoreError::InvalidInput(_))
         ));
-        assert!(matches!(
-            remove_workspace(data.path(), DEFAULT_WORKSPACE_ID),
-            Err(CoreError::InvalidInput(_))
-        ));
         let after = remove_workspace(data.path(), &added.workspace.id).unwrap();
         assert_eq!(after.workspaces.len(), 1);
         assert!(set_enabled(data.path(), true).unwrap().enabled);
         assert!(is_enabled(data.path()).unwrap());
+    }
+
+    #[test]
+    fn legacy_default_registration_is_removed_and_its_files_are_archived() {
+        let data = TempDir::new().unwrap();
+        let legacy = data.path().join("aia-workspace/cypress/default");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("user-spec.cy.js"), "// keep").unwrap();
+        write_private_json(
+            &data.path().join(REGISTRY_FILE),
+            &serde_json::json!({
+                "schemaVersion": SCHEMA_VERSION,
+                "enabled": true,
+                "workspaces": [{
+                    "id": "default",
+                    "name": "기본 작업공간",
+                    "path": legacy,
+                    "builtin": true,
+                    "recordVideo": false,
+                    "headed": false,
+                    "createdAt": 1
+                }]
+            }),
+        )
+        .unwrap();
+
+        let view = registry(data.path()).unwrap();
+        assert!(view.enabled);
+        assert!(view.workspaces.is_empty());
+        assert!(!legacy.exists());
+        let archived = fs::read_dir(data.path().join(LEGACY_WORKSPACE_TRASH_DIR))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(archived.join("user-spec.cy.js").is_file());
     }
 }

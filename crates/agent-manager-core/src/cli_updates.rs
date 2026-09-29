@@ -22,9 +22,10 @@ use serde_json::Value;
 
 use crate::chat::{ChatPhase, ChatSupervisor};
 use crate::cli_interface::{run_capped, CommandOutcome};
-use crate::domain::ProviderId;
+use crate::domain::{wire_enum, ProviderId};
 use crate::external_processes::{
     list_external_provider_processes, terminate_external_provider_processes,
+    TerminateExternalProcessesReport,
 };
 use crate::providers::{detect_provider_cli, provider_display_name, resolve_named_executable};
 use crate::terminal::TerminalSupervisor;
@@ -117,6 +118,16 @@ const ADAPTERS: &[ProviderCliAdapter] = &[
         model_caches: &[],
         no_model_cache_reason: "Antigravity CLI에서 버전에 종속된 모델 카탈로그 캐시 파일을 확인하지 못했습니다. ~/.gemini/antigravity-cli 아래 대화 이력·설정·로그는 정리 대상에서 제외합니다.",
     },
+    ProviderCliAdapter {
+        provider: ProviderId::Local,
+        version_args: &["--version"],
+        // 자기 CLI가 없다. 실행 파일은 Codex 것이므로 업데이트도 Codex 줄에서 한다.
+        self_update: None,
+        manual_update_hint: "Ollama 공급자는 Codex CLI를 빌려 쓰므로 Codex 줄에서 업데이트합니다.",
+        // 모델 목록은 서빙 서버에서 직접 가져오므로 버전에 묶인 캐시 파일이 없다.
+        model_caches: &[],
+        no_model_cache_reason: "Ollama 공급자는 모델 목록을 서빙 서버에서 직접 가져와 캐시 파일이 없습니다.",
+    },
 ];
 
 fn adapter(provider: ProviderId) -> &'static ProviderCliAdapter {
@@ -150,44 +161,19 @@ impl CliInstallSource {
         Self::NotDetected,
     ];
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::HomebrewCask => "homebrewCask",
-            Self::HomebrewFormula => "homebrewFormula",
-            Self::NpmGlobal => "npmGlobal",
-            Self::Standalone => "standalone",
-            Self::NotDetected => "notDetected",
-        }
-    }
-
     /// 설치 출처가 감지되었는지 여부.
     pub fn is_detected(self) -> bool {
         self != Self::NotDetected
     }
 }
 
-impl std::fmt::Display for CliInstallSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for CliInstallSource {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "homebrewCask" => Ok(Self::HomebrewCask),
-            "homebrewFormula" => Ok(Self::HomebrewFormula),
-            "npmGlobal" => Ok(Self::NpmGlobal),
-            "standalone" => Ok(Self::Standalone),
-            "notDetected" => Ok(Self::NotDetected),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 CLI 설치 출처입니다: {s}"
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed CliInstallSource, "알 수 없는 CLI 설치 출처입니다", {
+    HomebrewCask => "homebrewCask",
+    HomebrewFormula => "homebrewFormula",
+    NpmGlobal => "npmGlobal",
+    Standalone => "standalone",
+    NotDetected => "notDetected",
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -209,16 +195,6 @@ impl CliUpdateMethod {
         Self::Unsupported,
     ];
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::HomebrewCask => "homebrewCask",
-            Self::HomebrewFormula => "homebrewFormula",
-            Self::NpmGlobal => "npmGlobal",
-            Self::SelfUpdate => "selfUpdate",
-            Self::Unsupported => "unsupported",
-        }
-    }
-
     /// 업데이트 실행을 지원하는지 여부.
     pub fn is_update_supported(self) -> bool {
         self != Self::Unsupported
@@ -233,28 +209,13 @@ impl CliUpdateMethod {
     }
 }
 
-impl std::fmt::Display for CliUpdateMethod {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for CliUpdateMethod {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "homebrewCask" => Ok(Self::HomebrewCask),
-            "homebrewFormula" => Ok(Self::HomebrewFormula),
-            "npmGlobal" => Ok(Self::NpmGlobal),
-            "selfUpdate" => Ok(Self::SelfUpdate),
-            "unsupported" => Ok(Self::Unsupported),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 CLI 업데이트 방식입니다: {s}"
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed CliUpdateMethod, "알 수 없는 CLI 업데이트 방식입니다", {
+    HomebrewCask => "homebrewCask",
+    HomebrewFormula => "homebrewFormula",
+    NpmGlobal => "npmGlobal",
+    SelfUpdate => "selfUpdate",
+    Unsupported => "unsupported",
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -286,46 +247,20 @@ impl ModelCacheState {
         Self::Unknown,
     ];
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Absent => "absent",
-            Self::Matched => "matched",
-            Self::Mismatched => "mismatched",
-            Self::Outdated => "outdated",
-            Self::Unreadable => "unreadable",
-            Self::Unknown => "unknown",
-        }
-    }
-
     /// 정리(삭제)가 허용되는 상태인지 여부. 실행 버전보다 높게 기록된 캐시와 해석할 수 없는 캐시만 정리 대상이다.
     pub fn is_cleanup_available(self) -> bool {
         matches!(self, Self::Mismatched | Self::Unreadable)
     }
 }
 
-impl std::fmt::Display for ModelCacheState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for ModelCacheState {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "absent" => Ok(Self::Absent),
-            "matched" => Ok(Self::Matched),
-            "mismatched" => Ok(Self::Mismatched),
-            "outdated" => Ok(Self::Outdated),
-            "unreadable" => Ok(Self::Unreadable),
-            "unknown" => Ok(Self::Unknown),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 모델 캐시 상태입니다: {s}"
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed ModelCacheState, "알 수 없는 모델 캐시 상태입니다", {
+    Absent => "absent",
+    Matched => "matched",
+    Mismatched => "mismatched",
+    Outdated => "outdated",
+    Unreadable => "unreadable",
+    Unknown => "unknown",
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -390,42 +325,18 @@ impl CliUpdateOutcome {
         Self::Failed,
     ];
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Updated => "updated",
-            Self::AlreadyLatest => "alreadyLatest",
-            Self::VerificationFailed => "verificationFailed",
-            Self::Failed => "failed",
-        }
-    }
-
     /// 업데이트 실패 상태(실행 실패 또는 검증 실패)인지 여부.
     pub fn is_failure(self) -> bool {
         matches!(self, Self::Failed | Self::VerificationFailed)
     }
 }
 
-impl std::fmt::Display for CliUpdateOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for CliUpdateOutcome {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "updated" => Ok(Self::Updated),
-            "alreadyLatest" => Ok(Self::AlreadyLatest),
-            "verificationFailed" => Ok(Self::VerificationFailed),
-            "failed" => Ok(Self::Failed),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 CLI 업데이트 결과입니다: {s}"
-            ))),
-        }
-    }
-}
+wire_enum!(trimmed CliUpdateOutcome, "알 수 없는 CLI 업데이트 결과입니다", {
+    Updated => "updated",
+    AlreadyLatest => "alreadyLatest",
+    VerificationFailed => "verificationFailed",
+    Failed => "failed",
+});
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -440,6 +351,9 @@ pub struct ProviderRuntimeStopSummary {
     pub external_terminated_count: usize,
     pub external_forced_count: usize,
     pub external_failed_count: usize,
+    /// 외부 프로세스를 조회조차 하지 못했을 때의 사유. 정리를 건너뛴 사실은 영수증에
+    /// 남고 작업은 계속된다.
+    pub external_skipped_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -690,11 +604,7 @@ fn plan_update(adapter: &ProviderCliAdapter, executable: &Path) -> UpdatePlan {
                 Err(plan) => return plan,
             };
             let cask = source == CliInstallSource::HomebrewCask;
-            let label = format!(
-                "brew upgrade {} {}",
-                if cask { "--cask" } else { "--formula" },
-                package
-            );
+            let label = format!("brew upgrade {} {}", homebrew_kind_flag(cask), package);
             UpdatePlan {
                 source,
                 method: if cask {
@@ -976,6 +886,35 @@ fn split_version(version: &str) -> (Vec<u64>, String) {
 /// `brew info`·`brew upgrade`는 로컬 API 카탈로그를 스스로 갱신하지 않아 며칠
 /// 지난 "최신" 버전을 돌려줄 수 있다. 실행 전에 카탈로그를 갱신하되, 오프라인
 /// 등으로 실패하면 캐시된 카탈로그로 계속 진행한다.
+/// Homebrew 명령의 갈래 플래그. cask와 formula를 가르는 유일한 지점이다.
+fn homebrew_kind_flag(cask: bool) -> &'static str {
+    if cask {
+        "--cask"
+    } else {
+        "--formula"
+    }
+}
+
+/// 패키지 관리자에 메타데이터를 묻는 명령 한 번. 시간 초과와 실패를 같은 문구 틀로
+/// 오류로 바꾼다. 호출부는 성공한 출력만 해석하면 된다.
+fn run_metadata_command(
+    executable: &Path,
+    args: &[&str],
+    label: &str,
+) -> Result<CommandOutcome, CoreError> {
+    let outcome = run_capped(executable, args, METADATA_COMMAND_TIMEOUT)?;
+    if outcome.timed_out {
+        return Err(CoreError::Runtime(format!("{label} 시간이 초과되었습니다")));
+    }
+    if !outcome.success {
+        return Err(CoreError::Runtime(format!(
+            "{label}에 실패했습니다: {}",
+            text_limit::truncate_chars(outcome.stderr.trim(), 200)
+        )));
+    }
+    Ok(outcome)
+}
+
 fn refresh_homebrew_metadata(brew: &Path) {
     let _ = run_capped(brew, &["update", "--quiet"], METADATA_COMMAND_TIMEOUT);
 }
@@ -983,27 +922,11 @@ fn refresh_homebrew_metadata(brew: &Path) {
 fn homebrew_latest_version(token: &str, cask: bool) -> Result<String, CoreError> {
     let brew = resolve_named_executable(&["brew"])?;
     refresh_homebrew_metadata(&brew);
-    let outcome = run_capped(
+    let outcome = run_metadata_command(
         &brew,
-        &[
-            "info",
-            "--json=v2",
-            if cask { "--cask" } else { "--formula" },
-            token,
-        ],
-        METADATA_COMMAND_TIMEOUT,
+        &["info", "--json=v2", homebrew_kind_flag(cask), token],
+        "Homebrew 최신 버전 조회",
     )?;
-    if outcome.timed_out {
-        return Err(CoreError::Runtime(
-            "Homebrew 최신 버전 조회 시간이 초과되었습니다".to_owned(),
-        ));
-    }
-    if !outcome.success {
-        return Err(CoreError::Runtime(format!(
-            "Homebrew 최신 버전 조회에 실패했습니다: {}",
-            text_limit::truncate_chars(outcome.stderr.trim(), 200)
-        )));
-    }
     parse_homebrew_latest_version(&outcome.stdout, cask).ok_or_else(|| {
         CoreError::Runtime("Homebrew 응답에서 최신 버전을 찾지 못했습니다".to_owned())
     })
@@ -1031,22 +954,7 @@ fn parse_homebrew_latest_version(payload: &str, cask: bool) -> Option<String> {
 
 fn npm_latest_version(package: &str) -> Result<String, CoreError> {
     let npm = resolve_named_executable(&["npm"])?;
-    let outcome = run_capped(
-        &npm,
-        &["view", package, "version"],
-        METADATA_COMMAND_TIMEOUT,
-    )?;
-    if outcome.timed_out {
-        return Err(CoreError::Runtime(
-            "npm 최신 버전 조회 시간이 초과되었습니다".to_owned(),
-        ));
-    }
-    if !outcome.success {
-        return Err(CoreError::Runtime(format!(
-            "npm 최신 버전 조회에 실패했습니다: {}",
-            text_limit::truncate_chars(outcome.stderr.trim(), 200)
-        )));
-    }
+    let outcome = run_metadata_command(&npm, &["view", package, "version"], "npm 최신 버전 조회")?;
     outcome
         .stdout
         .lines()
@@ -1067,12 +975,7 @@ fn verify_install(status: &ProviderCliUpdateStatus) -> Result<(), CoreError> {
             let cask = status.update_method == CliUpdateMethod::HomebrewCask;
             let outcome = run_capped(
                 &brew,
-                &[
-                    "list",
-                    if cask { "--cask" } else { "--formula" },
-                    "--versions",
-                    package,
-                ],
+                &["list", homebrew_kind_flag(cask), "--versions", package],
                 METADATA_COMMAND_TIMEOUT,
             )?;
             if !outcome.success
@@ -1179,8 +1082,17 @@ fn stop_provider_runtimes(
     }
 
     // 관리 런타임을 모두 정리한 뒤 외부 독립 실행 CLI를 종료한다. 외부 종료 실패는
-    // 보고만 하고 작업을 막지 않는다.
-    let external = terminate_external_provider_processes(provider)?;
+    // 보고만 하고 작업을 막지 않는다 — 개별 프로세스가 끝내 죽지 않은 경우는 예전부터
+    // `failed`로만 남았고, 조회 자체가 안 되는 경우도 같은 취급을 받아야 한다. 여기서
+    // 오류를 올리면 공급자 CLI를 하나도 띄우지 않은 기기에서까지 업데이트가 막힌다.
+    let (external, external_skipped_reason) = match terminate_external_provider_processes(provider)
+    {
+        Ok(report) => (report, None),
+        Err(error) => (
+            TerminateExternalProcessesReport::empty(provider),
+            Some(error.to_string()),
+        ),
+    };
     Ok(ProviderRuntimeStopSummary {
         chat_requested_count: chat_report.requested_count,
         chat_stopped_count: chat_report.stopped_count,
@@ -1192,6 +1104,7 @@ fn stop_provider_runtimes(
         external_terminated_count: external.terminated_count,
         external_forced_count: external.forced_count,
         external_failed_count: external.failed.len(),
+        external_skipped_reason,
     })
 }
 
@@ -1205,6 +1118,69 @@ pub fn update_provider_cli(
     provider: ProviderId,
 ) -> Result<CliUpdateReceipt, CoreError> {
     let adapter = adapter(provider);
+    let ready = match prepare_update(adapter)? {
+        UpdateStart::AlreadyLatest(receipt) => return Ok(*receipt),
+        UpdateStart::Ready(ready) => *ready,
+    };
+
+    let stopped = stop_provider_runtimes(
+        chats,
+        terminals,
+        provider,
+        "CLI 업데이트를 실행하지 않았습니다",
+    )?;
+
+    let outcome = run_update_command(adapter, &ready.status, &ready.executable)?;
+    let next_status = status_after_update(chats, adapter, &ready.status);
+    let current_version = next_status.current_version.clone();
+    let (result, verified, message) = classify_update_outcome(
+        &outcome,
+        &ready.command_label,
+        ready.target_version.as_deref(),
+        current_version.as_deref(),
+        ready.previous_version.as_deref(),
+    );
+
+    Ok(CliUpdateReceipt {
+        provider,
+        outcome: result,
+        method: ready.status.update_method,
+        command_label: ready.command_label,
+        previous_version: ready.previous_version,
+        current_version,
+        target_version: ready.target_version,
+        verified,
+        message,
+        failure_output: result
+            .is_failure()
+            .then(|| combined_output_tail(&outcome))
+            .flatten(),
+        stopped,
+        status: next_status,
+    })
+}
+
+/// 업데이트 실행 전 게이트가 가른 두 갈래. 런타임을 종료하기 전에 끝나는 쪽과
+/// 명령을 실제로 돌릴 쪽을 나눈다.
+enum UpdateStart {
+    /// 이미 최신이라 런타임을 건드리지 않고 그대로 알린다.
+    AlreadyLatest(Box<CliUpdateReceipt>),
+    Ready(Box<ReadyUpdate>),
+}
+
+/// 업데이트 명령을 돌리기로 확정된 시점의 입력. 실행 전에 확인한 상태와 버전 기록을
+/// 결과 조립까지 그대로 들고 간다.
+struct ReadyUpdate {
+    status: ProviderCliUpdateStatus,
+    executable: PathBuf,
+    previous_version: Option<String>,
+    target_version: Option<String>,
+    command_label: String,
+}
+
+/// 지원 여부·실행 파일·설치 검증·최신 버전 확인을 차례로 본다. 여기서 갈라지는 갈래는
+/// 채팅과 터미널을 하나도 종료하지 않고 끝난다.
+fn prepare_update(adapter: &ProviderCliAdapter) -> Result<UpdateStart, CoreError> {
     let mut status = resolve_status(adapter);
     if !status.update_supported {
         return Err(CoreError::InvalidInput(format!(
@@ -1229,10 +1205,9 @@ pub fn update_provider_cli(
         .clone()
         .unwrap_or_else(|| "업데이트".to_owned());
 
-    // 이미 최신이면 런타임을 종료하지 않고 그대로 알린다.
     if status.checked && !status.update_available && previous_version.is_some() {
-        return Ok(CliUpdateReceipt {
-            provider,
+        return Ok(UpdateStart::AlreadyLatest(Box::new(CliUpdateReceipt {
+            provider: adapter.provider,
             outcome: CliUpdateOutcome::AlreadyLatest,
             method: status.update_method,
             command_label,
@@ -1244,72 +1219,67 @@ pub fn update_provider_cli(
             failure_output: None,
             stopped: ProviderRuntimeStopSummary::default(),
             status,
-        });
+        })));
     }
 
-    let stopped = stop_provider_runtimes(
-        chats,
-        terminals,
-        provider,
-        "CLI 업데이트를 실행하지 않았습니다",
-    )?;
+    Ok(UpdateStart::Ready(Box::new(ReadyUpdate {
+        status,
+        executable,
+        previous_version,
+        target_version,
+        command_label,
+    })))
+}
 
-    let outcome = run_update_command(adapter, &status, &executable)?;
-    // 업데이트 직후에는 버전 문자열이 그대로여도(재설치·롤백) 인터페이스가 바뀔 수 있으므로
-    // 강제로 다시 조사한다.
+/// 업데이트 직후에는 버전 문자열이 그대로여도(재설치·롤백) 인터페이스가 바뀔 수 있으므로
+/// 강제로 다시 조사한다. 최신 버전 기록은 네트워크를 다시 쓰지 않고 확인 시점 값을 옮겨
+/// 붙이되, 설치 버전이 그 기록보다 높으면 설치 버전을 최신 하한으로 끌어올린다.
+fn status_after_update(
+    chats: &ChatSupervisor,
+    adapter: &ProviderCliAdapter,
+    checked: &ProviderCliUpdateStatus,
+) -> ProviderCliUpdateStatus {
     let mut next_status = resolve_status_and_settings_schema(chats, adapter, true);
-    next_status.latest_version = status.latest_version.clone();
-    next_status.checked = status.checked;
-    next_status.check_error = status.check_error.clone();
+    next_status.latest_version = checked.latest_version.clone();
+    next_status.checked = checked.checked;
+    next_status.check_error = checked.check_error.clone();
     if let (Some(latest), Some(current)) = (
         next_status.latest_version.clone(),
         next_status.current_version.clone(),
     ) {
         let order = compare_versions(&latest, &current);
         next_status.update_available = order == Ordering::Greater;
-        // 확인 시점의 최신 기록이 낡아 그보다 높은 버전이 설치될 수 있다.
-        // 그때는 설치 버전이 최신 하한이므로 기록을 끌어올린다.
         if order == Ordering::Less {
             next_status.latest_version = Some(current);
         }
     }
+    next_status
+}
 
-    let current_version = next_status.current_version.clone();
-    let failure_output = combined_output_tail(&outcome);
-    let (result, verified, message) = if outcome.timed_out {
-        (
+/// 명령이 끝난 방식(시간 초과·실패·성공)으로 먼저 가르고, 성공한 경우에만 설치 버전을
+/// 목표와 대조한다.
+fn classify_update_outcome(
+    outcome: &CommandOutcome,
+    command_label: &str,
+    target_version: Option<&str>,
+    current_version: Option<&str>,
+    previous_version: Option<&str>,
+) -> (CliUpdateOutcome, bool, String) {
+    if outcome.timed_out {
+        return (
             CliUpdateOutcome::Failed,
             false,
             format!("{command_label} 실행 시간이 초과되었습니다. 기존 CLI는 그대로입니다."),
-        )
-    } else if !outcome.success {
-        (
+        );
+    }
+    if !outcome.success {
+        return (
             CliUpdateOutcome::Failed,
             false,
             format!("{command_label} 실행이 실패했습니다. 기존 CLI는 그대로입니다."),
-        )
-    } else {
-        classify_update_result(
-            target_version.as_deref(),
-            current_version.as_deref(),
-            previous_version.as_deref(),
-        )
-    };
-
-    Ok(CliUpdateReceipt {
-        provider,
-        outcome: result,
-        method: status.update_method,
-        command_label,
-        previous_version,
-        current_version,
-        target_version,
-        verified,
-        message,
-        failure_output: result.is_failure().then_some(failure_output).flatten(),
-        stopped,
-        status: next_status,
-    })
+        );
+    }
+    classify_update_result(target_version, current_version, previous_version)
 }
 
 /// 업데이트 명령이 성공 종료한 뒤 실제 실행 버전으로 결과를 판정한다.
@@ -1387,11 +1357,7 @@ fn run_update_command(
             refresh_homebrew_metadata(&brew);
             run_capped(
                 &brew,
-                &[
-                    "upgrade",
-                    if cask { "--cask" } else { "--formula" },
-                    package,
-                ],
+                &["upgrade", homebrew_kind_flag(cask), package],
                 UPDATE_COMMAND_TIMEOUT,
             )
         }
@@ -1600,6 +1566,87 @@ fn cleanup_entry(
     }
 }
 
+/// 정리 대상이 아닌 캐시를 왜 건너뛰었는지 한 줄로 설명한다.
+fn untouched_reason(state: ModelCacheState) -> &'static str {
+    match state {
+        ModelCacheState::Absent => "캐시 파일이 없습니다",
+        ModelCacheState::Matched => "캐시 버전이 실행 버전과 같아 정리하지 않았습니다",
+        _ => "실행 버전을 확인하지 못해 정리하지 않았습니다",
+    }
+}
+
+/// 지울 캐시가 하나도 없을 때의 영수증. 실행 중인 CLI를 멈추지 않고 캐시별 사유만 적는다.
+fn untouched_cleanup_receipt(
+    provider: ProviderId,
+    status: ProviderCliUpdateStatus,
+) -> ModelCacheCleanupReceipt {
+    let entries = status
+        .model_caches
+        .iter()
+        .map(|cache| {
+            cleanup_entry(
+                cache,
+                false,
+                Some(untouched_reason(cache.state).to_owned()),
+                None,
+            )
+        })
+        .collect();
+    ModelCacheCleanupReceipt {
+        provider,
+        removed_count: 0,
+        failed_count: 0,
+        entries,
+        stopped: ProviderRuntimeStopSummary::default(),
+        status,
+    }
+}
+
+/// allowlist 순서대로 캐시 파일을 지운다. 반환값은 캐시별 결과와 (지운 수, 실패 수)다.
+fn remove_cache_targets(
+    adapter: &ProviderCliAdapter,
+    status: &ProviderCliUpdateStatus,
+    targets: &[String],
+) -> (Vec<ModelCacheCleanupEntry>, usize, usize) {
+    let mut entries = Vec::new();
+    let mut removed_count = 0usize;
+    let mut failed_count = 0usize;
+    for spec in adapter.model_caches {
+        let cache = status
+            .model_caches
+            .iter()
+            .find(|cache| cache.id == spec.id)
+            .expect("캐시 상태는 allowlist와 1:1이다");
+        if !targets.contains(&cache.id) {
+            entries.push(cleanup_entry(
+                cache,
+                false,
+                Some("정리 대상이 아닙니다".to_owned()),
+                None,
+            ));
+            continue;
+        }
+        match cache_root(spec).and_then(|root| remove_cache_file(&root, spec.file_name)) {
+            Ok(removed) => {
+                if removed {
+                    removed_count += 1;
+                }
+                entries.push(cleanup_entry(
+                    cache,
+                    removed,
+                    (!removed).then(|| "캐시 파일이 이미 없습니다".to_owned()),
+                    None,
+                ));
+            }
+            Err(error) => {
+                failed_count += 1;
+                entries.push(cleanup_entry(cache, false, None, Some(error.to_string())));
+            }
+        }
+    }
+    (entries, removed_count, failed_count)
+}
+
 pub fn clear_provider_model_caches(
     chats: &ChatSupervisor,
     terminals: &TerminalSupervisor,
@@ -1620,71 +1667,17 @@ pub fn clear_provider_model_caches(
         .filter(|cache| cache.cleanup_available)
         .map(|cache| cache.id.clone())
         .collect::<Vec<_>>();
-
-    let mut entries = Vec::new();
-    let mut stopped = ProviderRuntimeStopSummary::default();
     if targets.is_empty() {
-        for cache in &status.model_caches {
-            let reason = match cache.state {
-                ModelCacheState::Absent => "캐시 파일이 없습니다",
-                ModelCacheState::Matched => "캐시 버전이 실행 버전과 같아 정리하지 않았습니다",
-                _ => "실행 버전을 확인하지 못해 정리하지 않았습니다",
-            };
-            entries.push(cleanup_entry(cache, false, Some(reason.to_owned()), None));
-        }
-        return Ok(ModelCacheCleanupReceipt {
-            provider,
-            removed_count: 0,
-            failed_count: 0,
-            entries,
-            stopped,
-            status,
-        });
+        return Ok(untouched_cleanup_receipt(provider, status));
     }
 
-    stopped = stop_provider_runtimes(
+    let stopped = stop_provider_runtimes(
         chats,
         terminals,
         provider,
         "모델 캐시를 정리하지 않았습니다",
     )?;
-
-    let mut removed_count = 0usize;
-    let mut failed_count = 0usize;
-    for spec in adapter.model_caches {
-        let cache = status
-            .model_caches
-            .iter()
-            .find(|cache| cache.id == spec.id)
-            .expect("캐시 상태는 allowlist와 1:1이다");
-        if !targets.contains(&cache.id) {
-            entries.push(cleanup_entry(
-                cache,
-                false,
-                Some("정리 대상이 아닙니다".to_owned()),
-                None,
-            ));
-            continue;
-        }
-        let outcome = cache_root(spec).and_then(|root| remove_cache_file(&root, spec.file_name));
-        match outcome {
-            Ok(removed) => {
-                if removed {
-                    removed_count += 1;
-                }
-                entries.push(cleanup_entry(
-                    cache,
-                    removed,
-                    (!removed).then(|| "캐시 파일이 이미 없습니다".to_owned()),
-                    None,
-                ));
-            }
-            Err(error) => {
-                failed_count += 1;
-                entries.push(cleanup_entry(cache, false, None, Some(error.to_string())));
-            }
-        }
-    }
+    let (entries, removed_count, failed_count) = remove_cache_targets(adapter, &status, &targets);
 
     Ok(ModelCacheCleanupReceipt {
         provider,
@@ -1874,7 +1867,11 @@ mod tests {
 
     #[test]
     fn standalone_installs_use_the_official_update_subcommand_for_every_provider() {
-        for adapter in ADAPTERS {
+        // 자체 업데이트 명령이 없는 공급자는 아래 전용 테스트가 따로 본다.
+        for adapter in ADAPTERS
+            .iter()
+            .filter(|adapter| adapter.self_update.is_some())
+        {
             let plan = plan_update(adapter, Path::new("/Users/x/.local/bin/tool"));
             assert_eq!(plan.source, CliInstallSource::Standalone);
             assert_eq!(plan.method, CliUpdateMethod::SelfUpdate);
@@ -2179,6 +2176,41 @@ mod tests {
         fs::remove_dir_all(root).expect("정리");
     }
 
+    /// `wire_enum!(trimmed ...)`이 만들어 준 전선 계약을 한 자리에서 확인한다.
+    ///
+    /// 네 enum의 시험이 같은 다섯 가지(`Display`가 `as_str`과 같은 문자열을 낼 것,
+    /// 그 문자열로 되파싱될 것, serde가 같은 문자열로 직렬화되고 되살아날 것, 앞뒤
+    /// 공백은 잘라 받을 것, 모르는 값은 `InvalidInput`으로 거절할 것)를 각자 베껴
+    /// 두고 있었다. 계약이 하나 늘면 고쳐야 할 자리가 넷이라 실제로 주석까지 똑같이
+    /// 복제돼 있었다. 변이 목록과 enum마다 다른 술어만 시험에 남긴다.
+    fn assert_wire_contract<T>(
+        variants: &[T],
+        wire: fn(T) -> &'static str,
+        padded: &str,
+        trimmed: T,
+    ) where
+        T: Copy
+            + PartialEq
+            + std::fmt::Debug
+            + std::fmt::Display
+            + std::str::FromStr<Err = CoreError>
+            + Serialize
+            + serde::de::DeserializeOwned,
+    {
+        for &variant in variants {
+            assert_eq!(variant.to_string(), wire(variant));
+            assert_eq!(wire(variant).parse::<T>().unwrap(), variant);
+            let serialized = serde_json::to_string(&variant).unwrap();
+            assert_eq!(serialized, format!("\"{}\"", wire(variant)));
+            assert_eq!(serde_json::from_str::<T>(&serialized).unwrap(), variant);
+        }
+        assert_eq!(padded.parse::<T>().unwrap(), trimmed);
+        assert!(matches!(
+            "invalid".parse::<T>(),
+            Err(CoreError::InvalidInput(_))
+        ));
+    }
+
     #[test]
     fn cli_install_source_display_and_from_str_round_trip() {
         assert_eq!(
@@ -2191,23 +2223,12 @@ mod tests {
                 CliInstallSource::NotDetected,
             ]
         );
-        for source in CliInstallSource::ALL {
-            assert_eq!(source.to_string(), source.as_str());
-            assert_eq!(source.as_str().parse::<CliInstallSource>().unwrap(), source);
-            // serde_json 직렬화 및 역직렬화 라운드트립 검증
-            let serialized = serde_json::to_string(&source).unwrap();
-            assert_eq!(serialized, format!("\"{}\"", source.as_str()));
-            let deserialized: CliInstallSource = serde_json::from_str(&serialized).unwrap();
-            assert_eq!(deserialized, source);
-        }
-        assert_eq!(
-            "  homebrewCask  ".parse::<CliInstallSource>().unwrap(),
-            CliInstallSource::HomebrewCask
+        assert_wire_contract(
+            &CliInstallSource::ALL,
+            CliInstallSource::as_str,
+            "  homebrewCask  ",
+            CliInstallSource::HomebrewCask,
         );
-        assert!(matches!(
-            "invalid".parse::<CliInstallSource>(),
-            Err(CoreError::InvalidInput(_))
-        ));
         assert!(CliInstallSource::HomebrewCask.is_detected());
         assert!(CliInstallSource::HomebrewFormula.is_detected());
         assert!(CliInstallSource::NpmGlobal.is_detected());
@@ -2227,23 +2248,12 @@ mod tests {
                 CliUpdateMethod::Unsupported,
             ]
         );
-        for method in CliUpdateMethod::ALL {
-            assert_eq!(method.to_string(), method.as_str());
-            assert_eq!(method.as_str().parse::<CliUpdateMethod>().unwrap(), method);
-            // serde_json 직렬화 및 역직렬화 라운드트립 검증
-            let serialized = serde_json::to_string(&method).unwrap();
-            assert_eq!(serialized, format!("\"{}\"", method.as_str()));
-            let deserialized: CliUpdateMethod = serde_json::from_str(&serialized).unwrap();
-            assert_eq!(deserialized, method);
-        }
-        assert_eq!(
-            "  selfUpdate  ".parse::<CliUpdateMethod>().unwrap(),
-            CliUpdateMethod::SelfUpdate
+        assert_wire_contract(
+            &CliUpdateMethod::ALL,
+            CliUpdateMethod::as_str,
+            "  selfUpdate  ",
+            CliUpdateMethod::SelfUpdate,
         );
-        assert!(matches!(
-            "invalid".parse::<CliUpdateMethod>(),
-            Err(CoreError::InvalidInput(_))
-        ));
         assert!(CliUpdateMethod::HomebrewCask.is_update_supported());
         assert!(CliUpdateMethod::SelfUpdate.is_update_supported());
         assert!(!CliUpdateMethod::Unsupported.is_update_supported());
@@ -2267,23 +2277,12 @@ mod tests {
                 ModelCacheState::Unknown,
             ]
         );
-        for state in ModelCacheState::ALL {
-            assert_eq!(state.to_string(), state.as_str());
-            assert_eq!(state.as_str().parse::<ModelCacheState>().unwrap(), state);
-            // serde_json 직렬화 및 역직렬화 라운드트립 검증
-            let serialized = serde_json::to_string(&state).unwrap();
-            assert_eq!(serialized, format!("\"{}\"", state.as_str()));
-            let deserialized: ModelCacheState = serde_json::from_str(&serialized).unwrap();
-            assert_eq!(deserialized, state);
-        }
-        assert_eq!(
-            "  mismatched  ".parse::<ModelCacheState>().unwrap(),
-            ModelCacheState::Mismatched
+        assert_wire_contract(
+            &ModelCacheState::ALL,
+            ModelCacheState::as_str,
+            "  mismatched  ",
+            ModelCacheState::Mismatched,
         );
-        assert!(matches!(
-            "invalid".parse::<ModelCacheState>(),
-            Err(CoreError::InvalidInput(_))
-        ));
         assert!(!ModelCacheState::Absent.is_cleanup_available());
         assert!(!ModelCacheState::Matched.is_cleanup_available());
         assert!(ModelCacheState::Mismatched.is_cleanup_available());
@@ -2303,26 +2302,12 @@ mod tests {
                 CliUpdateOutcome::Failed,
             ]
         );
-        for outcome in CliUpdateOutcome::ALL {
-            assert_eq!(outcome.to_string(), outcome.as_str());
-            assert_eq!(
-                outcome.as_str().parse::<CliUpdateOutcome>().unwrap(),
-                outcome
-            );
-            // serde_json 직렬화 및 역직렬화 라운드트립 검증
-            let serialized = serde_json::to_string(&outcome).unwrap();
-            assert_eq!(serialized, format!("\"{}\"", outcome.as_str()));
-            let deserialized: CliUpdateOutcome = serde_json::from_str(&serialized).unwrap();
-            assert_eq!(deserialized, outcome);
-        }
-        assert_eq!(
-            "  alreadyLatest  ".parse::<CliUpdateOutcome>().unwrap(),
-            CliUpdateOutcome::AlreadyLatest
+        assert_wire_contract(
+            &CliUpdateOutcome::ALL,
+            CliUpdateOutcome::as_str,
+            "  alreadyLatest  ",
+            CliUpdateOutcome::AlreadyLatest,
         );
-        assert!(matches!(
-            "invalid".parse::<CliUpdateOutcome>(),
-            Err(CoreError::InvalidInput(_))
-        ));
         assert!(!CliUpdateOutcome::Updated.is_failure());
         assert!(!CliUpdateOutcome::AlreadyLatest.is_failure());
         assert!(CliUpdateOutcome::VerificationFailed.is_failure());

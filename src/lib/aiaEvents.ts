@@ -1,11 +1,17 @@
 /**
- * AIA 사건 감지와 발송 예산. 제안 평가(`aiaSuggestions.ts`)와 같은 스냅샷을 읽지만
+ * AIA 사건 감지. 제안 평가(`aiaSuggestions.ts`)와 같은 스냅샷을 읽지만
  * 하는 일이 다르다 — 제안은 "지금 상태가 규칙에 걸리는가"를 보고, 사건은 "직전 판과
  * 견주어 무엇이 새로 나빠졌는가"를 본다. 한 파일에 섞여 있어 제안 규칙을 고칠 때
  * 사건 기준선까지 함께 읽어야 했으므로 여기로 떼어냈다.
  *
- * 두 쪽이 함께 쓰는 스냅샷 읽기(공급자 상태·번역 상태)도 여기 한 벌만 두고
- * `aiaSuggestions.ts`가 가져다 쓴다.
+ * 두 쪽이 함께 쓰는 것은 스냅샷 읽기가 아니라 **문제 질의**다 — "지금 CLI가 끊긴
+ * 공급자는 누구인가", "실패 건수가 임계에 닿은 번역 대상은 무엇인가". 스냅샷을 펼치는
+ * 낮은 단계 읽기를 내보내면 그 위의 판정(무엇을 문제로 볼지, 상태를 어떤 문자열로
+ * 적을지)이 사건 쪽과 제안 쪽에 두 벌로 생긴다. 그래서 읽기는 이 모듈 안에 감추고
+ * 질의만 내보내며, `aiaSuggestionRules.ts`가 그것을 가져다 쓴다.
+ *
+ * 감지된 사건을 몇 번까지 알릴지 세는 발송 예산은 `aiaEventBudget.ts`가 갖는다. 그쪽은
+ * 스냅샷을 전혀 보지 않고 발송 시각 목록만 다루므로 여기 있을 이유가 없었다.
  */
 import type {
   AccountSnapshot,
@@ -15,7 +21,6 @@ import type {
   SystemAutomationSnapshot,
   TranslationStatus,
 } from "../types";
-import { DAY, HOUR, numberList, parsePersisted } from "./aiaPrimitives.ts";
 
 export type AiaEventKind = "cliLost" | "accountAuthError" | "scheduleFailed" | "scheduleRecoveryError" | "translationFailed";
 
@@ -41,10 +46,6 @@ export interface AiaEventTransitionResult {
   baseline: AiaEventBaseline;
 }
 
-export interface AiaEventBudget {
-  dispatches: number[];
-}
-
 /** 기준선을 뜨는 데 필요한 스냅샷만. 제안 평가 입력을 그대로 넘겨도 받는다. */
 export interface AiaEventSnapshotInput {
   manager: ManagerSnapshot;
@@ -59,14 +60,25 @@ export interface AiaEventDetectionInput extends AiaEventSnapshotInput {
 }
 
 /** 관리자 스냅샷과 시스템 자동화 스냅샷의 공급자 상태를 합친다. 자동화 쪽이 더 최신이다. */
-export function providerStatuses(manager: ManagerSnapshot, automation: SystemAutomationSnapshot | null): ProviderStatus[] {
+function providerStatuses(manager: ManagerSnapshot, automation: SystemAutomationSnapshot | null): ProviderStatus[] {
   const statuses = new Map<string, ProviderStatus>();
   for (const provider of manager.status.providers) statuses.set(provider.provider, provider);
   for (const provider of automation?.providers ?? []) statuses.set(provider.provider, provider);
   return [...statuses.values()];
 }
 
-export function translationEntries(automation: SystemAutomationSnapshot | null): Array<[string, TranslationStatus]> {
+/**
+ * CLI가 감지되지 않은 공급자. 사건 기준선의 `cliMissing`과 제안 후보가 같은 목록을 봐야
+ * 한다 — 한쪽만 자동화 스냅샷을 덮어 읽으면 제안은 뜨는데 사건은 나지 않거나 그 반대가 된다.
+ */
+export function cliMissingProviders(
+  manager: ManagerSnapshot,
+  automation: SystemAutomationSnapshot | null,
+): ProviderStatus[] {
+  return providerStatuses(manager, automation).filter((provider) => !provider.cli.detected);
+}
+
+function translationEntries(automation: SystemAutomationSnapshot | null): Array<[string, TranslationStatus]> {
   if (!automation) return [];
   return [
     ["ui", automation.uiTranslation],
@@ -77,8 +89,64 @@ export function translationEntries(automation: SystemAutomationSnapshot | null):
 }
 
 /** 번역 상태 하나가 안고 있는 실패 건수. 묶음 실패와 문장 실패 중 큰 쪽을 본다. */
-export function translationFailureCount(status: TranslationStatus): number {
+function translationFailureCount(status: TranslationStatus): number {
   return Math.max(status.failed, status.segmentFailed);
+}
+
+/** 실패가 임계에 닿은 번역 대상 하나. */
+export interface FailingTranslation {
+  target: string;
+  failed: number;
+  /** `단계:실패수`. 사건 기준선의 상태 문자열과 제안의 상태 키가 이 한 벌을 함께 쓴다. */
+  stateKey: string;
+}
+
+/**
+ * 실패한 번역 대상만 남긴다. 오류 단계는 실패 건수와 무관하게 언제나 문제로 보고, 그
+ * 밖에는 `minFailureCount`에 닿은 것만 센다(기준선은 한 건이라도 있으면 문제다).
+ *
+ * 대상을 고르는 조건과 상태 문자열이 사건 쪽·제안 쪽에 각자 펼쳐져 있었다. 상태 문자열은
+ * 한쪽은 기준선 비교에, 다른 쪽은 숨김 지문에 쓰이는데 모양이 갈리면 같은 실패가 두
+ * 화면에서 다른 사건으로 읽힌다. 판정과 문자열을 여기 한 벌만 둔다.
+ */
+export function failingTranslations(
+  automation: SystemAutomationSnapshot | null,
+  minFailureCount = 1,
+): FailingTranslation[] {
+  return translationEntries(automation).flatMap(([target, status]) => {
+    const failed = translationFailureCount(status);
+    if (status.phase !== "error" && failed < minFailureCount) return [];
+    return [{ target, failed, stateKey: translationState(status.phase, failed) }];
+  });
+}
+
+/**
+ * 기준선이 상태를 문자열 한 줄로 적는 것은 저장과 비교가 쉬워서다. 그런데 그 한 줄을
+ * 조립하는 곳과 도로 뜯어 읽는 곳이 파일 양 끝에 떨어져 있었다 — 번역 실패는 여기서
+ * 붙이고 `translationFailureIncreased`가 `split(":")`으로 풀었고, 반복 요청 문제는
+ * `captureAiaEventBaseline`이 붙이고 규칙표가 `endsWith`로 꼬리만 훑었다. 조립 쪽 문구를
+ * 하나 바꾸면 해독 쪽은 오류 없이 조용히 "달라지지 않았다"로 읽어 사건이 통째로 나지
+ * 않으므로, 갈래마다 조립과 해독을 붙여 둔 한 쌍으로 두고 밖에서는 문자열 모양을 모른다.
+ */
+function translationState(phase: string, failed: number): string {
+  return `${phase}:${failed}`;
+}
+
+function readTranslationState(state: string): { phase: string; failed: number } {
+  const [phase = "", failedText] = state.split(":");
+  return { phase, failed: Number(failedText) || 0 };
+}
+
+/** 반복 요청 문제 상태의 복구 오류 자리에 적는 값. 복구 오류가 없으면 `none`이다. */
+const SCHEDULE_RECOVERY_ERROR = "recovery-error";
+
+function scheduleProblemState(status: string, recoveryError: boolean): string {
+  return `${status}:${recoveryError ? SCHEDULE_RECOVERY_ERROR : "none"}`;
+}
+
+function readScheduleProblemState(state: string): { status: string; recoveryError: boolean } {
+  const [status = "", recovery] = state.split(":");
+  return { status, recoveryError: recovery === SCHEDULE_RECOVERY_ERROR };
 }
 
 /**
@@ -111,8 +179,7 @@ function changedStates(
 }
 
 export function captureAiaEventBaseline(input: AiaEventSnapshotInput): AiaEventBaseline {
-  const cliMissing = providerStatuses(input.manager, input.automation)
-    .filter((provider) => !provider.cli.detected)
+  const cliMissing = cliMissingProviders(input.manager, input.automation)
     .map((provider) => provider.provider)
     .sort();
   const authErrors = stateRecord(input.accounts?.accounts ?? [], (account) => (
@@ -120,13 +187,13 @@ export function captureAiaEventBaseline(input: AiaEventSnapshotInput): AiaEventB
   ));
   const scheduleProblems = stateRecord(input.scheduler?.runs ?? [], (run) => (
     run.status === "failed" || run.recoveryError
-      ? [run.id, `${run.status}:${run.recoveryError ? "recovery-error" : "none"}`]
+      ? [run.id, scheduleProblemState(run.status, Boolean(run.recoveryError))]
       : null
   ));
-  const translationFailures = stateRecord(translationEntries(input.automation), ([target, status]) => {
-    const failed = translationFailureCount(status);
-    return status.phase === "error" || failed > 0 ? [target, `${status.phase}:${failed}`] : null;
-  });
+  const translationFailures = stateRecord(
+    failingTranslations(input.automation),
+    (translation) => [translation.target, translation.stateKey],
+  );
   return { cliMissing, authErrors, scheduleProblems, translationFailures };
 }
 
@@ -161,7 +228,7 @@ const EVENT_RULES: ReadonlyArray<{
     states: (baseline) => baseline.scheduleProblems,
     changed: (before, state) => before !== state,
     event: (_runId, state) => {
-      const recovery = state.endsWith("recovery-error");
+      const { recoveryError: recovery } = readScheduleProblemState(state);
       return {
         kind: recovery ? "scheduleRecoveryError" : "scheduleFailed",
         priority: recovery ? 90 : 80,
@@ -195,11 +262,9 @@ export function detectAiaEvents(
 
 function translationFailureIncreased(previous: string | undefined, current: string): boolean {
   if (previous === undefined) return true;
-  const [previousPhase, previousCountText] = previous.split(":");
-  const [currentPhase, currentCountText] = current.split(":");
-  const previousCount = Number(previousCountText) || 0;
-  const currentCount = Number(currentCountText) || 0;
-  return currentCount > previousCount || (previousPhase !== "error" && currentPhase === "error");
+  const before = readTranslationState(previous);
+  const now = readTranslationState(current);
+  return now.failed > before.failed || (before.phase !== "error" && now.phase === "error");
 }
 
 function aiaEvent(kind: AiaEventKind, targetId: string, priority: number, observedAt: number, summary: string): AiaEvent {
@@ -217,37 +282,4 @@ export function coalesceAiaEvents(events: AiaEvent[], now: number, windowMs = 30
   if (now - oldest < Math.max(0, windowMs)) return null;
   const selected = [...events].sort(compareEvents)[0];
   return { ...selected, coalescedCount: events.length };
-}
-
-export function emptyAiaEventBudget(): AiaEventBudget {
-  return { dispatches: [] };
-}
-
-export function parseAiaEventBudget(value: string | null | undefined): AiaEventBudget {
-  return parsePersisted(value, emptyAiaEventBudget, null, (parsed) => ({ dispatches: numberList(parsed.dispatches) }));
-}
-
-export function serializeAiaEventBudget(budget: AiaEventBudget): string {
-  return JSON.stringify({ dispatches: [...budget.dispatches].filter(Number.isFinite).sort((a, b) => a - b) });
-}
-
-/** 지금 시각 기준으로 롤링 창 안에 있는 발송 시각만 남긴다. 미래·비수치 값은 버린다. */
-function dispatchesInWindow(budget: AiaEventBudget, now: number, rollingWindowMs: number): number[] {
-  return budget.dispatches.filter((at) => Number.isFinite(at) && at <= now && now - at < rollingWindowMs);
-}
-
-export function canDispatchAiaEvent(
-  budget: AiaEventBudget,
-  now: number,
-  minimumIntervalMs = 6 * HOUR,
-  maximumPerWindow = 2,
-  rollingWindowMs = DAY,
-): boolean {
-  const dispatches = dispatchesInWindow(budget, now, rollingWindowMs);
-  const latest = Math.max(Number.NEGATIVE_INFINITY, ...dispatches);
-  return dispatches.length < maximumPerWindow && now - latest >= minimumIntervalMs;
-}
-
-export function recordAiaEventDispatch(budget: AiaEventBudget, now: number, rollingWindowMs = DAY): AiaEventBudget {
-  return { dispatches: [...dispatchesInWindow(budget, now, rollingWindowMs), now].sort((left, right) => left - right) };
 }

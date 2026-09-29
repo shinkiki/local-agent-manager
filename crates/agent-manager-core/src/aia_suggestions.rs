@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -31,6 +31,18 @@ const MAX_TOTAL_DEFINITIONS: usize = 100;
 const MAX_TITLE_CHARS: usize = 80;
 const MAX_DETAIL_CHARS: usize = 240;
 const MAX_PROMPT_CHARS: usize = 1_000;
+/// AIA 선제 제안 템플릿에 쓸 수 있는 변수 이름 목록.
+const ALLOWED_TEMPLATE_VARIABLES: &[&str] = &[
+    "projectName",
+    "projectPath",
+    "sessionTitle",
+    "providerName",
+    "usagePercent",
+    "scheduleName",
+    "featureName",
+    "translationTarget",
+    "skillName",
+];
 const BUNDLED_SKILL_KEY: &str = "aia-proactive-suggestions";
 const BUNDLED_SKILL_NAME: &str = "aia-proactive-suggestions";
 const BUNDLED_SKILL_DESCRIPTION: &str =
@@ -191,6 +203,24 @@ pub struct AiaSuggestionEffectivePack {
     pub pack: AiaSuggestionPack,
 }
 
+impl AiaSuggestionEffectivePack {
+    /// 팩 내부 제안 목록을 카탈로그에 노출할 형태의 반복자로 바꾼다.
+    pub(crate) fn catalog_definitions(
+        &self,
+    ) -> impl Iterator<Item = AiaSuggestionCatalogDefinition> + '_ {
+        self.pack
+            .suggestions
+            .iter()
+            .cloned()
+            .map(|definition| AiaSuggestionCatalogDefinition {
+                pack_id: self.pack.pack_id.clone(),
+                pack_display_name: self.pack.display_name.clone(),
+                skill_key: self.skill_key.clone(),
+                definition,
+            })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiaSuggestionCatalogDefinition {
@@ -254,13 +284,11 @@ fn load_aia_suggestion_catalog_from_root(
 ) -> Result<AiaSuggestionCatalog, CoreError> {
     let bundled = parse_and_validate_pack(BUNDLED_MANIFEST.as_bytes(), "번들 기본 팩")?;
     let mut effective = BTreeMap::new();
-    effective.insert(
-        bundled.pack_id.clone(),
-        AiaSuggestionEffectivePack {
-            source: AiaSuggestionPackSource::Bundled,
-            skill_key: None,
-            pack: bundled,
-        },
+    insert_effective_pack(
+        &mut effective,
+        AiaSuggestionPackSource::Bundled,
+        None,
+        bundled,
     );
 
     let mut issues = Vec::new();
@@ -271,16 +299,7 @@ fn load_aia_suggestion_catalog_from_root(
     let packs: Vec<_> = effective.into_values().collect();
     let definitions = packs
         .iter()
-        .flat_map(|entry| {
-            entry.pack.suggestions.iter().cloned().map(|definition| {
-                AiaSuggestionCatalogDefinition {
-                    pack_id: entry.pack.pack_id.clone(),
-                    pack_display_name: entry.pack.display_name.clone(),
-                    skill_key: entry.skill_key.clone(),
-                    definition,
-                }
-            })
-        })
+        .flat_map(AiaSuggestionEffectivePack::catalog_definitions)
         .collect::<Vec<_>>();
     let content_digest = digest_effective_packs(&packs)?;
     let bundled_path = common_root.join(BUNDLED_SKILL_KEY);
@@ -327,93 +346,93 @@ fn load_common_packs(
             continue;
         }
 
-        let candidate = load_common_pack(&canonical_root, &directory, &key);
-        let (pack, source, had_error) = match candidate {
-            Ok(pack) => (Some(pack), AiaSuggestionPackSource::CommonSkill, None),
-            Err(error) => {
-                let cached = cached_pack(home, &key);
-                let using_last_known_good = cached.is_some();
-                issues.push(AiaSuggestionCatalogIssue {
-                    skill_key: key.clone(),
-                    message: error.to_string(),
-                    using_last_known_good,
-                });
-                (cached, AiaSuggestionPackSource::LastKnownGood, Some(error))
-            }
-        };
-        let Some(pack) = pack else {
+        let Some((source, pack)) =
+            resolve_common_pack(home, &canonical_root, &directory, &key, effective, issues)
+        else {
             continue;
         };
-
-        let proposed_count = effective_definition_count_after_insert(effective, &pack);
-        if proposed_count > MAX_TOTAL_DEFINITIONS {
-            if had_error.is_none() {
-                let fallback = cached_pack(home, &key).filter(|cached| {
-                    effective_definition_count_after_insert(effective, cached)
-                        <= MAX_TOTAL_DEFINITIONS
-                });
-                issues.push(AiaSuggestionCatalogIssue {
-                    skill_key: key.clone(),
-                    message: format!("유효 제안은 전체 {MAX_TOTAL_DEFINITIONS}개까지 허용됩니다"),
-                    using_last_known_good: fallback.is_some(),
-                });
-                if let Some(fallback) = fallback {
-                    effective.insert(
-                        fallback.pack_id.clone(),
-                        AiaSuggestionEffectivePack {
-                            source: AiaSuggestionPackSource::LastKnownGood,
-                            skill_key: Some(key),
-                            pack: fallback,
-                        },
-                    );
-                }
-            }
-            continue;
-        }
 
         if source == AiaSuggestionPackSource::CommonSkill {
             cache_pack(home, &key, &pack);
         }
-        effective.insert(
-            pack.pack_id.clone(),
-            AiaSuggestionEffectivePack {
-                source,
-                skill_key: Some(key),
-                pack,
-            },
-        );
+        insert_effective_pack(effective, source, Some(key), pack);
     }
     Ok(())
 }
 
-fn load_common_pack(
+/// 공통 스킬 한 칸이 유효 팩 목록에 실제로 반영할 팩과 그 출처. 반영할 것이 없으면 `None`.
+///
+/// 읽기 실패와 정의 예산 초과는 둘 다 "마지막 정상본으로 물러설 수 있으면 물러서고, 아니면
+/// 이 칸을 통째로 건너뛴다"는 같은 모양인데도, 한 갈래는 팩·출처·오류를 묶은 세 칸짜리
+/// 임시값으로 루프 뒤까지 끌고 가고 다른 갈래는 루프 안에서 직접 등록해 서로 다른 모양으로
+/// 적혀 있었다. 그래서 "오류가 없었을 때만 예산 초과를 알린다" 같은 조건이 세 칸짜리
+/// 임시값의 한 칸을 되읽는 방식으로만 성립했다. 두 갈래를 각자 제 자리에서 닫아, 호출부에는
+/// 등록할 팩 하나만 남긴다.
+fn resolve_common_pack(
+    home: &Path,
     canonical_root: &Path,
     directory: &Path,
     key: &str,
-) -> Result<AiaSuggestionPack, CoreError> {
-    validate_skill_key(key)?;
-    let directory_meta = fs::symlink_metadata(directory)?;
-    if directory_meta.file_type().is_symlink() || !directory_meta.is_dir() {
-        return Err(CoreError::InvalidInput(
-            "AIA 제안 팩 스킬 디렉터리는 실제 디렉터리여야 합니다".to_owned(),
-        ));
+    effective: &BTreeMap<String, AiaSuggestionEffectivePack>,
+    issues: &mut Vec<AiaSuggestionCatalogIssue>,
+) -> Option<(AiaSuggestionPackSource, AiaSuggestionPack)> {
+    match load_common_pack(canonical_root, directory, key) {
+        Ok(pack) => {
+            if fits_definition_budget(effective, &pack) {
+                return Some((AiaSuggestionPackSource::CommonSkill, pack));
+            }
+            let fallback = last_known_good_within_budget(home, key, effective);
+            issues.push(AiaSuggestionCatalogIssue {
+                skill_key: key.to_owned(),
+                message: format!("유효 제안은 전체 {MAX_TOTAL_DEFINITIONS}개까지 허용됩니다"),
+                using_last_known_good: fallback.is_some(),
+            });
+            fallback.map(|pack| (AiaSuggestionPackSource::LastKnownGood, pack))
+        }
+        Err(error) => {
+            issues.push(AiaSuggestionCatalogIssue {
+                skill_key: key.to_owned(),
+                message: error.to_string(),
+                // 예산까지 따지기 전의 존재 여부다. 예산에 걸려 물러서지 못하는 경우까지
+                // 여기서 걸러 내면 "정상본은 있었다"는 사실이 화면에서 사라진다.
+                using_last_known_good: cached_pack(home, key).is_some(),
+            });
+            last_known_good_within_budget(home, key, effective)
+                .map(|pack| (AiaSuggestionPackSource::LastKnownGood, pack))
+        }
     }
-    let canonical_directory = fs::canonicalize(directory)?;
-    if canonical_directory.parent() != Some(canonical_root) {
-        return Err(CoreError::InvalidInput(
-            "AIA 제안 팩 경로가 공통 스킬 루트를 벗어났습니다".to_owned(),
-        ));
-    }
+}
 
-    let references = directory.join("references");
-    let references_metadata = fs::symlink_metadata(&references)?;
-    if references_metadata.file_type().is_symlink() || !references_metadata.is_dir() {
-        return Err(CoreError::InvalidInput(
-            "AIA 제안 팩 references는 실제 디렉터리여야 합니다".to_owned(),
-        ));
+/// 마지막 정상본 중 전체 정의 예산 안에 들어오는 것만.
+fn last_known_good_within_budget(
+    home: &Path,
+    key: &str,
+    effective: &BTreeMap<String, AiaSuggestionEffectivePack>,
+) -> Option<AiaSuggestionPack> {
+    cached_pack(home, key).filter(|cached| fits_definition_budget(effective, cached))
+}
+
+fn fits_definition_budget(
+    effective: &BTreeMap<String, AiaSuggestionEffectivePack>,
+    pack: &AiaSuggestionPack,
+) -> bool {
+    effective_definition_count_after_insert(effective, pack) <= MAX_TOTAL_DEFINITIONS
+}
+
+/// 심볼릭 링크가 아닌 실제 디렉터리인지 검증한다.
+fn ensure_real_directory(path: &Path, label: &str) -> Result<(), CoreError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(CoreError::InvalidInput(format!(
+            "{label}는 실제 디렉터리여야 합니다"
+        )));
     }
-    let manifest = directory.join(MANIFEST_RELATIVE);
-    let metadata = fs::symlink_metadata(&manifest)?;
+    Ok(())
+}
+
+/// 심볼릭 링크나 경로 이탈 없이 스킬 디렉터리 안에 있는 매니페스트 바이트를 안전하게 읽는다.
+fn read_bounded_manifest(manifest: &Path, boundary_directory: &Path) -> Result<Vec<u8>, CoreError> {
+    let metadata = fs::symlink_metadata(manifest)?;
     if metadata.file_type().is_symlink() {
         return Err(CoreError::InvalidInput(
             "AIA 제안 팩 manifest는 심볼릭 링크일 수 없습니다".to_owned(),
@@ -427,13 +446,33 @@ fn load_common_pack(
     if metadata.len() > MAX_PACK_BYTES {
         return Err(CoreError::TooLarge(MAX_PACK_BYTES));
     }
-    let canonical_manifest = fs::canonicalize(&manifest)?;
-    if !canonical_manifest.starts_with(&canonical_directory) {
+    let canonical_manifest = fs::canonicalize(manifest)?;
+    if !canonical_manifest.starts_with(boundary_directory) {
         return Err(CoreError::InvalidInput(
             "AIA 제안 팩 manifest 경로가 스킬 디렉터리를 벗어났습니다".to_owned(),
         ));
     }
-    let bytes = fs::read(canonical_manifest)?;
+    Ok(fs::read(canonical_manifest)?)
+}
+
+fn load_common_pack(
+    canonical_root: &Path,
+    directory: &Path,
+    key: &str,
+) -> Result<AiaSuggestionPack, CoreError> {
+    validate_skill_key(key)?;
+    ensure_real_directory(directory, "AIA 제안 팩 스킬 디렉터리")?;
+    let canonical_directory = fs::canonicalize(directory)?;
+    if canonical_directory.parent() != Some(canonical_root) {
+        return Err(CoreError::InvalidInput(
+            "AIA 제안 팩 경로가 공통 스킬 루트를 벗어났습니다".to_owned(),
+        ));
+    }
+
+    let references = directory.join("references");
+    ensure_real_directory(&references, "AIA 제안 팩 references")?;
+    let manifest = directory.join(MANIFEST_RELATIVE);
+    let bytes = read_bounded_manifest(&manifest, &canonical_directory)?;
     parse_and_validate_pack(&bytes, key)
 }
 
@@ -472,44 +511,53 @@ fn validate_pack(pack: &AiaSuggestionPack, source: &str) -> Result<(), CoreError
 
     let mut ids = BTreeSet::new();
     for definition in &pack.suggestions {
-        validate_identifier(&definition.id, "suggestion.id", source)?;
-        if !ids.insert(definition.id.as_str()) {
-            return invalid_pack(source, format!("중복 제안 ID: {}", definition.id));
-        }
-        if !(-1_000..=1_000).contains(&definition.priority) {
-            return invalid_pack(
-                source,
-                format!("{} priority 범위는 -1000~1000입니다", definition.id),
-            );
-        }
-        validate_template(
-            &definition.title_template,
-            "titleTemplate",
-            MAX_TITLE_CHARS,
-            source,
-        )?;
-        validate_template(
-            &definition.detail_template,
-            "detailTemplate",
-            MAX_DETAIL_CHARS,
-            source,
-        )?;
-        validate_template(
-            &definition.prompt_template,
-            "promptTemplate",
-            MAX_PROMPT_CHARS,
-            source,
-        )?;
-        if definition
-            .rearm
-            .cooldown_minutes
-            .is_some_and(|value| value > 525_600)
-        {
-            return invalid_pack(source, "rearm.cooldownMinutes는 525600 이하여야 합니다");
-        }
-        validate_parameters(definition, source)?;
+        validate_definition(definition, source, &mut ids)?;
     }
     Ok(())
+}
+
+/// 제안 정의 하나가 지켜야 할 형식과 팩 안의 ID 유일성을 검사한다.
+fn validate_definition<'a>(
+    definition: &'a AiaSuggestionDefinition,
+    source: &str,
+    ids: &mut BTreeSet<&'a str>,
+) -> Result<(), CoreError> {
+    validate_identifier(&definition.id, "suggestion.id", source)?;
+    if !ids.insert(definition.id.as_str()) {
+        return invalid_pack(source, format!("중복 제안 ID: {}", definition.id));
+    }
+    if !(-1_000..=1_000).contains(&definition.priority) {
+        return invalid_pack(
+            source,
+            format!("{} priority 범위는 -1000~1000입니다", definition.id),
+        );
+    }
+    validate_template(
+        &definition.title_template,
+        "titleTemplate",
+        MAX_TITLE_CHARS,
+        source,
+    )?;
+    validate_template(
+        &definition.detail_template,
+        "detailTemplate",
+        MAX_DETAIL_CHARS,
+        source,
+    )?;
+    validate_template(
+        &definition.prompt_template,
+        "promptTemplate",
+        MAX_PROMPT_CHARS,
+        source,
+    )?;
+    if definition
+        .rearm
+        .cooldown_minutes
+        .is_some_and(|value| value > 525_600)
+    {
+        return invalid_pack(source, "rearm.cooldownMinutes는 525600 이하여야 합니다");
+    }
+    validate_parameters(definition, source)
 }
 
 fn validate_parameters(
@@ -579,10 +627,10 @@ impl ParameterRule {
         match (self, value) {
             (Self::Number(min, max), AiaSuggestionParameterValue::Number(value)) => value
                 .as_f64()
-                .is_some_and(|number| number >= min && number <= max),
+                .is_some_and(|number| (min..=max).contains(&number)),
             (Self::Integer(min, max), AiaSuggestionParameterValue::Number(value)) => value
                 .as_i64()
-                .is_some_and(|number| number >= min && number <= max),
+                .is_some_and(|number| (min..=max).contains(&number)),
             (Self::NonemptyString(max), AiaSuggestionParameterValue::String(value)) => {
                 !value.trim().is_empty() && value.chars().count() <= max
             }
@@ -599,17 +647,6 @@ fn validate_template(
     source: &str,
 ) -> Result<(), CoreError> {
     validate_nonempty_limited(value, field, max_chars, source)?;
-    let allowed = [
-        "projectName",
-        "projectPath",
-        "sessionTitle",
-        "providerName",
-        "usagePercent",
-        "scheduleName",
-        "featureName",
-        "translationTarget",
-        "skillName",
-    ];
     let mut remainder = value;
     while let Some(open) = remainder.find('{') {
         let after_open = &remainder[open + 1..];
@@ -617,7 +654,7 @@ fn validate_template(
             return invalid_pack(source, format!("{field} 템플릿 괄호가 닫히지 않았습니다"));
         };
         let placeholder = &after_open[..close];
-        if !allowed.contains(&placeholder) {
+        if !ALLOWED_TEMPLATE_VARIABLES.contains(&placeholder) {
             return invalid_pack(
                 source,
                 format!("{field}에서 허용되지 않은 템플릿 변수: {placeholder}"),
@@ -631,17 +668,21 @@ fn validate_template(
     Ok(())
 }
 
-fn validate_identifier(value: &str, field: &str, source: &str) -> Result<(), CoreError> {
-    let valid = !value.is_empty()
-        && value.chars().count() <= 64
-        && value.chars().all(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
-        })
+/// 팩 식별자와 제안 식별자가 영소문자·숫자·하이픈 규약에 맞는지 단일 패스로 판정한다.
+fn is_valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
         && value
-            .chars()
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && value
+            .bytes()
             .next()
-            .is_some_and(|character| character.is_ascii_lowercase() || character.is_ascii_digit());
-    if !valid {
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+fn validate_identifier(value: &str, field: &str, source: &str) -> Result<(), CoreError> {
+    if !is_valid_identifier(value) {
         return invalid_pack(
             source,
             format!("{field}는 영소문자·숫자·하이픈으로 된 64자 이하 식별자여야 합니다"),
@@ -675,14 +716,31 @@ fn invalid_pack<T>(source: &str, message: impl Into<String>) -> Result<T, CoreEr
     )))
 }
 
+/// 유효 제안 팩 맵에 항목을 등록한다.
+fn insert_effective_pack(
+    effective: &mut BTreeMap<String, AiaSuggestionEffectivePack>,
+    source: AiaSuggestionPackSource,
+    skill_key: Option<String>,
+    pack: AiaSuggestionPack,
+) {
+    effective.insert(
+        pack.pack_id.clone(),
+        AiaSuggestionEffectivePack {
+            source,
+            skill_key,
+            pack,
+        },
+    );
+}
+
 fn effective_definition_count_after_insert(
     effective: &BTreeMap<String, AiaSuggestionEffectivePack>,
     pack: &AiaSuggestionPack,
 ) -> usize {
     effective
-        .iter()
-        .filter(|(pack_id, _)| pack_id.as_str() != pack.pack_id)
-        .map(|(_, entry)| entry.pack.suggestions.len())
+        .values()
+        .filter(|entry| entry.pack.pack_id != pack.pack_id)
+        .map(|entry| entry.pack.suggestions.len())
         .sum::<usize>()
         + pack.suggestions.len()
 }
@@ -701,19 +759,22 @@ fn cache_key(home: &Path, skill_key: &str) -> String {
     format!("{}\0{skill_key}", home.to_string_lossy())
 }
 
-fn cache_pack(home: &Path, skill_key: &str, pack: &AiaSuggestionPack) {
-    let cache = LAST_KNOWN_GOOD.get_or_init(|| Mutex::new(HashMap::new()));
+fn lock_pack_cache(
+    cache: &Mutex<HashMap<String, AiaSuggestionPack>>,
+) -> MutexGuard<'_, HashMap<String, AiaSuggestionPack>> {
     cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(cache_key(home, skill_key), pack.clone());
+}
+
+fn cache_pack(home: &Path, skill_key: &str, pack: &AiaSuggestionPack) {
+    let cache = LAST_KNOWN_GOOD.get_or_init(|| Mutex::new(HashMap::new()));
+    lock_pack_cache(cache).insert(cache_key(home, skill_key), pack.clone());
 }
 
 fn cached_pack(home: &Path, skill_key: &str) -> Option<AiaSuggestionPack> {
     LAST_KNOWN_GOOD.get().and_then(|cache| {
-        cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock_pack_cache(cache)
             .get(&cache_key(home, skill_key))
             .cloned()
     })

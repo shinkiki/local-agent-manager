@@ -2,77 +2,25 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   adapterSummary,
-  filterSkillEntries,
-  isProjectOriginFilter,
-  matchesSkillOrigin,
+  isSkillProviderDeployed,
+  latestSkillVersion,
   matchesSkillQuery,
   publishHadFailure,
   publishSummary,
   skillDescriptionError,
-  skillFilterCounts,
+  skillDivergenceHint,
+  skillDivergenceLabel,
   skillKeyError,
-  skillOriginProjects,
   skillStatusModifier,
   skillSyncCounts,
   skillSyncLabel,
   skillSyncState,
   sortSkillEntries,
 } from "./skillLibrary.ts";
+import { entry, providerState } from "./skillLibraryFixtures.mjs";
 
 const text = (ko) => ko;
 const translate = (ko) => ko;
-
-const providerState = (overrides = {}) => ({
-  provider: "claude",
-  status: "missing",
-  installs: [],
-  scope: null,
-  origin: null,
-  skillId: null,
-  path: null,
-  directory: null,
-  targetDirectory: "/home/user/.claude/skills/demo",
-  readOnly: false,
-  contentDigest: null,
-  divergent: false,
-  note: null,
-  ...overrides,
-});
-
-const commonSource = (overrides = {}) => ({
-  id: "skill-1",
-  key: "demo",
-  name: "demo",
-  description: "Demo skill",
-  path: "/home/user/.agents/skills/demo/SKILL.md",
-  directory: "/home/user/.agents/skills/demo",
-  contentDigest: "aaa",
-  fileCount: 2,
-  totalBytes: 100,
-  ...overrides,
-});
-
-const entry = (overrides = {}) => ({
-  key: "demo",
-  createdAtMs: null,
-  origin: null,
-  autoSync: false,
-  name: "demo",
-  description: "Demo skill",
-  originKind: "common",
-  common: commonSource(),
-  managed: true,
-  directoryName: "demo",
-  providers: [
-    providerState({ provider: "claude", status: "copy", contentDigest: "aaa" }),
-    providerState({ provider: "codex", status: "copy", contentDigest: "aaa" }),
-    providerState({ provider: "antigravity", status: "unsupported", readOnly: true, targetDirectory: null }),
-  ],
-  linkedCount: 0,
-  installedCount: 2,
-  missingCount: 0,
-  ...overrides,
-});
 
 test("스킬 키 검증은 경로 탈출과 예약 이름을 막는다", () => {
   assert.equal(skillKeyError("review-notes", text), null);
@@ -137,6 +85,13 @@ test("미지원 공급자는 게시 완료 판정에서 제외된다", () => {
 test("공통 원본이 없는 공급자 전용 스킬은 미게시다", () => {
   const providerOnly = entry({ originKind: "provider", common: null });
   assert.equal(skillSyncState(providerOnly), "unpublished");
+});
+
+test("공급자 배포 상태는 심볼릭 링크나 사본일 때만 참이다", () => {
+  assert.equal(isSkillProviderDeployed(providerState({ status: "linked" })), true);
+  assert.equal(isSkillProviderDeployed(providerState({ status: "copy" })), true);
+  assert.equal(isSkillProviderDeployed(providerState({ status: "missing" })), false);
+  assert.equal(isSkillProviderDeployed(providerState({ status: "unsupported" })), false);
 });
 
 test("읽기 전용 에이전트 소유 스킬은 관리 대상이 아니다", () => {
@@ -217,6 +172,7 @@ test("상태별 개수를 집계한다", () => {
   ]);
   assert.equal(counts.current, 1);
   assert.equal(counts.conflict, 1);
+  assert.equal(counts.stale, 0);
   assert.equal(counts.unmanaged, 1);
   assert.equal(counts.unpublished, 0);
 });
@@ -227,103 +183,70 @@ test("상태 칩 수식자는 갈라짐을 따로 표시한다", () => {
   assert.equal(skillStatusModifier(providerState({ status: "unsupported" })), "unsupported");
 });
 
-const projectOrigin = (path, name) => ({
-  provider: "claude",
-  scope: "project",
-  projectPath: path,
-  projectName: name,
-  archivedAtMs: null,
-});
-
-test("출처 필터는 프로젝트 전체와 개별 프로젝트를 따로 가린다", () => {
-  const personal = entry({ key: "personal" });
-  const alpha = entry({ key: "alpha", origin: projectOrigin("/repos/alpha", "alpha") });
-  const beta = entry({ key: "beta", origin: projectOrigin("/repos/beta", "beta") });
-
-  assert.equal(matchesSkillOrigin(personal, "personal"), true);
-  assert.equal(matchesSkillOrigin(personal, "project"), false);
-  assert.equal(matchesSkillOrigin(alpha, "project"), true);
-  assert.equal(matchesSkillOrigin(alpha, "project:/repos/alpha"), true);
-  assert.equal(matchesSkillOrigin(alpha, "project:/repos/beta"), false);
-  assert.equal(matchesSkillOrigin(beta, "all"), true);
-
-  assert.equal(isProjectOriginFilter("project"), true);
-  assert.equal(isProjectOriginFilter("project:/repos/alpha"), true);
-  assert.equal(isProjectOriginFilter("personal"), false);
-  assert.equal(isProjectOriginFilter("all"), false);
-
-  const filters = { kind: "all", state: "all", agent: "all", origin: "project:/repos/beta" };
-  assert.deepEqual(filterSkillEntries([personal, alpha, beta], filters).map((item) => item.key), ["beta"]);
-});
-
-test("Antigravity에 게시한 스킬을 에이전트 필터로 찾는다", () => {
-  const antigravity = entry({
-    key: "antigravity-skill",
-    providers: [providerState({ provider: "antigravity", status: "copy" })],
-  });
-  const claude = entry({
-    key: "claude-skill",
-    providers: [providerState({ provider: "claude", status: "copy" })],
-  });
-  const filters = { kind: "all", state: "all", agent: "antigravity", origin: "all" };
-
-  assert.deepEqual(
-    filterSkillEntries([antigravity, claude], filters).map((item) => item.key),
-    ["antigravity-skill"],
-  );
-  assert.equal(
-    skillFilterCounts([antigravity, claude], filters, ["all"]).agent.antigravity,
-    1,
-  );
-});
-
-test("출처 프로젝트 목록은 중복 없이 이름순으로 나온다", () => {
-  const projects = skillOriginProjects([
-    entry({ key: "b", origin: projectOrigin("/repos/beta", "beta") }),
-    entry({ key: "a", origin: projectOrigin("/repos/alpha", "alpha") }),
-    entry({ key: "a2", origin: projectOrigin("/repos/alpha", "alpha") }),
-    entry({ key: "p" }),
-  ]);
-  assert.deepEqual(projects, [
-    { path: "/repos/alpha", name: "alpha" },
-    { path: "/repos/beta", name: "beta" },
-  ]);
-});
-
-test("설정에서 제외한 프로젝트는 출처 칩에서 숨긴다", () => {
-  const projects = skillOriginProjects(
-    [
-      entry({ key: "b", origin: projectOrigin("/repos/beta", "beta") }),
-      entry({ key: "a", origin: projectOrigin("/repos/alpha", "alpha") }),
+// 지문만 보면 뒤처진 사본과 손으로 고친 사본이 같은 "갈라짐"이다. 둘을 한 이름으로 부르면
+// 뒤처진 사본에 "외부 수정"이 붙고, 그 사본을 새 원본으로 채택하는 쪽이 유일한 출구로
+// 보인다 — 누르면 최신 원본이 옛 내용으로 덮인다.
+test("뒤처진 사본은 외부 수정과 다른 상태로 보고된다", () => {
+  const stale = entry({
+    providers: [
+      providerState({ provider: "claude", status: "copy", divergent: true, divergence: "behind" }),
+      providerState({ provider: "codex", status: "missing" }),
     ],
-    new Set(["/repos/beta"]),
-  );
-  assert.deepEqual(projects, [{ path: "/repos/alpha", name: "alpha" }]);
+  });
+  assert.equal(skillSyncState(stale), "stale");
+  assert.equal(skillSyncLabel("stale", translate), "뒤처짐");
+  assert.equal(skillStatusModifier(stale.providers[0]), "stale");
 });
 
-test("필터 칩 개수는 자기 축의 선택을 빼고 센다", () => {
-  const archivedPersonal = entry({ key: "archived-personal" });
-  const archivedProject = entry({ key: "archived-project", origin: projectOrigin("/repos/alpha", "alpha") });
-  const unarchivedProject = entry({
-    key: "unarchived-project",
-    common: null,
-    origin: projectOrigin("/repos/alpha", "alpha"),
+test("한 항목에 두 방향이 섞이면 판단이 필요한 외부 수정을 대표로 삼는다", () => {
+  const mixed = entry({
+    providers: [
+      providerState({ provider: "claude", status: "copy", divergent: true, divergence: "behind" }),
+      providerState({ provider: "codex", status: "copy", divergent: true, divergence: "edited" }),
+    ],
   });
-  const entries = [archivedPersonal, archivedProject, unarchivedProject];
-  const originValues = ["all", "personal", "project", "project:/repos/alpha"];
+  assert.equal(skillSyncState(mixed), "conflict");
+});
 
-  const counts = skillFilterCounts(
-    entries,
-    { kind: "shared", state: "all", agent: "all", origin: "personal" },
-    originValues,
-  );
-  // 보관 축 개수는 출처(개인) 선택만 반영한다.
-  assert.equal(counts.kind.all, 1);
-  assert.equal(counts.kind.shared, 1);
-  assert.equal(counts.kind.agent, 0);
-  // 출처 축 개수는 보관 선택만 반영한다.
-  assert.equal(counts.origin.all, 2);
-  assert.equal(counts.origin.personal, 1);
-  assert.equal(counts.origin.project, 1);
-  assert.equal(counts.origin["project:/repos/alpha"], 1);
+test("방향을 모르면 어느 쪽이 새 내용인지 단정하지 않는다", () => {
+  const unknown = entry({
+    providers: [providerState({ status: "copy", divergent: true, divergence: "unknown" })],
+  });
+  assert.equal(skillSyncState(unknown), "conflict");
+  assert.equal(skillDivergenceLabel("unknown", translate), "원본과 다름");
+  assert.match(skillDivergenceHint("unknown", translate), /변경 내용으로 확인/);
+});
+
+test("방향별 다음 조치를 문구로 알려 준다", () => {
+  assert.match(skillDivergenceHint("behind", translate), /다시 배포/);
+  assert.match(skillDivergenceHint("edited", translate), /채택/);
+});
+
+// "가장 앞선 것으로 전부 맞춘다"가 어느 방향으로 갈지는 수정 시각 하나가 정한다.
+const divergent = (provider, modifiedAtMs) => ({
+  provider,
+  install: { skillId: `${provider}-install`, modifiedAtMs, divergent: true, divergence: null },
+});
+
+test("원본이 가장 새로우면 최신본은 원본이다", () => {
+  const latest = latestSkillVersion(2_000, [divergent("codex", 1_000), divergent("claude", 1_500)]);
+  assert.deepEqual(latest, { kind: "source" });
+});
+
+test("사용본이 원본보다 새로우면 그중 가장 나중 것을 고른다", () => {
+  const latest = latestSkillVersion(2_000, [divergent("codex", 3_000), divergent("claude", 4_000)]);
+  assert.equal(latest.kind, "install");
+  assert.equal(latest.provider, "claude");
+});
+
+test("같은 시각이면 원본이 이긴다", () => {
+  // 배포는 원본의 수정 시각을 사본에 넘기지 않는다. 동시각은 사람이 고친 흔적이 아니다.
+  assert.deepEqual(latestSkillVersion(2_000, [divergent("codex", 2_000)]), { kind: "source" });
+});
+
+test("시각을 모르는 자리가 하나라도 있으면 고르지 않는다", () => {
+  // 모르는 값을 0으로 깔면 그 자리가 늘 지고, 실제로 가장 새로운 사본이 조용히 덮인다.
+  assert.deepEqual(latestSkillVersion(2_000, [divergent("codex", null)]), { kind: "unknown" });
+  assert.deepEqual(latestSkillVersion(null, [divergent("codex", 3_000)]), { kind: "unknown" });
+  assert.deepEqual(latestSkillVersion(null, []), { kind: "source" });
 });

@@ -43,12 +43,22 @@ test("창이 낮아 위아래 모두 부족하면 화면 기준으로 펼친다"
   assert.equal(placement.maxHeight, 236);
 });
 
-test("같은 좌표는 같은 배치로 본다", () => {
+test("같은 좌표는 같은 배치로 보고 어느 필드든 다르면 다른 배치로 본다", () => {
   const viewport = { width: 1200, height: 900 };
   const first = anchoredPopoverPlacement(anchor(300, 200, 400), viewport);
   const second = anchoredPopoverPlacement(anchor(300, 200, 400), viewport);
   assert.equal(samePopoverPlacement(first, second), true);
-  assert.equal(samePopoverPlacement(first, anchoredPopoverPlacement(anchor(301, 200, 400), viewport)), false);
+  const differences = {
+    left: first.left + 1,
+    top: first.top + 1,
+    bottom: 1,
+    width: first.width + 1,
+    maxHeight: first.maxHeight - 1,
+    direction: "up",
+  };
+  for (const [field, value] of Object.entries(differences)) {
+    assert.equal(samePopoverPlacement(first, { ...first, [field]: value }), false, field);
+  }
   assert.equal(samePopoverPlacement(null, first), false);
   assert.equal(samePopoverPlacement(null, null), true);
 });

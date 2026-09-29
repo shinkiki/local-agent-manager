@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -7,23 +7,16 @@ use serde::{Deserialize, Serialize};
 use crate::app_data_file::{read_private_json_or_default, write_private_json};
 use crate::chat::{ChatApprovalMode, ChatMode, ReasoningEffort};
 use crate::domain::{
-    wire_enum, ChatOrigin, DocRoot, DocRootStatus, ProviderId, SessionFolder, SessionLink,
-    SessionMeta, SessionMetaPatch, SupplementStorageStats,
+    ChatOrigin, DocRoot, ProviderId, SessionBookmark, SessionFolder, SessionLink, SessionMeta,
+    SessionMetaPatch,
 };
 use crate::identifier::validate_identifier;
 use crate::path_guard;
 use crate::store_lock;
-use crate::user_home;
 use crate::CoreError;
 
 const STORE_FILE_NAME: &str = "manager-state.json";
 const STORE_LOCK_FILE_NAME: &str = "manager-state.lock";
-const SUPPLEMENT_STORE_FILE_NAME: &str = "session-supplements-v2.json";
-const SUPPLEMENT_LOCK_FILE_NAME: &str = "session-supplements-v2.lock";
-const AGENT_DATA_DIR_NAMES: [&str; 3] = [".claude", ".codex", ".gemini"];
-const MAX_SUPPLEMENT_TEXT_BYTES: usize = 256 * 1024;
-const MAX_SUPPLEMENT_TURNS: usize = 4_000;
-const MAX_SUPPLEMENT_TURNS_PER_SESSION: usize = 200;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,11 +39,24 @@ pub(crate) struct AppMetadata {
     /// 처음 열 때 현재 프로젝트 전부를 채워 기존 사용자에게 알림이 쏟아지지 않게 한다.
     #[serde(default)]
     pub known_projects: Option<Vec<String>>,
+    /// 자동정리가 목록에서 내린 세션 키(`session_key`). 공유 공급자 홈 원문은 지우지
+    /// 않으므로 파일이 그대로 남고, 툼스톤이 없으면 20초 뒤 재조사가 도로 담아 온다.
+    /// 목록을 줄이는 일과 용량을 줄이는 일이 갈리는 지점이 바로 여기다.
+    #[serde(default)]
+    pub cleaned_sessions: BTreeSet<String>,
 }
 
 impl AppMetadata {
     pub(crate) fn excluded_project_set(&self) -> BTreeSet<PathBuf> {
         self.excluded_projects.iter().map(PathBuf::from).collect()
+    }
+
+    /// 자동정리가 내린 세션인지. 카탈로그가 세션을 조립할 때마다 부르므로 집합 조회만 한다.
+    pub(crate) fn is_cleaned_session(&self, source: ProviderId, session_id: &str) -> bool {
+        !self.cleaned_sessions.is_empty()
+            && self
+                .cleaned_sessions
+                .contains(&session_key(source, session_id))
     }
 
     /// 시드 전(`None`)이면 결정 대기 판정을 하지 않는다.
@@ -59,41 +65,6 @@ impl AppMetadata {
             .as_ref()
             .map(|known| known.iter().map(PathBuf::from).collect())
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum SupplementOrigin {
-    Chat,
-    Scheduled,
-}
-
-impl SupplementOrigin {
-    #[cfg(test)]
-    pub const ALL: [Self; 2] = [Self::Chat, Self::Scheduled];
-}
-
-wire_enum!(trimmed SupplementOrigin, "알 수 없는 보완 저장 출처입니다", {
-    Chat => "chat",
-    Scheduled => "scheduled",
-});
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CapturedTranscriptTurn {
-    pub source: ProviderId,
-    pub session_id: String,
-    pub turn_id: String,
-    pub completed_at: i64,
-    pub text: String,
-    pub origin: SupplementOrigin,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SupplementStore {
-    #[serde(default)]
-    turns: Vec<CapturedTranscriptTurn>,
 }
 
 pub(crate) fn load_metadata(app_data_dir: &Path) -> Result<AppMetadata, CoreError> {
@@ -156,159 +127,119 @@ fn update_session_entry(
     })
 }
 
-pub(crate) fn captured_turns_for(
+#[cfg(test)]
+mod local_connection_meta_tests {
+    use super::*;
+
+    // 2026-09-27 실기기: 계정 슬롯 도우미의 id 길이 규칙에 "default" 가 걸려 메타에 남지 않았다.
+    #[test]
+    fn a_short_connection_id_is_recorded_and_rewritten_only_when_it_changes() {
+        let dir = tempfile::Builder::new()
+            .prefix("am-local-conn-meta-")
+            .tempdir()
+            .expect("임시 폴더");
+        let session = "ses-0123456789abcdef";
+        persist_session_local_connection_id(dir.path(), ProviderId::Local, session, "default")
+            .expect("기록");
+        assert_eq!(
+            session_meta(dir.path(), ProviderId::Local, session)
+                .expect("메타")
+                .local_connection_id
+                .as_deref(),
+            Some("default")
+        );
+        persist_session_local_connection_id(dir.path(), ProviderId::Local, session, "tailscale")
+            .expect("갱신");
+        assert_eq!(
+            session_meta(dir.path(), ProviderId::Local, session)
+                .expect("메타")
+                .local_connection_id
+                .as_deref(),
+            Some("tailscale")
+        );
+        assert!(persist_session_local_connection_id(
+            dir.path(),
+            ProviderId::Local,
+            session,
+            "Bad Id"
+        )
+        .is_err());
+    }
+}
+
+/// 세션 하나에 저장된 메타데이터. 아직 아무것도 남기지 않은 세션은 기본값이다.
+///
+/// 목록(카탈로그)을 들고 있지 않은 화면 — AIA 팝업 — 이 그 대화의 읽던 자리를 읽는
+/// 통로다. 빈 패치를 보내 되돌려 받는 방법도 있지만, 그러면 읽기만 하려는 화면이
+/// 저장소를 잠그고 쓰기를 한 번 일으키며 빈 항목까지 만든다.
+pub fn session_meta(
     app_data_dir: &Path,
     source: ProviderId,
     session_id: &str,
-) -> Result<Vec<CapturedTranscriptTurn>, CoreError> {
-    let store = load_supplement_store(app_data_dir)?;
-    let mut turns = store
-        .turns
-        .into_iter()
-        .filter(|turn| turn.source == source && turn.session_id == session_id)
-        .collect::<Vec<_>>();
-    turns.sort_by_key(|turn| turn.completed_at);
-    Ok(turns)
-}
-
-pub(crate) fn supplement_storage_stats(
-    app_data_dir: &Path,
-) -> Result<SupplementStorageStats, CoreError> {
-    let store = load_supplement_store(app_data_dir)?;
-    let session_count = store
-        .turns
-        .iter()
-        .map(|turn| session_key(turn.source, &turn.session_id))
-        .collect::<HashSet<_>>()
-        .len();
-    let size_bytes = fs::metadata(app_data_dir.join(SUPPLEMENT_STORE_FILE_NAME))
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    Ok(SupplementStorageStats {
-        turn_count: store.turns.len(),
-        session_count,
-        size_bytes,
-    })
-}
-
-pub(crate) fn persist_captured_turn(
-    app_data_dir: &Path,
-    source: ProviderId,
-    session_id: &str,
-    turn_id: &str,
-    completed_at: i64,
-    text: String,
-    origin: SupplementOrigin,
-) -> Result<(), CoreError> {
-    persist_captured_turn_inner(
-        app_data_dir,
-        captured_turn(source, session_id, turn_id, completed_at, text, origin)?,
-        true,
-    )
-}
-
-pub(crate) fn persist_captured_turn_if_absent(
-    app_data_dir: &Path,
-    source: ProviderId,
-    session_id: &str,
-    turn_id: &str,
-    completed_at: i64,
-    text: String,
-    origin: SupplementOrigin,
-) -> Result<(), CoreError> {
-    persist_captured_turn_inner(
-        app_data_dir,
-        captured_turn(source, session_id, turn_id, completed_at, text, origin)?,
-        false,
-    )
-}
-
-fn captured_turn(
-    source: ProviderId,
-    session_id: &str,
-    turn_id: &str,
-    completed_at: i64,
-    text: String,
-    origin: SupplementOrigin,
-) -> Result<CapturedTranscriptTurn, CoreError> {
+) -> Result<SessionMeta, CoreError> {
     validate_identifier(session_id)?;
-    validate_identifier(turn_id)?;
-    Ok(CapturedTranscriptTurn {
-        source,
-        session_id: session_id.to_owned(),
-        turn_id: turn_id.to_owned(),
-        completed_at,
-        text: cap_supplement_text(text),
-        origin,
-    })
+    let metadata = load_metadata(app_data_dir)?;
+    Ok(metadata
+        .sessions
+        .get(&session_key(source, session_id))
+        .cloned()
+        .unwrap_or_default())
 }
 
-fn persist_captured_turn_inner(
-    app_data_dir: &Path,
-    next: CapturedTranscriptTurn,
-    replace_existing: bool,
-) -> Result<(), CoreError> {
-    if next.text.is_empty() {
-        return Ok(());
+/// 세션 하나가 가질 수 있는 읽던 자리 수. 목록을 눈으로 훑어 고르는 장치라, 넘어가면
+/// 고르는 일 자체가 일이 된다.
+const MAX_SESSION_BOOKMARKS: usize = 50;
+const MAX_BOOKMARK_LABEL_CHARS: usize = 120;
+const MAX_BOOKMARK_SNIPPET_CHARS: usize = 200;
+/// 앵커가 가리킬 수 있는 메시지 열쇠 길이. `live:<uuid>:<kind>`와 `item:<offset>`이
+/// 넉넉히 들어가고, 저장소에 긴 문자열이 들어오는 것은 막는다.
+const MAX_BOOKMARK_MESSAGE_KEY_CHARS: usize = 200;
+
+/// 들어온 읽던 자리 목록을 저장해도 되는 모양으로 검증한다. 화면이 보낸 목록을 그대로
+/// 믿으면 원격 UI나 AIA가 저장소에 임의 길이 문자열을 밀어 넣을 수 있다.
+fn validate_bookmarks(bookmarks: Vec<SessionBookmark>) -> Result<Vec<SessionBookmark>, CoreError> {
+    if bookmarks.len() > MAX_SESSION_BOOKMARKS {
+        return Err(CoreError::InvalidInput(format!(
+            "읽던 자리는 세션당 {MAX_SESSION_BOOKMARKS}개까지 저장할 수 있습니다"
+        )));
     }
-    with_supplement_store(app_data_dir, |store| {
-        if let Some(existing) = store.turns.iter_mut().find(|turn| {
-            turn.source == next.source
-                && turn.session_id == next.session_id
-                && turn.turn_id == next.turn_id
-        }) {
-            if replace_existing {
-                *existing = next;
-            }
-        } else {
-            store.turns.push(next);
+    let mut seen = BTreeSet::new();
+    for bookmark in &bookmarks {
+        validate_identifier(&bookmark.id)?;
+        if !seen.insert(bookmark.id.as_str()) {
+            return Err(CoreError::InvalidInput(
+                "읽던 자리 식별자가 중복되었습니다".to_owned(),
+            ));
         }
-        trim_supplements(store);
-        Ok(())
-    })
-}
-
-fn load_supplement_store(app_data_dir: &Path) -> Result<SupplementStore, CoreError> {
-    read_private_json_or_default(&app_data_dir.join(SUPPLEMENT_STORE_FILE_NAME))
-}
-
-fn with_supplement_store<T>(
-    app_data_dir: &Path,
-    action: impl FnOnce(&mut SupplementStore) -> Result<T, CoreError>,
-) -> Result<T, CoreError> {
-    let _lock = store_lock::acquire(app_data_dir, SUPPLEMENT_LOCK_FILE_NAME, "보완 저장소")?;
-    let mut store = load_supplement_store(app_data_dir)?;
-    let value = action(&mut store)?;
-    let text = serde_json::to_string_pretty(&store)?;
-    fs::write(app_data_dir.join(SUPPLEMENT_STORE_FILE_NAME), text)?;
-    Ok(value)
-}
-
-fn cap_supplement_text(text: String) -> String {
-    let text = text.trim().to_owned();
-    if text.len() <= MAX_SUPPLEMENT_TEXT_BYTES {
-        return text;
+        ensure_char_limit(&bookmark.label, MAX_BOOKMARK_LABEL_CHARS, "읽던 자리 이름")?;
+        ensure_char_limit(
+            &bookmark.snippet,
+            MAX_BOOKMARK_SNIPPET_CHARS,
+            "읽던 자리 본문",
+        )?;
+        if bookmark.anchor.message_key.is_empty() {
+            return Err(CoreError::InvalidInput(
+                "읽던 자리가 가리킬 메시지가 없습니다".to_owned(),
+            ));
+        }
+        ensure_char_limit(
+            &bookmark.anchor.message_key,
+            MAX_BOOKMARK_MESSAGE_KEY_CHARS,
+            "읽던 자리 위치",
+        )?;
     }
-    let end = text.floor_char_boundary(MAX_SUPPLEMENT_TEXT_BYTES);
-    format!(
-        "{}\n\n[Agent Manager 보관 한도에 따라 일부 생략됨]",
-        &text[..end]
-    )
+    Ok(bookmarks)
 }
 
-fn trim_supplements(store: &mut SupplementStore) {
-    let mut per_session = HashMap::<String, usize>::new();
-    store
-        .turns
-        .sort_by_key(|turn| std::cmp::Reverse(turn.completed_at));
-    store.turns.retain(|turn| {
-        let key = session_key(turn.source, &turn.session_id);
-        let count = per_session.entry(key).or_default();
-        *count += 1;
-        *count <= MAX_SUPPLEMENT_TURNS_PER_SESSION
-    });
-    store.turns.truncate(MAX_SUPPLEMENT_TURNS);
-    store.turns.sort_by_key(|turn| turn.completed_at);
+/// 글자 수 상한 하나. 바이트가 아니라 문자로 센다 — 한글 한 글자가 3바이트라, 바이트로
+/// 재면 같은 길이의 한국어 이름만 거절당한다.
+fn ensure_char_limit(value: &str, max_chars: usize, label: &str) -> Result<(), CoreError> {
+    if value.chars().count() > max_chars {
+        return Err(CoreError::InvalidInput(format!(
+            "{label}이(가) 너무 깁니다({max_chars}자까지)"
+        )));
+    }
+    Ok(())
 }
 
 pub fn update_session_meta(
@@ -318,6 +249,7 @@ pub fn update_session_meta(
     patch: SessionMetaPatch,
 ) -> Result<SessionMeta, CoreError> {
     validate_identifier(session_id)?;
+    let bookmarks = patch.bookmarks.map(validate_bookmarks).transpose()?;
     with_metadata(app_data_dir, |metadata| {
         let folder_ids = if let Some(folder_ids) = patch.folder_ids {
             let known = metadata
@@ -367,6 +299,9 @@ pub fn update_session_meta(
                 }
                 None => None,
             };
+        }
+        if let Some(bookmarks) = bookmarks {
+            current.bookmarks = bookmarks;
         }
         Ok(current.clone())
     })
@@ -626,6 +561,29 @@ pub(crate) fn persist_session_pinned_account_id(
     )
 }
 
+/// 이 세션이 마지막으로 쓴 로컬 LLM 연결(M7 7.3). 실행마다 갱신되고 값이 같으면 다시
+/// 쓰지 않는다.
+///
+/// 계정 슬롯 도우미(`persist_session_account_slot`)를 쓰지 않는다 — 그쪽은 저장 id 길이
+/// (16~128자)를 요구해 `default`·`tailscale` 같은 연결 id 를 조용히 거절했다(2026-09-27
+/// 실기기 ses_f1db51aedffeHbfCvgxgbkjCyU: 메타에 연결 id 가 남지 않았다). 연결 id 는
+/// 제 규칙(영소문자·숫자·하이픈 1~32자)으로 검사한다.
+pub(crate) fn persist_session_local_connection_id(
+    app_data_dir: &Path,
+    source: ProviderId,
+    session_id: &str,
+    connection_id: &str,
+) -> Result<(), CoreError> {
+    let connection_id = crate::local_llm::normalize_connection_id(connection_id)?;
+    update_session_entry(app_data_dir, source, session_id, |current| {
+        if current.local_connection_id.as_deref() == Some(connection_id.as_str()) {
+            return false;
+        }
+        current.local_connection_id = Some(connection_id.clone());
+        true
+    })
+}
+
 /// 이 세션이 마지막으로 실행된 계정. 기록이 없으면 세션을 만든 계정으로 되돌아간다.
 /// `ResumeAccountPolicy::LastUsedAccount`에서만 이어가기 기준으로 쓴다.
 pub(crate) fn session_last_used_account_id(
@@ -648,6 +606,42 @@ pub(crate) fn session_pinned_account_id(
     session_meta_snapshot(app_data_dir, source, session_id)?.pinned_account_id
 }
 
+/// 자동정리(`C11`)가 목록에서 내린 세션을 기록하고, 그 세션이 붙잡고 있던 장치 로컬
+/// 보완 정보를 함께 지운다. 툼스톤·세션 메타·작업 경로가 한 파일에 있으므로 잠금도 한 번만
+/// 잡는다. 돌려주는 값은 새로 내려간 세션 수다(이미 내려가 있던 건 세지 않는다).
+pub(crate) fn record_cleaned_sessions(
+    app_data_dir: &Path,
+    keys: &BTreeSet<String>,
+) -> Result<usize, CoreError> {
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    with_metadata_changed(app_data_dir, |metadata| {
+        let mut added = 0;
+        for key in keys {
+            if metadata.cleaned_sessions.insert(key.clone()) {
+                added += 1;
+            }
+            metadata.sessions.remove(key);
+            metadata.session_working_directories.remove(key);
+        }
+        Ok((added > 0, added))
+    })
+}
+
+/// 툼스톤을 모두 지운다. 원문은 건드리지 않았으므로 다음 재조사에서 세션이 되돌아온다.
+pub(crate) fn clear_cleaned_sessions(app_data_dir: &Path) -> Result<usize, CoreError> {
+    with_metadata_changed(app_data_dir, |metadata| {
+        let count = metadata.cleaned_sessions.len();
+        metadata.cleaned_sessions.clear();
+        Ok((count > 0, count))
+    })
+}
+
+pub(crate) fn cleaned_session_count(app_data_dir: &Path) -> Result<usize, CoreError> {
+    Ok(load_metadata(app_data_dir)?.cleaned_sessions.len())
+}
+
 /// 채팅 런타임 lease와 실행 실패 기록은 [`crate::chat_runtime_store`]가 맡는다. 호출부가
 /// 쓰던 `store::` 경로를 그대로 두려고 여기서 다시 내보낸다.
 pub(crate) use crate::chat_runtime_store::{
@@ -655,12 +649,16 @@ pub(crate) use crate::chat_runtime_store::{
     remove_managed_chat_runtime_lease, runtime_failures_for, upsert_managed_chat_runtime_lease,
     ManagedChatRuntimeLease,
 };
+/// 문서 루트의 등록·해제와 보호 경계 판정은 [`crate::doc_roots`]가 맡는다. 호출부가
+/// 쓰던 `store::` 경로를 그대로 두려고 여기서 다시 내보낸다.
+pub(crate) use crate::doc_roots::is_restricted_doc_root;
+pub use crate::doc_roots::{add_doc_root, doc_root_paths, list_doc_roots, remove_doc_root};
 /// 문서 루트 안의 파일 트리 읽기·쓰기는 [`crate::document_tree`]가 맡는다. 호출부가
 /// 쓰던 `store::` 경로를 그대로 두려고 여기서 다시 내보낸다.
 pub use crate::document_tree::{
-    list_doc_tree, list_document_entries, read_doc, read_doc_linked_file,
-    read_doc_linked_file_download, read_document_file, read_document_file_download, save_doc,
-    search_document_entries,
+    create_doc, list_doc_tree, list_document_entries, read_doc, read_doc_linked_file,
+    read_doc_linked_file_download, read_doc_linked_file_source, read_document_file,
+    read_document_file_download, read_document_file_source, save_doc, search_document_entries,
 };
 pub(crate) use crate::session_folders::folders_with_counts;
 /// 정리폴더 트리는 [`crate::session_folders`]가 맡는다. 호출부가 쓰던
@@ -669,97 +667,13 @@ pub use crate::session_folders::{
     create_session_folder, delete_session_folder, list_session_folders, reorder_session_folder,
     update_session_folder, FolderMoveDirection, MAX_SESSION_FOLDER_DEPTH,
 };
-
-pub fn list_doc_roots(app_data_dir: &Path) -> Result<Vec<DocRootStatus>, CoreError> {
-    Ok(load_metadata(app_data_dir)?
-        .doc_roots
-        .into_iter()
-        .map(|root| {
-            let path = Path::new(&root.path);
-            DocRootStatus {
-                exists: path.is_dir(),
-                restricted: is_restricted_doc_root(app_data_dir, path),
-                root,
-            }
-        })
-        .collect())
-}
-
-/// 문서 루트를 등록한다.
-///
-/// `create_if_missing`은 화면이 "만들까요?"를 물어 사용자가 승인했을 때만 켠다. 폴더
-/// 생성 자체(`create_directory`)는 임의 위치를 대상으로 해서 호스트 전용으로 남겨 두고,
-/// 문서 루트 등록이라는 이 한 자리에서만 원격에도 열어 준다 — 원격에서 폴더를 못 만들어
-/// 등록이 막히던 흐름은 여기뿐이었다. 만드는 규칙은 `create_user_directory`와 같아서
-/// 이미 있는 상위 폴더 바로 아래 마지막 한 칸만 생기고, 앱 데이터·공급자 홈은 막힌다.
-pub fn add_doc_root(
-    app_data_dir: &Path,
-    name: &str,
-    path: &str,
-    create_if_missing: bool,
-) -> Result<DocRootStatus, CoreError> {
-    // 입력 해석은 채팅 작업 경로와 같은 규칙을 쓴다(`user_path`). 없는 폴더는 화면이
-    // "만들까요?"를 물을 수 있도록 고정 문구의 NotFound로 올라간다.
-    let canonical = match crate::user_path::resolve_existing_directory(path) {
-        // 만들지 못하면 그 이유를 그대로 올린다. 상위가 없어 거절됐을 때의 "찾을 수
-        // 없습니다: <상위>"가 사용자에게 어디가 잘못됐는지 더 정확히 말해 준다.
-        Err(CoreError::NotFound(_)) if create_if_missing => {
-            crate::user_path::create_user_directory(app_data_dir, path)?
-        }
-        other => other?,
-    };
-    if is_restricted_doc_root(app_data_dir, &canonical) {
-        return Err(CoreError::InvalidInput(
-            "공급자 인증 저장소 또는 Agent Manager 앱 데이터와 겹치는 폴더는 문서 루트로 등록할 수 없습니다".to_owned(),
-        ));
-    }
-    let canonical_text = canonical.to_string_lossy().into_owned();
-    with_metadata(app_data_dir, |metadata| {
-        if metadata
-            .doc_roots
-            .iter()
-            .any(|root| root.path == canonical_text)
-        {
-            return Err(CoreError::Conflict(
-                "이미 등록된 문서 폴더입니다".to_owned(),
-            ));
-        }
-        let display_name = name.trim();
-        let display_name = if display_name.is_empty() {
-            canonical
-                .file_name()
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_else(|| canonical_text.clone())
-        } else {
-            display_name.chars().take(120).collect()
-        };
-        let root = DocRoot {
-            id: stable_id(&canonical_text),
-            name: display_name,
-            path: canonical_text,
-            agent_data: is_agent_data_path(&canonical),
-        };
-        metadata.doc_roots.push(root.clone());
-        Ok(DocRootStatus {
-            root,
-            exists: true,
-            restricted: false,
-        })
-    })
-}
-
-pub fn remove_doc_root(app_data_dir: &Path, id: &str) -> Result<(), CoreError> {
-    with_metadata(app_data_dir, |metadata| {
-        let previous = metadata.doc_roots.len();
-        metadata.doc_roots.retain(|root| root.id != id);
-        if metadata.doc_roots.len() == previous {
-            return Err(CoreError::NotFound(
-                "문서 폴더를 찾을 수 없습니다".to_owned(),
-            ));
-        }
-        Ok(())
-    })
-}
+/// 세션 보완 저장소는 [`crate::supplement_store`]가 맡는다. 호출부가 쓰던
+/// `store::` 경로를 그대로 두려고 여기서 다시 내보낸다.
+pub(crate) use crate::supplement_store::{
+    captured_turns_for, persist_captured_turn, persist_captured_turn_if_absent,
+    persist_system_prompt, prune_supplements_for, supplement_storage_stats, CapturedTranscriptTurn,
+    SupplementOrigin,
+};
 
 /// 설정에서 제외한 프로젝트의 정규 경로 집합. 스냅샷 합성과 지침 배포 원장이 같은
 /// 집합을 읽어 어디서든 같은 프로젝트가 빠지게 한다.
@@ -855,57 +769,72 @@ pub(crate) fn seed_known_projects_if_needed(
     })
 }
 
-pub(crate) fn is_restricted_doc_root(app_data_dir: &Path, path: &Path) -> bool {
-    let redirected_provider_dirs = crate::credential_profiles::inherited_credential_dirs();
-    is_restricted_doc_root_with_provider_dirs(app_data_dir, path, &redirected_provider_dirs)
-}
-
-fn is_restricted_doc_root_with_provider_dirs(
-    app_data_dir: &Path,
-    path: &Path,
-    redirected_provider_dirs: &[PathBuf],
-) -> bool {
-    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let app_data = fs::canonicalize(app_data_dir).unwrap_or_else(|_| app_data_dir.to_path_buf());
-    let mut protected = vec![app_data];
-    if let Some(home) = user_home::optional_home_dir() {
-        protected.extend(AGENT_DATA_DIR_NAMES.into_iter().map(|name| home.join(name)));
-    }
-    // 공급자 홈을 환경변수로 옮긴 설치도 기본 홈과 똑같은 읽기·쓰기 금지 경계다.
-    // 이 변수들은 Agent Manager가 실제 공급자 런타임 구성에 사용하는 경로만 읽는다(G8).
-    protected.extend(redirected_provider_dirs.iter().cloned());
-    protected.into_iter().any(|item| {
-        let item = fs::canonicalize(&item).unwrap_or(item);
-        path.starts_with(&item) || item.starts_with(&path)
-    })
-}
-
 fn clean_optional(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().chars().take(20_000).collect::<String>())
         .filter(|value| !value.is_empty())
 }
 
-fn stable_id(value: &str) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("root-{hash:016x}")
-}
-
-fn is_agent_data_path(path: &Path) -> bool {
-    user_home::optional_home_dir().is_some_and(|home| {
-        AGENT_DATA_DIR_NAMES
-            .iter()
-            .any(|name| path.starts_with(home.join(name)))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ReadingAnchor;
+
+    #[test]
+    fn a_cleaned_session_is_tombstoned_and_its_device_local_metadata_goes_with_it() {
+        // 정리한 세션의 메타와 작업 경로까지 함께 지운다. 목록에 없는 세션의 즐겨찾기를
+        // 들고 있어 봐야 `manager-state.json`만 커진다.
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        update_session_meta(
+            temp.path(),
+            ProviderId::Claude,
+            "1234567890abcdef",
+            SessionMetaPatch {
+                favorite: Some(true),
+                hidden: None,
+                note: None,
+                custom_title: None,
+                folder_ids: None,
+                pinned_account_id: None,
+                bookmarks: None,
+            },
+        )
+        .expect("metadata must save");
+        persist_session_working_directory(
+            temp.path(),
+            ProviderId::Claude,
+            "1234567890abcdef",
+            temp.path(),
+        )
+        .expect("working directory must save");
+
+        let keys = BTreeSet::from(["claude:1234567890abcdef".to_owned()]);
+        assert_eq!(
+            record_cleaned_sessions(temp.path(), &keys).expect("tombstone must record"),
+            1
+        );
+        let loaded = load_metadata(temp.path()).expect("metadata must load");
+        assert!(loaded.is_cleaned_session(ProviderId::Claude, "1234567890abcdef"));
+        assert!(!loaded.sessions.contains_key("claude:1234567890abcdef"));
+        assert!(!loaded
+            .session_working_directories
+            .contains_key("claude:1234567890abcdef"));
+
+        // 같은 키를 다시 기록해도 새로 내려간 것으로 세지 않는다.
+        assert_eq!(
+            record_cleaned_sessions(temp.path(), &keys).expect("tombstone must be idempotent"),
+            0
+        );
+
+        // 기록을 비우면 다음 재조사에서 세션이 되돌아온다.
+        assert_eq!(
+            clear_cleaned_sessions(temp.path()).expect("tombstones must clear"),
+            1
+        );
+        assert!(!load_metadata(temp.path())
+            .expect("metadata must load")
+            .is_cleaned_session(ProviderId::Claude, "1234567890abcdef"));
+    }
 
     #[test]
     fn metadata_round_trip_preserves_session_and_root() {
@@ -917,6 +846,7 @@ mod tests {
             custom_title: None,
             folder_ids: None,
             pinned_account_id: None,
+            bookmarks: None,
         };
         update_session_meta(temp.path(), ProviderId::Claude, "1234567890abcdef", patch)
             .expect("metadata must save");
@@ -953,6 +883,7 @@ mod tests {
                     custom_title: Some(Some("saved title".to_owned())),
                     folder_ids: None,
                     pinned_account_id: None,
+                    bookmarks: None,
                 },
             );
             sender.send(result).expect("test receiver must remain open");
@@ -1317,6 +1248,7 @@ mod tests {
                 custom_title: None,
                 folder_ids: None,
                 pinned_account_id: Some(Some("claude-account-pinned-01".to_owned())),
+                bookmarks: None,
             },
         )
         .expect("pin must save");
@@ -1349,6 +1281,7 @@ mod tests {
                 custom_title: None,
                 folder_ids: None,
                 pinned_account_id: Some(None),
+                bookmarks: None,
             },
         )
         .expect("pin must clear");
@@ -1359,70 +1292,6 @@ mod tests {
         assert!(
             session_pinned_account_id(temp.path(), ProviderId::Claude, "session-unknown").is_none()
         );
-    }
-
-    #[test]
-    fn redirected_provider_homes_are_restricted_document_roots() {
-        let temp = tempfile::tempdir().expect("temp directory must exist");
-        let app_data = temp.path().join("app-data");
-        let redirected = temp.path().join("provider-state");
-        let nested = redirected.join("sessions");
-        fs::create_dir_all(&app_data).expect("app data");
-        fs::create_dir_all(&nested).expect("provider state");
-
-        assert!(is_restricted_doc_root_with_provider_dirs(
-            &app_data,
-            &redirected,
-            std::slice::from_ref(&redirected),
-        ));
-        assert!(is_restricted_doc_root_with_provider_dirs(
-            &app_data,
-            &nested,
-            std::slice::from_ref(&redirected),
-        ));
-        assert!(is_restricted_doc_root_with_provider_dirs(
-            &app_data,
-            temp.path(),
-            std::slice::from_ref(&redirected),
-        ));
-    }
-
-    #[test]
-    fn doc_root_registration_can_create_the_missing_last_segment() {
-        let temp = tempfile::tempdir().expect("temp directory must exist");
-        let app_data = temp.path().join("app-data");
-        fs::create_dir_all(&app_data).expect("app data must exist");
-        let parent = temp.path().join("Documents");
-        fs::create_dir_all(&parent).expect("parent must exist");
-        let target = parent.join("agentManagerQA");
-
-        // 기본값은 지금까지와 같다. 없는 폴더는 화면이 "만들까요?"를 물을 수 있도록
-        // 고정 문구의 NotFound로 올라간다.
-        let error = add_doc_root(&app_data, "QA", target.to_string_lossy().as_ref(), false)
-            .expect_err("없는 폴더는 거절한다");
-        assert!(matches!(error, CoreError::NotFound(_)));
-        assert!(!target.exists());
-
-        // 승인했을 때만 그 한 칸을 만들고 등록한다.
-        let root = add_doc_root(&app_data, "QA", target.to_string_lossy().as_ref(), true)
-            .expect("만들고 등록한다");
-        assert!(target.is_dir());
-        assert_eq!(root.root.name, "QA");
-        assert!(root.exists);
-
-        // 상위가 없으면 트리를 만들지 않는다 — 오타 하나로 폴더가 줄줄이 생기지 않는다.
-        let deep = temp.path().join("Documentz").join("agentManagerQA");
-        let error = add_doc_root(&app_data, "QA", deep.to_string_lossy().as_ref(), true)
-            .expect_err("상위가 없으면 거절한다");
-        assert!(matches!(error, CoreError::NotFound(_)));
-        assert!(!temp.path().join("Documentz").exists());
-
-        // 앱 데이터 안은 만들지도 등록하지도 않는다.
-        let inside = app_data.join("sneaky");
-        let error = add_doc_root(&app_data, "QA", inside.to_string_lossy().as_ref(), true)
-            .expect_err("앱 데이터 안은 거절한다");
-        assert!(matches!(error, CoreError::InvalidInput(_)));
-        assert!(!inside.exists());
     }
 
     #[test]
@@ -1441,6 +1310,7 @@ mod tests {
                 custom_title: None,
                 folder_ids: Some(vec![folder.id.clone()]),
                 pinned_account_id: None,
+                bookmarks: None,
             },
         )
         .expect("folder assignment must save");
@@ -1471,6 +1341,7 @@ mod tests {
                 custom_title: None,
                 folder_ids: Some(folder_ids),
                 pinned_account_id: None,
+                bookmarks: None,
             },
         )
         .expect("folder assignment must save");
@@ -1507,6 +1378,102 @@ mod tests {
         assert_eq!(folders[0].session_count, 1);
         assert_eq!(folders[0].total_session_count, 2);
         assert_eq!(folders[1].total_session_count, 1);
+    }
+
+    fn reading_bookmark(id: &str, label: &str) -> SessionBookmark {
+        SessionBookmark {
+            id: id.to_owned(),
+            label: label.to_owned(),
+            snippet: "세션 만료는 리프레시 토큰으로".to_owned(),
+            anchor: ReadingAnchor {
+                message_key: "item:4096".to_owned(),
+                markdown_line: Some(42),
+            },
+            created_at: 1_700_000_000_000,
+        }
+    }
+
+    fn save_bookmarks(
+        app_data_dir: &Path,
+        bookmarks: Vec<SessionBookmark>,
+    ) -> Result<SessionMeta, CoreError> {
+        update_session_meta(
+            app_data_dir,
+            ProviderId::Codex,
+            "1234567890abcdef",
+            SessionMetaPatch {
+                bookmarks: Some(bookmarks),
+                ..SessionMetaPatch::default()
+            },
+        )
+    }
+
+    #[test]
+    fn reading_bookmarks_survive_a_reload_and_are_read_without_writing() {
+        // 읽던 자리는 앱을 껐다 켜도 남아야 하고, 목록을 들고 있지 않은 화면은 저장소에
+        // 아무것도 쓰지 않고 읽을 수 있어야 한다.
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        let saved = save_bookmarks(
+            temp.path(),
+            vec![reading_bookmark(
+                "11111111-1111-4111-8111-111111111111",
+                "결론",
+            )],
+        )
+        .expect("bookmarks must save");
+        assert_eq!(saved.bookmarks.len(), 1);
+
+        let read = session_meta(temp.path(), ProviderId::Codex, "1234567890abcdef")
+            .expect("metadata must read");
+        assert_eq!(read.bookmarks, saved.bookmarks);
+        assert_eq!(read.bookmarks[0].anchor.markdown_line, Some(42));
+
+        // 아무것도 남기지 않은 세션은 기본값으로 나오고 항목을 만들지 않는다.
+        let untouched = session_meta(temp.path(), ProviderId::Claude, "fedcba0987654321")
+            .expect("metadata must read");
+        assert!(untouched.bookmarks.is_empty());
+        assert!(!load_metadata(temp.path())
+            .expect("metadata must reload")
+            .sessions
+            .contains_key("claude:fedcba0987654321"));
+    }
+
+    #[test]
+    fn reading_bookmarks_reject_an_oversized_or_duplicated_list() {
+        // 화면이 보낸 목록을 그대로 믿으면 원격 UI나 AIA가 저장소를 임의 길이로 불릴 수 있다.
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        let over_limit = (0..=MAX_SESSION_BOOKMARKS)
+            .map(|index| reading_bookmark(&format!("{index:0>36}"), "표시"))
+            .collect();
+        assert!(matches!(
+            save_bookmarks(temp.path(), over_limit),
+            Err(CoreError::InvalidInput(_))
+        ));
+
+        let duplicated = vec![
+            reading_bookmark("11111111-1111-4111-8111-111111111111", "하나"),
+            reading_bookmark("11111111-1111-4111-8111-111111111111", "둘"),
+        ];
+        assert!(matches!(
+            save_bookmarks(temp.path(), duplicated),
+            Err(CoreError::InvalidInput(_))
+        ));
+
+        let long_label = vec![SessionBookmark {
+            // 한글 이름은 바이트로 재면 같은 길이의 영문보다 먼저 걸린다. 글자로 센다.
+            label: "가".repeat(MAX_BOOKMARK_LABEL_CHARS),
+            ..reading_bookmark("11111111-1111-4111-8111-111111111111", "")
+        }];
+        assert!(save_bookmarks(temp.path(), long_label).is_ok());
+
+        // 거절된 목록은 저장되지 않았으므로 마지막으로 성공한 한 건만 남는다.
+        assert_eq!(
+            session_meta(temp.path(), ProviderId::Codex, "1234567890abcdef")
+                .expect("metadata must read")
+                .bookmarks
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1703,39 +1670,6 @@ mod tests {
     }
 
     #[test]
-    fn captured_turn_replaces_the_same_turn_and_reports_storage_stats() {
-        let temp = tempfile::tempdir().expect("temp directory must exist");
-        persist_captured_turn(
-            temp.path(),
-            ProviderId::Claude,
-            "session-1234567890",
-            "turn-1234567890abcd",
-            1,
-            "first response".to_owned(),
-            SupplementOrigin::Chat,
-        )
-        .expect("first captured turn");
-        persist_captured_turn(
-            temp.path(),
-            ProviderId::Claude,
-            "session-1234567890",
-            "turn-1234567890abcd",
-            2,
-            "final response".to_owned(),
-            SupplementOrigin::Chat,
-        )
-        .expect("replacement captured turn");
-
-        let turns = captured_turns_for(temp.path(), ProviderId::Claude, "session-1234567890")
-            .expect("captured turns");
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].text, "final response");
-        let stats = supplement_storage_stats(temp.path()).expect("supplement stats");
-        assert_eq!(stats.turn_count, 1);
-        assert_eq!(stats.session_count, 1);
-        assert!(stats.size_bytes > 0);
-    }
-    #[test]
     fn project_exclusion_normalizes_and_toggles() {
         let temp = tempfile::tempdir().expect("temp directory must exist");
         let project = temp.path().join("project");
@@ -1870,13 +1804,9 @@ mod tests {
     fn folder_move_direction_contract_and_serde() {
         use std::str::FromStr;
 
-        assert_eq!(FolderMoveDirection::ALL.len(), 2);
-        assert_eq!(
-            FolderMoveDirection::ALL,
-            [FolderMoveDirection::Up, FolderMoveDirection::Down]
-        );
+        let cases = [FolderMoveDirection::Up, FolderMoveDirection::Down];
 
-        for direction in FolderMoveDirection::ALL {
+        for direction in cases {
             let s = direction.as_str();
             assert_eq!(direction.to_string(), s);
             assert_eq!(FolderMoveDirection::from_str(s).expect("parse"), direction);
@@ -1889,13 +1819,9 @@ mod tests {
         }
 
         assert_eq!(FolderMoveDirection::Up.as_str(), "up");
-        assert!(FolderMoveDirection::Up.is_up());
-        assert!(!FolderMoveDirection::Up.is_down());
         assert_eq!(FolderMoveDirection::Up.delta(), -1);
 
         assert_eq!(FolderMoveDirection::Down.as_str(), "down");
-        assert!(FolderMoveDirection::Down.is_down());
-        assert!(!FolderMoveDirection::Down.is_up());
         assert_eq!(FolderMoveDirection::Down.delta(), 1);
 
         // 대소문자 무시 파싱 검증
@@ -1908,66 +1834,19 @@ mod tests {
             FolderMoveDirection::Down
         );
 
-        // 잘못된 입력 에러 검증
+        // 잘못된 입력 에러 검증 — 코드와 파라미터를 함께 싣고, 한국어 문장은 그대로다.
         let error = FolderMoveDirection::from_str("left").expect_err("invalid direction");
-        assert!(matches!(error, CoreError::InvalidInput(_)));
-    }
-
-    #[test]
-    fn supplement_origin_contract_and_serde() {
-        use std::str::FromStr;
-
-        assert_eq!(SupplementOrigin::ALL.len(), 2);
+        let CoreError::Coded(coded) = error else {
+            panic!("코드화된 실패여야 한다");
+        };
+        assert_eq!(coded.kind(), crate::AppErrorKind::InvalidInput);
+        assert_eq!(coded.code(), "SESSION_FOLDER_UNKNOWN_MOVE_DIRECTION");
         assert_eq!(
-            SupplementOrigin::ALL,
-            [SupplementOrigin::Chat, SupplementOrigin::Scheduled]
+            coded.params().get("direction").map(String::as_str),
+            Some("left")
         );
-
-        for origin in SupplementOrigin::ALL {
-            let s = origin.as_str();
-            assert_eq!(origin.to_string(), s);
-            assert_eq!(SupplementOrigin::from_str(s).expect("parse"), origin);
-
-            let json = serde_json::to_string(&origin).expect("serialize");
-            assert_eq!(json, format!("\"{s}\""));
-            let deserialized: SupplementOrigin = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(deserialized, origin);
-        }
-
-        assert!(" chat ".parse::<SupplementOrigin>().is_ok());
-        assert!("scheduled".parse::<SupplementOrigin>().is_ok());
-        assert!(matches!(
-            "unknown".parse::<SupplementOrigin>(),
-            Err(CoreError::InvalidInput(_))
-        ));
-    }
-
-    #[test]
-    fn trim_supplements_enforces_per_session_and_global_limits() {
-        let mut store = SupplementStore::default();
-        for i in 0..210 {
-            store.turns.push(CapturedTranscriptTurn {
-                source: ProviderId::Claude,
-                session_id: "session-1".to_owned(),
-                turn_id: format!("turn-{i}"),
-                completed_at: i as i64,
-                text: "sample".to_owned(),
-                origin: SupplementOrigin::Chat,
-            });
-        }
-        trim_supplements(&mut store);
-        assert_eq!(store.turns.len(), MAX_SUPPLEMENT_TURNS_PER_SESSION);
-        assert_eq!(store.turns.first().unwrap().completed_at, 10);
-        assert_eq!(store.turns.last().unwrap().completed_at, 209);
-    }
-
-    #[test]
-    fn cap_supplement_text_respects_char_boundary_and_limit() {
-        let short = "짧은 텍스트".to_owned();
-        assert_eq!(cap_supplement_text(short.clone()), short);
-
-        let long = "한글".repeat(MAX_SUPPLEMENT_TEXT_BYTES / 6 + 10);
-        let capped = cap_supplement_text(long);
-        assert!(capped.contains("[Agent Manager 보관 한도에 따라 일부 생략됨]"));
+        assert!(coded
+            .to_string()
+            .starts_with("알 수 없는 폴더 이동 방향입니다"));
     }
 }

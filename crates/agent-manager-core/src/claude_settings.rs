@@ -5,30 +5,65 @@
 //! 안 `enabledPlugins`·`skillOverrides` 엔트리 하나로만 제한한다.
 
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use uuid::Uuid;
 
-use crate::app_data_file::{replace_file, sync_dir, write_private_bytes};
 use crate::catalog::{
     child_directories, claude_installed_plugins, frontmatter_value, read_text_limited,
     split_frontmatter,
 };
-use crate::clock::now_ms;
+use crate::provider_settings_file::{save_backup, SettingsFileGuard, SettingsPathRules};
 use crate::store_lock;
 use crate::user_home::home_dir;
 use crate::CoreError;
 
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 const MAX_SKILL_FILE_BYTES: u64 = 1024 * 1024;
-const BACKUP_LIMIT: usize = 5;
 const SETTINGS_LOCK_FILE: &str = "claude-settings.lock";
+
+/// 문자열 값과 1:1로 대응하는 Claude 설정 열거형에 `ALL`·`as_str`·`Display`·`FromStr`를
+/// 한 벌로 붙인다. 네 열거형이 같은 네 덩어리를 각자 적고 있어, 변이 하나를 늘리거나
+/// 문자열 값을 고칠 때 네 곳을 맞춰 고쳐야 했고 `as_str`와 `FromStr` 중 한쪽만 고쳐도
+/// 컴파일은 지나가 해석만 조용히 어긋났다. 여기서는 변이와 문자열 값의 대응표만 적고
+/// `FromStr`가 그 표를 뒤집어 쓰므로 양방향이 어긋날 수 없다. `$label`은 알 수 없는 값을
+/// 만났을 때의 오류 문구 앞머리다. 모듈마다 같은 모양의 매크로를 두는 이 저장소의 방식을
+/// 따른다(`chat.rs`의 `chat_string_enum`, `account_tools.rs`의 `account_tool_string_enum`).
+macro_rules! claude_settings_string_enum {
+    ($ty:ident, $label:literal, { $($variant:ident => $value:literal),+ $(,)? }) => {
+        impl $ty {
+            pub const ALL: [Self; [$(stringify!($variant)),+].len()] = [$(Self::$variant),+];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value,)+
+                }
+            }
+        }
+
+        impl std::fmt::Display for $ty {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl std::str::FromStr for $ty {
+            type Err = CoreError;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s.trim() {
+                    $($value => Ok(Self::$variant),)+
+                    _ => Err(CoreError::InvalidInput(format!(
+                        concat!($label, ": {}"),
+                        s
+                    ))),
+                }
+            }
+        }
+    };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,17 +74,18 @@ pub enum ClaudeSettingsScopeKind {
     Policy,
 }
 
-impl ClaudeSettingsScopeKind {
-    pub const ALL: [Self; 4] = [Self::User, Self::Project, Self::Local, Self::Policy];
+claude_settings_string_enum!(ClaudeSettingsScopeKind, "알 수 없는 Claude 설정 스코프 종류입니다", {
+    User => "user",
+    Project => "project",
+    Local => "local",
+    Policy => "policy",
+});
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Project => "project",
-            Self::Local => "local",
-            Self::Policy => "policy",
-        }
-    }
+impl ClaudeSettingsScopeKind {
+    /// 값이 겹칠 때 이기는 순서(강한 갈래가 앞). Claude가 정한 우선순위이고, 이 모듈에서
+    /// 갈래를 훑는 자리는 모두 이 표를 돈다 — 순서를 여러 곳에 늘어놓으면 한쪽만 고쳐도
+    /// 컴파일이 통과해 조회 경로마다 다른 우선순위를 갖게 된다.
+    const PRECEDENCE: [Self; 4] = [Self::Policy, Self::Local, Self::Project, Self::User];
 
     /// 프로젝트 수준 스코프(project 또는 local)인지 여부.
     pub fn is_project_scoped(self) -> bool {
@@ -71,28 +107,6 @@ impl ClaudeSettingsScopeKind {
     }
 }
 
-impl std::fmt::Display for ClaudeSettingsScopeKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for ClaudeSettingsScopeKind {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "user" => Ok(Self::User),
-            "project" => Ok(Self::Project),
-            "local" => Ok(Self::Local),
-            "policy" => Ok(Self::Policy),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 Claude 설정 스코프 종류입니다: {s}"
-            ))),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ClaudeSettingsWriteScope {
@@ -100,41 +114,17 @@ pub enum ClaudeSettingsWriteScope {
     Project,
 }
 
+claude_settings_string_enum!(ClaudeSettingsWriteScope, "알 수 없는 Claude 설정 쓰기 스코프입니다", {
+    User => "user",
+    Project => "project",
+});
+
 impl ClaudeSettingsWriteScope {
-    pub const ALL: [Self; 2] = [Self::User, Self::Project];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Project => "project",
-        }
-    }
-
     /// 대응하는 ClaudeSettingsScopeKind를 반환한다.
     pub fn as_scope_kind(self) -> ClaudeSettingsScopeKind {
         match self {
             Self::User => ClaudeSettingsScopeKind::User,
             Self::Project => ClaudeSettingsScopeKind::Project,
-        }
-    }
-}
-
-impl std::fmt::Display for ClaudeSettingsWriteScope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for ClaudeSettingsWriteScope {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "user" => Ok(Self::User),
-            "project" => Ok(Self::Project),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 Claude 설정 쓰기 스코프입니다: {s}"
-            ))),
         }
     }
 }
@@ -147,17 +137,13 @@ pub enum ClaudePluginSettingValue {
     Custom,
 }
 
+claude_settings_string_enum!(ClaudePluginSettingValue, "알 수 없는 Claude 플러그인 설정값입니다", {
+    True => "true",
+    False => "false",
+    Custom => "custom",
+});
+
 impl ClaudePluginSettingValue {
-    pub const ALL: [Self; 3] = [Self::True, Self::False, Self::Custom];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::True => "true",
-            Self::False => "false",
-            Self::Custom => "custom",
-        }
-    }
-
     /// 플러그인이 활성화 상태인지 여부.
     pub fn is_enabled(self) -> bool {
         matches!(self, Self::True)
@@ -174,27 +160,6 @@ impl ClaudePluginSettingValue {
     }
 }
 
-impl std::fmt::Display for ClaudePluginSettingValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for ClaudePluginSettingValue {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "true" => Ok(Self::True),
-            "false" => Ok(Self::False),
-            "custom" => Ok(Self::Custom),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 Claude 플러그인 설정값입니다: {s}"
-            ))),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SkillOverrideValue {
@@ -204,18 +169,14 @@ pub enum SkillOverrideValue {
     Off,
 }
 
+claude_settings_string_enum!(SkillOverrideValue, "알 수 없는 스킬 오버라이드 값입니다", {
+    On => "on",
+    NameOnly => "name-only",
+    UserInvocableOnly => "user-invocable-only",
+    Off => "off",
+});
+
 impl SkillOverrideValue {
-    pub const ALL: [Self; 4] = [Self::On, Self::NameOnly, Self::UserInvocableOnly, Self::Off];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::On => "on",
-            Self::NameOnly => "name-only",
-            Self::UserInvocableOnly => "user-invocable-only",
-            Self::Off => "off",
-        }
-    }
-
     /// 오버라이드가 꺼져 있지 않고 유효하게 동작 중인지 여부.
     pub fn is_active(self) -> bool {
         !matches!(self, Self::Off)
@@ -224,28 +185,6 @@ impl SkillOverrideValue {
     /// 오버라이드가 꺼져 있는지(off) 여부.
     pub fn is_disabled(self) -> bool {
         matches!(self, Self::Off)
-    }
-}
-
-impl std::fmt::Display for SkillOverrideValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for SkillOverrideValue {
-    type Err = CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "on" => Ok(Self::On),
-            "name-only" => Ok(Self::NameOnly),
-            "user-invocable-only" => Ok(Self::UserInvocableOnly),
-            "off" => Ok(Self::Off),
-            _ => Err(CoreError::InvalidInput(format!(
-                "알 수 없는 스킬 오버라이드 값입니다: {s}"
-            ))),
-        }
     }
 }
 
@@ -262,22 +201,43 @@ pub struct ClaudeScopeValues<T> {
     pub policy: Option<T>,
 }
 
+impl<T> ClaudeScopeValues<T> {
+    /// 네 갈래가 모두 빈 묶음. `Default` 파생은 `T: Default`를 요구하므로 해석 결과를
+    /// 담는 자리에서는 쓸 수 없다.
+    fn empty() -> Self {
+        Self {
+            user: None,
+            project: None,
+            local: None,
+            policy: None,
+        }
+    }
+
+    /// 갈래 하나가 앉는 자리. 갈래를 늘리면 여기서 컴파일이 멈춘다.
+    fn slot_mut(&mut self, kind: ClaudeSettingsScopeKind) -> &mut Option<T> {
+        match kind {
+            ClaudeSettingsScopeKind::User => &mut self.user,
+            ClaudeSettingsScopeKind::Project => &mut self.project,
+            ClaudeSettingsScopeKind::Local => &mut self.local,
+            ClaudeSettingsScopeKind::Policy => &mut self.policy,
+        }
+    }
+}
+
 impl<T: Copy> ClaudeScopeValues<T> {
+    fn get(&self, kind: ClaudeSettingsScopeKind) -> Option<T> {
+        match kind {
+            ClaudeSettingsScopeKind::User => self.user,
+            ClaudeSettingsScopeKind::Project => self.project,
+            ClaudeSettingsScopeKind::Local => self.local,
+            ClaudeSettingsScopeKind::Policy => self.policy,
+        }
+    }
+
     fn winner(&self) -> Option<(ClaudeSettingsScopeKind, T)> {
-        self.policy
-            .map(|value| (ClaudeSettingsScopeKind::Policy, value))
-            .or_else(|| {
-                self.local
-                    .map(|value| (ClaudeSettingsScopeKind::Local, value))
-            })
-            .or_else(|| {
-                self.project
-                    .map(|value| (ClaudeSettingsScopeKind::Project, value))
-            })
-            .or_else(|| {
-                self.user
-                    .map(|value| (ClaudeSettingsScopeKind::User, value))
-            })
+        ClaudeSettingsScopeKind::PRECEDENCE
+            .into_iter()
+            .find_map(|kind| Some((kind, self.get(kind)?)))
     }
 }
 
@@ -396,19 +356,18 @@ impl ScopeDocuments {
         }
     }
 
-    fn raw(&self, section: &str, key: &str) -> [Option<&Value>; 4] {
-        [
-            self.user.value(section, key),
-            self.project
-                .as_ref()
-                .and_then(|document| document.value(section, key)),
-            self.local
-                .as_ref()
-                .and_then(|document| document.value(section, key)),
-            self.policy
-                .as_ref()
-                .and_then(|document| document.value(section, key)),
-        ]
+    /// 갈래 하나가 읽은 문서. user는 언제나 읽히고 나머지 셋은 대상이 없으면 비어 있다.
+    fn document(&self, kind: ClaudeSettingsScopeKind) -> Option<&ScopeDocument> {
+        match kind {
+            ClaudeSettingsScopeKind::User => Some(&self.user),
+            ClaudeSettingsScopeKind::Project => self.project.as_ref(),
+            ClaudeSettingsScopeKind::Local => self.local.as_ref(),
+            ClaudeSettingsScopeKind::Policy => self.policy.as_ref(),
+        }
+    }
+
+    fn raw(&self, section: &str, key: &str, kind: ClaudeSettingsScopeKind) -> Option<&Value> {
+        self.document(kind)?.value(section, key)
     }
 
     /// 네 갈래의 값을 같은 해석기로 읽는다. 해석하지 못한 값은 그 갈래가 비어 있는 것으로
@@ -419,13 +378,11 @@ impl ScopeDocuments {
         key: &str,
         parse: impl Fn(&Value) -> Option<T>,
     ) -> ClaudeScopeValues<T> {
-        let [user, project, local, policy] = self.raw(section, key);
-        ClaudeScopeValues {
-            user: user.and_then(&parse),
-            project: project.and_then(&parse),
-            local: local.and_then(&parse),
-            policy: policy.and_then(&parse),
+        let mut values = ClaudeScopeValues::empty();
+        for kind in ClaudeSettingsScopeKind::PRECEDENCE {
+            *values.slot_mut(kind) = self.raw(section, key, kind).and_then(&parse);
         }
+        values
     }
 
     /// 어느 갈래든 해석하지 못한 값이 있는지. 사용자가 손으로 고쳐야 하는 상태라
@@ -436,10 +393,56 @@ impl ScopeDocuments {
         key: &str,
         parse: impl Fn(&Value) -> Option<T>,
     ) -> bool {
-        self.raw(section, key)
+        ClaudeSettingsScopeKind::PRECEDENCE
             .into_iter()
-            .flatten()
+            .filter_map(|kind| self.raw(section, key, kind))
             .any(|value| parse(value).is_none())
+    }
+
+    /// 항목 하나의 갈래별 값과 우선순위 판정을 한 번에 읽는다. 값을 읽는 쪽과 이긴
+    /// 갈래를 고르는 쪽이 늘 붙어 다니므로 둘을 떼어 쓸 일이 없다.
+    fn resolve<T: Copy>(
+        &self,
+        section: &str,
+        key: &str,
+        parse: impl Fn(&Value) -> Option<T>,
+    ) -> ResolvedSetting<T> {
+        let values = self.values(section, key, parse);
+        ResolvedSetting {
+            winner: values.winner(),
+            values,
+        }
+    }
+}
+
+/// 항목 하나의 갈래별 값과 그중 이긴 갈래.
+///
+/// 플러그인과 스킬은 같은 우선순위로 이기고 같은 이유(정책 갈래가 값을 들고 있음)로
+/// 잠기지만, 그 밖에 무엇이 더 잠그는지만 다르다. 두 조립이 각자 `winner()`를 부르고
+/// `decided_by`를 만들고 `values.policy.is_some()`을 적고 있어 한쪽만 고치면 같은 설정이
+/// 항목 종류에 따라 다른 판정을 받는다. 공통분은 여기 두고, 갈래별 사정은 `locked`의
+/// 인자로만 얹는다.
+struct ResolvedSetting<T> {
+    values: ClaudeScopeValues<T>,
+    winner: Option<(ClaudeSettingsScopeKind, T)>,
+}
+
+impl<T: Copy> ResolvedSetting<T> {
+    /// 이긴 값. 어느 갈래에도 알아볼 수 있는 값이 없으면 `None`이고, 그때 기본값을
+    /// 무엇으로 볼지는 항목 종류가 정한다.
+    fn winner_value(&self) -> Option<T> {
+        self.winner.map(|(_, value)| value)
+    }
+
+    /// 어느 갈래가 값을 정했는지.
+    fn decided_by(&self) -> Option<ClaudeSettingsScopeKind> {
+        self.winner.map(|(scope, _)| scope)
+    }
+
+    /// 화면에서 잠글지. 정책 갈래는 사용자가 고칠 수 없으므로 언제나 잠그고,
+    /// `also`로 항목 종류별 사정(해석 불가한 값, 우리가 쓰지 않는 모양의 값)을 더한다.
+    fn locked(&self, also: bool) -> bool {
+        self.values.policy.is_some() || also
     }
 }
 
@@ -471,37 +474,7 @@ fn load_claude_settings_states_with_home(
 ) -> Result<ClaudeSettingsSnapshot, CoreError> {
     let documents = ScopeDocuments::read(home, project);
 
-    let mut plugins = claude_installed_plugins(home)
-        .into_iter()
-        .map(|installed| {
-            let values =
-                documents.values("enabledPlugins", &installed.plugin_id, plugin_setting_value);
-            let winner = values.winner();
-            let effective_enabled = winner
-                .map(|(_, value)| !value.is_disabled())
-                .unwrap_or(installed.default_enabled);
-            let locked =
-                values.policy.is_some() || winner.is_some_and(|(_, value)| value.is_custom());
-            ClaudePluginState {
-                plugin_id: installed.plugin_id,
-                name: installed.name,
-                marketplace: installed.marketplace,
-                version: installed.version,
-                install_path: installed.install_path.to_string_lossy().into_owned(),
-                skill_count: count_skill_directories(&installed.install_path.join("skills")),
-                default_enabled: installed.default_enabled,
-                values,
-                effective_enabled,
-                decided_by: winner.map(|(scope, _)| scope),
-                locked,
-            }
-        })
-        .collect::<Vec<_>>();
-    plugins.sort_by(|left, right| {
-        left.name
-            .cmp(&right.name)
-            .then_with(|| left.plugin_id.cmp(&right.plugin_id))
-    });
+    let plugins = plugin_states(home, &documents);
 
     let mut skills = Vec::new();
     scan_skill_overrides(
@@ -544,27 +517,25 @@ fn set_claude_plugin_enabled_with_home(
     project: Option<&Path>,
     request: &SetClaudePluginEnabledRequest,
 ) -> Result<ClaudeSettingsSnapshot, CoreError> {
-    let _guard = store_lock::acquire(app_data_dir, SETTINGS_LOCK_FILE, "Claude 설정")?;
-    let before = load_claude_settings_states_with_home(home, project)?;
-    if !before
-        .plugins
-        .iter()
-        .any(|plugin| plugin.plugin_id == request.plugin_id)
-    {
-        return Err(CoreError::NotFound(
-            "설치된 Claude Code 플러그인을 찾을 수 없습니다".to_owned(),
-        ));
-    }
-    let target = write_target(home, project, request.scope)?;
-    mutate_settings_entry(
+    apply_settings_entry(
         app_data_dir,
-        &target,
-        "enabledPlugins",
-        &request.plugin_id,
-        request.enabled.map(Value::Bool),
-        |current| current.is_boolean(),
-    )?;
-    load_claude_settings_states_with_home(home, project)
+        home,
+        project,
+        request.scope,
+        SettingsEntryWrite {
+            section: "enabledPlugins",
+            key: &request.plugin_id,
+            next: request.enabled.map(Value::Bool),
+            installed: &|before| {
+                before
+                    .plugins
+                    .iter()
+                    .any(|plugin| plugin.plugin_id == request.plugin_id)
+            },
+            missing_message: "설치된 Claude Code 플러그인을 찾을 수 없습니다",
+            editable_current: Value::is_boolean,
+        },
+    )
 }
 
 fn set_claude_skill_override_with_home(
@@ -573,36 +544,104 @@ fn set_claude_skill_override_with_home(
     project: Option<&Path>,
     request: &SetClaudeSkillOverrideRequest,
 ) -> Result<ClaudeSettingsSnapshot, CoreError> {
+    apply_settings_entry(
+        app_data_dir,
+        home,
+        project,
+        request.scope,
+        SettingsEntryWrite {
+            section: "skillOverrides",
+            key: &request.override_key,
+            // `as_str`은 이 enum의 serde 표기(kebab-case)와 같은 값을 주고 왕복 테스트가
+            // 그 일치를 지킨다. 직렬화 왕복으로 문자열을 얻던 두 단계의 `expect`를 지운다.
+            next: request
+                .value
+                .map(|value| Value::String(value.as_str().to_owned())),
+            installed: &|before| {
+                before
+                    .skills
+                    .iter()
+                    .any(|skill| skill.override_key == request.override_key)
+            },
+            missing_message: "설치된 Claude Code 스킬을 찾을 수 없습니다",
+            editable_current: |current| skill_override_value(current).is_some(),
+        },
+    )
+}
+
+/// 설정 항목 하나를 쓰는 요청에서 플러그인·스킬이 갈리는 부분만 담는다.
+struct SettingsEntryWrite<'a> {
+    /// 항목이 사는 설정 섹션 이름.
+    section: &'a str,
+    /// 섹션 안 항목 키.
+    key: &'a str,
+    /// 쓸 값. `None`이면 항목을 지운다.
+    next: Option<Value>,
+    /// 인벤토리에 이 항목이 있는지. 설치되지 않은 항목은 쓰기 전에 끊는다.
+    installed: &'a dyn Fn(&ClaudeSettingsSnapshot) -> bool,
+    /// 설치돼 있지 않을 때 낼 오류 메시지.
+    missing_message: &'a str,
+    /// 대상 파일에 이미 있는 값을 우리가 덮어써도 되는 모양인지.
+    editable_current: fn(&Value) -> bool,
+}
+
+/// 설정 항목 쓰기의 공통 골격. 설정 락을 잡고 인벤토리에 있는 항목인지 확인한 뒤 허용된
+/// 대상 파일의 항목 하나만 고치고, 쓰기 후 상태를 다시 읽어 돌려준다. 락 안에서 읽고
+/// 쓰고 다시 읽는 순서가 두 쓰기 경로에서 어긋나지 않게 한 곳에 둔다.
+fn apply_settings_entry(
+    app_data_dir: &Path,
+    home: &Path,
+    project: Option<&Path>,
+    scope: ClaudeSettingsWriteScope,
+    write: SettingsEntryWrite<'_>,
+) -> Result<ClaudeSettingsSnapshot, CoreError> {
     let _guard = store_lock::acquire(app_data_dir, SETTINGS_LOCK_FILE, "Claude 설정")?;
     let before = load_claude_settings_states_with_home(home, project)?;
-    if !before
-        .skills
-        .iter()
-        .any(|skill| skill.override_key == request.override_key)
-    {
-        return Err(CoreError::NotFound(
-            "설치된 Claude Code 스킬을 찾을 수 없습니다".to_owned(),
-        ));
+    if !(write.installed)(&before) {
+        return Err(CoreError::NotFound(write.missing_message.to_owned()));
     }
-    let target = write_target(home, project, request.scope)?;
+    let target = write_target(home, project, scope)?;
     mutate_settings_entry(
         app_data_dir,
         &target,
-        "skillOverrides",
-        &request.override_key,
-        request.value.map(|value| {
-            Value::String(
-                serde_json::to_value(value)
-                    .expect("skill override enum serializes")
-                    .as_str()
-                    .expect("skill override is a string")
-                    .to_owned(),
-            )
-        }),
-        |current| skill_override_value(current).is_some(),
+        write.section,
+        write.key,
+        write.next,
+        write.editable_current,
     )?;
     load_claude_settings_states_with_home(home, project)
 }
+
+/// Claude 설정 파일을 손댈 때 쓰는 판정표. 판정과 쓰기 순서 자체는
+/// `provider_settings_file`이 소유하고, 여기에는 어느 공급자의 설정인지 알리는 문구만 둔다.
+const CLAUDE_GUARD: SettingsFileGuard = SettingsFileGuard {
+    read: SettingsPathRules {
+        symlink: "심볼릭 링크 설정 파일은 읽지 않습니다",
+        wrong_kind: "설정 경로가 일반 파일이 아닙니다",
+        directory: false,
+    },
+    write: SettingsPathRules {
+        symlink: "Claude 설정 파일이 심볼릭 링크라 수정하지 않습니다",
+        wrong_kind: "Claude 설정 경로가 일반 파일이 아닙니다",
+        directory: false,
+    },
+    parent: SettingsPathRules {
+        symlink: "Claude 설정 폴더가 심볼릭 링크라 수정하지 않습니다",
+        wrong_kind: "Claude 설정 상위 경로가 폴더가 아닙니다",
+        directory: true,
+    },
+    grandparent: SettingsPathRules {
+        symlink: "Claude 설정 폴더의 상위 경로가 안전한 폴더가 아닙니다",
+        wrong_kind: "Claude 설정 폴더의 상위 경로가 안전한 폴더가 아닙니다",
+        directory: true,
+    },
+    missing_parent: "Claude 설정 상위 경로가 없습니다",
+    missing_grandparent: "Claude 설정 폴더의 상위 경로가 없습니다",
+    fallback_file_name: "settings.json",
+};
+
+/// Claude 설정 백업이 쌓이는 앱 데이터 저장소 이름.
+const BACKUP_STORE: &str = "claude-settings-backups";
 
 fn read_scope_document(path: &Path) -> ScopeDocument {
     let path_text = path.to_string_lossy().into_owned();
@@ -622,19 +661,8 @@ fn read_scope_document(path: &Path) -> ScopeDocument {
             return invalid_scope(path_text, false, error.to_string());
         }
     };
-    if metadata.file_type().is_symlink() {
-        return invalid_scope(
-            path_text,
-            true,
-            "심볼릭 링크 설정 파일은 읽지 않습니다".to_owned(),
-        );
-    }
-    if !metadata.is_file() {
-        return invalid_scope(
-            path_text,
-            true,
-            "설정 경로가 일반 파일이 아닙니다".to_owned(),
-        );
+    if let Err(message) = CLAUDE_GUARD.read.check(&metadata) {
+        return invalid_scope(path_text, true, message.to_owned());
     }
     if metadata.len() > MAX_SETTINGS_BYTES {
         return invalid_scope(
@@ -691,6 +719,47 @@ fn skill_override_value(value: &Value) -> Option<SkillOverrideValue> {
     value.as_str()?.parse().ok()
 }
 
+/// 설치된 마켓플레이스 플러그인의 설정 상태. 스킬 쪽 `scan_skill_overrides`와 짝이며,
+/// 이름·플러그인 id 순으로 고정해 화면이 조회마다 순서를 바꾸지 않게 한다.
+fn plugin_states(home: &Path, documents: &ScopeDocuments) -> Vec<ClaudePluginState> {
+    let mut plugins = claude_installed_plugins(home)
+        .into_iter()
+        .map(|installed| {
+            let setting =
+                documents.resolve("enabledPlugins", &installed.plugin_id, plugin_setting_value);
+            // 우리가 쓰지 않는 모양(배열·객체·문자열)으로 적힌 값은 사용자가 손으로 넣은
+            // 설정이다. 켜진 것으로 보되 덮어쓰지 않도록 잠근다.
+            let locked = setting.locked(
+                setting
+                    .winner_value()
+                    .is_some_and(ClaudePluginSettingValue::is_custom),
+            );
+            ClaudePluginState {
+                plugin_id: installed.plugin_id,
+                name: installed.name,
+                marketplace: installed.marketplace,
+                version: installed.version,
+                install_path: installed.install_path.to_string_lossy().into_owned(),
+                skill_count: count_skill_directories(&installed.install_path.join("skills")),
+                default_enabled: installed.default_enabled,
+                effective_enabled: setting
+                    .winner_value()
+                    .map(|value| !value.is_disabled())
+                    .unwrap_or(installed.default_enabled),
+                decided_by: setting.decided_by(),
+                locked,
+                values: setting.values,
+            }
+        })
+        .collect::<Vec<_>>();
+    plugins.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+    });
+    plugins
+}
+
 fn scan_skill_overrides(
     parent: &Path,
     scope: &str,
@@ -713,24 +782,22 @@ fn scan_skill_overrides(
         if name.trim().is_empty() || !seen.insert(directory.clone()) {
             continue;
         }
-        let values = documents.values("skillOverrides", &name, skill_override_value);
-        let winner = values.winner();
-        let invalid_winner =
-            documents.has_unreadable("skillOverrides", &name, skill_override_value);
+        let setting = documents.resolve("skillOverrides", &name, skill_override_value);
+        // 해석하지 못한 값이 한 갈래라도 있으면 사용자가 손으로 고쳐야 한다.
+        let locked =
+            setting.locked(documents.has_unreadable("skillOverrides", &name, skill_override_value));
         output.push(ClaudeSkillOverrideState {
             override_key: name.clone(),
             name,
             directory: directory.to_string_lossy().into_owned(),
             scope: scope.to_owned(),
             project_path: project_path.clone(),
-            effective: winner
-                .map(|(_, value)| value)
-                .unwrap_or(SkillOverrideValue::On),
-            decided_by: winner.map(|(scope, _)| scope),
-            locked: values.policy.is_some() || invalid_winner,
+            effective: setting.winner_value().unwrap_or(SkillOverrideValue::On),
+            decided_by: setting.decided_by(),
+            locked,
             disable_model_invocation: frontmatter_value(frontmatter, "disable-model-invocation")
                 .is_some_and(|value| value.eq_ignore_ascii_case("true")),
-            values,
+            values: setting.values,
         });
     }
 }
@@ -772,7 +839,7 @@ fn mutate_settings_entry(
             "설정 키가 올바르지 않습니다".to_owned(),
         ));
     }
-    ensure_settings_parent(target)?;
+    CLAUDE_GUARD.ensure_parent(target)?;
     let document = read_scope_document(target);
     if let Some(error) = document.status.parse_error {
         return Err(CoreError::InvalidInput(format!(
@@ -813,123 +880,9 @@ fn mutate_settings_entry(
     bytes.push(b'\n');
     if document.status.exists {
         let original = fs::read(target)?;
-        save_backup(app_data_dir, target, &original)?;
+        save_backup(app_data_dir, BACKUP_STORE, "json", target, &original)?;
     }
-    atomic_write_provider_settings(target, &bytes)
-}
-
-fn ensure_settings_parent(target: &Path) -> Result<(), CoreError> {
-    let parent = target
-        .parent()
-        .ok_or_else(|| CoreError::InvalidInput("Claude 설정 상위 경로가 없습니다".to_owned()))?;
-    match fs::symlink_metadata(parent) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(CoreError::InvalidInput(
-            "Claude 설정 폴더가 심볼릭 링크라 수정하지 않습니다".to_owned(),
-        )),
-        Ok(metadata) if metadata.is_dir() => Ok(()),
-        Ok(_) => Err(CoreError::InvalidInput(
-            "Claude 설정 상위 경로가 폴더가 아닙니다".to_owned(),
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let grandparent = parent.parent().ok_or_else(|| {
-                CoreError::InvalidInput("Claude 설정 폴더의 상위 경로가 없습니다".to_owned())
-            })?;
-            let metadata = fs::symlink_metadata(grandparent)?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(CoreError::InvalidInput(
-                    "Claude 설정 폴더의 상위 경로가 안전한 폴더가 아닙니다".to_owned(),
-                ));
-            }
-            fs::create_dir(parent)?;
-            #[cfg(unix)]
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-            Ok(())
-        }
-        Err(error) => Err(CoreError::Io(error)),
-    }
-}
-
-fn atomic_write_provider_settings(target: &Path, bytes: &[u8]) -> Result<(), CoreError> {
-    let parent = target
-        .parent()
-        .ok_or_else(|| CoreError::InvalidInput("Claude 설정 상위 경로가 없습니다".to_owned()))?;
-    let existing_mode = match fs::symlink_metadata(target) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(CoreError::InvalidInput(
-                "Claude 설정 파일이 심볼릭 링크라 수정하지 않습니다".to_owned(),
-            ));
-        }
-        Ok(metadata) if metadata.is_file() => {
-            #[cfg(unix)]
-            {
-                metadata.permissions().mode() & 0o777
-            }
-            #[cfg(not(unix))]
-            {
-                0
-            }
-        }
-        Ok(_) => {
-            return Err(CoreError::InvalidInput(
-                "Claude 설정 경로가 일반 파일이 아닙니다".to_owned(),
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0o600,
-        Err(error) => return Err(CoreError::Io(error)),
-    };
-    let file_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("settings.json");
-    let temporary = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
-    let result = (|| -> Result<(), CoreError> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(existing_mode);
-        let mut file = options.open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        replace_file(&temporary, target)?;
-        sync_dir(parent)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn save_backup(app_data_dir: &Path, target: &Path, bytes: &[u8]) -> Result<(), CoreError> {
-    let key = stable_path_key(target);
-    let directory = app_data_dir.join("claude-settings-backups").join(key);
-    fs::create_dir_all(&directory)?;
-    #[cfg(unix)]
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-    let timestamp = now_ms();
-    let path = directory.join(format!("{timestamp}-{}.json", Uuid::new_v4()));
-    write_private_bytes(&path, bytes)?;
-
-    let mut backups = fs::read_dir(&directory)?
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    backups.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
-    for stale in backups.into_iter().skip(BACKUP_LIMIT) {
-        let _ = fs::remove_file(stale);
-    }
-    Ok(())
-}
-
-fn stable_path_key(path: &Path) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in path.to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    CLAUDE_GUARD.atomic_write(target, &bytes)
 }
 
 fn policy_settings_path() -> Option<PathBuf> {
@@ -954,6 +907,9 @@ fn policy_settings_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_settings_file::BACKUP_LIMIT;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let root = tempfile::tempdir().expect("fixture");

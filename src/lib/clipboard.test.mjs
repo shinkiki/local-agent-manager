@@ -21,13 +21,29 @@ function createMockElement() {
   };
 }
 
-async function withMockDom({ writeText, execCommandResult = true } = {}, run) {
-  const originalNavDesc = Object.getOwnPropertyDescriptor(globalThis, "navigator");
-  const originalDocDesc = Object.getOwnPropertyDescriptor(globalThis, "document");
-  const originalHtmlElement = globalThis.HTMLElement;
+/**
+ * 전역 하나를 이 테스트 동안만 갈아 끼우고, 끝나면 원래대로 되돌리는 함수를 돌려준다.
+ *
+ * `navigator`·`document`·`HTMLElement`가 저마다 "원래 값을 기억하고, 끼우고, 되돌린다"를
+ * 조금씩 다른 모양으로 들고 있었다 — 앞의 둘은 속성 기술자로, `HTMLElement`는 값 대입으로.
+ * 그래서 갈아 끼울 전역을 하나 더할 때마다 되돌리는 쪽을 손으로 다시 적어야 했고, 한쪽만
+ * 적으면 그 전역이 다음 테스트 파일까지 그대로 새어 나간다. 원래 없던 전역은 되돌릴 때 값을
+ * 덮어쓰는 것이 아니라 지워야 하므로 값이 아니라 속성 기술자를 기억한다.
+ */
+function stubGlobal(name, value) {
+  const original = Object.getOwnPropertyDescriptor(globalThis, name);
+  Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+  return () => {
+    if (original) {
+      Object.defineProperty(globalThis, name, original);
+    } else {
+      delete globalThis[name];
+    }
+  };
+}
 
+async function withMockDom({ writeText, execCommandResult = true } = {}, run) {
   class MockHTMLElement {}
-  globalThis.HTMLElement = MockHTMLElement;
 
   let createdInput = null;
   let activeElementFocused = false;
@@ -63,17 +79,11 @@ async function withMockDom({ writeText, execCommandResult = true } = {}, run) {
 
   const navigatorMock = writeText !== undefined ? { clipboard: { writeText } } : {};
 
-  Object.defineProperty(globalThis, "navigator", {
-    value: navigatorMock,
-    configurable: true,
-    writable: true,
-  });
-
-  Object.defineProperty(globalThis, "document", {
-    value: documentMock,
-    configurable: true,
-    writable: true,
-  });
+  const restores = [
+    stubGlobal("HTMLElement", MockHTMLElement),
+    stubGlobal("navigator", navigatorMock),
+    stubGlobal("document", documentMock),
+  ];
 
   try {
     return await run({
@@ -81,17 +91,7 @@ async function withMockDom({ writeText, execCommandResult = true } = {}, run) {
       getCreatedInput: () => createdInput,
     });
   } finally {
-    if (originalNavDesc) {
-      Object.defineProperty(globalThis, "navigator", originalNavDesc);
-    } else {
-      delete globalThis.navigator;
-    }
-    if (originalDocDesc) {
-      Object.defineProperty(globalThis, "document", originalDocDesc);
-    } else {
-      delete globalThis.document;
-    }
-    globalThis.HTMLElement = originalHtmlElement;
+    for (const restore of restores.reverse()) restore();
   }
 }
 
@@ -158,6 +158,27 @@ test("writeClipboardText rethrows writeText error when fallback also fails", asy
         async () => writeClipboardText("failed text"),
         (err) => err === originalError,
       );
+    },
+  );
+});
+
+test("writeClipboardText keeps a null writeText rejection distinct from an unavailable API", async () => {
+  await withMockDom(
+    {
+      writeText: async () => {
+        throw null;
+      },
+      execCommandResult: false,
+    },
+    async () => {
+      let rejected = false;
+      try {
+        await writeClipboardText("null rejection");
+      } catch (cause) {
+        rejected = true;
+        assert.equal(cause, null);
+      }
+      assert.equal(rejected, true);
     },
   );
 });
