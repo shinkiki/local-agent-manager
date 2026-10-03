@@ -23,7 +23,7 @@ same-file = "1"
 # Windows `fs::canonicalize`가 돌려주는 `\\?\` 확장 경로를 자식 프로세스(Cypress·Node)에 넘기기
 # 전에 벗긴다. 접두어를 안전하게 뗄 수 있을 때만 떼고, 다른 플랫폼에서는 그대로다.
 dunce = "1"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 # C10. 데이터베이스 기본도구의 내장 드라이버. 둘 다 순수 Rust 동기 클라이언트라 사용자
 # 기기에 클라이언트를 설치하지 않아도 되고, Core의 동기 호출 경로에 그대로 맞는다.
 mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
@@ -43,7 +43,7 @@ futures-util = "0.3"
 flate2 = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
-hyper-tungstenite = "0.20"
+hyper-tungstenite = "0.30"
 hyper-util = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "rustls"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
