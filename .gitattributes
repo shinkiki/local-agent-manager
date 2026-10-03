@@ -7,6 +7,7 @@
 # 검증(C5-7의 `markdownLinkCases.json`)도 한쪽만 줄바꿈이 달라진다.
 #
 # 저장소에는 이미 LF로 들어 있으므로 여기서 바뀌는 것은 작업 트리뿐이다.
+crates/agent-manager-core/src/*.md     text eol=lf
 crates/agent-manager-core/skills/**    text eol=lf
 crates/agent-manager-core/assets/**    text eol=lf
 src/lib/markdownLinkCases.json         text eol=lf

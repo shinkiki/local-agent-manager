@@ -71,3 +71,9 @@ test("되짚기 표는 한 표 안의 같은 영어에서 뒤 항목을 고른�
   assert.equal(staticUiEnglish("대화 내역"), "Conversation");
   assert.equal(staticUiKoreanByEnglish.get("Conversation"), "대화");
 });
+
+/** 되짚은 원문을 다시 옮기면 같은 영어가 나와야 한다 — "Reasoning"이 "Reasoning level"로 바뀌지 않는다. */
+test("되짚기 표는 다시 옮겨도 같은 영어가 나오는 원문을 고른다", () => {
+  assert.equal(staticUiEnglish(staticUiKoreanByEnglish.get("Reasoning")), "Reasoning");
+  assert.equal(staticUiEnglish(staticUiKoreanByEnglish.get("Conversation")), "Conversation");
+});

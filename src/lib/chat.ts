@@ -56,6 +56,11 @@ export interface ChatConnection {
   detach(): Promise<void>;
 }
 
+/** 공급자가 공식 fork를 제공하는지. 백엔드 `validate_fork_request`와 같은 목록이다. */
+export function supportsSessionFork(source: ProviderId): boolean {
+  return source === "codex" || source === "claude";
+}
+
 export async function connectChat(
   request: ChatStartRequest,
   onEvent: (event: ChatEvent) => void,

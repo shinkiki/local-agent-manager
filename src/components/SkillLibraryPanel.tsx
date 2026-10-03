@@ -23,7 +23,7 @@ import {
   unarchiveSharedSkill,
   updateCommonSkill,
 } from "../lib/ipc";
-import { formatDate } from "../lib/format";
+import { formatDate, formatDateTime } from "../lib/format";
 import { useI18n, type UiText } from "../lib/i18n";
 import { useMenuTranslations } from "../lib/translations";
 import { errorText } from "../lib/errorText";
@@ -2723,7 +2723,7 @@ function SkillAiaEditCard({ directory, onRequestAiaPrompt }: {
     <div className="skill-editor-aia">
       <p className="prose-copy">{text(
         "원문이 다른 언어라 직접 고치기 어렵다면, 한국어로 수정 내용을 적어 AIA에게 맡기세요. 원문 언어와 문체를 유지하며 수정합니다.",
-        "If the source language is hard to edit directly, describe the change in Korean and delegate it to AIA. It edits while keeping the original language and style.",
+        "If the source language is hard to edit directly, describe the change in your own language and delegate it to AIA. It edits while keeping the original language and style.",
       )}</p>
       <textarea
         value={instruction}
@@ -2890,7 +2890,7 @@ function SkillTrashDrawer({
                 <strong>{item.key}</strong>
                 <span className="scope-pill">{describeLocation(item)}</span>
                 {item.kind === "link" && <span className="scope-pill">{text("링크", "link")}</span>}
-                <small>{new Date(item.deletedAtMs).toLocaleString()}</small>
+                <small>{formatDateTime(item.deletedAtMs)}</small>
               </TrashRow>
             ))}
           </div>

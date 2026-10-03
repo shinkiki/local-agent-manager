@@ -3,11 +3,12 @@
  *
  * 사용자는 목표만 적는다. "설계 시작"을 누르면 AIA 가 회차 설계 스킬(round-designer)을 따라
  * 스킬·스크립트·시험·워크플로 계약·반복 요청을 만들고, 등록은 승인 카드로 끝난다. 그 뒤 회차가
- * 남긴 구조화된 보고가 아래 이력에 쌓이고, 사람이 정할 것은 "결정 대기"로 올라온다.
+ * 남긴 구조화된 보고와 사람이 정할 것은 목표 카드의 "회차 상세" 모달(RoundReportsModal)에서
+ * 읽고 답한다. 카드에는 "결정 대기 N" 배지만 올라와 어느 목표를 열어야 하는지 알린다.
  *
  * 스크립트를 여기서 돌리지 않는다. 회차는 워크플로가 띄운 에이전트 채팅이 돈다.
  */
-import { LoaderCircle, Play, Plus, Target, Trash2 } from "lucide-react";
+import { FileText, LoaderCircle, Play, Plus, Target, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { useI18n } from "../lib/i18n";
@@ -16,11 +17,11 @@ import {
   deleteRoundGoal,
   getRoundGoals,
   listRoundReports,
-  resolveRoundDecision,
   updateRoundGoal,
 } from "../lib/ipc";
 import { roundDesignPrompt } from "../lib/roundDesign";
 import type { RoundGoal, RoundGoalInput, RoundGoalStatus, RoundReport } from "../types";
+import { pendingDecisionCount, RoundReportsModal } from "./RoundReportsModal";
 import { ErrorBanner, useConfirm } from "./Shared";
 
 function errorMessage(error: unknown): string {
@@ -43,24 +44,18 @@ function statusLabel(text: Text, status: RoundGoalStatus): string {
   }
 }
 
-function outcomeLabel(text: Text, outcome: RoundReport["outcome"]): string {
-  switch (outcome) {
-    case "pass": return text("통과", "Pass");
-    case "partial": return text("부분", "Partial");
-    case "fail": return text("실패", "Fail");
-  }
-}
-
-export function RoundGoalsPanel({ onRequestAiaPrompt }: { onRequestAiaPrompt?: (prompt: string) => void }) {
+export function RoundGoalsPanel({ onRequestAiaPrompt, refreshNonce = 0 }: { onRequestAiaPrompt?: (prompt: string) => void; refreshNonce?: number }) {
   const { text } = useI18n();
   const { confirm, confirmDialog } = useConfirm();
   const [goals, setGoals] = useState<RoundGoal[] | null>(null);
   const [reports, setReports] = useState<RoundReport[]>([]);
   const [draft, setDraft] = useState<RoundGoalInput | null>(null);
-  const [selectedGoal, setSelectedGoal] = useState<string>("");
-  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [detailGoal, setDetailGoal] = useState<RoundGoal | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 목표 상태를 바꿀 때 반복 요청도 함께 멈추거나 되살린다. 말하지 않으면 사용자는 목표만
+  // 바뀐 줄 알고, 멈춘 줄 알면서 사용량이 계속 나가던 예전과 같은 자리에 선다.
+  const [notice, setNotice] = useState<string | null>(null);
 
   const load = useCallback(() => {
     setBusy(true);
@@ -70,7 +65,10 @@ export function RoundGoalsPanel({ onRequestAiaPrompt }: { onRequestAiaPrompt?: (
       .finally(() => setBusy(false));
   }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  // 목표 상태는 이 화면 밖(회차·AIA·다른 기기)에서도 바뀐다. 마운트 때 한 번만 읽던 동안은
+  // 앱을 껐다 켜야 반영됐는데, 끄면 페이싱과 세션이 함께 끊긴다. 로고 새로고침이 올려 주는
+  // 나수를 같이 보고 다시 읽는다.
+  useEffect(() => { void load(); }, [load, refreshNonce]);
 
   const save = useCallback(() => {
     if (!draft) return;
@@ -85,8 +83,17 @@ export function RoundGoalsPanel({ onRequestAiaPrompt }: { onRequestAiaPrompt?: (
   const setStatus = useCallback((goal: RoundGoal, status: RoundGoalStatus) => {
     setBusy(true);
     setError(null);
+    setNotice(null);
     updateRoundGoal(goal.id, { status })
-      .then(() => load())
+      .then((updated) => {
+        const changed = updated.scheduleChanged;
+        if (changed) {
+          setNotice(changed.enabled
+            ? text("반복 요청도 함께 다시 켰습니다.", "The recurring request was resumed too.")
+            : text("반복 요청도 함께 멈췄습니다.", "The recurring request was paused too."));
+        }
+        return load();
+      })
       .catch((cause) => setError(errorMessage(cause)))
       .finally(() => setBusy(false));
   }, [load]);
@@ -115,26 +122,15 @@ export function RoundGoalsPanel({ onRequestAiaPrompt }: { onRequestAiaPrompt?: (
     if (goal.status === "draft") setStatus(goal, "designing");
   }, [onRequestAiaPrompt, setStatus]);
 
-  const answer = useCallback((report: RoundReport, index: number, value: string) => {
-    const trimmed = value.trim();
-    if (!trimmed) return;
-    setBusy(true);
-    setError(null);
-    resolveRoundDecision(report.id, index, trimmed)
-      .then(() => load())
-      .catch((cause) => setError(errorMessage(cause)))
-      .finally(() => setBusy(false));
-  }, [load]);
-
-  const visibleReports = useMemo(
-    () => (selectedGoal ? reports.filter((report) => report.goalId === selectedGoal) : reports),
-    [reports, selectedGoal],
-  );
-  const pending = useMemo(
-    () => reports.flatMap((report) => report.decisions.map((decision, index) => ({ report, decision, index })).filter((item) => !item.decision.resolved)),
-    [reports],
-  );
-  const goalTitle = (id: string | null | undefined) => goals?.find((goal) => goal.id === id)?.title ?? null;
+  // 카드 배지용. 보고 목록은 모달이 목표별로 따로 조회하므로 여기서는 미결 개수만 센다.
+  const pendingByGoal = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const report of reports) {
+      if (!report.goalId) continue;
+      counts[report.goalId] = (counts[report.goalId] ?? 0) + pendingDecisionCount(report);
+    }
+    return counts;
+  }, [reports]);
 
   return (
     // 자동화 탭의 형제(AIA 선제 제안)와 같은 카드 틀을 쓴다. settings-subsection은 카드
@@ -152,37 +148,13 @@ export function RoundGoalsPanel({ onRequestAiaPrompt }: { onRequestAiaPrompt?: (
           {busy && <LoaderCircle className="spin" size={14} />}
         </div>
         <p>{text(
-          "목표만 적으면 AIA 가 회차 설계 스킬을 따라 스킬·스크립트·시험·워크플로·반복 요청을 만들고, 등록은 승인 카드로 끝납니다. 회차가 남긴 보고와 사람이 정할 것이 아래에 쌓입니다.",
-          "Write the goal; AIA follows the round-designer skill to create the skill, scripts, tests, workflow, and recurring request, and registration ends with approval cards. Round reports and decisions for you accumulate below.",
+          "목표만 적으면 AIA 가 회차 설계 스킬을 따라 스킬·스크립트·시험·워크플로·반복 요청을 만들고, 등록은 승인 카드로 끝납니다. 회차가 남긴 보고와 사람이 정할 것은 각 목표의 회차 상세에서 읽고 결정합니다.",
+          "Write the goal; AIA follows the round-designer skill to create the skill, scripts, tests, workflow, and recurring request, and registration ends with approval cards. Read each goal's round reports and answer its decisions in its round detail.",
         )}</p>
       </header>
       <div className="settings-subsection">
         {error && <ErrorBanner message={error} />}
-        {pending.length > 0 && (
-          <div className="detail-card" data-ui-anchor="addons.round-goals.pending">
-            <strong>{text(`결정 대기 ${pending.length}건`, `${pending.length} decision(s) waiting`)}</strong>
-            {pending.map(({ report, decision, index }) => {
-              const key = `${report.id}:${index}`;
-              return (
-                <div className="form-row" key={key}>
-                  <label>{goalTitle(report.goalId) ?? report.title}</label>
-                  <div>
-                    <p>{decision.question}</p>
-                    <div className="path-field-group">
-                      {decision.options.map((option) => (
-                        <button key={option} className={`button compact${decision.recommendation === option ? " primary" : ""}`} type="button" disabled={busy} onClick={() => answer(report, index, option)}>
-                          {option}{decision.recommendation === option ? ` (${text("추천", "recommended")})` : ""}
-                        </button>
-                      ))}
-                      <input type="text" value={answers[key] ?? ""} placeholder={text("직접 적기", "Write your own")} disabled={busy} onChange={(event) => setAnswers((current) => ({ ...current, [key]: event.target.value }))} />
-                      <button className="button compact" type="button" disabled={busy || !(answers[key] ?? "").trim()} onClick={() => answer(report, index, answers[key] ?? "")}>{text("적기", "Answer")}</button>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
+        {notice && <p className="account-action-notice" role="status">{notice}</p>}
         {goals !== null && goals.length === 0 && (
           <div className="plugin-empty-state">
             <i><Target size={25} /></i>
@@ -204,6 +176,7 @@ export function RoundGoalsPanel({ onRequestAiaPrompt }: { onRequestAiaPrompt?: (
                   <span className={goal.status === "active" ? "health ready" : "health warning"}>{statusLabel(text, goal.status)}</span>
                   {goal.skillKey && <span className="db-badge">{text("스킬", "Skill")} {goal.skillKey}</span>}
                   {goal.scheduleId && <span className="db-badge">{text("반복 요청", "Recurring")}</span>}
+                  {(pendingByGoal[goal.id] ?? 0) > 0 && <span className="db-badge round-goal-pending">{text(`결정 대기 ${pendingByGoal[goal.id]}`, `${pendingByGoal[goal.id]} pending`)}</span>}
                 </div>
                 <p>{goal.goal}</p>
                 <small className="db-connection-meta">
@@ -219,10 +192,13 @@ export function RoundGoalsPanel({ onRequestAiaPrompt }: { onRequestAiaPrompt?: (
                     </button>
                   )}
                   {goal.status === "active" && <button className="button compact" type="button" disabled={busy} onClick={() => setStatus(goal, "paused")}>{text("일시정지", "Pause")}</button>}
-                  {goal.status === "paused" && <button className="button compact" type="button" disabled={busy} onClick={() => setStatus(goal, "active")}>{text("다시 진행", "Resume")}</button>}
+                  {/* `done` 에서도 되돌릴 수 있어야 한다. 끝냄은 되돌릴 수 없는 전이가 아니다 —
+                      2차 범위가 붙으면 같은 목표를 다시 연다. 이 조건에 done 이 빠져 있던 동안
+                      완료된 목표는 화면에서 버튼이 하나도 뜨지 않아 빠져나올 길이 없었다. */}
+                  {(goal.status === "paused" || goal.status === "done") && <button className="button compact" type="button" disabled={busy} onClick={() => setStatus(goal, "active")}>{text("다시 진행", "Resume")}</button>}
                   {goal.status !== "done" && <button className="button compact" type="button" disabled={busy} onClick={() => setStatus(goal, "done")}>{text("끝냄", "Mark done")}</button>}
-                  <button className="button compact" type="button" disabled={busy} onClick={() => setSelectedGoal((current) => (current === goal.id ? "" : goal.id))}>
-                    {selectedGoal === goal.id ? text("전체 보고", "All reports") : text("이 목표 보고", "Reports")}
+                  <button className="button compact" type="button" disabled={busy} onClick={() => setDetailGoal(goal)}>
+                    <FileText size={13} />{text("회차 상세", "Round detail")}{(pendingByGoal[goal.id] ?? 0) > 0 ? ` (${pendingByGoal[goal.id]})` : ""}
                   </button>
                   <button className="button compact danger" type="button" disabled={busy} onClick={() => remove(goal)}><Trash2 size={13} />{text("지우기", "Delete")}</button>
                 </div>
@@ -276,42 +252,8 @@ export function RoundGoalsPanel({ onRequestAiaPrompt }: { onRequestAiaPrompt?: (
             </div>
           </div>
         )}
-        <div className="detail-card" data-ui-anchor="addons.round-goals.reports">
-          <strong>{selectedGoal ? text(`회차 보고 — ${goalTitle(selectedGoal) ?? ""}`, `Round reports — ${goalTitle(selectedGoal) ?? ""}`) : text("회차 보고", "Round reports")}</strong>
-          {visibleReports.length === 0 && <p className="round-report-empty">{text("아직 보고가 없습니다.", "No reports yet.")}</p>}
-          {visibleReports.map((report) => {
-            return (
-              <article className="db-connection-row" key={report.id} data-round-id={report.id}>
-                <div className="db-connection-head">
-                  <strong>{report.title}</strong>
-                  <span className={report.outcome === "pass" ? "health ready" : "health warning"}>{outcomeLabel(text, report.outcome)}</span>
-                  <span className="db-badge">{new Date(report.recordedAt).toLocaleString()}</span>
-                  {goalTitle(report.goalId) && <span className="db-badge">{goalTitle(report.goalId)}</span>}
-                </div>
-                {report.summary && <p>{report.summary}</p>}
-                {report.measures.length > 0 && (
-                  <table className="round-report-table">
-                    <thead><tr><th>{text("측정", "Measure")}</th><th>{text("전", "Before")}</th><th>{text("후", "After")}</th></tr></thead>
-                    <tbody>{report.measures.map((measure) => <tr key={measure.label}><td>{measure.label}</td><td>{measure.before}</td><td>{measure.after}</td></tr>)}</tbody>
-                  </table>
-                )}
-                {report.failureKinds.length > 0 && (
-                  <small className="db-connection-meta">
-                    {text("실패 종류", "Failure kinds")}: {report.failureKinds.map((kind) => `${kind.kind} ${kind.before}→${kind.after}`).join(" · ")}
-                  </small>
-                )}
-                {report.fixes.length > 0 && <small className="db-connection-meta">{text("고친 것", "Fixes")}: {report.fixes.join(" · ")}</small>}
-                {report.commits.length > 0 && <small className="db-connection-meta">{text("커밋", "Commits")}: {report.commits.join(", ")}</small>}
-                {report.reverted.length > 0 && <small className="db-connection-meta">{text("되돌린 것", "Reverted")}: {report.reverted.join(" · ")}</small>}
-                {report.next.length > 0 && <small className="db-connection-meta">{text("다음", "Next")}: {report.next.join(" · ")}</small>}
-                {report.decisions.filter((decision) => decision.resolved).map((decision) => (
-                  <small className="db-connection-meta" key={decision.question}>{text("결정", "Decision")}: {decision.question} → {decision.resolved}</small>
-                ))}
-              </article>
-            );
-          })}
-        </div>
       </div>
+      {detailGoal && <RoundReportsModal goal={detailGoal} onClose={() => setDetailGoal(null)} onResolved={() => { void load(); }} />}
       {confirmDialog}
     </section>
   );

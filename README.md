@@ -25,158 +25,158 @@ A desktop app that manages the local conversations and work of Claude Code, Open
 
 All screenshots use demo data in dark mode — no real accounts or projects.
 
-![Dashboard](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-dashboard.png)
+![Dashboard](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-dashboard.png)
 
 <details>
 <summary><b>More screenshots (34)</b></summary>
 
 ### Dashboard and chat
 
-**Connection status of four providers, per-account usage, sessions, tokens and storage on one screen**
+**Dashboard: sessions, tokens, connected CLIs and per-account burn rate**
 
-![Connection status of four providers, per-account usage, sessions, tokens and storage on one screen](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-dashboard.png)
+![Dashboard: sessions, tokens, connected CLIs and per-account burn rate](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-dashboard.png)
 
-**Recent sessions, recurring schedules, top projects and model distribution**
+**Recent sessions, recurring schedules, top projects and model mix**
 
-![Recent sessions, recurring schedules, top projects and model distribution](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-dashboard-activity.png)
+![Recent sessions, recurring schedules, top projects and model mix](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-dashboard-activity.png)
 
-**Chat with agents in the app: tool output and markdown answers**
+**Live chat with grouped tool calls and test output**
 
-![Chat with agents in the app: tool output and markdown answers](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-chat.png)
+![Live chat with grouped tool calls and test output](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-chat.png)
 
-**Risky commands wait for your approval before they run**
+**Permission request card before a git push**
 
-![Risky commands wait for your approval before they run](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-chat-approval.png)
+![Permission request card before a git push](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-chat-approval.png)
 
-**Plan mode: review the plan and choose how it runs**
+**Plan-mode review card with run options**
 
-![Plan mode: review the plan and choose how it runs](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-chat-plan.png)
+![Plan-mode review card with run options](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-chat-plan.png)
 
-**Ask the AIA assistant about usage and schedules**
+**AIA system agent answering a usage and schedule question**
 
-![Ask the AIA assistant about usage and schedules](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-aia.png)
+![AIA system agent answering a usage and schedule question](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-aia.png)
 
-**Completed, approval-needed, failed and pacing alerts in one place**
+**Notification center: approvals, completions, failures, pacing tips**
 
-![Completed, approval-needed, failed and pacing alerts in one place](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-notifications.png)
+![Notification center: approvals, completions, failures, pacing tips](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-notifications.png)
 
 ### Sessions
 
-**One session list across four providers, organized with folders, favorites and filters**
+**Unified session catalog across all providers, with folders**
 
-![One session list across four providers, organized with folders, favorites and filters](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-sessions.png)
+![Unified session catalog across all providers, with folders](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-sessions.png)
 
-**Re-read any session's conversation and tool calls in the detail view**
+**Session drawer with the full conversation and tool calls**
 
-![Re-read any session's conversation and tool calls in the detail view](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-session-transcript.png)
+![Session drawer with the full conversation and tool calls](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-session-transcript.png)
 
 ### Projects (in development)
 
-**Browse the repository tree and preview README read-only**
+**Project file browser with rendered README preview**
 
-![Browse the repository tree and preview README read-only](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-projects-files.png)
+![Project file browser with rendered README preview](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-projects-files.png)
 
-**Branch ahead/behind, staged/unstaged/untracked changes and commit history on one screen**
+**Git tab: staged/changed/untracked files and commit graph**
 
-![Branch ahead/behind, staged/unstaged/untracked changes and commit history on one screen](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-projects-git.png)
+![Git tab: staged/changed/untracked files and commit graph](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-projects-git.png)
 
-**Click a changed file to review its patch in a diff modal**
+**Staged diff viewer**
 
-![Click a changed file to review its patch in a diff modal](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-projects-git-diff.png)
+![Staged diff viewer](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-projects-git-diff.png)
 
-**Expand a commit to see its changed files next to branches and remotes**
+**Branches, remotes, worktrees and expanded commit files**
 
-![Expand a commit to see its changed files next to branches and remotes](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-projects-git-history.png)
+![Branches, remotes, worktrees and expanded commit files](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-projects-git-history.png)
 
 ### Automation
 
-**Recurring requests: per-provider schedules, next run, a live run and earlier run history**
+**Recurring requests with next run and recent results**
 
-![Recurring requests: per-provider schedules, next run, a live run and earlier run history](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-schedules.png)
+![Recurring requests with next run and recent results](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-schedules.png)
 
-**Recurring request editor: prompt, working path, permission mode and approval handling**
+**Schedule editor: prompt, account, execution mode and approvals**
 
-![Recurring request editor: prompt, working path, permission mode and approval handling](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-schedule-editor.png)
+![Schedule editor: prompt, account, execution mode and approvals](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-schedule-editor.png)
 
-**Registered workflow contracts with a paced-round contract's detail and runtime settings**
+**Registered workflow contracts and run settings**
 
-![Registered workflow contracts with a paced-round contract's detail and runtime settings](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-workflows.png)
+![Registered workflow contracts and run settings](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-workflows.png)
 
-**Workflow pacing: account-pool usage and time until each window resets**
+**Workflow pacing: account pool and usage budget**
 
-![Workflow pacing: account-pool usage and time until each window resets](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-pacing.png)
+![Workflow pacing: account pool and usage budget](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-pacing.png)
 
-**Pacing round cards: next-run accounts and reasoning effort, completion condition, per-account cost per run**
+**Paced rounds with per-account cost per run**
 
-![Pacing round cards: next-run accounts and reasoning effort, completion condition, per-account cost per run](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-pacing-rounds.png)
+![Paced rounds with per-account cost per run](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-pacing-rounds.png)
 
 ### Library
 
-**Shared skills deployed to Claude, Codex, Antigravity and Ollama, per user and per project**
+**Skill library with per-agent install state**
 
-![Shared skills deployed to Claude, Codex, Antigravity and Ollama, per user and per project](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-skills.png)
+![Skill library with per-agent install state](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-skills.png)
 
-**Skill detail: which location and agent uses a skill**
+**Skill drawer: OS compatibility and per-location deployment**
 
-![Skill detail: which location and agent uses a skill](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-skills-detail.png)
+![Skill drawer: OS compatibility and per-location deployment](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-skills-detail.png)
 
-**Where shared team rules are deployed as CLAUDE.md / AGENTS.md / GEMINI.md**
+**Instruction deployment matrix by project and agent**
 
-![Where shared team rules are deployed as CLAUDE.md / AGENTS.md / GEMINI.md](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-instructions.png)
+![Instruction deployment matrix by project and agent](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-instructions.png)
 
-**Deployed instruction files per project, linked documents and a rendered preview**
+**Deployed CLAUDE.md / AGENTS.md / GEMINI.md browser**
 
-![Deployed instruction files per project, linked documents and a rendered preview](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-instructions-info.png)
+![Deployed CLAUDE.md / AGENTS.md / GEMINI.md browser](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-instructions-info.png)
 
-**Registered folder tree and a document preview with a rendered Mermaid diagram**
+**Docs viewer rendering Markdown and Mermaid**
 
-![Registered folder tree and a document preview with a rendered Mermaid diagram](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-docs.png)
+![Docs viewer rendering Markdown and Mermaid](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-docs.png)
 
-**Claude agent definitions with model, tools and file path**
+**Claude sub-agent definitions with tools and models**
 
-![Claude agent definitions with model, tools and file path](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-agents.png)
+![Claude sub-agent definitions with tools and models](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-agents.png)
 
-**Task lists, plans and walkthroughs from Antigravity conversations**
+**Antigravity artifacts grouped by conversation**
 
-![Task lists, plans and walkthroughs from Antigravity conversations](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-artifacts.png)
+![Antigravity artifacts grouped by conversation](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-artifacts.png)
 
-**Disk used by provider transcripts and by Agent Manager's own store**
+**Storage overview: provider sources vs app-owned data**
 
-![Disk used by provider transcripts and by Agent Manager's own store](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-storage.png)
+![Storage overview: provider sources vs app-owned data](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-storage.png)
 
-**Saved secrets and per-chat secrets, values masked**
+**Saved and per-chat secrets, values never shown**
 
-![Saved secrets and per-chat secrets, values masked](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-storage-secrets.png)
+![Saved and per-chat secrets, values never shown](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-storage-secrets.png)
 
 ### Add-ons and settings
 
-**Connect Notion, GitHub, Google Drive/Calendar and Figma as chat tools, with a policy per tool**
+**External MCP plugins (Notion, GitHub, Google) with tool permissions**
 
-![Connect Notion, GitHub, Google Drive/Calendar and Figma as chat tools, with a policy per tool](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-addons-plugins.png)
+![External MCP plugins (Notion, GitHub, Google) with tool permissions](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-addons-plugins.png)
 
-**Give each SSH key a server and decide agent use, file transfer and live output**
+**SSH keys with agent-enabled endpoints**
 
-![Give each SSH key a server and decide agent use, file transfer and live output](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-addons-ssh.png)
+![SSH keys with agent-enabled endpoints](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-addons-ssh.png)
 
-**Register PostgreSQL, MySQL and SQLite connections with environment labels and write modes**
+**Database connections with read-only / approval write modes**
 
-![Register PostgreSQL, MySQL and SQLite connections with environment labels and write modes](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-addons-db.png)
+![Database connections with read-only / approval write modes](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-addons-db.png)
 
-**Edit a Cypress workspace's config and spec files inside the app**
+**Cypress automation workspaces and spec editor**
 
-![Edit a Cypress workspace's config and spec files inside the app](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-addons-cypress.png)
+![Cypress automation workspaces and spec editor](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-addons-cypress.png)
 
-**Manage provider CLIs and the 5-hour / 7-day usage of several accounts**
+**Multiple accounts per provider with live usage windows**
 
-![Manage provider CLIs and the 5-hour / 7-day usage of several accounts](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-settings-accounts.png)
+![Multiple accounts per provider with live usage windows](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-settings-accounts.png)
 
-**Register and check several Ollama servers, on this machine or across Tailscale**
+**Local LLM (Ollama) connections with reachability checks**
 
-![Register and check several Ollama servers, on this machine or across Tailscale](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-settings-local-llm.png)
+![Local LLM (Ollama) connections with reachability checks](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-settings-local-llm.png)
 
-**Use Agent Manager from your phone with Tailscale serve and remote editing**
+**Backend service: Tailscale remote access, remote editing, sleep prevention**
 
-![Use Agent Manager from your phone with Tailscale serve and remote editing](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-settings-backend.png)
+![Backend service: Tailscale remote access, remote editing, sleep prevention](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.1/am-031-en-settings-backend.png)
 
 </details>
 

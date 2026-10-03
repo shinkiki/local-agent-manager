@@ -44,7 +44,7 @@ const STATIC_UI_EN: Record<string, string> = {
   "스킬을 찾지 못했습니다": "No skills found", "에이전트 정의가 없습니다": "No agent definitions", "아티팩트가 없습니다": "No artifacts", "세션이 없습니다": "No sessions", "조건에 맞는 세션이 없습니다": "No sessions match the filters", "표시할 대화가 없습니다": "No conversations to display", "등록된 폴더 없음": "No registered folders", "파일을 선택하세요": "Select a file", "데이터 없음": "No data", "설명이 없습니다.": "No description.", "모델 기록이 없습니다": "No model history", "프로젝트 기록이 없습니다": "No project history",
   "제목·프로젝트·ID·메모 검색": "Search title, project, ID, or note", "파일명 검색": "Search file name", "새문서.md": "new-document.md", "제목 입력": "Enter title", "새 폴더 이름": "New folder name", "표시 이름 (선택)": "Display name (optional)", "에이전트명·설명·도구 검색": "Search agent, description, or tool", "대화 제목·아티팩트·요약 검색": "Search conversation, artifact, or summary", "스킬명·설명·출처 검색": "Search name, description, or source",
   "대화 내역": "Conversation", "작업 로그": "Activity", "메타": "Metadata", "터미널": "Terminal", "메모": "Note", "표시 제목": "Display title", "세션 정보": "Session info", "요청일시": "Requested", "브랜치": "Branch", "총 토큰": "Total tokens", "입력 소스": "Input source", "실행 클라이언트": "Execution client", "기록 방식": "History mode", "컨텍스트 ID": "Context ID", "스레드 종류": "Thread type", "모델 공급자": "Model provider", "CLI 버전": "CLI version", "등록 도구": "Registered tools",
-  "사용자": "User", "진행 상황": "Progress", "도구 실행": "Tool call", "도구 결과": "Tool result", "도구 오류": "Tool error", "승인 대기": "Awaiting approval", "권한 승인 대기": "Permission approval required", "선택할 때까지 Claude 작업이 일시 정지됩니다.": "Claude is paused until you choose an action.", "이번만 허용": "Allow once", "세션 동안 허용": "Allow for session", "거절": "Decline", "작업 취소": "Cancel task", "Claude 실행 계획 검토": "Claude plan review", "계획대로 실행": "Run this plan", "계획 다시 세우기": "Revise the plan", "Claude 질문": "Claude has a question", "답변 보내기": "Send answers", "답변 없이 진행": "Continue without answering", "직접 입력": "Write my own", "선택지에 없는 답을 적으세요": "Write an answer that is not listed", "답변을 보냈습니다": "Answers sent", "답변 없이 진행했습니다": "Continued without answering", "답하지 않고 진행했습니다": "Continued without an answer", "계획대로 실행했습니다": "Approved and ran this plan", "계획을 다시 세우도록 돌려보냈습니다": "Sent back for a revised plan", "실행 정책에 의해 이미 거절된 권한 기록입니다. 현재 승인을 기다리고 있지 않습니다.": "This permission was already denied by policy and is not awaiting approval.", "권한 제한 후 응답 종료": "Response ended with permission limits", "사용자 중단": "Stopped by user", "응답 종료": "Response ended", "권한 제한": "Permission limited", "중단됨": "Interrupted", "도구 실패 포함": "Includes tool failures", "대기열 추가": "Queue", "대기열에서 삭제": "Remove from queue", "입력창으로 되돌리기": "Return to composer", "권한": "Permissions", "승인": "Approval", "이어가기 권한 모드": "Continuation permission mode", "이어가기 승인 처리": "Continuation approval handling", "권한 모드를 바꾸면 같은 세션으로 다시 연결합니다.": "Changing permission mode reconnects the same session.", "승인 처리를 바꾸면 같은 세션으로 다시 연결합니다.": "Changing approval handling reconnects the same session.", "다음 전송부터 같은 세션을 전체 접근으로 다시 연결합니다.": "The same session will reconnect with full access on the next send.", "권한 모드를 변경하지 못했습니다:": "Could not change permission mode:",
+  "사용자": "User", "진행 상황": "Progress", "도구 실행": "Tool call", "도구 결과": "Tool result", "도구 오류": "Tool error", "승인 대기": "Awaiting approval", "권한 승인 대기": "Permission approval required", "선택할 때까지 Claude 작업이 일시 정지됩니다.": "Claude is paused until you choose an action.", "이번만 허용": "Allow once", "세션 동안 허용": "Allow for session", "거절": "Decline", "작업 취소": "Cancel task", "Claude 실행 계획 검토": "Claude plan review", "계획대로 실행": "Run this plan", "계획 다시 세우기": "Revise the plan", "Claude 질문": "Claude has a question", "Claude 권한 확인": "Claude permission request", "답변 보내기": "Send answers", "답변 없이 진행": "Continue without answering", "직접 입력": "Write my own", "선택지에 없는 답을 적으세요": "Write an answer that is not listed", "답변을 보냈습니다": "Answers sent", "답변 없이 진행했습니다": "Continued without answering", "답하지 않고 진행했습니다": "Continued without an answer", "계획대로 실행했습니다": "Approved and ran this plan", "계획을 다시 세우도록 돌려보냈습니다": "Sent back for a revised plan", "실행 정책에 의해 이미 거절된 권한 기록입니다. 현재 승인을 기다리고 있지 않습니다.": "This permission was already denied by policy and is not awaiting approval.", "권한 제한 후 응답 종료": "Response ended with permission limits", "사용자 중단": "Stopped by user", "응답 종료": "Response ended", "권한 제한": "Permission limited", "중단됨": "Interrupted", "도구 실패 포함": "Includes tool failures", "대기열 추가": "Queue", "대기열에서 삭제": "Remove from queue", "입력창으로 되돌리기": "Return to composer", "권한": "Permissions", "승인": "Approval", "이어가기 권한 모드": "Continuation permission mode", "이어가기 승인 처리": "Continuation approval handling", "권한 모드를 바꾸면 같은 세션으로 다시 연결합니다.": "Changing permission mode reconnects the same session.", "승인 처리를 바꾸면 같은 세션으로 다시 연결합니다.": "Changing approval handling reconnects the same session.", "다음 전송부터 같은 세션을 전체 접근으로 다시 연결합니다.": "The same session will reconnect with full access on the next send.", "권한 모드를 변경하지 못했습니다:": "Could not change permission mode:",
   "기본": "Default", "기본 모델": "Default model", "공급자 기본값": "Provider default", "상속": "Inherited", "전체 접근": "Full access", "작업공간 쓰기": "Workspace write", "분석·계획만": "Analysis and planning only", "외부 경로 허용": "Allow external paths", "읽기 전용": "Read only",
   "실행 대상": "Run target", "에이전트 요청": "Agent request", "시스템 워크플로": "System workflow", "실행할 워크플로": "Workflow to run", "워크플로 선택": "Select a workflow", "입력 없음": "No inputs", "복구가 어려운 영향": "Hard-to-recover effects", "등록된 시스템 워크플로가 없습니다. 워크플로 화면에서 AIA가 먼저 등록해야 선택할 수 있습니다.": "No system workflow is registered yet. AIA has to register one on the Workflows screen before it can be selected.", "워크플로는 등록된 기본 작업만 호출합니다. 공급자 CLI를 띄우지 않아 실행 계정·작업 경로·권한 범위와 세션 참조는 쓰이지 않습니다.": "A workflow calls only registered built-in operations. It starts no provider CLI, so the run account, working directory, permission scope, and session reference are unused.", "실행할 워크플로를 선택하세요.": "Select the workflow to run.", "워크플로 승인 버전을 확인할 수 없습니다.": "The approved workflow version could not be read.", "현재 카탈로그와 호환되지 않는 워크플로입니다. AIA가 다시 등록해야 합니다.": "This workflow is not compatible with the current catalog. AIA has to register it again.",
   "반복 요청 수정": "Edit recurring request", "새 반복 요청": "New recurring request", "반복할 요청": "Request to repeat", "작업 경로": "Working directory", "실행 계정": "Run account", "주기": "Schedule", "간격": "Interval", "실행 시각": "Run time", "요일": "Day", "세션 방식": "Session strategy", "재개 실패 시": "On resume failure", "매 N시간": "Every N hours", "매일": "Daily", "평일": "Weekdays", "매주": "Weekly", "고급 Cron": "Advanced Cron", "매번 새 채팅": "New chat each time", "동일 대화 이어가기": "Continue same conversation", "작업 일시정지": "Pause request", "즉시 새 대화": "Start a new chat", "한 번 재시도 후 새 대화": "Retry once, then new chat", "지금 실행": "Run now", "전체 일시정지": "Pause all", "전체 재개": "Resume all", "전체 일시정지 중입니다. 예약 실행만 멈추고 지금 실행은 그대로 나갑니다.": "All recurring requests are paused. Only scheduled runs are held — Run now still works.", "이전 실행": "Previous runs", "최근 실행": "Recent runs", "이전 실행 보기": "Show previous runs", "실행 내역 접기": "Hide run history",
@@ -85,22 +85,33 @@ const STATIC_UI_SOURCES = [
 const FIXED_UI_EN_TABLES: readonly Record<string, string>[] = [STATIC_UI_EN, GENERATED_UI_EN];
 
 /**
- * 앞 표가 이기도록 영어 → 한국어를 모은다. 이미 자리를 잡은 영어는 덮어쓰지 않는다.
+ * 영어 → 한국어 되짚기 표를 모은다. 고르는 순서는 셋이다.
  *
- * 순위는 **표 사이**의 것이다. 한 표 안에서 같은 영어를 두 원문이 쓰면(`"대화 내역"`과
- * `"대화"`가 둘 다 `"Conversation"`) 뒤에 적힌 항목이 이긴다 — 순위를 한 방향으로 모으기
- * 전의 규칙이 그랬고, 대응표는 그 규칙을 전제로 적혀 있다. 표 안까지 "앞이 이긴다"로 바꾸면
- * 영어에서 한국어로 되돌린 채팅 탭이 "대화 내역"으로 돌아온다.
+ * 1. **되짚었다 다시 옮기면 같은 영어가 나오는 원문**이 먼저다. 생성 카탈로그에는 `"추론"`과
+ *    `"추론 수준"`이 둘 다 `"Reasoning"`인데, 뒤의 것은 손 대응표에서 `"Reasoning level"`로
+ *    옮겨진다. 그것을 고르면 영어 화면의 "Reasoning"이 "Reasoning level"로 바뀐다.
+ * 2. 그 조건이 같으면 앞 표가 이긴다(정방향 조회 `staticUiEnglish`와 같은 순위).
+ * 3. 한 표 안에서는 뒤에 적힌 항목이 이긴다. `"대화 내역"`과 `"대화"`가 둘 다 `"Conversation"`인
+ *    손 대응표가 이 규칙을 전제로 적혀 있다 — 표 안까지 "앞이 이긴다"로 바꾸면 영어에서
+ *    한국어로 되돌린 채팅 탭이 "대화 내역"이 된다.
  */
 function koreanByEnglish(tables: readonly Record<string, string>[]): Map<string, string> {
-  const byEnglish = new Map<string, string>();
-  for (const table of tables) {
-    const withinTable = new Map(Object.entries(table).map(([ko, en]) => [en, ko]));
-    for (const [en, ko] of withinTable) {
-      if (!byEnglish.has(en)) byEnglish.set(en, ko);
+  const forward = (ko: string) => {
+    for (const table of tables) if (table[ko] !== undefined) return table[ko];
+    return undefined;
+  };
+  const chosen = new Map<string, { ko: string; table: number; roundTrips: boolean }>();
+  tables.forEach((table, tableIndex) => {
+    for (const [ko, en] of Object.entries(table)) {
+      const roundTrips = forward(ko) === en;
+      const current = chosen.get(en);
+      const replace = !current
+        || (roundTrips && !current.roundTrips)
+        || (current.table === tableIndex && roundTrips === current.roundTrips);
+      if (replace) chosen.set(en, { ko, table: tableIndex, roundTrips });
     }
-  }
-  return byEnglish;
+  });
+  return new Map([...chosen].map(([en, { ko }]) => [en, ko]));
 }
 
 /**

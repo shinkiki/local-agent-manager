@@ -5,6 +5,7 @@ import { nearestUsageReset, sidebarUsageError, sidebarUsageMeters } from "../lib
 import type { SidebarUsageDensity, SidebarUsageMeter, SidebarUsageSource, SidebarUsageWindowMeter } from "../lib/sidebarUsage";
 import type { ProviderStatus } from "../types";
 
+import { formatDateTime } from "../lib/format";
 /**
  * 미터가 실제로 그릴 창. 창이 하나도 없는 계정도 자리를 비워 두지 않고 "정보 없음" 칸을
  * 같은 모양으로 그리므로, 접힘·펼침 어느 쪽도 이 목록 위에서 그린다.
@@ -155,7 +156,7 @@ export function AppStatusbar({ sources, providers, platform, architecture, densi
         <span className="statusbar-detail">{usageError
           ? text("사용량 확인 오류", "Usage check failed")
           : nearestReset
-            ? `${new Date(nearestReset).toLocaleString()} ${text("초기화", "reset")}`
+            ? `${formatDateTime(nearestReset)} ${text("초기화", "reset")}`
             : `${platform} · ${architecture}`}</span>
         <button
           className={`icon-button compact statusbar-refresh${refreshing ? " busy" : ""}`}

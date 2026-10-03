@@ -1,22 +1,34 @@
 import type { ProviderId } from "../types";
+import { runtimeLocale, runtimeText } from "./i18nRuntime.ts";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 
-const RELATIVE_UNITS: readonly [number, string][] = [
-  [DAY_MS, "일"],
-  [HOUR_MS, "시간"],
-  [MINUTE_MS, "분"],
+/** 상대 시간 단위. 한국어는 붙여 쓰고("3분 전"), 영어는 단수·복수를 가른다("3 minutes ago"). */
+const RELATIVE_UNITS: readonly [size: number, ko: string, en: string][] = [
+  [DAY_MS, "일", "day"],
+  [HOUR_MS, "시간", "hour"],
+  [MINUTE_MS, "분", "minute"],
 ];
 
-const DATE_FORMATTER = new Intl.DateTimeFormat("ko-KR", {
+/**
+ * 날짜 표기에 쓸 BCP 47 태그. 한국어 화면만 한국식 날짜를 쓰고, 영어·제3언어는 영어식으로 맞춘다.
+ *
+ * 로캘 없이 `toLocaleString()`을 부르면 화면 언어가 아니라 **브라우저 기본값**을 따라, 영어
+ * 화면에서도 한국어 OS에서는 "오전 3:03"이 나온다. 날짜를 적는 자리는 모두 이 태그를 거친다.
+ */
+export function dateLocaleTag(locale: string = runtimeLocale().locale): string {
+  return locale === "ko" ? "ko-KR" : "en-US";
+}
+
+const DATE_OPTIONS: Intl.DateTimeFormatOptions = {
   year: "numeric",
   month: "2-digit",
   day: "2-digit",
   hour: "2-digit",
   minute: "2-digit",
-});
+};
 
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"] as const;
 const BYTES_PER_UNIT = 1024;
@@ -41,13 +53,16 @@ export function formatRelative(timestamp: number | null, now: number = Date.now(
   const delta = now - timestamp;
   const future = delta < 0;
   const absolute = Math.abs(delta);
-  for (const [size, label] of RELATIVE_UNITS) {
+  for (const [size, ko, en] of RELATIVE_UNITS) {
     if (absolute >= size) {
       const value = Math.floor(absolute / size);
-      return future ? `${value}${label} 후` : `${value}${label} 전`;
+      const unit = `${en}${value === 1 ? "" : "s"}`;
+      return future
+        ? runtimeText(`${value}${ko} 후`, `in ${value} ${unit}`)
+        : runtimeText(`${value}${ko} 전`, `${value} ${unit} ago`);
     }
   }
-  return future ? "잠시 후" : "방금 전";
+  return future ? runtimeText("잠시 후", "soon") : runtimeText("방금 전", "just now");
 }
 
 /**
@@ -67,7 +82,22 @@ export function formatCountdown(remainingMs: number): string | null {
 
 export function formatDate(timestamp: number | null): string {
   if (!timestamp) return EMPTY_PLACEHOLDER;
-  return DATE_FORMATTER.format(new Date(timestamp));
+  return new Date(timestamp).toLocaleString(dateLocaleTag(), DATE_OPTIONS);
+}
+
+/** `new Date(t).toLocaleString()`의 자리. 날짜와 시각을 화면 언어로 적는다. */
+export function formatDateTime(timestamp: number | string | Date): string {
+  return new Date(timestamp).toLocaleString(dateLocaleTag());
+}
+
+/** `new Date(t).toLocaleDateString()`의 자리. */
+export function formatDateOnly(timestamp: number | string | Date): string {
+  return new Date(timestamp).toLocaleDateString(dateLocaleTag());
+}
+
+/** `new Date(t).toLocaleTimeString()`의 자리. */
+export function formatTimeOnly(timestamp: number | string | Date, options?: Intl.DateTimeFormatOptions): string {
+  return new Date(timestamp).toLocaleTimeString(dateLocaleTag(), options);
 }
 
 export function formatBytes(value: number | null): string {

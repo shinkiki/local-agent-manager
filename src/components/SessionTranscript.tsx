@@ -32,6 +32,7 @@ import { transcriptMessageKey } from "../lib/readingAnchor";
 import { readStoredText } from "../lib/storedText";
 import { useI18n, type UiText } from "../lib/i18n";
 
+import { runtimeText } from "../lib/i18nRuntime";
 export const SESSION_TRANSCRIPT_LIMIT_KEY = "agent-manager.session-transcript-limit";
 export const DEFAULT_SESSION_TRANSCRIPT_LIMIT: SessionTranscriptLimit = "latest100";
 /**
@@ -863,7 +864,7 @@ function SessionInfoBlock({ block }: { block: Extract<ContentBlock, { kind: "ses
     ["스레드 종류", block.threadSource],
     ["기록 방식", block.historyMode],
     ["컨텍스트 ID", block.contextWindowId],
-    ["등록 도구", `${block.toolCount.toLocaleString()}개`],
+    ["등록 도구", runtimeText(`${block.toolCount.toLocaleString()}개`, block.toolCount.toLocaleString())],
   ].filter((field): field is [string, string] => Boolean(field[1]));
 
   return (

@@ -72,7 +72,19 @@ export function bashExecutable() {
 
 /// 도구 호출 하나를 샌드박스에서 실행한다. 되돌려주는 문자열이 곧 모델이 다음 턴에 보는
 /// 되먹임이다.
-export function runTool(dir, call) {
+/// 하네스가 없는 도구 호출을 되돌릴 때 쓰는 말. 배포본은 **이름 목록을 함께 준다**
+/// (`chat.rs` 가 실제로 받아 가르는 본문: `The arguments provided to the tool are invalid:
+/// Model tried to call unavailable tool 'plan_cannot_do'. Available tools: invalid, webfetch.`).
+/// 탐침은 `오류: 없는 도구 run` 한 줄만 돌려주고 있었다 — 다시 물을 거리가 없는 막다른
+/// 말이고, 그것은 배포본이 주는 되먹임이 아니다(2026-10-02 GPU `dedupe-block` 실측에서
+/// 모델이 `run {"command":"node check.mjs"}` 를 부른 자리).
+export function unavailableToolMessage(name, tools) {
+  const names = (tools ?? []).join(", ");
+  return `오류: Model tried to call unavailable tool '${name}'.${names ? ` Available tools: ${names}.` : ""}`;
+}
+
+/// `tools` 는 그 시행에서 실제로 열린 도구 이름들이다. 주지 않으면 목록 없는 말이 나간다.
+export function runTool(dir, call, tools) {
   try {
     if (call.name === "read") {
       const at = inside(dir, String(call.args.filePath ?? ""));
@@ -123,7 +135,7 @@ export function runTool(dir, call) {
   } catch (err) {
     return `오류: ${String(err.stdout ?? "")}${String(err.stderr ?? err.message)}`.slice(0, 2000);
   }
-  return `오류: 없는 도구 ${call.name}`;
+  return unavailableToolMessage(call.name, tools);
 }
 
 /// 샌드박스를 깐다. 돌려주는 값은 처음 내용이라 '정말 바뀌었는가'를 나중에 견줄 수 있다.
@@ -392,11 +404,25 @@ export function scoreRun(task, run) {
   // 실패로 끝내지 않고 횟수만 센다 — 선언되지 않은 도구를 곧바로 부르는 비율이 재는 값이다.
   const tolerated = task.tolerateUnknown ?? [];
   const hard = unknown.filter((n) => !tolerated.includes(n));
-  if (hard.length) return { ok: false, why: `없는 도구 이름: ${[...new Set(hard)].join(",")}` };
+  // 2026-10-02 코드 리팩토링 9회차. 옛 줄은 여기서 **곧바로 실패로 끝냈다**:
+  //   if (hard.length) return { ok: false, why: `없는 도구 이름: …` };
+  // 배포본은 그러지 않는다. 하네스는 없는 도구 호출을 `invalid` 카드로 되돌리고 실패
+  // 한 번으로 세며 **단계는 계속 돈다**(`chat.rs` 9263~ 의 `looks_refused` 자리, 주석에
+  // 적힌 실기기 ses_f23700d3 이 그 경로다). 끝내는 것은 턴 상한이지 이름 하나가 아니다.
+  // 그래서 탐침만 "지어낸 이름 한 번 = 그 시행은 끝"으로 재고 있었고, GPU `dedupe-block`
+  // n=20 실측에서 `run {"command":"node check.mjs"}` 를 한 번 부른 뒤 다음 턴에 `bash` 로
+  // 바로잡아 일을 끝낸 시행이 **부수효과를 보지도 않고** 실패로 찍혔다.
+  // 통과는 끝난 자리로 정하고 돌아간 것은 따로 적는다(절차 4절).
+  //
+  // 넓힌 만큼은 **세어서** 잡는다. 지어낸 이름은 도구 수 민감도가 드러나는 신호라
+  // 숨기면 안 되므로 통과·실패 양쪽 `why` 에 횟수와 이름이 그대로 남고, `invented` 로도
+  // 나가 측정기가 시행을 가로질러 합산한다.
   const direct = unknown.length - hard.length;
-  const tag = direct ? ` (미선언 도구 직접 호출 ${direct}회)` : "";
+  const tags = [];
+  if (hard.length) tags.push(` (지어낸 도구 이름 ${hard.length}회: ${[...new Set(hard)].join(",")})`);
+  if (direct) tags.push(` (미선언 도구 직접 호출 ${direct}회)`);
   const scored = scoreRunInner(task, run);
-  return { ...scored, why: `${scored.why}${tag}` };
+  return { ...scored, invented: hard.length, why: `${scored.why}${tags.join("")}` };
 }
 
 function scoreRunInner(task, run) {

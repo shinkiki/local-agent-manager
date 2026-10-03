@@ -1,6 +1,6 @@
 import { Database, KeyRound } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { formatBytes } from "../lib/format";
+import { formatBytes, formatTimeOnly } from "../lib/format";
 import { useI18n, type UiText } from "../lib/i18n";
 import { getStorageOverview } from "../lib/ipc";
 import { usePoll } from "../lib/poll";
@@ -22,7 +22,7 @@ const storageTabs: readonly SettingsSubTab<StorageTabId>[] = [
 ];
 
 /** 측정 시각 표기. 저장소 화면은 같은 날 안에서 30초마다 다시 재므로 시:분:초만 적는다. */
-const MEASURED_AT_FORMATTER = new Intl.DateTimeFormat("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+const MEASURED_AT_OPTIONS: Intl.DateTimeFormatOptions = { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
 
 /**
  * 저장소 측정의 폴링과 마지막 성공값을 한 벌로 관리한다. 갱신 실패를 다시 던지는 것은
@@ -113,7 +113,7 @@ function StorageUsageSection() {
 
   const { overview, at } = measured;
   const stale = error !== null;
-  const measuredAtText = MEASURED_AT_FORMATTER.format(new Date(at));
+  const measuredAtText = formatTimeOnly(at, MEASURED_AT_OPTIONS);
 
   return (
     <div className="view-stack storage-view">

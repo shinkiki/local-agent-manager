@@ -22,6 +22,7 @@ mod chat_settings;
 mod claude_branch_plugins;
 mod claude_settings;
 mod cli_interface;
+mod cli_quarantine;
 mod cli_updates;
 mod clock;
 mod credential_profiles;
@@ -61,6 +62,7 @@ mod process_signal;
 mod project_files;
 mod project_git;
 mod project_instructions;
+mod project_overlays;
 mod project_registry;
 mod provider_settings_file;
 mod provider_telemetry;
@@ -99,6 +101,7 @@ mod terminal;
 mod text_limit;
 mod translation;
 mod trash_store;
+mod turn_continuation;
 mod usage_budget;
 mod usage_budget_policy;
 mod usage_history;
@@ -266,21 +269,25 @@ pub use power::{
     sleep_prevention_status, SleepPreventionStatus,
 };
 pub use project_files::{
-    is_restricted_project_root, list_project_entries, read_project_file, ListProjectEntriesRequest,
-    ProjectFileView, ReadProjectFileRequest,
+    is_restricted_project_root, list_project_entries, read_project_file, search_project_files,
+    ListProjectEntriesRequest, ProjectFileSearchHit, ProjectFileSearchPage,
+    ProjectFileSearchRequest, ProjectFileView, ReadProjectFileRequest,
 };
 pub use project_git::{
-    commit_project_git, fetch_project_git, project_git_commit_files, project_git_diff,
-    project_git_log, project_git_overview, project_git_status, pull_project_git, push_project_git,
-    rebase_project_git, stage_project_git_paths, stash_project_git, switch_project_git_branch,
-    unstage_project_git_paths, GitActionReceipt, GitBranch, GitChangeKind, GitCommit,
-    GitCommitFile, GitCommitFiles, GitDiff, GitDiffKind, GitHead, GitInProgress, GitInProgressKind,
-    GitLog, GitOutcome, GitOverview, GitPullMode, GitRebaseAction, GitRemote, GitRepositoryInfo,
-    GitStash, GitStashAction, GitStatus, GitStatusEntry, GitUnavailableReason, GitUpstream,
-    GitWorktree, ProjectGitCommitFilesRequest, ProjectGitCommitRequest, ProjectGitDiffRequest,
-    ProjectGitFetchRequest, ProjectGitLogRequest, ProjectGitPathsRequest, ProjectGitPullRequest,
-    ProjectGitPushRequest, ProjectGitRebaseRequest, ProjectGitStashRequest,
-    ProjectGitSwitchRequest, ProjectGitTarget,
+    commit_project_git, fetch_project_git, get_project_branch_comparison,
+    list_project_branch_follows, project_git_commit_files, project_git_diff, project_git_log,
+    project_git_overview, project_git_status, pull_project_git, push_project_git,
+    rebase_project_git, set_project_branch_follow, stage_project_git_paths, stash_project_git,
+    switch_project_git_branch, unstage_project_git_paths, GitActionReceipt, GitBranch,
+    GitBranchComparison, GitChangeKind, GitCommit, GitCommitFile, GitCommitFiles, GitDiff,
+    GitDiffKind, GitHead, GitInProgress, GitInProgressKind, GitLog, GitOutcome, GitOverview,
+    GitPullMode, GitRebaseAction, GitRemote, GitRepositoryInfo, GitStash, GitStashAction,
+    GitStatus, GitStatusEntry, GitUnavailableReason, GitUpstream, GitWorktree, ProjectBranchFollow,
+    ProjectBranchFollows, ProjectGitCommitFilesRequest, ProjectGitCommitRequest,
+    ProjectGitComparisonRequest, ProjectGitDiffRequest, ProjectGitFetchRequest,
+    ProjectGitLogRequest, ProjectGitPathsRequest, ProjectGitPullRequest, ProjectGitPushRequest,
+    ProjectGitRebaseRequest, ProjectGitStashRequest, ProjectGitSwitchRequest, ProjectGitTarget,
+    SetProjectBranchFollowRequest,
 };
 pub use project_instructions::{
     attach_project_instruction_deployment, check_project_instruction_delete,
@@ -307,6 +314,15 @@ pub use project_instructions::{
     ReadDeployedInstructionFileRequest, SaveProjectInstructionPlatformVariantRequest,
     SetProjectInstructionPlatformsRequest, SyncProjectInstructionRequest,
     UnarchiveSharedProjectInstructionRequest, UpdateProjectInstructionRequest,
+};
+pub use project_overlays::{
+    apply_project_overlay, check_project_overlay_apply, delete_project_overlay_set,
+    list_project_overlay_sets, overlay_repository_id, save_project_overlay_set,
+    snapshot_project_overlay, ApplyProjectOverlayRequest, CheckProjectOverlayApplyRequest,
+    DeleteProjectOverlaySetRequest, ProjectOverlayOutcome, ProjectOverlayReceipt,
+    ProjectOverlayRejection, ProjectOverlaySet, ProjectOverlaySets, ProjectOverlayState,
+    ProjectOverlayTarget, ProjectOverlayTrigger, SaveProjectOverlaySetRequest,
+    SnapshotProjectOverlayRequest,
 };
 pub use provider_telemetry::{
     load_provider_telemetry, set_provider_telemetry_option, ProviderTelemetryFile,

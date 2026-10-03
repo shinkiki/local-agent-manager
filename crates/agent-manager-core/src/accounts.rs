@@ -4231,7 +4231,18 @@ fn normalized_display_name(
 /// 자신에게 돌아오면 항상 상속 오염이다. 판정은 경로 문자열의 구성요소 접두로만
 /// 한다 — 존재하지 않는 경로일 수 있어 canonicalize에 기대지 않는다.
 fn env_path_unless_self_referential(var: &str, profile_root: &Path) -> Option<PathBuf> {
-    let value = PathBuf::from(env::var_os(var)?);
+    path_unless_self_referential(var, env::var_os(var)?, profile_root)
+}
+
+/// 값을 받아 판단만 한다. 환경을 읽는 일과 가른 이유는 시험이다 — `env::set_var` 는 프로세스
+/// 전역이라 다른 스레드가 환경을 읽는 동안 안전하지 않고(`tempfile` 도 TMPDIR 을 읽는다),
+/// 이 판단을 보려고 환경을 바꾸던 동안 무관한 시험들이 간헐적으로 흔들렸다.
+fn path_unless_self_referential(
+    var: &str,
+    raw: std::ffi::OsString,
+    profile_root: &Path,
+) -> Option<PathBuf> {
+    let value = PathBuf::from(raw);
     if value.starts_with(profile_root) {
         eprintln!(
             "[accounts] {var}={}는 이 앱의 자격증명 프로필을 가리켜 무시합니다. 재기동 절차가 이 변수를 지우지 않고 백엔드를 띄운 것입니다",
@@ -9006,21 +9017,19 @@ mod tests {
     fn inherited_isolation_paths_pointing_at_our_own_profiles_are_dropped() {
         let root = Path::new("/data/credential-profiles");
         let var = "AM_TEST_ENV_PATH_SELF_REFERENTIAL";
-        env::set_var(var, "/data/credential-profiles/claude/claude-1234");
-        assert_eq!(env_path_unless_self_referential(var, root), None);
-        env::set_var(var, "/Users/someone/.codex-custom");
+        let judge = |value: &str| {
+            super::path_unless_self_referential(var, std::ffi::OsString::from(value), root)
+        };
+        assert_eq!(judge("/data/credential-profiles/claude/claude-1234"), None);
         assert_eq!(
-            env_path_unless_self_referential(var, root),
+            judge("/Users/someone/.codex-custom"),
             Some(PathBuf::from("/Users/someone/.codex-custom"))
         );
         // 접두 문자열이 아니라 경로 구성요소로 비교한다.
-        env::set_var(var, "/data/credential-profiles-backup/x");
         assert_eq!(
-            env_path_unless_self_referential(var, root),
+            judge("/data/credential-profiles-backup/x"),
             Some(PathBuf::from("/data/credential-profiles-backup/x"))
         );
-        env::remove_var(var);
-        assert_eq!(env_path_unless_self_referential(var, root), None);
     }
 
     /// 토큰 엔드포인트에 `User-Agent`가 붙으면 갱신이 429로 막힌다(2026-08-27 실측:

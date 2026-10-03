@@ -505,6 +505,8 @@ fn resolve_status(adapter: &ProviderCliAdapter) -> ProviderCliUpdateStatus {
 
     status.detected = true;
     status.executable_path = Some(executable.to_string_lossy().into_owned());
+    // 업데이트 직후 상태를 다시 읽는 자리이기도 하다. 버전을 묻기 전에 격리 속성을 푼다(C18).
+    crate::cli_quarantine::release_cask_quarantine(&executable);
     match probe_cli_version(&executable, adapter.version_args) {
         Ok(version) => status.current_version = Some(version),
         Err(error) => status.version_error = Some(error.to_string()),

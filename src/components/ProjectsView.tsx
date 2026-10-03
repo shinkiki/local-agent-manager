@@ -41,11 +41,12 @@ const PROJECTS_TAB_IDS: readonly ProjectsTabId[] = projectsTabs.map((tab) => tab
  * `onRegistryChanged`로 앱의 자원 화면들을 무효화하고, 그 회전값이 다시 이리로 돌아와 선택
  * 목록을 새로 읽는다.
  */
-export function ProjectsView({ active, tabRequest = null, registryRevision, onRegistryChanged }: {
+export function ProjectsView({ active, tabRequest = null, registryRevision, onRegistryChanged, onRequestAiaPrompt }: {
   active: boolean;
   tabRequest?: TabRequest<ProjectsTabId> | null;
   registryRevision: number;
   onRegistryChanged: () => void;
+  onRequestAiaPrompt: (prompt: string) => void;
 }) {
   const { text } = useI18n();
   const [tab, setTab] = useStoredChoice<ProjectsTabId>(PROJECTS_TAB_KEY, PROJECTS_TAB_IDS, "files");
@@ -88,7 +89,7 @@ export function ProjectsView({ active, tabRequest = null, registryRevision, onRe
       </SettingsSubTabPanel>
       <SettingsSubTabPanel idPrefix="projects" id="git" active={tab === "git"}>
         <ProjectPanelBody registry={registry} selectedPath={selectedPath} onOpenSettings={() => setTab("settings")}>
-          {(path) => <ProjectGitPanel key={path} projectPath={path} active={active && tab === "git"} />}
+          {(path) => <ProjectGitPanel key={path} projectPath={path} active={active && tab === "git"} onRequestAiaPrompt={onRequestAiaPrompt} />}
         </ProjectPanelBody>
       </SettingsSubTabPanel>
       <SettingsSubTabPanel idPrefix="projects" id="settings" active={tab === "settings"}>

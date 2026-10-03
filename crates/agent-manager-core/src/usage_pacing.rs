@@ -5244,12 +5244,13 @@ fn select_stale_runs(
         .iter()
         .filter(|chat| {
             chat.unattended
-                && matches!(
-                    chat.state,
-                    crate::chat::ChatPhase::Ready
-                        | crate::chat::ChatPhase::Stopped
-                        | crate::chat::ChatPhase::Failed
-                )
+                // 아직 살아 있는데 턴만 끝난 것이 정리 대상이다. 이미 Stopped·Failed 인
+                // 런타임을 다시 집으면 `stop_managed` 가 alreadyStopped 로 되돌려 보낼 뿐
+                // 목록에서 빠지지는 않아, 같은 죽은 채팅을 회차마다 다시 멈추게 된다.
+                // 실제로 회차당 +5씩 쌓여 269건이 됐고, 한 회차의 단계 277개 중 269개가
+                // 그 헛된 stop_chat 이었다(2026-10-02 실측). 기동한 회차는 그 뒤에서
+                // 밀려 작업을 시작하지 못한 채 레인만 잡고 끝났다.
+                && chat.state == crate::chat::ChatPhase::Ready
                 && chat.last_turn_status.is_some()
                 && match &chat.origin {
                     // 반복 요청이 띄운 런타임은 그 반복 요청만 정리한다. 워크플로 일치로도
@@ -6211,6 +6212,28 @@ mod tests {
         let auto = cadence_with_switch(dir.path(), true, false);
         assert!(!auto.round_paused(&workflow_schedule("s-qa", "wf-qa", 5, true).input));
         assert!(auto.pacing_ids.get().is_none());
+    }
+
+    /// 정리 대상은 **아직 살아 있는데 턴만 끝난** 런타임이다. 이미 Stopped·Failed 인 것을
+    /// 다시 집으면 `stop_managed` 가 alreadyStopped 로 되돌릴 뿐 목록에서 빠지지 않아,
+    /// 회차마다 같은 죽은 채팅을 다시 멈춘다. 실제로 +5씩 쌓여 269건이 됐고 한 회차의
+    /// 단계 277개 중 269개가 그 헛된 stop_chat 이었다(2026-10-02 실측).
+    #[test]
+    fn stale_cleanup_skips_runtimes_that_are_already_dead() {
+        let request = request("7일", 100.0);
+        let chats = vec![
+            finished_chat("run-idle", "/tmp/project", true, ChatPhase::Ready),
+            finished_chat("run-dead", "/tmp/project", true, ChatPhase::Stopped),
+            finished_chat("run-failed", "/tmp/project", true, ChatPhase::Failed),
+            finished_chat("run-working", "/tmp/project", true, ChatPhase::Running),
+        ];
+        let picked = super::select_stale_runs(&request, &chats, "s-qa");
+        let ids: Vec<&str> = picked.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["run-idle"],
+            "턴만 끝난 것 하나만 집어야 한다 — 죽은 것은 다시 멈출 것이 없고, 도는 것은 건드리지 않는다"
+        );
     }
 
     fn finished_chat(

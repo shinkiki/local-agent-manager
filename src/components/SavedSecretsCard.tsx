@@ -26,6 +26,7 @@ import { useI18n, type UiText } from "../lib/i18n";
 import type { SavedSecretView } from "../types";
 import { AppToggle, EmptyState, ErrorBanner, useConfirm } from "./Shared";
 
+import { formatDateTime } from "../lib/format";
 function nameIssueText(issue: NonNullable<ReturnType<typeof chatSecretNameIssue>>, text: UiText): string {
   switch (issue) {
     case "empty": return text("이름을 입력하세요.", "Enter a name.");
@@ -58,7 +59,7 @@ function validate(name: string, purpose: string, value: string, text: UiText): {
   return { name: normalized, purpose: purpose.trim(), value };
 }
 
-const dateText = (at: number | null) => (at === null ? null : new Date(at).toLocaleString());
+const dateText = (at: number | null) => (at === null ? null : formatDateTime(at));
 
 export function SavedSecretsCard({ active, reloadSignal = 0 }: {
   active: boolean;

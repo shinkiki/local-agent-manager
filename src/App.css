@@ -1806,6 +1806,15 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .modal { display: flex; width: min(520px, 100%); min-width: 0; max-height: min(86vh, 720px); flex-direction: column; border: 1px solid var(--x35485e); border-radius: 13px; background: var(--x090f16); box-shadow: 0 28px 90px var(--t-shadow-drawer); animation: modal-in 150ms ease-out; }
 /* 공급자별 본문 편집기처럼 칸이 여럿인 폼용. 세로는 기본 모달과 같게 두고 폭만 넓힌다. */
 .modal.wide { width: min(880px, 100%); max-height: min(90vh, 820px); }
+/* diff처럼 넓은 내용을 화면 안에서 최대화하는 보기. 새 창과 달리 현재 선택·모달 문맥은 유지한다. */
+.modal.full {
+  align-self: center;
+  justify-self: center;
+  width: calc(100vw - clamp(32px, 10vw, 96px));
+  min-height: 0;
+  height: calc(100dvh - clamp(32px, 10vw, 96px) - var(--keyboard-inset, 0px));
+  max-height: none;
+}
 .modal-header { display: flex; min-height: 56px; flex: none; align-items: center; justify-content: space-between; gap: 14px; padding: 0 14px 0 17px; border-bottom: 1px solid var(--border); background: var(--x0f1720); border-radius: 12px 12px 0 0; }
 .modal-title { display: flex; min-width: 0; align-items: center; gap: 8px; color: var(--xedf3f8); font-size: var(--ui-font-10); font-weight: 750; }
 .modal-title > svg { flex: none; color: var(--accent); }
@@ -4021,6 +4030,21 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
    서야 하므로 왼쪽 글머리에 맞춘다. */
 .round-report-empty { margin: 8px 0 0; color: var(--faint); font-size: var(--ui-font-8); }
 /* 회차 보고의 측정표(M10). 좁은 카드 안에서 세 칸만 쓴다. */
+/* 회차 상세 모달(RoundReportsModal). 보고 한 건이 <details> 하나이고, 머리줄(summary)이 접힘
+   손잡이다. 미결 결정이 있는 카드와 모달 제목은 같은 배지(round-goal-pending)로 알린다. */
+.round-goal-pending { border-color: rgba(233, 190, 93, .35); background: rgba(233, 190, 93, .1); color: var(--xe9be5d); }
+.round-report-modal-body { display: flex; flex-direction: column; gap: 8px; }
+.round-report-details { border: 1px solid var(--border-soft); border-radius: 9px; padding: 8px 10px; }
+.round-report-details > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; cursor: pointer; list-style: none; }
+.round-report-details > summary::-webkit-details-marker { display: none; }
+.round-report-details > summary::before { content: "▸"; color: var(--faint); font-size: var(--ui-font-7); }
+.round-report-details[open] > summary::before { content: "▾"; }
+.round-report-body { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.round-report-body > p { margin: 0; }
+.round-decision { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border: 1px dashed rgba(233, 190, 93, .45); border-radius: 8px; }
+.round-decision > p { margin: 0; font-weight: 600; }
+.round-decision-form.path-field-group { flex-direction: row; flex-wrap: wrap; align-items: center; }
+.round-decision-form > input { min-width: 200px; flex: 1; }
 .round-report-table { width: 100%; border-collapse: collapse; font-size: var(--ui-font-7); }.round-report-table th, .round-report-table td { padding: 2px 8px 2px 0; text-align: left; border-bottom: 1px solid var(--border-soft); }.round-report-table th { color: var(--muted); font-weight: 600; }
 /* 프로젝트 화면 · 형상관리 탭(ProjectGitPanel). 왼쪽 열은 변경·커밋·브랜치·스태시, 오른쪽은
    차이와 이력. 두 열 모두 자기 안에서 스크롤하도록 min-height 0을 준다. */
@@ -4047,6 +4071,8 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .git-inprogress { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
 .git-inprogress-actions { display: inline-flex; flex: none; gap: 6px; }
 .git-receipt { display: flex; flex-direction: column; gap: 6px; }
+.git-receipt-actions { display: flex; justify-content: flex-end; }
+.git-aia-resolve { border-color: rgba(var(--accent-rgb), .34); background: rgba(var(--accent-rgb), .1); color: var(--green); }
 .git-receipt-list small, .git-receipt-hint { color: var(--muted); font-size: var(--ui-font-8); }
 .git-conflict-list, .git-blocked-list { margin: 4px 0 0; padding-left: 18px; color: var(--text); font-size: var(--ui-font-8); }
 .git-conflict-list code { color: var(--danger); }
@@ -4057,7 +4083,15 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .git-change-group-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 4px 4px; }
 .git-change-group-head strong { color: var(--muted); font-size: var(--ui-font-8); }
 .git-change-group-head strong span { color: var(--faint); font-weight: 600; }
-.git-change-list, .git-branch-list, .git-worktree-list, .git-stash-list, .git-log-list { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.git-change-list, .git-branch-list, .git-branch-follow-list, .git-worktree-list, .git-stash-list, .git-log-list { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.git-branch-follow-card { padding: 8px; border: 1px solid var(--border-soft); border-radius: 6px; }
+.git-branch-follow-card dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 12px; margin: 6px 0 0; font-size: 12px; }
+.git-branch-follow-card dl div { display: flex; gap: 4px; min-width: 0; }
+.git-branch-follow-card dt { color: var(--muted); }
+.git-branch-follow-card dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* B5: 수신·송신 수 옆에 기준(마지막 fetch)을 붙여 실시간 값으로 읽히지 않게 한다. */
+.git-branch-follow-card .git-follow-basis { margin-left: 4px; color: var(--muted); font-size: 11px; }
+.git-log-list { gap: 0; }
 .git-change-row { display: flex; min-width: 0; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 6px; }
 .git-change-row:hover { background: rgba(var(--accent-rgb), .05); }
 .git-change-row.selected { background: rgba(var(--accent-rgb), .1); }
@@ -4078,23 +4112,52 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .git-branch-main { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 1px; }
 .git-branch-main strong { overflow: hidden; color: var(--xe4ebf3); font-size: var(--ui-font-8); text-overflow: ellipsis; white-space: nowrap; }
 .git-branch-main small { overflow: hidden; color: var(--faint); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
+.git-branch-context-menu { position: fixed; z-index: 120; display: flex; width: 230px; flex-direction: column; gap: 1px; padding: 6px; border: 1px solid var(--x35485e); border-radius: 11px; background: var(--x101923); box-shadow: 0 20px 48px var(--t-shadow-popover); }
+.git-branch-context-menu > header { min-width: 0; padding: 6px 8px 8px; border-bottom: 1px solid var(--border-soft); }
+.git-branch-context-menu > header strong { display: block; overflow: hidden; color: var(--xd3dde7); font-size: var(--ui-font-8); text-overflow: ellipsis; white-space: nowrap; }
+.git-branch-context-menu > button { display: flex; width: 100%; min-height: 32px; align-items: center; gap: 8px; padding: 0 8px; border: 0; border-radius: 7px; background: transparent; color: var(--xc6d1dc); font: inherit; font-size: var(--ui-font-8); font-weight: 650; text-align: left; cursor: pointer; }
+.git-branch-context-menu > button:hover:not(:disabled), .git-branch-context-menu > button:focus-visible { outline: 0; background: var(--x192634); color: var(--text); }
+.git-branch-context-menu > button:disabled { cursor: not-allowed; opacity: .45; }
+.git-branch-context-menu > button > svg { flex: none; color: var(--faint); }
 .git-worktree-row { flex-direction: column; align-items: flex-start; gap: 1px; }
 .git-worktree-row code { overflow: hidden; max-width: 100%; color: var(--xe4ebf3); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
 .git-worktree-row small { color: var(--faint); font-size: var(--ui-font-7); }
 .git-row-actions { display: inline-flex; flex: none; gap: 4px; }
-.git-log-row { display: flex; min-width: 0; flex-direction: column; border-top: 1px solid var(--border-soft); }
-.git-log-toggle { display: flex; width: 100%; min-width: 0; align-items: flex-start; gap: 10px; padding: 6px 12px; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
-.git-log-toggle:hover { background: var(--x0b1219); }
-.git-log-row:first-child { border-top: 0; }
-.git-log-sha { flex: none; padding-top: 2px; color: var(--faint); font-size: var(--ui-font-7); }
-.git-log-main { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.git-log-row { display: flex; min-width: 0; flex-direction: column; background: linear-gradient(90deg, var(--git-lane-bg) 0, transparent 56%); box-shadow: inset 0 1px var(--border-soft); }
+.git-log-toggle { display: flex; width: 100%; min-width: 0; align-items: stretch; gap: 10px; padding: 0 12px; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.git-log-toggle:hover { background: rgba(255, 255, 255, .025); }
+.git-log-row:first-child { box-shadow: none; }
+.git-log-head { display: flex; min-width: 0; align-items: stretch; }
+.git-log-head .git-log-toggle { min-width: 0; flex: 1; }
+.git-log-pick { flex: none; align-items: center; padding-left: 10px; }
+.git-log-row.picked { background: linear-gradient(90deg, var(--git-lane-bg) 0, rgba(255, 255, 255, .05) 56%); }
+.git-log-graph { position: relative; align-self: stretch; min-height: 38px; flex: none; }
+.git-log-graph svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.git-graph-stroke { fill: none; stroke: var(--git-lane-color); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.git-log-node { position: absolute; top: 50%; width: 9px; height: 9px; border: 2px solid var(--x0e161f); border-radius: 50%; background: var(--git-lane-color); box-shadow: 0 0 0 1px var(--git-lane-color); transform: translate(-50%, -50%); }
+.git-log-expanded { position: relative; display: flow-root; min-width: 0; }
+.git-log-graph-tails { position: absolute; top: 0; bottom: 0; left: 12px; min-height: 0; }
+.git-graph-tail { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--git-lane-color); transform: translateX(-50%); }
+.lane-color-0 { --git-lane-color: #e8ae54; --git-lane-bg: rgba(232, 174, 84, .09); }
+.lane-color-1 { --git-lane-color: #63b3ed; --git-lane-bg: rgba(99, 179, 237, .09); }
+.lane-color-2 { --git-lane-color: #68d391; --git-lane-bg: rgba(104, 211, 145, .09); }
+.lane-color-3 { --git-lane-color: #b794f4; --git-lane-bg: rgba(183, 148, 244, .09); }
+.lane-color-4 { --git-lane-color: #f687b3; --git-lane-bg: rgba(246, 135, 179, .09); }
+.lane-color-5 { --git-lane-color: #4fd1c5; --git-lane-bg: rgba(79, 209, 197, .09); }
+.lane-color-6 { --git-lane-color: #fc8181; --git-lane-bg: rgba(252, 129, 129, .09); }
+.lane-color-7 { --git-lane-color: #90cdf4; --git-lane-bg: rgba(144, 205, 244, .09); }
+.git-log-sha { flex: none; padding-top: 8px; color: var(--faint); font-size: var(--ui-font-7); }
+.git-log-main { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; padding: 6px 0; }
 .git-log-main strong { overflow: hidden; color: var(--xe4ebf3); font-size: var(--ui-font-8); text-overflow: ellipsis; white-space: nowrap; }
 .git-log-main small { color: var(--faint); font-size: var(--ui-font-7); }
 .git-log-refs { display: flex; flex-wrap: wrap; gap: 4px; }
+.git-log-refs .skill-extra-pill { border: 1px solid var(--git-lane-color); background: var(--git-lane-bg); color: var(--git-lane-color); }
 .git-commit-box textarea { width: calc(100% - 24px); margin: 0 12px; padding: 8px 9px; font-size: var(--ui-font-8); line-height: 1.5; resize: vertical; }
 .git-commit-box .form-actions, .git-log .form-actions { margin: 8px 12px 10px; }
 @media (max-width: 900px) {
-  .git-panel { grid-template-columns: minmax(0, 1fr); }
+  /* 한 열에서는 바깥 탭이 전체를 스크롤한다. 남은 높이에 맞춘 grid를 유지하면 왼쪽 묶음이
+     내용보다 짧게 수축하고, visible인 브랜치 목록 위에서 다음 행(이력)이 시작해 겹친다. */
+  .git-panel { display: flex; flex: none; flex-direction: column; }
   .git-panel-aside, .git-panel-main { overflow: visible; }
 }
 /* 채팅 비밀값 패널. 승인 카드의 비밀번호 칸(.chat-approval-secret)과 같은 노란 톤이지만 실행 설정 메뉴 자리에 얹히는 별도 상자다. 값은 어디에도 그리지 않는다. */
@@ -4104,13 +4167,19 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .git-diff-modal-title { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
 .git-diff-modal-title small { color: var(--faint); font-size: var(--ui-font-7); font-weight: 400; }
 .git-diff-modal-body { min-height: 120px; max-height: min(70vh, 900px); overflow: auto; }
+.modal.full .modal-body { overflow: auto; }
+.modal.full .git-diff-modal-body { max-height: none; overflow: visible; }
+.modal.full .git-diff-modal-body .skill-diff.git-diff {
+  overflow-x: visible;
+  overflow-y: visible;
+}
 .git-diff-window { display: flex; height: 100vh; flex-direction: column; }
 .git-diff-window-head { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--border); }
 .git-diff-window-head > div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
 .git-diff-window-head small { overflow: hidden; color: var(--faint); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
 .git-diff-window-body { min-height: 0; flex: 1; overflow: auto; padding: 12px 18px 24px; }
 /* 이력 행을 누르면 그 커밋이 바꾼 파일이 아래로 펼쳐진다. */
-.git-log-row.expanded { background: var(--x0b1219); }
+.git-log-row.expanded { background: linear-gradient(90deg, var(--git-lane-bg) 0, var(--x0b1219) 65%); }
 .git-commit-files { display: flex; flex-direction: column; gap: 2px; margin: 0 0 6px 32px; padding: 0 12px 6px; list-style: none; }
 .git-commit-file { display: flex; min-width: 0; align-items: center; gap: 8px; }
 .git-commit-file .git-change-path { min-width: 0; flex: 1; }

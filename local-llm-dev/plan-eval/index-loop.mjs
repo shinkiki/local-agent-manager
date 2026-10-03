@@ -7,6 +7,12 @@ export const TASKS = [
     { id: "web-to-notion", need: [["webfetch", "bash"], ["notion-create-pages"]], needReadOnly: "cannot_do", prompt: "인터넷에서 React 최신 안정 버전을 조사해서 노션에 정리해줘" },
     { id: "find-then-edit", need: [["notion-search", "notion-ai-search", "notion-fetch", "notion-list-recent-pages", "notion-list-private-pages"], ["notion-update-page"]], needReadOnly: "cannot_do", prompt: "노션에서 '테스트 페이지'를 찾아서 그 페이지에 오늘 날짜를 적은 줄을 하나 덧붙여줘." },
     { id: "local-read", need: [["read", "bash"]], prompt: "이 폴더 package.json 의 name 필드가 무엇인지 읽어서 알려줘." },
+    // 2026-10-02 코드 리팩토링 10회차: 리팩토링 과제에 계획 턴이 없었다. 실행 탐침
+    // (`tuning-eval/refactor-loop.mjs`)은 도구 다섯을 한 턴에 열어 평평하게 돌리는데,
+    // 제품은 계획을 세우고 단계마다 도구 **하나**만 연다. 그래서 "읽고 고친다"가 두 단계로
+    // 서는지, 고치는 단계가 어느 도구를 고르는지는 아무도 재지 않았다. 읽기 전용에서는
+    // write·edit·bash 가 색인에 없으므로 정답이 거절로 뒤집힌다(반대 방향 과제).
+    { id: "local-refactor", need: [["read", "bash"], ["edit", "write"]], needReadOnly: "cannot_do", prompt: "report.mjs 안에 같은 서식 코드가 두 번 반복돼. 그 부분을 함수 하나로 뽑아내서 양쪽이 같이 쓰게 고쳐줘." },
     { id: "pick-comment", need: [["notion-create-comment"]], needReadOnly: "cannot_do", prompt: "노션의 어떤 페이지에 '확인했습니다'라는 댓글을 하나 달아줘." },
     { id: "impossible", need: "cannot_do", prompt: "내 지메일에 온 마지막 메일을 읽어서 요약해줘." },
     // 9.13: 전용 파이썬 도구가 없으니 write(.py) → bash(실행) 두 단계로 나뉘어야 한다.
@@ -28,6 +34,20 @@ export function groupToolIndex(index) {
         lines.push("- " + name + ": " + description);
     }
     return lines.join("\n");
+}
+// 10회차가 남긴 물음: `write` 의 두 번째 문장("Overwrites the whole file.")이
+// local-refactor 에서 통째로 다시 쓰는 길을 밀어 주는가. `trim-write` 후보가 그 문장만 뺀
+// 색인으로 돈다. **환경변수가 아니라 후보인 이유**: 11회차에 환경변수로 두고 base 20회 →
+// trim 20회를 잇달아 돌렸더니 같은 레인이 창 사이에 7점(18/20 → 11/20, 색인은 그대로)을
+// 움직여 두 수를 견줄 수 없었다. 후보로 두면 탐침이 시행마다 번갈아 돌리므로(index-probe
+// 의 `i % 2` 뒤집기) 창이 흔들려도 두 후보가 같이 흔들린다.
+export function trimWriteSecondSentence(index) {
+    return index.split("\n").map(line => {
+        if (!line.startsWith("- write: "))
+            return line;
+        const cut = line.indexOf(". ", "- write: ".length);
+        return cut < 0 ? line : line.slice(0, cut + 1);
+    }).join("\n");
 }
 export function glossToolIndex(index) {
     const glosses = {
@@ -76,15 +96,18 @@ const toolList = contract.schemas.map(s => ({ type: "function", function: { ...s
 // OpenCode's invalid tool is part of the real planning surface.
 toolList.unshift({ type: "function", function: { name: "invalid", description: "Do not use", parameters: { type: "object", properties: { tool: { type: "string" }, error: { type: "string" } }, required: ["tool", "error"] } } });
 export async function plan(task, model, variant, marker, complete) {
-    if (!["baseline", "snapshot", "review", "guard", "grouped", "single", "four-tools", "gloss", "draft-only", "with-insert"].includes(variant))
+    if (!["baseline", "snapshot", "review", "guard", "grouped", "single", "four-tools", "gloss", "trim-write", "draft-only", "with-insert"].includes(variant))
         throw Error("Unknown experimental variant: " + variant);
+    // `trim-write` 는 **색인 한 줄만** 다른 `guard` 다. 다른 가드까지 달라지면 두 수가 또
+    // 섞이므로, guard 가 보는 모든 자리에서 같이 참이어야 한다.
+    const guardLike = ["guard", "trim-write"].includes(variant);
     // grouped keeps the four-tool control used in its original length experiment.
     const maxTools = { single: 1, "four-tools": 4, grouped: 4 }[variant] ?? contract.maxTools;
     // Explicit controls keep their recorded surface; guard follows the product draft agent.
     const draftNames = contract.draftSchemas?.map(s => "plan_" + s.name);
     const planningTools = structuredClone(toolList).filter(t => variant === "draft-only"
         ? t.function.name !== "plan_insert_step"
-        : variant === "guard" && draftNames
+        : guardLike && draftNames
             ? t.function.name === "invalid" || draftNames.includes(t.function.name)
             : true);
     const available = planningTools.map(t => t.function.name).sort().join(", ");
@@ -95,13 +118,15 @@ export async function plan(task, model, variant, marker, complete) {
     const request = task.prompt + "\n\n(회차 " + marker + ")";
     // READ_ONLY=1 이면 plan(읽기 전용) 모드의 색인 — 작업 공간은 read·webfetch, 플러그인은 readOnly 도구만(9.14).
     const baseIndex = process.env.READ_ONLY ? contract.indexReadOnly : contract.index;
-    const renderedIndex = variant === "grouped" ? groupToolIndex(baseIndex) : variant === "gloss" ? glossToolIndex(baseIndex) : baseIndex;
-    const index = process.env.NO_ALIAS ? renderedIndex.replace(/ · 노션/g, "") : renderedIndex;
+    const renderedIndex = variant === "grouped" ? groupToolIndex(baseIndex) : variant === "gloss" ? glossToolIndex(baseIndex) : variant === "trim-write" ? trimWriteSecondSentence(baseIndex) : baseIndex;
+    const aliasIndex = process.env.NO_ALIAS ? renderedIndex.replace(/ · 노션/g, "") : renderedIndex;
+    const index = aliasIndex;
     // 색인은 시스템 글에 있다(9.15). 사용자 턴은 요청뿐이다 — 제품이 그렇게 보내므로
     // 탐침도 그래야 같은 것을 잰다.
     const messages = [{ role: "system", content: (process.env.READ_ONLY ? contract.systemPromptReadOnly : contract.systemPrompt).replace("<INDEX>", index) }, { role: "user", content: contract.prompt.replace("<REQUEST>", request) }];
+    const indexNames = index.split("\n").map(l => l.match(/^- ([^ :]+)/)?.[1]).filter(Boolean);
     const steps = [], trace = [];
-    let nudges = 0, badNames = 0, mismatches = 0, repairs = 0, reviewed = -1, directIndexCall, refusalBounced = false;
+    let nudges = 0, badNames = 0, mismatches = 0, repairs = 0, reviewed = -1, directIndexCall, refusalBounced = false, readOnlyPlanBounced = false;
     const finish = ended => ({ steps, ended, nudges, badNames, mismatches, repairs, turns: trace.length, maxTools, indexChars: index.length, trace });
     // 제품과 같은 가드(2026-09-27): 제목이 플러그인 이름을 말하는데 도구가 그 플러그인 것이 아니면 되묻는다.
     const listedTools = list => list.slice(0, 20).join(", ") + (list.length > 20 ? " and " + (list.length - 20) + " more" : "");
@@ -113,6 +138,32 @@ export async function plan(task, model, variant, marker, complete) {
                 return contract.pluginMismatchError.replace("<ALIAS>", alias).replace("<TOOLS>", listedTools(group.tools));
         }
         return null;
+    };
+    // 제품의 두 번째 가드(2026-10-02, 11회차): 제목은 고친다는데 도구가 전부 읽기 전용이면
+    // 되묻는다. 낱말·도구 목록·문구를 전부 계약에서 읽으므로 제품이 바뀌면 탐침도 바뀐다.
+    const writingIntentMismatch = (title, ts) => {
+        const lowered = title.toLowerCase();
+        if (!(contract.writeIntentWords ?? []).some(w => lowered.includes(w)))
+            return null;
+        const readers = contract.readingTools ?? [];
+        if (!ts.length || !ts.every(t => readers.includes(t)))
+            return null;
+        const writers = (contract.writingTools ?? []).filter(w => names.includes(w));
+        return writers.length ? contract.writingIntentError.replace("<TOOLS>", listedTools(ts)).replace("<WRITERS>", listedTools(writers)) : null;
+    };
+    // 제품의 세 번째 가드(2026-10-03, 12회차): 요청은 고치라는데 모든 단계가 읽기 전용이면
+    // 확정을 **한 번** 되돌린다. 두 번째 finish_plan 은 제품처럼 그대로 받는다.
+    const readOnlyPlan = () => {
+        const lowered = request.toLowerCase();
+        if (!(contract.writeIntentWords ?? []).some(w => lowered.includes(w)))
+            return null;
+        const readers = contract.readingTools ?? [];
+        if (!steps.length || !steps.every(s => s.tools.length && s.tools.every(t => readers.includes(t))))
+            return null;
+        // 모듈 수준의 `names` 가 아니라 **이 턴이 실제로 보낸 색인**에서 읽는다. 읽기 전용
+        // 모드에는 고칠 수 있는 도구가 색인에 없으므로 제품처럼 발동하지 않아야 한다.
+        const writers = (contract.writingTools ?? []).filter(w => indexNames.includes(w));
+        return writers.length ? contract.readOnlyPlanError.replace("<WRITERS>", listedTools(writers)) : null;
     };
     const listed = names.slice(0, 20).join(", ") + (names.length > 20 ? " and " + (names.length - 20) + " more" : "");
     for (let turn = 0; turn < 60; turn++) {
@@ -143,17 +194,22 @@ export async function plan(task, model, variant, marker, complete) {
                     reviewed = steps.length;
                     output = { ...feedback(request, steps, variant), next: "아직 실행을 시작하지 않았다. 이것은 확정 전 검토용 초안이다. 요청에서 요구한 결과·저장 위치와 각 단계의 도구를 대조하라. 빠진 작업이 있으면 add_step 으로 더하고, 모두 담겼으면 finish_plan 을 한 번 더 불러 확정하라." };
                 }
+                else if (guardLike && !readOnlyPlanBounced && readOnlyPlan()) {
+                    readOnlyPlanBounced = true;
+                    mismatches++;
+                    output = readOnlyPlan();
+                }
                 else
                     return finish("확정");
             }
             else if (name === "cannot_do") {
                 if (typeof args.reason !== "string" || !args.reason.trim())
                     output = "You must state why it cannot be done";
-                else if (variant === "guard" && directIndexCall) {
+                else if (guardLike && directIndexCall) {
                     output = contract.directIndexCallError.replaceAll("<TOOL>", directIndexCall);
                     directIndexCall = undefined;
                 }
-                else if (variant === "guard" && steps.length && !refusalBounced) {
+                else if (guardLike && steps.length && !refusalBounced) {
                     // 적어 둔 단계를 쥐고 거절하는 길은 제품이 한 번 되돌린다(2026-09-26).
                     // 탐침이 이 보호를 모르면 제품에 없는 실패를 세게 된다.
                     output = contract.refusalDraftError.replaceAll("<STEPS>", String(steps.length));
@@ -167,7 +223,7 @@ export async function plan(task, model, variant, marker, complete) {
             else if (name === "answer_now") {
                 if (typeof args.answer !== "string" || !args.answer.trim())
                     output = "You must write the answer text";
-                else if (args.answer.trim() && ["guard", "grouped", "single", "four-tools", "gloss", "draft-only", "with-insert"].includes(variant) && steps.length)
+                else if (args.answer.trim() && ["guard", "grouped", "single", "four-tools", "gloss", "trim-write", "draft-only", "with-insert"].includes(variant) && steps.length)
                     output = contract.answerDraftError;
                 else if (args.answer.trim())
                     return finish("바로답함");
@@ -203,6 +259,10 @@ export async function plan(task, model, variant, marker, complete) {
                     mismatches++;
                     output = pluginMismatch(args.title.trim(), ts);
                 }
+                else if (writingIntentMismatch(args.title.trim(), ts)) {
+                    mismatches++;
+                    output = writingIntentMismatch(args.title.trim(), ts);
+                }
                 else if (uses.some(n => n < 1 || n > steps.length))
                     output = "Step " + uses.find(n => n < 1 || n > steps.length) + " does not exist yet. Only numbers of steps already written may be used";
                 else {
@@ -214,7 +274,7 @@ export async function plan(task, model, variant, marker, complete) {
             else {
                 repairs++;
                 const requested = name === "invalid" ? args.tool : raw;
-                if (variant === "guard" && !directIndexCall && names.includes(requested))
+                if (guardLike && !directIndexCall && names.includes(requested))
                     directIndexCall = requested;
                 output = "The arguments provided to the tool are invalid: " + (name === "invalid" ? args.error : "Model tried to call unavailable tool '" + requested + "'. Available tools: " + available + ".");
             }

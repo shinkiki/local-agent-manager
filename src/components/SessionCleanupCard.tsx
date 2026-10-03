@@ -14,6 +14,7 @@ import type { SessionCleanupPolicy, SessionCleanupPreview, SessionCleanupReceipt
 import { AppToggle, ErrorBanner, useConfirm } from "./Shared";
 import { errorText } from "../lib/errorText";
 
+import { formatDateTime } from "../lib/format";
 /*
  * 아래 세 껍데기(`loadWhileMounted`·`useCardTask`·`useLoadOnActiveEntry`)는 SettingsView.tsx의
  * 같은 이름 함수를 그대로 옮겨 적은 것이다. 설정 화면의 다른 카드들이 아직 그쪽 것을 쓰고,
@@ -555,7 +556,7 @@ function SessionCleanupSchedule({ status, policy, locked, onPatch, onToggleEnabl
           <strong>{text("실행 주기", "Interval")}</strong>
           <small>{status.lastRunAt === null
             ? text("아직 실행한 적이 없습니다.", "Has not run yet.")
-            : text(`마지막 실행 ${new Date(status.lastRunAt).toLocaleString()}`, `Last run ${new Date(status.lastRunAt).toLocaleString()}`)}</small>
+            : text(`마지막 실행 ${formatDateTime(status.lastRunAt)}`, `Last run ${formatDateTime(status.lastRunAt)}`)}</small>
         </span>
         <span className="session-cleanup-condition-value">
           <CleanupNumberInput
@@ -615,7 +616,7 @@ function SessionCleanupReceipts({ receipts }: { receipts: SessionCleanupReceipt[
       <ul>
         {receipts.slice(0, 5).map((receipt) => (
           <li key={receipt.startedAt} className={receiptFailed(receipt) ? "failed" : undefined}>
-            <span>{new Date(receipt.startedAt).toLocaleString()}</span>
+            <span>{formatDateTime(receipt.startedAt)}</span>
             <small>{receipt.manual ? text("수동", "Manual") : text("자동", "Automatic")} · {receiptSummary(receipt, text)}</small>
           </li>
         ))}

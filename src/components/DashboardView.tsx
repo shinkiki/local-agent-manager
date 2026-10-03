@@ -14,6 +14,7 @@ import { displayPath } from "../lib/displayPath";
 import { usageSeriesColor } from "../lib/usageSeriesColor";
 import { useEffectiveDark } from "../lib/useDiagramSvg";
 
+import { runtimeText } from "../lib/i18nRuntime";
 interface DashboardProps {
   snapshot: ManagerSnapshot;
   scheduler: SchedulerSnapshot | null;
@@ -40,6 +41,11 @@ const DASHBOARD_PROVIDER_SHORT_NAMES: Record<ProviderId, string> = {
   antigravity: "AG",
   local: "로컬",
 };
+
+/** 짧은 이름. "로컬"만 번역이 필요한 낱말이라 화면 언어를 따른다(나머지는 고유명사). */
+function dashboardProviderShortName(provider: ProviderId): string {
+  return provider === "local" ? runtimeText("로컬", "Local") : DASHBOARD_PROVIDER_SHORT_NAMES[provider];
+}
 
 /**
  * 주간 추이 한 주의 전체 세션 수. 최댓값을 잡을 때와 막대를 그릴 때가 따로 세고 있었는데,
@@ -138,7 +144,7 @@ function dashboardStatCards(dashboard: ManagerSnapshot["dashboard"], text: Text)
     {
       label: text("전체 세션", "All sessions"),
       value: dashboard.sessionCount.toLocaleString(),
-      detail: PROVIDER_IDS.map((provider) => `${DASHBOARD_PROVIDER_SHORT_NAMES[provider]} ${dashboard.sessionsBySource[provider]}`).join(" · "),
+      detail: PROVIDER_IDS.map((provider) => `${dashboardProviderShortName(provider)} ${dashboard.sessionsBySource[provider]}`).join(" · "),
     },
     {
       label: text("총 토큰", "Total tokens"),
@@ -396,7 +402,7 @@ function WeeklySessionTrendPanel({ weekly }: { weekly: ManagerSnapshot["dashboar
             <Fragment key={provider}>
               {index > 0 && " "}
               <i className={provider} />
-              {DASHBOARD_PROVIDER_SHORT_NAMES[provider]}
+              {dashboardProviderShortName(provider)}
             </Fragment>
           ))}
         </div>

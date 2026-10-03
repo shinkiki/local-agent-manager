@@ -153,6 +153,25 @@ const ADAPTERS: &[SkillAdapter] = &[
     },
 ];
 
+/// 시스템 스킬을 깔 공급자 개인 스킬 루트. **홈이 이미 있는 공급자만** 돌려준다.
+///
+/// 쓰지 않는 공급자의 홈을 앱이 새로 만들지 않는다(G3: 공급자 소유 영역). 나중에 그
+/// 공급자를 설치하면 홈이 생기고, 다음 기동의 `ensure_system_skills`가 그때 깐다 —
+/// 공급자를 뒤늦게 추가해도 따로 할 일이 없다.
+pub(crate) fn existing_personal_skill_roots(home: &Path) -> Vec<(ProviderId, PathBuf)> {
+    ADAPTERS
+        .iter()
+        .filter_map(|adapter| {
+            let root = home.join(adapter.personal_root_relative);
+            // 스킬 루트 자체가 아직 없어도, 공급자 홈(그 위 디렉터리)이 있으면 그 공급자를
+            // 쓰고 있다는 뜻이라 루트를 만들어 깐다. 홈조차 없으면 건너뛴다.
+            let provider_home = root.parent()?;
+            let in_use = root.exists() || provider_home.exists();
+            in_use.then_some((adapter.provider, root))
+        })
+        .collect()
+}
+
 /// 다른 공급자만 해석하는 프런트매터 키. 게시할 때 대상 공급자가 쓰지 않는 키만
 /// 정확히 걷어내고, 모르는 키는 손대지 않는다. 알 수 없는 키를 지우는 쪽이 원본
 /// 정보를 잃게 만들기 때문이다.
@@ -3928,6 +3947,34 @@ mod tests {
 
     /// 프로젝트 루트는 등록 프로젝트마다 하나씩, 공급자별 상대 경로로 붙는다.
     /// 위치 지정 게시 대상(`resolve_install_root`)도 같은 경로를 써야 한다.
+    /// 시스템 스킬은 홈이 있는 공급자에만 깔린다. 쓰지 않는 공급자의 홈을 앱이 새로
+    /// 만들면 공급자 소유 영역(G3)을 침범하고, 그 공급자를 나중에 설치하면 홈이 생겨
+    /// 다음 기동이 알아서 깐다.
+    #[test]
+    fn personal_skill_roots_cover_only_providers_whose_home_exists() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let home = temporary.path();
+        // Claude 는 스킬 루트까지 있고, Codex 는 홈만 있다(아직 스킬을 깐 적 없음).
+        // 둘 다 "그 공급자를 쓰고 있다"는 뜻이라 설치 대상이다.
+        std::fs::create_dir_all(home.join(".claude/skills")).expect("claude");
+        std::fs::create_dir_all(home.join(".codex")).expect("codex");
+
+        let roots = existing_personal_skill_roots(home);
+        let picked: Vec<ProviderId> = roots.iter().map(|(provider, _)| *provider).collect();
+        assert!(picked.contains(&ProviderId::Claude));
+        assert!(picked.contains(&ProviderId::Codex));
+        // 홈이 없는 공급자는 고르지 않는다 — 쓰지 않는 공급자의 홈을 앱이 만들지 않는다(G3).
+        assert!(!picked.contains(&ProviderId::Antigravity));
+        assert!(!picked.contains(&ProviderId::Local));
+        for (_, root) in &roots {
+            assert!(
+                root.starts_with(home),
+                "홈 밖을 가리킨다: {}",
+                root.display()
+            );
+        }
+    }
+
     #[test]
     fn adapter_project_roots_match_resolved_install_root() {
         let temp = TempDir::new().expect("temp");

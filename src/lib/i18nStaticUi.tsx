@@ -210,13 +210,24 @@ function translateStaticUiTree(target: Node, rewrite: StaticUiRewrite): void {
   eachDescendantStaticUiSlot(target, apply);
 }
 
+/** 한글·가나·한자 없이 라틴 문자와 기호로만 된 글자인지. 영어 화면의 되짚기 생략 판정이다. */
+export function isPlainLatinText(value: string): boolean {
+  return !/[\p{Script=Hangul}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(value)
+    && !/[^\p{Script=Latin}\p{N}\p{P}\p{S}\p{Z}\s]/u.test(value);
+}
+
 export function StaticUiLocalization({ locale, messages }: { locale: AppLocale; messages: Record<string, string> }) {
   useEffect(() => {
     const root = document.getElementById("root");
     if (!root) return undefined;
     const rewrite: StaticUiRewrite = {
       translate: (source) => localizedStaticText(source, locale, messages),
-      restate: (current) => canonicalSourceText(current, messages, staticUiKoreanByEnglish),
+      // 영어 화면에서 한글 없는 라틴 글자는 컴포넌트가 이미 영어로 그린 값이다. 그것을 한국어로
+      // 되짚었다가 다시 옮기면, 같은 영어를 쓰는 다른 원문의 번역으로 바뀐다 — 버튼 "Pause"가
+      // "일시정지"를 거쳐 상태 "Paused"가 됐다. 한국어 리터럴과 제3언어 글자만 되짚는다.
+      restate: (current) => locale === "en" && isPlainLatinText(current)
+        ? current
+        : canonicalSourceText(current, messages, staticUiKoreanByEnglish),
     };
     let applying = false;
     const apply = (target: Node) => {

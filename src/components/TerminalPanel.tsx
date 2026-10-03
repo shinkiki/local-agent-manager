@@ -8,6 +8,7 @@ import { ErrorBanner, NoticeBanner } from "./Shared";
 import { errorText } from "../lib/errorText";
 import { useI18n, type UiText } from "../lib/i18n";
 
+import { formatTimeOnly } from "../lib/format";
 type TerminalSurfacePhase = TerminalPhase | "idle" | "connecting";
 
 const MOBILE_TERMINAL_QUERY = "(max-width: 760px)";
@@ -426,7 +427,7 @@ function TerminalSurface({
           <span className={`terminal-status terminal-status-${phase}`} />
           <strong>{phaseLabel(phase, text)}</strong>
           {info?.reconnectDeadline && phase === "detached" && (
-            <small>{new Date(info.reconnectDeadline).toLocaleTimeString()}{text("까지 재연결 가능", " (reconnect deadline)")}</small>
+            <small>{formatTimeOnly(info.reconnectDeadline)}{text("까지 재연결 가능", " (reconnect deadline)")}</small>
           )}
         </div>
         <div>

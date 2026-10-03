@@ -1,6 +1,7 @@
 import type { CypressRunState, CypressRunStatus, CypressRunTest } from "../types";
 import { cleanPathInput } from "./crossPlatformPath.ts";
 
+import { runtimeText } from "./i18nRuntime.ts";
 // 실행 한 건을 사람이 읽는 모양으로 바꾸는 규칙 — 상태별 요약 문구, 실패 테스트 평탄화,
 // 산출물 경로의 표시 이름. 작업공간 안의 파일을 어디까지 만질 수 있는지(cypressWorkspace.ts)와
 // 바뀌는 이유가 다르다. 실행 상태 갈래가 늘거나 요약 문구를 손볼 때 경로 검증 규칙을 함께
@@ -9,10 +10,10 @@ import { cleanPathInput } from "./crossPlatformPath.ts";
 function formatDuration(durationMs: number): string {
   if (durationMs < 1000) return `${Math.max(0, Math.round(durationMs))}ms`;
   const seconds = durationMs / 1000;
-  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}초`;
+  if (seconds < 60) return runtimeText(`${seconds.toFixed(seconds < 10 ? 1 : 0)}초`, `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`);
   const minutes = Math.floor(seconds / 60);
   const rest = Math.round(seconds - minutes * 60);
-  return rest > 0 ? `${minutes}분 ${rest}초` : `${minutes}분`;
+  return rest > 0 ? runtimeText(`${minutes}분 ${rest}초`, `${minutes}m ${rest}s`) : runtimeText(`${minutes}분`, `${minutes}m`);
 }
 
 /**

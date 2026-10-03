@@ -79,6 +79,8 @@ default app-data boundary or hold credential material there.
 | C17 | saved secret vault (`saved_secrets.rs`) | the OS Keychain item derived from a secret name, plus its name, purpose, agent-use flag and timestamps in the app data directory | the user saved it deliberately and deletes it the same way; no provider state is touched | yes — the whole feature follows the one `remoteWrite` switch (`C17-7`) |
 | C14 | local provider execution harness (`acp.rs`, `opencode_config.rs`, `local_llm.rs`) | exactly two keys in the user-owned `~/.config/opencode/opencode.json` — `provider.agent-manager-local` and the `agent.agent-manager-local*` entries — plus the connection record in the app data directory and the OS Keychain item holding its API key | every other key is read and written back untouched and the file is replaced atomically; turning the connection off removes the two keys rather than leaving a stale address behind | yes — registering the connection and probing a server address are both write-gated, the probe deliberately so (`C14-7`) |
 | C16 | project git adapter (`project_git.rs`) | the git repository whose worktree contains an **active registered project** — index, refs, stash and worktree files — only through the user's own `git` binary; a repository whose top-level is the user's home or a restricted root is refused | every offered operation leaves a reflog / `ORIG_HEAD` / stash anchor on its receipt (`headBefore`, `headAfter`, `droppedStashSha`); irrecoverable commands (`reset --hard`, `clean`, discarding worktree changes, `branch -D`, `--force*`, `--amend`, interactive rebase) are not offered at all | yes, except `push_project_git` (host-only: it publishes outward with the host user's credentials) |
+| C18 | cask quarantine release (`cli_quarantine.rs`) | the `com.apple.quarantine` extended attribute — nothing else — on regular files directly inside the resolved provider CLI's `Caskroom/<token>/<version>/…` folder, for a cask token registered in `TRUSTED_CASK_SIGNERS` and a file whose signature satisfies that vendor's Developer ID team | the attribute only makes Gatekeeper re-evaluate a notarized binary on every exec; file contents, permissions and every other attribute stay as installed, and the next cask upgrade stamps a fresh folder anyway | yes — it runs as part of resolving an executable, never as its own operation |
+| C19 | local overlay adapter (`project_overlays.rs`) | 앱 데이터의 `<app data>/git-overlays/`, 그리고 스냅샷·적용 시점에만 **등록된 활성 프로젝트** 작업 트리의 선택된 추적 파일 | patch를 먼저 쓰고 digest까지 확인한 뒤에만 되돌리고, 재적용은 `git apply --check`가 통과할 때만 한다. 세트 삭제는 앱 소유 휴지통으로 옮긴다 | 읽기는 열려 있고, 세트 저장·삭제와 작업 트리를 바꾸는 스냅샷·적용 모두 write mode에서 원격 가능(2026-10-02 사용자 결정) |
 
 ### C1 — credential adapter
 
@@ -1236,6 +1238,92 @@ identity, SSH, caches and the browser profile with it. This exception exists to 
   `C12-11` measurements there, assume neither, and treat the platform the way `C12-7` treats a failed
   probe — refuse, never fall back.
 
+
+### C18 — cask quarantine release (`cli_quarantine.rs`)
+
+Homebrew stamps `com.apple.quarantine` on every file of a freshly installed or upgraded cask.
+Codex's `codex-code-mode-host` then stalls in Gatekeeper evaluation on every exec, and every
+code-mode-only model fails with `timed out negotiating with the code-mode host`. Upgrades also
+happen in a terminal outside the app, so the release runs where an executable is resolved
+(`chat::resolve_executable`, `cli_updates::resolve_status`), not only after an in-app update.
+
+- **C18-1** Consider only regular files directly inside the resolved executable's folder, and only
+  when that folder sits below `Caskroom/<token>/<version>/`. Never follow a symlink, never descend
+  into a subfolder, never touch a Cellar, npm or standalone install.
+- **C18-2** Release only for a cask token listed in `TRUSTED_CASK_SIGNERS`, and only a file that
+  passes `/usr/bin/codesign --verify --strict` against a Developer ID Application requirement
+  pinned to that token's team. Register a token only after reading `TeamIdentifier=` from the
+  installed binaries. An unsigned, ad-hoc or foreign-team file keeps its attribute and is logged.
+- **C18-3** Remove exactly the `com.apple.quarantine` attribute. File contents, permissions and all
+  other attributes stay untouched.
+- **C18-4** A failure never blocks the caller's launch; the outcome is logged only. A folder is
+  remembered as settled only when nothing was refused, so a refused file is retried on the next
+  resolution.
+
+
+### C19 — local overlay adapter
+
+브랜치마다 다른 로컬 설정(디버그 플래그, 로컬 포트, 실험용 상수)을 브랜치를 옮길 때마다 손으로
+되돌리는 일을 없앤다. overlay는 추적 중인 파일의 unstaged 변경을 patch로 떠서 앱 데이터에
+보관하고, 작업 트리를 HEAD 원본으로 되돌렸다가, 나중에 같은 patch를 다시 적용한다. 그 되돌림이
+`git restore --source=HEAD --worktree`이고 **C16-4가 명시로 금지한 명령**이라, C16 안에서는 쓸 수
+없다. 또 patch는 캐시가 아니라 **사용자 로컬 데이터**다 — C2처럼 "공급자가 다시 만든다"는 복구
+근거가 없으므로 복구 근거를 patch 저장 순서 자체가 진다.
+
+- **C19-1** 세트는 `<app data>/git-overlays/<저장소 식별자>/<세트 id>/`에만 쓴다. 사용자 저장소
+  안에는 patch도 메타데이터도 잠금 파일도 두지 않는다 — 저장소 안에 두면 그 파일이 브랜치를
+  따라다니고, overlay가 없애려던 문제를 overlay가 다시 만든다. 식별자와 세트 id는 단일 경로
+  성분으로 검증하고(C3-6), 대상 파일 경로는 `classify_relative_path`·`assert_within_root`를
+  지나며 `.git` 성분과 pathspec 매직을 거절한다(C16-5, G10). patch는
+  `git diff --binary --full-index`로 뜬다 — `--full-index`가 없으면 축약 blob 해시가 재적용
+  시점에 모호해지고 `--binary`가 없으면 바이너리 변경이 조용히 빠진다. 저장은 staged write 뒤
+  atomic replace이고 디렉터리는 `0700`, patch 파일은 `0600`이다. 메타데이터는 repository
+  identity, canonical root, 대상 경로, snapshot id, 생성 시점, 기준 HEAD, patch digest, 적용
+  상태만 담는다. 파일 내용과 patch 본문은 메타데이터에 들어가지 않는다.
+- **C19-2** patch 본문에는 파일 **내용**이 그대로 들어가므로, `.env`, `*.pem`, `*.key`, `id_*`,
+  `credential`/`credentials`, `secrets`, `.npmrc`, `.netrc`에 걸리는 경로는 기본 제외하고 **사유와
+  함께 거절**한다. G4가 금지하는 것은 Agent Manager 파일에 비밀값을 남기는 것이고, 앱 데이터
+  안의 patch가 바로 그 파일이다. 거절은 조용하지 않다 — 어느 경로가 어느 규칙에 걸렸는지
+  영수증에 싣는다.
+  - v1은 예외 등록을 제공하지 않는다. 거절 사유만 보여 주고, 민감 경로를
+    overlay에 넣는 길은 열지 않는다.
+- **C19-3** 이 예외가 더하는 git 명령은 정확히 둘이다 — `git restore --source=HEAD --worktree`
+  (patch 저장이 성공한 **뒤에만**)와 `git apply`(재적용). C16-4가 금지한 나머지는 여전히
+  금지다: 어떤 `--force*`도, `reset --hard`도, `clean`도, `--amend`도, 대화형 rebase도 이 예외가
+  열지 않는다. `git checkout`은 worktree 복원에 쓰지 않는다(`restore`가 범위가 좁다). 순서가
+  안전의 전부다 — patch를 쓰고 fsync하고 digest를 확인한 뒤에 되돌리므로, 저장이 실패하면 작업
+  트리는 한 글자도 바뀌지 않는다. 재적용은 `git apply --check`가 먼저 돌고, 실패하면 아무것도
+  적용하지 않은 채 `overlayNeedsResolution`과 충돌한 `affected` 경로를 돌려준다. 부분 적용과
+  3-way 자동 병합은 v1에 없다 — 절반 적용된 작업 트리는 이 기능이 되돌릴 수 없는 상태다.
+  자동 검사·적용은 **앱이 시작한** Git 작업(switch/pull/rebase/merge) 뒤에만 하고, 터미널 같은
+  외부 Git 작업을 감지한 경우에는 자동 적용하지 않고 검사 결과와 적용 버튼만 내민다. Git 작업
+  자체가 실패하면 이전 브랜치에서 재적용을 시도하고, 그 재적용까지 실패해도 **patch는
+  보존하고** 복구 영수증을 남긴다 — patch를 잃는 경로는 어디에도 없다. v1이 지원하는 것은
+  HEAD에 있는 추적된 일반 파일의 unstaged 변경뿐이고, `untracked`, `staged`, `deleted`,
+  `rename`, `modeChange`, `submodule`, `conflicted`, `symlink`, `unbornHead`는 등록 또는 스냅샷
+  생성을 사유와 함께 거절한다. 저장소 하나에 변경 하나다 — C16-3의 저장소 단위 잠금을 git
+  어댑터와 **공유**해 overlay 적용과 `git` 변경이 서로를 가로지르지 않게 하고, 겹치면 `busy`를
+  돌려준다.
+- **C19-4** 읽기(`list_project_overlay_sets`, `check_project_overlay_apply`)는 원격 UI에 열린다.
+  세트 저장·삭제(`save_project_overlay_set`, `delete_project_overlay_set`)와 작업 트리를 바꾸는
+  둘(`snapshot_project_overlay`, `apply_project_overlay`)은 모두 쓰기 게이트를 지나고 **write
+  mode에서 원격 가능**하다(2026-10-02 사용자 결정). 초안은 뒤의 둘을 C16-7의 push와 같은 부류로
+  보아 호스트 전용으로 제안했으나, push가 호스트 전용인 이유는 호스트 사용자의 자격증명으로
+  **바깥으로** 내보내기 때문이고 overlay는 바깥으로 나가지 않는다. 남는 위험은 "화면 앞에 없는
+  사이 작업 트리가 바뀐다"인데, 그 답은 권한 경계가 아니라 복구성이다 — patch를 먼저 쓰고
+  digest까지 확인한 뒤에만 되돌리고, 재적용은 `--check`가 통과할 때만 하고, 모든 변경이 C19-5의
+  영수증을 남기므로 무엇이 왜 바뀌었는지 영수증만으로 되짚을 수 있다. G11의 하나뿐인 결정
+  지점(`remoteWrite`)이 이것을 진다. 따라서 호스트 전용 목록(`is_host_only_command`)에는 overlay
+  명령이 **하나도 들어가지 않는다**.
+- **C19-5** 모든 overlay 변경은 오류가 아니라 영수증을 남긴다(C16-6과 같은 모양). 최소 필드는
+  `head_before`/`head_after`(되돌림의 기준점), `snapshot_id`, `patch_digest`(저장한 patch의
+  SHA-256, 적용 시점에 같은 patch인지 확인한다), `outcome`(`applied`/`overlayNeedsResolution`/
+  `rejected`/`busy`), `affected`(검사 실패 시 충돌한 경로), `rejected`(거절한 경로와 사유),
+  `trigger`(`app`/`external` — 자동 적용했는지 버튼을 내밀었는지)다. 영수증에는 patch 본문도
+  파일 내용도 싣지 않는다(G4). 세트 삭제는 지우지 않고 앱 소유 휴지통으로 옮긴다(C3-11) —
+  patch는 사용자 로컬 데이터이고, 지우면 그 변경의 유일한 사본이 사라진다.
+
+
 ## 4. External MCP interfaces (`mcp_registry.rs`)
 
 Third-party MCP servers are the only outbound network dependency AIA can acquire at runtime.
@@ -1292,11 +1380,24 @@ through the **device flow** because its authorization server has no dynamic regi
   The authorize scope is resolved as **stored user choice → preset override → discovery →
   preset default**; changing the scope counts as a connection change, so the old registration
   and refresh token are dropped and consent is asked again.
-- **P4** Registration, removal, token entry, and OAuth start/cancel are **host-only** commands.
-  The enable toggle and the connection check are write-gated and remote-eligible; both stay inside
-  app-owned storage. AIA can inspect and toggle plugins, list the current tools of an enabled,
-  credential-ready plugin, and call them only through the typed read/execute proxy operations;
-  it never receives a credential.
+- **P4** Registration, editing, token entry, removal, OAuth cancel, the enable toggle and the
+  connection check are write-gated and **remote-eligible in write mode** (user decision,
+  2026-09-30). The earlier boundary ("a token is never accepted over a remote path", 2026-08-30)
+  stopped holding on 2026-09-29, when `C15-7`/`C17-7` put every secret path behind the single
+  `remoteWrite` switch: a remote screen in write mode already hands values to the backend and
+  saves them to the OS secure store. Keeping plugin tokens out blocked connecting Notion from a
+  phone without closing any disclosure path. Removal follows registration — what is registered
+  remotely must be removable remotely, and what it deletes is an app-owned record plus a token the
+  user can reissue at the provider.
+  **`begin_external_plugin_oauth` stays host-only**, and that is a physical limit rather than a
+  permission: the callback `redirect_uri` is the host's loopback, so approving in a remote browser
+  redirects nowhere and only leaves a pending flow the remote screen cannot finish. Connecting
+  from a remote screen therefore means a token method. `set_external_plugin_tool_policy` /
+  `set_external_plugin_tool_policies` also stay host-only — `allow` removes an approval card, and
+  a decision that widens authority is taken at the host (same rule as `set_remote_write_enabled`).
+  AIA can inspect and toggle plugins, list the current tools of an enabled, credential-ready
+  plugin, and call them only through the typed read/execute proxy operations; it never receives a
+  credential.
 - **P5** Endpoints follow E2–E4: HTTPS remote, loopback HTTP allowed, no credentials in the URL,
   no redirects followed. Plugin ids are `[a-z0-9][a-z0-9_-]{0,31}` because they become the MCP
   server name for both Claude (`--mcp-config`, additive, never strict) and Codex
@@ -1362,7 +1463,13 @@ runtime, and a **grant** is the scope that runtime may read. No grant, no tools.
   audit records (`actor: sessionContext` with the principal as `subject`), credential removal, and
   marking session content as untrusted data so an instruction inside a past conversation is never
   taken as a new command.
-- **X7** A standard chat is never given `aia_system`. The separate `agent_manager_Cypress` endpoint exposes only the C7 allowlist when enabled; it cannot call other system operations or read env plaintext. Session context tools are attached only when
+- **X7** A standard chat a person started is never given `aia_system`. The one exception is a run a
+  registered workflow launched (chat origin `workflow`): registration is the approval, and those runs
+  must reach `record_round_report` and the rest of the round catalog (2026-10-02). They keep the
+  standard profile — only the tools open, not the AIA persona, cwd, or session volatility — and the
+  server is merged next to the plugin servers, so `--strict-mcp-config` stays AIA-only and the chat
+  keeps Cypress and the user's own MCP servers. The separate `agent_manager_Cypress` endpoint exposes
+  only the C7 allowlist when enabled; it cannot call other system operations or read env plaintext. Session context tools are attached only when
   the chat was started with `sessionContext`, and `tools/list` returns nothing while no grant is
   live. Provider MCP config is merged at the leaf (`mcp_servers.<name>`) so a chat keeps the
   user's own MCP servers.

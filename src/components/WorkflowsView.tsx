@@ -54,6 +54,7 @@ import { ErrorBanner, HelpHint, LoadingState, NoticeBanner, useConfirm, Workflow
 import { UsageBudgetPanel } from "./UsageBudgetPanel";
 import { errorText } from "../lib/errorText";
 
+import { formatDateTime } from "../lib/format";
 export type WorkflowsTabId = "catalog" | "recurring";
 
 // 워크플로 화면의 중메뉴. 등록된 계약을 다루는 자리(관리)와, 페이싱이 통제하는 워크플로의
@@ -1113,7 +1114,7 @@ function WorkflowVersionHistory({ versions }: { versions: SystemWorkflowVersion[
     <ul>{[...versions].reverse().map((version) => <li key={version.version}>
       <span>v{version.version}</span>
       <div><strong>{riskView(version.computedRisk, text).label}</strong><small>{text(`시스템 작업 ${version.requiredOperations.length}종`, `${version.requiredOperations.length} system operations`)}</small></div>
-      <time>{new Date(version.registeredAt).toLocaleString()}</time>
+      <time>{formatDateTime(version.registeredAt)}</time>
     </li>)}</ul>
   </WorkflowDetailSection>;
 }

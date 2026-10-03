@@ -12,6 +12,12 @@ const PROMPT_EXCLUSIONS = new Set([
   "src/lib/schemaDiscoveryPrompts.ts",
   // AIA 에게 보내는 회차 설계 요청문(M10). 화면 글이 아니라 에이전트 지시문이다.
   "src/lib/roundDesign.ts",
+  // 형상관리 화면이 AIA 에게 일을 넘길 때 쓰는 요청문(계획 5-AIA). 위와 같은 범주다 —
+  // 화면이 부르지만 결과는 에이전트에게 가는 글이라 카탈로그에 넣을 자리가 없다.
+  "src/lib/projectAiaHandoff.ts",
+  // 회차 점검표의 채점 규칙. 한국어 문자열은 전부 실패 사유이고 이 파일을 읽는 것은
+  // DOM 이 아니라 scripts/project-menu-conformance.mjs 다.
+  "src/lib/projectMenuConformance.ts",
 ]);
 const SOURCE_EXTENSIONS = new Set([".ts", ".tsx"]);
 /** 생성 파일. 소스의 `text(ko, en)` 짝을 그대로 옮겨 적은 것이라 다시 세면 같은 문구를 두 번 센다. */

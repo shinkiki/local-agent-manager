@@ -1,6 +1,6 @@
 import type { ProviderAccountView, ProviderHomeView, ProviderId } from "../types";
 import { IDLE_USAGE_REFRESH_INTERVAL_MS, usageRefreshDeferred, usageResetElapsedSinceUpdate } from "./accountUsage.ts";
-import { formatRelative } from "./format.ts";
+import { formatRelative, formatDateTime } from "./format.ts";
 import type { UiText } from "./i18nLocale.ts";
 
 type HomeAccountTone = "muted" | "ready" | "warning";
@@ -139,7 +139,7 @@ export function homeUsageNote(
       tone: "muted",
     };
   }
-  const at = new Date(usage.updatedAt).toLocaleString();
+  const at = formatDateTime(usage.updatedAt);
   if (keepsLastValue) {
     return {
       note: text(

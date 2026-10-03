@@ -23,13 +23,14 @@ export interface AiaSuggestionPackPanelProps {
 }
 
 /**
- * 애드온 → 자동화의 AIA 선제 제안 화면. 예전에는 켜고 끄는 스위치가 설정 → AIA 설정에,
- * 팩을 공통 스킬로 복사·복구하는 카드가 스킬 → 스킬관리에 따로 서 있어, 제안이 뜨지 않을 때
- * "꺼 둔 것인지 팩이 깨진 것인지"를 두 화면을 오가며 맞춰 봐야 했다. 스위치와 팩 관리·검증
- * 문제 목록이 한자리에 서면 그 판단이 한 화면에서 끝난다.
+ * 설정 → AIA 설정의 선제 제안 화면. 스위치는 원래 이 탭에, 팩을 공통 스킬로 복사·복구하는
+ * 카드는 스킬 → 스킬관리에 따로 서 있었고, 둘을 합치느라 애드온 → 자동화로 함께 옮겼다가
+ * 다시 이 탭으로 돌아왔다 — 선제 제안은 AIA가 스스로 하는 일이라, AIA를 실행할 에이전트를
+ * 고르는 자리 바로 아래가 제자리다. 스위치와 팩 관리·검증 문제 목록은 한자리에 남아, 제안이
+ * 뜨지 않을 때 "꺼 둔 것인지 팩이 깨진 것인지"가 한 화면에서 갈린다.
  *
- * 카탈로그는 탭을 실제로 연 뒤에만 읽는다 — 애드온의 패널은 고르지 않은 탭까지 모두
- * 마운트되므로, 다른 탭을 보는 동안 제안 팩 검증까지 도는 일을 막는다.
+ * 카탈로그는 화면을 실제로 연 뒤에만 읽는다 — 보지 않는 화면에서 제안 팩 검증까지 도는 일을
+ * 막는다.
  */
 export function AiaSuggestionPackPanel({ active, automation = null, onAutomationChange, onSkillsChanged }: AiaSuggestionPackPanelProps) {
   const { text } = useI18n();
@@ -135,7 +136,7 @@ export function AiaSuggestionPackPanel({ active, automation = null, onAutomation
   };
 
   return (
-    <section className="settings-card aia-suggestion-pack-panel" data-ui-anchor="addons.automation-suggestions">
+    <section className="settings-card aia-suggestion-pack-panel" data-ui-anchor="settings.aia-suggestions">
       <header className="plugin-page-header">
         <div className="plugin-page-title">
           <i><AiaMark size={18} /></i>
@@ -171,8 +172,8 @@ export function AiaSuggestionPackPanel({ active, automation = null, onAutomation
             />
           ) : (
             <small className="aia-suggestion-pack-hint">{text(
-              "설정 → AIA 설정에서 시스템 에이전트를 골라야 켤 수 있습니다.",
-              "Choose a system agent in Settings → AIA to turn this on.",
+              "위에서 시스템 에이전트를 골라야 켤 수 있습니다.",
+              "Choose a system agent above to turn this on.",
             )}</small>
           )}
         </div>

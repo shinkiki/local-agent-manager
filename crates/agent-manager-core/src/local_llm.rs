@@ -60,7 +60,7 @@ const MIN_CONTEXT_WINDOW: u32 = 1_024;
 const MAX_CONTEXT_WINDOW: u32 = 10_000_000;
 
 /// 저장된 연결 한 벌. 화면과 실행 경로가 같은 값을 본다.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalLlmConnection {
     /// OpenAI 호환 API의 기준 주소. 끝의 `/`는 떼고 저장한다.
@@ -72,6 +72,33 @@ pub struct LocalLlmConnection {
     /// 키가 저장돼 있는지만 알린다. 값은 어떤 응답에도 실리지 않는다(G4).
     pub api_key_configured: bool,
     pub enabled: bool,
+    /// 이 연결의 채팅이 단계 계획을 거치는지. 끄면 계획 턴 없이 한 턴에 도구를 바로 부른다.
+    ///
+    /// 모델마다 잘하는 자리가 다르다. 2026-10-03 측정: 기준 모델은 계획 29/30·기능 지도 43/95,
+    /// AIA 역할로 미세조정한 모델은 계획 14/30·기능 지도 85/93 이다. 한 모델에 둘을 담으려
+    /// 네 회차를 썼지만 붙지 않았다. 그래서 연결마다 어느 쪽으로 쓸지 정한다.
+    ///
+    /// 기본은 켬이다 — 예전 설정 파일에는 이 칸이 없고, 없으면 지금까지와 같게 돌아야 한다.
+    #[serde(default = "plan_steps_default")]
+    pub plan_steps: bool,
+}
+
+/// 이 칸이 없는 옛 설정 파일은 계획을 켠 것으로 읽는다.
+fn plan_steps_default() -> bool {
+    true
+}
+
+impl Default for LocalLlmConnection {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            default_model: String::new(),
+            context_window: None,
+            api_key_configured: false,
+            enabled: false,
+            plan_steps: true,
+        }
+    }
 }
 
 /// 화면이 보내는 저장 요청.
@@ -146,6 +173,9 @@ pub struct UpsertLocalLlmConnectionRequest {
     #[serde(default)]
     pub model_windows: Option<BTreeMap<String, u32>>,
     pub enabled: bool,
+    /// 단계 계획을 거칠지. 화면이 보내지 않으면 켠 것으로 본다.
+    #[serde(default = "plan_steps_default")]
+    pub plan_steps: bool,
     /// `None`이면 저장된 키를 그대로 두고, 빈 문자열이면 지우며, 값이 있으면 바꾼다.
     pub api_key: Option<String>,
 }
@@ -503,6 +533,7 @@ pub fn upsert_local_llm_connection(
             context_window,
             api_key_configured,
             enabled: request.enabled,
+            plan_steps: request.plan_steps,
         },
         model_windows,
     };
@@ -594,9 +625,14 @@ pub fn set_local_llm_connection(
     app_data_dir: &Path,
     request: SetLocalLlmConnectionRequest,
 ) -> Result<LocalLlmConnection, CoreError> {
-    let label = get_local_llm_connection_by_id(app_data_dir, DEFAULT_CONNECTION_ID)
-        .map(|entry| entry.label)
-        .unwrap_or_else(|_| "기본 연결".to_owned());
+    // v1 요청에는 라벨도 계획 여부도 없다. 저장본의 값을 그대로 지킨다 — 옛 화면이 저장했다고
+    // 해서 새 칸이 기본값으로 되돌아가면 안 된다.
+    let saved = get_local_llm_connection_by_id(app_data_dir, DEFAULT_CONNECTION_ID).ok();
+    let label = saved
+        .as_ref()
+        .map(|entry| entry.label.clone())
+        .unwrap_or_else(|| "기본 연결".to_owned());
+    let plan_steps = saved.is_none_or(|entry| entry.connection.plan_steps);
     let entry = upsert_local_llm_connection(
         app_data_dir,
         UpsertLocalLlmConnectionRequest {
@@ -607,6 +643,7 @@ pub fn set_local_llm_connection(
             context_window: request.context_window,
             model_windows: None,
             enabled: request.enabled,
+            plan_steps,
             api_key: request.api_key,
         },
     )?;
@@ -888,6 +925,7 @@ mod tests {
             context_window: Some(65_536),
             api_key_configured: false,
             enabled: true,
+            plan_steps: true,
         };
         assert_eq!(saved, expected);
         assert_eq!(
@@ -996,6 +1034,7 @@ mod tests {
                         context_window: None,
                         api_key_configured: true,
                         enabled: true,
+                        plan_steps: true,
                     },
                     model_windows: BTreeMap::new(),
                 }];
@@ -1034,8 +1073,66 @@ mod connection_list_tests {
             context_window: None,
             model_windows: None,
             enabled: true,
+            plan_steps: true,
             api_key: None,
         }
+    }
+
+    // 2026-10-03: 모델마다 잘하는 자리가 달라 연결마다 계획 여부를 고른다. 기본은 켬이고,
+    // 이 칸이 없는 옛 저장 파일도 켠 것으로 읽어야 지금까지와 같게 돈다.
+    #[test]
+    fn step_planning_is_a_per_connection_choice_and_defaults_to_on() {
+        let dir = temp_dir();
+        let on = upsert_local_llm_connection(dir.path(), request(None, "계획함", "http://a/v1"))
+            .unwrap();
+        assert!(on.connection.plan_steps);
+
+        let mut off_request = request(None, "계획안함", "http://b/v1");
+        off_request.plan_steps = false;
+        let off = upsert_local_llm_connection(dir.path(), off_request).unwrap();
+        assert!(!off.connection.plan_steps);
+
+        // 다시 읽어도 각자의 값을 지킨다.
+        let reread = get_local_llm_connection_by_id(dir.path(), &off.id).unwrap();
+        assert!(!reread.connection.plan_steps);
+        assert!(
+            get_local_llm_connection_by_id(dir.path(), &on.id)
+                .unwrap()
+                .connection
+                .plan_steps
+        );
+    }
+
+    // 이 칸을 모르는 옛 파일은 켠 것으로 읽는다. 없다고 꺼지면 조용히 동작이 바뀐다.
+    #[test]
+    fn a_stored_connection_without_the_field_reads_as_planning() {
+        let parsed: LocalLlmConnection = serde_json::from_str(
+            r#"{"baseUrl":"http://a/v1","defaultModel":"m","contextWindow":null,"apiKeyConfigured":false,"enabled":true}"#,
+        )
+        .unwrap();
+        assert!(parsed.plan_steps);
+    }
+
+    // v1 저장 요청에는 이 칸이 없다. 옛 화면이 저장해도 고른 값이 되돌아가면 안 된다.
+    #[test]
+    fn the_v1_save_keeps_the_planning_choice() {
+        let dir = temp_dir();
+        let mut off_request = request(Some(DEFAULT_CONNECTION_ID), "기본", "http://a/v1");
+        off_request.plan_steps = false;
+        upsert_local_llm_connection(dir.path(), off_request).unwrap();
+
+        let saved = set_local_llm_connection(
+            dir.path(),
+            SetLocalLlmConnectionRequest {
+                base_url: "http://b/v1".to_owned(),
+                default_model: "m".to_owned(),
+                context_window: None,
+                enabled: true,
+                api_key: None,
+            },
+        )
+        .unwrap();
+        assert!(!saved.plan_steps, "v1 저장이 계획 선택을 되돌렸다");
     }
 
     // M7 7.1: v1 단일 연결은 첫 읽기에서 default 로 한 번 옮겨지고 v1 파일은 남는다.
@@ -1050,6 +1147,7 @@ mod connection_list_tests {
                 context_window: Some(32_768),
                 api_key_configured: false,
                 enabled: true,
+                plan_steps: true,
             },
         };
         STORE

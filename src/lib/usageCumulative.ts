@@ -13,6 +13,9 @@
 import { usageWindowLengthMs, USAGE_WINDOW_UNIT_MS } from "./usageWindowLabel.ts";
 import type { AccountUsageHistory } from "../types";
 
+import { runtimeText } from "./i18nRuntime.ts";
+
+const MONTH_SHORT_EN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
 export interface UsagePeriod {
   from: number;
   to: number;
@@ -38,7 +41,7 @@ export function recentMonthPeriods(now: number, count: number): MonthPeriod[] {
     const month = start.getMonth() + 1;
     months.push({
       key: `${start.getFullYear()}-${String(month).padStart(2, "0")}`,
-      label: `${month}월`,
+      label: runtimeText(`${month}월`, MONTH_SHORT_EN[month - 1]),
       from: start.getTime(),
       to: Math.min(end.getTime(), now),
     });

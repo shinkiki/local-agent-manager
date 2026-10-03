@@ -325,16 +325,16 @@ export function Drawer({ title, actions, headerContent, onClose, bodyRef, bodyOv
 /**
  * 화면 가운데에 띄우는 작은 대화상자. 한 가지 입력만 받는 편집처럼 Drawer를 열기에는
  * 무거운 작업에 쓴다. 배경 클릭과 Esc로 닫히므로 저장 중에는 onClose에서 막아야 한다.
- * `size="wide"`는 여러 칸짜리 폼이나 본문 편집기가 들어가 기본 폭이 좁을 때만 쓴다.
+ * `size="wide"`는 여러 칸짜리 폼, `size="full"`은 사용자가 전체 보기를 고른 큰 본문에 쓴다.
  */
-export function Modal({ title, onClose, footer, size = "default", elevated = false, children }: PropsWithChildren<{ title: ReactNode; onClose: () => void; footer?: ReactNode; size?: "default" | "wide"; elevated?: boolean }>) {
+export function Modal({ title, onClose, footer, size = "default", elevated = false, children }: PropsWithChildren<{ title: ReactNode; onClose: () => void; footer?: ReactNode; size?: "default" | "wide" | "full"; elevated?: boolean }>) {
   const { text } = useI18n();
   const titleId = useId();
   useEscapeToClose(onClose);
   return (
     <DialogSurface
       backdropClassName={`modal-backdrop${elevated ? " modal-backdrop-elevated" : ""}`}
-      className={`modal${size === "wide" ? " wide" : ""}`}
+      className={`modal${size === "default" ? "" : ` ${size}`}`}
       labelledBy={titleId}
       onBackdropClose={onClose}
     >

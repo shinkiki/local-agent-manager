@@ -4,7 +4,7 @@ import type { TabRequest } from "../lib/uiGuide";
 import { beginProviderAccountLogin, cancelProviderAccountLogin, cancelUiTranslation, checkProviderCliUpdate, clearProviderModelCaches, consumeAccountResetCredit, deleteProviderAccount, finishProviderAccountLogin, getAccountTools, getAntigravityUsage, getBackendServiceSettings, getBackgroundSettings, getCliUpdateStatus, getProviderRuntimeCounts, getResourceRepository, getSleepPrevention, getTailscaleServiceStatus, getWebAccessStatus, hasTauriRuntime, refreshProviderAccountUsage, requestSystemLanguage, resetMenuTranslation, restartApp, revalidateProviderAccountCredential, retryMenuTranslation, retryUiTranslation, setAutoSwitchPolicy, setAutoSwitchResume, setAutoSwitchUsageGap, setResumeAccountPolicy, setBackendServiceSettings, setBackgroundSettings, setSleepPrevention, setProviderAccountAutoSwitch, setProviderAccountAutoSwitchPriority, setProviderAccountDisabled, setProviderAccountNote, setProviderAccountLabel, setRemoteWriteEnabled, setResourceRepository, setSystemAutomationSettings, setTailscaleServiceEnabled, switchActiveProviderAccount, updateProviderCli, type BackendServiceSettings, type SleepPreventionStatus, type TailscaleServiceStatus, type WebAccessStatus } from "../lib/ipc";
 import { getUiTranslationCatalog, useI18n, type UiText } from "../lib/i18n";
 import { runtimeText } from "../lib/i18nRuntime";
-import { sourceName } from "../lib/format";
+import { sourceName, formatDateOnly, formatDateTime } from "../lib/format";
 import { accountUsageDisplayState, displayUsageWindows, usageLevel, usageWindowValueUnavailable, type DisplayUsageWindow } from "../lib/accountUsage";
 import { autoSwitchEventSummary } from "../lib/autoSwitchEvent";
 import { homeAccountSummary, homeUsageNote } from "../lib/homeAccount";
@@ -24,6 +24,7 @@ import { currentBackendServicePort, DEFAULT_BACKEND_SERVICE_PORT, MAX_BACKEND_SE
 import { repositoryTransferPrompt } from "../lib/skillTransfer";
 import { moveNavigationItem, previewView, setNavigationVisibility, type ConfigurableViewId, type NavigationPreferences } from "../lib/navigationPreferences";
 import { AiaMark, AppToggle, BrandMark, Drawer, ErrorBanner, HelpHint, Modal, NoticeBanner, PathField, SourceBadge, useConfirm, useEscapeToClose, useOutsidePointerToClose } from "./Shared";
+import { AiaSuggestionPackPanel } from "./AiaSuggestionPackPanel";
 import { TelemetrySettingsCard } from "./TelemetrySettingsCard";
 import { AccountLoginTerminalPanel } from "./TerminalPanel";
 import { errorText } from "../lib/errorText";
@@ -61,6 +62,9 @@ interface SettingsViewProps {
   /// 공통 저장소 경로나 프로젝트 활성여부가 바뀌면 알린다. 스킬·지침 화면이 다시 읽고
   /// 스냅샷도 다시 받아야 한다.
   onRepositoryChanged?: () => void;
+  /// AIA 설정 탭의 선제 제안 팩을 공통 스킬로 복사·복구하면 스킬 목록과 제안 카탈로그가
+  /// 함께 바뀐다.
+  onSkillsChanged?: () => void;
 }
 
 interface SettingsChoiceOption<T extends string> {
@@ -386,7 +390,7 @@ const navigationLabels = (text: UiText): Record<ConfigurableViewId, { label: str
   },
 });
 
-export function SettingsView({ active, providers, accounts, onAccountsChange, onConnectCli, models, themeMode, onThemeModeChange, accentColor, onAccentColorChange, navigationPreferences, onNavigationPreferencesChange, messageDisplayMode, onMessageDisplayModeChange, automation, onAutomationChange, onRequestAiaPrompt, tabRequest, systemAgentNoticeRequest = null, appVersionManifest, onRepositoryChanged }: SettingsViewProps) {
+export function SettingsView({ active, providers, accounts, onAccountsChange, onConnectCli, models, themeMode, onThemeModeChange, accentColor, onAccentColorChange, navigationPreferences, onNavigationPreferencesChange, messageDisplayMode, onMessageDisplayModeChange, automation, onAutomationChange, onRequestAiaPrompt, tabRequest, systemAgentNoticeRequest = null, appVersionManifest, onRepositoryChanged, onSkillsChanged }: SettingsViewProps) {
   const { text } = useI18n();
   const [tab, setTab] = useState<SettingsTabId>("connections");
   const [showSystemAgentNotice, setShowSystemAgentNotice] = useState(false);
@@ -437,7 +441,13 @@ export function SettingsView({ active, providers, accounts, onAccountsChange, on
         {systemCard(["cli"])}
         <RuntimeSettingsUpdateCard active={active} providers={providers} automation={automation} aiaAvailable={Boolean(aiaRuntimeProvider(automation))} onRequestDiscovery={onRequestAiaPrompt} onAutomationChange={onAutomationChange} />
       </>}
-      {tab === "aia" && systemCard(["agent"])}
+      {tab === "aia" && <>
+        {systemCard(["agent"])}
+        {/* 선제 제안은 AIA가 스스로 하는 일이라 시스템 에이전트 선택 바로 아래가 제자리다.
+            애드온 → 자동화에 있을 때는 AIA를 켜고 끄는 자리와 AIA가 먼저 말을 거는 자리가
+            갈려 있어, 제안이 뜨지 않을 때 두 화면을 오가야 했다. */}
+        <AiaSuggestionPackPanel active={active} automation={automation} onAutomationChange={onAutomationChange} onSkillsChanged={onSkillsChanged} />
+      </>}
       {tab === "service" && systemCard(["service"])}
       {tab === "language" && systemCard(["language"])}
       {/* 프로젝트 활성여부 카드는 프로젝트 화면의 설정 탭으로 옮겨 갔다. `onRepositoryChanged`는
@@ -936,7 +946,7 @@ function RuntimeSettingsUpdateCard({ active, providers, automation, aiaAvailable
               : sources.length === 0
                 ? text("탐지된 CLI가 없어 조사할 대상이 없습니다 · 내장 스키마 사용 중", "No CLI was detected, so there is nothing to inspect · using the built-in schema")
                 : updatedAt !== null
-                  ? text(`${new Date(updatedAt).toLocaleString()} 기준`, `As of ${new Date(updatedAt).toLocaleString()}`)
+                  ? text(`${formatDateTime(updatedAt)} 기준`, `As of ${formatDateTime(updatedAt)}`)
                   : text("조사 기록이 없습니다 · 내장 스키마 사용 중", "No inspection recorded yet · using the built-in schema")}</small>
         </span>
         {/* 조사 대상이 없으면 요청해도 보낼 것이 없다. 눌리기만 하고 아무 일도 일어나지
@@ -951,7 +961,7 @@ function RuntimeSettingsUpdateCard({ active, providers, automation, aiaAvailable
             : catalogState.stale.length > 0
               ? text(`재조사 필요 · ${catalogState.stale.join(", ")}`, `Needs a re-check · ${catalogState.stale.join(", ")}`)
               : catalogState.updatedAt !== null
-                ? text(`${new Date(catalogState.updatedAt).toLocaleString()} 기준 · CLI 버전과 일치`, `As of ${new Date(catalogState.updatedAt).toLocaleString()} · matches the CLI version`)
+                ? text(`${formatDateTime(catalogState.updatedAt)} 기준 · CLI 버전과 일치`, `As of ${formatDateTime(catalogState.updatedAt)} · matches the CLI version`)
                 : text("CLI가 목록을 직접 제공합니다 · 제안 없음", "The CLI provides the list directly · no proposal")}</small>
         </span>
         <button
@@ -1960,7 +1970,7 @@ function ProviderCliUpdatePanel({ status, access, busyKey, pending, notices, err
 function ProviderAutoSwitchNote({ accounts, event }: { accounts: ProviderAccountView[]; event: AutoSwitchEventView }) {
   const { text } = useI18n();
   const summary = autoSwitchEventSummary(accounts, event);
-  return <p className="provider-auto-switch-note"><Repeat size={12} aria-hidden="true" />{text("자동전환됨:", "Auto-switched:")} {summary.transition} · {new Date(event.at).toLocaleString()}{summary.resumedNote}</p>;
+  return <p className="provider-auto-switch-note"><Repeat size={12} aria-hidden="true" />{text("자동전환됨:", "Auto-switched:")} {summary.transition} · {formatDateTime(event.at)}{summary.resumedNote}</p>;
 }
 
 /**
@@ -2011,7 +2021,7 @@ function UsageMeters({ usage, windows }: { usage: AccountUsageView; windows: Dis
       return <li className={usageLevel(percent)} key={window.label}>
         <span><em>{window.label}</em><b>{unavailable ? text("확인 불가", "Unavailable") : `${Math.round(percent)}%`}</b></span>
         <div className="progress" role="img" aria-label={unavailable ? `${window.label} ${text("사용량 확인 불가", "usage unavailable")}` : `${window.label} ${text("사용량", "usage")} ${Math.round(percent)}%`}><span style={{ width: `${unavailable ? 0 : percent}%` }} /></div>
-        {window.resetsAt !== null && <small>{new Date(window.resetsAt).toLocaleString()} {unavailable ? text("초기화 후 갱신 실패", "Failed to refresh after reset") : window.resetElapsed ? text("초기화됨", "Reset") : text("초기화", "Reset")}</small>}
+        {window.resetsAt !== null && <small>{formatDateTime(window.resetsAt)} {unavailable ? text("초기화 후 갱신 실패", "Failed to refresh after reset") : window.resetElapsed ? text("초기화됨", "Reset") : text("초기화", "Reset")}</small>}
       </li>;
     })}
   </ul>;
@@ -2056,7 +2066,7 @@ function AntigravityUsageCard({
       <span className="provider-usage-heading">
         <strong>{text("사용량", "Usage")}</strong>
         {usage?.updatedAt !== null && usage?.updatedAt !== undefined && <small className="provider-usage-updated">
-          {text("확인 시각", "Checked")} {new Date(usage.updatedAt).toLocaleString()}
+          {text("확인 시각", "Checked")} {formatDateTime(usage.updatedAt)}
         </small>}
       </span>
       <button className="button compact" type="button" onClick={onRefresh} disabled={loading}>
@@ -2327,9 +2337,9 @@ function ProviderAccountUsagePanel({ account, editable, busy, refreshing, consum
     <div className="account-usage-head">
       <strong>{text("사용량", "Usage")}</strong>
       <button className={`icon-button compact${refreshing ? " busy" : ""}`} type="button" disabled={busy || !usageDisplay.canRefresh} aria-label={text("사용량 새로고침", "Refresh usage")} title={usageRetryAt !== null
-        ? `${text("사용량 한도로 지금은 갱신하지 않습니다.", "Refresh paused due to usage limit.")} ${new Date(usageRetryAt).toLocaleString()} ${text("이후 갱신할 수 있습니다", "or later can be refreshed")}`
+        ? `${text("사용량 한도로 지금은 갱신하지 않습니다.", "Refresh paused due to usage limit.")} ${formatDateTime(usageRetryAt)} ${text("이후 갱신할 수 있습니다", "or later can be refreshed")}`
         : usageDisplay.canRefresh ? text("사용량 새로고침", "Refresh usage") : text("중지되었거나 재인증이 필요한 계정은 조회하지 않습니다", "Stopped or re-authentication required accounts are not polled")} onClick={requestUsageRefresh}><RefreshCw size={13} /></button>
-      {usageRetryAt !== null && <em className="account-usage-retry" role="status">{new Date(usageRetryAt).toLocaleString()} {text("이후 갱신 가능", "or later refresh available")}</em>}
+      {usageRetryAt !== null && <em className="account-usage-retry" role="status">{formatDateTime(usageRetryAt)} {text("이후 갱신 가능", "or later refresh available")}</em>}
     </div>
     <UsageMeters usage={account.usage} windows={windows} />
     {/* 소진된 창을 즉시 되돌리는 크레딧. 장수가 한정돼 있고 만료가 있어서, 남은 장수와
@@ -2339,7 +2349,7 @@ function ProviderAccountUsagePanel({ account, editable, busy, refreshing, consum
       <span>
         <Ticket size={13} aria-hidden="true" />
         <strong>{text("한도 리셋", "Limit reset")} {resetCredits.availableCount}{text("장", " credits")}</strong>
-        {resetCredits.nextExpiresAt !== null && <em>{new Date(resetCredits.nextExpiresAt).toLocaleDateString()} {text("만료", "expires")}</em>}
+        {resetCredits.nextExpiresAt !== null && <em>{formatDateOnly(resetCredits.nextExpiresAt)} {text("만료", "expires")}</em>}
       </span>
       {editable && <button
         className="button compact"
@@ -2353,11 +2363,11 @@ function ProviderAccountUsagePanel({ account, editable, busy, refreshing, consum
         기준 시각으로 낡음을 알리고, 실패 사유는 도움말로만 남긴다. */}
     <small className={`account-usage-note${usageDisplay.error ? " error" : ""}`} title={usageDisplay.staleError ?? undefined}>{usageDisplay.error
       ?? (usageDisplay.staleError !== null && account.usage.updatedAt !== null
-        ? `${new Date(account.usage.updatedAt).toLocaleString()} ${text("기준 · 갱신에 실패해 마지막 조회 값을 유지합니다", "as of · refresh failed, retaining last polled value")}`
+        ? `${formatDateTime(account.usage.updatedAt)} ${text("기준 · 갱신에 실패해 마지막 조회 값을 유지합니다", "as of · refresh failed, retaining last polled value")}`
         : usageDisplay.cached && account.usage.updatedAt !== null
-          ? `${new Date(account.usage.updatedAt).toLocaleString()} ${text("마지막 성공 조회", "last successful poll")} · ${resetElapsed ? text("초기화 시간 경과로 0% 표시", "showing 0% due to elapsed reset time") : text("중지·재인증 상태라 갱신하지 않습니다", "refresh paused in stopped/re-auth state")}`
+          ? `${formatDateTime(account.usage.updatedAt)} ${text("마지막 성공 조회", "last successful poll")} · ${resetElapsed ? text("초기화 시간 경과로 0% 표시", "showing 0% due to elapsed reset time") : text("중지·재인증 상태라 갱신하지 않습니다", "refresh paused in stopped/re-auth state")}`
           : account.usage.updatedAt !== null
-            ? `${new Date(account.usage.updatedAt).toLocaleString()} ${text("기준", "as of")}`
+            ? text(`${formatDateTime(account.usage.updatedAt)} 기준`, `As of ${formatDateTime(account.usage.updatedAt)}`)
             : text("아직 조회하지 않았습니다. 새로고침으로 사용량을 확인하세요.", "Not polled yet. Click refresh to check usage."))}</small>
   </div>;
 }
@@ -2378,8 +2388,8 @@ function AccountExpiryNotice({ account }: { account: ProviderAccountView }) {
   return <p className="provider-account-expiry" role="status">
     <ShieldAlert size={13} aria-hidden="true" />
     <span>{text(
-      `인증이 ${days}일 뒤 만료됩니다 (${new Date(expiresAt).toLocaleString()}). 만료되면 갱신이 거부되어 재인증해야만 이 계정으로 실행할 수 있습니다.`,
-      `Authentication expires in ${days} day${days === 1 ? "" : "s"} (${new Date(expiresAt).toLocaleString()}). After that, refresh is refused and the account cannot run until you re-authenticate.`,
+      `인증이 ${days}일 뒤 만료됩니다 (${formatDateTime(expiresAt)}). 만료되면 갱신이 거부되어 재인증해야만 이 계정으로 실행할 수 있습니다.`,
+      `Authentication expires in ${days} day${days === 1 ? "" : "s"} (${formatDateTime(expiresAt)}). After that, refresh is refused and the account cannot run until you re-authenticate.`,
     )}</span>
   </p>;
 }
@@ -3067,7 +3077,7 @@ function SystemAgentRuntimeSettings({ provider, providerName, recentModels, runt
 /// 다만 "아직 안 온 값"과 "오지 못한 값"은 다르다. 조회가 실패로 끝났는데도 확인 중을
 /// 두면 화면에 다시 부르는 길이 없어 영원히 기다리는 표식이 되고, 같은 줄의 요약이
 /// 실패를 말하는 것과 정면으로 어긋난다(QA #80). `loadError`가 있으면 그 사실을 적는다.
-function BackendServiceToggleRow({ title, help, summary, checked, highlighted, disabled, loadError, onChange }: {
+function BackendServiceToggleRow({ title, help, summary, checked, highlighted, disabled, loadError, desktopOnly, onChange }: {
   title: string;
   help?: ReactNode;
   summary: string;
@@ -3076,6 +3086,8 @@ function BackendServiceToggleRow({ title, help, summary, checked, highlighted, d
   disabled: boolean;
   /** 이 행의 값을 실어 오는 조회가 실패로 끝났을 때의 사유. */
   loadError?: string | null;
+  /** 데스크톱 앱에서만 읽고 바꿀 수 있는 값. 브라우저·원격 화면에서는 조회 자체를 하지 않는다. */
+  desktopOnly?: boolean;
   onChange: (next: boolean) => void;
 }) {
   const { text } = useI18n();
@@ -3089,7 +3101,10 @@ function BackendServiceToggleRow({ title, help, summary, checked, highlighted, d
         <strong>{title}{help}</strong>
         <small>{summary}</small>
       </span>
-      {unknown
+      {unknown && desktopOnly
+        // 조회하지 않는 값에 "확인 중"을 두면 영원히 기다리는 표식이 된다(qa34).
+        ? <em className="health muted backend-service-toggle-desktop-only">{text("데스크톱 앱 전용", "Desktop app only")}</em>
+        : unknown
         ? failed
           ? <em className="health warning backend-service-toggle-failed" role="status" aria-label={text(`${title} 상태를 읽지 못했습니다`, `Could not read ${title} status`)}>{text("읽지 못함", "Unavailable")}</em>
           : <em className="health muted backend-service-toggle-pending" role="status" aria-label={text(`${title} 상태 확인 중`, `Checking ${title} status`)}>{text("확인 중…", "Checking…")}</em>
@@ -3231,7 +3246,7 @@ function AppVersionSettings({ manifest }: { manifest: AppVersionManifest | null 
       {manifest && !hidden && <>
         <div className="app-version-row"><span>{text("최신 버전", "Latest version")}</span><strong className="app-version-new">v{manifest.latestVersion}</strong></div>
         {!isNewerAppVersion(manifest.latestVersion) && <small>{text("현재 최신 버전입니다.", "This is the latest version.")}</small>}
-        {manifest.releasedAt && <small>{text("릴리스", "Released")} {new Date(manifest.releasedAt).toLocaleString()}</small>}
+        {manifest.releasedAt && <small>{text("릴리스", "Released")} {formatDateTime(manifest.releasedAt)}</small>}
         {manifest.releaseNotes && <p className="app-version-notes">{manifest.releaseNotes}</p>}
         <div className="app-version-actions">
           <a className="button primary compact" href={manifest.downloadUrl} target="_blank" rel="noreferrer" onClick={openDownload}>{text("다운로드 페이지", "Download page")}</a>
@@ -3240,7 +3255,7 @@ function AppVersionSettings({ manifest }: { manifest: AppVersionManifest | null 
       </>}
       {manifest && hidden && <small>{text("이 버전의 알림을 숨겼습니다.", "Notifications for this version are hidden.")}</small>}
       {!manifest && <small>{checkedAt
-        ? text(`${new Date(checkedAt).toLocaleString()}에 확인했습니다. 새 버전이 없습니다.`, `Checked ${new Date(checkedAt).toLocaleString()}. No newer version found.`)
+        ? text(`${formatDateTime(checkedAt)}에 확인했습니다. 새 버전이 없습니다.`, `Checked ${formatDateTime(checkedAt)}. No newer version found.`)
         : text("새 버전 정보를 확인하지 못했습니다.", "Version information is not available yet.")}</small>}
     </div>
   </section>;
@@ -3401,6 +3416,7 @@ type BackendToggleState = {
   checked: boolean | null;
   loadError: string | null;
   disabled: boolean;
+  desktopOnly?: boolean;
   highlighted?: boolean;
   onChange: (next: boolean) => void;
 };
@@ -3647,6 +3663,7 @@ function useLoginStartToggle({ nativeRuntime, clearNotice, setNotice }: {
     checked: enabled,
     loadError: task.error,
     disabled: !nativeRuntime || task.busy,
+    desktopOnly: !nativeRuntime,
     onChange: (next) => void toggle(next),
   };
 }

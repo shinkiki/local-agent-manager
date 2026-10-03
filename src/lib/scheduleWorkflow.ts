@@ -2,6 +2,7 @@ import type { ScheduleWorkflowBinding, SystemWorkflowSummary } from "../types";
 import { joinSummary } from "./sequence.ts";
 import { missingRequiredInputNames, workflowInputEntries } from "./scheduleWorkflowInputs.ts";
 
+import { runtimeText } from "./i18nRuntime.ts";
 /**
  * 예약에 묶인 워크플로를 다루는 규칙 — 지금 그대로 실행할 수 있는지, 그리고 카드 한 줄에
  * 어떻게 적는지.
@@ -63,7 +64,8 @@ export function describeScheduleWorkflow(
   workflows: SystemWorkflowSummary[],
 ): string {
   const known = workflows.find((workflow) => workflow.id === binding.workflowId);
-  const head = `워크플로 ${known?.displayName ?? binding.workflowId} v${binding.approvedVersion}`;
+  const name = known?.displayName ?? binding.workflowId;
+  const head = runtimeText(`워크플로 ${name} v${binding.approvedVersion}`, `Workflow ${name} v${binding.approvedVersion}`);
   return joinSummary([head, scheduleWorkflowBlocker(binding, known)]);
 }
 
@@ -76,8 +78,8 @@ function scheduleWorkflowBlocker(
   binding: ScheduleWorkflowBinding,
   known: SystemWorkflowSummary | undefined,
 ): string | null {
-  if (!known) return "목록에 없음";
-  if (known.version !== binding.approvedVersion) return `재승인 필요(현재 v${known.version ?? "?"})`;
-  if (!known.compatible) return "카탈로그 비호환";
+  if (!known) return runtimeText("목록에 없음", "Not in list");
+  if (known.version !== binding.approvedVersion) return runtimeText(`재승인 필요(현재 v${known.version ?? "?"})`, `Needs re-approval (now v${known.version ?? "?"})`);
+  if (!known.compatible) return runtimeText("카탈로그 비호환", "Incompatible with catalog");
   return null;
 }

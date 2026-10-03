@@ -2325,6 +2325,7 @@ fn run_start_request(
         approval_mode: schedule.input.approval_mode,
         resume_session_id: resume_session_id.map(str::to_owned),
         handoff_origin: None,
+        fork_session_id: None,
         origin: Some(ChatOrigin {
             kind: ChatOriginKind::Schedule,
             workflow_id: None,

@@ -37,7 +37,10 @@ import {
   RemoteConnectionError,
   setSchedulesPaused,
   getLocalLlmConnections,
+  getSystemSkillNotice,
+  acknowledgeSystemSkillNotice,
 } from "./lib/ipc";
+import { providerLabel } from "./lib/skillLibrary";
 import { SESSION_SYNC_DELAYS_MS, sessionSyncKey, unindexedRunTargets } from "./lib/sessionSyncBudget";
 import { aiaAttentionForChat, selectAiaAttention, withoutAiaAttention } from "./lib/aiaAttention";
 import { aiaRuntimeProvider } from "./lib/aiaRuntime";
@@ -231,6 +234,8 @@ function App() {
   const { toasts, pushToast, dismissToast } = useAppToasts();
   const [reconnecting, setReconnecting] = useState(false);
   const [appRefreshing, setAppRefreshing] = useState(false);
+  // 로고 새로고침이 올리는 나수. 스스로 다시 읽지 않는 패널이 이 값을 보고 다시 읽는다.
+  const [refreshNonce, setRefreshNonce] = useState(0);
   const [setupProviderId, setSetupProviderId] = useState<ProviderId | null>(null);
   const snapshotRef = useRef<ManagerSnapshot | null>(null);
   const automationRef = useRef<SystemAutomationSnapshot | null>(null);
@@ -385,14 +390,19 @@ function App() {
    * 두 경로 모두 자체적으로 중복 실행을 막고 실패를 스스로 보고하므로 여기서는
    * 진행 표시만 맡는다. 화면을 다시 불러오지는 않아 작성 중인 입력은 남는다.
    */
+  // 로고 새로고침은 화면 전체를 다시 읽는다. 상태 카드와 세션 목록만 읽던 동안은 회차 목표처럼
+  // 스스로 다시 읽지 않는 패널이 뒤처진 채 남아, 앱을 껐다 켜야 맞았다 — 그런데 끄면 페이싱과
+  // 세션이 함께 끊긴다. 스냅숏까지 다시 받고 나수를 올려 그 패널들에게도 다시 읽으라고 알린다.
+  // 스케줄러(10초)·사용량 예산(30초)처럼 이미 주기로 읽는 곳은 건드리지 않는다.
   const refreshApp = useCallback(async () => {
     setAppRefreshing(true);
     try {
-      await Promise.all([refreshStatusCard(), reconcileSessionList()]);
+      await Promise.all([refresh(), refreshStatusCard(), reconcileSessionList()]);
+      setRefreshNonce((current) => current + 1);
     } finally {
       setAppRefreshing(false);
     }
-  }, [reconcileSessionList, refreshStatusCard]);
+  }, [refresh, reconcileSessionList, refreshStatusCard]);
 
 
   const pollAutomation = useCallback(async () => {
@@ -430,6 +440,9 @@ function App() {
   // 종료 확인 창은 시작 화면·오류 화면에서도 떠야 한다. 셸은 그 화면에서도 종료 의사를
   // 넘기고, 창이 보이지 않으면 사용자에게는 앱이 꺼지지 않는 것으로만 보인다.
   const quitConfirmDialog = useQuitConfirmation(text);
+  // 기동 때 깔린 공급자 스킬을 한 번 알린다. 종료 확인과 같은 자리에서 걸어, 시작 화면에서도
+  // 뜨게 한다 — 설치는 백엔드가 뜨는 그 순간에 끝나므로 본 화면을 기다릴 이유가 없다.
+  const systemSkillNoticeDialog = useSystemSkillNotice(text);
 
 
   // CLI가 업데이트되면 AIA가 제안한 모델·추론 카탈로그가 그 버전보다 오래된 것이 되고,
@@ -690,6 +703,7 @@ function App() {
           ? text("서버와 다시 연결하는 중…", "Reconnecting to the server…")
           : text("로컬 에이전트 데이터를 인덱싱하고 있습니다", "Indexing local agent data")} />
         {quitConfirmDialog}
+        {systemSkillNoticeDialog}
       </main>
     );
   }
@@ -702,6 +716,7 @@ function App() {
         <ErrorBanner message={error ?? text("앱을 시작하지 못했습니다", "Could not start the app")} />
         <button className="button primary" type="button" onClick={() => refresh(true)}>{text("다시 시도", "Retry")}</button>
         {quitConfirmDialog}
+        {systemSkillNoticeDialog}
       </main>
     );
   }
@@ -775,15 +790,15 @@ function App() {
           {panel("chat", () => <MemoChatView providers={snapshot.status.providers} accounts={accounts} projects={projectOptions} models={modelOptions} sessions={snapshot.sessions} messageDisplayMode={messageDisplayMode} transcriptLimit={transcriptLimit} onTranscriptLimitChange={setTranscriptLimit} scheduler={schedulerSnapshot} onRefreshScheduler={refreshScheduler} onSchedulerSnapshot={applySchedulerSnapshot} tabRequest={chatTabRequest} onConnectCli={connectCli} onOpenSession={openSession} onMetaChanged={updateSessionMeta} onSessionCatalogChanged={syncSessionCatalog} attentionTarget={chatViewAttentionTarget} onAttentionTargetHandled={clearChatViewAttentionTarget} popout={Boolean(popoutRequest)} />)}
           {panel("sessions", () => <MemoSessionsView providers={snapshot.status.providers} sessions={snapshot.sessions} folders={snapshot.folders} catalogHealth={catalogHealth} onRefreshList={reconcileSessionList} selected={selectedSession} messageDisplayMode={messageDisplayMode} transcriptLimit={transcriptLimit} onTranscriptLimitChange={setTranscriptLimit} onSelect={selectSession} onMetaChanged={updateSessionMeta} onFoldersChanged={updateFolders} onSessionCatalogChanged={syncSessionCatalog} attentionTarget={sessionAttentionTarget} onAttentionTargetHandled={clearSessionAttentionTarget} popout={Boolean(popoutRequest)} />)}
           {panel("docs", () => <MemoDocsView providers={snapshot.status.providers} accounts={accounts} models={modelOptions} onRequestAiaPrompt={requestAiaPrompt} />)}
-          {panel("projects", () => <MemoProjectsView active={view === "projects"} tabRequest={projectsTabRequest} registryRevision={resourceRepositoryRevision} onRegistryChanged={invalidateResourceViews} />)}
+          {panel("projects", () => <MemoProjectsView active={view === "projects"} tabRequest={projectsTabRequest} registryRevision={resourceRepositoryRevision} onRegistryChanged={invalidateResourceViews} onRequestAiaPrompt={requestAiaPrompt} />)}
           {panel("instructions", () => <MemoInstructionsView onChanged={reloadChangedInstructions} onRequestAiaPrompt={requestAiaPrompt} repositoryRevision={resourceRepositoryRevision} automation={automation} onAutomationChange={applyAutomationChange} />)}
           {panel("skills", () => <MemoSkillsView active={view === "skills"} skills={snapshot.skills} automation={automation} onAutomationChange={applyAutomationChange} onSkillsChanged={reloadChangedResources} onRequestAiaPrompt={requestAiaPrompt} aiaTransferAvailable={skillTransferAiaAvailable} catalogHealth={catalogHealth} repositoryRevision={resourceRepositoryRevision} />)}
           {panel("agents", () => <MemoAgentsView agents={snapshot.agents} automation={automation} onAutomationChange={applyAutomationChange} catalogHealth={catalogHealth} />)}
           {panel("artifacts", () => <MemoArtifactsView groups={snapshot.artifacts} automation={automation} onAutomationChange={applyAutomationChange} catalogHealth={catalogHealth} />)}
           {panel("workflows", () => <MemoWorkflowsView active={view === "workflows"} onRequestAiaPrompt={requestAiaPrompt} tabRequest={workflowsTabRequest} pacingSuggestions={pacingSuggestions} />)}
-          {panel("addons", () => <MemoAddonsView active={view === "addons"} tabRequest={addonsTabRequest} automation={automation} onAutomationChange={applyAutomationChange} onSkillsChanged={reloadChangedResources} onRequestAiaPrompt={requestAiaPrompt} />)}
-          {panel("storage", () => <MemoStorageView active={view === "storage"} tabRequest={storageTabRequest} />)}
-          {panel("settings", () => <MemoSettingsView active={view === "settings"} providers={snapshot.status.providers} accounts={accounts} models={modelOptions} onAccountsChange={setAccounts} onConnectCli={connectCli} themeMode={themeMode} onThemeModeChange={setThemeMode} accentColor={accentColor} onAccentColorChange={setAccentColor} navigationPreferences={navigationPreferences} onNavigationPreferencesChange={setNavigationPreferences} messageDisplayMode={messageDisplayMode} onMessageDisplayModeChange={setMessageDisplayMode} automation={automation} onAutomationChange={applyAutomationChange} onRequestAiaPrompt={requestAiaPrompt} tabRequest={settingsTabRequest} systemAgentNoticeRequest={systemAgentNoticeRequest} appVersionManifest={appVersionManifest} onRepositoryChanged={invalidateResourceViews} />)}
+          {panel("addons", () => <MemoAddonsView active={view === "addons"} tabRequest={addonsTabRequest} automation={automation} onAutomationChange={applyAutomationChange} onSkillsChanged={reloadChangedResources} onRequestAiaPrompt={requestAiaPrompt} refreshNonce={refreshNonce} />)}
+          {panel("storage",() => <MemoStorageView active={view === "storage"} tabRequest={storageTabRequest} />)}
+          {panel("settings", () => <MemoSettingsView active={view === "settings"} providers={snapshot.status.providers} accounts={accounts} models={modelOptions} onAccountsChange={setAccounts} onConnectCli={connectCli} themeMode={themeMode} onThemeModeChange={setThemeMode} accentColor={accentColor} onAccentColorChange={setAccentColor} navigationPreferences={navigationPreferences} onNavigationPreferencesChange={setNavigationPreferences} messageDisplayMode={messageDisplayMode} onMessageDisplayModeChange={setMessageDisplayMode} automation={automation} onAutomationChange={applyAutomationChange} onRequestAiaPrompt={requestAiaPrompt} tabRequest={settingsTabRequest} systemAgentNoticeRequest={systemAgentNoticeRequest} appVersionManifest={appVersionManifest} onRepositoryChanged={invalidateResourceViews} onSkillsChanged={reloadChangedResources} />)}
           </Suspense>
         </main>
       </section>
@@ -1010,6 +1025,54 @@ function useSessionCatalogCenter({ snapshotRef, sessionsViewActive, refresh, rep
  * 물을 근거를 얻지 못했으면(백엔드 응답 실패) 막지 않고 종료한다. 확인 절차가 종료를
  * 가로막는 쪽이 더 나쁘고, 셸도 같은 이유로 답이 없으면 스스로 종료한다.
  */
+/**
+ * 공급자 설치본에 시스템 스킬이 새로 깔리거나 갱신되면 기동 때 한 번 알린다.
+ *
+ * 설치 자체는 막지 않는다 — 이 스킬들이 있어야 일반 채팅도 SSH·DB·비밀값·세션조회에
+ * 닿는다. 다만 공급자의 **사용자 전역** 스킬 루트(`~/.claude/skills` 등)에 파일이 생기는
+ * 일이라, Agent Manager 밖에서 띄운 세션도 그 스킬을 싣게 된다. 모르고 지나갈 일이 아니다.
+ *
+ * 바뀐 것이 없으면 뜨지 않는다. 확인하면 백엔드가 안내를 지워 다음 기동에서 다시 뜨지 않는다.
+ */
+function useSystemSkillNotice(text: (ko: string, en: string) => string) {
+  const { confirm, confirmDialog } = useConfirm();
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const notice = await getSystemSkillNotice().catch(() => null);
+      if (cancelled || !notice || notice.entries.length === 0) return;
+      const providers = [...new Set(notice.entries.map((entry) => entry.provider))];
+      const items = notice.entries.map((entry) => {
+        const what = entry.outcome === "installed"
+          ? text("추가됨", "added")
+          : text("갱신됨", "updated");
+        return `${providerLabel(entry.provider)} · ${entry.key} — ${what}`;
+      });
+      await confirm({
+        title: text("에이전트 스킬이 설치되었습니다", "Agent skills were installed"),
+        message: [
+          text(
+            `공급자 ${providers.length}곳의 스킬 ${notice.entries.length}건이 바뀌었습니다.`,
+            `${notice.entries.length} skill(s) changed across ${providers.length} provider(s).`,
+          ),
+          text(
+            "이 스킬들은 공급자의 사용자 스킬 폴더에 깔리므로, Agent Manager 밖에서 띄운 세션에도 보입니다.",
+            "They live in each provider's user skill folder, so sessions started outside Agent Manager see them too.",
+          ),
+        ].join("\n"),
+        items,
+        confirmLabel: text("확인", "OK"),
+        cancelLabel: text("닫기", "Close"),
+      });
+      if (!cancelled) await acknowledgeSystemSkillNotice().catch(() => undefined);
+    })();
+    return () => { cancelled = true; };
+  }, [confirm, text]);
+
+  return confirmDialog;
+}
+
 function useQuitConfirmation(text: (ko: string, en: string) => string) {
   const { confirm, confirmDialog } = useConfirm();
 

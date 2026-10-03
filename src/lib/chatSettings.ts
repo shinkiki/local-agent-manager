@@ -6,6 +6,7 @@ import type {
 } from "../types";
 import { fallbackSettingFields } from "./chatModes.ts";
 
+import { runtimeCatalogText } from "./i18nRuntime.ts";
 // 실행설정 항목 스키마는 백엔드 ChatProviderOptions.settings로 내려오며,
 // 카탈로그가 도착하기 전에는 fallbackSettingFields가 같은 내용을 즉시 제공한다.
 // 이 모듈은 스키마가 어디서 왔든 항목을 찾고 저장값을 맞추는 일만 한다. 어떤 실행
@@ -35,7 +36,8 @@ export function settingOptions(fields: ChatSettingField[], key: string): ChatSet
 }
 
 export function settingOptionLabel(fields: ChatSettingField[], key: string, value: string): string | null {
-  return settingOptions(fields, key).find((option) => option.value === value)?.label ?? null;
+  const label = settingOptions(fields, key).find((option) => option.value === value)?.label;
+  return label === undefined ? null : runtimeCatalogText(label);
 }
 
 /**

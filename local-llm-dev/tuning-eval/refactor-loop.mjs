@@ -117,7 +117,8 @@ async function once(task) {
     calls.push(...turnCalls);
     messages.push({ role: "assistant", content: msg.content ?? "", tool_calls: msg.tool_calls });
     for (const call of turnCalls) {
-      const out = runTool(dir, call);
+      // 열린 도구 이름을 함께 준다 — 없는 도구를 불렀을 때 배포본처럼 목록을 돌려주기 위해서다.
+      const out = runTool(dir, call, task.tools);
       if (process.env.VERBOSE) console.log(`     ${turn}> ${call.name} ${JSON.stringify(call.args).slice(0, 110)}`);
       messages.push({ role: "tool", tool_call_id: call.id, content: out });
     }
@@ -133,6 +134,8 @@ for (const task of TASKS) {
   const whys = [];
   const turnCounts = [];
   let nudgeTotal = 0;
+  // 지어낸 도구 이름은 통과해도 센다 — 도구 수 민감도의 신호라 합격률 뒤에 숨기지 않는다.
+  let inventedTotal = 0;
   for (let i = 0; i < REPEATS; i++) {
     const run = await once(task);
     const score = run.error
@@ -141,6 +144,7 @@ for (const task of TASKS) {
     // 돌아간 턴 수는 통과 여부와 따로 적는다 — 비용이지 결함이 아니다.
     turnCounts.push(run.turns ?? 0);
     nudgeTotal += run.nudges ?? 0;
+    inventedTotal += score.invented ?? 0;
     if (score.ok) ok++;
     else whys.push(score.why);
     if (process.env.VERBOSE)
@@ -153,7 +157,7 @@ for (const task of TASKS) {
   }
   rows.push({ id: task.id, ok, turns: turnCounts });
   console.log(`${ok === REPEATS ? "O" : "X"} ${task.id.padEnd(20)} ${ok}/${REPEATS}  ${task.label}`);
-  console.log(`    턴 ${turnCounts.join("·")} · 다시 보냄 ${nudgeTotal}회`);
+  console.log(`    턴 ${turnCounts.join("·")} · 다시 보냄 ${nudgeTotal}회 · 지어낸 도구 이름 ${inventedTotal}회`);
   if (whys.length) console.log(`    어긋난 예: ${[...new Set(whys)].slice(0, 3).join(" / ")}`);
 }
 console.log("\n요약 " + rows.map((r) => `${r.id}=${r.ok}/${REPEATS}`).join(" "));

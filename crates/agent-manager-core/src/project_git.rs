@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::cli_interface::{run_capped_with, CappedOptions, CommandOutcome};
 use crate::doc_roots::is_restricted_doc_root;
 use crate::git_refs::read_small;
+use crate::json_store::{JsonStore, SchemaVersioned};
 use crate::path_guard::{self, CurDirPolicy, RootLabels};
 use crate::process_output::MAX_CAPTURED_OUTPUT_BYTES;
 use crate::providers::resolve_named_executable;
@@ -37,7 +38,7 @@ use crate::CoreError;
 const MIN_GIT_VERSION: (u32, u32) = (2, 25);
 
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
-const LOCAL_MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const LOCAL_MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
 
 const MAX_STATUS_ENTRIES: usize = 5_000;
@@ -505,6 +506,48 @@ pub struct GitLog {
     pub has_more: bool,
 }
 
+/// 팔로우 카드가 묻는 한 가지: 이 브랜치와 그 upstream 사이에 무엇이 오고 무엇이 나가는가.
+/// `branch`를 비우면 현재 HEAD 브랜치, `upstream`을 비우면 그 브랜치에 설정된 upstream이다.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitComparisonRequest {
+    pub project_path: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub upstream: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// 브랜치와 upstream의 차이를 **방향으로 갈라** 돌려준다(B6). 한 숫자로 합치면 "3 커밋 차이"가
+/// 받아야 할 것인지 보내야 할 것인지 화면이 말할 수 없고, 사용자는 pull과 push 중 무엇을
+/// 눌러야 하는지 알 수 없다.
+///
+/// 이 수치는 **마지막 fetch 기준**이다. 원격을 새로 묻지 않으므로(읽기 조회이고 네트워크를
+/// 쓰지 않는다) `last_fetched_at`을 같이 실어 화면이 그 사실을 말하게 한다.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranchComparison {
+    pub project_path: String,
+    pub branch: Option<String>,
+    pub upstream: Option<String>,
+    /// upstream이 설정되지 않았거나 사라졌다. 이때 양쪽 목록은 비어 있다.
+    pub no_upstream: bool,
+    /// `branch..upstream` — 받아야 할 커밋(최신 먼저).
+    pub incoming: Vec<GitCommit>,
+    /// `upstream..branch` — 보내야 할 커밋(최신 먼저).
+    pub outgoing: Vec<GitCommit>,
+    pub incoming_count: u32,
+    pub outgoing_count: u32,
+    pub incoming_truncated: bool,
+    pub outgoing_truncated: bool,
+    /// 양쪽 모두 0이 아니다 — fast-forward로 정리되지 않는다.
+    pub diverged: bool,
+    /// `FETCH_HEAD`의 수정 시각(unix 초). 한 번도 fetch하지 않았으면 null이다.
+    pub last_fetched_at: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------
 // 영수증
 // ---------------------------------------------------------------------------
@@ -598,7 +641,7 @@ impl GitRunner {
         Self::open_with_env(app_data_dir, project_root, Vec::new())
     }
 
-    fn open_with_env(
+    pub(crate) fn open_with_env(
         app_data_dir: &Path,
         project_root: &Path,
         extra_env: Vec<(String, String)>,
@@ -691,6 +734,11 @@ impl GitRunner {
         Ok(runner)
     }
 
+    /// overlay 어댑터가 저장소 단위 잠금을 git 어댑터와 **공유**하기 위해 보는 키(C19-3).
+    pub(crate) fn overlay_lock_key(&self) -> &Path {
+        &self.root
+    }
+
     fn root_string(&self) -> String {
         self.root.to_string_lossy().into_owned()
     }
@@ -754,6 +802,32 @@ impl GitRunner {
         timeout: Duration,
     ) -> Result<CommandOutcome, CoreError> {
         self.run(args, input, timeout, true)
+    }
+
+    /// C19 overlay 어댑터가 쓰는 읽기. 경로를 stdin으로 넘기므로 입력을 함께 받는다.
+    pub(crate) fn overlay_read_with_input(
+        &self,
+        args: &[&str],
+        input: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<CommandOutcome, CoreError> {
+        self.run(args, input, timeout, false)
+    }
+
+    /// C19 overlay 어댑터가 쓰는 변경. `restore --source=HEAD --worktree` 한 갈래뿐이고,
+    /// 부를 수 있는 자리는 patch 저장이 끝난 뒤의 `snapshot_patch_then_restore` 하나다.
+    pub(crate) fn overlay_write_with_input(
+        &self,
+        args: &[&str],
+        input: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<CommandOutcome, CoreError> {
+        self.run(args, input, timeout, true)
+    }
+
+    /// overlay 영수증의 `head_before`/`head_after`(C19-5).
+    pub(crate) fn overlay_head_sha(&self) -> Result<Option<String>, CoreError> {
+        self.head_sha()
     }
 
     /// `HEAD`가 가리키는 커밋. 아직 커밋이 없으면 `None`.
@@ -1009,10 +1083,10 @@ fn busy_repositories() -> &'static Mutex<BTreeSet<PathBuf>> {
     BUSY.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
-struct BusyGuard(PathBuf);
+pub(crate) struct BusyGuard(PathBuf);
 
 impl BusyGuard {
-    fn acquire(root: &Path) -> Option<Self> {
+    pub(crate) fn acquire(root: &Path) -> Option<Self> {
         let mut busy = busy_repositories()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1418,6 +1492,376 @@ fn log_with(runner: &GitRunner, request: &ProjectGitLogRequest) -> Result<GitLog
         reference,
         commits,
         has_more,
+    })
+}
+
+/// 브랜치와 upstream의 차이를 방향으로 갈라 읽는다(B6, C16-7 읽기이므로 게이트 없음).
+/// 네트워크를 쓰지 않는다 — 마지막 fetch가 가져다 놓은 원격 추적 ref만 본다.
+pub fn get_project_branch_comparison(
+    app_data_dir: &Path,
+    project_root: &Path,
+    request: &ProjectGitComparisonRequest,
+) -> Result<GitBranchComparison, CoreError> {
+    let runner = GitRunner::open(app_data_dir, project_root)?;
+    branch_comparison_with(&runner, request)
+}
+
+fn branch_comparison_with(
+    runner: &GitRunner,
+    request: &ProjectGitComparisonRequest,
+) -> Result<GitBranchComparison, CoreError> {
+    let limit = request
+        .limit
+        .unwrap_or(DEFAULT_LOG_LIMIT)
+        .clamp(1, MAX_LOG_LIMIT);
+    let last_fetched_at = last_fetch_time(runner);
+    let empty = |branch: Option<String>, upstream: Option<String>| GitBranchComparison {
+        project_path: runner.root_string(),
+        branch,
+        upstream,
+        no_upstream: true,
+        incoming: Vec::new(),
+        outgoing: Vec::new(),
+        incoming_count: 0,
+        outgoing_count: 0,
+        incoming_truncated: false,
+        outgoing_truncated: false,
+        diverged: false,
+        last_fetched_at,
+    };
+
+    let branch = match request
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(name) => {
+            validate_branch_name(name)?;
+            name.to_owned()
+        }
+        // detached HEAD나 첫 커밋 전에는 비교할 브랜치가 없다. 오류가 아니라 빈 비교다.
+        None => match runner.head()?.branch {
+            Some(name) => name,
+            None => return Ok(empty(None, None)),
+        },
+    };
+
+    let upstream = match request
+        .upstream
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(name) => {
+            validate_ref_text(name)?;
+            name.to_owned()
+        }
+        None => match configured_upstream(runner, &branch)? {
+            Some(name) => name,
+            None => return Ok(empty(Some(branch), None)),
+        },
+    };
+
+    // 양쪽 모두 커밋을 가리켜야 범위를 물을 수 있다. upstream이 gone이면 여기서 걸린다(C16-5).
+    if !ref_is_commit(runner, &branch)? {
+        return Ok(empty(Some(branch), Some(upstream)));
+    }
+    if !ref_is_commit(runner, &upstream)? {
+        return Ok(empty(Some(branch), Some(upstream)));
+    }
+
+    let (incoming_count, outgoing_count) = left_right_counts(runner, &branch, &upstream)?;
+    let incoming = range_commits(runner, &branch, &upstream, limit)?;
+    let outgoing = range_commits(runner, &upstream, &branch, limit)?;
+    Ok(GitBranchComparison {
+        project_path: runner.root_string(),
+        branch: Some(branch),
+        upstream: Some(upstream),
+        no_upstream: false,
+        incoming_truncated: incoming_count as usize > incoming.len(),
+        outgoing_truncated: outgoing_count as usize > outgoing.len(),
+        diverged: incoming_count > 0 && outgoing_count > 0,
+        incoming,
+        outgoing,
+        incoming_count,
+        outgoing_count,
+        last_fetched_at,
+    })
+}
+
+/// `branch.<name>.remote` + `merge`가 아니라 `for-each-ref`에 묻는다. 두 설정을 손으로 합치면
+/// `remote = .`(로컬 추적)와 refspec 변형에서 어긋난다.
+fn configured_upstream(runner: &GitRunner, branch: &str) -> Result<Option<String>, CoreError> {
+    let reference = format!("refs/heads/{branch}");
+    let outcome = runner.read(
+        &[
+            "for-each-ref",
+            "--format=%(upstream:short)",
+            "--end-of-options",
+            &reference,
+        ],
+        READ_TIMEOUT,
+    )?;
+    if !outcome.success {
+        return Ok(None);
+    }
+    Ok(outcome
+        .stdout
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned))
+}
+
+fn ref_is_commit(runner: &GitRunner, reference: &str) -> Result<bool, CoreError> {
+    let spec = format!("{reference}^{{commit}}");
+    let outcome = runner.read(
+        &["rev-parse", "-q", "--verify", "--end-of-options", &spec],
+        READ_TIMEOUT,
+    )?;
+    Ok(outcome.success)
+}
+
+/// `rev-list --count --left-right A...B`는 한 번의 호출로 양쪽 수를 준다. 두 번 세면 그 사이에
+/// 다른 명령이 ref를 옮겨 둘이 다른 시점을 말할 수 있다.
+fn left_right_counts(
+    runner: &GitRunner,
+    branch: &str,
+    upstream: &str,
+) -> Result<(u32, u32), CoreError> {
+    let range = format!("{branch}...{upstream}");
+    let outcome = runner.read(
+        &[
+            "rev-list",
+            "--count",
+            "--left-right",
+            "--end-of-options",
+            &range,
+            "--",
+        ],
+        READ_TIMEOUT,
+    )?;
+    if !outcome.success {
+        return Err(CoreError::Runtime(format!(
+            "git rev-list 실패: {}",
+            first_line(&outcome.stderr)
+        )));
+    }
+    let mut fields = outcome.stdout.split_whitespace();
+    // 왼쪽이 branch에만 있는 수(= 보낼 것), 오른쪽이 upstream에만 있는 수(= 받을 것)다.
+    let outgoing = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let incoming = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    Ok((incoming, outgoing))
+}
+
+/// `from..to` — `to`에는 있고 `from`에는 없는 커밋. `..`은 여기서만 만들어지고, 양쪽은 이미
+/// 검증을 지난 값이라 사용자 입력이 범위 문법으로 새지 않는다(C16-5).
+fn range_commits(
+    runner: &GitRunner,
+    from: &str,
+    to: &str,
+    limit: usize,
+) -> Result<Vec<GitCommit>, CoreError> {
+    let range = format!("{from}..{to}");
+    let count = limit.to_string();
+    let outcome = runner.read(
+        &[
+            "log",
+            "-z",
+            "--no-color",
+            "--format=%H%x1f%h%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%cn%x1f%ct%x1f%D%x1f%s%x1f%b",
+            "-n",
+            &count,
+            "--end-of-options",
+            &range,
+            "--",
+        ],
+        READ_TIMEOUT,
+    )?;
+    if !outcome.success {
+        return Err(CoreError::Runtime(format!(
+            "git log 실패: {}",
+            first_line(&outcome.stderr)
+        )));
+    }
+    Ok(parse_log_records(&outcome.stdout))
+}
+
+/// 마지막 fetch 시각. `FETCH_HEAD`는 fetch가 매번 다시 쓰는 파일이라 그 mtime이 가장 가까운
+/// 답이다. 없으면(한 번도 fetch하지 않았으면) null이다.
+fn last_fetch_time(runner: &GitRunner) -> Option<i64> {
+    let candidates = [
+        runner.common_dir.join("FETCH_HEAD"),
+        runner.git_dir.join("FETCH_HEAD"),
+    ];
+    candidates
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .filter_map(|meta| meta.modified().ok())
+        .filter_map(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .max()
+}
+
+// ---------------------------------------------------------------------------
+// 브랜치 팔로우(B3)
+// ---------------------------------------------------------------------------
+
+const BRANCH_FOLLOWS_VERSION: u32 = 1;
+
+/// 팔로우는 저장소가 아니라 **이 기기의 선택**이므로 앱 데이터에만 둔다(G7). git config나
+/// `.git` 안에 적으면 저장소를 공유하는 모든 사람·모든 워크트리가 같은 목록을 보게 되고,
+/// 그것은 C16이 읽기 전용으로 두기로 한 사용자 소유 상태를 쓰는 일이기도 하다.
+///
+/// 즐겨찾기(세션 메타의 `favorite`)와 **다른 파일**에 둔다. 둘은 수명도 주체도 다르다 —
+/// 즐겨찾기는 사용자가 목록에서 위로 올리려는 표시이고, 팔로우는 "이 브랜치의 수신/송신을
+/// 계속 재라"는 지시라 프로젝트와 브랜치 이름에 매여 있다. 한 파일에 섞으면 브랜치가
+/// 사라졌을 때 어느 쪽을 지워야 하는지가 한 자리에서 갈라지지 않는다.
+const BRANCH_FOLLOWS_STORE: JsonStore = JsonStore {
+    file: "project-branch-follows-v1.json",
+    lock_file: "project-branch-follows-v1.lock",
+    label: "프로젝트 브랜치 팔로우 저장소",
+    version: BRANCH_FOLLOWS_VERSION,
+};
+
+/// 저장할 수 있는 팔로우 수 상한. 레인 워크트리를 많이 쓰는 저장소 여럿을 담고도 남으면서,
+/// 조회마다 읽는 파일이 무한정 자라지 않게 한다.
+const MAX_BRANCH_FOLLOWS: usize = 500;
+
+/// 사용자가 계속 지켜보겠다고 표시한 브랜치 하나. 저장본과 화면 표시가 같은 모양이다.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectBranchFollow {
+    /// 등록 프로젝트 경로. 저장소 최상위가 아니라 사용자가 고른 프로젝트 기준이다 —
+    /// 화면이 프로젝트 단위로 묻기 때문이다.
+    pub project_path: String,
+    pub branch: String,
+    /// 표시한 시각(epoch 초). 목록 정렬과 "언제부터 보고 있었나"에만 쓰는 비밀 아닌 값이다.
+    pub followed_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectBranchFollows {
+    pub schema_version: u32,
+    pub project_path: String,
+    /// 이 프로젝트의 팔로우만. 다른 프로젝트의 선택은 화면에 실리지 않는다.
+    pub follows: Vec<ProjectBranchFollow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetProjectBranchFollowRequest {
+    pub project_path: String,
+    pub branch: String,
+    /// 참이면 추가(이미 있으면 그대로), 거짓이면 제거. 토글이 아니라 상태를 보내게 해서
+    /// 두 화면이 같은 순간에 눌러도 결과가 뒤집히지 않는다.
+    pub follow: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BranchFollowStore {
+    schema_version: u32,
+    #[serde(default)]
+    follows: Vec<ProjectBranchFollow>,
+}
+
+impl Default for BranchFollowStore {
+    fn default() -> Self {
+        Self {
+            schema_version: BRANCH_FOLLOWS_VERSION,
+            follows: Vec::new(),
+        }
+    }
+}
+
+impl SchemaVersioned for BranchFollowStore {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
+fn follow_key(project_root: &Path) -> String {
+    project_root.to_string_lossy().into_owned()
+}
+
+fn project_follows(store: BranchFollowStore, key: &str) -> Vec<ProjectBranchFollow> {
+    let mut follows: Vec<ProjectBranchFollow> = store
+        .follows
+        .into_iter()
+        .filter(|entry| entry.project_path == key)
+        .collect();
+    follows.sort_by(|a, b| a.branch.cmp(&b.branch));
+    follows
+}
+
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// 이 프로젝트에서 팔로우 중인 브랜치. 조회라 git을 띄우지 않는다 — 저장본만 읽으므로
+/// 저장소가 잠겨 있거나 git이 없어도 화면이 표시를 잃지 않는다.
+pub fn list_project_branch_follows(
+    app_data_dir: &Path,
+    project_root: &Path,
+) -> Result<ProjectBranchFollows, CoreError> {
+    let key = follow_key(project_root);
+    let store: BranchFollowStore = BRANCH_FOLLOWS_STORE.read(app_data_dir)?;
+    Ok(ProjectBranchFollows {
+        schema_version: BRANCH_FOLLOWS_VERSION,
+        follows: project_follows(store, &key),
+        project_path: key,
+    })
+}
+
+/// 팔로우를 켜거나 끈다. 브랜치 이름은 git에 넘기지 않더라도 저장 전에 검증한다 —
+/// 저장본에 들어간 이름은 다음 조회에서 `get_project_branch_comparison`의 인자가 되고,
+/// 그때 거절하면 화면에 지울 수 없는 줄이 남는다(C16-5와 같은 이유).
+pub fn set_project_branch_follow(
+    app_data_dir: &Path,
+    project_root: &Path,
+    request: &SetProjectBranchFollowRequest,
+) -> Result<ProjectBranchFollows, CoreError> {
+    let branch = request.branch.trim().to_owned();
+    validate_branch_name(&branch)?;
+    let key = follow_key(project_root);
+    let store: BranchFollowStore =
+        BRANCH_FOLLOWS_STORE.update(app_data_dir, |store: &mut BranchFollowStore| {
+            let existing = store
+                .follows
+                .iter()
+                .position(|entry| entry.project_path == key && entry.branch == branch);
+            match (request.follow, existing) {
+                (true, Some(_)) | (false, None) => Ok(false),
+                (true, None) => {
+                    if store.follows.len() >= MAX_BRANCH_FOLLOWS {
+                        return Err(CoreError::InvalidInput(format!(
+                            "팔로우는 최대 {MAX_BRANCH_FOLLOWS}개까지 저장할 수 있습니다"
+                        )));
+                    }
+                    store.follows.push(ProjectBranchFollow {
+                        project_path: key.clone(),
+                        branch: branch.clone(),
+                        followed_at: now_seconds(),
+                    });
+                    Ok(true)
+                }
+                (false, Some(index)) => {
+                    store.follows.remove(index);
+                    Ok(true)
+                }
+            }
+        })?;
+    Ok(ProjectBranchFollows {
+        schema_version: BRANCH_FOLLOWS_VERSION,
+        follows: project_follows(store, &key),
+        project_path: key,
     })
 }
 
@@ -1860,7 +2304,7 @@ fn validate_ref_text(reference: &str) -> Result<(), CoreError> {
 
 /// 저장소 루트 기준 상대 경로 하나를 검증한다. 존재하지 않아도 된다(지운 파일을 스테이지할 수
 /// 있어야 한다) — 그래서 존재하는 가장 가까운 조상까지 정규화해 루트 안인지 본다.
-fn validate_repo_path(root: &Path, raw: &str) -> Result<String, CoreError> {
+pub(crate) fn validate_repo_path(root: &Path, raw: &str) -> Result<String, CoreError> {
     let value = raw.trim();
     if value.is_empty() || value.len() > MAX_PATH_BYTES {
         return Err(CoreError::InvalidInput(
@@ -1892,7 +2336,7 @@ fn validate_repo_path(root: &Path, raw: &str) -> Result<String, CoreError> {
 }
 
 /// stage·unstage에 넘길 NUL 구분 pathspec. 개수 상한과 중복 제거를 여기서 한다.
-fn pathspec_payload(root: &Path, paths: &[String]) -> Result<Vec<u8>, CoreError> {
+pub(crate) fn pathspec_payload(root: &Path, paths: &[String]) -> Result<Vec<u8>, CoreError> {
     if paths.is_empty() {
         return Err(CoreError::InvalidInput(
             "경로를 하나 이상 지정하세요".to_owned(),
@@ -2505,6 +2949,107 @@ fn redact_git_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B3. 팔로우는 프로젝트와 브랜치에 매인 기기 단위 저장본이다(G7). 2026-10-02 측정:
+    /// 저장 자리가 없어 화면이 "계속 볼 브랜치"를 기억하지 못했다. 토글이 아니라 상태를
+    /// 보내므로 같은 요청을 두 번 보내도 결과가 뒤집히지 않아야 하고, 끈 뒤에는 줄 자체가
+    /// 사라져야 한다 — 꺼진 줄을 남겨 두면 상한 500에 꺼진 것들이 쌓인다.
+    #[test]
+    fn branch_follow_is_stored_per_project_and_is_idempotent() {
+        let dir = tempfile::tempdir().expect("임시 앱 데이터");
+        let app_data = dir.path();
+        let one = Path::new("/tmp/project-one");
+        let two = Path::new("/tmp/project-two");
+
+        assert!(list_project_branch_follows(app_data, one)
+            .expect("빈 목록")
+            .follows
+            .is_empty());
+
+        let request = SetProjectBranchFollowRequest {
+            project_path: "/tmp/project-one".to_owned(),
+            branch: "feature/a".to_owned(),
+            follow: true,
+        };
+        let saved = set_project_branch_follow(app_data, one, &request).expect("저장");
+        assert_eq!(saved.follows.len(), 1);
+        assert_eq!(saved.follows[0].branch, "feature/a");
+        // 같은 상태를 다시 보내도 한 줄이다.
+        let again = set_project_branch_follow(app_data, one, &request).expect("재저장");
+        assert_eq!(again.follows.len(), 1);
+        assert_eq!(again.follows[0].followed_at, saved.follows[0].followed_at);
+
+        // 다른 프로젝트의 선택은 섞이지 않는다.
+        set_project_branch_follow(
+            app_data,
+            two,
+            &SetProjectBranchFollowRequest {
+                project_path: "/tmp/project-two".to_owned(),
+                branch: "feature/a".to_owned(),
+                follow: true,
+            },
+        )
+        .expect("다른 프로젝트 저장");
+        assert_eq!(
+            list_project_branch_follows(app_data, one)
+                .unwrap()
+                .follows
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_project_branch_follows(app_data, two)
+                .unwrap()
+                .follows
+                .len(),
+            1
+        );
+
+        let cleared = set_project_branch_follow(
+            app_data,
+            one,
+            &SetProjectBranchFollowRequest {
+                project_path: "/tmp/project-one".to_owned(),
+                branch: "feature/a".to_owned(),
+                follow: false,
+            },
+        )
+        .expect("해제");
+        assert!(cleared.follows.is_empty());
+        // 해제는 그 프로젝트만 지운다.
+        assert_eq!(
+            list_project_branch_follows(app_data, two)
+                .unwrap()
+                .follows
+                .len(),
+            1
+        );
+    }
+
+    /// B3. 저장본에 들어간 브랜치 이름은 다음 조회에서 비교 요청의 인자가 되므로, 저장
+    /// 시점에 C16-5와 같은 검증을 통과해야 한다. `-`로 시작하는 이름이나 제어문자가
+    /// 저장되면 지울 수 없는 줄이 화면에 남는다.
+    #[test]
+    fn branch_follow_refuses_names_git_would_refuse() {
+        let dir = tempfile::tempdir().expect("임시 앱 데이터");
+        let app_data = dir.path();
+        let root = Path::new("/tmp/project-one");
+        for bad in ["--upload-pack=x", "with space", "tab\there", ""] {
+            let request = SetProjectBranchFollowRequest {
+                project_path: "/tmp/project-one".to_owned(),
+                branch: bad.to_owned(),
+                follow: true,
+            };
+            assert!(
+                set_project_branch_follow(app_data, root, &request).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(list_project_branch_follows(app_data, root)
+            .unwrap()
+            .follows
+            .is_empty());
+    }
 
     #[test]
     fn version_is_parsed_from_the_banner() {
@@ -3165,6 +3710,154 @@ def456\x1fdef\x1f\x1fAn\x1fan@x\x1f1699999999\x1fCn\x1f1699999999\x1f\x1fRoot\x1
 
         // 존재하지 않는 ref.
         assert!(git.verify_commit_ref("nope").is_err());
+    }
+
+    /// B6/B7. 비교는 수신(`HEAD..upstream`)과 송신(`upstream..HEAD`)으로 갈려 나온다.
+    ///
+    /// 2026-10-02에 이 시험이 붙은 이유: 그때까지 화면이 쓸 수 있는 수치는 `GitUpstream`의
+    /// `ahead`/`behind` 두 숫자뿐이었고, 어떤 커밋이 오고 어떤 커밋이 나가는지는 어디서도
+    /// 답하지 않았다. 한 숫자로 합친 "3 커밋 차이"는 사용자가 pull을 눌러야 하는지 push를
+    /// 눌러야 하는지 말해 주지 못한다.
+    ///
+    /// 그래서 문구가 아니라 **방향이 뒤집히지 않는 것**을 고정한다. 여기서는 upstream에만 있는
+    /// 커밋 하나와 로컬에만 있는 커밋 둘을 실제 git으로 만들어 두고, 각 목록에 들어온 SHA가
+    /// 정확히 그 커밋인지 본다. 수를 세는 자리(`rev-list --left-right`)와 목록을 뽑는
+    /// 자리(`log from..to`)가 따로라 한쪽만 뒤집히는 실수가 실제로 가능하고, 그때 개수는
+    /// 맞는데 내용이 반대인 화면이 된다.
+    #[test]
+    fn project_branch_comparison_splits_incoming_and_outgoing() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let git = runner(&repo);
+        let ask = |branch: Option<&str>, upstream: Option<&str>| {
+            branch_comparison_with(
+                &git,
+                &ProjectGitComparisonRequest {
+                    project_path: String::new(),
+                    branch: branch.map(str::to_owned),
+                    upstream: upstream.map(str::to_owned),
+                    limit: None,
+                },
+            )
+        };
+
+        // 첫 커밋 전에는 비교할 브랜치가 없다 — 오류가 아니라 빈 비교다.
+        let unborn = ask(None, None).expect("unborn");
+        assert!(unborn.no_upstream);
+        assert!(unborn.incoming.is_empty() && unborn.outgoing.is_empty());
+
+        let write = |name: &str, body: &str| {
+            std::fs::write(repo.root.join(name), body).expect("write");
+            stage_with(&git, &[name.to_owned()]).expect("stage");
+        };
+        write("a.txt", "one\n");
+        commit_with(&git, "base").expect("base");
+
+        // 원격 대신 같은 저장소의 다른 브랜치를 upstream으로 쓴다. 비교가 묻는 것은 두 ref의
+        // 관계뿐이라 네트워크가 필요 없고, 시험이 원격 상태에 의존하지 않는다.
+        let branched = git
+            .read(
+                &["branch", "upstream-side", "--end-of-options"],
+                READ_TIMEOUT,
+            )
+            .expect("branch");
+        assert!(branched.success, "{}", branched.stderr);
+
+        // upstream 쪽에 커밋 하나 — 받아야 할 것.
+        let switched = switch_with(
+            &git,
+            &ProjectGitSwitchRequest {
+                project_path: String::new(),
+                branch: "upstream-side".into(),
+                create: false,
+                start_point: None,
+            },
+        )
+        .expect("switch");
+        assert!(switched.succeeded, "{}", switched.stderr);
+        write("b.txt", "theirs\n");
+        let theirs = commit_with(&git, "그쪽 커밋").expect("theirs");
+        let theirs_sha = theirs.head_after.clone().expect("theirs sha");
+
+        // main으로 돌아와 커밋 둘 — 보내야 할 것.
+        switch_with(
+            &git,
+            &ProjectGitSwitchRequest {
+                project_path: String::new(),
+                branch: "main".into(),
+                create: false,
+                start_point: None,
+            },
+        )
+        .expect("switch back");
+        write("c.txt", "mine one\n");
+        let mine_one = commit_with(&git, "내 커밋 1").expect("mine one");
+        let mine_one_sha = mine_one.head_after.clone().expect("mine one sha");
+        write("d.txt", "mine two\n");
+        let mine_two = commit_with(&git, "내 커밋 2").expect("mine two");
+        let mine_two_sha = mine_two.head_after.clone().expect("mine two sha");
+
+        let split = ask(None, Some("upstream-side")).expect("comparison");
+        assert!(!split.no_upstream);
+        assert_eq!(split.branch.as_deref(), Some("main"));
+        assert_eq!(split.upstream.as_deref(), Some("upstream-side"));
+        assert_eq!(
+            (split.incoming_count, split.outgoing_count),
+            (1, 2),
+            "수신은 upstream에만, 송신은 branch에만 있는 커밋 수다"
+        );
+        assert!(split.diverged, "양쪽 다 0이 아니면 fast-forward가 아니다");
+        let incoming: Vec<&str> = split.incoming.iter().map(|c| c.sha.as_str()).collect();
+        let outgoing: Vec<&str> = split.outgoing.iter().map(|c| c.sha.as_str()).collect();
+        assert_eq!(
+            incoming,
+            vec![theirs_sha.as_str()],
+            "수신은 그쪽 커밋뿐이다"
+        );
+        assert_eq!(
+            outgoing,
+            vec![mine_two_sha.as_str(), mine_one_sha.as_str()],
+            "송신은 내 커밋 둘, 최신이 먼저다"
+        );
+        assert!(!split.incoming_truncated && !split.outgoing_truncated);
+
+        // 방향을 바꿔 물으면 두 목록도 그대로 뒤집힌다 — 어느 쪽이 기준인지가 수치의 의미다.
+        let mirrored = ask(Some("upstream-side"), Some("main")).expect("mirrored");
+        assert_eq!(
+            (mirrored.incoming_count, mirrored.outgoing_count),
+            (2, 1),
+            "기준을 바꾸면 수신과 송신이 자리를 맞바꾼다"
+        );
+
+        // limit은 목록만 자르고 수치는 전체를 말한다 — 화면이 "2건 중 1건"을 그릴 수 있어야 한다.
+        let capped = branch_comparison_with(
+            &git,
+            &ProjectGitComparisonRequest {
+                project_path: String::new(),
+                branch: None,
+                upstream: Some("upstream-side".into()),
+                limit: Some(1),
+            },
+        )
+        .expect("capped");
+        assert_eq!(capped.outgoing.len(), 1);
+        assert_eq!(capped.outgoing_count, 2);
+        assert!(capped.outgoing_truncated);
+        assert!(!capped.incoming_truncated);
+
+        // upstream이 설정되지 않은 브랜치는 빈 비교다. 없는 ref도 오류가 아니라 같은 모양이다.
+        let none = ask(None, None).expect("no upstream");
+        assert!(none.no_upstream);
+        assert_eq!(none.branch.as_deref(), Some("main"));
+        assert!(none.upstream.is_none());
+        let missing = ask(None, Some("no-such-branch")).expect("missing upstream");
+        assert!(missing.no_upstream);
+        assert!(missing.incoming.is_empty() && missing.outgoing.is_empty());
+
+        // 범위 문법은 이쪽에서만 만든다 — 입력으로 들어온 `..`은 거절한다(C16-5).
+        assert!(ask(None, Some("main..upstream-side")).is_err());
+        assert!(ask(Some("-x"), None).is_err());
     }
 
     #[test]

@@ -25,7 +25,7 @@ import {
   unarchiveSharedProjectInstruction,
   updateProjectInstruction,
 } from "../lib/ipc";
-import { formatBytes, sourceName } from "../lib/format";
+import { formatBytes, sourceName, formatDateTime } from "../lib/format";
 import { useI18n, type UiText } from "../lib/i18n";
 import { runtimeText } from "../lib/i18nRuntime";
 import { localDocumentLinks } from "../lib/markdownLinks";
@@ -1966,7 +1966,7 @@ function InstructionTrashDrawer({
               : item.scope === "personal"
                 ? text("개인 배포 파일", "Personal deployed file")
                 : text("프로젝트 배포 파일", "Project deployed file")}</small>
-            <small>{new Date(item.deletedAtMs).toLocaleString()}</small>
+            <small>{formatDateTime(item.deletedAtMs)}</small>
           </TrashRow>
         ))}
       </div>

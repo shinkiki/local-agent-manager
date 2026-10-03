@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type PointerEvent as ReactPointerEvent, type Dispatch, type ReactNode, type RefObject, type SetStateAction } from "react";
 import { createPortal } from "react-dom";
-import { AppWindow, Archive, ArchiveRestore, Check, ChevronDown, ExternalLink, Folder, GripVertical, MessagesSquare, PanelLeftOpen, ScrollText, SlidersHorizontal, SquareTerminal, Star, TriangleAlert, type LucideIcon } from "lucide-react";
-import { attachChat, connectChat, supportsDeliveryDuringTurn, type ChatConnection } from "../lib/chat";
+import { AppWindow, Archive, ArchiveRestore, Check, ChevronDown, ExternalLink, Folder, GitBranch, GripVertical, MessagesSquare, PanelLeftOpen, ScrollText, SlidersHorizontal, SquareTerminal, Star, TriangleAlert, type LucideIcon } from "lucide-react";
+import { attachChat, connectChat, supportsDeliveryDuringTurn, supportsSessionFork, type ChatConnection } from "../lib/chat";
 import { BACKEND_RESTARTED_MESSAGE, ChatRejectedError } from "../lib/chatReconnect";
 import {
   downloadSessionLinkedFile,
   getDetachedChatForSession,
+  getLiveChats,
   getProviderAccounts,
   getSessionLinkedFile,
   hasTauriRuntime,
@@ -29,6 +30,8 @@ import type {
   ChatModelCatalogOption,
   ChatPhase,
   ChatReasoningOption,
+  ChatSessionInfo,
+  ChatStartRequest,
   MessageDisplayMode,
   ModelOption,
   ProviderAccountView,
@@ -155,11 +158,17 @@ function resolveSessionHandoffLinks(
   }));
 }
 
-/** 목록 검색 조건. 필터와 '가려졌는지' 판정이 같은 규칙을 쓰도록 한곳에 둔다. */
-function matchesSessionQuery(session: SessionSummary, query: string): boolean {
+/**
+ * 목록 검색 조건. 필터와 '가려졌는지' 판정이 같은 규칙을 쓰도록 한곳에 둔다.
+ *
+ * 세션 id 말고 채팅 id도 받는다. AIA와 알림은 실행 중인 대화를 채팅 id로 가리키는데,
+ * 그 값을 그대로 붙여 넣으면 0건이 나와 "분명 있다고 했는데 검색이 안 된다"가 됐다.
+ * 채팅 id는 살아 있는 실행에만 붙으므로, 실행이 끝나면 세션 id로만 찾힌다.
+ */
+function matchesSessionQuery(session: SessionSummary, query: string, chatIds: readonly string[]): boolean {
   const needle = query.trim().toLowerCase();
   if (!needle) return true;
-  return [session.title, session.project, session.cwd, session.id, session.meta.note]
+  return [session.title, session.project, session.cwd, session.id, session.meta.note, ...chatIds]
     .filter((value): value is string => Boolean(value))
     .some((value) => value.toLowerCase().includes(needle));
 }
@@ -274,10 +283,33 @@ function startedBySchedule(session: SessionSummary): boolean {
  * 반복 요청 회차를 한 번 열면 '반복 요청 포함'이 켜진 채 남아 이후 목록이 회차 세션으로
  * 덮였다. 지금은 연 세션 한 건만 목록에 끼워 넣는다(`pinnedKey`).
  */
-type SessionListFilterAxis = (session: SessionSummary, filters: SessionListFilters) => boolean;
+/**
+ * 걸러내기가 세션 바깥에서 가져다 쓰는 값. 지금은 실행 중인 채팅 id 뿐이다. 필터 상태
+ * (`SessionListFilters`)와 섞지 않는다 — 저쪽은 사용자가 고른 값이라 기본값과 견줘
+ * '몇 개 걸려 있는지'를 세고, 이쪽은 런타임에서 흘러드는 값이라 셈에 들어가면 안 된다.
+ */
+interface SessionListLookups {
+  /** `sessionKey(source, id)` → 그 세션에 붙어 있는 실행의 채팅 id. */
+  chatIds: ReadonlyMap<string, string[]>;
+}
+
+const NO_SESSION_LIST_LOOKUPS: SessionListLookups = { chatIds: new Map() };
+
+/** 채팅 id 찾아보기를 다시 읽는 주기. 검색창에 무언가 적혀 있는 동안에만 돈다. */
+const LIVE_CHAT_LOOKUP_REFRESH_MS = 5_000;
+
+type SessionListFilterAxis = (
+  session: SessionSummary,
+  filters: SessionListFilters,
+  lookups: SessionListLookups,
+) => boolean;
 
 const SESSION_LIST_FILTER_AXES: SessionListFilterAxis[] = [
-  (session, filters) => matchesSessionQuery(session, filters.query),
+  (session, filters, lookups) => matchesSessionQuery(
+    session,
+    filters.query,
+    lookups.chatIds.get(sessionKey(session.source, session.id)) ?? [],
+  ),
   (session, filters) => filters.source === "all" || session.source === filters.source,
   (session, filters) => filters.project === "all" || session.cwd === filters.project,
   // 보관함 칩은 켜면 보관한 세션'만' 보여 준다. 이 축만 양방향으로 걸러낸다.
@@ -294,8 +326,12 @@ const SESSION_LIST_FILTER_AXES: SessionListFilterAxis[] = [
 
 // 폴더 조건만 뺀 걸러내기. 폴더 사이드바 개수를 이 조건으로 세어야 "미분류 98건"을 눌렀는데
 // 숨김·보관·서브에이전트로 걸러져 목록이 0건이 되는 어긋남이 생기지 않는다.
-function sessionMatchesListFilters(session: SessionSummary, filters: SessionListFilters): boolean {
-  return SESSION_LIST_FILTER_AXES.every((matches) => matches(session, filters));
+function sessionMatchesListFilters(
+  session: SessionSummary,
+  filters: SessionListFilters,
+  lookups: SessionListLookups = NO_SESSION_LIST_LOOKUPS,
+): boolean {
+  return SESSION_LIST_FILTER_AXES.every((matches) => matches(session, filters, lookups));
 }
 
 /**
@@ -490,6 +526,41 @@ interface SessionListScope {
   showMore: () => void;
 }
 
+/**
+ * 지금 살아 있는 실행을 세션별 채팅 id로 모은다. 목록 검색이 채팅 id도 받기 위한 것이라
+ * 검색창에 무언가 적혀 있을 때만 읽는다 — 목록을 열어 두기만 해도 도는 폴링을 만들지
+ * 않으려는 것이다. 일반 채팅과 AIA 채팅은 프로필이 갈려 두 번 물어야 다 모인다.
+ */
+function useLiveChatIdsBySession(active: boolean): ReadonlyMap<string, string[]> {
+  const [chats, setChats] = useState<ChatSessionInfo[]>([]);
+  useEffect(() => {
+    if (!active) return;
+    let cancelled = false;
+    const load = async () => {
+      const [standard, aia] = await Promise.all([
+        getLiveChats("standard").catch(() => [] as ChatSessionInfo[]),
+        getLiveChats("aia").catch(() => [] as ChatSessionInfo[]),
+      ]);
+      if (!cancelled) setChats([...standard, ...aia]);
+    };
+    void load();
+    const timer = window.setInterval(() => { void load(); }, LIVE_CHAT_LOOKUP_REFRESH_MS);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [active]);
+
+  return useMemo(() => {
+    const bySession = new Map<string, string[]>();
+    for (const chat of chats) {
+      if (!chat.providerSessionId) continue;
+      const key = sessionKey(chat.source, chat.providerSessionId);
+      const ids = bySession.get(key);
+      if (ids) ids.push(chat.chatId);
+      else bySession.set(key, [chat.chatId]);
+    }
+    return bySession;
+  }, [chats]);
+}
+
 function useSessionListScope(
   sessions: SessionSummary[],
   folders: SessionFolder[],
@@ -515,9 +586,12 @@ function useSessionListScope(
   ), [folders, folderFilter]);
   const hiddenFolders = useMemo(() => hiddenFolderIds(folders), [folders]);
 
+  const chatIds = useLiveChatIdsBySession(filters.query.trim().length > 0);
+  const lookups = useMemo<SessionListLookups>(() => ({ chatIds }), [chatIds]);
+
   const folderScoped = useMemo(
-    () => sessions.filter((session) => sessionMatchesListFilters(session, filters)),
-    [sessions, filters],
+    () => sessions.filter((session) => sessionMatchesListFilters(session, filters, lookups)),
+    [sessions, filters, lookups],
   );
 
   const folderPasses = useCallback((session: SessionSummary) => {
@@ -568,7 +642,7 @@ function useSessionListScope(
     const key = sessionKey(selected.source, selected.id);
     // 끼워 넣기 없이도 목록에 나오는지로 판정한다. 끼워 넣은 세션까지 '보인다'로 세면
     // 필터를 바꿔 가려진 순간을 영영 알 수 없다.
-    const shownOnItsOwn = sessionMatchesListFilters(selected, filters) && folderPasses(selected);
+    const shownOnItsOwn = sessionMatchesListFilters(selected, filters, lookups) && folderPasses(selected);
     if (shownOnItsOwn) {
       selectionRef.current = { key, settled: true };
       setPinnedKey((current) => (current === key ? null : current));
@@ -582,7 +656,7 @@ function useSessionListScope(
     if (tracked) return;
     selectionRef.current = { key, settled: false };
     setPinnedKey(key);
-  }, [filters, folderPasses, onSelect, selected]);
+  }, [filters, folderPasses, lookups, onSelect, selected]);
 
   return { filters, patchFilters, folderFilter, selectFolder: setFolderFilter, projects, folderScoped, filtered, visible, showMore };
 }
@@ -880,7 +954,7 @@ function SessionListToolbar({
         className="search-input"
         value={filters.query}
         onChange={(event) => onPatchFilters({ query: event.target.value })}
-        placeholder={text("제목·프로젝트·ID·메모 검색", "Search title, project, ID, memo")}
+        placeholder={text("제목·프로젝트·세션/채팅 ID·메모 검색", "Search title, project, session/chat ID, memo")}
       />
       <select value={filters.project} onChange={(event) => onPatchFilters({ project: event.target.value })}>
         <option value="all">{text("프로젝트 전체", "All projects")}</option>
@@ -2704,6 +2778,7 @@ function SessionDrawer({
     continuation.setError,
   );
 
+  const forkCwd = continuation.target.cwd;
   return (
     <>
     <Drawer
@@ -2728,6 +2803,18 @@ function SessionDrawer({
         continuationBusy={continuation.busy}
         settingsPanel={settingsPanel}
         onReleaseForProviderApp={continuation.releaseForProviderApp}
+        forkRequest={forkCwd ? () => ({
+          source: session.source,
+          cwd: forkCwd,
+          // 다른 에이전트로 넘기려고 고른 상태면 그 공급자의 모델·추론은 원본에 맞지 않는다.
+          ...(continuation.source === session.source
+            ? { model: continuation.model || null, reasoningEffort: continuation.reasoningEffort || null, settings: continuation.extraSettings }
+            : { model: null, reasoningEffort: null }),
+          mode: continuation.mode,
+          approvalMode: continuation.approvalMode,
+          forkSessionId: session.id,
+          unattended: false,
+        }) : null}
         onError={setError}
       />}
       headerContent={<div className="session-drawer-header-content">
@@ -2807,16 +2894,43 @@ function SessionDrawer({
  * 앱을 여는 두 단계 조작이라 그동안 버튼을 잠글 상태가 필요한데, 그 상태는 이 줄 밖에서
  * 쓰이지 않으므로 드로어 본문이 아니라 여기서 든다. 실패 문구만 드로어로 올려 보낸다.
  */
-function SessionDrawerHeaderActions({ session, popout, continuationBusy, settingsPanel, onReleaseForProviderApp, onError }: {
+function SessionDrawerHeaderActions({ session, popout, continuationBusy, settingsPanel, onReleaseForProviderApp, forkRequest, onError }: {
   session: SessionSummary;
   popout: boolean;
   continuationBusy: boolean;
   settingsPanel: SessionSettingsPanel;
   onReleaseForProviderApp: () => Promise<void>;
+  /**
+   * 이 세션을 원본으로 삼는 fork 시작 요청. 누를 때의 이어가기 설정으로 만든다. 이어가기가
+   * 막힌 세션(작업 경로 없음·하위 에이전트)은 fork도 할 수 없어 `null`이다.
+   */
+  forkRequest: (() => ChatStartRequest) | null;
   onError: (message: string | null) => void;
 }) {
   const { text } = useI18n();
   const [openingProviderApp, setOpeningProviderApp] = useState(false);
+  const [forking, setForking] = useState(false);
+
+  /**
+   * 이 세션을 이어받은 새 세션을 띄워 별도 창으로 연다. 원본 세션과 이 드로어의 이어가기는
+   * 그대로 둔다. 시작만 이 창에서 하고 연결은 떼어 새 창이 붙게 한다 — 떼어낸 실행은
+   * 백그라운드에 남으므로 창 열기가 막혀도 채팅 화면 목록에서 다시 찾을 수 있다.
+   */
+  const forkIntoWindow = async () => {
+    if (forking || !forkRequest) return;
+    setForking(true);
+    onError(null);
+    try {
+      const connection = await connectChat(forkRequest(), () => undefined);
+      const { chatId } = connection.info;
+      await connection.detach();
+      await openPopoutWindow({ kind: "chat", chatId });
+    } catch (cause) {
+      onError(errorText(cause));
+    } finally {
+      setForking(false);
+    }
+  };
 
   const openInCodex = async () => {
     if (session.source !== "codex" || openingProviderApp) return;
@@ -2838,8 +2952,17 @@ function SessionDrawerHeaderActions({ session, popout, continuationBusy, setting
         className="button compact"
         type="button"
         onClick={() => { void openPopoutWindow({ kind: "session", source: session.source, sessionId: session.id }).catch((cause: unknown) => onError(errorText(cause))); }}
+        aria-label={text("새 창으로 열기", "Open in new window")}
         title={text("이 세션을 별도 창으로 엽니다", "Open this session in a separate window")}
-      ><AppWindow size={13} /><span>{text("새 창으로 열기", "Open in new window")}</span></button>}
+      ><AppWindow size={13} aria-hidden="true" /></button>}
+      {supportsSessionFork(session.source) && <button
+        className="button compact session-fork-action"
+        type="button"
+        disabled={forking || continuationBusy || !forkRequest}
+        onClick={() => void forkIntoWindow()}
+        aria-label={text("포크", "Fork")}
+        title={text("이 세션을 이어받은 새 세션을 별도 창으로 엽니다. 원본 세션은 그대로 남습니다.", "Opens a new session that carries this conversation over, in a separate window. The original session stays as is.")}
+      ><GitBranch size={13} aria-hidden="true" /></button>}
       {hasTauriRuntime() && session.source === "codex" && <button
         className="button compact session-provider-open"
         type="button"

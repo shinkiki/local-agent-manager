@@ -243,7 +243,7 @@ fn builtin_tool_is_enabled(
 fn cypress_automation_instruction(app_data_dir: &Path) -> String {
     let skill = crate::resource_repository::repository_skills_root(app_data_dir)
         .join("cypress-automation/SKILL.md");
-    format!("\n브라우저 자동화는 agent_manager_Cypress MCP의 작업공간 조회·파일 작성·실행·상태조회 도구를 사용합니다. 기본 작업공간은 없으므로 list_cypress_workspaces에서 현재 요청의 프로젝트 경로와 실행 유형이 정확히 맞는 작업공간을 명시적으로 고르세요. Agent Manager 자체 QA는 executionType=agentManagerIsolated인 작업공간만 사용하며, 다른 사이트·프로젝트는 standard 작업공간을 사용합니다. 일반 채팅에는 aia_system이 없으므로 해당 도구를 요구하는 QA 스킬도 Cypress 전용 도구의 동명 작업으로 수행하세요. MCP 직접 연결이 없는 공급자는 {} 스킬을 읽고 같은 백엔드에 연결하세요. 연결 위치 파일은 {} 입니다. 사용 토글·실행 유형·env 값은 사용자가 애드온 → Cypress에서 편집합니다. 실행 종료와 실제 산출물을 확인하고 계정 값을 출력하지 마세요.\n", skill.display(), app_data_dir.join("cypress-agent-mcp.json").display())
+    format!("\n브라우저 자동화는 agent_manager_Cypress MCP의 작업공간 조회·파일 작성·실행·상태조회 도구를 사용합니다. 기본 작업공간은 없으므로 list_cypress_workspaces에서 현재 요청의 프로젝트 경로와 실행 유형이 정확히 맞는 작업공간을 명시적으로 고르세요. Agent Manager 자체 QA는 executionType=agentManagerIsolated인 작업공간만 사용하며, 다른 사이트·프로젝트는 standard 작업공간을 사용합니다. 사람이 연 일반 채팅에는 aia_system이 없으므로, 그때는 해당 도구를 요구하는 QA 스킬도 Cypress 전용 도구의 동명 작업으로 수행하세요(워크플로가 띄운 실행에는 aia_system이 붙습니다). MCP 직접 연결이 없는 공급자는 {} 스킬을 읽고 같은 백엔드에 연결하세요. 연결 위치 파일은 {} 입니다. 사용 토글·실행 유형·env 값은 사용자가 애드온 → Cypress에서 편집합니다. 실행 종료와 실제 산출물을 확인하고 계정 값을 출력하지 마세요.\n", skill.display(), app_data_dir.join("cypress-agent-mcp.json").display())
 }
 
 /// 이 런타임에 실리는 결정정책. 없으면 판단 지침을 붙이지 않는다는 뜻이다.
@@ -285,6 +285,23 @@ fn chat_developer_instructions(runtime: &ChatRuntime) -> Option<String> {
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 한도 종료 때 보관한 입력 하나. 실행되다 끊긴 요청인지, 대기열에서 옮겨 온 아직 시작하지
+/// 않은 요청인지를 함께 든다 — 다시 보낼 때 다루는 방식이 다르다(`ResumeInputs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeldInput {
+    text: String,
+    started: bool,
+}
+
+/// 자동전환 복원이 새 세션에 다시 보낼 입력.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumeInputs {
+    /// 실행되다 한도로 끊긴 요청(순서 유지). 공급자 기록에 일부 단계가 남아 있을 수 있다.
+    pub interrupted: Vec<String>,
+    /// 아직 시작하지 않은 요청(순서 유지).
+    pub queued: Vec<String>,
+}
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -662,6 +679,11 @@ pub struct ChatStartRequest {
     /// 다른 공급자 세션에서 새 세션으로 인계할 때의 원본. 같은 공급자 재개에는 쓰지 않는다.
     #[serde(default)]
     pub handoff_origin: Option<SessionLink>,
+    /// 같은 공급자의 기존 세션을 원본으로 삼아 새 세션으로 갈라낸다(fork). 원본은 그대로 남고
+    /// 이 실행은 원본 대화를 이어받은 새 공급자 세션이 된다. Codex·Claude만 지원하며
+    /// `resume_session_id`·`handoff_origin`과 함께 쓸 수 없다([`validate_fork_request`]).
+    #[serde(default)]
+    pub fork_session_id: Option<String>,
     /// 이 채팅을 누가 시작했는지. 클라이언트가 보낼 수 없고 실행 컨텍스트(워크플로 실행기·
     /// 스케줄러·디스패처)만 채운다 — 사용량 페이싱이 런타임을 소비자에 귀속하는 근거라
     /// 위조되면 안 된다.
@@ -1784,6 +1806,9 @@ struct ChatRuntime {
     /// 그때는 턴 id가 앞머리가 된다(`take_captured_message`).
     capture_id: Option<String>,
     handoff_origin: Option<SessionLink>,
+    /// fork 원본 공급자 세션. 첫 기동에서만 쓰인다 — Codex는 `thread/fork`의 `threadId`,
+    /// Claude는 `--resume <원본> --fork-session`. 새 세션 ID는 `provider_session_id`가 든다.
+    fork_source_session_id: Option<String>,
     origin: Option<ChatOrigin>,
     app_data_dir: Option<PathBuf>,
     attention: Arc<ChatAttentionStore>,
@@ -1969,7 +1994,7 @@ struct RuntimeState {
     active_turn_input: Option<String>,
     /// 사용량 한도 오류로 끊긴 턴들의 사용자 입력(순서 유지). 턴이 정상 완료되면
     /// 한도 상태가 풀린 것이므로 비운다.
-    limit_interrupted_inputs: VecDeque<String>,
+    limit_interrupted_inputs: VecDeque<HeldInput>,
     /// 마지막 턴 요청 기준 컨텍스트 사용량 추정(토큰). 공급자가 압축하면 다음
     /// 턴까지 크기를 알 수 없으므로 None으로 되돌린다.
     context_used_tokens: Option<u64>,
@@ -2143,6 +2168,29 @@ impl RuntimeState {
         pending
     }
 
+    /// 자동전환 복원이 다시 보낼 입력을 끊긴 것과 시작하지 않은 것으로 나눈다. 보관 목록 →
+    /// 실행 중이던 턴 → 대기열 순서를 지킨다.
+    fn resume_inputs(&self) -> ResumeInputs {
+        let mut inputs = ResumeInputs::default();
+        for held in &self.limit_interrupted_inputs {
+            let target = if held.started {
+                &mut inputs.interrupted
+            } else {
+                &mut inputs.queued
+            };
+            target.push(held.text.clone());
+        }
+        if let Some(input) = &self.active_turn_input {
+            inputs.interrupted.push(input.clone());
+        }
+        inputs
+            .queued
+            .extend(self.queue.iter().map(|message| message.text.clone()));
+        inputs.interrupted.retain(|text| !text.trim().is_empty());
+        inputs.queued.retain(|text| !text.trim().is_empty());
+        inputs
+    }
+
     /// 새 턴을 이 상태에 등록하고 턴 id를 돌려준다.
     fn claim_turn(&mut self, input_text: &str) -> String {
         let turn_id = Uuid::new_v4().to_string();
@@ -2226,7 +2274,10 @@ impl RuntimeState {
         }
         if let Some(input) = self.active_turn_input.take() {
             if self.limit_interrupted_inputs.len() < MAX_QUEUED_MESSAGES {
-                self.limit_interrupted_inputs.push_back(input);
+                self.limit_interrupted_inputs.push_back(HeldInput {
+                    text: input,
+                    started: true,
+                });
             }
         }
     }
@@ -3329,6 +3380,38 @@ fn validate_handoff_origin(
     Ok(())
 }
 
+/// 세션 fork 요청의 조건. 원본을 이어받는 새 세션이라 재개·인계와 겹칠 수 없고, 공급자가
+/// 공식 fork를 제공하는 Codex(`thread/fork`)·Claude(`--fork-session`)만 받는다. 원본이
+/// 카탈로그에 있는지는 보지 않는다 — 방금 만든 대화는 아직 색인 전일 수 있고, 없는
+/// 원본은 공급자가 시작 단계에서 거절한다.
+fn validate_fork_request(request: &ChatStartRequest) -> Result<(), CoreError> {
+    let Some(session_id) = request.fork_session_id.as_deref() else {
+        return Ok(());
+    };
+    crate::identifier::validate_identifier(session_id)?;
+    if !matches!(request.source, ProviderId::Codex | ProviderId::Claude) {
+        return Err(CoreError::InvalidInput(
+            "세션 fork는 Codex와 Claude만 지원합니다".to_owned(),
+        ));
+    }
+    if request.resume_session_id.is_some() {
+        return Err(CoreError::InvalidInput(
+            "세션 재개와 fork를 동시에 요청할 수 없습니다".to_owned(),
+        ));
+    }
+    if request.handoff_origin.is_some() {
+        return Err(CoreError::InvalidInput(
+            "에이전트 인계와 fork를 동시에 요청할 수 없습니다".to_owned(),
+        ));
+    }
+    if request.profile == ChatProfile::Aia {
+        return Err(CoreError::InvalidInput(
+            "AIA 대화는 fork할 수 없습니다".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn effective_chat_profile(
     request: &ChatStartRequest,
     app_data_dir: Option<&PathBuf>,
@@ -3687,6 +3770,11 @@ impl ChatSupervisor {
         self.inner.accounts.clone()
     }
 
+    /// 앱 데이터 경로. 테스트용 감독자처럼 저장소 없이 만든 경우 `None`.
+    pub(crate) fn app_data_dir(&self) -> Option<&Path> {
+        self.inner.app_data_dir.as_deref()
+    }
+
     pub fn set_session_catalog(&self, catalog: SessionCatalog) -> Result<(), CoreError> {
         *lock(&self.inner.session_catalog)? = Some(catalog);
         Ok(())
@@ -4042,6 +4130,7 @@ impl ChatSupervisor {
         profile: ChatProfile,
         source: ProviderId,
         chat_id: &str,
+        plan_steps: bool,
     ) -> Result<McpInjection, CoreError> {
         let system_url = if system_tools {
             let base = lock(&self.inner.system_mcp_url)?.clone().ok_or_else(|| {
@@ -4088,7 +4177,10 @@ impl ChatSupervisor {
         let plugin_proxy_base = lock(&self.inner.plugin_mcp_base)?.clone();
         // 계획은 로컬 공급자의 것이다. 다른 공급자는 도구를 다 열어도 호출을 못 하지
         // 않으므로 계획으로 단계를 쪼갤 이유가 없다.
-        let plan_url = if source == ProviderId::Local && PLANNING_RUNS_STEPS {
+        //
+        // `plan_steps` 는 연결마다의 선택이다(`local_plan_steps`). 끄면 이 값이 `None` 이 되고,
+        // 그 하나로 계획 MCP 부착·단계 진행·종합·전용 설정 쓰기가 모두 함께 꺼진다.
+        let plan_url = if source == ProviderId::Local && PLANNING_RUNS_STEPS && plan_steps {
             plugin_proxy_base
                 .as_deref()
                 .map(|base| format!("{base}{}/{chat_id}", crate::system_mcp::PLAN_PATH))
@@ -4195,6 +4287,7 @@ impl ChatSupervisor {
         )?;
         let session_catalog = lock(&self.inner.session_catalog)?.clone();
         validate_handoff_origin(request, session_catalog.as_ref())?;
+        validate_fork_request(request)?;
         if let Some(session_id) = request.resume_session_id.as_deref() {
             crate::identifier::validate_identifier(session_id)?;
         }
@@ -4210,9 +4303,12 @@ impl ChatSupervisor {
         &self,
         request: &ChatStartRequest,
     ) -> Result<StartAccountPlan, CoreError> {
+        // fork도 원본 세션의 계정을 따른다. Claude 대화 기록은 계정별 자격증명 프로필 안에
+        // 있어, 다른 계정으로 띄우면 `--resume <원본>`이 기록을 찾지 못한다.
         let session_account_id = request
             .resume_session_id
             .as_deref()
+            .or(request.fork_session_id.as_deref())
             .and_then(|session_id| self.session_resume_account_id(request.source, session_id));
         let account_id = resolve_start_account_id(
             request.source,
@@ -4348,13 +4444,25 @@ impl ChatSupervisor {
         let claim_guard = self.claim_resume_session(resume_key, &chat_id)?;
         let accounts = self.resolve_start_account_plan(&request)?;
         let system_tools = system_tools_for(profile, request.system_tools, request.source);
-        let mcp = self.resolve_mcp_injection(system_tools, profile, request.source, &chat_id)?;
         let cwd = self.resolve_start_cwd(profile, &request.cwd)?;
         let model = normalize_model(request.model)?;
+        // 연결을 먼저 정한다 — 계획 여부가 그 연결의 설정이다.
         let local_connection_id = resolve_local_connection_id(
             self.inner.app_data_dir.as_deref(),
             request.source,
             request.local_connection_id.as_deref(),
+        )?;
+        let plan_steps = local_plan_steps(
+            self.inner.app_data_dir.as_deref(),
+            request.source,
+            &local_connection_id,
+        );
+        let mcp = self.resolve_mcp_injection(
+            system_tools,
+            profile,
+            request.source,
+            &chat_id,
+            plan_steps,
         )?;
         let executable = resolve_executable(request.source)?;
         startup_not_cancelled(
@@ -4412,6 +4520,7 @@ impl ChatSupervisor {
             plugin_tool_policies: mcp.plugin_tool_policies,
             capture_id: request.capture_id,
             handoff_origin: request.handoff_origin,
+            fork_source_session_id: request.fork_session_id,
             origin: request.origin,
             app_data_dir: self.inner.app_data_dir.clone(),
             attention: Arc::clone(&self.inner.attention),
@@ -4711,16 +4820,14 @@ impl ChatSupervisor {
     /// 자동전환이 이 채팅을 강제 종료하기 직전, 복원 세션에서 다시 보내야 할
     /// 사용자 입력 목록. 한도 오류로 끊긴 턴 → 실행 중인 턴 → 대기열 순서이며,
     /// 첨부 파일은 새 런타임으로 옮길 수 없어 텍스트만 캡처한다.
-    pub fn pending_input_texts(&self, chat_id: &str) -> Result<Vec<String>, CoreError> {
+    /// 자동전환 복원이 새 세션에 다시 보낼 입력. 끊긴 요청과 아직 시작하지 않은 요청을
+    /// 나눠 돌려준다 — 끊긴 요청은 이어가기 문구로 감싸고(`turn_continuation`), 시작하지 않은
+    /// 요청은 원문 그대로 보낸다. 시작하지 않은 요청을 "이어서"로 감싸면 모델이 없는 진행을
+    /// 지어낼 자리를 주게 된다.
+    pub fn pending_resume_inputs(&self, chat_id: &str) -> Result<ResumeInputs, CoreError> {
         let runtime = self.runtime(chat_id)?;
         let state = lock(&runtime.state)?;
-        let mut texts: Vec<String> = state.limit_interrupted_inputs.iter().cloned().collect();
-        if let Some(input) = &state.active_turn_input {
-            texts.push(input.clone());
-        }
-        texts.extend(state.queue.iter().map(|message| message.text.clone()));
-        texts.retain(|text| !text.trim().is_empty());
-        Ok(texts)
+        Ok(state.resume_inputs())
     }
 
     pub fn all_chats(&self) -> Result<Vec<ChatSessionInfo>, CoreError> {
@@ -6639,7 +6746,9 @@ impl ChatRuntime {
         // 도구가 실재하는지 보는 카탈로그가 그것으로 선다.
         let (_index, catalog) = self.opencode_tool_index();
         self.with_state(|state| {
-            state.plan = crate::plan::PlanSlot::Drafting(crate::plan::PlanDraft::new(catalog));
+            state.plan = crate::plan::PlanSlot::Drafting(
+                crate::plan::PlanDraft::new(catalog).with_request(&message.text),
+            );
         });
 
         let agent = crate::opencode_config::DRAFT_AGENT_ID;
@@ -7886,7 +7995,10 @@ impl ChatRuntime {
                 }
                 state
                     .limit_interrupted_inputs
-                    .extend(state.queue.drain(..).map(|message| message.text));
+                    .extend(state.queue.drain(..).map(|message| HeldInput {
+                        text: message.text,
+                        started: false,
+                    }));
                 true
             })
             .unwrap_or(false);
@@ -8574,10 +8686,37 @@ fn spawn_managed_chat_child(
     }
     apply_account_credential_env(&mut command, runtime)?;
     apply_local_llm_api_key_env(&mut command, runtime)?;
+    apply_prompt_cache_env(&mut command, runtime);
     configure_managed_chat_command(&mut command);
     command
         .spawn()
         .map_err(|error| CoreError::Runtime(format!("{failure}: {error}")))
+}
+
+/// Claude CLI가 캐시를 1시간 대신 5분 수명으로 쓰게 하는 스위치(2.1.284에서 확인).
+const CLAUDE_FORCE_5M_PROMPT_CACHE_ENV: &str = "FORCE_PROMPT_CACHING_5M";
+
+/// 이 런타임이 짧은 프롬프트 캐시를 쓰는가 — 무인 실행이 새 세션으로 시작한 Claude 일반 채팅.
+///
+/// Claude CLI는 캐시를 1시간 수명으로 쓰고, 그 쓰기는 기본 입력 단가의 2배다(5분 수명은 1.25배).
+/// 1시간은 사람이 쉬었다 돌아오는 대화를 위한 값인데, 무인 회차는 호출이 몇 초 간격으로 이어지고
+/// 회차가 끝나면 그 세션을 다시 읽지 않는다. 14일 실측 모의(2026-09-30): 무인 실행은 5분 수명이
+/// 약 8% 쌌고(회차를 시작할 때 공통 프리픽스가 식는 손해 포함), AIA는 18%·대화형은 0.3% 비쌌다.
+///
+/// 재개하는 실행은 뺀다. 같은 세션을 이어 가는 반복 요청(`continue`)은 회차 사이 간격이 5분을
+/// 넘는 순간 이력 전체가 식는다. 한 번의 도구 실행이 5분을 넘으면 다음 호출에서 식는 것은
+/// 받아들인 비용이다(14일 무인 호출 4,705번 중 15번).
+fn uses_short_prompt_cache(runtime: &ChatRuntime) -> bool {
+    runtime.source == ProviderId::Claude
+        && runtime.profile == ChatProfile::Standard
+        && runtime.unattended
+        && !runtime.resuming
+}
+
+fn apply_prompt_cache_env(command: &mut Command, runtime: &ChatRuntime) {
+    if uses_short_prompt_cache(runtime) {
+        command.env(CLAUDE_FORCE_5M_PROMPT_CACHE_ENV, "1");
+    }
 }
 
 /// 기동 직후 자식의 표준 입력을 회수한다. 세 공급자 기동 경로와 모델 목록 조회가
@@ -9454,6 +9593,8 @@ fn codex_startup_handshake(
     let result = read_rpc_result(&mut reader, 2).map_err(|error| {
         if runtime.resuming {
             CoreError::ResumeFailed(format!("Codex 세션을 재개하지 못했습니다: {error}"))
+        } else if runtime.fork_source_session_id.is_some() {
+            CoreError::Runtime(format!("Codex 세션을 fork하지 못했습니다: {error}"))
         } else {
             error
         }
@@ -9553,6 +9694,13 @@ fn codex_thread_request(
     mut params: Value,
 ) -> Result<(&'static str, Value), CoreError> {
     if !runtime.resuming {
+        if let Some(source_id) = &runtime.fork_source_session_id {
+            // fork는 재개와 같은 인자를 받고 새 thread를 돌려준다. 과거 턴을 응답에서 빼는
+            // 이유도 재개와 같다.
+            params["threadId"] = Value::String(source_id.clone());
+            params["excludeTurns"] = Value::Bool(true);
+            return Ok(("thread/fork", params));
+        }
         return Ok(("thread/start", params));
     }
     let thread_id = runtime
@@ -9795,6 +9943,22 @@ fn resolve_local_connection_id(
         }
         _ => Ok(normalized),
     }
+}
+
+/// 이 연결의 채팅이 단계 계획을 거치는지. 로컬이 아니거나 연결을 못 읽으면 켠 것으로 본다.
+///
+/// 모델마다 잘하는 자리가 다르다 — 기준 모델은 계획을 세우고, AIA 역할로 미세조정한 모델은
+/// 기능 지도를 안다(`local-llm-dev/finetune/README.md`). 한 모델에 둘을 담으려 네 회차를 썼지만
+/// 붙지 않아, 연결마다 어느 쪽으로 쓸지 고르게 했다.
+fn local_plan_steps(app_data_dir: Option<&Path>, source: ProviderId, connection_id: &str) -> bool {
+    if source != ProviderId::Local {
+        return true;
+    }
+    let Some(app_data_dir) = app_data_dir else {
+        return true;
+    };
+    local_llm::get_local_llm_connection_by_id(app_data_dir, connection_id)
+        .map_or(true, |entry| entry.connection.plan_steps)
 }
 
 fn normalize_local_connection_id(
@@ -10869,6 +11033,14 @@ fn claude_stream_cli_args(runtime: &ChatRuntime, resume: bool) -> Vec<String> {
         .with_state(|state| state.provider_session_id.clone())
         .flatten();
     if let Some(session_id) = session_id {
+        // fork는 새 세션을 처음 만들 때만 원본을 가리킨다. 새 ID의 기록이 생긴 뒤의 재기동은
+        // `resume`이 참이 되어 새 세션 자신을 이어간다.
+        if !resume {
+            if let Some(source_id) = &runtime.fork_source_session_id {
+                push_flag(&mut args, "--resume", source_id.clone());
+                args.push("--fork-session".to_owned());
+            }
+        }
         push_flag(
             &mut args,
             if resume { "--resume" } else { "--session-id" },
@@ -10880,14 +11052,23 @@ fn claude_stream_cli_args(runtime: &ChatRuntime, resume: bool) -> Vec<String> {
 
 /// 일반 채팅에 붙는 외부 플러그인의 Claude MCP 설정. 플러그인이 없거나 AIA면 None.
 fn plugin_mcp_config_json(runtime: &ChatRuntime) -> Option<String> {
-    if runtime.profile != ChatProfile::Standard || runtime.plugin_mcp_servers.is_empty() {
+    if runtime.profile != ChatProfile::Standard {
         return None;
     }
-    let servers = runtime
+    let mut servers = runtime
         .plugin_mcp_servers
         .iter()
         .map(|(name, url)| (name.clone(), json!({"type": "http", "url": url})))
         .collect::<serde_json::Map<_, _>>();
+    // 시스템 도구를 쥔 일반 실행(워크플로가 띄운 회차)은 `aia_system`을 **플러그인과 같은
+    // 덩어리로** 받는다. AIA 프로필 쪽 분기에 얹으면 `--strict-mcp-config`가 함께 붙어
+    // Cypress와 사용자 MCP가 끊긴다 — 회차가 지금 쓰는 도구를 빼앗는 꼴이다.
+    if let Some(url) = &runtime.system_mcp_url {
+        servers.insert("aia_system".to_owned(), json!({"type": "http", "url": url}));
+    }
+    if servers.is_empty() {
+        return None;
+    }
     Some(json!({"mcpServers": servers}).to_string())
 }
 
@@ -10900,7 +11081,9 @@ fn plugin_mcp_config_json(runtime: &ChatRuntime) -> Option<String> {
 /// 승인 없이 통과시키기로 한 실행에만 `approve`를 주고, 나머지는 지금까지처럼 쓰기 도구에서
 /// 승인 카드를 띄우는 `writes`다.
 fn apply_plugin_mcp_config(runtime: &ChatRuntime, params: &mut Value) {
-    if runtime.profile != ChatProfile::Standard || runtime.plugin_mcp_servers.is_empty() {
+    if runtime.profile != ChatProfile::Standard
+        || (runtime.plugin_mcp_servers.is_empty() && runtime.system_mcp_url.is_none())
+    {
         return;
     }
     let mut config = params
@@ -10918,6 +11101,17 @@ fn apply_plugin_mcp_config(runtime: &ChatRuntime, params: &mut Value) {
             "url": url,
             "default_tools_approval_mode": tools_approval,
             "startup_timeout_sec": 30,
+            "tool_timeout_sec": 120
+        });
+    }
+    // 시스템 도구를 쥔 일반 실행은 여기서 `aia_system`을 함께 받는다. AIA 프로필 분기는
+    // `serviceName`과 샌드박스 쓰기 루트까지 바꾸므로 그 길로 보내지 않는다 — 열어야 하는
+    // 것은 도구뿐이고, 회차가 기대는 작업 경로와 권한은 그대로여야 한다.
+    if let Some(url) = &runtime.system_mcp_url {
+        config["mcp_servers.aia_system"] = json!({
+            "url": url,
+            "default_tools_approval_mode": "writes",
+            "startup_timeout_sec": 10,
             "tool_timeout_sec": 120
         });
     }
@@ -12512,6 +12706,9 @@ pub(crate) fn resolve_executable(source: ProviderId) -> Result<PathBuf, CoreErro
             "공급자 CLI 경로가 실행 파일이 아닙니다".to_owned(),
         ));
     }
+    // 채팅·터미널·로그인이 모두 여기서 실행 파일을 얻는다. 앱 밖에서 cask를 올렸어도
+    // 다음 실행 전에 새 버전 폴더의 격리 속성이 풀린다(C18).
+    crate::cli_quarantine::release_cask_quarantine(&path);
     Ok(path)
 }
 
@@ -13188,6 +13385,83 @@ mod tests {
     }
 
     #[test]
+    fn claude_fork_points_at_the_source_only_until_the_new_session_exists() {
+        let mut runtime = fixture_runtime(ProviderId::Claude);
+        runtime.fork_source_session_id = Some("source".to_owned());
+        runtime
+            .state
+            .lock()
+            .expect("runtime state")
+            .provider_session_id = Some("fresh".to_owned());
+        let first = claude_stream_cli_args(&runtime, false);
+        assert!(first.windows(2).any(|args| args == ["--resume", "source"]));
+        assert!(first.iter().any(|arg| arg == "--fork-session"));
+        assert!(first
+            .windows(2)
+            .any(|args| args == ["--session-id", "fresh"]));
+
+        // 새 세션 기록이 생긴 뒤의 재기동은 원본이 아니라 새 세션을 잇는다.
+        let resumed = claude_stream_cli_args(&runtime, true);
+        assert!(resumed.windows(2).any(|args| args == ["--resume", "fresh"]));
+        assert!(!resumed
+            .iter()
+            .any(|arg| arg == "--fork-session" || arg == "source"));
+    }
+
+    #[test]
+    fn codex_fork_asks_app_server_for_a_new_thread_from_the_source() {
+        let mut runtime = fixture_runtime(ProviderId::Codex);
+        runtime.fork_source_session_id = Some("source-thread".to_owned());
+        let (method, params) =
+            codex_thread_request(&runtime, json!({"cwd": "/tmp"})).expect("fork request");
+        assert_eq!(method, "thread/fork");
+        assert_eq!(params["threadId"], "source-thread");
+        assert_eq!(params["excludeTurns"], true);
+        assert_eq!(params["cwd"], "/tmp");
+
+        runtime.fork_source_session_id = None;
+        let (method, params) = codex_thread_request(&runtime, json!({})).expect("start request");
+        assert_eq!(method, "thread/start");
+        assert!(params.get("threadId").is_none());
+    }
+
+    #[test]
+    fn fork_requests_are_limited_to_codex_and_claude_without_resume_or_handoff() {
+        let cwd = std::env::temp_dir();
+        let source_id = "019f0000-0000-7000-8000-000000000001".to_owned();
+        for provider in [ProviderId::Codex, ProviderId::Claude] {
+            let mut request = fixture_start_request(provider, &cwd);
+            request.fork_session_id = Some(source_id.clone());
+            assert!(validate_fork_request(&request).is_ok(), "{provider:?}");
+        }
+        let mut antigravity = fixture_start_request(ProviderId::Antigravity, &cwd);
+        antigravity.fork_session_id = Some(source_id.clone());
+        assert!(validate_fork_request(&antigravity).is_err());
+
+        let mut with_resume = fixture_start_request(ProviderId::Codex, &cwd);
+        with_resume.fork_session_id = Some(source_id.clone());
+        with_resume.resume_session_id = Some(source_id.clone());
+        assert!(validate_fork_request(&with_resume).is_err());
+
+        let mut with_handoff = fixture_start_request(ProviderId::Claude, &cwd);
+        with_handoff.fork_session_id = Some(source_id.clone());
+        with_handoff.handoff_origin = Some(SessionLink {
+            source: ProviderId::Codex,
+            id: source_id.clone(),
+        });
+        assert!(validate_fork_request(&with_handoff).is_err());
+
+        let mut aia = fixture_start_request(ProviderId::Claude, &cwd);
+        aia.fork_session_id = Some(source_id);
+        aia.profile = ChatProfile::Aia;
+        assert!(validate_fork_request(&aia).is_err());
+
+        assert!(
+            validate_fork_request(&fixture_start_request(ProviderId::Antigravity, &cwd)).is_ok()
+        );
+    }
+
+    #[test]
     fn cli_arguments_include_selected_reasoning_effort() {
         let mut claude = fixture_runtime(ProviderId::Claude);
         claude.reasoning_effort = Some(ReasoningEffort::High);
@@ -13393,6 +13667,7 @@ mod tests {
             context_window: Some(65_536),
             api_key_configured: false,
             enabled: true,
+            plan_steps: true,
         };
         let args = local_llm_provider_args(&connection, connection.context_window, false);
         let pairs: Vec<&[String]> = args.chunks(2).collect();
@@ -13891,6 +14166,7 @@ mod tests {
             context_window: None,
             api_key_configured: false,
             enabled: true,
+            plan_steps: true,
         };
         let mut runtime = fixture_runtime(ProviderId::Local);
         assert_eq!(
@@ -17002,20 +17278,89 @@ mod tests {
         assert_eq!(state.phase, ChatPhase::Stopped);
         assert!(state.active_turn_input.is_none());
         assert_eq!(
-            state.limit_interrupted_inputs.front().map(String::as_str),
-            Some("끊긴 요청")
-        );
-        assert_eq!(
             state
                 .limit_interrupted_inputs
                 .iter()
-                .map(String::as_str)
+                .map(|held| (held.text.as_str(), held.started))
                 .collect::<Vec<_>>(),
-            vec!["끊긴 요청", "뒤이어 보낸 요청"]
+            vec![("끊긴 요청", true), ("뒤이어 보낸 요청", false)],
+            "끊긴 요청과 시작하지 않은 요청은 다시 보내는 방식이 달라 구분해 둔다"
         );
         assert!(
             state.queue.is_empty(),
             "한도 제한 뒤 대기열을 Claude에 다시 보내면 안 된다"
+        );
+    }
+
+    #[test]
+    fn only_fresh_unattended_claude_chats_use_the_short_prompt_cache() {
+        let env_of = |runtime: &ChatRuntime| {
+            let mut command = Command::new("true");
+            apply_prompt_cache_env(&mut command, runtime);
+            command
+                .get_envs()
+                .find(|(key, _)| *key == CLAUDE_FORCE_5M_PROMPT_CACHE_ENV)
+                .and_then(|(_, value)| value.map(|value| value.to_owned()))
+        };
+        let mut round = fixture_runtime(ProviderId::Claude);
+        round.unattended = true;
+        assert_eq!(
+            env_of(&round),
+            Some("1".into()),
+            "새 세션으로 시작한 무인 회차"
+        );
+
+        let mut continued = fixture_runtime(ProviderId::Claude);
+        continued.unattended = true;
+        continued.resuming = true;
+        assert_eq!(env_of(&continued), None, "회차 사이 간격만큼 이력이 식는다");
+
+        let attended = fixture_runtime(ProviderId::Claude);
+        assert_eq!(env_of(&attended), None, "사람이 쉬었다 돌아오는 대화");
+
+        let mut aia = fixture_runtime(ProviderId::Claude);
+        aia.unattended = true;
+        aia.profile = ChatProfile::Aia;
+        assert_eq!(env_of(&aia), None, "AIA는 5분 수명이 더 비쌌다");
+
+        let mut codex = fixture_runtime(ProviderId::Codex);
+        codex.unattended = true;
+        assert_eq!(env_of(&codex), None, "Claude CLI 전용 스위치");
+    }
+
+    #[test]
+    fn resume_inputs_separate_interrupted_requests_from_ones_that_never_started() {
+        let runtime = Arc::new(fixture_runtime(ProviderId::Codex));
+        let mut state = runtime.test_state();
+        state.limit_interrupted_inputs.push_back(HeldInput {
+            text: "먼저 끊긴 요청".to_owned(),
+            started: true,
+        });
+        state.limit_interrupted_inputs.push_back(HeldInput {
+            text: "한도 때 대기열에서 옮긴 요청".to_owned(),
+            started: false,
+        });
+        state.active_turn_input = Some("실행 중이던 요청".to_owned());
+        state.queue.push_back(PendingChatMessage {
+            id: "queued".to_owned(),
+            text: "대기열 요청".to_owned(),
+            attachments: Vec::new(),
+        });
+        state.queue.push_back(PendingChatMessage {
+            id: "blank".to_owned(),
+            text: "  ".to_owned(),
+            attachments: Vec::new(),
+        });
+
+        assert_eq!(
+            state.resume_inputs(),
+            ResumeInputs {
+                interrupted: vec!["먼저 끊긴 요청".to_owned(), "실행 중이던 요청".to_owned()],
+                queued: vec![
+                    "한도 때 대기열에서 옮긴 요청".to_owned(),
+                    "대기열 요청".to_owned()
+                ],
+            }
         );
     }
 
@@ -17026,9 +17371,10 @@ mod tests {
             let mut state = runtime.test_state();
             state.phase = ChatPhase::Running;
             state.active_turn_id = Some("turn-2".to_owned());
-            state
-                .limit_interrupted_inputs
-                .push_back("이전에 끊긴 요청".to_owned());
+            state.limit_interrupted_inputs.push_back(HeldInput {
+                text: "이전에 끊긴 요청".to_owned(),
+                started: true,
+            });
         }
 
         handle_stream_cli_message(&runtime, json!({"type": "result", "is_error": false}));
@@ -17643,6 +17989,68 @@ mod tests {
         assert_eq!(resume_params["excludeTurns"], true);
     }
 
+    /// 워크플로가 띄운 회차는 standard 프로필 그대로 돌면서 시스템 도구를 쥔다(X7 예외).
+    /// 이 자리가 `profile == Aia`로 묶여 있던 동안, `system_tools`가 켜지고 런타임에
+    /// 주소까지 실렸는데도 CLI 인자에는 아무것도 가지 않아 등록된 모든 회차의 보고가
+    /// 0건이었다 — 실패가 아니라 설정 목록에 아예 없었다(2026-10-02 실측).
+    #[test]
+    fn a_standard_run_holding_system_tools_gets_aia_system_next_to_its_plugins() {
+        // Claude — 플러그인과 한 덩어리로 나가고 strict 는 붙지 않는다.
+        let mut claude = fixture_runtime(ProviderId::Claude);
+        claude.profile = ChatProfile::Standard;
+        claude.plugin_mcp_servers = vec![(
+            CYPRESS_MCP_SERVER_ID.to_owned(),
+            "http://127.0.0.1:1/cypress".to_owned(),
+        )];
+        claude.system_mcp_url = Some("http://127.0.0.1:1/system/chat".to_owned());
+        let config: Value =
+            serde_json::from_str(&plugin_mcp_config_json(&claude).expect("standard config"))
+                .expect("json");
+        assert_eq!(
+            config["mcpServers"]["aia_system"]["url"],
+            "http://127.0.0.1:1/system/chat"
+        );
+        // 회차가 지금 쓰는 도구를 빼앗지 않는다.
+        assert!(config["mcpServers"][CYPRESS_MCP_SERVER_ID].is_object());
+        let args = claude_stream_cli_args(&claude, false);
+        assert!(
+            !args
+                .iter()
+                .any(|argument| argument == "--strict-mcp-config"),
+            "일반 실행에 strict 를 붙이면 사용자 MCP 가 끊긴다"
+        );
+
+        // Codex — 사용자의 config.toml 을 지우지 않도록 dotted 경로로 합친다.
+        let mut codex = fixture_runtime(ProviderId::Codex);
+        codex.profile = ChatProfile::Standard;
+        codex.system_mcp_url = Some("http://127.0.0.1:1/system/chat".to_owned());
+        let mut params = json!({});
+        apply_plugin_mcp_config(&codex, &mut params);
+        assert_eq!(
+            params["config"]["mcp_servers.aia_system"]["url"],
+            "http://127.0.0.1:1/system/chat"
+        );
+        // AIA 전용 설정은 따라오지 않는다 — 회차의 작업 경로와 권한은 그대로여야 한다.
+        assert!(params.get("serviceName").is_none());
+        assert!(params["config"].get("sandbox_workspace_write").is_none());
+    }
+
+    /// 사람이 연 일반 채팅은 그대로 닫혀 있다. 예외는 출처가 워크플로일 때뿐이고,
+    /// 그 판단은 이미 `system_tools`로 접혀 런타임 주소 유무로 나타난다.
+    #[test]
+    fn a_standard_chat_without_system_tools_gets_no_aia_system() {
+        let mut runtime = fixture_runtime(ProviderId::Claude);
+        runtime.profile = ChatProfile::Standard;
+        runtime.plugin_mcp_servers = vec![(
+            CYPRESS_MCP_SERVER_ID.to_owned(),
+            "http://127.0.0.1:1/cypress".to_owned(),
+        )];
+        runtime.system_mcp_url = None;
+        let config: Value =
+            serde_json::from_str(&plugin_mcp_config_json(&runtime).expect("config")).expect("json");
+        assert!(config["mcpServers"].get("aia_system").is_none());
+    }
+
     #[test]
     fn cypress_is_injected_only_when_enabled_with_fallback_for_all_providers() {
         let dir = tempfile::tempdir().unwrap();
@@ -17658,7 +18066,7 @@ mod tests {
                 ProviderId::Antigravity,
             ] {
                 let injected = supervisor
-                    .resolve_mcp_injection(false, ChatProfile::Standard, source, "test")
+                    .resolve_mcp_injection(false, ChatProfile::Standard, source, "test", true)
                     .unwrap();
                 assert!(injected.system_url.is_none());
                 assert_eq!(
@@ -18203,6 +18611,7 @@ mod tests {
             plugin_tool_policies: BTreeMap::new(),
             capture_id: None,
             handoff_origin: None,
+            fork_source_session_id: None,
             origin: None,
             app_data_dir: None,
             attention: Arc::new(ChatAttentionStore::default()),
@@ -19051,6 +19460,7 @@ mod tests {
             approval_mode: ChatApprovalMode::default(),
             resume_session_id: None,
             handoff_origin: None,
+            fork_session_id: None,
             origin: None,
             unattended: false,
             pin_account: false,

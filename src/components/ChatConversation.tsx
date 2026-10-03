@@ -32,6 +32,7 @@ import { isReadableFinalResponse } from "../lib/voice";
 import { liveMessageKey } from "../lib/readingAnchor";
 import { useI18n } from "../lib/i18n";
 
+import { runtimeText } from "../lib/i18nRuntime";
 // 이 모듈은 대화를 그리는 쪽의 정문이다. 상태 모델과 이벤트 접기는 `ChatEventStream`이
 // 맡지만, 그리기와 함께 쓰이는 이름이라 여기서도 그대로 꺼내 준다.
 export type { ChatEntry, ChatTurn, ChatActivityEntry } from "./ChatEventStream";
@@ -540,17 +541,20 @@ export function chatEntryKey(entry: ChatEntry): string {
   return entry.type === "message" ? `${entry.type}-${entry.id}-${entry.kind}` : `${entry.type}-${entry.id}`;
 }
 
-const TURN_STATUS_LABELS: Record<string, string> = {
-  started: "응답 중",
-  running: "응답 중",
-  completedWithDenials: "권한 제한 후 응답 종료",
-  interrupted: "사용자 중단",
-  failed: "실패",
-  error: "실패",
-};
+/** 부를 때마다 짓는다 — 모듈 적재 때 굳히면 언어를 바꾼 뒤에도 처음 언어로 남는다. */
+function turnStatusLabels(): Record<string, string> {
+  return {
+    started: runtimeText("응답 중", "Responding"),
+    running: runtimeText("응답 중", "Responding"),
+    completedWithDenials: runtimeText("권한 제한 후 응답 종료", "Response ended with denials"),
+    interrupted: runtimeText("사용자 중단", "Stopped by user"),
+    failed: runtimeText("실패", "Failed"),
+    error: runtimeText("실패", "Failed"),
+  };
+}
 
 export function chatTurnStatusLabel(status: string): string {
-  return TURN_STATUS_LABELS[status] ?? "응답 종료";
+  return turnStatusLabels()[status] ?? runtimeText("응답 종료", "Response ended");
 }
 
 export function chatActivityCounts(entries: ChatActivityEntry[]): { tools: number; reasoning: number } {
@@ -581,10 +585,13 @@ function completedChatActivityStatus(entries: ChatActivityEntry[]): string {
 
 function chatActivitySummary(entries: ChatActivityEntry[]): string {
   const { tools, reasoning } = chatActivityCounts(entries);
-  return [tools ? `도구 ${tools}개` : "", reasoning ? `진행 상황 ${reasoning}개` : ""].filter(Boolean).join(" · ");
+  return [
+    tools ? runtimeText(`도구 ${tools}개`, `${tools} tool call${tools === 1 ? "" : "s"}`) : "",
+    reasoning ? runtimeText(`진행 상황 ${reasoning}개`, `${reasoning} progress update${reasoning === 1 ? "" : "s"}`) : "",
+  ].filter(Boolean).join(" · ");
 }
 
 function chatTurnDuration(turn: ChatTurn): string {
   const seconds = Math.max(0, Math.round(((turn.finishedAt ?? Date.now()) - turn.startedAt) / 1000));
-  return turn.finishedAt ? `${seconds}초` : "진행 중";
+  return turn.finishedAt ? runtimeText(`${seconds}초`, `${seconds}s`) : runtimeText("진행 중", "In progress");
 }

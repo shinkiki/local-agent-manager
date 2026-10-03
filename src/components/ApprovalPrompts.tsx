@@ -12,6 +12,7 @@ import { Modal } from "./Shared";
 import type { ChatApprovalDecision, ChatApprovalQuestion } from "../types";
 import { useI18n } from "../lib/i18n";
 
+import { runtimeCatalogText } from "../lib/i18nRuntime";
 export interface ChatApprovalPrompt {
   id: string;
   /**
@@ -81,7 +82,7 @@ export function ChatApprovalDock({ className = "chat-approval-dock", label, titl
         </button>
       </header>
       {collapsed
-        ? <p className="approval-dock-summary">{prompts.map((prompt) => prompt.title).join(" · ")}</p>
+        ? <p className="approval-dock-summary">{prompts.map((prompt) => runtimeCatalogText(prompt.title)).join(" · ")}</p>
         : prompts.map((prompt) => <ChatApprovalCard prompt={prompt} onDecision={onDecision} key={prompt.id} />)}
     </div>
   );
@@ -122,7 +123,7 @@ export function ChatApprovalCard({ prompt, onDecision }: { prompt: ChatApprovalP
   return (
     <article className={`chat-approval${pending ? " chat-approval-pending" : ""}`} role={pending ? "alert" : undefined}>
       <header className="chat-approval-head">
-        <strong>{prompt.title}</strong>
+        <strong>{runtimeCatalogText(prompt.title)}</strong>
         {plan && prompt.detail && (
           <button className="chat-approval-expand" type="button" onClick={() => setReading(true)}>
             <Maximize2 size={13} aria-hidden="true" />크게 보기
@@ -147,7 +148,7 @@ export function ChatApprovalCard({ prompt, onDecision }: { prompt: ChatApprovalP
       {/* 본문이 긴 카드는 어디에 있든(채팅 독·AIA 팝업) 화면 맨 위 레이어에 띄워야 가려지지 않는다. */}
       {reading && createPortal(
         <Modal
-          title={prompt.title}
+          title={runtimeCatalogText(prompt.title)}
           size="wide"
           elevated
           onClose={() => setReading(false)}

@@ -8,10 +8,17 @@ test("M4 static UI audit measures catalog gaps and declares prompt exclusions", 
   assert.ok(report.counts.dictionaryKeys > 0);
   assert.ok(report.counts.missingCatalog > 0);
   assert.ok(report.counts.missingCatalog <= report.counts.unwrappedKorean);
+  // 2026-10-02: `0ca36072` 가 감사기(`scripts/check-i18n-static-ui.mjs`)에만
+  // `projectAiaHandoff.ts`·`projectMenuConformance.ts` 두 줄을 더하고 이 기대값은 그대로
+  // 두어, 개발선에서 이 시험 하나가 깨진 채로 돌고 있었다. 예외 목록은 "화면 글이 아닌
+  // 한국어 문자열"의 선언이라 사람이 읽고 넘겨야 하는 것이므로, 양쪽을 한 벌로 고정해
+  // 한쪽만 고친 사람에게 다른 쪽도 고치라고 말하게 둔다.
   assert.deepEqual(report.exclusions, [
     "src/lib/skillTransfer.ts",
     "src/lib/schemaDiscoveryPrompts.ts",
     "src/lib/roundDesign.ts",
+    "src/lib/projectAiaHandoff.ts",
+    "src/lib/projectMenuConformance.ts",
   ]);
   // 2026-09-27: Windows 에서 path.relative 가 역슬래시를 돌려줘 예외가 한 건도 걸리지 않았다.
   // 예외 파일의 문구가 실제로 빠졌는지 수로 본다.

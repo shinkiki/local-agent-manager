@@ -196,10 +196,65 @@ test("턴을 다 쓰고도 하던 중이었으면 '끝내 못 함' 이 아니라
   assert.match(refuse.why, /턴 소진/);
 });
 
-test("없는 도구 이름을 부르면 무엇을 기대했든 실패다", () => {
+// 2026-10-02 코드 리팩토링 9회차 — 옛 시험은 "없는 도구 이름을 부르면 무엇을 기대했든
+// 실패다"였다. **배포본이 그렇게 하지 않는다.** 하네스는 없는 도구 호출을 `invalid` 카드로
+// 되돌리고 실패 한 번으로 셀 뿐 단계를 계속 돌린다(`chat.rs` 의 `looks_refused` 자리).
+// GPU `dedupe-block` n=20 실측의 한 시행이 그 차이를 그대로 밟았다 — 아래 호출 순서가
+// 그 시행에서 모델이 실제로 보낸 것이고, `run` 하나 때문에 부수효과를 보지도 못한 채
+// 실패로 찍혔다.
+test("지어낸 도구 이름은 시행을 끝내지 않는다 — 부수효과로 채점하고 횟수만 센다", () => {
+  const fixed = `function formatRow(r) {
+  const name = String(r.name).padEnd(10, " ");
+  const qty = String(r.qty).padStart(4, " ");
+  return name + qty;
+}
+export function render(rows) {
+  const out = [];
+  out.push("== 상단 ==");
+  for (const r of rows) out.push(formatRow(r));
+  out.push("== 하단 ==");
+  for (const r of rows) out.push(formatRow(r));
+  return out.join("\n");
+}
+`;
+  const s = scored("dedupe-block", {
+    edits: { "report.mjs": fixed },
+    text: "고쳤습니다.",
+    calls: [
+      { name: "read", args: { filePath: "report.mjs" } },
+      { name: "write", args: { filePath: "report.mjs" } },
+      // 실측 그대로: 없는 이름을 한 번 부르고 다음 턴에 `bash` 로 바로잡았다.
+      { name: "run", args: { command: "node check.mjs" } },
+      { name: "bash", args: { command: "node check.mjs" } },
+    ],
+  });
+  assert.equal(s.ok, true);
+  assert.equal(s.invented, 1);
+  assert.match(s.why, /지어낸 도구 이름 1회: run/);
+});
+
+// 넓힌 만큼은 세어서 잡는다 — 지어낸 이름이 합격률 뒤로 숨으면 도구 수 민감도의 신호가
+// 사라진다. 실패한 시행에서도 **실패 종류는 부수효과 쪽**으로 남고 이름은 덧붙는다.
+test("지어낸 도구 이름은 통과·실패 양쪽 이유에 남는다", () => {
   const s = scored("rename-across-files", { calls: [{ name: "edit_file", args: {} }] });
   assert.equal(s.ok, false);
-  assert.match(s.why, /없는 도구 이름/);
+  assert.equal(s.invented, 1);
+  assert.match(s.why, /파일이 안 바뀜|도구 미호출|읽기만 함/);
+  assert.match(s.why, /지어낸 도구 이름 1회: edit_file/);
+});
+
+// 배포본이 돌려주는 말에는 **부를 수 있는 이름이 들어 있다**(`chat.rs` 시험이 받는 본문:
+// "Model tried to call unavailable tool 'plan_cannot_do'. Available tools: invalid, webfetch.").
+// 탐침이 `오류: 없는 도구 run` 한 줄만 주면 모델은 다시 물을 거리 없이 막다른 길에 선다.
+test("없는 도구를 부르면 배포본처럼 부를 수 있는 이름을 함께 돌려준다", () => {
+  const dir = mkdtempSync(join(tmpdir(), "refactor-eval-test-"));
+  try {
+    const out = runTool(dir, { name: "run", args: { command: "node check.mjs" } }, task("dedupe-block").tools);
+    assert.match(out, /unavailable tool 'run'/);
+    for (const name of task("dedupe-block").tools) assert.ok(out.includes(name), `${name} 이 목록에 없다: ${out}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // 2026-09-25 코드 리팩토링 2회차 — 탐침이 **아예 돌지 않고 있었다.**

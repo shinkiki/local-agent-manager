@@ -137,7 +137,108 @@ fn plugin_mismatch_message(alias: &str, tools: &str) -> String {
     )
 }
 
+/// 제목이 "파일을 고친다"고 말할 때 쓰이는 말들.
+///
+/// 뜻이 하나뿐인 것만 둔다. `추출`·`작성`·`적용` 은 "추출할 자리를 찾는다"처럼 읽기 단계의
+/// 제목에도 그대로 쓰여서, 넣으면 멀쩡한 조회 단계를 되묻게 된다. 가드가 아니라 울타리가
+/// 되는 자리다.
+const WRITE_INTENT_WORDS: &[&str] = &[
+    "수정",
+    "고치",
+    "고쳐",
+    "바꾸",
+    "바꿔",
+    "변경",
+    "덮어",
+    "리팩터",
+    "리팩토링",
+    "refactor",
+    "rewrite",
+    "replace",
+    "modify",
+];
+
+/// 제목은 파일을 고친다는데 도구는 읽기만 하는 단계를 되돌리는 문구.
+///
+/// 2026-10-02 코드 리팩토링 11회차 실측(GPU `local-refactor` n=20): 실패 2건이 둘 다 이
+/// 모양이었다 — 마지막 단계 제목이 "…확인하고 동일한 패턴을 찾기 위해 수정하기"인데 도구는
+/// `read` 였다. 계획은 확정되고 고쳐진 것은 없다. 플러그인 되묻기(`plugin_mismatch`)와 같은
+/// 모양으로, 고칠 수 있는 도구 이름을 함께 주어 다시 물을 거리를 남긴다.
+fn writing_intent_message(tools: &str, writers: &str) -> String {
+    format!(
+        "The step title says the file changes but '{tools}' only reads. Tools that change a file: {writers}. Pick one of them, or reword the title if this step only reads"
+    )
+}
+
+/// 요청은 파일을 고치라는데 계획의 모든 단계가 읽기만 하는 것을 되돌리는 문구.
+///
+/// 2026-10-03 코드 리팩토링 12회차 실측(GPU `local-refactor` n=20 끼워넣기, 40시행):
+/// 실패 13건 가운데 3건이 이 모양이었다 — 요청은 "함수 하나로 뽑아내서 … 고쳐줘"인데
+/// 계획은 `read: report.mjs 파일 읽어서 내용 확인` 한 단계로 확정됐다(trim-write 10·19).
+/// 단계 되묻기(`writing_intent_mismatch`)는 제목에 고친다는 말이 없어 발동하지 못한다.
+/// 고칠 수 있는 도구 이름과 거절이라는 출구를 함께 준다 — 막는 것이 아니라 되묻는 것이다.
+fn read_only_plan_message(writers: &str) -> String {
+    format!(
+        "The request asks for a file to change, but every step of this plan only reads. Add the step that changes it with one of: {writers}, or call cannot_do with the reason if it cannot be done"
+    )
+}
+
 impl ToolCatalog {
+    /// 요청이 파일을 고치라고 말하는데 계획의 **모든** 단계가 읽기 전용 작업 공간 도구만
+    /// 쓰면 고칠 수 있는 도구 이름을 돌려준다.
+    ///
+    /// 단계 하나라도 `bash`·`edit`·`write` 나 플러그인 도구를 쓰면 발동하지 않는다 —
+    /// 셸은 파일을 쓰고("노션 페이지 수정"처럼) 플러그인 자리는 `plugin_mismatch` 가 본다.
+    /// 읽기 전용 모드에는 고칠 수 있는 도구가 카탈로그에 없으므로 역시 발동하지 않는다.
+    /// 낱말·도구 이름은 둘 다 목록에서 읽는다.
+    fn read_only_plan(
+        &self,
+        request: &str,
+        steps: &[(String, Vec<String>, Vec<usize>)],
+    ) -> Option<String> {
+        let lowered = request.to_lowercase();
+        if !WRITE_INTENT_WORDS.iter().any(|word| lowered.contains(word)) {
+            return None;
+        }
+        let readers = crate::opencode_config::reading_workspace_tools();
+        if steps.is_empty()
+            || !steps.iter().all(|(_, tools, _)| {
+                !tools.is_empty() && tools.iter().all(|t| readers.contains(&t.as_str()))
+            })
+        {
+            return None;
+        }
+        let writers: Vec<String> = crate::opencode_config::writing_workspace_tools()
+            .iter()
+            .filter(|name| self.contains(name))
+            .map(|name| (*name).to_owned())
+            .collect();
+        (!writers.is_empty()).then(|| listed_names(&writers))
+    }
+
+    /// 제목이 파일을 고친다고 말하는데 고른 도구가 **전부** 읽기 전용 작업 공간 도구이면
+    /// 고칠 수 있는 도구 이름을 돌려준다.
+    ///
+    /// 플러그인 도구가 하나라도 섞이면 발동하지 않는다 — "노션 페이지 수정"은 파일을 고치는
+    /// 말이 아니고, 그 자리는 이미 `plugin_mismatch` 가 본다. 읽기 전용 모드에서는 고칠 수
+    /// 있는 도구가 카탈로그에 없으므로 역시 발동하지 않는다. 둘 다 목록에서 읽어 정한다.
+    fn writing_intent_mismatch(&self, title: &str, tools: &[String]) -> Option<String> {
+        let lowered = title.to_lowercase();
+        if !WRITE_INTENT_WORDS.iter().any(|word| lowered.contains(word)) {
+            return None;
+        }
+        let readers = crate::opencode_config::reading_workspace_tools();
+        if tools.is_empty() || !tools.iter().all(|t| readers.contains(&t.as_str())) {
+            return None;
+        }
+        let writers: Vec<String> = crate::opencode_config::writing_workspace_tools()
+            .iter()
+            .filter(|name| self.contains(name))
+            .map(|name| (*name).to_owned())
+            .collect();
+        (!writers.is_empty()).then(|| listed_names(&writers))
+    }
+
     /// 이름들을 받아 정렬·중복 제거한 목록을 만든다.
     ///
     /// 정렬해 두면 오류 문구에 적히는 순서가 호출마다 흔들리지 않는다. 같은 실수에 같은
@@ -377,6 +478,11 @@ pub(crate) struct PlanDraft {
     direct_index_call: Option<String>,
     /// 초안이 있는데 거절해서 한 번 되돌렸는지. 두 번째는 그대로 받는다.
     refusal_bounced: bool,
+    /// 이 계획 턴이 받은 요청 글. 확정할 때 "요청은 고치라는데 계획이 읽기만 한다"를
+    /// 보는 자리가 이것뿐이다 — 단계 제목만으로는 알 수 없다(2026-10-03 12회차).
+    request: String,
+    /// 읽기만 하는 계획을 확정하려다 한 번 되돌렸는지. 두 번째는 그대로 받는다.
+    read_only_plan_bounced: bool,
 }
 
 impl PlanDraft {
@@ -386,7 +492,19 @@ impl PlanDraft {
             steps: Vec::new(),
             direct_index_call: None,
             refusal_bounced: false,
+            request: String::new(),
+            read_only_plan_bounced: false,
         }
+    }
+
+    /// 이 초안이 답할 요청 글을 실어 둔다.
+    ///
+    /// 되묻기 하나를 위해서만 쓴다. 요청 글 자체는 계획 상태에 남지 않아도 되지만,
+    /// `finish` 가 "요청은 고치라는데 모든 단계가 읽기 전용"을 보려면 여기가 유일한
+    /// 자리다.
+    pub(crate) fn with_request(mut self, request: &str) -> Self {
+        self.request = request.to_owned();
+        self
     }
 
     /// 색인 도구를 곧바로 부른 것을 적어 둔다. 먼저 부른 이름만 든다.
@@ -406,6 +524,21 @@ impl PlanDraft {
     /// 그대로 받는다.
     fn take_refusal_bounced(&mut self) -> bool {
         std::mem::replace(&mut self.refusal_bounced, true)
+    }
+
+    /// 요청은 고치라는데 모든 단계가 읽기만 하면 **한 번** 되돌린다.
+    ///
+    /// 두 번째 `finish_plan` 은 그대로 받는다. 거절과 같은 규율이다 — 되묻기가 영영
+    /// 막으면 진짜로 읽기만 하면 되는 요청이 갇힌다.
+    fn bounce_read_only_plan(&mut self) -> Result<(), CoreError> {
+        if self.read_only_plan_bounced {
+            return Ok(());
+        }
+        let Some(writers) = self.catalog.read_only_plan(&self.request, &self.steps) else {
+            return Ok(());
+        };
+        self.read_only_plan_bounced = true;
+        Err(CoreError::InvalidInput(read_only_plan_message(&writers)))
     }
 
     /// 모델에 되돌려주는 기존 계획 응답. 탐침도 이 계약을 읽어 같은 고리를 돈다.
@@ -454,6 +587,12 @@ impl PlanDraft {
             return Err(CoreError::InvalidInput(plugin_mismatch_message(
                 &alias,
                 &listed_names(&group.tools),
+            )));
+        }
+        if let Some(writers) = self.catalog.writing_intent_mismatch(&title, &tools) {
+            return Err(CoreError::InvalidInput(writing_intent_message(
+                &listed_names(&tools),
+                &writers,
             )));
         }
         let uses = normalize_uses(uses, self.steps.len())?;
@@ -1757,7 +1896,13 @@ impl PlanSlot {
     }
 
     pub(crate) fn finish(&mut self) -> Result<usize, CoreError> {
-        let draft = self.take_draft()?;
+        let mut draft = self.take_draft()?;
+        // 되묻기는 `PlanDraft::finish` 가 아니라 여기 있다 — 거기서 세운 표시는 초안을
+        // 되돌려 넣을 때 사라져 같은 되묻기가 영영 돈다.
+        if let Err(error) = draft.bounce_read_only_plan() {
+            *self = PlanSlot::Drafting(draft);
+            return Err(error);
+        }
         match draft.clone().finish() {
             Ok(plan) => {
                 let steps = plan.steps().len();
@@ -1921,19 +2066,39 @@ pub(crate) fn tool_index(catalogs: &[(String, Vec<(String, String)>)]) -> String
     )
 }
 
+/// 색인 한 줄에 실을 설명의 길이 상한.
+///
+/// 잘라야 하는 것은 **긴 설명**이지 두 번째 문장이 아니다. 경계를 문장에만 두면, 상류가
+/// 긴 산문을 주는 플러그인과 우리가 색인용으로 한 줄씩 적은 작업 공간 도구가 같은 칼을
+/// 맞는다 — 120자는 플러그인 설명 45개 가운데 하나만 더 통과시키면서(실측 +62자) 우리가
+/// 적은 다섯 줄은 전부 통째로 지나가게 하는 자리다.
+const MAX_INDEX_DESCRIPTION_CHARS: usize = 120;
+
 /// 설명에서 첫 산문 줄만 뽑는다.
 ///
 /// **마크다운 헤딩을 건너뛴다.** 그냥 첫 줄을 잡으면 설명이 `## Overview` 로 시작하는
 /// `notion-create-pages` 와 `notion-update-page` 가 빈칸으로 나온다 — 하필 가장 많이 쓰는
 /// 둘이다(2026-09-26 실측에서 실제로 그렇게 비었다). 설명 없는 이름만 남으면 계획이
 /// 무엇을 고르는지 알 수 없다.
+///
+/// **짧은 줄은 문장에서 자르지 않는다.** 예전에는 길이와 상관없이 첫 `". "` 에서 끊었다.
+/// 그래서 [`crate::opencode_config::KEPT_TOOL_DESCRIPTIONS`] 의 두 번째 문장이 색인에 한
+/// 번도 실린 적이 없다 — 하필 그 문장들이 도구를 **가르는** 말이다(`write`: "Overwrites
+/// the whole file.", `edit`: "Does not rewrite the whole file.", `bash`: "Use it to find
+/// files or run commands."). 계획 턴이 본 것은 "Writes content to one file." 과 "Finds and
+/// replaces part of a file." 뿐이었고, 우리가 둘을 가르려고 적어 둔 말은 조용히 버려졌다
+/// (2026-10-02 코드 리팩토링 10회차). 우리 쪽 어휘가 모델에 닿지 않는 자리라, 길이 상한을
+/// 넘을 때만 문장에서 끊는다.
 fn first_line(description: &str) -> String {
     for line in description.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // 첫 문장까지. 마침표 뒤 공백을 경계로 본다 — 설명이 길어도 색인은 한 줄이다.
+        if line.chars().count() <= MAX_INDEX_DESCRIPTION_CHARS {
+            return line.to_owned();
+        }
+        // 긴 설명만 첫 문장까지 줄인다. 마침표 뒤 공백을 경계로 본다.
         return match line.find(". ") {
             Some(at) => line[..=at].trim_end().to_owned(),
             None => line.to_owned(),
@@ -2304,7 +2469,7 @@ mod tests {
     fn the_index_skips_markdown_headings_to_find_the_description() {
         let description = "## Overview
 
-Creates one or more Notion pages. More text follows."
+Creates one or more Notion pages."
             .to_owned();
         let catalogs = vec![(
             "notion-team".to_owned(),
@@ -2314,6 +2479,71 @@ Creates one or more Notion pages. More text follows."
             tool_index(&catalogs),
             "- notion-create-pages (notion-team): Creates one or more Notion pages."
         );
+    }
+
+    /// 색인은 **긴** 설명만 첫 문장에서 끊는다.
+    ///
+    /// 길이와 상관없이 첫 `". "` 에서 끊던 동안, 우리가 색인용으로 적은 작업 공간 설명의
+    /// 두 번째 문장이 한 번도 모델에 닿지 않았다(아래 시험이 그 자리다). 상류 플러그인
+    /// 설명은 첫 줄만 501자까지 오므로 자르는 일 자체는 남아야 한다 — 가르는 것은 길이다.
+    #[test]
+    fn the_index_cuts_at_a_sentence_only_when_the_line_is_long() {
+        let short = "Writes content to one file. Overwrites the whole file.";
+        let long = format!(
+            "{}. {}",
+            "A".repeat(MAX_INDEX_DESCRIPTION_CHARS),
+            "Tail follows."
+        );
+        let catalogs = vec![(
+            String::new(),
+            vec![
+                ("write".to_owned(), short.to_owned()),
+                ("long".to_owned(), long.clone()),
+            ],
+        )];
+        let index = tool_index(&catalogs);
+        assert_eq!(
+            index.lines().next(),
+            Some(format!("- write: {short}").as_str())
+        );
+        assert_eq!(
+            index.lines().nth(1),
+            Some(format!("- long: {}.", "A".repeat(MAX_INDEX_DESCRIPTION_CHARS)).as_str())
+        );
+    }
+
+    /// 계획 턴 색인은 우리가 적은 작업 공간 설명을 **통째로** 싣는다.
+    ///
+    /// 문구 하나를 훑는 대신 켜진 것 전부를 센다. 2026-10-02 코드 리팩토링 10회차에서
+    /// 드러난 자리라서다: `write`/`edit`/`bash`/`webfetch` 의 두 번째 문장 — 둘을 **가르는**
+    /// 말 — 이 `first_line` 의 문장 경계에 걸려 색인에 한 번도 실리지 않았다. 설명을
+    /// 늘리거나 줄이는 사람에게 색인도 같이 보라고 말해 주는 것이 이 시험의 일이다.
+    #[test]
+    fn the_index_carries_every_workspace_tool_description_whole() {
+        for read_only in [false, true] {
+            let described = crate::opencode_config::workspace_tool_descriptions(read_only);
+            let catalogs = vec![(
+                String::new(),
+                described
+                    .iter()
+                    .map(|(name, text)| ((*name).to_owned(), (*text).to_owned()))
+                    .collect::<Vec<_>>(),
+            )];
+            let index = tool_index(&catalogs);
+            assert_eq!(
+                index.lines().count(),
+                described.len(),
+                "색인 줄 수가 켜진 작업 공간 도구 수와 다르다 (read_only={read_only})"
+            );
+            for (name, text) in &described {
+                assert!(
+                    index
+                        .lines()
+                        .any(|line| line == format!("- {name}: {text}")),
+                    "'{name}' 설명이 색인에 통째로 실리지 않았다: {index}"
+                );
+            }
+        }
     }
 
     /// 플러그인이 아닌 도구는 소유자를 적지 않는다. 괄호가 비면 읽는 쪽이 헷갈린다.
@@ -2599,6 +2829,132 @@ Creates one or more Notion pages. More text follows."
                 &[],
             )
             .unwrap();
+    }
+
+    /// 제목이 "고친다"고 말하는데 도구가 읽기만 하는 단계는 되묻는다.
+    ///
+    /// 2026-10-02 코드 리팩토링 11회차, GPU `local-refactor` n=20 의 실패 2건 가운데 1건이
+    /// 그대로 이 모양이었다 — 아래 제목과 도구는 그 시행이 실제로 보낸 값이다. 계획은
+    /// `확정` 으로 끝나고 파일은 그대로였다.
+    #[test]
+    fn a_step_that_says_it_changes_the_file_must_use_a_writing_tool() {
+        let catalogs = vec![(
+            String::new(),
+            crate::opencode_config::workspace_tool_descriptions(false)
+                .into_iter()
+                .map(|(name, text)| (name.to_owned(), text.to_owned()))
+                .collect::<Vec<_>>(),
+        )];
+        let mut draft = PlanDraft::new(ToolCatalog::from_catalogs(&catalogs));
+        let text = draft
+            .add_step(
+                "report.mjs 에서 두 번 반복되는 서식 코드를 확인하고 동일한 패턴을 찾기 위해 수정하기",
+                &["read".into()],
+                &[],
+            )
+            .expect_err("고친다는 제목에 read")
+            .to_string();
+        assert!(text.contains("'read' only reads"), "{text}");
+        // 고칠 수 있는 도구 이름은 목록에서 읽는다 — 상수로 적힌 문장이 아니다.
+        for writer in crate::opencode_config::writing_workspace_tools() {
+            assert!(text.contains(writer), "{writer} 가 빠졌다: {text}");
+        }
+        // 같은 제목에 쓰기 도구를 고르면 통과한다.
+        draft
+            .add_step("중복 서식 코드를 함수로 묶어 수정", &["edit".into()], &[])
+            .unwrap();
+        // 읽기만 한다고 말하는 제목은 건드리지 않는다 — 울타리가 아니라 되묻기다.
+        draft
+            .add_step("report.mjs 를 읽어 중복 구간을 확인", &["read".into()], &[])
+            .unwrap();
+        // 읽기 전용 모드에는 고칠 수 있는 도구가 없으므로 발동하지 않는다.
+        let read_only = vec![(
+            String::new(),
+            crate::opencode_config::workspace_tool_descriptions(true)
+                .into_iter()
+                .map(|(name, text)| (name.to_owned(), text.to_owned()))
+                .collect::<Vec<_>>(),
+        )];
+        PlanDraft::new(ToolCatalog::from_catalogs(&read_only))
+            .add_step("파일을 수정한다", &["read".into()], &[])
+            .unwrap();
+    }
+
+    /// 요청은 고치라는데 계획이 읽기만 하면 확정을 한 번 되돌린다.
+    ///
+    /// 2026-10-03 코드 리팩토링 12회차, GPU `local-refactor` 끼워넣기 40시행의 실패 13건
+    /// 가운데 3건이 이 모양이었다. 아래 요청과 단계는 trim-write 19 시행이 실제로 보낸
+    /// 값이다 — 한 단계, 제목에 고친다는 말이 없어 단계 되묻기가 발동하지 못했고, 계획은
+    /// `확정` 으로 끝나고 파일은 그대로였다.
+    #[test]
+    fn a_read_only_plan_for_a_request_that_asks_for_a_change_is_bounced_once() {
+        let catalogs = vec![(
+            String::new(),
+            crate::opencode_config::workspace_tool_descriptions(false)
+                .into_iter()
+                .map(|(name, text)| (name.to_owned(), text.to_owned()))
+                .collect::<Vec<_>>(),
+        )];
+        let request = "report.mjs 안에 같은 서식 코드가 두 번 반복돼. 그 부분을 함수 하나로 뽑아내서 양쪽이 같이 쓰게 고쳐줘.";
+        let draft = || {
+            let mut draft =
+                PlanDraft::new(ToolCatalog::from_catalogs(&catalogs)).with_request(request);
+            draft
+                .add_step("report.mjs 파일 읽어서 내용 확인", &["read".into()], &[])
+                .unwrap();
+            PlanSlot::Drafting(draft)
+        };
+
+        let mut slot = draft();
+        let text = slot.finish().expect_err("읽기만 하는 계획").to_string();
+        // 고칠 수 있는 도구 이름은 목록에서 읽는다 — 상수로 적힌 문장이 아니다.
+        for writer in crate::opencode_config::writing_workspace_tools() {
+            assert!(text.contains(writer), "{writer} 가 빠졌다: {text}");
+        }
+        // 출구를 함께 준다. 막는 것이 아니라 되묻는 것이다.
+        assert!(text.contains("cannot_do"), "{text}");
+        // 되돌린 뒤에도 초안은 남아 있어야 한다 — 다시 세우게 만들면 되묻기가 손해다.
+        assert!(matches!(slot, PlanSlot::Drafting(_)), "초안이 사라졌다");
+        // 두 번째 확정은 그대로 받는다. 되묻기가 영영 막으면 진짜 읽기 계획이 갇힌다.
+        assert_eq!(slot.finish().unwrap(), 1);
+
+        // 고치는 단계가 하나라도 있으면 발동하지 않는다. `bash` 도 파일을 쓴다.
+        for writer in crate::opencode_config::writing_workspace_tools() {
+            let mut slot = draft();
+            let PlanSlot::Drafting(d) = &mut slot else {
+                unreachable!()
+            };
+            d.add_step("중복 코드를 함수로 묶는다", &[(*writer).into()], &[])
+                .unwrap();
+            assert_eq!(slot.finish().unwrap(), 2, "{writer}");
+        }
+
+        // 고치라는 말이 없는 요청은 건드리지 않는다.
+        let mut slot = {
+            let mut d = PlanDraft::new(ToolCatalog::from_catalogs(&catalogs))
+                .with_request("이 폴더 package.json 의 name 필드가 무엇인지 읽어서 알려줘.");
+            d.add_step("package.json 을 읽는다", &["read".into()], &[])
+                .unwrap();
+            PlanSlot::Drafting(d)
+        };
+        assert_eq!(slot.finish().unwrap(), 1);
+
+        // 읽기 전용 모드에는 고칠 수 있는 도구가 없으므로 발동하지 않는다.
+        let read_only = vec![(
+            String::new(),
+            crate::opencode_config::workspace_tool_descriptions(true)
+                .into_iter()
+                .map(|(name, text)| (name.to_owned(), text.to_owned()))
+                .collect::<Vec<_>>(),
+        )];
+        let mut slot = {
+            let mut d =
+                PlanDraft::new(ToolCatalog::from_catalogs(&read_only)).with_request(request);
+            d.add_step("report.mjs 파일 읽어서 내용 확인", &["read".into()], &[])
+                .unwrap();
+            PlanSlot::Drafting(d)
+        };
+        assert_eq!(slot.finish().unwrap(), 1);
     }
 
     #[test]
@@ -3569,6 +3925,13 @@ Creates one or more Notion pages. More text follows."
             "directIndexCallError": direct_error, "refusalDraftError": refusal_error,
             // 제목이 플러그인을 말하는데 도구가 아닌 단계를 되돌리는 가드(2026-09-27).
             "pluginGroups": names.groups(), "pluginMismatchError": plugin_mismatch_message("<ALIAS>", "<TOOLS>"),
+            // 제목은 고친다는데 도구는 읽기만 하는 단계를 되돌리는 가드(2026-10-02, 11회차).
+            "writeIntentWords": WRITE_INTENT_WORDS,
+            "readingTools": crate::opencode_config::reading_workspace_tools(),
+            "writingTools": crate::opencode_config::writing_workspace_tools(),
+            "writingIntentError": writing_intent_message("<TOOLS>", "<WRITERS>"),
+            // 요청은 고치라는데 모든 단계가 읽기 전용인 계획을 되돌리는 가드(2026-10-03, 12회차).
+            "readOnlyPlanError": read_only_plan_message("<WRITERS>"),
         });
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../local-llm-dev/plan-eval/fixtures/planning-contract.json");

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { RefreshCw } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { GitBranch as GitBranchIcon, GitCompareArrows, RefreshCw, Sparkles } from "lucide-react";
 import { useI18n } from "../lib/i18n";
 import type { UiText } from "../lib/i18nLocale";
 import { formatDate, formatRelative } from "../lib/format";
@@ -22,6 +22,9 @@ import {
   unstageProjectGitPaths,
 } from "../lib/ipc";
 import { gitChangeCode, gitChangeKindCode, gitChangeLabelKey, groupGitStatus, type GitChangeLabelKey } from "../lib/gitStatus";
+import { layoutGitGraph, type GitGraphRow } from "../lib/gitGraph";
+import { gitConflictAiaPrompt } from "../lib/gitConflictAiaPrompt";
+import { MAX_AIA_REVIEW_COMMITS, buildAiaCommitReviewRequest } from "../lib/projectAiaHandoff";
 import type {
   GitActionReceipt,
   GitBranch,
@@ -39,7 +42,7 @@ import type {
   GitUnavailableReason,
   GitWorktree,
 } from "../types";
-import { EmptyState, ErrorBanner, LoadingState, NoticeBanner, useBusyAction, useConfirm, type ConfirmRequest } from "./Shared";
+import { EmptyState, ErrorBanner, LoadingState, NoticeBanner, useBusyAction, useConfirm, useEscapeToClose, useOutsidePointerToClose, type ConfirmRequest } from "./Shared";
 import { useRequestGeneration } from "./DocumentTreePane";
 import { GitDiffModal } from "./GitDiffModal";
 
@@ -52,7 +55,11 @@ import { GitDiffModal } from "./GitDiffModal";
  * 오류가 아니므로 배너에 그대로 적고, 성공·실패 어느 쪽이든 개요를 다시 읽는다(충돌한
  * 리베이스는 `inProgress`를 바꾼다).
  */
-export function ProjectGitPanel({ projectPath, active }: { projectPath: string; active: boolean }) {
+export function ProjectGitPanel({ projectPath, active, onRequestAiaPrompt }: {
+  projectPath: string;
+  active: boolean;
+  onRequestAiaPrompt: (prompt: string) => void;
+}) {
   const { text } = useI18n();
   const { confirm, confirmDialog } = useConfirm();
   const git = useProjectGit(projectPath, active);
@@ -90,6 +97,10 @@ export function ProjectGitPanel({ projectPath, active }: { projectPath: string; 
   }
 
   const repository = overview.repository;
+  const conflictedFiles = status?.entries.filter((entry) => entry.unmerged !== null).map((entry) => entry.path) ?? [];
+  const requestAiaConflictHelp = (operation: string, conflicts: readonly string[], blocked: readonly string[] = []) => {
+    onRequestAiaPrompt(gitConflictAiaPrompt({ projectPath, operation, conflictedFiles: conflicts, blockedFiles: blocked }));
+  };
   return (
     <div className="git-panel-shell">
       {loadError && <ErrorBanner message={loadError} />}
@@ -104,18 +115,19 @@ export function ProjectGitPanel({ projectPath, active }: { projectPath: string; 
         confirm={confirm}
         git={git}
       />
-      {repository.inProgress && <InProgressBanner inProgress={repository.inProgress} locked={locked} confirm={confirm} git={git} />}
-      {receipt && <ReceiptBanner receipt={receipt} />}
+      {repository.inProgress && <InProgressBanner inProgress={repository.inProgress} conflictedFiles={conflictedFiles} locked={locked} confirm={confirm} onRequestAiaConflictHelp={requestAiaConflictHelp} git={git} />}
+      {receipt && <ReceiptBanner receipt={receipt} showAiaHelp={repository.inProgress === null} onRequestAiaConflictHelp={requestAiaConflictHelp} />}
       <div className="git-panel">
         <div className="git-panel-aside">
           <ChangesSection status={status} locked={locked} git={git} />
           <CommitBox status={status} locked={locked} git={git} />
-          <BranchesSection repository={repository} locked={locked} git={git} />
+          <FollowCardsSection repository={repository} />
+          <BranchesSection repository={repository} locked={locked} confirm={confirm} git={git} />
           <WorktreesSection worktrees={repository.worktrees} />
           <StashesSection repository={repository} locked={locked} confirm={confirm} git={git} />
         </div>
         <div className="git-panel-main">
-          <LogSection git={git} />
+          <LogSection git={git} onRequestAiaPrompt={onRequestAiaPrompt} />
         </div>
       </div>
       {git.selectedDiff && (
@@ -410,10 +422,12 @@ function OverviewHeader({ projectPath, repository, locked, loading, remote, writ
 // ---------------------------------------------------------------------------
 // 진행 중 작업
 
-function InProgressBanner({ inProgress, locked, confirm, git }: {
+function InProgressBanner({ inProgress, conflictedFiles, locked, confirm, onRequestAiaConflictHelp, git }: {
   inProgress: GitInProgress;
+  conflictedFiles: string[];
   locked: boolean;
   confirm: (request: ConfirmRequest) => Promise<boolean>;
+  onRequestAiaConflictHelp: (operation: string, conflicted: readonly string[], blocked?: readonly string[]) => void;
   git: ProjectGitState;
 }) {
   const { text } = useI18n();
@@ -448,11 +462,18 @@ function InProgressBanner({ inProgress, locked, confirm, git }: {
           ? text("진행 중입니다. 충돌을 해결한 뒤 계속하거나 건너뛰거나 중단하세요.", "In progress. Resolve conflicts, then continue, skip, or abort.")
           : text("진행 중입니다. 터미널에서 마무리한 뒤 새로고침하세요.", "In progress. Finish it in a terminal, then refresh.")}
       </span>
-      {isRebase && (
+      {(isRebase || conflictedFiles.length > 0) && (
         <span className="git-inprogress-actions">
+          {conflictedFiles.length > 0 && (
+            <button className="button compact git-aia-resolve" type="button" onClick={() => onRequestAiaConflictHelp(kindLabel[inProgress.kind], conflictedFiles)}>
+              <Sparkles size={13} />{text("AIA로 해결", "Resolve with AIA")}
+            </button>
+          )}
+          {isRebase && <>
           <button className="button compact" type="button" disabled={locked} onClick={() => void git.mutate("rebase", () => rebaseProjectGit({ projectPath, action: "continue" }))}>{text("계속", "Continue")}</button>
           <button className="button compact" type="button" disabled={locked} onClick={() => void git.mutate("rebase", () => rebaseProjectGit({ projectPath, action: "skip" }))}>{text("건너뛰기", "Skip")}</button>
           <button className="button compact danger" type="button" disabled={locked} onClick={() => void abort()}>{text("중단", "Abort")}</button>
+          </>}
         </span>
       )}
     </div>
@@ -462,9 +483,14 @@ function InProgressBanner({ inProgress, locked, confirm, git }: {
 // ---------------------------------------------------------------------------
 // 영수증
 
-function ReceiptBanner({ receipt }: { receipt: GitActionReceipt }) {
+function ReceiptBanner({ receipt, showAiaHelp, onRequestAiaConflictHelp }: {
+  receipt: GitActionReceipt;
+  showAiaHelp: boolean;
+  onRequestAiaConflictHelp: (operation: string, conflicted: readonly string[], blocked?: readonly string[]) => void;
+}) {
   const { text } = useI18n();
   const output = [receipt.stdout, receipt.stderr].filter((part) => part.trim().length > 0).join("\n");
+  const canAskAia = showAiaHelp && !receipt.succeeded && (receipt.conflictedFiles.length > 0 || receipt.blockedFiles.length > 0);
   const details = (
     <>
       {receipt.conflictedFiles.length > 0 && (
@@ -507,6 +533,13 @@ function ReceiptBanner({ receipt }: { receipt: GitActionReceipt }) {
         <span>{receipt.message}</span>
       </div>
       {details}
+      {canAskAia && (
+        <div className="git-receipt-actions">
+          <button className="button compact git-aia-resolve" type="button" onClick={() => onRequestAiaConflictHelp(receipt.action, receipt.conflictedFiles, receipt.blockedFiles)}>
+            <Sparkles size={13} />{text("AIA로 해결", "Resolve with AIA")}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -665,14 +698,81 @@ function CommitBox({ status, locked, git }: { status: GitStatus | null; locked: 
 }
 
 // ---------------------------------------------------------------------------
+// 팔로우 기준 동기화 상태
+
+/**
+ * 업스트림이 붙은 로컬 브랜치는 팔로우 카드로 따로 읽는다. `ahead`/`behind`는 Core가
+ * 마지막 fetch 뒤의 로컬 ref에서 계산한 값이므로, 원격에 다시 묻는 화면 조회와 섞지
+ * 않는다. fetch 시각 자체는 팔로우 저장소가 다음 단계에서 보관해 이 카드에 넘긴다.
+ *
+ * B5: 그래서 화면은 이 수를 **마지막 fetch 기준**이라고 못박는다. 예전 문구는
+ * "가장 최근 가져오기 결과를 반영합니다"였는데, 그것은 값이 어디서 왔는지만 말할 뿐
+ * 지금 원격과 다를 수 있다는 말이 아니었다. 사용자가 이 수를 실시간으로 읽으면
+ * 가져오기를 하지 않은 채 "받을 것 없음"으로 판단하게 된다 — 로컬 ref가 몇 시간째
+ * 그대로여도 수신 0은 그대로 0이기 때문이다. 그래서 섹션 캡션과 카드의 수치 칸
+ * 양쪽에 같은 기준을 적고, 갱신하는 방법(가져오기)까지 한 문장에 담는다.
+ */
+function FollowCardsSection({ repository }: { repository: GitRepositoryInfo }) {
+  const { text } = useI18n();
+  const followedBranches = repository.localBranches.filter((branch) => branch.upstream !== null);
+  if (followedBranches.length === 0) return null;
+
+  return (
+    <section className="git-branch-follows settings-subsection">
+      <header>
+        <div>
+          <strong>{text("팔로우 중인 브랜치", "Followed branches")}</strong>
+          <small>{text("수신·송신 수와 분기 상태는 실시간이 아니라 마지막 fetch 기준입니다. 최신 값을 보려면 가져오기를 실행하세요.", "Incoming, outgoing, and diverged are not live — they are as of the last fetch. Run fetch to refresh them.")}</small>
+        </div>
+      </header>
+      <ul className="git-branch-follow-list">
+        {followedBranches.map((branch) => {
+          const incoming = branch.behind;
+          const outgoing = branch.ahead;
+          const diverged = incoming > 0 && outgoing > 0;
+          // B4: 이 단계의 overview에는 fetch 시각이 없으므로 추측한 시간을 표시하지 않는다.
+          const lastFetchedAt: number | null = null;
+          return (
+            <li className="git-branch-follow-card" key={branch.name}>
+              <strong>{branch.name}</strong>
+              <dl>
+                <div><dt>{text("upstream", "Upstream")}</dt><dd>{branch.upstream}</dd></div>
+                <div><dt>{text("마지막 fetch", "Last fetch")}</dt><dd>{lastFetchedAt === null ? text("기록 없음", "Not recorded") : formatDate(lastFetchedAt)}</dd></div>
+                <div><dt>{text("수신", "Incoming")}</dt><dd>{incoming}<small className="git-follow-basis">{text("마지막 fetch 기준", "As of last fetch")}</small></dd></div>
+                <div><dt>{text("송신", "Outgoing")}</dt><dd>{outgoing}<small className="git-follow-basis">{text("마지막 fetch 기준", "As of last fetch")}</small></dd></div>
+                <div><dt>{text("분기됨", "Diverged")}</dt><dd>{diverged ? text("예", "Yes") : text("아니요", "No")}</dd></div>
+              </dl>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // 브랜치
 
-function BranchesSection({ repository, locked, git }: { repository: GitRepositoryInfo; locked: boolean; git: ProjectGitState }) {
+interface BranchContextMenuState {
+  branch: GitBranch;
+  remote: boolean;
+  x: number;
+  y: number;
+}
+
+function BranchesSection({ repository, locked, confirm, git }: {
+  repository: GitRepositoryInfo;
+  locked: boolean;
+  confirm: (request: ConfirmRequest) => Promise<boolean>;
+  git: ProjectGitState;
+}) {
   const { text } = useI18n();
   const { projectPath } = git;
   const [createOpen, setCreateOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [startPoint, setStartPoint] = useState("HEAD");
+  const [contextMenu, setContextMenu] = useState<BranchContextMenuState | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
   const localNames = useMemo(() => new Set(repository.localBranches.map((branch) => branch.name)), [repository.localBranches]);
   const remoteNames = useMemo(() => repository.remotes.map((remote) => remote.name), [repository.remotes]);
 
@@ -696,10 +796,32 @@ function BranchesSection({ repository, locked, git }: { repository: GitRepositor
       setCreateOpen(false);
     }
   };
+  const rebaseOnto = async (branch: GitBranch) => {
+    const head = repository.head.branch ?? repository.head.shortSha ?? "HEAD";
+    const accepted = await confirm({
+      title: text("리베이스 시작", "Start rebase"),
+      message: text(`${head}을(를) ${branch.name} 위로 리베이스합니다. 충돌이 나면 형상관리 화면에서 계속·건너뛰기·중단할 수 있습니다.`, `Rebase ${head} onto ${branch.name}. If conflicts occur, you can continue, skip, or abort from source control.`),
+      confirmLabel: text("시작", "Start"),
+    });
+    if (!accepted) return;
+    await git.mutate("rebase", () => rebaseProjectGit({ projectPath, action: "start", onto: branch.name }));
+  };
+  useEscapeToClose(() => setContextMenu(null), contextMenu !== null);
+  useOutsidePointerToClose(() => setContextMenu(null), contextMenu !== null, [contextMenuRef]);
   const startPoints = ["HEAD", ...repository.localBranches.map((branch) => branch.name), ...repository.remoteBranches.map((branch) => branch.name)];
 
   const row = (branch: GitBranch, isRemote: boolean) => (
-    <li className={`git-branch-row${branch.isHead ? " current" : ""}`} key={`${isRemote ? "r" : "l"}:${branch.name}`}>
+    <li
+      className={`git-branch-row${branch.isHead ? " current" : ""}`}
+      key={`${isRemote ? "r" : "l"}:${branch.name}`}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        const bounds = event.currentTarget.getBoundingClientRect();
+        const x = event.clientX || bounds.left + 24;
+        const y = event.clientY || bounds.top + 24;
+        setContextMenu({ branch, remote: isRemote, x: Math.min(x, window.innerWidth - 238), y: Math.min(y, window.innerHeight - 126) });
+      }}
+    >
       <div className="git-branch-main">
         <strong>{branch.name}</strong>
         <small>
@@ -749,6 +871,33 @@ function BranchesSection({ repository, locked, git }: { repository: GitRepositor
             {repository.remoteBranches.map((branch) => row(branch, true))}
           </ul>
         </>
+      )}
+      {contextMenu && (
+        <div
+          className="git-branch-context-menu"
+          ref={contextMenuRef}
+          role="menu"
+          aria-label={text(`${contextMenu.branch.name} 브랜치 메뉴`, `${contextMenu.branch.name} branch menu`)}
+          style={{ left: Math.max(8, contextMenu.x), top: Math.max(8, contextMenu.y) }}
+        >
+          <header><strong>{contextMenu.branch.name}</strong></header>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={locked || contextMenu.branch.isHead}
+            onClick={() => { const target = contextMenu; setContextMenu(null); void switchTo(target.branch, target.remote); }}
+          >
+            <GitBranchIcon size={14} />{text("이 브랜치로 전환", "Switch to this branch")}
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={locked || repository.head.unborn || repository.head.detached || repository.inProgress !== null || contextMenu.branch.isHead}
+            onClick={() => { const target = contextMenu.branch; setContextMenu(null); void rebaseOnto(target); }}
+          >
+            <GitCompareArrows size={14} />{text("이 브랜치 위로 리베이스", "Rebase onto this branch")}
+          </button>
+        </div>
       )}
     </section>
   );
@@ -864,10 +1013,69 @@ function StashesSection({ repository, locked, confirm, git }: {
 // 이력
 
 /** 이력 한 줄. 누르면 그 커밋이 바꾼 파일이 아래로 펼쳐지고, 파일을 누르면 diff 모달이 뜬다. */
-function LogRow({ commit, expanded, onToggle, git }: { commit: GitCommit; expanded: boolean; onToggle: () => void; git: ProjectGitState }) {
+const GIT_GRAPH_COLUMN_WIDTH = 14;
+
+/** 부모 관계의 한 행. 선은 행 높이에 맞춰 늘어나고 노드는 찌그러지지 않도록 별도 요소로 둔다. */
+function GitGraphCell({ row, columns }: { row: GitGraphRow; columns: number }) {
+  const x = (lane: number) => lane * GIT_GRAPH_COLUMN_WIDTH + GIT_GRAPH_COLUMN_WIDTH / 2;
+  const width = columns * GIT_GRAPH_COLUMN_WIDTH;
+  return (
+    <span className="git-log-graph" style={{ width }} aria-hidden="true">
+      <svg viewBox={`0 0 ${width} 100`} preserveAspectRatio="none">
+        {row.segments.map((segment, index) => {
+          const fromX = x(segment.from);
+          const toX = x(segment.to);
+          const startY = segment.start === "node" ? 50 : 0;
+          const path = fromX === toX
+            ? `M ${fromX} ${startY} L ${toX} 100`
+            : `M ${fromX} ${startY} C ${fromX} 72, ${toX} 78, ${toX} 100`;
+          return <path className={`git-graph-stroke lane-color-${segment.color}`} d={path} key={`${index}:${path}`} />;
+        })}
+        {row.continuesFromTop && <path className={`git-graph-stroke lane-color-${row.color}`} d={`M ${x(row.lane)} 0 L ${x(row.lane)} 50`} />}
+      </svg>
+      <span className={`git-log-node lane-color-${row.color}`} style={{ left: x(row.lane) }} />
+    </span>
+  );
+}
+
+/** 펼친 파일 목록의 높이만큼 다음 커밋을 기다리는 레인을 곧게 이어 준다. */
+function GitGraphTails({ row, columns }: { row: GitGraphRow; columns: number }) {
+  const width = columns * GIT_GRAPH_COLUMN_WIDTH;
+  return (
+    <span className="git-log-graph git-log-graph-tails" style={{ width }} aria-hidden="true">
+      {row.tails.map((tail) => (
+        <span
+          className={`git-graph-tail lane-color-${tail.color}`}
+          style={{ left: tail.lane * GIT_GRAPH_COLUMN_WIDTH + GIT_GRAPH_COLUMN_WIDTH / 2 }}
+          key={`${tail.lane}:${tail.color}`}
+        />
+      ))}
+    </span>
+  );
+}
+
+function LogRow({ commit, graphRow, graphColumns, expanded, onToggle, picked, onTogglePick, git }: {
+  commit: GitCommit;
+  graphRow: GitGraphRow;
+  graphColumns: number;
+  expanded: boolean;
+  onToggle: () => void;
+  picked: boolean;
+  onTogglePick: () => void;
+  git: ProjectGitState;
+}) {
   const { text } = useI18n();
   return (
-    <li className={expanded ? "git-log-row expanded" : "git-log-row"}>
+    <li className={`git-log-row lane-color-${graphRow.color}${expanded ? " expanded" : ""}${picked ? " picked" : ""}`}>
+      <div className="git-log-head">
+      <label className="check-filter git-log-pick">
+        <input
+          type="checkbox"
+          checked={picked}
+          onChange={onTogglePick}
+          aria-label={text(`AIA에 넘길 커밋으로 선택: ${commit.subject}`, `Select for AIA: ${commit.subject}`)}
+        />
+      </label>
       <button
         className="git-log-toggle"
         type="button"
@@ -875,6 +1083,7 @@ function LogRow({ commit, expanded, onToggle, git }: { commit: GitCommit; expand
         onClick={onToggle}
         title={commit.body ? `${commit.subject}\n\n${commit.body}` : commit.subject}
       >
+        <GitGraphCell row={graphRow} columns={graphColumns} />
         <code className="git-log-sha" title={commit.sha}>{commit.shortSha}</code>
         <div className="git-log-main">
           <strong>{commit.subject}</strong>
@@ -887,7 +1096,13 @@ function LogRow({ commit, expanded, onToggle, git }: { commit: GitCommit; expand
           )}
         </div>
       </button>
-      {expanded && <CommitFilesList commit={commit} git={git} />}
+      </div>
+      {expanded && (
+        <div className="git-log-expanded" style={{ paddingLeft: graphColumns * GIT_GRAPH_COLUMN_WIDTH }}>
+          <GitGraphTails row={graphRow} columns={graphColumns} />
+          <CommitFilesList commit={commit} git={git} />
+        </div>
+      )}
     </li>
   );
 }
@@ -931,13 +1146,47 @@ function CommitFilesList({ commit, git }: { commit: GitCommit; git: ProjectGitSt
   );
 }
 
-function LogSection({ git }: { git: ProjectGitState }) {
+function LogSection({ git, onRequestAiaPrompt }: { git: ProjectGitState; onRequestAiaPrompt: (prompt: string) => void }) {
   const { text } = useI18n();
-  const { log, logError, logLoading } = git;
+  const { log, logError, logLoading, projectPath } = git;
   const [expanded, setExpanded] = useState<string | null>(null);
+  /** 고른 커밋의 SHA를 **고른 순서대로** 담는다. Set 을 쓰면 그 순서가 사라진다. */
+  const [picked, setPicked] = useState<readonly string[]>([]);
+  const graph = useMemo(() => layoutGitGraph(log?.commits ?? []), [log?.commits]);
+  const togglePick = useCallback((sha: string) => {
+    setPicked((current) => current.includes(sha) ? current.filter((entry) => entry !== sha) : [...current, sha]);
+  }, []);
+  const requestAiaReview = (intent: "review" | "analyze") => {
+    const bySha = new Map((log?.commits ?? []).map((commit) => [commit.sha, commit]));
+    const commits = picked
+      .map((sha) => bySha.get(sha))
+      .filter((commit): commit is GitCommit => commit !== undefined)
+      .map((commit) => ({ sha: commit.sha, subject: commit.subject }));
+    if (commits.length === 0) return;
+    onRequestAiaPrompt(buildAiaCommitReviewRequest({ projectPath, commits, intent }).prompt);
+    setPicked([]);
+  };
+  const overCap = picked.length > MAX_AIA_REVIEW_COMMITS;
   return (
     <section className="git-log settings-subsection">
-      <header><div><strong>{text("이력", "History")}</strong></div></header>
+      <header>
+        <div><strong>{text("이력", "History")}</strong></div>
+        {picked.length > 0 && (
+          <span className="git-row-actions">
+            <small>
+              {text(`${picked.length}개 선택`, `${picked.length} selected`)}
+              {overCap && ` · ${text(`앞 ${MAX_AIA_REVIEW_COMMITS}개만 전달됩니다`, `only the first ${MAX_AIA_REVIEW_COMMITS} are sent`)}`}
+            </small>
+            <button className="button compact" type="button" onClick={() => requestAiaReview("review")}>
+              <Sparkles size={13} />{text("AIA 리뷰", "AIA review")}
+            </button>
+            <button className="button compact" type="button" onClick={() => requestAiaReview("analyze")}>
+              {text("AIA 분석", "AIA analysis")}
+            </button>
+            <button className="button compact" type="button" onClick={() => setPicked([])}>{text("선택 해제", "Clear")}</button>
+          </span>
+        )}
+      </header>
       {logError && <ErrorBanner message={logError} />}
       {log === null && !logError && (logLoading
         ? <LoadingState label={text("이력을 읽고 있습니다", "Reading history")} />
@@ -945,8 +1194,8 @@ function LogSection({ git }: { git: ProjectGitState }) {
       {log && log.commits.length === 0 && <p className="git-empty-note">{text("표시할 커밋이 없습니다.", "No commits to show.")}</p>}
       {log && log.commits.length > 0 && (
         <ul className="git-log-list">
-          {log.commits.map((commit) => (
-            <LogRow key={commit.sha} commit={commit} expanded={expanded === commit.sha} onToggle={() => setExpanded(expanded === commit.sha ? null : commit.sha)} git={git} />
+          {log.commits.map((commit, index) => (
+            <LogRow key={commit.sha} commit={commit} graphRow={graph.rows[index]} graphColumns={graph.columns} expanded={expanded === commit.sha} onToggle={() => setExpanded(expanded === commit.sha ? null : commit.sha)} picked={picked.includes(commit.sha)} onTogglePick={() => togglePick(commit.sha)} git={git} />
           ))}
         </ul>
       )}

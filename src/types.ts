@@ -551,6 +551,13 @@ export interface LocalLlmConnection {
   /** 키가 저장돼 있는지만 알린다. 값은 어느 응답에도 실리지 않는다. */
   apiKeyConfigured: boolean;
   enabled: boolean;
+  /**
+   * 이 연결의 채팅이 단계 계획을 거치는지. 끄면 계획 턴 없이 한 턴에 도구를 바로 부른다.
+   *
+   * 모델마다 잘하는 자리가 다르다. 기준 모델은 계획을 세우고, AIA 역할로 미세조정한 모델은
+   * 기능 지도를 안다. 한 모델에 둘을 담지 못해 연결마다 고르게 했다.
+   */
+  planSteps: boolean;
 }
 
 /** 저장 요청. `apiKey`를 생략하면 저장된 키를 그대로 두고, 빈 문자열이면 지운다. */
@@ -587,6 +594,8 @@ export interface UpsertLocalLlmConnectionRequest {
   contextWindow: number | null;
   modelWindows?: Record<string, number>;
   enabled: boolean;
+  /** 단계 계획을 거칠지. 생략하면 켠 것으로 본다. */
+  planSteps: boolean;
   apiKey?: string;
 }
 
@@ -1262,6 +1271,158 @@ export interface GitLog {
   hasMore: boolean;
 }
 
+export interface ProjectGitComparisonRequest {
+  projectPath: string;
+  /** 비우면 현재 HEAD 브랜치. */
+  branch?: string;
+  /** 비우면 그 브랜치에 설정된 upstream. */
+  upstream?: string;
+  limit?: number;
+}
+
+/**
+ * 브랜치와 upstream의 차이를 방향으로 갈라 본다(B6). 수치는 네트워크를 다시 묻지 않은
+ * **마지막 fetch 기준**이라 화면은 `lastFetchedAt`을 함께 말해야 한다.
+ */
+export interface GitBranchComparison {
+  projectPath: string;
+  branch: string | null;
+  upstream: string | null;
+  /** upstream이 없거나 사라졌다. 이때 양쪽 목록은 비어 있다. */
+  noUpstream: boolean;
+  /** `branch..upstream` — 받아야 할 커밋(최신 먼저). */
+  incoming: GitCommit[];
+  /** `upstream..branch` — 보내야 할 커밋(최신 먼저). */
+  outgoing: GitCommit[];
+  incomingCount: number;
+  outgoingCount: number;
+  incomingTruncated: boolean;
+  outgoingTruncated: boolean;
+  /** 양쪽 모두 0이 아니다 — fast-forward로 정리되지 않는다. */
+  diverged: boolean;
+  /** `FETCH_HEAD` 수정 시각(unix 초). 한 번도 fetch하지 않았으면 null. */
+  lastFetchedAt: number | null;
+}
+
+/**
+ * 사용자가 계속 지켜보겠다고 표시한 브랜치 하나(B3). 저장소가 아니라 이 기기의 앱 데이터에만
+ * 쌓이고, 즐겨찾기와는 별개의 저장본이다.
+ */
+export interface ProjectBranchFollow {
+  projectPath: string;
+  branch: string;
+  /** 표시한 시각(unix 초). */
+  followedAt: number;
+}
+
+export interface ProjectBranchFollows {
+  schemaVersion: number;
+  projectPath: string;
+  follows: ProjectBranchFollow[];
+}
+
+export interface SetProjectBranchFollowRequest {
+  projectPath: string;
+  branch: string;
+  /** 토글이 아니라 원하는 상태. 같은 값을 두 번 보내도 결과가 뒤집히지 않는다. */
+  follow: boolean;
+}
+
+/**
+ * 브랜치 독립 로컬 overlay 세트 하나(C19). 메타데이터만 실리고 patch 본문도 파일 내용도
+ * 오지 않는다 — 앱 데이터 안의 patch가 비밀값이 남는 자리라 거기까지만 내보낸다.
+ */
+export interface ProjectOverlaySet {
+  schemaVersion: number;
+  setId: string;
+  name: string;
+  /** 앱 데이터 아래 폴더 이름이 되는 저장소 식별자. 단일 경로 성분이다. */
+  repositoryId: string;
+  repositoryRoot: string;
+  /** 저장소 루트 기준 상대 경로. */
+  paths: string[];
+  createdAt: number;
+  updatedAt: number;
+  /** patch를 뜰 때의 기준 HEAD. 아직 뜨지 않았으면 null. */
+  baseHead: string | null;
+  snapshotId: string | null;
+  patchDigest: string | null;
+  state: "registered" | "stored" | "applied";
+}
+
+/** 거절한 경로 하나와 그 사유(C19-2). 조용히 빠지는 경로는 없다. */
+export interface ProjectOverlayRejection {
+  path: string;
+  reason: string;
+}
+
+export interface ProjectOverlaySets {
+  schemaVersion: number;
+  repositoryId: string;
+  repositoryRoot: string;
+  sets: ProjectOverlaySet[];
+  /** 읽지 못한 세트 폴더. 목록에서 빼면 사용자가 지울 수도 없다. */
+  unreadable: string[];
+}
+
+/** overlay 변경 하나의 결말(C19-5). git 영수증과 같은 틀이라 화면이 같은 모양으로 그린다. */
+export interface ProjectOverlayReceipt {
+  action: string;
+  succeeded: boolean;
+  outcome:
+    | "saved"
+    | "deleted"
+    | "rejected"
+    | "snapshotted"
+    /** `git apply --check`가 통과했다. 검사만 했고 적용은 하지 않았다(C19-3). */
+    | "applicable"
+    /** patch를 작업 트리에 되돌려 넣었다(C19-3). */
+    | "applied"
+    /** 검사가 실패해 아무것도 적용하지 않았다. 충돌한 경로가 `affected`에 실린다. */
+    | "overlayNeedsResolution"
+    | "busy";
+  message: string;
+  headBefore: string | null;
+  headAfter: string | null;
+  setId: string | null;
+  snapshotId: string | null;
+  patchDigest: string | null;
+  affected: string[];
+  rejected: ProjectOverlayRejection[];
+  trigger: "app" | "external";
+}
+
+export interface SaveProjectOverlaySetRequest {
+  projectPath: string;
+  /** 기존 세트를 고칠 때만 채운다. 비우면 새 세트. */
+  setId?: string | null;
+  name: string;
+  paths: string[];
+}
+
+export interface DeleteProjectOverlaySetRequest {
+  projectPath: string;
+  setId: string;
+}
+
+export interface CheckProjectOverlayApplyRequest {
+  projectPath: string;
+  setId: string;
+}
+
+export interface SnapshotProjectOverlayRequest {
+  projectPath: string;
+  setId: string;
+  /** 앱이 시작한 작업인지 외부 Git 작업을 보고 내민 것인지(C19-5). 비우면 `app`. */
+  trigger?: "app" | "external" | null;
+}
+
+/** 저장해 둔 patch를 작업 트리에 되돌려 넣는 요청(C19-3). */
+export interface ApplyProjectOverlayRequest {
+  projectPath: string;
+  setId: string;
+}
+
 export type GitOutcome =
   | "completed"
   | "nothingToCommit"
@@ -1295,11 +1456,46 @@ export interface GitActionReceipt {
   timedOut: boolean;
 }
 
+/** C19 overlay 변경의 결말. 검사는 적용하지 않으므로 `applicable`로 답한다. */
 export interface ListProjectEntriesRequest {
   projectPath: string;
   parentPath?: string;
   cursor?: string | null;
   limit?: number;
+}
+
+export interface ProjectFileSearchRequest {
+  projectPath: string;
+  query: string;
+  limit?: number;
+  /** 본문도 볼지(F3). 기본은 꺼짐이고, 켜도 결과에 본문은 실리지 않는다. */
+  searchContents?: boolean;
+}
+
+/**
+ * 검색 결과 한 줄(F4). 목록의 `DocumentEntry`를 그대로 펼쳐 싣고 검색에서만 쓰는 세 칸을
+ * 더한다. `gitStatus`가 null인 것은 "변경 없음"일 수도, 저장소가 아니어서 읽지 못한 것일
+ * 수도 있다 — 구별은 페이지의 `gitStatusAvailable`가 한다. `inOverlay`는 overlay 어댑터
+ * (C19)가 서기 전까지 언제나 거짓이다.
+ */
+export interface ProjectFileSearchHit extends DocumentEntry {
+  gitStatus: GitChangeKind | null;
+  modifiedAt: number;
+  inOverlay: boolean;
+}
+
+/** 검색 결과. `truncated`면 결과 상한이나 훑기 상한에 닿아 더 있을 수 있다는 뜻이다. */
+export interface ProjectFileSearchPage {
+  query: string;
+  entries: ProjectFileSearchHit[];
+  scanned: number;
+  truncated: boolean;
+  /** git 상태를 읽었는지. 거짓이면 모든 줄의 `gitStatus`가 null이다. */
+  gitStatusAvailable: boolean;
+  /** 내용 검색을 켜고 돈 결과인지. */
+  searchedContents: boolean;
+  /** 내용 검색을 켰는데도 열지 않은 파일 수 — 제외 폴더·1MB 초과·바이너리. */
+  excluded: number;
 }
 
 export interface ReadProjectFileRequest {
@@ -2473,6 +2669,8 @@ export interface ChatStartRequest {
   resumeSessionId?: string | null;
   /** 다른 공급자 세션에서 새 세션으로 인계할 때의 원본. */
   handoffOrigin?: SessionLink | null;
+  /** 같은 공급자 세션을 원본으로 새 세션을 갈라낸다(fork). Codex·Claude만 받는다. */
+  forkSessionId?: string | null;
   unattended?: boolean;
   /**
    * 이 실행 계정을 세션에 고정할지. 고정은 이어가기 정책과 페일오버보다 우선하므로,
@@ -3552,6 +3750,26 @@ export interface SetUsageBudgetConsumerRequest {
 export type RoundGoalStatus = "draft" | "designing" | "active" | "paused" | "done";
 
 /** 사용자가 적는 회차 목표. 설계 산출물(스킬·워크플로·반복 요청)은 AIA 가 등록한 뒤 붙는다. */
+/// 목표 상태를 바꾸면서 함께 켜고 끈 반복 요청. 상태가 그 자리를 정하지 않는 경우
+/// (설계 전 상태이거나 목표에 반복 요청이 없을 때)에는 오지 않는다.
+/** 공급자 설치본에 시스템 스킬이 새로 깔리거나 갱신된 한 줄. */
+export interface SystemSkillNoticeEntry {
+  provider: ProviderId;
+  key: string;
+  outcome: "installed" | "upToDate" | "updated" | "userModified";
+}
+
+/** 아직 사용자가 확인하지 않은 설치 안내. 확인하면 백엔드가 지운다. */
+export interface SystemSkillNotice {
+  recordedAt: number;
+  entries: SystemSkillNoticeEntry[];
+}
+
+export interface RoundGoalScheduleChange {
+  id: string;
+  enabled: boolean;
+}
+
 export interface RoundGoal {
   id: string;
   title: string;
@@ -3566,6 +3784,8 @@ export interface RoundGoal {
   notes: string;
   createdAt: number;
   updatedAt: number;
+  /// 상태 변경 응답에만 실린다. 조회로 받은 목표에는 없다.
+  scheduleChanged?: RoundGoalScheduleChange;
 }
 
 export interface RoundGoalInput {

@@ -5,7 +5,6 @@ import type { SystemAutomationSnapshot } from "../types";
 import type { TabRequest } from "../lib/uiGuide";
 import { useStoredChoice } from "./SkillLibraryPanel";
 import { AiaOnboardingCards } from "./AiaOnboardingCards";
-import { AiaSuggestionPackPanel } from "./AiaSuggestionPackPanel";
 import { RoundGoalsPanel } from "./RoundGoalsPanel";
 import { BuiltinToolAccess } from "./BuiltinToolAccess";
 import { ClaudePluginsCard } from "./ClaudePluginsCard";
@@ -48,7 +47,7 @@ function AgentManagerMark({ size }: { size?: number }) {
  * 얹는다. Claude Code는 클로드 전용 라우트라, 자동화는 붙는 도구가 아니라 비운다.
  */
 /**
- * 패널 한 벌이 받는 것. 대부분의 탭은 `active`만 쓰지만 자동화 탭의 AIA 선제 제안은 앱이 들고
+ * 패널 한 벌이 받는 것. 대부분의 탭은 `active`만 쓰지만 자동화 탭의 온보딩 카드는 앱이 들고
  * 있는 시스템 자동화 스냅숏을 읽고 쓰므로, 그 세 값을 모든 패널에 똑같이 흘려 보낸다 —
  * 자동화 탭만 따로 그리면 탭 표 하나에서 이름·표식·내용이 나온다는 이 파일의 규칙이 깨진다.
  */
@@ -63,6 +62,8 @@ export interface AddonsPanelProps {
    * 그 버튼은 서지 않는다.
    */
   onRequestAiaPrompt?: (prompt: string) => void;
+  /** 로고 새로고침이 올리는 나수. 스스로 다시 읽지 않는 패널이 이 값을 보고 다시 읽는다. */
+  refreshNonce?: number;
 }
 
 interface AddonsTab extends SettingsSubTab<AddonsTabId> {
@@ -91,9 +92,9 @@ const ADDONS_TAB_IDS: readonly AddonsTabId[] = addonsTabs.map((tab) => tab.id);
  *
  * 앞 네 탭은 설정 → 플러그인 중메뉴에 있던 카드를 동작 그대로 옮겨 온 것이고, 그 설정 탭은
  * 없앴다. Claude Code 탭은 클로드 전용 라우트를 가진 도구 하나로 같은 줄에 선다. 자동화 탭은
- * 앱이 스스로 돌리는 것들의 자리라, AIA 선제 제안과 (아직 목업인) QA 워크플로 온보딩이 선다.
+ * 앱이 스스로 돌리는 것들의 자리라, 회차 목표와 온보딩 카드가 선다.
  */
-export function AddonsView({ active, tabRequest = null, automation = null, onAutomationChange, onSkillsChanged, onRequestAiaPrompt }: {
+export function AddonsView({ active, tabRequest = null, automation = null, onAutomationChange, onSkillsChanged, onRequestAiaPrompt, refreshNonce = 0 }: {
   active: boolean;
   tabRequest?: TabRequest<AddonsTabId> | null;
 } & Omit<AddonsPanelProps, "active">) {
@@ -114,6 +115,7 @@ export function AddonsView({ active, tabRequest = null, automation = null, onAut
           onAutomationChange={onAutomationChange}
           onSkillsChanged={onSkillsChanged}
           onRequestAiaPrompt={onRequestAiaPrompt}
+          refreshNonce={refreshNonce}
           key={addon.id}
         />
       ))}
@@ -140,13 +142,13 @@ function AddonPanelSlot({ addon: { id, tool, panel: Panel }, selected, viewActiv
 }
 
 /**
- * 자동화 탭의 내용. 앱이 스스로 돌리는 것 둘이 위아래로 선다 — AIA 선제 제안이 먼저,
- * 데이터로 오는 온보딩 카드가 그 아래다. 카드는 이 파일이 아니라 온보딩 팩이 정한다(W6).
+ * 자동화 탭의 내용. 회차 목표가 먼저, 데이터로 오는 온보딩 카드가 그 아래다. 카드는 이 파일이
+ * 아니라 온보딩 팩이 정한다(W6). AIA 선제 제안은 AIA 자체를 켜고 끄는 자리인 설정 → AIA
+ * 설정으로 옮겨 갔다 — 여기 있을 때는 제안이 뜨지 않는 이유를 두 화면에서 맞춰 봐야 했다.
  */
 function AutomationPanel(props: AddonsPanelProps) {
   return <>
-    <RoundGoalsPanel onRequestAiaPrompt={props.onRequestAiaPrompt} />
-    <AiaSuggestionPackPanel {...props} />
+    <RoundGoalsPanel onRequestAiaPrompt={props.onRequestAiaPrompt} refreshNonce={props.refreshNonce} />
     <AiaOnboardingCards {...props} />
   </>;
 }

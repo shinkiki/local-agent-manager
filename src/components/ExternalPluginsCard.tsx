@@ -11,6 +11,7 @@ import type { ExternalPluginAuthKind, ExternalPluginOAuthStart, ExternalPluginVi
 import { AppToggle, BrandMark, ErrorBanner, Modal, useConfirm, type ConfirmRequest } from "./Shared";
 import { errorText } from "../lib/errorText";
 
+import { formatDateTime } from "../lib/format";
 /** OAuth 승인을 기다리는 동안 상태를 다시 읽는 간격. 콜백은 백엔드가 받으므로 화면은 폴링으로 안다. */
 const OAUTH_POLL_INTERVAL_MS = 2_000;
 
@@ -482,17 +483,17 @@ export function ExternalPluginsCard({ active }: { active: boolean }) {
           <ShieldCheck size={16} aria-hidden="true" />
           <span>
             <strong>{text(
-              access?.writable ? "원격 화면에서는 연결 관리가 제한됩니다" : "이 원격 연결은 읽기 전용입니다",
-              access?.writable ? "Connection management is limited remotely" : "This remote connection is read-only",
+              access?.writable ? "원격 화면에서는 OAuth 인증만 제한됩니다" : "이 원격 연결은 읽기 전용입니다",
+              access?.writable ? "Only OAuth sign-in is limited on a remote screen" : "This remote connection is read-only",
             )}</strong>
             <small>{access?.writable
               ? text(
-                "사용 전환과 연결 확인만 가능합니다. 편집·인증·도구 권한·삭제는 Agent Manager가 실행 중인 호스트 앱에서 진행하세요.",
-                "You can toggle and verify here. Edit, sign-in, tool permissions and removal are available in the host app running Agent Manager.",
+                "등록·편집·토큰 입력·삭제는 여기서 할 수 있습니다. OAuth 승인은 콜백이 호스트의 loopback으로 돌아와 호스트 앱에서만 끝낼 수 있고, 도구 권한도 호스트 전용입니다 — 원격에서 새로 붙이려면 토큰 방식을 쓰세요.",
+                "You can register, edit, enter tokens and remove here. OAuth approval only finishes in the host app because the callback returns to the host's loopback, and tool permissions stay host-only — use a token method to connect from a remote screen.",
               )
               : text(
-                "설정을 바꾸려면 쓰기 권한으로 다시 연결하세요. 편집·인증·도구 권한·삭제는 쓰기 권한과 관계없이 호스트 앱에서만 가능합니다.",
-                "Reconnect with write access to change settings. Edit, sign-in, tool permissions and removal remain host-only regardless of remote write access.",
+                "설정을 바꾸려면 쓰기 권한으로 다시 연결하세요. OAuth 인증과 도구 권한은 쓰기 권한과 관계없이 호스트 앱에서만 가능합니다.",
+                "Reconnect with write access to change settings. OAuth sign-in and tool permissions remain host-only regardless of remote write access.",
               )}</small>
           </span>
         </div>
@@ -534,9 +535,9 @@ export function ExternalPluginsCard({ active }: { active: boolean }) {
             <strong>{text("새 플러그인 연결", "Connect a plugin")}</strong>
             <small>{isHost
               ? text(`최대 ${snapshot.maxPlugins}개 · 변경 내용은 새로 시작하는 채팅부터 적용됩니다.`, `Up to ${snapshot.maxPlugins} · Changes apply to newly started chats.`)
-              : text("등록·인증·토큰 입력은 호스트 화면에서만 할 수 있습니다. 여기서는 사용 토글과 연결 확인만 됩니다.", "Registration, sign-in and tokens are host-only. Here you can toggle and verify.")}</small>
+              : text(`최대 ${snapshot.maxPlugins}개 · 원격에서는 토큰 방식으로 붙일 수 있습니다. OAuth 승인은 호스트 화면에서 끝내야 합니다.`, `Up to ${snapshot.maxPlugins} · Token methods work from a remote screen; OAuth approval must finish on the host.`)}</small>
           </span>
-          <button className="button compact primary" type="button" disabled={!isHost || !canWrite || snapshot.plugins.length >= snapshot.maxPlugins} onClick={() => setForm({ editing: null, draft: presetDraft("notionOauth", snapshot) })}><Plus size={13} />{text("플러그인 추가", "Add plugin")}</button>
+          <button className="button compact primary" type="button" disabled={!canWrite || snapshot.plugins.length >= snapshot.maxPlugins} onClick={() => setForm({ editing: null, draft: presetDraft(isHost ? "notionOauth" : "notionToken", snapshot) })}><Plus size={13} />{text("플러그인 추가", "Add plugin")}</button>
         </div>
       )}
       {snapshot && form && (
@@ -915,8 +916,11 @@ function PluginRow({
 }: PluginRowProps) {
   const { text } = useI18n();
   const rowBusy = busy !== null && busy.endsWith(`:${plugin.id}`);
-  // 편집·인증·토큰·삭제·도구 권한은 모두 호스트 화면에서 쓰기 권한이 있고 이 행이 한가할 때만 눌린다.
-  const managementDisabled = !isHost || !canWrite || rowBusy;
+  // 편집·토큰 변경·삭제는 쓰기 권한만 있으면 원격에서도 눌린다(P4, 2026-09-30).
+  const manageDisabled = !canWrite || rowBusy;
+  // 인증과 도구 권한만 호스트에 남는다 — 앞은 콜백이 호스트 loopback으로 돌아와서,
+  // 뒤는 허용이 승인 카드를 없애는 권한 확대라서다.
+  const hostOnlyDisabled = !isHost || manageDisabled;
   const status = statusFor(plugin, text);
   const mark = markOf(plugin, presets);
   const brand = mark.brand;
@@ -930,7 +934,7 @@ function PluginRow({
       <div className="plugin-row-main">
         <div className="plugin-row-name"><strong>{plugin.displayName}</strong><code>{plugin.id}</code></div>
         <small>{authLabel(plugin.auth, text)} · {plugin.url ?? text("내장 MCP 서버", "Managed MCP server")}</small>
-        <span className={`plugin-status ${status.tone}`}><i />{status.label}{plugin.lastVerifiedAt !== null && status.tone === "ok" ? <time dateTime={new Date(plugin.lastVerifiedAt).toISOString()}>{new Date(plugin.lastVerifiedAt).toLocaleString()}</time> : null}</span>
+        <span className={`plugin-status ${status.tone}`}><i />{status.label}{plugin.lastVerifiedAt !== null && status.tone === "ok" ? <time dateTime={new Date(plugin.lastVerifiedAt).toISOString()}>{formatDateTime(plugin.lastVerifiedAt)}</time> : null}</span>
         {plugin.lastError && <small className="plugin-error">{plugin.lastError}</small>}
       </div>
       <div className="plugin-row-actions">
@@ -942,13 +946,13 @@ function PluginRow({
         </div>
         <div className="plugin-row-action-group plugin-row-management-actions">
           {isOAuthKind(plugin.auth) && (plugin.oauthPending
-            ? <button className="button compact" type="button" disabled={!isHost || rowBusy} onClick={onCancelOAuth}><X size={13} />{text("취소", "Cancel")}</button>
-            : <button className="button compact primary" type="button" disabled={managementDisabled} title={isHost ? text("브라우저에서 승인하면 refresh token을 보안 저장소에 둡니다", "Approve in the browser; the refresh token is kept in the secure store") : text("인증은 호스트 화면에서만 할 수 있습니다", "Sign-in is only available on the host")} onClick={onStartOAuth}>
+            ? <button className="button compact" type="button" disabled={rowBusy || !canWrite} onClick={onCancelOAuth}><X size={13} />{text("취소", "Cancel")}</button>
+            : <button className="button compact primary" type="button" disabled={hostOnlyDisabled} title={isHost ? text("브라우저에서 승인하면 refresh token을 보안 저장소에 둡니다", "Approve in the browser; the refresh token is kept in the secure store") : text("승인 콜백이 호스트의 loopback으로 돌아오므로 인증은 호스트 화면에서만 끝낼 수 있습니다", "The approval callback returns to the host's loopback, so sign-in can only finish on the host")} onClick={onStartOAuth}>
               <ShieldCheck size={13} />{plugin.credentialReady ? text("다시 인증", "Re-authenticate") : text("인증", "Sign in")}
             </button>)}
-          {usesStaticToken(plugin.auth) && <button className="button compact" type="button" disabled={managementDisabled} title={isHost ? undefined : text("토큰 입력은 호스트 화면에서만 할 수 있습니다", "Tokens can only be entered on the host")} onClick={onChangeToken}><KeyRound size={13} />{text("토큰 변경", "Change token")}</button>}
-          <button className="button compact" type="button" disabled={managementDisabled} title={isHost ? text("표시 이름·주소·인증 방식을 편집합니다", "Edit the name, address and authentication") : text("편집은 호스트 화면에서만 할 수 있습니다", "Editing is host-only")} onClick={onEdit}><Pencil size={13} />{text("편집", "Edit")}</button>
-          <button className="plugin-remove-button" type="button" disabled={managementDisabled} aria-label={text(`${plugin.displayName} 삭제`, `Remove ${plugin.displayName}`)} title={isHost ? text("삭제", "Remove") : text("삭제는 호스트 화면에서만 할 수 있습니다", "Removal is host-only")} onClick={onRemove}><Trash2 size={14} /></button>
+          {usesStaticToken(plugin.auth) && <button className="button compact" type="button" disabled={manageDisabled} onClick={onChangeToken}><KeyRound size={13} />{text("토큰 변경", "Change token")}</button>}
+          <button className="button compact" type="button" disabled={manageDisabled} title={text("표시 이름·주소·인증 방식을 편집합니다", "Edit the name, address and authentication")} onClick={onEdit}><Pencil size={13} />{text("편집", "Edit")}</button>
+          <button className="plugin-remove-button" type="button" disabled={manageDisabled} aria-label={text(`${plugin.displayName} 삭제`, `Remove ${plugin.displayName}`)} title={text("삭제", "Remove")} onClick={onRemove}><Trash2 size={14} /></button>
         </div>
       </div>
       {toolNames.length > 0 && (
@@ -963,7 +967,7 @@ function PluginRow({
         <PluginToolsPanel
           plugin={plugin}
           toolNames={toolNames}
-          disabled={managementDisabled}
+          disabled={hostOnlyDisabled}
           isHost={isHost}
           onChangeToolPolicy={onChangeToolPolicy}
           onChangeAllToolPolicies={onChangeAllToolPolicies}

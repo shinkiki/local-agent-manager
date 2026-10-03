@@ -3820,6 +3820,7 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "plan_usage_paced_runs"
             | "set_usage_budget_policy"
             | "acknowledge_drain_notice"
+            | "acknowledge_system_skill_notice"
             | "set_usage_budget_account"
             | "set_usage_budget_consumer"
             | "set_usage_budget_savings"
@@ -3876,6 +3877,20 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "fetch_project_git"
             | "pull_project_git"
             | "push_project_git"
+            | "set_project_branch_follow"
+            // C19-4. 세트 저장·삭제는 쓰기 게이트를 지나고 write mode에서 원격 가능하다.
+            // 작업 트리가 아니라 앱 데이터의 장부를 바꾸고, 삭제는 지우지 않고 앱 소유
+            // 휴지통으로 옮기므로 되돌릴 자리가 남는다. 호스트 전용 목록에는 overlay 명령이
+            // 하나도 들어가지 않는다.
+            | "save_project_overlay_set"
+            | "delete_project_overlay_set"
+            // C19-4. 작업 트리를 바꾸지만 바깥으로 나가지 않는다. push가 호스트 전용인
+            // 이유는 호스트 자격증명으로 내보내기 때문이고 overlay에는 그 축이 없다.
+            | "snapshot_project_overlay"
+            // C19-4. 적용은 작업 트리를 바꾸지만 되돌릴 자리가 남는다 — 검사가 통과할 때만
+            // 적용하고, patch는 앱 데이터에 그대로 남아 같은 세트를 다시 뜰 수 있다.
+            // 2026-10-02 사용자 결정으로 write mode에서 원격 가능하다.
+            | "apply_project_overlay"
     )
 }
 
@@ -3900,14 +3915,26 @@ pub(crate) const HOST_ONLY_COMMAND_MESSAGE: &str =
 /// 조회지만 쓰기 목록에 넣어 원격 읽기 전용 모드에서는 막는다 — 비밀 원문은 변경 권한과 같은
 /// 급으로 다룬다.
 ///
-/// 외부 플러그인(2026-08-30 사용자 결정: 원격 UI 인증은 지원하지 않는다)의 등록·편집·토큰
-/// 입력·OAuth 시작·취소·삭제는 호스트 전용이다. 토큰은 원격 경로로 받지 않고, OAuth 콜백은
-/// 호스트 loopback으로만 돌아오며, 삭제는 보안 저장소의 비밀값을 지우는 되돌릴 수 없는
-/// 작업이다. 편집도 같은 급이다 — 토큰을 받을 수 있고, 연결 지점이 바뀌면 저장된 자격증명을
-/// 지운다. 외부 플러그인의 변경 도구 호출도 앱 밖의 데이터를 바꾸며 복구를 보장할 수 없어
-/// 호스트 전용이다. 도구 정책도 마찬가지다 — 허용으로 바꾸면 그 도구는 승인 카드를 거치지
-/// 않으므로, 권한을 넓히는 결정은 호스트 화면에서만 내린다. 사용 토글과 연결 확인은 앱 소유
-/// 저장소 안의 변경이라 원격 write에 허용한다.
+/// 외부 플러그인의 등록·편집·토큰 입력·삭제는 2026-09-30 사용자 결정으로 원격 write에
+/// 허용한다. 처음 경계(2026-08-30)는 "토큰은 원격 경로로 받지 않는다"였는데, 2026-09-29에
+/// 비밀값(C15-7/C17-7)을 `remoteWrite` 하나로 모으면서 그 전제가 이미 깨졌다 — 원격 화면은
+/// 승인 카드로 비밀값을 백엔드 메모리에 넣고 보안 저장소에 저장까지 한다. 플러그인 토큰만
+/// 남겨 두면 막는 것은 유출 경로가 아니라 "폰에서 노션을 붙이는 일"뿐이었다. 삭제도 같이
+/// 연다: 등록할 수 있는데 지우지 못하면 원격에서 잘못 넣은 항목을 되돌릴 방법이 없고,
+/// 지워지는 것은 앱이 소유한 기록과 사용자가 발급처에서 다시 받을 수 있는 토큰뿐이다.
+///
+/// **OAuth 시작(`begin_external_plugin_oauth`)만 호스트 전용으로 남는다.** 이것은 권한이
+/// 아니라 물리적 제약이다 — 콜백 `redirect_uri`가 호스트 loopback이라(`external_plugins.rs`의
+/// `begin_callback_oauth`) 원격 브라우저에서 승인하면 리디렉트가 닿을 곳이 없다. 원격에서
+/// 눌리게 하면 끝낼 수 없는 대기 상태만 만든다. 그래서 등록은 열되 인증은 호스트에서 하고,
+/// 원격에서 새로 붙일 때는 토큰 방식을 쓴다. 시작이 호스트 전용이면 취소도 거기서 되지만,
+/// 취소는 대기 상태를 거두는 정리 동작이라 원격에도 연다 — 삭제를 열어 둔 채 취소만 막으면
+/// 원격에서 대기 중인 플러그인을 지우는 것 말고는 손쓸 수가 없다.
+///
+/// 도구 정책은 계속 호스트 전용이다 — 허용으로 바꾸면 그 도구는 승인 카드를 거치지 않으므로,
+/// 권한을 넓히는 결정은 호스트 화면에서만 내린다. 외부 플러그인의 변경 도구 호출도 앱 밖의
+/// 데이터를 바꾸며 복구를 보장할 수 없어 호스트 전용이다. 사용 토글과 연결 확인은 앱 소유
+/// 저장소 안의 변경이라 전부터 원격 write에 허용한다.
 ///
 /// SSH(C9)는 처음엔 연결 서버와 키 관리가 모두 호스트 전용이었으나 2026-09-03 사용자
 /// 결정으로 원격 write에 전부 허용했다. 엔드포인트는 비밀값 없는 앱 데이터(호스트·포트·
@@ -3947,14 +3974,9 @@ pub(crate) fn is_host_only_command(command: &str) -> bool {
         command,
         "analyze_aia_event"
             | "set_resource_repository"
-            | "register_external_plugin"
-            | "update_external_plugin"
-            | "remove_external_plugin"
-            | "set_external_plugin_token"
             | "set_external_plugin_tool_policy"
             | "set_external_plugin_tool_policies"
             | "begin_external_plugin_oauth"
-            | "cancel_external_plugin_oauth"
             | "execute_external_plugin_tool"
             | "execute_ssh_command"
             | "relay_ssh_command"
@@ -4043,6 +4065,34 @@ pub(crate) struct SystemCommandContext<'a> {
     /// 이 호출이 워크플로 단계에서 왔다면 그 출처. 워크플로 실행기가 단계마다 채우며,
     /// `start_chat`이 띄우는 채팅과 `plan_usage_paced_runs`의 소비자 식별에 실린다.
     pub(crate) origin: Option<ChatOrigin>,
+}
+
+/// 목표 상태가 그 목표의 반복 요청을 켜야 하는가 꺼야 하는가. 등록 전 상태
+/// (`Draft`·`Designing`)는 건드릴 반복 요청이 없으므로 아무것도 정하지 않는다.
+fn schedule_enabled_for_goal(status: crate::RoundGoalStatus) -> Option<bool> {
+    match status {
+        crate::RoundGoalStatus::Active => Some(true),
+        // 끝난 목표의 회차가 계속 도는 것은 멈춘 목표가 도는 것과 같은 문제다.
+        crate::RoundGoalStatus::Paused | crate::RoundGoalStatus::Done => Some(false),
+        crate::RoundGoalStatus::Draft | crate::RoundGoalStatus::Designing => None,
+    }
+}
+
+/// 이 출처가 띄우는 실행이 시스템 도구(aia_system MCP)를 쥐는가.
+///
+/// `StartChatRequest::system_tools`는 `skip_deserializing`이라 계약도 호출자도 보낼 수
+/// 없다. 그래서 출처만이 답을 안다 — 이 함수가 그 한 자리다.
+///
+/// 반복 요청이 채팅을 직접 띄우는 경로는 2026-09-27 결정으로 이미 열려 있었는데, 같은
+/// 반복 요청이 워크플로를 거쳐 띄우면 닫혀 있었다. 그래서 회차가 `record_round_report`를
+/// 부르지 못했고 등록된 모든 회차의 보고가 0건으로 남았다.
+///
+/// 2026-10-02 사용자 결정: **출처가 워크플로면 전부 연다.** 반복 요청 트리거로 좁히지
+/// 않으므로 AIA가 `execute_system_workflow`로 돌린 실행도 도구를 쥔다 — 등록된 계약만
+/// 돌 수 있고 등록 자체가 승인 자리라는 것이 근거다. 사용자·AIA 대화가 직접 띄운 실행은
+/// 그대로 닫힌다.
+fn system_tools_for_origin(origin: Option<&ChatOrigin>) -> bool {
+    origin.is_some_and(|origin| origin.kind == ChatOriginKind::Workflow)
 }
 
 /// 워크플로 단계 호출 위치를 채팅 출처로 옮긴다. 반복 요청이 트리거면 그 id가 페이싱
@@ -5893,6 +5943,13 @@ fn dispatch_session_command(
             )?)
         }
         "get_storage_overview" => to_value(load_storage_overview(app_data_dir)?),
+        "get_system_skill_notice" => {
+            to_value(crate::system_skills::get_system_skill_notice(app_data_dir)?)
+        }
+        "acknowledge_system_skill_notice" => {
+            crate::system_skills::acknowledge_system_skill_notice(app_data_dir)?;
+            to_value(json!({ "acknowledged": true }))
+        }
         "get_session_detail" => {
             let args: RequestEnvelope<SessionDetailRequest> = parse_params(params)?;
             if let Some(before_index) = args.request.transcript_before_index {
@@ -5999,11 +6056,33 @@ fn dispatch_session_command(
         }
         "update_round_goal" => {
             let args: RequestEnvelope<UpdateRoundGoalArg> = parse_params(params)?;
-            to_value(crate::update_round_goal(
-                app_data_dir,
-                &args.request.id,
-                args.request.patch,
-            )?)
+            let wanted = args.request.patch.status;
+            let goal =
+                crate::update_round_goal(app_data_dir, &args.request.id, args.request.patch)?;
+            // 목표 상태가 주인이다. 멈춘 목표의 반복 요청이 계속 돌면 사용자는 멈춘 줄
+            // 알면서 사용량을 계속 쓴다 — 화면에는 "일시정지"가 적혀 있고 회차는 10분마다
+            // 기동한다. 반대로 다시 진행은 꺼 둔 반복 요청을 되살려야 말이 맞는다.
+            //
+            // `rounds.rs`가 아니라 여기서 묶는다. 그 모듈은 목표 기록만 아는 계층이고,
+            // 스케줄러를 알게 하면 기록 계층이 실행 계층에 의존하게 된다. 생성 직후 예산
+            // 소비자를 맞추는 `create_scheduled_request` 분기와 같은 자리·같은 모양이다.
+            let changed = match (
+                wanted.and_then(schedule_enabled_for_goal),
+                &goal.schedule_id,
+            ) {
+                (Some(enabled), Some(schedule_id)) => {
+                    let updated = scheduler.set_enabled(schedule_id, enabled)?;
+                    scheduler.refresh_paced_auto_cadence()?;
+                    Some(json!({ "id": updated.id, "enabled": enabled }))
+                }
+                _ => None,
+            };
+            // 함께 바꾼 것은 영수증으로 돌려준다. 말하지 않으면 사용자는 목표만 바뀐 줄 안다.
+            let mut value = to_value(goal)?;
+            if let (Some(object), Some(changed)) = (value.as_object_mut(), changed) {
+                object.insert("scheduleChanged".to_owned(), changed);
+            }
+            Ok(value)
         }
         "delete_round_goal" => {
             let args: RequestEnvelope<IdArg> = parse_params(params)?;
@@ -6552,6 +6631,17 @@ fn dispatch_project_command(
                 args.request.limit,
             )?)
         }
+        "search_project_files" => {
+            let args: RequestEnvelope<crate::ProjectFileSearchRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::search_project_files(
+                app_data_dir,
+                &root,
+                &args.request.query,
+                args.request.limit,
+                args.request.search_contents,
+            )?)
+        }
         "read_project_file" => {
             let args: RequestEnvelope<crate::ReadProjectFileRequest> = parse_params(params)?;
             let root = project(&args.request.project_path)?;
@@ -6579,6 +6669,76 @@ fn dispatch_project_command(
             let args: RequestEnvelope<crate::ProjectGitLogRequest> = parse_params(params)?;
             let root = project(&args.request.project_path)?;
             to_value(crate::project_git_log(app_data_dir, &root, &args.request)?)
+        }
+        "get_project_branch_comparison" => {
+            let args: RequestEnvelope<crate::ProjectGitComparisonRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::get_project_branch_comparison(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        "list_project_branch_follows" => {
+            let args: RequestEnvelope<crate::ProjectGitTarget> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::list_project_branch_follows(app_data_dir, &root)?)
+        }
+        // 팔로우는 앱 데이터에만 쌓이고 저장소를 건드리지 않으므로(G7) 쓰기 게이트 아래
+        // 원격에서도 쓴다. 지우면 그대로 돌아가는 기기 단위 선택이다.
+        "set_project_branch_follow" => {
+            let args: RequestEnvelope<crate::SetProjectBranchFollowRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::set_project_branch_follow(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        // C19. overlay 세트 장부. git을 띄우지 않으므로 저장소가 잠겨 있어도 답한다.
+        "list_project_overlay_sets" => {
+            let args: RequestEnvelope<crate::ProjectOverlayTarget> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::list_project_overlay_sets(app_data_dir, &root)?)
+        }
+        "save_project_overlay_set" => {
+            let args: RequestEnvelope<crate::SaveProjectOverlaySetRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::save_project_overlay_set(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        "snapshot_project_overlay" => {
+            let args: RequestEnvelope<crate::SnapshotProjectOverlayRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::snapshot_project_overlay(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        "delete_project_overlay_set" => {
+            let args: RequestEnvelope<crate::DeleteProjectOverlaySetRequest> =
+                parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::delete_project_overlay_set(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        // C19-3. 저장해 둔 patch를 작업 트리에 되돌려 넣는다. 검사가 통과하지 못하면
+        // 아무것도 적용하지 않고 overlayNeedsResolution 영수증만 돌려준다.
+        "apply_project_overlay" => {
+            let args: RequestEnvelope<crate::ApplyProjectOverlayRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::apply_project_overlay(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
         }
         "get_project_git_commit_files" => {
             let args: RequestEnvelope<crate::ProjectGitCommitFilesRequest> = parse_params(params)?;
@@ -6661,6 +6821,17 @@ fn dispatch_project_command(
             let args: RequestEnvelope<crate::ProjectGitPushRequest> = parse_params(params)?;
             let root = project(&args.request.project_path)?;
             to_value(crate::push_project_git(app_data_dir, &root, &args.request)?)
+        }
+        // C19-4. 재적용 전 검사는 작업 트리를 바꾸지 않는 조회라 게이트가 없고 원격에도 열린다.
+        "check_project_overlay_apply" => {
+            let args: RequestEnvelope<crate::CheckProjectOverlayApplyRequest> =
+                parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::check_project_overlay_apply(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
         }
         _ => dispatch_document_command(context, command, params),
     }
@@ -6875,6 +7046,19 @@ fn dispatch_scheduler_and_run_command(
                     ChatOriginKind::User
                 })
             }));
+            // 워크플로 단계가 띄우는 실행은 시스템 도구를 쥔다. 계약은 이 값을 보낼 수
+            // 없고(`StartChatRequest::system_tools`는 skip_deserializing) 출처만이 정하므로,
+            // 등록된 계약이 띄운 실행인지는 여기서만 알 수 있다. 반복 요청이 채팅을 직접
+            // 띄우는 경로(scheduler.rs)는 2026-09-27 결정으로 이미 열려 있었는데, 같은 반복
+            // 요청이 워크플로를 거쳐 띄우면 닫혀 있었다 — 그래서 회차가 record_round_report
+            // 를 부르지 못해 등록된 모든 회차의 보고가 0건으로 남았다.
+            //
+            // 출처가 워크플로면 전부 연다(2026-10-02 사용자 결정). 반복 요청 트리거로
+            // 좁히지 않으므로, AIA 가 execute_system_workflow 로 돌린 워크플로의 실행도
+            // 도구를 쥔다 — 등록된 계약만 돌 수 있고 등록 자체가 승인 자리라는 것이 근거다.
+            if system_tools_for_origin(context.origin.as_ref()) {
+                args.request.chat.system_tools = true;
+            }
             // 소비자 선택이 켜져 있으면, 예산에서 꺼진 반복 요청의 워크플로는 무인 런타임을
             // 띄우지 못한다. 페이싱 계산이 없는 워크플로도 여기서 같은 토글을 따른다.
             // 단, 페이싱을 끈 워크플로는 예산 관리 대상이 아니므로 이 게이트를 지나간다.
@@ -9121,6 +9305,69 @@ mod tests {
         );
     }
 
+    /// 목표 상태가 그 목표의 반복 요청을 함께 멈추고 되살린다. 이어져 있지 않던 동안
+    /// 화면에는 "일시정지"가 적히고 회차는 10분마다 계속 기동했다 — 사용자는 멈춘 줄
+    /// 알면서 사용량을 썼다.
+    #[test]
+    fn goal_status_decides_whether_its_schedule_keeps_running() {
+        use crate::RoundGoalStatus;
+
+        assert_eq!(
+            schedule_enabled_for_goal(RoundGoalStatus::Active),
+            Some(true)
+        );
+        // 끝난 목표의 회차가 계속 도는 것은 멈춘 목표가 도는 것과 같은 문제다.
+        for status in [RoundGoalStatus::Paused, RoundGoalStatus::Done] {
+            assert_eq!(
+                schedule_enabled_for_goal(status),
+                Some(false),
+                "{status:?} 목표의 반복 요청이 계속 돌면 안 된다"
+            );
+        }
+        // 등록 전 상태는 건드릴 반복 요청이 없다. false 로 답하면 아직 만들지도 않은
+        // 반복 요청을 끄러 가고, true 면 설계 중인 목표가 돌기 시작한다.
+        for status in [RoundGoalStatus::Draft, RoundGoalStatus::Designing] {
+            assert_eq!(schedule_enabled_for_goal(status), None, "{status:?}");
+        }
+    }
+
+    /// 회차는 워크플로 단계가 띄운다. 이 자리가 닫혀 있던 동안 등록된 모든 회차의
+    /// 보고가 0건이었다 — 에이전트가 record_round_report 를 가지고 있지 않았다.
+    #[test]
+    fn workflow_launched_runs_hold_system_tools_and_direct_starts_do_not() {
+        let workflow = ChatOrigin {
+            kind: ChatOriginKind::Workflow,
+            workflow_id: Some("project-menu-overlay-round".to_owned()),
+            execution_id: Some("wfround-1".to_owned()),
+            schedule_id: Some("schedule-1".to_owned()),
+            run_id: Some("run-1".to_owned()),
+            consumer_id: Some("schedule-1".to_owned()),
+        };
+        assert!(system_tools_for_origin(Some(&workflow)));
+
+        // 반복 요청 트리거가 없는 워크플로(AIA 가 직접 돌린 것)도 함께 열린다 —
+        // 2026-10-02 결정이 트리거로 좁히지 않았다.
+        let manual = ChatOrigin {
+            schedule_id: None,
+            run_id: None,
+            ..workflow
+        };
+        assert!(system_tools_for_origin(Some(&manual)));
+
+        // 사람과 AIA 대화가 직접 띄운 실행은 그대로 닫힌다.
+        for kind in [
+            ChatOriginKind::User,
+            ChatOriginKind::Aia,
+            ChatOriginKind::Schedule,
+        ] {
+            assert!(
+                !system_tools_for_origin(Some(&ChatOrigin::direct(kind))),
+                "{kind:?} 출처가 시스템 도구를 쥐면 안 된다"
+            );
+        }
+        assert!(!system_tools_for_origin(None));
+    }
+
     #[test]
     fn local_ui_cors_preflight_uses_an_exact_origin_and_header_allowlist() {
         let access = RequestAccess {
@@ -9565,24 +9812,27 @@ mod tests {
         );
     }
 
+    /// P4(2026-09-30 결정). 등록·편집·토큰 입력·삭제는 원격 write까지 열고, 승인 카드를
+    /// 없애는 도구 정책과 호스트 loopback으로 콜백이 돌아오는 OAuth 시작만 호스트에 남긴다.
     #[test]
-    fn external_plugin_auth_stays_on_the_host() {
-        // 토큰 입력·OAuth·등록·편집·도구 권한·삭제는 호스트 전용,
-        // 토글·연결 확인은 원격 write까지.
+    fn external_plugin_oauth_start_and_tool_policy_stay_on_the_host() {
+        for command in [
+            "set_external_plugin_tool_policy",
+            "set_external_plugin_tool_policies",
+            "begin_external_plugin_oauth",
+        ] {
+            assert!(is_write_command(command), "{command}");
+            assert!(is_host_only_command(command), "{command}");
+        }
         for command in [
             "register_external_plugin",
             "update_external_plugin",
             "remove_external_plugin",
             "set_external_plugin_token",
-            "set_external_plugin_tool_policy",
-            "set_external_plugin_tool_policies",
-            "begin_external_plugin_oauth",
             "cancel_external_plugin_oauth",
+            "set_external_plugin_enabled",
+            "verify_external_plugin",
         ] {
-            assert!(is_write_command(command), "{command}");
-            assert!(is_host_only_command(command), "{command}");
-        }
-        for command in ["set_external_plugin_enabled", "verify_external_plugin"] {
             assert!(is_write_command(command), "{command}");
             assert!(!is_host_only_command(command), "{command}");
         }
@@ -9720,11 +9970,15 @@ mod tests {
         for command in [
             "list_project_entries",
             "read_project_file",
+            "search_project_files",
             "get_project_git_overview",
             "get_project_git_status",
             "get_project_git_diff",
             "get_project_git_log",
             "get_project_git_commit_files",
+            "get_project_branch_comparison",
+            // 팔로우 조회는 앱 데이터만 읽으므로 게이트가 없다(B3).
+            "list_project_branch_follows",
         ] {
             assert!(!is_write_command(command), "{command}");
             assert!(!is_host_only_command(command), "{command}");
@@ -9738,6 +9992,8 @@ mod tests {
             "rebase_project_git",
             "fetch_project_git",
             "pull_project_git",
+            // 팔로우 저장은 앱 데이터 한 줄이라 원격 write로 열되 게이트는 지난다(B3).
+            "set_project_branch_follow",
         ] {
             assert!(is_write_command(command), "{command}");
             assert!(!is_host_only_command(command), "{command}");
@@ -9745,6 +10001,34 @@ mod tests {
         // 바깥으로 게시하는 push는 되돌릴 방법이 앱 안에 없다.
         assert!(is_write_command("push_project_git"));
         assert!(is_host_only_command("push_project_git"));
+    }
+
+    /// C19-4. overlay는 읽기 하나와 쓰기 셋으로 갈리고, **호스트 전용은 하나도 없다**
+    /// (2026-10-02 사용자 결정). 초안은 작업 트리를 바꾸는 둘을 C16-7의 push와 같은 부류로
+    /// 보아 호스트 전용으로 제안했으나, push가 호스트 전용인 이유는 호스트 사용자의
+    /// 자격증명으로 **바깥으로** 내보내기 때문이고 overlay는 바깥으로 나가지 않는다.
+    ///
+    /// 문구가 아니라 일치를 고정한다: 게이트 목록과 호스트 전용 목록을 한쪽만 고치면
+    /// 읽기 전용 원격 UI에서 작업 트리가 조용히 되돌아가거나(게이트 누락), 사용자가
+    /// 원격에서 overlay를 쓸 수 없게 된다(호스트 전용 추가).
+    #[test]
+    fn project_overlay_c19_splits_writes_between_remote_and_host_only() {
+        // 세트 장부 조회는 앱 데이터만 읽는다. 재적용 전 검사는 git을 띄우지만 `apply --check`
+        // 뿐이라 작업 트리를 바꾸지 않는다 — 게이트에 올리면 읽기 전용 원격 UI가 "적용할 수
+        // 있는지"조차 묻지 못한다.
+        for command in ["list_project_overlay_sets", "check_project_overlay_apply"] {
+            assert!(!is_write_command(command), "{command}");
+            assert!(!is_host_only_command(command), "{command}");
+        }
+        for command in [
+            "save_project_overlay_set",
+            "delete_project_overlay_set",
+            // 작업 트리를 바꾸지만 복구는 권한 경계가 아니라 저장 순서와 영수증이 진다.
+            "snapshot_project_overlay",
+        ] {
+            assert!(is_write_command(command), "{command}");
+            assert!(!is_host_only_command(command), "{command}");
+        }
     }
 
     /// C15-7·C17-7. 비밀값 기능의 원격 제한은 설정의 원격 편집 스위치 하나만 따른다

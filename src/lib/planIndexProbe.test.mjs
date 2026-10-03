@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { contract, TASKS, groupToolIndex, glossToolIndex, feedback, nudge, plan, score } from "../../local-llm-dev/plan-eval/index-loop.mjs";
+import { contract, TASKS, groupToolIndex, glossToolIndex, trimWriteSecondSentence, feedback, nudge, plan, score } from "../../local-llm-dev/plan-eval/index-loop.mjs";
 const task = TASKS.find(t => t.id === "web-to-notion");
 const call = (name, args = {}) => ({ role: "assistant", content: "", tool_calls: [{ id: "test-" + name, type: "function", function: { name: "plan_" + name, arguments: JSON.stringify(args) } }] });
 async function scripted(messages, variant = "snapshot") {
@@ -253,5 +253,86 @@ test("기본 탐침도 색인 도구 직접 호출 뒤 첫 거절만 되돌린�
         assert.equal(result.turns, tool === "webfetch" ? 3 : 2);
         if (tool === "webfetch")
             assert.equal(seen[2].messages.at(-1).content, contract.directIndexCallError.replaceAll("<TOOL>", tool));
+    }
+});
+
+// 2026-10-02 코드 리팩토링 11회차, GPU local-refactor n=20 의 실패 1건이 보낸 실제 제목·인자.
+// 탐침이 제품의 두 번째 되묻기를 쓰는지 본다 — 탐침이 느슨하면 이 실패를 못 보고,
+// 엄하면 제품에 없는 실패를 센다.
+test("탐침도 '고친다는 제목에 읽기 전용 도구' 단계를 제품 문구로 되묻는다", async () => {
+    const titles = ["report.mjs 에서 두 번 반복되는 서식 코드를 확인하고 동일한 패턴을 찾기 위해 수정하기", "report.mjs 를 읽어 중복 구간을 확인"];
+    const { seen, result } = await scripted([
+        call("add_step", { title: titles[0], tools: ["read"] }),
+        call("add_step", { title: titles[0], tools: ["edit"] }),
+        call("add_step", { title: titles[1], tools: ["read"] }),
+        call("finish_plan")
+    ], "guard");
+    const bounced = seen[1].messages.at(-1).content;
+    assert.equal(bounced, contract.writingIntentError.replace("<TOOLS>", "read").replace("<WRITERS>", contract.writingTools.join(", ")));
+    // 쓰기 도구를 고른 같은 제목과, 읽기만 한다고 말한 제목은 그대로 통과한다.
+    assert.deepEqual(result.steps.map(s => s.tools), [["edit"], ["read"]]);
+    assert.equal(result.ended, "확정");
+    assert.equal(result.mismatches, 1);
+    // 제품의 가드가 목록에서 읽는 것과 같은 값을 계약이 싣는다.
+    assert.deepEqual(contract.readingTools.concat(contract.writingTools).sort(), ["bash", "edit", "read", "webfetch", "write"]);
+    assert.ok(contract.writeIntentWords.includes("수정") && !contract.writeIntentWords.includes("추출"));
+});
+
+// 2026-10-02 11회차: 같은 색인으로 20회씩 잇달아 두 번 돌렸더니 같은 레인이 창 사이에
+// 18/20 → 11/20 으로 움직였다. 그래서 색인 변종은 환경변수가 아니라 **후보**여야 한다 —
+// 탐침이 시행마다 번갈아 돌려야 창의 흔들림이 두 후보에 똑같이 실린다.
+test("trim-write 후보는 write 설명의 두 번째 문장만 빼고 나머지는 guard 와 같다", async () => {
+    const trimmed = trimWriteSecondSentence(contract.index).split("\n");
+    const original = contract.index.split("\n");
+    assert.equal(trimmed.length, original.length);
+    const changed = original.filter((line, i) => trimmed[i] !== line);
+    assert.equal(changed.length, 1);
+    assert.match(changed[0], /^- write: /);
+    assert.equal(trimmed[original.indexOf(changed[0])], "- write: Writes content to one file.");
+    // 다른 도구의 두 번째 문장은 건드리지 않는다.
+    assert.ok(trimmed.some(l => l === original.find(o => o.startsWith("- edit: "))));
+    // 색인 말고는 guard 와 같은 계약이다: 같은 초안 도구, 같은 되묻기.
+    const script = [call("add_step", { title: "조회", tools: ["read"] }), call("answer_now", { answer: "읽겠습니다" }), call("finish_plan")];
+    const a = await scripted(structuredClone(script), "guard");
+    const b = await scripted(structuredClone(script), "trim-write");
+    assert.equal(b.seen[2].messages.at(-1).content, contract.answerDraftError);
+    assert.deepEqual(b.seen[0].tools.map(t => t.function.name), a.seen[0].tools.map(t => t.function.name));
+    assert.equal(b.result.ended, "확정");
+    assert.notEqual(b.seen[0].messages[0].content, a.seen[0].messages[0].content);
+});
+
+// 2026-10-03 12회차: GPU `local-refactor` 40시행의 실패 3건이 "요청은 고치라는데 계획이
+// 읽기만 한다"였다(trim-write 10·19, guard 13 의 앞머리). 제품이 확정을 한 번 되돌리므로
+// 탐침도 같은 자리에서 같은 문구로 되돌려야 한다 — 느슨하면 있는 결함을 놓친다.
+test("요청은 고치라는데 모든 단계가 읽기 전용인 계획을 제품과 같은 문구로 한 번 되돌린다", async () => {
+    const refactor = TASKS.find(t => t.id === "local-refactor");
+    const run = async (script, variant = "guard") => {
+        const seen = [];
+        let at = 0;
+        const result = await plan(refactor, "fixture-model", variant, "fixture", async (body) => { seen.push(structuredClone(body)); assert.ok(at < script.length, "unexpected model turn"); return script[at++]; });
+        return { result, seen };
+    };
+    const readOnly = [call("add_step", { title: "report.mjs 파일 읽어서 내용 확인", tools: ["read"] }), call("finish_plan"), call("finish_plan")];
+    const { result, seen } = await run(structuredClone(readOnly));
+    assert.equal(seen[2].messages.at(-1).content, contract.readOnlyPlanError.replace("<WRITERS>", contract.writingTools.join(", ")));
+    // 두 번째 확정은 제품처럼 그대로 받는다.
+    assert.equal(result.ended, "확정");
+    assert.equal(result.mismatches, 1);
+    // 고치는 단계가 하나라도 있으면 발동하지 않는다. `bash` 도 파일을 쓴다.
+    for (const writer of contract.writingTools) {
+        const { result: ok, seen: s } = await run([call("add_step", { title: "report.mjs 를 읽는다", tools: ["read"] }), call("add_step", { title: "중복 코드를 함수로 묶는다", tools: [writer] }), call("finish_plan")]);
+        assert.equal(ok.ended, "확정", writer);
+        assert.equal(s.length, 3, writer);
+    }
+    // 고치라는 말이 없는 요청은 건드리지 않는다.
+    const read = TASKS.find(t => t.id === "local-read");
+    assert.ok(!contract.writeIntentWords.some(w => read.prompt.toLowerCase().includes(w)));
+    // 읽기 전용 모드에는 고칠 수 있는 도구가 색인에 없으므로 발동하지 않는다.
+    process.env.READ_ONLY = "1";
+    try {
+        const { seen: s } = await run([call("add_step", { title: "report.mjs 파일 읽어서 내용 확인", tools: ["read"] }), call("finish_plan")]);
+        assert.equal(s.length, 2, "되묻지 않고 바로 확정한다");
+    } finally {
+        delete process.env.READ_ONLY;
     }
 });

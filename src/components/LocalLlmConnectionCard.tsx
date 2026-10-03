@@ -46,10 +46,11 @@ interface ConnectionDraft {
   apiKey: string;
   enabled: boolean;
   apiKeyConfigured: boolean;
+  planSteps: boolean;
 }
 
 function emptyDraft(): ConnectionDraft {
-  return { id: null, label: "", baseUrl: "", defaultModel: "", contextWindow: "", apiKey: "", enabled: true, apiKeyConfigured: false };
+  return { id: null, label: "", baseUrl: "", defaultModel: "", contextWindow: "", apiKey: "", enabled: true, apiKeyConfigured: false, planSteps: true };
 }
 
 function draftFrom(entry: LocalLlmConnectionEntry): ConnectionDraft {
@@ -63,6 +64,7 @@ function draftFrom(entry: LocalLlmConnectionEntry): ConnectionDraft {
     apiKey: "",
     enabled: entry.enabled,
     apiKeyConfigured: entry.apiKeyConfigured,
+    planSteps: entry.planSteps,
   };
 }
 
@@ -162,6 +164,7 @@ export function LocalLlmConnectionCard() {
       defaultModel: draft.defaultModel,
       contextWindow: Number.isFinite(parsedWindow) && parsedWindow > 0 ? parsedWindow : null,
       enabled: draft.enabled,
+      planSteps: draft.planSteps,
       apiKey: nextApiKey,
     })
       .then((saved) => {
@@ -440,6 +443,34 @@ export function LocalLlmConnectionCard() {
               <span>{text("새 채팅에서 이 연결을 고를 수 있게 합니다.", "Allow picking this connection in new chats.")}</span>
             </label>
           </div>
+          <div className="form-row">
+            <label>{text("단계 계획", "Step planning")}</label>
+            <label className="check-filter">
+              <input
+                type="checkbox"
+                checked={draft.planSteps}
+                disabled={busy === "save"}
+                onChange={(event) => update({ planSteps: event.target.checked })}
+              />
+              <span>
+                {text(
+                  "요청을 단계로 쪼개 도구를 하나씩 엽니다. 끄면 한 턴에 도구를 바로 부릅니다.",
+                  "Split the request into steps and open one tool at a time. Off calls tools directly in one turn.",
+                )}
+              </span>
+            </label>
+          </div>
+          {!draft.planSteps ? (
+            <div className="form-row">
+              <label />
+              <p className="local-llm-hint">
+                {text(
+                  "계획을 세우는 모델에는 켜 두고, 조회·기록만 맡길 모델에는 끕니다. 끈 연결은 여러 도구를 잇는 일을 끝내지 못할 수 있습니다.",
+                  "Keep it on for models that plan. Turn it off for models that only look things up and record them; those connections may not finish work that chains several tools.",
+                )}
+              </p>
+            </div>
+          ) : null}
           <div className="form-row">
             <label />
             <div className="path-field-group">

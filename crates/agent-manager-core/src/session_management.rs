@@ -16,9 +16,11 @@ use uuid::Uuid;
 
 use crate::app_data_file::{read_private_json, read_private_json_or_default, write_private_json};
 use crate::catalog::{INTERRUPTED_ROLE, RUNTIME_FAILURE_ROLE};
+use crate::chat::ResumeInputs;
 use crate::clock::now_ms;
 use crate::domain::wire_enum;
 use crate::text_limit;
+use crate::turn_continuation;
 use crate::{
     load_session_detail_with_limit, AccountSnapshot, AccountSupervisor, AutoSwitchEventView,
     AutoSwitchReason, AutoSwitchSignal, ChatDeliveryStatus, ChatMessageDelivery, ChatPhase,
@@ -1434,7 +1436,7 @@ fn rotate_active_account(
 /// 아직 응답을 받지 못한 사용자 입력(한도로 끊긴 턴·실행 중 턴·대기열).
 struct ResumableChatSession {
     info: ChatSessionInfo,
-    pending_inputs: Vec<String>,
+    pending_inputs: ResumeInputs,
 }
 
 /// 옮길 세션들이 쓰는 모델. 하나라도 모델을 모르는 세션(공급자 기본 모델로 연 채팅)이
@@ -1507,7 +1509,9 @@ fn rebindable_sessions(
             }
         })
         .map(|info| {
-            let pending_inputs = chats.pending_input_texts(&info.chat_id).unwrap_or_default();
+            let pending_inputs = chats
+                .pending_resume_inputs(&info.chat_id)
+                .unwrap_or_default();
             ResumableChatSession {
                 info,
                 pending_inputs,
@@ -1534,6 +1538,12 @@ fn resume_interrupted_sessions(
             pending_inputs,
         } = session;
         let session_id = info.provider_session_id.clone();
+        // 요청을 만들며 `info`를 옮기므로 이어가기 기록에 쓸 값은 먼저 떼어 둔다.
+        let origin = ContinuationOrigin {
+            provider: info.source,
+            chat_id: info.chat_id.clone(),
+            account_id: info.account_id.clone(),
+        };
         if account_id.is_some() {
             if let Err(error) = chats.stop(&info.chat_id) {
                 eprintln!(
@@ -1557,6 +1567,7 @@ fn resume_interrupted_sessions(
             approval_mode: info.approval_mode,
             resume_session_id: session_id.clone(),
             handoff_origin: None,
+            fork_session_id: None,
             origin: None,
             capture_id: None,
             unattended: false,
@@ -1575,18 +1586,34 @@ fn resume_interrupted_sessions(
                 // start()가 돌려주는 화면 연결은 즉시 분리해, 다른 detached
                 // 런타임처럼 채팅 목록에서 다시 연결하도록 둔다.
                 let chat_id = attachment.info.chat_id.clone();
+                let attachment_account_id = attachment.info.account_id.clone();
                 let generation = attachment.generation;
                 drop(attachment);
                 let _ = chats.detach_attachment(&chat_id, generation);
                 // 한도로 끊긴 요청과 대기열 메시지를 새 계정 세션에서 이어 보낸다.
-                // 첫 메시지가 턴을 시작하고 나머지는 대기열로 순서가 유지된다.
-                for input in &pending_inputs {
+                // 첫 메시지가 턴을 시작하고 나머지는 대기열로 순서가 유지된다. 끊긴 요청은
+                // 원문 대신 이어가기 문구로 감싼다 — 원문을 다시 보내면 공급자 기록에 남은
+                // 단계 위에 같은 요청이 한 번 더 쌓여 끝낸 단계를 되풀이한다(`turn_continuation`).
+                let continuation =
+                    turn_continuation::continuation_message(&pending_inputs.interrupted);
+                let messages = continuation.iter().chain(pending_inputs.queued.iter());
+                for input in messages {
                     if let Err(error) = chats.send(&chat_id, input) {
                         eprintln!(
                             "[auto-switch] 끊긴 요청 재전송 실패({}): {error}",
                             session_id.as_deref().unwrap_or("-")
                         );
                     }
+                }
+                if continuation.is_some() {
+                    record_continuation(
+                        chats,
+                        &origin,
+                        session_id.as_deref(),
+                        &chat_id,
+                        attachment_account_id.as_deref(),
+                        &pending_inputs,
+                    );
                 }
                 resumed += 1;
             }
@@ -1597,6 +1624,43 @@ fn resume_interrupted_sessions(
         }
     }
     resumed
+}
+
+/// 이어가기 기록에 남길, 옮기기 전 채팅의 값.
+struct ContinuationOrigin {
+    provider: ProviderId,
+    chat_id: String,
+    account_id: Option<String>,
+}
+
+/// 이어가기 한 건을 앱 데이터에 남긴다. 기록이 실패해도 이어가기는 이미 보냈으므로 로그만 남긴다.
+fn record_continuation(
+    chats: &ChatSupervisor,
+    origin: &ContinuationOrigin,
+    provider_session_id: Option<&str>,
+    chat_id: &str,
+    to_account_id: Option<&str>,
+    inputs: &ResumeInputs,
+) {
+    let Some(app_data_dir) = chats.app_data_dir() else {
+        return;
+    };
+    let entry = turn_continuation::ContinuationRecord::new(
+        origin.provider,
+        provider_session_id,
+        &origin.chat_id,
+        chat_id,
+        origin.account_id.as_deref(),
+        to_account_id,
+        inputs.interrupted.len(),
+        inputs.queued.len(),
+    );
+    if let Err(error) = turn_continuation::record(app_data_dir, &entry) {
+        eprintln!(
+            "[auto-switch] 이어가기 기록 실패({}): {error}",
+            provider_session_id.unwrap_or("-")
+        );
+    }
 }
 
 pub fn get_chat_delivery_status(
@@ -1960,6 +2024,9 @@ impl SessionFilterScope {
             && filters.search.as_deref().is_none_or(|needle| {
                 searchable(&[
                     &item.session_id,
+                    // 목록이 chatId를 같이 돌려주므로 그 값으로도 되찾을 수 있어야 한다.
+                    // 살아 있는 채팅에만 붙는 값이라, 실행이 끝나면 이 축은 자연히 빠진다.
+                    item.chat_id.as_deref().unwrap_or(""),
                     &item.title,
                     item.project.as_deref().unwrap_or(""),
                     item.cwd.as_deref().unwrap_or(""),
@@ -3044,5 +3111,51 @@ mod tests {
             assert_eq!(SystemAuditPhase::from_str(&s).unwrap(), phase);
         }
         assert!(SystemAuditPhase::from_str("unknown").is_err());
+    }
+
+    fn searchable_summary(session_id: &str, chat_id: Option<&str>) -> ManagedSessionSummary {
+        ManagedSessionSummary {
+            session_id: session_id.to_owned(),
+            chat_id: chat_id.map(str::to_owned),
+            source: ProviderId::Claude,
+            cwd: None,
+            project: None,
+            title: "제목".into(),
+            created_at: None,
+            updated_at: None,
+            turn_count: 0,
+            status: SessionManagementStatus::Completed,
+            last_turn_status: None,
+            folder_ids: Vec::new(),
+        }
+    }
+
+    fn matches_search(item: &ManagedSessionSummary, needle: &str) -> bool {
+        let applied = SessionScopeFilters::default().applied(None, normalized_search(Some(needle)));
+        SessionFilterScope::resolve(applied)
+            .expect("필터를 세울 수 있어야 한다")
+            .matches(item)
+    }
+
+    /// 목록이 chatId를 같이 돌려주는 이상 그 값으로도 되찾을 수 있어야 한다. AIA와 알림은
+    /// 실행 중인 대화를 채팅 id로 가리키는데, 검색이 세션 id만 보던 때는 그 값을 그대로
+    /// 넣으면 0건이 나와 "있다고 한 세션을 찾을 수 없다"가 됐다.
+    #[test]
+    fn session_search_finds_a_row_by_its_chat_id_too() {
+        let live = searchable_summary("d9b3c172-c3a6", Some("3082e187-da57"));
+        assert!(matches_search(&live, "d9b3c172-c3a6"));
+        assert!(matches_search(&live, "3082e187-da57"));
+        // 대문자로 붙여 넣어도 같은 행을 찾는다.
+        assert!(matches_search(
+            &live,
+            &normalized_search(Some("3082E187")).unwrap()
+        ));
+        assert!(!matches_search(&live, "없는값"));
+
+        // 실행이 끝나 채팅 id가 사라진 세션은 세션 id로만 찾힌다. 빈 문자열을 끼워 넣은
+        // 탓에 아무 검색어에나 걸리는 일이 없어야 한다.
+        let ended = searchable_summary("d9b3c172-c3a6", None);
+        assert!(matches_search(&ended, "d9b3c172-c3a6"));
+        assert!(!matches_search(&ended, "3082e187-da57"));
     }
 }

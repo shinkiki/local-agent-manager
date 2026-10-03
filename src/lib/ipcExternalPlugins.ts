@@ -25,7 +25,7 @@ export function getExternalPlugins(): Promise<ExternalPluginsSnapshot> {
   return call<ExternalPluginsSnapshot>("get_external_plugins");
 }
 
-/** 플러그인 등록. 토큰·client_secret은 호스트에서만 보내며 응답에 돌아오지 않는다. */
+/** 플러그인 등록. 토큰·client_secret은 요청에만 싣고 응답에는 돌아오지 않는다. */
 export function registerExternalPlugin(request: RegisterExternalPluginRequest): Promise<ExternalPluginView> {
   return notifyBuiltinTools(call<ExternalPluginView>("register_external_plugin", { ...request }));
 }
@@ -57,7 +57,11 @@ export function setExternalPluginToken(id: string, token: string): Promise<Exter
   return notifyBuiltinTools(call<ExternalPluginView>("set_external_plugin_token", { id, token }));
 }
 
-/** OAuth 승인 주소를 받는다. 호스트 화면이 브라우저로 열고, 콜백은 백엔드 loopback이 받는다. */
+/**
+ * OAuth 승인 주소를 받는다. 호스트 화면이 브라우저로 열고, 콜백은 백엔드 loopback이 받는다.
+ * 그래서 이 명령만 호스트 전용으로 남는다 — 원격 브라우저에서 승인하면 리디렉트가 닿을 곳이
+ * 없어, 끝낼 수 없는 대기 상태만 생긴다.
+ */
 export function beginExternalPluginOAuth(id: string): Promise<ExternalPluginOAuthStart> {
   return call<ExternalPluginOAuthStart>("begin_external_plugin_oauth", { id }, { timeoutMs: PLUGIN_OAUTH_BEGIN_TIMEOUT_MS });
 }

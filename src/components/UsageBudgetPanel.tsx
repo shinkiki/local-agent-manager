@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Dispatch, ReactNode, SetStateAction } from "react";
 import { usageLevel } from "../lib/accountUsage";
 import { reasoningLabel } from "../lib/chatSettings";
-import { formatCountdown, formatDate, formatRelative, sourceName } from "../lib/format";
+import { formatCountdown, formatDate, formatRelative, sourceName, formatDateOnly, formatDateTime } from "../lib/format";
 import { useI18n, type UiText } from "../lib/i18n";
 import { acknowledgeDrainNotice, deleteScheduledRequest, getSchedulerSnapshot, getSystemWorkflows, getUsageBudget, runScheduledRequestNow, setScheduleEnabled, setSystemWorkflowPacing, setUsageBudgetAccount, setUsageBudgetConsumer, setUsageBudgetPolicy, setUsageBudgetSavings, showNativeNotification } from "../lib/ipc";
 // 참여 계정을 고르는 규칙의 정본. 요약 수치(`poolSummary`)가 아니라 계정 목록 자체가
@@ -22,6 +22,7 @@ import { PacedTriggerEditor } from "./PacedTriggerEditor";
 import { AppToggle, ErrorBanner, HelpHint, Modal, SourceBadge, useConfirm } from "./Shared";
 import { errorText } from "../lib/errorText";
 
+import { runtimeCatalogText } from "../lib/i18nRuntime";
 /** 회차 조작 한 번. 바쁨 표시 키와 실제 호출을 함께 받아 성공·실패를 훅이 처리한다. */
 type TriggerAction = (key: string, action: () => Promise<unknown>) => Promise<void>;
 
@@ -825,7 +826,7 @@ function AccountPoolBar({ account, windowLabel, now }: {
       <div
         className="progress"
         role="img"
-        aria-label={`${label} ${windowLabel} ${text("사용량", "usage")} ${displayUsed}`}
+        aria-label={`${label} ${runtimeCatalogText(windowLabel)} ${text("사용량", "usage")} ${displayUsed}`}
       >
         <span style={{ width: `${used ?? 0}%` }} />
         {/* 목표선. 막대가 어디까지 차야 이 계정의 몫을 다 쓴 것인지 눈금으로 알린다. */}
@@ -873,7 +874,7 @@ function AccountPoolSection({ snapshot, pool, busy, onOpenPool }: {
                   <small>
                     {pool.pooled === 0
                       ? text("아직 참여 계정을 고르지 않았습니다.", "No account has been added to the pool yet.")
-                      : text(`${snapshot.windowLabel} 창 기준 현황입니다.`, `Current state of the ${snapshot.windowLabel} window.`)}
+                      : text(`${snapshot.windowLabel} 창 기준 현황입니다.`, `Current state of the ${runtimeCatalogText(snapshot.windowLabel)} window.`)}
                   </small>
                 </div>
                 <button
@@ -888,7 +889,7 @@ function AccountPoolSection({ snapshot, pool, busy, onOpenPool }: {
                 </button>
               </div>
               <dl className="usage-budget-metrics">
-                <Metric label={text("평균 소진율", "Average used")} value={percent(pool.averageUsedPercent, 0)} note={snapshot.windowLabel} />
+                <Metric label={text("평균 소진율", "Average used")} value={percent(pool.averageUsedPercent, 0)} note={runtimeCatalogText(snapshot.windowLabel)} />
                 <Metric label={text("평균 순여유", "Average headroom")} value={percent(pool.averageHeadroomPercent, 0)} note={text("목표까지", "to target")} />
                 <Metric
                   label={text("최다 소진 계정", "Busiest account")}
@@ -1335,7 +1336,7 @@ function DrainStatusCard({ snapshot }: { snapshot: UsageBudgetSnapshot }) {
                 "쓸 수 있는 한도 리셋 크레딧이 있는 계정이 없어 모두 균등 소비로 돕니다. 되돌릴 수단 없이 한도만 일찍 태우면 남은 기간 내내 그 계정이 멈추기 때문입니다.",
                 "No account has a spendable reset credit, so all stay on even pacing — draining with no way back would strand them for the rest of the period.",
               )}
-          {drainActBy !== null && ` · ${text("가장 이른 크레딧 마감", "Earliest credit deadline")} ${new Date(drainActBy).toLocaleDateString()}`}
+          {drainActBy !== null && ` · ${text("가장 이른 크레딧 마감", "Earliest credit deadline")} ${formatDateOnly(drainActBy)}`}
           {drainingAccounts.length > 0 && drainReserve > 0
             && ` · ${text(`${drainReserve}장은 남겨 둡니다`, `keeping ${drainReserve} in reserve`)}`}
         </small>
@@ -1385,7 +1386,7 @@ function BudgetDefaultsModal({ snapshot, draft, savings, busy, error, onDraftCha
         title={text("기본 목표·가드", "Default target and guard")}
         note={text(
           `현재 창 ${snapshot.windowLabel}, 회차 간격 ${snapshot.cadenceMinutes}분. 비워 두면 캡 없이 워크플로 인자를 그대로 씁니다. 소진 모드가 몰아 쓰는 중인 계정은 이 두 값 대신 100%를 씁니다.`,
-          `Window ${snapshot.windowLabel}, cadence ${snapshot.cadenceMinutes} min. Leave empty to use workflow arguments without a cap. Accounts the drain mode is currently draining use 100% instead of these two.`,
+          `Window ${runtimeCatalogText(snapshot.windowLabel)}, cadence ${snapshot.cadenceMinutes} min. Leave empty to use workflow arguments without a cap. Accounts the drain mode is currently draining use 100% instead of these two.`,
         )}
       >
         <div className="usage-budget-defaults">
@@ -1786,10 +1787,10 @@ function ConsumerRoundDetails({ consumer, snapshot, view, detailsId }: {
               : consumer.completionCondition)
             : text("없음", "none")}
           note={view.completed
-            ? `${text("완료", "completed")} · ${consumer.completedAt ? new Date(consumer.completedAt).toLocaleString() : ""}${consumer.completionNote ? ` · ${consumer.completionNote}` : ""}`
+            ? `${text("완료", "completed")} · ${consumer.completedAt ? formatDateTime(consumer.completedAt) : ""}${consumer.completionNote ? ` · ${consumer.completionNote}` : ""}`
             : text(`누적 성공 ${consumer.completedRuns ?? 0}건`, `${consumer.completedRuns ?? 0} successful run(s)`)}
         />
-        <Metric label={text("평균 소진율", "Average used")} value={percent(summary.averageUsedPercent, 0)} note={snapshot.windowLabel} />
+        <Metric label={text("평균 소진율", "Average used")} value={percent(summary.averageUsedPercent, 0)} note={runtimeCatalogText(snapshot.windowLabel)} />
         {summary.costs.length === 0 && (
           <Metric label={text("회당 소비", "Cost per run")} value="–" note={text("실측 없음", "not measured")} />
         )}
@@ -2094,7 +2095,7 @@ function useDrainExpiryNotice(snapshot: UsageBudgetSnapshot | null) {
     const drain = due.overview.drain;
     const expires = drain.nextExpiresAt === null
       ? ""
-      : ` (${new Date(drain.nextExpiresAt).toLocaleDateString()} ${text("만료", "expires")})`;
+      : ` (${formatDateOnly(drain.nextExpiresAt)} ${text("만료", "expires")})`;
     void showNativeNotification(
       text("한도 리셋 크레딧 만료 임박", "Reset credit expiring soon"),
       `${due.displayName}: ${text("지금 소진 모드를 켜야 이 크레딧을 쓸 수 있습니다.", "Turn on drain mode now to use this credit.")}${expires}`,
@@ -3124,10 +3125,10 @@ function budgetSummary(snapshot: UsageBudgetSnapshot, text: UiText): string {
   const defaults = snapshot.defaults;
   const target = defaults.targetPercent === null || defaults.targetPercent === undefined
     ? text("목표 없음", "no target")
-    : `${defaults.windowLabel?.trim() || snapshot.windowLabel} ${defaults.targetPercent}%`;
+    : `${runtimeCatalogText(defaults.windowLabel?.trim() || snapshot.windowLabel)} ${defaults.targetPercent}%`;
   const guard = defaults.guardPercent === null || defaults.guardPercent === undefined
     ? text("가드 없음", "no guard")
-    : `${defaults.guardWindowLabel?.trim() || text("가드", "guard")} ${defaults.guardPercent}%`;
+    : `${defaults.guardWindowLabel?.trim() ? runtimeCatalogText(defaults.guardWindowLabel.trim()) : text("가드", "guard")} ${defaults.guardPercent}%`;
   const quiet = describeQuietHours(defaults.quietHours, text);
   return `${target} · ${guard} · ${cadenceLabel(snapshot.cadenceMinutes, text)}${quiet ? ` · ${quiet}` : ""}`;
 }

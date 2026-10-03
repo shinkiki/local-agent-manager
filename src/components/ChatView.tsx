@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AppWindow, CalendarClock, ExternalLink, MessagesSquare, PanelLeftOpen, Plus, RotateCw, ScrollText } from "lucide-react";
-import { attachChat, connectChat, supportsDeliveryDuringTurn, type ChatConnection } from "../lib/chat";
+import { AppWindow, CalendarClock, ExternalLink, GitBranch, MessagesSquare, PanelLeftOpen, Plus, RotateCw, ScrollText } from "lucide-react";
+import { attachChat, connectChat, supportsDeliveryDuringTurn, supportsSessionFork, type ChatConnection } from "../lib/chat";
 import { ChatRejectedError } from "../lib/chatReconnect";
 import type { TabRequest } from "../lib/uiGuide";
 import {
@@ -1375,6 +1375,52 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
   };
 
   /**
+   * 이 대화를 원본으로 새 세션을 갈라낸다(fork). 원본 채팅은 "새 채팅"처럼 백그라운드에
+   * 두고, 같은 경로·모델·추론·권한으로 원본 대화를 이어받은 새 세션을 이 자리에 띄운다.
+   * 원본 공급자 세션은 건드리지 않으므로 채팅 목록에서 언제든 다시 열 수 있다.
+   */
+  const forkChat = async () => {
+    const current = sessionRef.current;
+    const originSessionId = current?.providerSessionId;
+    if (!current || !originSessionId || !supportsSessionFork(current.source) || chatSwitchingRef.current) return;
+    markChatSwitching(true);
+    setError(null);
+    try {
+      const connection = connectionRef.current;
+      if (connection) {
+        rememberChatLocalState(current.chatId);
+        await connection.detach();
+      }
+      takeConnection();
+      putTurns([]);
+      putPhase("connecting");
+      const generation = bumpConnectionGeneration();
+      const forked = await connectChat({
+        source: current.source,
+        cwd: current.cwd,
+        model: model.trim() || null,
+        reasoningEffort: reasoningEffort || null,
+        mode,
+        approvalMode,
+        forkSessionId: originSessionId,
+        unattended: false,
+        settings: extraSettings,
+      }, eventsForGeneration(generation));
+      connectionRef.current = forked;
+      applyAttachSnapshot(forked.info, generation);
+      if (forked.info.providerSessionId) {
+        void onSessionCatalogChanged(forked.info.source, forked.info.providerSessionId);
+      }
+    } catch (cause) {
+      putSession(null);
+      setError(`${text("대화를 포크하지 못했습니다", "Failed to fork the conversation")}: ${errorText(cause)}`);
+    } finally {
+      markChatSwitching(false);
+      void refreshLiveChats();
+    }
+  };
+
+  /**
    * 채팅을 별도 창으로 연다. 백엔드가 화면마다 구독을 따로 유지하므로 이 창의 대화는
    * 그대로 두고 새 창이 같은 대화를 함께 본다. 브라우저 팝업 차단을 피하려면 창 열기가
    * 클릭과 같은 처리 흐름에 있어야 해서 await 없이 바로 호출한다.
@@ -1618,6 +1664,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
                 두 버튼은 CSS 미디어쿼리로 갈라 끼운다(뷰포트를 JS로 재느니 화면 폭에 맡긴다). */}
             {!popout && <button className="button chat-session-popout-action" type="button" onClick={() => popOutChat(session.chatId)} title={text("이 채팅을 별도 창으로 엽니다. 이 창의 대화도 그대로 유지됩니다.", "Opens this chat in a separate window. The conversation here stays as is.")}><AppWindow size={13} />{text("새 창으로 열기", "Open in new window")}</button>}
             {!popout && <button className="button chat-session-new-chat-action" type="button" disabled={chatSwitching} onClick={() => { setTab("conversation"); void newChat(); }} title={text("이 채팅은 백그라운드로 두고 새 채팅을 시작합니다", "Keeps this chat in the background and starts a new one")}><Plus size={13} />{text("새 채팅", "New chat")}</button>}
+            {!popout && supportsSessionFork(session.source) && <button className="button chat-session-fork-action" type="button" disabled={!session.providerSessionId || chatSwitching || chatBusy || phase === "connecting"} onClick={() => { setTab("conversation"); void forkChat(); }} title={session.providerSessionId ? text("이 대화를 이어받은 새 세션을 만듭니다. 원본 채팅은 백그라운드에 남습니다.", "Starts a new session that carries this conversation over. The original chat stays in the background.") : text("첫 응답을 받아 세션이 생긴 뒤에 포크할 수 있습니다", "You can fork once the first reply creates a session")}><GitBranch size={13} />{text("포크", "Fork")}</button>}
             {hasTauriRuntime() && session.source === "codex" && session.providerSessionId && <button className="button" type="button" disabled={openingProviderApp || phase === "running" || phase === "waitingApproval"} onClick={() => void openInCodex()} title={text("이 연결을 종료하고 같은 대화를 Codex 앱에서 엽니다", "Closes this connection and opens the same conversation in the Codex app")}><ExternalLink size={13} />{openingProviderApp ? text("여는 중…", "Opening…") : text("Codex에서 열기", "Open in Codex")}</button>}
           </div>
         </header>

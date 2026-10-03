@@ -76,3 +76,41 @@ test("공급자 표시 이름 표에는 빈 칸이 없다", async () => {
     assert.ok(name && name !== provider, `${provider}: ${name}`);
   }
 });
+
+/**
+ * 영어 화면에서는 상대 시간·날짜가 한국어로 남지 않는다. 날짜는 로캘 없이 부르면 화면 언어가
+ * 아니라 브라우저 기본값을 따라 한국어 OS에서 "오전"이 나왔다.
+ */
+test("영어 화면의 상대 시간과 날짜는 영어로 적는다", async () => {
+  const { setRuntimeLocale } = await import("./i18nRuntime.ts");
+  const { formatDateTime, dateLocaleTag } = await import("./format.ts");
+  const now = Date.UTC(2026, 8, 30, 3, 0, 0);
+  setRuntimeLocale("en", {});
+  try {
+    assert.equal(formatRelative(now - 3 * 60_000, now), "3 minutes ago");
+    assert.equal(formatRelative(now - 60 * 60_000, now), "1 hour ago");
+    assert.equal(formatRelative(now + 2 * 24 * 60 * 60_000, now), "in 2 days");
+    assert.equal(formatRelative(now - 10_000, now), "just now");
+    assert.equal(dateLocaleTag(), "en-US");
+    assert.doesNotMatch(formatDateTime(now), /[가-힣]/);
+    assert.doesNotMatch(formatDate(now), /[가-힣]/);
+  } finally {
+    setRuntimeLocale("ko", {});
+  }
+  assert.equal(formatRelative(now - 3 * 60_000, now), "3분 전");
+  assert.equal(dateLocaleTag(), "ko-KR");
+});
+
+/** 백엔드 한국어 라벨을 이어 붙인 한 줄은 토막마다 옮긴다("작업공간 쓰기 · 직접 승인"). */
+test("이어 붙인 백엔드 라벨은 영어 화면에서 토막마다 옮긴다", async () => {
+  const { setRuntimeLocale, runtimeCatalogText } = await import("./i18nRuntime.ts");
+  setRuntimeLocale("en", {});
+  try {
+    assert.equal(runtimeCatalogText("작업공간 쓰기 · 직접 승인"), "Workspace write · Manual approval");
+    assert.equal(runtimeCatalogText("Claude 권한 확인 · Bash"), "Claude permission request · Bash");
+    assert.equal(runtimeCatalogText("7일"), "7 days");
+  } finally {
+    setRuntimeLocale("ko", {});
+  }
+  assert.equal(runtimeCatalogText("작업공간 쓰기 · 직접 승인"), "작업공간 쓰기 · 직접 승인");
+});

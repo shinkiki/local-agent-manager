@@ -557,6 +557,22 @@ pub const KEPT_TOOL_DESCRIPTIONS: &[(&str, &str)] = &[
 /// 이름에도 걸린다.
 const WRITING_TOOLS: &[&str] = &["write", "edit", "bash"];
 
+/// 파일을 바꿀 수 있는 작업 공간 도구의 이름. 계획 가드가 "제목은 고친다는데 도구는 읽기만
+/// 한다"를 되물을 때 **목록에서 읽어** 쓴다(`plan::writing_intent_mismatch`). 프롬프트가
+/// 이름을 상수로 적으면 그 문장은 표면이 바뀌는 날 거짓이 된다.
+pub(crate) fn writing_workspace_tools() -> &'static [&'static str] {
+    WRITING_TOOLS
+}
+
+/// 파일을 바꿀 수 없는 작업 공간 도구의 이름(`read`·`webfetch`).
+pub(crate) fn reading_workspace_tools() -> Vec<&'static str> {
+    KEPT_TOOLS
+        .iter()
+        .copied()
+        .filter(|name| !WRITING_TOOLS.contains(name))
+        .collect()
+}
+
 /// 이 채팅의 계획이 고를 수 있는 작업 공간 도구와 설명.
 ///
 /// **읽기 전용 모드에서 좁히는 자리는 여기 하나다.** 돌려주는 목록이 계획 턴의 색인
@@ -1542,6 +1558,7 @@ mod tests {
                 context_window: None,
                 api_key_configured: false,
                 enabled,
+                plan_steps: true,
             },
             model_windows: Default::default(),
         }

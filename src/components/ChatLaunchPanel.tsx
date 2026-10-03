@@ -147,7 +147,9 @@ export function ChatLaunchForm({
   const { source, switchSource, cwd, setCwd, manualCwd, setManualCwd, launchAccountId, setLaunchAccountId } = draft;
   const selectedProject = projects.find((project) => project.path === cwd) ?? null;
   // 빈 경로는 "작업 경로 없음" 선택이지 직접 입력이 아니다. 직접 입력은 사용자가 고른 때만.
-  const usingManualCwd = manualCwd || (cwd !== NO_CWD && !selectedProject);
+  // 등록 프로젝트가 없으면 고를 목록 자체가 없으므로 입력칸이 유일한 길이다. 첫 설치에서
+  // 목록도 입력칸도 없이 경로를 적을 방법이 사라졌었다.
+  const usingManualCwd = manualCwd || projects.length === 0 || (cwd !== NO_CWD && !selectedProject);
   return (
     <section className="chat-launch-layout chat-launch-workspace">
       <article className="chat-launch-card">

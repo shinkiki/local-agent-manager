@@ -28,6 +28,7 @@ import type { ChatSecretsGroup, ChatSecretsOverview, ChatSecretSummary } from ".
 import { SavedSecretsCard } from "./SavedSecretsCard";
 import { EmptyState, ErrorBanner, LoadingState, SourceBadge, useConfirm } from "./Shared";
 
+import { formatDateTime } from "../lib/format";
 function purposeIssueText(issue: ChatSecretFieldIssue, text: UiText): string {
   return issue === "empty"
     ? text("용도를 한 줄로 적으세요.", "Describe the purpose in one line.")
@@ -253,7 +254,7 @@ function SecretsGroupCard({ group, now, busy, editing, revealed, onToggleReveal,
           </span>
           <code className="storage-secrets-cwd" title={group.cwd}>{displayPath(group.cwd)}</code>
         </div>
-        <small>{text(`시작 ${new Date(group.startedAt).toLocaleString()}`, `Started ${new Date(group.startedAt).toLocaleString()}`)}</small>
+        <small>{text(`시작 ${formatDateTime(group.startedAt)}`, `Started ${formatDateTime(group.startedAt)}`)}</small>
       </header>
       <table className="storage-secrets-table">
         <thead>

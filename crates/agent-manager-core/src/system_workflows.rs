@@ -2626,8 +2626,30 @@ fn approval_summary(contract: &SystemWorkflowContract, validated: &ValidatedCont
                 .unwrap_or(0),
             "maxTotalOperationCalls": MAX_TOTAL_OPERATION_CALLS,
         },
-        "grantsAfterRegistration": "AIA의 수동 변경 호출은 system_execute 승인 정책을 따릅니다. 승인 버전에 고정된 페이싱 예약 회차는 스케줄러가 자동 실행하며 회차마다 사용자 승인을 요구하지 않습니다. 채팅 권한·승인·판단은 계약의 chatRuntime과 start_chat 설정을 따릅니다",
+        "grantsAfterRegistration": grants_after_registration(contract),
     })
+}
+
+/// 등록이 무엇을 허용하게 되는지. 계약이 실행을 띄우면 그 실행이 쥐는 것까지 적는다.
+///
+/// 고정 문구였는데, `start_chat`을 둔 계약은 등록의 의미가 한 겹 더 있다 — 그 계약이 띄운
+/// 실행은 Agent Manager 자신을 다루는 시스템 도구를 쥔다(2026-10-02 결정, `remote.rs`의
+/// `system_tools_for_origin`). 그 사실이 요약에 없으면 사용자는 "워크플로 한 번 돈다"로
+/// 읽고 누르게 되고, 승인 카드가 실제 결과보다 작아 보인다.
+fn grants_after_registration(contract: &SystemWorkflowContract) -> String {
+    let mut text = String::from(
+        "AIA의 수동 변경 호출은 system_execute 승인 정책을 따릅니다. 승인 버전에 고정된 페이싱 예약 회차는 스케줄러가 자동 실행하며 회차마다 사용자 승인을 요구하지 않습니다. 채팅 권한·승인·판단은 계약의 chatRuntime과 start_chat 설정을 따릅니다",
+    );
+    if contract
+        .steps
+        .iter()
+        .any(|step| step.operation == "start_chat")
+    {
+        text.push_str(
+            ". 이 계약은 start_chat으로 실행을 띄웁니다 — 워크플로가 띄운 실행은 Agent Manager 자신을 다루는 시스템 도구(aia_system)를 쥡니다. 예약 실행과 수동 실행 모두 해당하며, 그 실행의 변경에는 별도 승인 카드가 뜨지 않습니다(chatRuntime의 approvalMode를 따름)",
+        );
+    }
+    text
 }
 
 /// 계약 전체 검증. 등록·제안·실행 전 재검증에 공통으로 사용한다.
@@ -4252,6 +4274,33 @@ mod tests {
                 .expect("missing map")
                 .is_empty()
         );
+    }
+
+    /// 등록 승인 카드가 결과를 다 보여 줘야 한다. start_chat 을 둔 계약은 그 실행이
+    /// 시스템 도구를 쥐는데, 요약이 그 말을 안 하면 "워크플로 한 번 돈다"로 읽힌다.
+    #[test]
+    fn the_approval_summary_warns_when_a_contract_launches_system_tool_runs() {
+        let (_dir, registry) = registry();
+
+        let launching = registry
+            .propose(usage_paced_round_contract())
+            .expect("propose");
+        let grants = launching["approvalSummary"]["grantsAfterRegistration"]
+            .as_str()
+            .expect("grants");
+        assert!(
+            grants.contains("start_chat으로 실행을 띄웁니다"),
+            "{grants}"
+        );
+        assert!(grants.contains("aia_system"), "{grants}");
+
+        // 실행을 띄우지 않는 계약은 그 문장을 달지 않는다 — 없는 결과를 경고하면
+        // 다음부터 읽지 않게 된다.
+        let plain = registry.propose(stop_provider_contract()).expect("propose");
+        let plain_grants = plain["approvalSummary"]["grantsAfterRegistration"]
+            .as_str()
+            .expect("grants");
+        assert!(!plain_grants.contains("aia_system"), "{plain_grants}");
     }
 
     /// 스킬은 무인 런타임이 따를 절차 본문이라 승인 화면에 보여야 한다.

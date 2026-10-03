@@ -14,7 +14,7 @@
  * `ipc.ts`가 이 파일의 이름을 그대로 다시 내보내므로 화면 쪽 import 경로는 예전 그대로
  * `lib/ipc`다.
  */
-import type { CommonSkillDetail, CommonSkillDigest, CommonSkillSource, HostPlatform, ProviderId, SetSkillPlatformsRequest, SkillDeleteReceipt, SkillDetail, SkillFileContent, SkillFileWrite, SkillInstallComparison, SkillLibrary, SkillLocation, SkillMigrationPlan, SkillOverwritePolicy, SkillPublishReceipt, SkillSyncReceipt, SkillTrashOverview, SkillTrashRestoreReceipt, SkillUpdateReceipt } from "../types";
+import type { CommonSkillDetail, CommonSkillDigest, CommonSkillSource, HostPlatform, ProviderId, SetSkillPlatformsRequest, SkillDeleteReceipt, SkillDetail, SkillFileContent, SkillFileWrite, SkillInstallComparison, SkillLibrary, SkillLocation, SkillMigrationPlan, SkillOverwritePolicy, SkillPublishReceipt, SkillSyncReceipt, SkillTrashOverview, SkillTrashRestoreReceipt, SkillUpdateReceipt, SystemSkillNotice } from "../types";
 import { userActorRequest, userConfirmedDeleteRequest } from "./ipcDeletion";
 import { call } from "./ipcTransport";
 
@@ -149,4 +149,13 @@ export function restoreSkillTrash(id: string): Promise<SkillTrashRestoreReceipt>
 /** 휴지통 비우기. id를 생략하면 전체를 지운다. 지운 항목 수를 돌려준다. */
 export function purgeSkillTrash(id?: string): Promise<number> {
   return call<number>("purge_skill_trash", { id: id ?? null });
+}
+
+/** 기동 때 한 번 읽는다. 확인하지 않은 안내가 없으면 null. */
+export function getSystemSkillNotice(): Promise<SystemSkillNotice | null> {
+  return call<SystemSkillNotice | null>("get_system_skill_notice", {});
+}
+
+export function acknowledgeSystemSkillNotice(): Promise<{ acknowledged: boolean }> {
+  return call<{ acknowledged: boolean }>("acknowledge_system_skill_notice", {});
 }

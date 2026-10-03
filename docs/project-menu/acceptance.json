@@ -1,0 +1,851 @@
+{
+  "version": 1,
+  "source": "https://app.notion.com/p/8c2257f3dd7282f5a6d2815817481b4a",
+  "note": "프로젝트 메뉴 고도화 및 브랜치 독립 로컬 설정 Overlay 계획의 구현 단계와 완료 기준을, 제품이 실제로 읽는 계약 위에서 다시 묻는 점검표. 이름은 회차가 구현할 계약이다 — 바꾸려면 여기를 먼저 바꾸고 보고에 적는다.",
+  "items": [
+    {
+      "id": "F1",
+      "stage": "1-파일검색",
+      "title": "파일명·상대경로 검색이 Core에 있고 네 계약에 모두 올라 있다",
+      "checks": [
+        {
+          "id": "F1.core",
+          "kind": "rustSymbol",
+          "title": "Core 검색 함수",
+          "file": "crates/agent-manager-core/src/project_files.rs",
+          "symbol": "search_project_files"
+        },
+        {
+          "id": "F1.dispatch",
+          "kind": "remoteDispatch",
+          "title": "remote 디스패치",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "command": "search_project_files"
+        },
+        {
+          "id": "F1.ungated",
+          "kind": "remoteWriteGate",
+          "title": "읽기이므로 쓰기 게이트에 없다",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "command": "search_project_files",
+          "expect": false
+        },
+        {
+          "id": "F1.aia",
+          "kind": "aiaCapability",
+          "title": "AIA 카탈로그에 Read로 등록",
+          "file": "crates/agent-manager-core/src/system_mcp.rs",
+          "command": "search_project_files",
+          "access": "Read"
+        },
+        {
+          "id": "F1.ipc",
+          "kind": "ipcWrapper",
+          "title": "프런트 IPC 래퍼",
+          "file": "src/lib/ipcProjects.ts",
+          "command": "search_project_files"
+        },
+        {
+          "id": "F2.guard",
+          "kind": "requiredLiterals",
+          "title": "경로 분류와 결과 상한",
+          "file": "crates/agent-manager-core/src/project_files.rs",
+          "literals": [
+            "classify_relative_path",
+            "MAX_PROJECT_SEARCH_HITS"
+          ],
+          "category": "safety"
+        }
+      ]
+    },
+    {
+      "id": "F3",
+      "stage": "1-파일검색",
+      "title": "내용 검색은 명시로 켜고 binary·대용량·제외 경로를 읽지 않는다",
+      "checks": [
+        {
+          "id": "F3.request",
+          "kind": "rustSymbol",
+          "title": "검색 요청 타입",
+          "file": "crates/agent-manager-core/src/project_files.rs",
+          "symbol": "ProjectFileSearchRequest"
+        },
+        {
+          "id": "F3.opt",
+          "kind": "requiredLiterals",
+          "title": "내용 검색 스위치와 제외 규칙",
+          "file": "crates/agent-manager-core/src/project_files.rs",
+          "literals": [
+            "search_contents",
+            "excluded"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "F4",
+      "stage": "1-파일검색",
+      "title": "결과에 git 상태·마지막 수정·overlay 포함 여부가 실린다",
+      "checks": [
+        {
+          "id": "F4.hit",
+          "kind": "rustSymbol",
+          "title": "검색 결과 타입",
+          "file": "crates/agent-manager-core/src/project_files.rs",
+          "symbol": "ProjectFileSearchHit"
+        },
+        {
+          "id": "F4.fields",
+          "kind": "requiredLiterals",
+          "title": "세 칸",
+          "file": "crates/agent-manager-core/src/project_files.rs",
+          "literals": [
+            "git_status",
+            "modified_at",
+            "in_overlay"
+          ]
+        },
+        {
+          "id": "F4.ui",
+          "kind": "frontendSymbol",
+          "title": "화면이 그 칸을 쓴다",
+          "file": "src/components/ProjectFilesPanel.tsx",
+          "symbol": "inOverlay"
+        }
+      ]
+    },
+    {
+      "id": "F5",
+      "stage": "1-파일검색",
+      "title": "검색 제외·상한에 회귀 시험이 붙어 있다",
+      "checks": [
+        {
+          "id": "F5.test",
+          "kind": "testNamed",
+          "title": "Core 시험",
+          "file": "crates/agent-manager-core/src/project_files.rs",
+          "name": "project_files_search_excludes_binary_and_oversized_entries"
+        }
+      ]
+    },
+    {
+      "id": "B1",
+      "stage": "2-브랜치",
+      "title": "slash 브랜치 이름이 가상 폴더 트리로 렌더링된다",
+      "checks": [
+        {
+          "id": "B1.module",
+          "kind": "frontendSymbol",
+          "title": "순수 트리 모듈",
+          "file": "src/lib/projectBranchTree.ts",
+          "symbol": "buildBranchTree"
+        },
+        {
+          "id": "B1.test",
+          "kind": "testNamed",
+          "title": "단위 시험",
+          "file": "src/lib/projectBranchTree.test.mjs",
+          "name": "buildBranchTree"
+        }
+      ]
+    },
+    {
+      "id": "B2",
+      "stage": "2-브랜치",
+      "title": "트리는 보여 주기만 하고 git ref를 건드리지 않는다",
+      "checks": [
+        {
+          "id": "B2.pure",
+          "kind": "forbiddenLiterals",
+          "title": "트리 모듈에 IPC 호출이 없다",
+          "file": "src/lib/projectBranchTree.ts",
+          "literals": [
+            "invoke(",
+            "ipc"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B3",
+      "stage": "2-브랜치",
+      "title": "팔로우가 즐겨찾기와 따로 앱 데이터에 저장된다",
+      "checks": [
+        {
+          "id": "B3.read",
+          "kind": "rustSymbol",
+          "title": "팔로우 조회",
+          "file": "crates/agent-manager-core/src/project_git.rs",
+          "symbol": "list_project_branch_follows"
+        },
+        {
+          "id": "B3.write",
+          "kind": "rustSymbol",
+          "title": "팔로우 저장",
+          "file": "crates/agent-manager-core/src/project_git.rs",
+          "symbol": "set_project_branch_follow"
+        },
+        {
+          "id": "B3.dispatch",
+          "kind": "remoteDispatch",
+          "title": "remote 디스패치",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "command": "set_project_branch_follow"
+        },
+        {
+          "id": "B3.gate",
+          "kind": "remoteWriteGate",
+          "title": "쓰기 게이트",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "command": "set_project_branch_follow"
+        },
+        {
+          "id": "B3.aia",
+          "kind": "aiaCapability",
+          "title": "AIA 카탈로그에 Execute로 등록",
+          "file": "crates/agent-manager-core/src/system_mcp.rs",
+          "command": "set_project_branch_follow",
+          "access": "Execute"
+        },
+        {
+          "id": "B3.ipc",
+          "kind": "ipcWrapper",
+          "title": "프런트 IPC 래퍼",
+          "file": "src/lib/ipcProjects.ts",
+          "command": "set_project_branch_follow"
+        }
+      ]
+    },
+    {
+      "id": "B4",
+      "stage": "2-브랜치",
+      "title": "팔로우 카드에 upstream·마지막 fetch·수신/송신·diverged가 보인다",
+      "checks": [
+        {
+          "id": "B4.ui",
+          "kind": "requiredLiterals",
+          "title": "카드가 네 값을 쓴다",
+          "file": "src/components/ProjectGitPanel.tsx",
+          "literals": [
+            "lastFetchedAt",
+            "incoming",
+            "outgoing",
+            "diverged"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B5",
+      "stage": "2-브랜치",
+      "title": "차이가 실시간이 아니라 마지막 fetch 기준임을 화면이 말한다",
+      "checks": [
+        {
+          "id": "B5.caption",
+          "kind": "requiredLiterals",
+          "title": "기준 표시 문구",
+          "file": "src/components/ProjectGitPanel.tsx",
+          "literals": [
+            "마지막 fetch 기준"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B6",
+      "stage": "2-브랜치",
+      "title": "비교가 수신(HEAD..upstream)과 송신(upstream..HEAD)으로 갈려 나온다",
+      "checks": [
+        {
+          "id": "B6.core",
+          "kind": "rustSymbol",
+          "title": "비교 함수",
+          "file": "crates/agent-manager-core/src/project_git.rs",
+          "symbol": "get_project_branch_comparison"
+        },
+        {
+          "id": "B6.dispatch",
+          "kind": "remoteDispatch",
+          "title": "remote 디스패치",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "command": "get_project_branch_comparison"
+        },
+        {
+          "id": "B6.ungated",
+          "kind": "remoteWriteGate",
+          "title": "읽기이므로 쓰기 게이트에 없다",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "command": "get_project_branch_comparison",
+          "expect": false
+        },
+        {
+          "id": "B6.aia",
+          "kind": "aiaCapability",
+          "title": "AIA 카탈로그에 Read로 등록",
+          "file": "crates/agent-manager-core/src/system_mcp.rs",
+          "command": "get_project_branch_comparison",
+          "access": "Read"
+        },
+        {
+          "id": "B6.ipc",
+          "kind": "ipcWrapper",
+          "title": "프런트 IPC 래퍼",
+          "file": "src/lib/ipcProjects.ts",
+          "command": "get_project_branch_comparison"
+        }
+      ]
+    },
+    {
+      "id": "B7",
+      "stage": "2-브랜치",
+      "title": "수신·송신 분리에 회귀 시험이 붙어 있다",
+      "checks": [
+        {
+          "id": "B7.test",
+          "kind": "testNamed",
+          "title": "Core 시험",
+          "file": "crates/agent-manager-core/src/project_git.rs",
+          "name": "project_branch_comparison_splits_incoming_and_outgoing"
+        }
+      ]
+    },
+    {
+      "id": "R1",
+      "stage": "3-C19",
+      "title": "AGENTS.md에 C19 local overlay adapter 예외 절이 있다",
+      "checks": [
+        {
+          "id": "R1.rule",
+          "kind": "agentsRule",
+          "title": "C19 절",
+          "file": "AGENTS.md",
+          "name": "C19"
+        }
+      ]
+    },
+    {
+      "id": "R2",
+      "stage": "3-C19",
+      "title": "C19가 저장 범위·민감 경로·write-gate·remote 정책·영수증 스키마를 못박는다",
+      "checks": [
+        {
+          "id": "R2.clauses",
+          "kind": "requiredLiterals",
+          "title": "조건 ID 다섯",
+          "file": "AGENTS.md",
+          "literals": [
+            "C19-1",
+            "C19-2",
+            "C19-3",
+            "C19-4",
+            "C19-5"
+          ],
+          "category": "contract"
+        }
+      ]
+    },
+    {
+      "id": "O1",
+      "stage": "4-Overlay",
+      "title": "overlay 세트 CRUD가 네 계약에 올라 있다",
+      "checks": [
+        {
+          "id": "O1.list",
+          "kind": "rustSymbol",
+          "title": "세트 조회",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "symbol": "list_project_overlay_sets"
+        },
+        {
+          "id": "O1.save",
+          "kind": "rustSymbol",
+          "title": "세트 저장",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "symbol": "save_project_overlay_set"
+        },
+        {
+          "id": "O1.delete",
+          "kind": "rustSymbol",
+          "title": "세트 삭제",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "symbol": "delete_project_overlay_set"
+        },
+        {
+          "id": "O1.dispatch",
+          "kind": "remoteDispatch",
+          "title": "remote 디스패치",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "command": "save_project_overlay_set"
+        },
+        {
+          "id": "O1.gate",
+          "kind": "remoteWriteGate",
+          "title": "쓰기 게이트",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "command": "save_project_overlay_set"
+        },
+        {
+          "id": "O1.aia",
+          "kind": "aiaCapability",
+          "title": "AIA 카탈로그에 Execute로 등록",
+          "file": "crates/agent-manager-core/src/system_mcp.rs",
+          "command": "save_project_overlay_set",
+          "access": "Execute"
+        },
+        {
+          "id": "O1.ipc",
+          "kind": "ipcWrapper",
+          "title": "프런트 IPC 래퍼",
+          "file": "src/lib/ipcProjects.ts",
+          "command": "save_project_overlay_set"
+        }
+      ]
+    },
+    {
+      "id": "O2",
+      "stage": "4-Overlay",
+      "title": "스냅샷이 쓰기 게이트에 올라 있고 원격 write에서 막히지 않는다",
+      "checks": [
+        {
+          "id": "O2.core",
+          "kind": "rustSymbol",
+          "title": "스냅샷 함수",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "symbol": "snapshot_project_overlay"
+        },
+        {
+          "id": "O2.dispatch",
+          "kind": "remoteDispatch",
+          "title": "remote 디스패치",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "command": "snapshot_project_overlay"
+        },
+        {
+          "id": "O2.gate",
+          "kind": "remoteWriteGate",
+          "title": "쓰기 게이트",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "command": "snapshot_project_overlay"
+        },
+        {
+          "id": "O2.host",
+          "kind": "remoteHostOnly",
+          "title": "원격 write 모드에서 허용(2026-10-02 사용자 결정) — 호스트 전용 목록에 없어야 한다",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "command": "snapshot_project_overlay",
+          "expect": false
+        },
+        {
+          "id": "O2.ipc",
+          "kind": "ipcWrapper",
+          "title": "프런트 IPC 래퍼",
+          "file": "src/lib/ipcProjects.ts",
+          "command": "snapshot_project_overlay"
+        }
+      ]
+    },
+    {
+      "id": "O3",
+      "stage": "4-Overlay",
+      "title": "patch 저장이 성공한 뒤에만 선택 파일을 HEAD 원본으로 되돌린다",
+      "checks": [
+        {
+          "id": "O3.restore",
+          "kind": "requiredLiterals",
+          "title": "restore 인자와 저장 선행",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "literals": [
+            "--source=HEAD",
+            "--worktree",
+            "--binary",
+            "--full-index"
+          ],
+          "category": "safety"
+        }
+      ]
+    },
+    {
+      "id": "O4",
+      "stage": "4-Overlay",
+      "title": "재적용 전 git apply --check가 먼저 돈다",
+      "checks": [
+        {
+          "id": "O4.core",
+          "kind": "rustSymbol",
+          "title": "검사 함수",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "symbol": "check_project_overlay_apply"
+        },
+        {
+          "id": "O4.flag",
+          "kind": "requiredLiterals",
+          "title": "검사 인자",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "literals": [
+            "\"--check\""
+          ],
+          "category": "safety"
+        },
+        {
+          "id": "O4.dispatch",
+          "kind": "remoteDispatch",
+          "title": "remote 디스패치",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "command": "check_project_overlay_apply"
+        },
+        {
+          "id": "O4.aia",
+          "kind": "aiaCapability",
+          "title": "AIA 카탈로그에 Read로 등록",
+          "file": "crates/agent-manager-core/src/system_mcp.rs",
+          "command": "check_project_overlay_apply",
+          "access": "Read"
+        }
+      ]
+    },
+    {
+      "id": "O5",
+      "stage": "4-Overlay",
+      "title": "검사 실패는 자동 적용하지 않고 overlayNeedsResolution으로 남는다",
+      "checks": [
+        {
+          "id": "O5.core",
+          "kind": "rustSymbol",
+          "title": "적용 함수",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "symbol": "apply_project_overlay"
+        },
+        {
+          "id": "O5.state",
+          "kind": "requiredLiterals",
+          "title": "미해결 상태와 영향 파일",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "literals": [
+            "overlayNeedsResolution",
+            "affected"
+          ]
+        },
+        {
+          "id": "O5.gate",
+          "kind": "remoteWriteGate",
+          "title": "쓰기 게이트",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "command": "apply_project_overlay"
+        },
+        {
+          "id": "O5.host",
+          "kind": "remoteHostOnly",
+          "title": "원격 write 모드에서 허용(2026-10-02 사용자 결정) — 호스트 전용 목록에 없어야 한다",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "command": "apply_project_overlay",
+          "expect": false
+        }
+      ]
+    },
+    {
+      "id": "O6",
+      "stage": "4-Overlay",
+      "title": "v1이 지원하지 않는 파일 상태는 사유와 함께 거절된다",
+      "checks": [
+        {
+          "id": "O6.reasons",
+          "kind": "requiredLiterals",
+          "title": "거절 사유 목록",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "literals": [
+            "untracked",
+            "staged",
+            "rename",
+            "submodule",
+            "symlink",
+            "unbornHead"
+          ],
+          "category": "safety"
+        }
+      ]
+    },
+    {
+      "id": "O7",
+      "stage": "4-Overlay",
+      "title": "patch는 앱 데이터에만 쌓이고 되돌릴 수 없는 git 명령은 쓰지 않는다",
+      "checks": [
+        {
+          "id": "O7.store",
+          "kind": "requiredLiterals",
+          "title": "앱 데이터 git-overlays 아래",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "literals": [
+            "git-overlays",
+            "app_data"
+          ],
+          "category": "safety"
+        },
+        {
+          "id": "O7.forbidden",
+          "kind": "forbiddenLiterals",
+          "title": "금지 명령",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "literals": [
+            "\"--force\"",
+            "\"--hard\"",
+            "\"clean\"",
+            "\"--amend\"",
+            "\"checkout\""
+          ]
+        },
+        {
+          "id": "O7.sensitive",
+          "kind": "requiredLiterals",
+          "title": "민감 경로 기본 제외",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "literals": [
+            ".env",
+            "credential"
+          ],
+          "category": "safety"
+        }
+      ]
+    },
+    {
+      "id": "O8",
+      "stage": "4-Overlay",
+      "title": "모든 overlay 변경에 복구 가능한 영수증이 남는다",
+      "checks": [
+        {
+          "id": "O8.receipt",
+          "kind": "requiredLiterals",
+          "title": "영수증 칸",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "literals": [
+            "head_before",
+            "head_after",
+            "snapshot_id",
+            "patch_digest"
+          ],
+          "category": "safety"
+        }
+      ]
+    },
+    {
+      "id": "O9",
+      "stage": "4-Overlay",
+      "title": "git과 overlay 적용이 저장소 단위 잠금으로 직렬화된다",
+      "checks": [
+        {
+          "id": "O9.lock",
+          "kind": "requiredLiterals",
+          "title": "겹친 호출은 busy",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "literals": [
+            "busy"
+          ],
+          "category": "safety"
+        }
+      ]
+    },
+    {
+      "id": "O10",
+      "stage": "4-Overlay",
+      "title": "overlay 핵심 세 갈래에 회귀 시험이 붙어 있다",
+      "checks": [
+        {
+          "id": "O10.reject",
+          "kind": "testNamed",
+          "title": "거절 시험",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "name": "project_overlay_c19_snapshot_rejects_unsupported_file_states"
+        },
+        {
+          "id": "O10.preserve",
+          "kind": "testNamed",
+          "title": "검사 실패 보존 시험",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "name": "project_overlay_c19_apply_check_failure_preserves_git_state"
+        },
+        {
+          "id": "O10.store",
+          "kind": "testNamed",
+          "title": "저장 위치 시험",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "name": "project_overlay_c19_patches_live_outside_the_repository"
+        }
+      ]
+    },
+    {
+      "id": "A1",
+      "stage": "5-AIA",
+      "title": "이력에서 최대 20개 커밋을 골라 AIA 리뷰·분석을 요청한다",
+      "checks": [
+        {
+          "id": "A1.builder",
+          "kind": "frontendSymbol",
+          "title": "요청 생성기",
+          "file": "src/lib/projectAiaHandoff.ts",
+          "symbol": "buildAiaCommitReviewRequest"
+        },
+        {
+          "id": "A1.cap",
+          "kind": "requiredLiterals",
+          "title": "선택 상한",
+          "file": "src/lib/projectAiaHandoff.ts",
+          "literals": [
+            "MAX_AIA_REVIEW_COMMITS"
+          ]
+        },
+        {
+          "id": "A1.ui",
+          "kind": "frontendSymbol",
+          "title": "화면 연결",
+          "file": "src/components/ProjectGitPanel.tsx",
+          "symbol": "buildAiaCommitReviewRequest"
+        }
+      ]
+    },
+    {
+      "id": "A2",
+      "stage": "5-AIA",
+      "title": "요청에는 경로·SHA·제목·선택 순서만 싣고 diff는 싣지 않는다",
+      "checks": [
+        {
+          "id": "A2.fields",
+          "kind": "requiredLiterals",
+          "title": "전달 칸",
+          "file": "src/lib/projectAiaHandoff.ts",
+          "literals": [
+            "projectPath",
+            "sha",
+            "subject",
+            "order"
+          ]
+        },
+        {
+          "id": "A2.test",
+          "kind": "testNamed",
+          "title": "diff 미포함 시험",
+          "file": "src/lib/projectAiaHandoff.test.mjs",
+          "name": "diff를 싣지 않는다"
+        }
+      ]
+    },
+    {
+      "id": "A3",
+      "stage": "5-AIA",
+      "title": "overlay 충돌도 같은 안전 흐름으로 AIA에 넘어간다",
+      "checks": [
+        {
+          "id": "A3.builder",
+          "kind": "frontendSymbol",
+          "title": "충돌 요청 생성기",
+          "file": "src/lib/projectAiaHandoff.ts",
+          "symbol": "buildAiaOverlayConflictRequest"
+        }
+      ]
+    },
+    {
+      "id": "A4",
+      "stage": "5-AIA",
+      "title": "분석 모드는 기본적으로 쓰기 없이 돌고 수정은 따로 승인받는다",
+      "checks": [
+        {
+          "id": "A4.readonly",
+          "kind": "requiredLiterals",
+          "title": "읽기 전용 기본값",
+          "file": "src/lib/projectAiaHandoff.ts",
+          "literals": [
+            "readOnly"
+          ]
+        },
+        {
+          "id": "A4.test",
+          "kind": "testNamed",
+          "title": "기본값 시험",
+          "file": "src/lib/projectAiaHandoff.test.mjs",
+          "name": "readOnly"
+        }
+      ]
+    },
+    {
+      "id": "V1",
+      "stage": "6-검증",
+      "title": "C16 원격 분리와 접근 등급 파수꾼이 그대로 있다",
+      "checks": [
+        {
+          "id": "V1.remote",
+          "kind": "testNamed",
+          "title": "C16 원격 분리 시험",
+          "category": "safety",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "name": "project_git_c16_split_writes_between_remote_and_host_only"
+        },
+        {
+          "id": "V1.mcp",
+          "kind": "testNamed",
+          "title": "C16 접근 등급 시험",
+          "category": "safety",
+          "file": "crates/agent-manager-core/src/system_mcp.rs",
+          "name": "project_git_c16_operations_are_exposed_with_expected_access"
+        }
+      ]
+    },
+    {
+      "id": "V2",
+      "stage": "6-검증",
+      "title": "C19 원격 분리와 접근 등급에도 같은 파수꾼이 선다",
+      "checks": [
+        {
+          "id": "V2.remote",
+          "kind": "testNamed",
+          "title": "C19 원격 분리 시험",
+          "file": "crates/agent-manager-core/src/remote.rs",
+          "name": "project_overlay_c19_splits_writes_between_remote_and_host_only"
+        },
+        {
+          "id": "V2.mcp",
+          "kind": "testNamed",
+          "title": "C19 접근 등급 시험",
+          "file": "crates/agent-manager-core/src/system_mcp.rs",
+          "name": "project_overlay_c19_operations_are_exposed_with_expected_access"
+        }
+      ]
+    },
+    {
+      "id": "V3",
+      "stage": "6-검증",
+      "title": "프로젝트 메뉴 화면 흐름에 E2E 스펙이 있다",
+      "checks": [
+        {
+          "id": "V3.spec",
+          "kind": "requiredLiterals",
+          "title": "E2E 스펙",
+          "file": "cypress/e2e/project-menu-overlay.cy.ts",
+          "literals": [
+            "overlay"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "V4",
+      "stage": "6-검증",
+      "title": "경로 탈출과 동시 요청이 시험으로 막혀 있다",
+      "checks": [
+        {
+          "id": "V4.escape",
+          "kind": "testNamed",
+          "title": "경로 탈출 시험",
+          "category": "safety",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "name": "project_overlay_c19_rejects_paths_outside_repository"
+        },
+        {
+          "id": "V4.concurrent",
+          "kind": "testNamed",
+          "title": "동시 요청 시험",
+          "category": "safety",
+          "file": "crates/agent-manager-core/src/project_overlays.rs",
+          "name": "project_overlay_c19_serializes_concurrent_requests"
+        }
+      ]
+    }
+  ]
+}

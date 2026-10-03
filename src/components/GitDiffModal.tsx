@@ -1,5 +1,5 @@
-import { ExternalLink } from "lucide-react";
-import type { ReactNode } from "react";
+import { ExternalLink, Maximize2, Minimize2 } from "lucide-react";
+import { useState, type ReactNode } from "react";
 import { useI18n } from "../lib/i18n";
 import type { UiText } from "../lib/i18nLocale";
 import { openPopoutWindow } from "../lib/popoutWindow";
@@ -55,6 +55,7 @@ export function GitDiffModal({ target, diff, error, loading, onClose }: {
   onClose: () => void;
 }) {
   const { text } = useI18n();
+  const [full, setFull] = useState(false);
   const label = gitDiffTargetLabel(target, text);
   let body: ReactNode;
   if (error) body = <ErrorBanner message={error} />;
@@ -66,11 +67,15 @@ export function GitDiffModal({ target, diff, error, loading, onClose }: {
   };
   return (
     <Modal
-      size="wide"
+      size={full ? "full" : "wide"}
       title={<span className="git-diff-modal-title"><code>{target.path}</code><small>{label}{target.originalPath ? ` · ${target.originalPath} →` : ""}</small></span>}
       onClose={onClose}
       footer={
         <>
+          <button className="button" type="button" aria-pressed={full} onClick={() => setFull((current) => !current)}>
+            {full ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+            {full ? text("기본 보기", "Default view") : text("전체 보기", "Full view")}
+          </button>
           <button className="button" type="button" onClick={openWindow}>
             <ExternalLink size={14} />{text("새 창", "New window")}
           </button>

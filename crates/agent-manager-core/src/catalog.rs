@@ -3091,7 +3091,10 @@ fn codex_session_from_row(
         token_usage: None,
         model,
         git_branch,
-        is_subagent: thread_source.as_deref() == Some("subagent"),
+        is_subagent: matches!(
+            thread_source.as_deref(),
+            Some("subagent" | "guardian_review")
+        ),
         aia_workspace: false,
         default_workspace: false,
         archived,
