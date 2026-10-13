@@ -21,6 +21,7 @@ const CYPRESS_OPERATIONS: &[&str] = &[
     "list_cypress_runs",
     "add_cypress_workspace",
     "install_cypress_module",
+    "verify_cypress_environment",
 ];
 
 const DB_OPERATIONS: &[&str] = &[
@@ -70,10 +71,10 @@ const MCP_AIA_OPERATIONS: &[&str] = &[
 /// 일반 채팅은 플러그인 서버가 그대로 붙으므로 도구 이름이 고정 목록이 아니다. 이름 규칙만 싣는다.
 const MCP_DIRECT_OPERATIONS: &[&str] = &["mcp__<플러그인id>__<서버가 알려 주는 도구>"];
 
-/// 실행 단위 MCP 주입이 없는 공급자는 자기 전역 설정에 적어 둔 서버만 본다. 도구 이름 규칙은
-/// 그 설정에 사용자가 붙인 서버 이름이 정하므로 앱이 알 수 없다.
+/// 실행 단위 MCP 주입이 없는 공급자는 자기 전역 설정에 적힌 서버만 본다. 앱이 그 설정에
+/// 플러그인 id를 서버 이름으로 등록해 두므로(P12) 이름 규칙만 싣는다.
 const MCP_EXTERNAL_CONFIG_OPERATIONS: &[&str] =
-    &["<CLI 전역 설정에 등록한 서버 이름>__<서버가 알려 주는 도구>"];
+    &["<플러그인id 서버>가 알려 주는 도구 (앱이 Antigravity 전역 설정에 자동 등록)"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -140,9 +141,10 @@ pub enum AgentBuiltinToolNote {
     },
     CypressEnabled,
     CypressDisabled,
-    /// 앱이 붙여 주지 못해 CLI 전역 설정에 사용자가 직접 등록해야 하는 공급자의 상태.
-    /// `registered`는 그 설정이 지금 프록시 주소를 가리키는 플러그인, `missing`은 앱에서는
-    /// 쓸 수 있지만 아직 등록되지 않은 플러그인이다.
+    /// 실행마다 붙여 주지 못해 CLI 전역 설정으로 받는 공급자의 상태. 앱이 그 설정을 맞춰
+    /// 두지만(P12), 맞추기 전이거나 사용자 서버와 이름이 겹치면 갈린다. `registered`는 그
+    /// 설정이 지금 프록시 주소를 가리키는 플러그인, `missing`은 앱에서는 쓸 수 있지만 아직
+    /// 등록되지 않은 플러그인이다.
     #[serde(rename_all = "camelCase")]
     McpExternalConfig {
         registered: Vec<String>,
@@ -199,6 +201,8 @@ struct BuiltinToolState {
     mcp_pending: usize,
     /// 그중 Antigravity CLI의 전역 설정이 지금 프록시 주소로 가리키고 있는 플러그인 id.
     mcp_registered_in_antigravity: Vec<String>,
+    /// Antigravity CLI의 전역 설정이 지금 내장 Cypress 주소를 가리키는지.
+    cypress_registered_in_antigravity: bool,
 }
 
 /// 현재 호스트 설정을 읽되, 한 도구의 상태 조회 실패가 다른 도구의 발견까지 막지 않는다.
@@ -228,8 +232,14 @@ pub fn load_agent_builtin_tools(app_data_dir: &Path) -> AgentBuiltinToolsCatalog
         "외부 MCP 상태",
         &mut issues,
     );
-    let mcp_registered_in_antigravity =
-        antigravity_registered_plugins(app_data_dir, &mcp_attachable);
+    let antigravity = antigravity_registrations(app_data_dir, &mcp_attachable);
+    let conflicts = crate::antigravity_mcp_sync::last_conflicts(app_data_dir);
+    if !conflicts.is_empty() {
+        issues.push(format!(
+            "Antigravity 전역 MCP 설정에 같은 이름의 사용자 서버가 있어 등록하지 못했습니다: {}",
+            conflicts.join(", ")
+        ));
+    }
     catalog_from_state(
         BuiltinToolState {
             cypress_enabled,
@@ -237,7 +247,8 @@ pub fn load_agent_builtin_tools(app_data_dir: &Path) -> AgentBuiltinToolsCatalog
             ssh,
             mcp_attachable,
             mcp_pending,
-            mcp_registered_in_antigravity,
+            mcp_registered_in_antigravity: antigravity.plugins,
+            cypress_registered_in_antigravity: antigravity.cypress,
         },
         issues,
     )
@@ -253,59 +264,56 @@ fn or_note<T: Default>(result: Result<T, CoreError>, subject: &str, issues: &mut
     })
 }
 
+/// Antigravity CLI 전역 설정에서 지금 프록시를 가리키는 등록.
+#[derive(Default)]
+struct AntigravityRegistrations {
+    plugins: Vec<String>,
+    cypress: bool,
+}
+
 /// Antigravity CLI 전역 설정(`~/.gemini/config/mcp_config.json`)이 **지금** 프록시 주소로
-/// 가리키고 있는 플러그인 id.
+/// 가리키고 있는 플러그인과 Cypress.
 ///
-/// 이 공급자는 실행 단위 MCP 플래그가 없어 앱이 채팅마다 서버를 붙이지 못한다. 대신 프록시
-/// 주소가 부팅 사이에 유지되므로 사용자가 `agy mcp add`로 한 번 등록해 둘 수 있고, 여기서는
-/// 그 등록이 살아 있는지만 확인한다. 주소를 통째로 대조하는 것이 핵심이다 — 포트나 라우트
-/// 키가 바뀐 뒤 남은 옛 등록은 닿지 않으므로 "등록됨"으로 세면 안 된다.
+/// 이 공급자는 실행 단위 MCP 플래그가 없어 앱이 채팅마다 서버를 붙이지 못한다. 대신 앱이
+/// 그 설정을 공식 CLI로 맞춰 두고(P12, `antigravity_mcp_sync`), 여기서는 그 등록이 살아
+/// 있는지만 확인한다. 주소를 통째로 대조하는 것이 핵심이다 — 포트나 라우트 키가 바뀐 뒤 남은
+/// 옛 등록은 닿지 않으므로 "등록됨"으로 세면 안 된다. 조각 없는 옛 주소(`<base>/<id>`)도
+/// 아직 닿으므로 센다. 사용자가 `agy mcp disable`로 꺼 둔 항목은 세지 않는다.
 ///
 /// 설정을 읽지 못하면 빈 결과다. 이 조회는 안내 문구를 만들 뿐이라, 못 읽었다고 카탈로그
 /// 전체를 실패로 만들지 않는다.
-fn antigravity_registered_plugins(
+fn antigravity_registrations(
     app_data_dir: &Path,
     attachable: &[(String, String)],
-) -> Vec<String> {
+) -> AntigravityRegistrations {
     let Some(base) = crate::system_mcp::stored_plugin_proxy_base(app_data_dir) else {
-        return Vec::new();
+        return AntigravityRegistrations::default();
     };
     let Some(home) = crate::user_home::optional_home_dir() else {
-        return Vec::new();
+        return AntigravityRegistrations::default();
     };
-    let path = home.join(".gemini/config/mcp_config.json");
-    let Ok(bytes) = std::fs::read(&path) else {
-        return Vec::new();
+    let Ok(config) = crate::antigravity_mcp_sync::read_config(&home) else {
+        return AntigravityRegistrations::default();
     };
-    let Ok(config) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return Vec::new();
-    };
-    let Some(servers) = config.get("mcpServers").and_then(|value| value.as_object()) else {
-        return Vec::new();
-    };
-    let urls: Vec<&str> = servers
+    let urls: Vec<&str> = config
         .values()
-        .filter(|server| {
-            !server
-                .get("disabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-        })
-        .filter_map(|server| {
-            server
-                .get("serverUrl")
-                .or_else(|| server.get("url"))
-                .and_then(serde_json::Value::as_str)
-        })
+        .filter(|entry| !entry.disabled)
+        .filter_map(|entry| entry.url.as_deref())
         .collect();
-    attachable
+    let plugins = attachable
         .iter()
         .filter(|(id, _)| {
-            let expected = format!("{base}/{id}");
-            urls.iter().any(|url| url.trim_end_matches('/') == expected)
+            let current = crate::antigravity_mcp_sync::plugin_url(&base, id);
+            let legacy = format!("{base}/{id}");
+            urls.iter().any(|url| *url == current || *url == legacy)
         })
         .map(|(id, _)| id.clone())
-        .collect()
+        .collect();
+    let cypress_url = format!("{base}{}", crate::system_mcp::CYPRESS_PATH);
+    AntigravityRegistrations {
+        plugins,
+        cypress: urls.contains(&cypress_url.as_str()),
+    }
 }
 
 fn catalog_from_state(state: BuiltinToolState, issues: Vec<String>) -> AgentBuiltinToolsCatalog {
@@ -340,6 +348,7 @@ fn catalog_from_state(state: BuiltinToolState, issues: Vec<String>) -> AgentBuil
                 routes: vec![
                     route("aiaSystem", CYPRESS_OPERATIONS),
                     route("directMcp", CYPRESS_OPERATIONS),
+                    route("externalMcpConfig", CYPRESS_OPERATIONS),
                     route("systemSkillHttp", CYPRESS_OPERATIONS),
                 ],
             },
@@ -380,7 +389,16 @@ fn agent_view(
         Some(ProviderId::Claude | ProviderId::Codex | ProviderId::Local) => {
             ("systemSkillCli", "directMcp", true)
         }
-        Some(ProviderId::Antigravity) => ("systemSkillCli", "systemSkillHttp", true),
+        // P12. 앱이 전역 설정에 Cypress를 등록해 두었으면 MCP로, 아니면 스킬+HTTP로 닿는다.
+        Some(ProviderId::Antigravity) => (
+            "systemSkillCli",
+            if state.cypress_registered_in_antigravity {
+                "externalMcpConfig"
+            } else {
+                "systemSkillHttp"
+            },
+            true,
+        ),
     };
     let antigravity = provider == Some(ProviderId::Antigravity);
     let mcp_access = if provider.is_none() {
@@ -561,6 +579,7 @@ mod tests {
                 mcp_attachable: vec![("notion".to_owned(), "Notion".to_owned())],
                 mcp_pending: 0,
                 mcp_registered_in_antigravity: Vec::new(),
+                cypress_registered_in_antigravity: false,
             },
             Vec::new(),
         );
@@ -586,6 +605,19 @@ mod tests {
         let cypress = tool(&catalog, "antigravity", "cypress");
         assert_eq!(cypress.access_method, "systemSkillHttp");
         assert!(cypress.enablement_requires_new_chat);
+        // P12. 전역 설정에 등록되면 Antigravity도 Cypress를 MCP로 받는다.
+        let registered = catalog_from_state(
+            BuiltinToolState {
+                cypress_enabled: true,
+                cypress_registered_in_antigravity: true,
+                ..BuiltinToolState::default()
+            },
+            Vec::new(),
+        );
+        assert_eq!(
+            tool(&registered, "antigravity", "cypress").access_method,
+            "externalMcpConfig"
+        );
         // C10. 데이터베이스는 공급자에 따라 경로가 갈리지 않는다 — 자기 셸이 있는
         // 에이전트도 비밀번호를 받지 못하므로 실행은 언제나 앱을 거친다.
         assert_eq!(

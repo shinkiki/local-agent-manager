@@ -347,11 +347,15 @@ function referencedSteps(step: SystemWorkflowStep): string[] {
  * 여기서 막는 것은 그 앞 단계 — **문법이 깨져 그림이 통째로 안 그려지는 것**이다. 계약의
  * 표시 이름·단계 id·스킬 이름은 사람이나 에이전트가 쓴 문자열이라 따옴표나 대괄호가 들어올
  * 수 있고, 하나만 들어와도 도식 전체가 사라진다.
+ *
+ * 라벨은 늘 따옴표로 감싸므로 그 안의 괄호·대괄호는 문법을 깨지 않아 그대로 둔다. 깨는 것은
+ * 따옴표 하나뿐이고, 그것도 `#quot;` 같은 엔티티가 아니라 홑따옴표로 바꾼다 — `htmlLabels:
+ * false`에서 엔진은 `#40;`을 `&#40;`로만 되돌리고 SVG 글자로 그대로 찍어, 계약 이름의
+ * `(NAS)`가 묶음 제목에 `&#40;NAS&#41;`로 보였다.
  */
 function escapeLabel(value: string): string {
   return value
     .replace(/[<>]/g, "")
-    .replace(/"/g, "#quot;")
-    .replace(/[[\]{}()]/g, (bracket) => `#${bracket.charCodeAt(0)};`)
+    .replace(/"/g, "'")
     .replace(/\n/g, "<br/>");
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode, type Ref } from "react";
 import {
   AlertTriangle,
   Bot,
@@ -20,6 +20,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useI18n, type UiText } from "../lib/i18n";
+import { AiaOnboardingCards } from "./AiaOnboardingCards";
+import { RoundGoalsPanel } from "./RoundGoalsPanel";
 import { WorkflowProcedurePanel } from "./WorkflowProcedurePanel";
 import { WorkflowRuntimeEditor } from "./WorkflowRuntimeEditor";
 import { WorkflowVersionDiff } from "./WorkflowVersionDiff";
@@ -45,24 +47,39 @@ import type {
   SystemWorkflowLimits,
   SystemWorkflowList,
   SystemWorkflowStep,
+  SystemAutomationSnapshot,
   SystemWorkflowSummary,
   SystemWorkflowVersion,
   WorkflowPacingMode,
   WorkflowRisk,
 } from "../types";
-import { ErrorBanner, HelpHint, LoadingState, NoticeBanner, useConfirm, WorkflowInputControl, type ConfirmRequest } from "./Shared";
+import { ErrorBanner, HelpHint, LoadingState, LogoMark, NoticeBanner, useConfirm, WorkflowInputControl, type ConfirmRequest } from "./Shared";
 import { UsageBudgetPanel } from "./UsageBudgetPanel";
 import { errorText } from "../lib/errorText";
 
 import { formatDateTime } from "../lib/format";
-export type WorkflowsTabId = "catalog" | "recurring";
+export type WorkflowsTabId = "catalog" | "recurring" | "automation";
+
+/**
+ * 자동화 탭의 표식. 다른 탭은 워크플로 자체를 가리키지만 자동화는 앱이 스스로 만들어 주는
+ * 자리라 앱의 메인 표식(타륜)으로 선다. 로고는 자기 `role="img"`와 이름을 갖고 있어 그대로
+ * 두면 탭 이름이 "Agent Manager 로고 자동화"로 읽히므로, 감싼 자리에서 숨겨 장식으로 둔다.
+ * 탭 크기에서는 로고의 놋빛 드롭섀도가 이웃 탭까지 번져 CSS로 걷는다.
+ */
+function AgentManagerMark({ size }: { size?: number }) {
+  return <span className="agent-manager-mark" aria-hidden="true"><LogoMark size={size} /></span>;
+}
 
 // 워크플로 화면의 중메뉴. 등록된 계약을 다루는 자리(관리)와, 페이싱이 통제하는 워크플로의
-// 계정·예산을 다루는 자리를 나눈다. 반복 요청 자체는 채팅 화면의 반복 요청 탭이 만든다.
+// 계정·예산을 다루는 자리, 그리고 앱이 스스로 돌리는 것들(회차 목표·온보딩 카드)의 자리를
+// 나눈다. 반복 요청 자체는 채팅 화면의 반복 요청 탭이 만든다.
 // 탭 id는 화면 안내(uiGuideTargets)·자동화가 참조하는 계약이라 이름만 바뀌어도 그대로 둔다.
-const workflowsTabs: { id: WorkflowsTabId; icon: LucideIcon; ko: string; en: string }[] = [
+// 자동화 탭은 애드온 화면에서 옮겨 왔다 — 붙는 도구가 아니라 앱이 돌리는 절차라 워크플로와
+// 같은 화면에 서고, 마지막 탭이다.
+const workflowsTabs: { id: WorkflowsTabId; icon: ComponentType<{ size?: number; "aria-hidden"?: "true" }>; ko: string; en: string }[] = [
   { id: "catalog", icon: Workflow, ko: "워크플로 관리", en: "Workflow management" },
   { id: "recurring", icon: Gauge, ko: "워크플로 페이싱", en: "Workflow pacing" },
+  { id: "automation", icon: AgentManagerMark, ko: "자동화", en: "Automation" },
 ];
 
 interface Props {
@@ -72,6 +89,12 @@ interface Props {
   tabRequest?: TabRequest<WorkflowsTabId> | null;
   /** 페이싱 관측이 올린 제안 알림. 페이싱 탭 위에 배너로 깔린다. */
   pacingSuggestions?: readonly ChatAttentionItem[];
+  /** 자동화 탭의 온보딩 카드가 읽고 쓰는 시스템 자동화 스냅숏. */
+  automation?: SystemAutomationSnapshot | null;
+  onAutomationChange?: (snapshot: SystemAutomationSnapshot) => void;
+  onSkillsChanged?: () => void;
+  /** 로고 새로고침이 올리는 나수. 스스로 다시 읽지 않는 회차 목표 패널이 보고 다시 읽는다. */
+  refreshNonce?: number;
 }
 
 /**
@@ -92,7 +115,7 @@ function PacingSuggestionBanner({ items }: { items: readonly ChatAttentionItem[]
   </section>;
 }
 
-export function WorkflowsView({ active, onRequestAiaPrompt, tabRequest, pacingSuggestions = [] }: Props) {
+export function WorkflowsView({ active, onRequestAiaPrompt, tabRequest, pacingSuggestions = [], automation = null, onAutomationChange, onSkillsChanged, refreshNonce = 0 }: Props) {
   const { text } = useI18n();
   const [tab, setTab] = useState<WorkflowsTabId>("catalog");
   useEffect(() => {
@@ -116,9 +139,21 @@ export function WorkflowsView({ active, onRequestAiaPrompt, tabRequest, pacingSu
         onClick={() => setTab(item.id)}
       ><item.icon size={13} aria-hidden="true" /><span>{text(item.ko, item.en)}</span></button>)}
     </nav>
-    {tab === "catalog"
-      ? <WorkflowCatalogPanel catalog={catalog} aiaAvailable={aiaAvailable} onRequestAiaPrompt={onRequestAiaPrompt} />
-      : <><PacingSuggestionBanner items={pacingSuggestions} /><UsageBudgetPanel active={active} /></>}
+    {tab === "catalog" && <WorkflowCatalogPanel catalog={catalog} aiaAvailable={aiaAvailable} onRequestAiaPrompt={onRequestAiaPrompt} />}
+    {tab === "recurring" && <><PacingSuggestionBanner items={pacingSuggestions} /><UsageBudgetPanel active={active} /></>}
+    {/* 자동화 탭만은 내려놓지 않고 숨긴다 — 온보딩 카드는 단계마다 입력을 들고 있어, 다른 탭을
+        잠깐 다녀오는 것만으로 채우던 값이 경고 없이 사라지면 안 된다(애드온 화면에서 쓰던
+        수명 규칙 그대로다). 안쪽 조회·폴링은 보일 때만 돌도록 `active`로 가른다. */}
+    <div className="workflows-automation" hidden={tab !== "automation"}>
+      <RoundGoalsPanel onRequestAiaPrompt={onRequestAiaPrompt} refreshNonce={refreshNonce} />
+      <AiaOnboardingCards
+        active={active && tab === "automation"}
+        automation={automation}
+        onAutomationChange={onAutomationChange}
+        onSkillsChanged={onSkillsChanged}
+        onRequestAiaPrompt={onRequestAiaPrompt}
+      />
+    </div>
     {/* 확인창은 탭과 무관하게 화면 위에 뜬다. 패널 안에 두면 탭을 옮긴 순간 대화가 사라진다. */}
     {catalog.confirmDialog}
   </div>;
@@ -1064,13 +1099,19 @@ function WorkflowStepList({ steps }: { steps: SystemWorkflowStep[] }) {
 /** 방금 돌린 실행 한 건의 결과와 단계별 상태. */
 function WorkflowExecutionReport({ execution }: { execution: SystemWorkflowExecution }) {
   const { text } = useI18n();
+  const round = execution.round;
+  // 남은 일감 조각을 바깥 문구 안에 템플릿으로 끼우면 그 조각이 제 키로 카탈로그에 오르지
+  // 않아 번역에서 빠진다(i18n 정적 감사의 missingCatalog). 조각을 먼저 번역해 끼운다.
+  const remainingWork = round && typeof round.remainingWork === "number"
+    ? text(` 남은 일감 ${round.remainingWork}건 ·`, ` ${round.remainingWork} remaining ·`)
+    : "";
   return <WorkflowDetailSection
     variant={`workflow-execution${execution.succeeded ? " succeeded" : " failed"}`}
     icon={execution.succeeded ? <CheckCircle2 size={15} /> : <AlertTriangle size={15} />}
     title={execution.succeeded ? text("실행 성공", "Run succeeded") : text("실행 실패", "Run failed")}
-    note={<>v{execution.version} · {execution.finishedAt - execution.startedAt}ms{execution.failedStepId ? text(` · 실패 단계 ${execution.failedStepId}`, ` · failed step ${execution.failedStepId}`) : ""}{execution.round ? text(
-      ` · 회차 계획 ${execution.round.plannedRuns}건 · 기동 ${execution.round.launchedRuns}건 · 정리 ${execution.round.staleRuns}건`,
-      ` · ${execution.round.plannedRuns} planned · ${execution.round.launchedRuns} launched · ${execution.round.staleRuns} cleared`,
+    note={<>v{execution.version} · {execution.finishedAt - execution.startedAt}ms{execution.failedStepId ? text(` · 실패 단계 ${execution.failedStepId}`, ` · failed step ${execution.failedStepId}`) : ""}{round ? text(
+      ` · 회차${remainingWork} 계획 ${round.plannedRuns}건 · 기동 ${round.launchedRuns}건 · 정리 ${round.staleRuns}건`,
+      ` ·${remainingWork} ${round.plannedRuns} planned · ${round.launchedRuns} launched · ${round.staleRuns} cleared`,
     ) : ""}</>}
   >
     {execution.failure && <p>{execution.failure}</p>}

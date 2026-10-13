@@ -1,0 +1,14 @@
+{
+  "findingId": "F-scripts-generate-ui-catalog-mjs-check-4e045831",
+  "file": "scripts/generate-ui-catalog.mjs",
+  "symbol": "--check",
+  "symptom": "CRLF 체크아웃에서 생성 카탈로그 비교가 늘 어긋난다고 말한다",
+  "detail": "생성기는 늘 LF로 적는데 core.autocrlf=true(Windows 기본)로 받은 작업 트리는 src/lib/i18nGeneratedUiCatalog.ts를 CRLF로 푼다. `current !== next`가 바이트 비교라, 소스와 한 글자도 다르지 않은 갓 받은 저장소에서도 `npm run i18n:check`의 첫 칸이 코드와 무관하게 종료 코드 1로 떨어지고 `npm run check` 전체가 거기서 멈춘다. 재현: origin/dev-history를 새 워크트리로 받아 `npm run i18n:check` → \"UI 번역 카탈로그 생성 파일이 소스와 다릅니다\".",
+  "severity": "P2",
+  "state": "fixed",
+  "agentsRules": ["V4"],
+  "occurrences": [{ "itemId": "C-af9507eabc40", "at": "2026-10-06T00:00:00Z", "lane": "L07" }],
+  "fix": "줄끝을 지우고 비교하는 generatedCatalogMatches()를 내보내고 --check·쓰기 양쪽이 그것을 쓰게 했다. 가져오기만 해도 생성 파일이 다시 쓰이지 않도록 본문을 check-i18n-static-ui.mjs와 같은 진입점 가드로 감쌌다.",
+  "test": "src/lib/i18nGeneratedUiCatalog.test.mjs",
+  "fixCommits": ["b7d9df2a"]
+}

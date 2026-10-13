@@ -99,6 +99,10 @@ fn cask_target(executable: &Path) -> Option<(PathBuf, &'static str)> {
 
 /// codesign 요구 조건: Apple이 발급한 Developer ID Application 인증서이고 리프 인증서의
 /// 조직 단위가 등록된 팀일 것. ad-hoc 서명이나 다른 팀 서명은 통과하지 못한다.
+///
+/// 부르는 곳은 macOS `platform::signed_by_team`뿐이라 다른 플랫폼 lib에서는 쓰이지 않는다.
+/// 요구 조건 문자열을 고정하는 시험은 어느 플랫폼에서든 돌도록 `test`를 함께 연다.
+#[cfg(any(target_os = "macos", test))]
 fn signer_requirement(team: &str) -> String {
     format!(
         "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists \

@@ -18,11 +18,17 @@ use uuid::Uuid;
 use crate::CoreError;
 
 /// 앱 소유 파일에 공통으로 적용하는 읽기·쓰기 및 소유자 전용 생성 권한(G7).
+///
+/// G10: 마지막 경로 성분이 심볼릭 링크면 따라가지 않고 `ELOOP`로 거절한다. 잠금 파일과
+/// 감사 로그는 이미 있는 파일을 그대로 열기 때문에, 그 자리에 링크가 놓이면 앱 데이터
+/// 밖 파일을 열어 잠그거나 그 끝에 기록을 덧붙이게 된다.
 fn private_open_options() -> OpenOptions {
     let mut options = OpenOptions::new();
     options.read(true).write(true);
     #[cfg(unix)]
-    options.mode(0o600);
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     options
 }
 
@@ -194,6 +200,37 @@ mod tests {
             let mode = fs::metadata(path).expect("metadata").permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_open_helpers_refuse_a_symlinked_final_component_g10() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let target = outside.path().join("foreign");
+        fs::write(&target, b"foreign").expect("foreign file");
+        let lock = directory.path().join("store.lock");
+        let log = directory.path().join("audit.jsonl");
+        std::os::unix::fs::symlink(&target, &lock).expect("planted lock symlink");
+        std::os::unix::fs::symlink(&target, &log).expect("planted log symlink");
+
+        for result in [
+            open_private_file(&lock, false),
+            open_private_append_file(&log),
+        ] {
+            assert!(matches!(
+                result,
+                Err(CoreError::Io(ref error)) if error.raw_os_error() == Some(libc::ELOOP)
+            ));
+        }
+        assert_eq!(fs::read(&target).expect("target contents"), b"foreign");
+
+        // 가리키는 곳이 없는 링크도 따라가 앱 데이터 밖에 새 파일을 만들지 않는다.
+        let missing = outside.path().join("created-outside");
+        let dangling = directory.path().join("dangling.lock");
+        std::os::unix::fs::symlink(&missing, &dangling).expect("dangling symlink");
+        assert!(open_private_file(&dangling, false).is_err());
+        assert!(!missing.exists());
     }
 
     #[test]

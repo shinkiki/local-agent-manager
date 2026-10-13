@@ -8,6 +8,7 @@
 //! 심볼릭 링크는 목록에서 감추고 읽기는 거절한다(G10 — 링크를 따라가면 등록 폴더 밖이
 //! 보인다). 쓰기 경로는 없다.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,7 @@ use crate::document_tree::{
 use crate::domain::{DocumentEntry, DocumentEntryPage, DocumentPreviewKind};
 use crate::path_guard::{self, CurDirPolicy, RelativePathIssue};
 use crate::project_git::{project_git_status, GitChangeKind, GitStatus};
+use crate::project_overlays::list_project_overlay_sets;
 use crate::user_home::home_dir;
 use crate::CoreError;
 
@@ -312,9 +314,13 @@ pub fn search_project_files(
     // git 상태는 결과가 정해진 뒤 한 번만 읽는다(F4). 줄마다 `git status`를 부르면 결과
     // 상한만큼 프로세스를 띄우게 되고, 저장소가 아니면 그 비용이 전부 헛것이 된다.
     let status = project_git_status(app_data_dir, root).ok();
+    // overlay 장부도 같은 이유로 한 번만 읽는다. git 상태와 달리 git을 띄우지 않으므로,
+    // 저장소가 잠겨 있거나 저장소가 아니어도 이 칸은 답할 수 있다 —
+    // `list_project_overlay_sets`가 그렇게 설계된 조회다(C19-1).
+    let overlay_paths = overlay_paths_in_project(app_data_dir, root);
     let hits = entries
         .into_iter()
-        .map(|entry| project_search_hit(root, entry, status.as_ref()))
+        .map(|entry| project_search_hit(root, entry, status.as_ref(), &overlay_paths))
         .collect();
     Ok(ProjectFileSearchPage {
         query: needle,
@@ -333,27 +339,48 @@ pub fn search_project_files(
 /// 기준이고 검색 결과의 경로는 프로젝트 루트 기준이다. 둘을 그대로 비교하면 하위 폴더
 /// 프로젝트에서 모든 줄이 "변경 없음"으로 보인다 — 그래서 저장소 루트 대비 프로젝트의
 /// 자리(`offset`)를 앞에 붙여 맞춘다.
+///
+/// **overlay 장부도 같은 기준이다.** 2026-10-04 실측: overlay 세트에 담기는 경로는
+/// `ProjectOverlayPanel`이 `get_project_git_status`의 변경 목록에서 그대로 가져오고
+/// (`status.entries[].path`), `snapshot_project_overlay`·`apply_project_overlay`는 그 경로를
+/// 저장소 최상위에서 도는 git에 pathspec으로 넘긴다(`GitRunner::root`는 `--show-toplevel`
+/// 결과다). 즉 세트의 경로는 처음부터 **저장소 루트 기준**이고, `ProjectOverlaySet.paths`의
+/// 타입 주석이 적어 둔 그대로다. `save_project_overlay_set`이 `validate_repo_path`에 넘기는
+/// 루트가 등록 프로젝트 루트라는 사실은 이 기준을 바꾸지 않는다 — 그 검증은 경로를 변환하지
+/// 않고 받아들이기만 한다.
 fn project_search_hit(
     root: &Path,
     entry: DocumentEntry,
     status: Option<&GitStatus>,
+    overlay_paths: &BTreeSet<String>,
 ) -> ProjectFileSearchHit {
-    let git_status = status.and_then(|status| {
-        let repo_root = Path::new(&status.project_path);
-        let offset = root
-            .strip_prefix(repo_root)
+    // 저장소 루트 대비 프로젝트의 자리. git 상태를 읽어야만 알 수 있으므로, 읽지 못하면
+    // 빈 값으로 두고 프로젝트가 곧 저장소 루트인 흔한 경우에 맞춘다 — 하위 폴더 프로젝트에서
+    // git이 잠겨 있는 동안 overlay 표시가 비는 것은, 그 때문에 검색이 죽는 것보다 낫다.
+    let offset = status
+        .and_then(|status| {
+            // 양쪽을 같은 표기로 맞춘 뒤에 뗀다. `root`는 디스패처가 정규화해 넘긴 경로라
+            // Windows에서 `\\?\C:\...` 꼴이고 `GitStatus::project_path`는 자식에게 보여 줄
+            // 표기(`child_facing`)로 `\\?\`가 떨어져 있다. 그대로 `strip_prefix`하면 하위 폴더
+            // 프로젝트에서 **언제나** 실패해 offset이 비고, git 상태 칸과 overlay 칸이 둘 다
+            // 조용히 비어 버린다(2026-10-04 실측).
+            normalized_relative(
+                &path_guard::child_facing(Path::new(&status.project_path)),
+                &path_guard::child_facing(root),
+            )
             .ok()
-            .map(|offset| offset.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
-        let wanted = if offset.is_empty() {
-            entry.relative_path.clone()
-        } else {
-            format!("{}/{}", offset.trim_end_matches('/'), entry.relative_path)
-        };
+        })
+        .unwrap_or_default();
+    let repo_relative = if offset.is_empty() {
+        entry.relative_path.clone()
+    } else {
+        format!("{}/{}", offset.trim_end_matches('/'), entry.relative_path)
+    };
+    let git_status = status.and_then(|status| {
         status
             .entries
             .iter()
-            .find(|item| item.path == wanted)
+            .find(|item| item.path == repo_relative)
             .map(|item| {
                 if item.worktree_status == GitChangeKind::Unmodified {
                     item.index_status
@@ -362,14 +389,39 @@ fn project_search_hit(
                 }
             })
     });
+    // overlay 세트에 담긴 경로인가(F4). 세트의 경로는 git 상태와 **같은** 저장소 루트
+    // 기준이므로(위 주석의 실측) `offset`을 붙인 경로로 맞춘다. 붙이지 않으면 하위 폴더
+    // 프로젝트에서는 어떤 줄도 overlay로 표시되지 않는다.
+    //
+    // 세트 상태(`registered`/`stored`/`applied`)는 가리지 않는다. 이 칸이 답하는 것은 "이
+    // 파일을 overlay가 관리하는가"이고, 아직 patch를 뜨지 않은 `registered`도 다음 스냅샷에서
+    // 작업 트리가 HEAD 원본으로 되돌려지는 파일이다. 어느 세트의 어느 상태인지는 overlay
+    // 탭이 세트 단위로 보여 준다.
+    let in_overlay = overlay_paths.contains(&repo_relative);
     ProjectFileSearchHit {
         modified_at: entry.modified_at,
         entry,
         git_status,
-        // overlay 세트는 C19 예외가 선 뒤에 생긴다. 그 전까지 이 칸은 없는 사실이므로
-        // 추측하지 않고 false로 둔다(O1 이 서면 그 자리에서 바뀐다).
-        in_overlay: false,
+        in_overlay,
     }
+}
+
+/// 이 프로젝트의 overlay 세트들이 담고 있는 대상 경로 전부(C19-1).
+///
+/// 장부를 읽지 못하면 **검색을 실패시키지 않고 빈 집합으로 둔다**. overlay 장부 하나 때문에
+/// 파일 검색이 통째로 죽는 것은 F1이 약속한 것보다 나쁘고, 이 칸은 결과에 붙는 부가 정보지
+/// 결과 자체가 아니다. 그때 모든 줄의 `inOverlay`는 false다 — git 상태가 같은 상황에서
+/// `gitStatusAvailable`로 "못 읽었다"를 따로 말하는 것과 달리, 여기서는 세트가 없는 것과
+/// 못 읽은 것이 화면에서 같게 보인다. 세트 목록 자체는 overlay 탭이 같은 조회로 보여 주므로
+/// 읽히지 않는 장부는 거기서 드러난다.
+fn overlay_paths_in_project(app_data_dir: &Path, root: &Path) -> BTreeSet<String> {
+    let Ok(sets) = list_project_overlay_sets(app_data_dir, root) else {
+        return BTreeSet::new();
+    };
+    sets.sets
+        .into_iter()
+        .flat_map(|set| set.paths.into_iter())
+        .collect()
 }
 
 /// 내용 검색에서 파일 하나를 본 결과. "걸리지 않았다"와 "열지 않았다"를 가르는 것이
@@ -485,7 +537,14 @@ fn project_entry(
 
 fn normalized_relative(root: &Path, path: &Path) -> Result<String, CoreError> {
     path.strip_prefix(root)
-        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        // C16-9 / G10: Unix의 역슬래시는 파일명 일부다. 실제 경로 성분 사이만 정규화한다.
+        .map(|relative| {
+            relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
         .map_err(|_| path_outside_root())
 }
 
@@ -579,6 +638,98 @@ mod tests {
         let bin = read_project_file(&root, "logo.bin").expect("bin");
         assert_eq!(bin.kind, DocumentPreviewKind::Binary);
         assert!(bin.content.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c16_9_literal_backslashes_round_trip_through_list_read_and_search() {
+        let (_dir, root, app_data) = project();
+        fs::write(root.join(r"src\main.rs"), "literal backslash file\n").expect("file");
+        fs::create_dir(root.join(r"docs\drafts")).expect("directory");
+        fs::write(root.join(r"docs\drafts/note.md"), "# literal directory\n").expect("note");
+
+        let page = list_project_entries(&root, "", None, None).expect("list");
+        let file = page
+            .entries
+            .iter()
+            .find(|entry| entry.name == r"src\main.rs")
+            .expect("file entry");
+        assert_eq!(file.relative_path, r"src\main.rs");
+        let view = read_project_file(&root, &file.relative_path).expect("read returned path");
+        assert_eq!(view.relative_path, file.relative_path);
+        assert_eq!(view.content.as_deref(), Some("literal backslash file\n"));
+        assert_eq!(
+            read_project_file(&root, "src/main.rs")
+                .expect("nested file")
+                .content
+                .as_deref(),
+            Some("fn main() {}\n")
+        );
+
+        let directory = page
+            .entries
+            .iter()
+            .find(|entry| entry.name == r"docs\drafts")
+            .expect("directory entry");
+        let nested =
+            list_project_entries(&root, &directory.relative_path, None, None).expect("nested list");
+        assert_eq!(nested.entries[0].parent_path, r"docs\drafts");
+        assert_eq!(nested.entries[0].relative_path, r"docs\drafts/note.md");
+        assert_eq!(
+            read_project_file(&root, &nested.entries[0].relative_path)
+                .expect("nested read")
+                .content
+                .as_deref(),
+            Some("# literal directory\n")
+        );
+
+        let search = search_project_files(&app_data, &root, r"\", None, false).expect("search");
+        let paths: Vec<&str> = search
+            .entries
+            .iter()
+            .map(|hit| hit.entry.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![r"docs\drafts", r"docs\drafts/note.md", r"src\main.rs"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c16_1_literal_backslash_project_offset_matches_git_and_overlay_paths() {
+        let (_dir, repo, _app_data) = project();
+        let root = repo.join(r"app\local");
+        fs::create_dir(&root).expect("subproject");
+        let path = root.join("main.rs");
+        fs::write(&path, "fn main() {}\n").expect("file");
+        let status = GitStatus {
+            project_path: repo.to_string_lossy().into_owned(),
+            head: Default::default(),
+            upstream: None,
+            entries: vec![crate::project_git::GitStatusEntry {
+                path: r"app\local/main.rs".to_owned(),
+                original_path: None,
+                index_status: GitChangeKind::Unmodified,
+                worktree_status: GitChangeKind::Modified,
+                is_submodule: false,
+                unmerged: None,
+                rename_score: None,
+            }],
+            truncated: false,
+            conflicted_count: 0,
+            staged_count: 0,
+            unstaged_count: 1,
+            untracked_count: 0,
+        };
+        let overlay_paths = BTreeSet::from([r"app\local/main.rs".to_owned()]);
+        let entry =
+            project_entry(&root, &path, &fs::metadata(&path).expect("metadata")).expect("entry");
+        let hit = project_search_hit(&root, entry.clone(), Some(&status), &overlay_paths);
+        assert_eq!(hit.git_status, Some(GitChangeKind::Modified));
+        assert!(hit.in_overlay);
+        let wrong_paths = BTreeSet::from(["app/local/main.rs".to_owned()]);
+        assert!(!project_search_hit(&root, entry, Some(&status), &wrong_paths).in_overlay);
     }
 
     #[test]
@@ -811,7 +962,7 @@ mod tests {
         assert_eq!(hit.modified_at, hit.entry.modified_at);
         assert!(
             !hit.in_overlay,
-            "overlay 어댑터가 없는데 inOverlay가 참이다"
+            "overlay 세트를 하나도 저장하지 않았는데 inOverlay가 참이다"
         );
         assert!(
             !page.git_status_available,
@@ -826,5 +977,242 @@ mod tests {
         );
         assert!(encoded.contains("\"inOverlay\":false"));
         assert!(encoded.contains("\"gitStatus\":null"));
+    }
+
+    /// 2026-10-04. 검색 줄의 `inOverlay`가 **실제 overlay 장부를 보고** 정해지는지 고정한다
+    /// (F4, C19-1).
+    ///
+    /// 이 칸은 C19가 서기 전에 `in_overlay: false` 상수로 못박혀 있었고, "O1이 서면 그 자리에서
+    /// 바꾼다"는 주석만 남아 있었다. C19·O1이 선 뒤에도 상수는 그대로였다 — 점검표의 F4
+    /// (타입에 칸이 있다·화면이 그 칸을 쓴다)는 셋 다 녹색인데 제품은 모든 파일을 "overlay
+    /// 아님"으로 답하고 있었다. 측정이 통과하는데 기능이 없는 자리다.
+    ///
+    /// 고정하는 것 셋: 세트에 담은 경로만 참이고, 같은 폴더의 다른 파일은 거짓이며, 세트를
+    /// **저장하기 전**에는 같은 검색이 전부 거짓이다. 셋째가 "항상 참"으로 뒤집는 반대 방향의
+    /// 상수를 잡는다.
+    ///
+    /// git을 띄우지 않는 것도 일부러다. overlay 장부 조회는 git 없이 답하도록 만들어져 있어
+    /// (C19-1), 저장소가 아닌 폴더에서도 이 칸은 사실대로 나와야 한다.
+    #[test]
+    fn project_files_search_marks_paths_registered_in_an_overlay_set() {
+        let (_dir, root, app_data) = project();
+        // 세트에 담지 않은 같은 확장자 파일. 없으면 "전부 참"으로 뒤집어도 시험이 통과한다.
+        fs::write(
+            root.join("src/other.rs"),
+            "pub fn other() {}
+",
+        )
+        .expect("other");
+
+        let before =
+            search_project_files(&app_data, &root, "main.rs", None, false).expect("before");
+        assert!(
+            before.entries.iter().all(|hit| !hit.in_overlay),
+            "세트를 저장하기 전인데 inOverlay가 참인 줄이 있다"
+        );
+
+        let receipt = crate::project_overlays::save_project_overlay_set(
+            &app_data,
+            &root,
+            &crate::project_overlays::SaveProjectOverlaySetRequest {
+                project_path: root.to_string_lossy().into_owned(),
+                set_id: None,
+                name: "로컬 포트".to_owned(),
+                paths: vec!["src/main.rs".to_owned()],
+            },
+        )
+        .expect("세트 저장");
+        assert!(receipt.succeeded, "{}", receipt.message);
+
+        let page = search_project_files(&app_data, &root, ".rs", None, false).expect("search");
+        let marked: Vec<&str> = page
+            .entries
+            .iter()
+            .filter(|hit| hit.in_overlay)
+            .map(|hit| hit.entry.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            marked,
+            vec!["src/main.rs"],
+            "세트에 담은 경로만 표시되어야 한다: {:?}",
+            page.entries
+                .iter()
+                .map(|hit| (hit.entry.relative_path.as_str(), hit.in_overlay))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            page.entries.len() > marked.len(),
+            "비교 대상이 될 다른 파일이 결과에 없어 시험이 공허하다"
+        );
+
+        let encoded = serde_json::to_string(&page).expect("serialize");
+        assert!(encoded.contains("\"inOverlay\":true"), "{encoded}");
+    }
+
+    /// 2026-10-04. 프로젝트가 저장소의 **하위 폴더**일 때 `inOverlay`가 어느 기준으로
+    /// 맞춰지는지 고정한다(F4, C19-1, C16-1).
+    ///
+    /// 앞 시험(`..._marks_paths_registered_in_an_overlay_set`)은 프로젝트가 곧 저장소 루트인
+    /// 폴더에서 돌아 두 기준이 같은 문자열이라, 기준을 틀려도 통과한다. 실제로 그랬다 —
+    /// 구현은 세트 경로를 **프로젝트 루트 기준**으로 보고 검색 줄의 상대 경로와 그대로
+    /// 비교했고, 그 전제는 "세트를 저장할 때 `validate_repo_path`에 넘긴 루트가 등록 프로젝트
+    /// 루트"라는 사실에서 나왔다.
+    ///
+    /// 실측으로 뒤집혔다. 세트에 담기는 경로는 `ProjectOverlayPanel`이 `git status`의 변경
+    /// 목록에서 그대로 가져오고(저장소 루트 기준), 스냅샷과 적용은 그 경로를 저장소 최상위에서
+    /// 도는 git에 pathspec으로 넘긴다. `validate_repo_path`는 경로를 **변환하지 않고** 받기만
+    /// 하므로 그 호출의 루트는 기준을 정하지 못한다. 그래서 하위 폴더 프로젝트에서는 어떤
+    /// 파일도 overlay로 표시되지 않았다 — 점검표 F4 세 점검은 전부 녹색인 채로.
+    ///
+    /// 두 방향을 함께 못박는다. 저장소 루트 기준 경로(`app/src/main.rs`)는 표시되고, 예전
+    /// 구현이 기대하던 프로젝트 루트 기준 경로(`src/main.rs`)는 표시되지 않는다. 둘째가 없으면
+    /// "둘 다 맞춰 본다"는 느슨한 구현이 그대로 통과한다.
+    ///
+    /// 쓰는 동안 **두 번째 결함**이 같은 자리에서 드러났다. 기준을 맞춰도 offset이 비어 있었는데,
+    /// 디스패처가 넘기는 `root`는 정규화된 Windows 경로(`\\?\C:\...`)이고
+    /// `GitStatus::project_path`는 `child_facing` 표기라 `strip_prefix`가 **언제나** 실패했기
+    /// 때문이다. 그래서 하위 폴더 프로젝트에서는 overlay 칸뿐 아니라 git 상태 칸도 늘 비어
+    /// 있었다 — 그 칸도 이 시험이 함께 못박는다.
+    #[test]
+    fn project_files_overlay_flag_uses_repository_root_paths_in_a_subfolder_project() {
+        let Ok(executable) = crate::providers::resolve_named_executable(&["git"]) else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = fs::canonicalize(dir.path())
+            .expect("canonical")
+            .join("repo");
+        let root = repo.join("app");
+        let app_data = fs::canonicalize(dir.path())
+            .expect("canonical")
+            .join("app-data");
+        fs::create_dir_all(root.join("src")).expect("project");
+        fs::create_dir_all(&app_data).expect("app data");
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main() {}
+",
+        )
+        .expect("main");
+        fs::write(
+            root.join("src/other.rs"),
+            "pub fn other() {}
+",
+        )
+        .expect("other");
+        let git = |args: &[&str]| {
+            std::process::Command::new(&executable)
+                .args(args)
+                .current_dir(&repo)
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "AM Test")
+                .env("GIT_AUTHOR_EMAIL", "am@test.invalid")
+                .env("GIT_COMMITTER_NAME", "AM Test")
+                .env("GIT_COMMITTER_EMAIL", "am@test.invalid")
+                .output()
+                .expect("git")
+        };
+        assert!(git(&["init", "-q", "-b", "main"]).status.success());
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-q", "-m", "base"]).status.success());
+        // overlay가 받는 것은 추적 파일의 unstaged 변경뿐이다(C19-3). 그 모양 그대로 만든다.
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main() { let port = 4000; }
+",
+        )
+        .expect("edit");
+
+        // 저장소 루트가 읽히지 않으면 이 시험이 묻는 것 자체가 성립하지 않는다.
+        let probe = search_project_files(&app_data, &root, ".rs", None, false).expect("probe");
+        if !probe.git_status_available {
+            return;
+        }
+        // 같은 `offset`이 git 상태 칸도 맞춘다. 하위 폴더 프로젝트에서 이 칸이 비어 있던 것이
+        // overlay 칸이 비어 있던 것과 같은 원인이다.
+        assert_eq!(
+            probe
+                .entries
+                .iter()
+                .find(|hit| hit.entry.relative_path == "src/main.rs")
+                .and_then(|hit| hit.git_status),
+            Some(GitChangeKind::Modified),
+            "하위 폴더 프로젝트에서 git 상태 칸이 비었다: {:?}",
+            probe
+                .entries
+                .iter()
+                .map(|hit| (hit.entry.relative_path.as_str(), hit.git_status))
+                .collect::<Vec<_>>()
+        );
+
+        // 화면이 세트에 담는 경로는 `git status`가 준 저장소 루트 기준 경로다.
+        let receipt = crate::project_overlays::save_project_overlay_set(
+            &app_data,
+            &root,
+            &crate::project_overlays::SaveProjectOverlaySetRequest {
+                project_path: root.to_string_lossy().into_owned(),
+                set_id: None,
+                name: "로컬 포트".to_owned(),
+                paths: vec!["app/src/main.rs".to_owned()],
+            },
+        )
+        .expect("세트 저장");
+        assert!(receipt.succeeded, "{}", receipt.message);
+
+        let page = search_project_files(&app_data, &root, ".rs", None, false).expect("search");
+        let marked: Vec<&str> = page
+            .entries
+            .iter()
+            .filter(|hit| hit.in_overlay)
+            .map(|hit| hit.entry.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            marked,
+            vec!["src/main.rs"],
+            "저장소 루트 기준 경로를 담았는데 표시되지 않는다: {:?}",
+            page.entries
+                .iter()
+                .map(|hit| (hit.entry.relative_path.as_str(), hit.in_overlay))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            page.entries.len() > marked.len(),
+            "비교 대상이 될 다른 파일이 결과에 없어 시험이 공허하다"
+        );
+
+        // 반대 방향: 프로젝트 루트 기준 경로는 이 저장소에서 overlay 경로가 아니다.
+        let receipt = crate::project_overlays::save_project_overlay_set(
+            &app_data,
+            &root,
+            &crate::project_overlays::SaveProjectOverlaySetRequest {
+                project_path: root.to_string_lossy().into_owned(),
+                set_id: None,
+                name: "프로젝트 기준".to_owned(),
+                paths: vec!["src/other.rs".to_owned()],
+            },
+        )
+        .expect("세트 저장");
+        assert!(receipt.succeeded, "{}", receipt.message);
+
+        let page = search_project_files(&app_data, &root, ".rs", None, false).expect("search");
+        let marked: Vec<&str> = page
+            .entries
+            .iter()
+            .filter(|hit| hit.in_overlay)
+            .map(|hit| hit.entry.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            marked,
+            vec!["src/main.rs"],
+            "프로젝트 루트 기준 경로까지 overlay로 읽었다: {:?}",
+            page.entries
+                .iter()
+                .map(|hit| (hit.entry.relative_path.as_str(), hit.in_overlay))
+                .collect::<Vec<_>>()
+        );
     }
 }

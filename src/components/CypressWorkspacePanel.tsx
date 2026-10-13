@@ -17,14 +17,17 @@ import {
   removeCypressWorkspace,
   runCypressSpec,
   setCypressEnabled,
+  setCypressWorkspaceModuleDir,
   setCypressWorkspaceOptions,
   stopCypressRun,
+  verifyCypressEnvironment,
   writeCypressEnvFile,
   writeCypressWorkspaceFile,
   type WebAccessStatus,
 } from "../lib/ipc";
 import { cypressArtifactLabel, failedCypressTests, filterCypressFilePaths, isMissingCypressFile, isSensitiveCypressFile, parseEnvJsonText, specFiles, summarizeCypressRun, validateWorkspaceRelativePath } from "../lib/cypressWorkspace";
 import type {
+  CypressEnvironmentCheck,
   CypressExecutionType,
   CypressRegistry,
   CypressRunArtifact,
@@ -96,21 +99,17 @@ function runStatePill(state: CypressRunState): string {
 
 /**
  * 쓰기 조작(등록·설치·제거·파일 삭제·저장·중지)의 잠금 한 벌. 무엇 하나가 도는 동안
- * 나머지 버튼도 함께 막히고, 막힌 이유는 권한 쪽일 때만 적는다는 것이 이 패널의 규칙이다.
+ * 나머지 버튼도 함께 막힌다는 것이 이 패널의 규칙이다.
  *
- * 그 규칙이 `canWrite`·`busy`·`hostOnlyReason` 세 조각으로 흩어진 채 옆칸·머리줄·파일
- * 목록·편집기·실행 칸 다섯 곳에 각각 내려가, 받는 쪽마다 `!canWrite || busy !== null`과
- * `hostOnlyReason ?? undefined`를 다시 적고 있었다. 세 조각을 따로 내려보내면 어느
- * 컴포넌트가 셋 중 둘만 쓰는지 읽어서는 갈라지지 않고, 규칙을 고칠 때 다섯 자리를 모두
- * 찾아야 한다. 판정은 상태를 쥔 훅에서 한 번만 하고, 화면은 그 결과만 받는다.
+ * 잠그는 까닭은 바쁨 하나뿐이다. C20 전에는 원격 읽기 전용 모드라는 권한 쪽 까닭이 하나
+ * 더 있어 막힌 이유 문구까지 함께 내려보냈지만, 로그인한 채널은 호스트와 같은 권한을 가지므로
+ * 그 갈래는 없어졌다. 판정은 상태를 쥔 훅에서 한 번만 하고, 옆칸·머리줄·파일 목록·편집기·
+ * 실행 칸은 그 결과만 받는다 — 받는 쪽마다 `busy !== null`을 다시 적으면 규칙을 고칠 때
+ * 다섯 자리를 모두 찾아야 한다.
  */
 interface CypressWriteGate {
-  /** 쓰기 권한 자체가 있는가. 바쁨과 무관하게 입력창·편집 가능 여부를 정하는 자리가 본다. */
-  canWrite: boolean;
-  /** 지금 쓰기 조작을 막아야 하는가(권한이 없거나 다른 조작이 도는 중). */
+  /** 지금 쓰기 조작을 막아야 하는가(다른 조작이 도는 중). */
   blocked: boolean;
-  /** 권한 때문에 막혔다면 그 이유. 바빠서 잠깐 막힌 것은 적을 이유가 없어 `null`이다. */
-  reason: string | null;
 }
 
 /** 설치 바쁨 키의 머리. 키를 짓는 자리와 다시 풀어 읽는 자리가 같은 글자를 봐야 한다. */
@@ -135,7 +134,9 @@ type CypressBusyKey =
   | "open"
   | "stop"
   | `${typeof INSTALL_BUSY_PREFIX}${string}`
+  | `verify-${string}`
   | `remove-${string}`
+  | `module-${string}`
   | `options-${string}`;
 
 /**
@@ -147,14 +148,6 @@ type CypressRunBusy = <T,>(
   report: (message: string) => void,
   action: () => Promise<T>,
 ) => Promise<T | null>;
-
-/**
- * 호스트 전용 조작 버튼이 함께 받아야 하는 잠금·이유 한 쌍. 잠그기만 하고 이유를 빠뜨리면
- * 원격 화면에서는 눌리지 않는 버튼만 남아 왜 막혔는지 알 수 없다.
- */
-function writeGateProps(gate: CypressWriteGate): { disabled: boolean; title: string | undefined } {
-  return { disabled: gate.blocked, title: gate.reason ?? undefined };
-}
 
 /**
  * 훅이 아직 살아 있는지 묻는 문. 편집기 훅과 실행 훅이 폐기 깃발 ref와 그것을 뒤집는
@@ -200,9 +193,8 @@ type CypressFileEditor = ReturnType<typeof useCypressFileEditor>;
  * 인자로 받는다 — 저장·삭제 중에 등록·설치 버튼까지 함께 막히는 지금 동작을 그대로 두려는
  * 것이다. 실행 쪽이 같은 목록에서 스펙을 뽑으므로 `files`는 그대로 내보낸다.
  */
-function useCypressFileEditor({ workspace, canWrite, runBusy, confirm, onNotice }: {
+function useCypressFileEditor({ workspace, runBusy, confirm, onNotice }: {
   workspace: CypressWorkspace | null;
-  canWrite: boolean;
   runBusy: CypressRunBusy;
   confirm: (request: ConfirmRequest) => Promise<boolean>;
   onNotice: (message: string) => void;
@@ -269,8 +261,8 @@ function useCypressFileEditor({ workspace, canWrite, runBusy, confirm, onNotice 
     void loadFiles(workspace);
   }, [workspace?.id, loadFiles]);
 
-  // 활성 파일의 내용이 없으면 읽어 온다. 민감 파일은 원문 명령을 먼저 쓰고, 원격(403)이면
-  // 마스킹본으로 대신 보인다 — 그 경우 편집·저장은 막힌다.
+  // 활성 파일의 내용이 없으면 읽어 온다. 민감 파일은 원문 명령을 먼저 쓰고, 그 읽기가
+  // 실패하면 마스킹본으로 대신 보인다 — 그 경우 편집·저장은 막힌다.
   useEffect(() => {
     if (!workspace || !activePath || contents[activePath] !== undefined) return;
     let disposed = false;
@@ -299,7 +291,7 @@ function useCypressFileEditor({ workspace, canWrite, runBusy, confirm, onNotice 
   const activeIsSensitive = activePath !== null && isSensitiveCypressFile(activePath);
   const activeIsMasked = activePath !== null && maskedPaths.has(activePath);
   const activeContent = activePath ? contents[activePath] : undefined;
-  const activeEditable = activePath !== null && !activeIsMasked && canWrite;
+  const activeEditable = activePath !== null && !activeIsMasked;
   const activeEditing = activePath !== null && (editingPaths[activePath] ?? dirtyPaths.has(activePath));
 
   const selectFile = (path: string) => {
@@ -416,7 +408,7 @@ function useCypressFileEditor({ workspace, canWrite, runBusy, confirm, onNotice 
     });
   };
 
-  /** 활성 파일의 본문을 고친다. 편집이 막힌 상태에서는 무시한다(마스킹본·읽기 전용). */
+  /** 활성 파일의 본문을 고친다. 편집이 막힌 상태(마스킹본)에서는 무시한다. */
   const editActiveContent = (value: string) => {
     const path = activePath;
     if (!activeEditable || path === null) return;
@@ -424,7 +416,7 @@ function useCypressFileEditor({ workspace, canWrite, runBusy, confirm, onNotice 
     setDirtyPaths(withPath(path));
   };
 
-  /** 활성 파일의 보기·편집을 뒤집는다. 읽기 전용이면 편집으로 넘어가지 않는다. */
+  /** 활성 파일의 보기·편집을 뒤집는다. 마스킹본이면 편집으로 넘어가지 않는다. */
   const toggleActiveEditing = () => {
     const path = activePath;
     if (path === null) return;
@@ -660,18 +652,13 @@ function useCypressRegistry({ confirm }: {
   const [busy, setBusy] = useState<CypressBusyKey | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [installOutput, setInstallOutput] = useState<string | null>(null);
+  /** 마지막 환경 점검 결과. 작업공간이 바뀌면 다른 작업공간의 결과를 보이지 않도록 id를 함께 쥔다. */
+  const [environmentCheck, setEnvironmentCheck] = useState<{ workspaceId: string; result: CypressEnvironmentCheck } | null>(null);
 
   const form = useCypressWorkspaceForm();
 
-  // 쓰기 권한만 본다. 원격 write 모드면 호스트와 같게 설정·실행할 수 있고(C7, 2026-08-29 결정),
-  // 원격 읽기 전용 모드에서는 변경 명령이 403이므로 버튼을 미리 막는다.
-  const canWrite = access?.writable === true;
-  const hostOnlyReason = access === null
-    ? text("접속 권한을 확인하고 있습니다.", "Checking access.")
-    : !canWrite
-      ? text("원격 편집이 꺼져 있어 변경할 수 없습니다.", "Remote editing is off; changes are disabled.")
-      : null;
-
+  // 접근 상태는 권한 판정에 쓰지 않는다 — C20부터 로그인한 채널은 호스트와 같게 설정·실행할
+  // 수 있다. 여기서 읽는 까닭은 `remote` 하나로, 런처 창이 어느 화면에 뜨는지 적기 위해서다.
   useEffect(() => {
     let disposed = false;
     const stillHere = () => !disposed;
@@ -760,11 +747,25 @@ function useCypressRegistry({ confirm }: {
     if (next && selectedId === workspace.id) setSelectedId(null);
   };
 
+  /**
+   * 모듈이 깔려 있어도 브라우저를 띄울 시스템 패키지가 없으면 실행은 시작 전에 멈춘다
+   * (헤드리스 리눅스의 Xvfb 부재, 2026-10-10 실측). 실행을 눌러서야 알게 하지 않으려고
+   * 설치 직후와 요청 시에 `cypress verify`를 돌려 결과와 조치를 보인다.
+   */
+  const verify = async (workspace: CypressWorkspace) => {
+    setError(null);
+    await runBusy(`verify-${workspace.id}`, setError, async () => {
+      const result = await verifyCypressEnvironment(workspace.id);
+      setEnvironmentCheck({ workspaceId: workspace.id, result });
+    });
+  };
+
   const install = async (workspace: CypressWorkspace, options: { afterRegister?: boolean } = {}) => {
     setError(null);
     if (!options.afterRegister) setNotice(null);
     setInstallOutput(null);
-    await runBusy(`${INSTALL_BUSY_PREFIX}${workspace.id}`, setError, async () => {
+    setEnvironmentCheck(null);
+    const receipt = await runBusy(`${INSTALL_BUSY_PREFIX}${workspace.id}`, setError, async () => {
       const receipt = await installCypressModule(workspace.id);
       setRegistry((current) => current
         ? { ...current, workspaces: current.workspaces.map((item) => (item.id === receipt.workspace.id ? receipt.workspace : item)) }
@@ -774,7 +775,10 @@ function useCypressRegistry({ confirm }: {
         `'${workspace.name}'에 Cypress ${receipt.workspace.cypressVersion ?? ""}를 설치했습니다.`,
         `Installed Cypress ${receipt.workspace.cypressVersion ?? ""} for '${workspace.name}'.`,
       ));
+      return receipt;
     });
+    // 설치가 끝난 자리에서 바로 점검한다. 점검 실패는 설치 성공 안내를 지우지 않는다.
+    if (receipt) await verify(receipt.workspace);
   };
 
   /**
@@ -791,21 +795,28 @@ function useCypressRegistry({ confirm }: {
     ));
   };
 
+  /** C7-4: 모듈 경로만 갱신한다. 등록 폴더와 실행 옵션을 같이 보내지 않는다. */
+  const changeModuleDir = (moduleDir: string) => {
+    if (!selected) return;
+    void mutate(`module-${selected.id}`, () => setCypressWorkspaceModuleDir(selected.id, moduleDir.trim() || null));
+  };
+
   const busyInstallId = busy?.startsWith(INSTALL_BUSY_PREFIX) ? busy.slice(INSTALL_BUSY_PREFIX.length) : null;
-  const writeGate: CypressWriteGate = { canWrite, blocked: !canWrite || busy !== null, reason: hostOnlyReason };
+  const busyVerifyId = busy?.startsWith("verify-") ? busy.slice("verify-".length) : null;
+  const writeGate: CypressWriteGate = { blocked: busy !== null };
 
   return {
-    access, registry, error, notice, setNotice, busy, busyInstallId,
-    selectedId, setSelectedId, selected, installOutput, writeGate, runBusy,
+    access, registry, error, notice, setNotice, busy, busyInstallId, busyVerifyId,
+    selectedId, setSelectedId, selected, installOutput, environmentCheck, writeGate, runBusy,
     toggleEnabled, form,
-    submitWorkspace, removeWorkspace, install, changeRunOptions,
+    submitWorkspace, removeWorkspace, install, verify, changeRunOptions, changeModuleDir,
   };
 }
 
 /**
  * 애드온 → Cypress 탭. 에이전트가 Cypress로 웹 테스트·정보 조회·크롤링·매크로를 돌릴 작업공간을
- * 관리한다. 등록·설치·실행·민감 파일 쓰기는 호스트 전용이므로 원격 접속에서는 버튼을 막고
- * 그 이유를 적는다. 파일 편집기는 스킬 편집기의 마크업·상태 패턴을 따르되 저장은 파일 단위다.
+ * 관리한다. 등록·설치·실행·민감 파일 쓰기는 로그인한 어느 채널에서나 호스트와 같게 할 수
+ * 있다(C20). 파일 편집기는 스킬 편집기의 마크업·상태 패턴을 따르되 저장은 파일 단위다.
  */
 export function CypressWorkspacePanel({ active }: {
   /** 설정 화면이 보이는 동안만 실행 상태를 폴링한다. */
@@ -814,25 +825,24 @@ export function CypressWorkspacePanel({ active }: {
   const { text } = useI18n();
   const { confirm, confirmDialog } = useConfirm();
   const {
-    access, registry, error, notice, setNotice, busy, busyInstallId,
-    selectedId, setSelectedId, selected, installOutput, writeGate, runBusy,
+    access, registry, error, notice, setNotice, busy, busyInstallId, busyVerifyId,
+    selectedId, setSelectedId, selected, installOutput, environmentCheck, writeGate, runBusy,
     toggleEnabled, form,
-    submitWorkspace, removeWorkspace, install, changeRunOptions,
+    submitWorkspace, removeWorkspace, install, verify, changeRunOptions, changeModuleDir,
   } = useCypressRegistry({ confirm });
 
   // ---- 파일 편집기 ----
 
-  const editor = useCypressFileEditor({ workspace: selected, canWrite: writeGate.canWrite, runBusy, confirm, onNotice: setNotice });
+  const editor = useCypressFileEditor({ workspace: selected, runBusy, confirm, onNotice: setNotice });
 
   // ---- 실행 ----
 
   const runner = useCypressRunner({ workspace: selected, active, runBusy });
   const specs = useMemo(() => specFiles(editor.files ?? []), [editor.files]);
-  const canRun = writeGate.canWrite && selected !== null && selected.moduleReady && registry?.enabled !== false;
-  const runBlockedReason = writeGate.reason
-    ?? (!selected?.moduleReady ? text("Cypress 모듈을 먼저 설치하세요.", "Install the Cypress module first.") : null);
+  const canRun = selected !== null && selected.moduleReady && registry?.enabled !== false;
+  const runBlockedReason = !selected?.moduleReady ? text("Cypress 모듈을 먼저 설치하세요.", "Install the Cypress module first.") : null;
   // 토글이 꺼져 있어도 손으로 하는 실행은 막지 않으므로, 그때는 막힌 이유 대신 그 사실을 적는다.
-  const runBlockedNote = registry && !registry.enabled && writeGate.canWrite
+  const runBlockedNote = registry && !registry.enabled
     ? text("위 토글이 꺼져 있어도 여기서 직접 실행은 할 수 있습니다.", "Manual runs work here even while the toggle above is off.")
     : runBlockedReason;
 
@@ -865,7 +875,6 @@ export function CypressWorkspacePanel({ active }: {
                 "켜면 Claude·Codex·Antigravity와 AIA가 등록된 작업공간을 사용할 수 있습니다. 새 채팅부터 도구가 연결되며, 끄면 실행 중 채팅의 호출도 차단됩니다. 웹 테스트·정보 조회·크롤링·매크로에 씁니다.",
                 "When on, Claude, Codex, Antigravity, and AIA can use these workspaces. New chats receive the tools; turning this off also blocks calls from existing chats.",
               )}</small>
-              {writeGate.reason && <small className="cypress-host-note">{writeGate.reason}</small>}
             </div>
             <AppToggle
               checked={registry?.enabled ?? false}
@@ -895,10 +904,14 @@ export function CypressWorkspacePanel({ active }: {
               <CypressWorkspaceDetailHeader
                 workspace={selected}
                 busyInstallId={busyInstallId}
+                busyVerifyId={busyVerifyId}
                 gate={writeGate}
                 installOutput={installOutput}
+                environmentCheck={environmentCheck?.workspaceId === selected.id ? environmentCheck.result : null}
                 onInstall={install}
+                onVerify={verify}
                 onRemove={removeWorkspace}
+                onChangeModuleDir={changeModuleDir}
               />
             )}
 
@@ -908,7 +921,6 @@ export function CypressWorkspacePanel({ active }: {
                 editor={editor}
                 gate={writeGate}
                 busy={busy}
-                showReadOnlyNote={!writeGate.canWrite && access !== null}
               />
             )}
 
@@ -994,7 +1006,7 @@ function CypressWorkspaceNav({ registry, selectedId, busyInstallId, gate, form, 
             <strong>{text("작업공간", "Workspaces")}</strong>
             <small>{text("테스트할 Cypress 프로젝트를 작업공간으로 추가합니다. 실행 전에는 목록에서 대상을 명시적으로 선택해야 합니다.", "Add each Cypress project as a workspace. You must explicitly select a target before running it.")}</small>
           </div>
-          <button className="button compact" type="button" {...writeGateProps(gate)} aria-expanded={form.open} onClick={form.toggle}>
+          <button className="button compact" type="button" disabled={gate.blocked} aria-expanded={form.open} onClick={form.toggle}>
             <Plus size={13} aria-hidden="true" />{text("작업공간 추가", "Add workspace")}
           </button>
         </header>
@@ -1024,16 +1036,26 @@ function CypressWorkspaceNav({ registry, selectedId, busyInstallId, gate, form, 
  * 고른 작업공간의 머리줄. 경로·모듈 위치와 설치·제거 조작, 그리고 방금 돌린 설치 출력을
  * 함께 둔다. 조작은 전부 부모의 함수가 하므로 여기에는 상태가 없다.
  */
-function CypressWorkspaceDetailHeader({ workspace, busyInstallId, gate, installOutput, onInstall, onRemove }: {
+function CypressWorkspaceDetailHeader({ workspace, busyInstallId, busyVerifyId, gate, installOutput, environmentCheck, onInstall, onVerify, onRemove, onChangeModuleDir }: {
   workspace: CypressWorkspace;
   busyInstallId: string | null;
+  busyVerifyId: string | null;
   gate: CypressWriteGate;
   installOutput: string | null;
+  /** 이 작업공간의 마지막 환경 점검. 없으면 아직 점검하지 않은 것이다. */
+  environmentCheck: CypressEnvironmentCheck | null;
   onInstall: (workspace: CypressWorkspace) => void | Promise<unknown>;
+  onVerify: (workspace: CypressWorkspace) => void | Promise<unknown>;
   onRemove: (workspace: CypressWorkspace) => void | Promise<unknown>;
+  onChangeModuleDir: (moduleDir: string) => void;
 }) {
   const { text } = useI18n();
   const installing = busyInstallId === workspace.id;
+  const verifying = busyVerifyId === workspace.id;
+  const [moduleDir, setModuleDir] = useState(workspace.moduleDir ?? workspace.path);
+  useEffect(() => { setModuleDir(workspace.moduleDir ?? workspace.path); }, [workspace.id, workspace.moduleDir, workspace.path]);
+  const effectiveModuleDir = workspace.moduleDir ?? workspace.path;
+  const moduleChanged = moduleDir.trim() !== effectiveModuleDir;
   return (
     <section className="settings-subsection cypress-workspace-detail">
       <header>
@@ -1041,25 +1063,59 @@ function CypressWorkspaceDetailHeader({ workspace, busyInstallId, gate, installO
           <strong data-user-content>{workspace.name}</strong>
           <small>
             <CypressWorkspacePath path={workspace.path} />
-            {workspace.moduleDir && <span className="project-registry-meta"><span>{text("모듈", "Module")}: <code data-user-content>{displayPath(workspace.moduleDir)}</code></span></span>}
+            <span className={`cypress-module-status${workspace.moduleReady ? " ready" : " missing"}`}>
+              {workspace.moduleReady
+                ? text("Cypress 모듈 연결됨", "Cypress module connected")
+                : text("Cypress 모듈 경로를 확인하세요", "Check the Cypress module path")}
+            </span>
           </small>
         </div>
         <div className="cypress-workspace-actions">
           {!workspace.moduleReady && (
-            <button className="button compact" type="button" {...writeGateProps(gate)} onClick={() => { void onInstall(workspace); }}>
+            <button className="button compact" type="button" disabled={gate.blocked} onClick={() => { void onInstall(workspace); }}>
               {installing ? <LoaderCircle size={13} className="spinning" aria-hidden="true" /> : <RefreshCw size={13} aria-hidden="true" />}
               {installing ? text("설치 중… (최대 15분)", "Installing… (up to 15 min)") : text("설치", "Install")}
             </button>
           )}
-          <button className="button compact danger" type="button" {...writeGateProps(gate)} onClick={() => { void onRemove(workspace); }}>
+          {workspace.moduleReady && (
+            <button className="button compact" type="button" disabled={gate.blocked} onClick={() => { void onVerify(workspace); }}>
+              {verifying ? <LoaderCircle size={13} className="spinning" aria-hidden="true" /> : <Search size={13} aria-hidden="true" />}
+              {verifying ? text("점검 중…", "Checking…") : text("환경 점검", "Check environment")}
+            </button>
+          )}
+          <button className="button compact danger" type="button" disabled={gate.blocked} onClick={() => { void onRemove(workspace); }}>
             <Trash2 size={13} aria-hidden="true" />{text("제거", "Remove")}
           </button>
         </div>
       </header>
+      <div className="cypress-module-dir-editor">
+        <div>
+          <div className="cypress-module-dir-heading">
+            <label htmlFor={`cypress-module-${workspace.id}`}>{text("Cypress 모듈 위치", "Cypress module dir")}</label>
+            <code data-user-content>{displayPath(effectiveModuleDir)}</code>
+          </div>
+          <PathField id={`cypress-module-${workspace.id}`} value={moduleDir} onChange={setModuleDir} placeholder={text("비우면 작업공간 폴더", "Leave empty to use the workspace folder")} />
+          <small>{text("이 폴더 아래의 node_modules/cypress를 확인합니다. 등록 폴더와 실행 옵션은 바뀌지 않습니다.", "Checks node_modules/cypress below this folder. The workspace folder and run options stay unchanged.")}</small>
+          <div className="cypress-module-dir-actions">
+            {effectiveModuleDir !== workspace.path && <button className="button compact" type="button" disabled={gate.blocked} onClick={() => setModuleDir(workspace.path)}>{text("작업공간 폴더 사용", "Use workspace folder")}</button>}
+            <button className="button compact primary" type="button" disabled={gate.blocked || !moduleChanged} onClick={() => onChangeModuleDir(moduleDir)}>{text("모듈 위치 저장", "Save module dir")}</button>
+          </div>
+        </div>
+      </div>
       {installOutput && (
         <details className="cypress-details cypress-install-output">
           <summary>{text("설치 출력", "Install output")}</summary>
           <pre data-user-content>{installOutput}</pre>
+        </details>
+      )}
+      {environmentCheck && (environmentCheck.ok
+        ? <NoticeBanner message={text("실행 환경 확인됨 — Cypress 바이너리와 브라우저 의존성이 준비되어 있습니다.", "Environment verified — the Cypress binary and browser dependencies are ready.")} />
+        : <ErrorBanner message={environmentCheck.hint ?? text("Cypress 환경 점검에 실패했습니다. 아래 출력을 확인하세요.", "The Cypress environment check failed. See the output below.")} />
+      )}
+      {environmentCheck && !environmentCheck.ok && environmentCheck.output && (
+        <details className="cypress-details cypress-install-output">
+          <summary>{text("점검 출력", "Check output")}</summary>
+          <pre data-user-content>{environmentCheck.output}</pre>
         </details>
       )}
     </section>
@@ -1216,9 +1272,8 @@ function CypressFilePicker({ workspaceId, editor, gate }: {
           onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void editor.addFile(); } }}
           placeholder={text("새 파일 경로 (예: e2e/login.cy.js)", "New file path (e.g. e2e/login.cy.js)")}
           spellCheck={false}
-          disabled={!gate.canWrite}
         />
-        <button className="button compact" type="button" onClick={() => { void editor.addFile(); }} disabled={!gate.canWrite || !editor.newFileName.trim()}>{text("추가", "Add")}</button>
+        <button className="button compact" type="button" onClick={() => { void editor.addFile(); }} disabled={!editor.newFileName.trim()}>{text("추가", "Add")}</button>
       </div>
     </div>
   );
@@ -1293,7 +1348,7 @@ function CypressSensitiveBar({ masked, revealed, onToggleReveal }: {
     <div className="cypress-sensitive-bar">
       <span className="skill-sync-pill conflict">{text("민감 파일 · 비밀정보", "Sensitive file · secrets")}</span>
       {masked
-        ? <small>{text("원격 읽기 전용 모드에서는 값이 가려져 보이며 편집·저장할 수 없습니다.", "Values are masked in remote read-only mode; editing and saving are disabled.")}</small>
+        ? <small>{text("원문을 읽지 못해 값이 가려진 사본으로 보입니다. 편집·저장할 수 없습니다.", "The plain text could not be read, so values are shown masked; editing and saving are disabled.")}</small>
         : <small>{text("기본으로 내용을 숨깁니다. 편집하려면 펼치세요.", "Hidden by default. Reveal to edit.")}</small>}
       <button className="button compact" type="button" onClick={onToggleReveal}>
         {revealed ? <EyeOff size={13} aria-hidden="true" /> : <Eye size={13} aria-hidden="true" />}
@@ -1345,13 +1400,11 @@ function CypressActiveFileBody({ path, content, sensitive, revealed, editing, ed
  * 바쁨 표시(`busy`)는 패널 전체가 공유하므로 그대로 받아 버튼을 막는다. 활성 파일의 머리줄·
  * 민감 파일 줄·본문 갈래는 이름 있는 조각으로 나가 있고, 여기에는 배치와 저장·다시 읽기만 남는다.
  */
-function CypressFileEditorSection({ workspace, editor, gate, busy, showReadOnlyNote }: {
+function CypressFileEditorSection({ workspace, editor, gate, busy }: {
   workspace: CypressWorkspace;
   editor: CypressFileEditor;
   gate: CypressWriteGate;
   busy: CypressBusyKey | null;
-  /** 접속 권한을 확인한 뒤 읽기 전용으로 판정됐을 때만 그 이유를 적는다. */
-  showReadOnlyNote: boolean;
 }) {
   const { text } = useI18n();
   const { activePath, activeContent, activeIsSensitive, activeIsMasked, activeEditable, activeEditing } = editor;
@@ -1406,11 +1459,10 @@ function CypressFileEditorSection({ workspace, editor, gate, busy, showReadOnlyN
                   onEdit={editor.editActiveContent}
                 />
                 <div className="form-actions cypress-form-actions">
-                  {showReadOnlyNote && <small className="cypress-muted">{text("원격 편집이 꺼져 있어 읽기만 할 수 있습니다.", "Remote editing is off; files are read-only.")}</small>}
                   <button className="button" type="button" disabled={busy !== null} onClick={editor.reload}>
                     <RefreshCw size={13} aria-hidden="true" />{text("다시 읽기", "Reload")}
                   </button>
-                  <button className="button primary" type="button" disabled={busy !== null || editor.dirtyPaths.size === 0 || !gate.canWrite} onClick={() => { void editor.saveFiles(); }}>
+                  <button className="button primary" type="button" disabled={busy !== null || editor.dirtyPaths.size === 0} onClick={() => { void editor.saveFiles(); }}>
                     {busy === "save" ? text("저장 중…", "Saving…") : text(`저장${editor.dirtyPaths.size > 0 ? ` (${editor.dirtyPaths.size})` : ""}`, `Save${editor.dirtyPaths.size > 0 ? ` (${editor.dirtyPaths.size})` : ""}`)}
                   </button>
                 </div>
@@ -1424,7 +1476,7 @@ function CypressFileEditorSection({ workspace, editor, gate, busy, showReadOnlyN
 }
 
 /**
- * 스펙 실행 자리. 상태는 `useCypressRunner`가 들고, 무엇을 막을지(권한·설치·지금 도는 실행)는
+ * 스펙 실행 자리. 상태는 `useCypressRunner`가 들고, 무엇을 막을지(설치·지금 도는 실행)는
  * 패널이 판단해 넘긴다 — 같은 판단이 설치·제거 버튼에도 쓰이기 때문이다.
  */
 function CypressRunSection({ workspace, runner, specs, gate, busy, canRun, runBlockedReason, runBlockedNote, openHint, onChangeOptions }: {

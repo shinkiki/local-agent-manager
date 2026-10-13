@@ -1,7 +1,7 @@
 {
   "name": "agent-manager-tauri",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Local-first desktop manager for Claude Code, OpenAI Codex, and Google Antigravity sessions",
   "author": "shinkiki",
   "license": "MIT OR Apache-2.0",
@@ -36,6 +36,7 @@
     "check": "npm run i18n:check && npm run build && npm run rust:fmt && npm run rust:clippy && npm run rust:test",
     "test:unit": "node --experimental-strip-types --test --test-reporter=dot src/lib/*.test.mjs",
     "conformance:project-menu": "node --experimental-strip-types scripts/project-menu-conformance.mjs",
+    "flaky:isolate": "node --experimental-strip-types scripts/flaky-isolate.mjs",
     "test:e2e": "node scripts/e2e.mjs",
     "test:e2e:open": "node scripts/e2e.mjs --open",
     "icons:generate": "node ./scripts/generate-service-icons.mjs",

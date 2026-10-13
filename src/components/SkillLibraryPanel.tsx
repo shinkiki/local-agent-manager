@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps, type Dispatch, type KeyboardEvent, type ReactNode, type SetStateAction } from "react";
-import { AlertTriangle, ArchiveX, ArrowUpFromLine, Ban, FileDiff, FileText, FolderInput, History, Link2, Plus, RefreshCw, Send, ShieldAlert, Trash2 } from "lucide-react";
+import { AlertTriangle, ArchiveX, Ban, FileDiff, FileText, FolderInput, History, Link2, Plus, RefreshCw, Send, ShieldAlert, Trash2, Undo2 } from "lucide-react";
 import { DetailInfo } from "./DetailDrawer";
 import { FilterAxis, FilterAxisBar, FilterChipRow, type FilterAxisSpec } from "./FilterAxisBar";
 import {
@@ -43,7 +43,6 @@ import {
   providerLabel,
   publishHadFailure,
   publishSummary,
-  latestSkillVersion,
   skillDescriptionError,
   skillDivergenceHint,
   skillDivergenceLabel,
@@ -62,7 +61,6 @@ import type {
   SkillDivergentInstall,
   SkillFilterCounts,
   SkillKindFilter,
-  SkillLatestVersion,
   SkillLibraryFilters,
   SkillStateFilter,
 } from "../lib/skillLibrary";
@@ -1840,7 +1838,7 @@ function BulkDeployModal({
   );
 }
 
-type SkillDrawerBusy = "import" | "delete" | "unarchive" | "sync" | "redeploy" | "latest" | "save" | "migration" | "platforms";
+type SkillDrawerBusy = "import" | "delete" | "unarchive" | "sync" | "revert" | "save" | "migration" | "platforms";
 
 /** `busyRunner`가 돌려주는 실행기. 훅 사이로 넘길 때 이 이름으로 받는다. */
 export type BusyRunner<K extends string> =
@@ -2061,23 +2059,29 @@ function SkillLibraryDrawer({
   };
 
   /**
-   * 뒤처진 사용본 자리에 보관 원본을 다시 배포한다. 채택(`runSync`)과 방향이 반대인
-   * 조치라, 사본을 덮는다는 사실과 어느 자리인지를 확인 문구에 그대로 적는다.
+   * 한 사용본의 수정을 버리고 그 자리를 보관 원본으로 되돌린다. 채택(`runSync`)과 방향이
+   * 반대인 조치라, 사본을 덮는다는 사실과 어느 자리인지를 확인 문구에 그대로 적는다.
+   *
+   * 되돌릴 수 없는 유일한 조치이기도 하다. 채택은 밀려난 원본이 휴지통에 남지만 여기서
+   * 덮이는 것은 사용본뿐이라 휴지통을 거치지 않는다. 그 사실도 함께 적는다.
    */
-  const runRedeploy = async (provider: ProviderId, install: SkillInstallView) => {
+  const runRevertInstall = async (provider: ProviderId, install: SkillInstallView) => {
     const where = install.projectName ?? install.projectPath ?? text("개인", "personal");
     const proceed = await confirm({
-      title: text("원본 배포", "Deploy source"),
+      title: text("변경사항 취소", "Discard changes"),
       message: text(
-        `보관 원본을 ${providerLabel(provider)}(${where})에 다시 배포할까요?`,
-        `Redeploy the archived source to ${providerLabel(provider)} (${where})?`,
+        `${providerLabel(provider)}(${where})의 사용본을 보관 원본으로 되돌릴까요?`,
+        `Revert the install at ${providerLabel(provider)} (${where}) to the archived source?`,
       ),
-      warning: text("그 자리의 사본은 원본 내용으로 덮입니다.", "The copy at that location is replaced by the source."),
-      confirmLabel: text("배포", "Deploy"),
+      warning: text(
+        "그 자리에서 고친 내용은 버려집니다. 휴지통에 남지 않아 되돌릴 수 없습니다.",
+        "Edits made at that location are discarded. They do not go to the trash and cannot be undone.",
+      ),
+      confirmLabel: text("되돌리기", "Revert"),
       tone: "danger",
     });
     if (!proceed) return;
-    await runBusy("redeploy", async () => {
+    await runBusy("revert", async () => {
       const receipt = await publishCommonSkill({
         key: entry.key,
         providers: [provider],
@@ -2086,18 +2090,39 @@ function SkillLibraryDrawer({
       });
       const failure = receipt.results.find((result) => result.outcome === "failed");
       if (failure) {
-        setActionError(failure.message ?? text("배포에 실패했습니다.", "Failed to deploy the source."));
+        setActionError(failure.message ?? text("되돌리기에 실패했습니다.", "Failed to revert to the source."));
         return;
       }
       onChanged(text(
-        `'${entry.key}'의 보관 원본을 ${providerLabel(provider)}(${where})에 배포했습니다.`,
-        `Deployed the archived source of '${entry.key}' to ${providerLabel(provider)} (${where}).`,
+        `${providerLabel(provider)}(${where})의 '${entry.key}'을 보관 원본으로 되돌렸습니다.`,
+        `Reverted '${entry.key}' at ${providerLabel(provider)} (${where}) to the archived source.`,
       ));
     });
   };
 
-  /** 외부에서 수정된 사용본을 새 원본으로 채택하고 나머지 위치에 재배포한다. */
-  const runSync = async (install: SkillInstallView) => {
+  /**
+   * 외부에서 수정된 사용본을 새 원본으로 채택하고 나머지 위치에 재배포한다.
+   *
+   * 카드의 세 조치 중 보관 원본을 바꾸는 것은 이것뿐인데 혼자 확인 없이 나갔다. 영향이
+   * 가장 큰 조치가 가장 조용했던 셈이라, 누르기 전에 무엇이 원본이 되고 이전 원본이
+   * 어디로 가는지를 말한다. 휴지통에 남아 되살릴 수 있다는 것까지 적어 겁주지는 않는다.
+   */
+  const runSync = async (provider: ProviderId, install: SkillInstallView) => {
+    const where = install.projectName ?? install.projectPath ?? text("개인", "personal");
+    const proceed = await confirm({
+      title: text("이 버전으로 통일", "Apply this version"),
+      message: text(
+        `${providerLabel(provider)}(${where})의 사용본을 '${entry.key}'의 새 보관 원본으로 삼을까요?`,
+        `Make the install at ${providerLabel(provider)} (${where}) the new archived source of '${entry.key}'?`,
+      ),
+      warning: text(
+        "이 버전이 원본이 되어 나머지 사용 위치에 배포됩니다. 이전 원본은 휴지통으로 이동하므로 되살릴 수 있습니다.",
+        "This version becomes the source and is deployed to the other locations. The previous source moves to the trash, so it can be restored.",
+      ),
+      confirmLabel: text("통일", "Apply"),
+      tone: "danger",
+    });
+    if (!proceed) return;
     await runBusy("sync", async () => {
       const receipt = await syncSkillFromInstall(install.skillId);
       onChanged(text(
@@ -2105,52 +2130,6 @@ function SkillLibraryDrawer({
         `Synced '${entry.key}' to the edited install. The previous source is in the trash.`,
       ));
       void receipt;
-    });
-  };
-
-  /**
-   * 갈라진 자리 전부를 가장 나중에 고쳐진 버전으로 맞춘다. 방향 판정은 사람이 하지 않고
-   * 수정 시각이 정하므로(`latestSkillVersion`), 어느 쪽이 이겼는지와 나머지가 어떻게
-   * 되는지를 확인 문구에 적어 누르기 전에 보이게 한다.
-   */
-  const runApplyLatest = async (
-    latest: SkillLatestVersion,
-    divergents: readonly SkillDivergentInstall[],
-  ) => {
-    if (latest.kind === "unknown" || divergents.length === 0) return;
-    const winner = latest.kind === "source"
-      ? text("보관 원본", "the archived source")
-      : `${providerLabel(latest.provider)} · ${displayPath(latest.install.directory)}`;
-    const proceed = await confirm({
-      title: text("최신본으로 통일", "Apply the newest version"),
-      message: text(
-        `가장 나중에 고쳐진 ${winner}를 기준으로 '${entry.key}'의 갈라진 자리 ${divergents.length}곳을 맞출까요?`,
-        `Align ${divergents.length} diverged location(s) of '${entry.key}' with ${winner}, the most recently modified version?`,
-      ),
-      warning: latest.kind === "source"
-        ? text("나머지 사용본의 내용은 원본으로 덮입니다.", "The other installs are replaced by the source.")
-        : text(
-            "그 사용본이 새 원본이 되고 나머지 자리에 배포됩니다. 이전 원본은 휴지통으로 이동합니다.",
-            "That install becomes the new source and is deployed elsewhere. The previous source moves to the trash.",
-          ),
-      confirmLabel: text("통일", "Apply"),
-      tone: "danger",
-    });
-    if (!proceed) return;
-    await runBusy("latest", async () => {
-      if (latest.kind === "source") {
-        await redeployToInstalls(entry.key, divergents);
-        onChanged(text(
-          `'${entry.key}'의 갈라진 자리를 보관 원본으로 맞췄습니다.`,
-          `Aligned the diverged locations of '${entry.key}' with the archived source.`,
-        ));
-        return;
-      }
-      await syncSkillFromInstall(latest.install.skillId);
-      onChanged(text(
-        `'${entry.key}'을 ${providerLabel(latest.provider)}의 최신 사용본으로 맞췄습니다. 이전 원본은 휴지통에 있습니다.`,
-        `Aligned '${entry.key}' with the newest install from ${providerLabel(latest.provider)}. The previous source is in the trash.`,
-      ));
     });
   };
 
@@ -2313,12 +2292,10 @@ function SkillLibraryDrawer({
       {entry.common && divergentInstalls.length > 0 && (
         <SkillDivergentSection
           divergentInstalls={divergentInstalls}
-          latest={latestSkillVersion(entry.common.modifiedAtMs, divergentInstalls)}
-          onApplyLatest={(latest) => { void runApplyLatest(latest, divergentInstalls); }}
           useBusy={useBusy}
           busy={busy}
-          onSync={(install) => { void runSync(install); }}
-          onRedeploy={(provider, install) => { void runRedeploy(provider, install); }}
+          onSync={(provider, install) => { void runSync(provider, install); }}
+          onRevertInstall={(provider, install) => { void runRevertInstall(provider, install); }}
         />
       )}
 
@@ -2447,63 +2424,47 @@ function SkillLocationMatrixSection({
  * 보관 원본과 내용이 갈라진 사용본 목록. 각 사본의 차이 비교(열림/닫힘)와 조치 버튼을
  * 서랍 본체와 분리한다.
  *
- * 조치는 방향에 따라 반대다. 예전에는 두 방향을 "외부 수정 감지" 한 이름으로 부르고
- * 버튼도 "이 버전으로 동기화" 하나만 두어서, 배포가 덜 된 뒤처진 사본에도 그 버튼이
- * 유일한 출구로 보였다 — 누르면 옛 사본이 새 원본이 되어 최신 내용이 휴지통으로 갔다.
- * 그래서 뒤처진 사본에는 원본 재배포를 먼저 세우고, 채택 버튼은 그 뒤에 남긴다.
+ * 카드가 묻는 것은 자리마다 하나다 — 이 차이를 어느 쪽으로 맞출까. 답이 둘이라 행의
+ * 조치도 둘이다: "변경사항 취소"가 보관 원본 쪽이고, "이 버전으로 통일"이 그 사용본
+ * 쪽이다. 조치는 전부 행에 있고 카드 머리에는 하나도 두지 않는다.
+ *
+ * 한동안 머리에 전역 버튼이 있었다. 처음에는 수정 시각으로 방향을 대신 골라 주는
+ * "최신본으로 통일"이었고, 그 다음에는 모든 자리를 한 번에 되돌리는 "변경사항 취소"였다.
+ * 둘 다 실제로 부르는 것은 행의 조치와 **같은 호출**이었다 — 동작 둘을 버튼 셋이 나눠
+ * 갖고 있어서, 사용자가 조치를 고르기 전에 "이 둘이 뭐가 다르냐"를 먼저 풀어야 했다.
+ * 범위를 행 하나로 통일하면 그 질문이 사라진다. 갈라진 자리가 여럿일 때 전부 되돌리려면
+ * 행마다 누른다 — 묶음 조치가 다시 필요해지면 그때 세운다.
+ *
+ * 어느 쪽이 새 내용인지는 행의 배지(뒤처짐·외부 수정 감지)와 변경 내용 보기가 말해 준다.
+ * 방향은 버튼의 존재가 아니라 어느 쪽이 주 버튼(primary)으로 서느냐로 말한다 — 뒤처진
+ * 사본에서만 되돌리기가 주 버튼이고, 사람이 정해야 하는 자리(외부 수정·방향 모름)에서는
+ * 둘 다 주 버튼이 아니어서 고르라는 사실이 그대로 보인다.
  */
 function SkillDivergentSection({
   divergentInstalls,
   useBusy,
   busy,
-  latest,
   onSync,
-  onRedeploy,
-  onApplyLatest,
+  onRevertInstall,
 }: {
   divergentInstalls: readonly SkillDivergentInstall[];
   useBusy: string | null;
   busy: SkillDrawerBusy | null;
-  /** 갈라진 자리 중 가장 나중에 고쳐진 쪽. 한 번에 통일할 때의 기준이다. */
-  latest: SkillLatestVersion;
-  onSync: (install: SkillInstallView) => void;
-  onRedeploy: (provider: ProviderId, install: SkillInstallView) => void;
-  onApplyLatest: (latest: SkillLatestVersion) => void;
+  onSync: (provider: ProviderId, install: SkillInstallView) => void;
+  onRevertInstall: (provider: ProviderId, install: SkillInstallView) => void;
 }) {
   const { text } = useI18n();
   const [compareSkillId, setCompareSkillId] = useState<string | null>(null);
   const disabled = busy !== null || useBusy !== null;
-  const latestLabel = latest.kind === "install"
-    ? `${providerLabel(latest.provider)} ${text("사용본", "install")}`
-    : text("보관 원본", "archived source");
 
   return (
     <section className="detail-card">
       <div className="section-title">
         <h3>{text("원본과 다른 사용본", "Installs differing from the source")}</h3>
-        <div className="section-title-actions">
-          {/* 자리마다 방향을 읽고 버튼을 고르는 대신, 수정 시각이 정한 최신본으로 한 번에
-              맞춘다. 시각을 모르는 자리가 섞이면 고를 근거가 없어 누를 수 없게 둔다. */}
-          <button
-            className="button compact primary"
-            type="button"
-            disabled={disabled || latest.kind === "unknown"}
-            title={latest.kind === "unknown"
-              ? text(
-                  "수정 시각을 읽지 못한 자리가 있어 최신본을 고를 수 없습니다. 변경 내용을 보고 직접 정하세요.",
-                  "Some locations have no readable modification time, so the newest version cannot be chosen. Compare the changes and decide manually.",
-                )
-              : text(`기준: ${latestLabel}`, `Basis: ${latestLabel}`)}
-            onClick={() => onApplyLatest(latest)}
-          >
-            <ArrowUpFromLine size={13} aria-hidden="true" />
-            {busy === "latest" ? text("맞추는 중…", "Applying…") : text("최신본으로 통일", "Apply the newest")}
-          </button>
-        </div>
       </div>
       <p className="prose-copy">{text(
-        "아래 사용본이 보관 원본과 다릅니다. 뒤처진 사본은 원본을 다시 배포하면 맞춰지고, 원본보다 나중에 수정된 사본은 채택할지 정해야 합니다. 채택하면 그 버전이 원본이 되고 나머지 위치에 재배포되며, 이전 원본은 휴지통으로 이동합니다.",
-        "These installs differ from the archived source. An out-of-date copy is fixed by redeploying the source; a copy edited after the source needs a decision. Adopting one makes it the source, redeploys it everywhere else, and moves the previous source to the trash.",
+        "아래 사용본이 보관 원본과 다릅니다. 자리마다 어느 쪽으로 맞출지 고르세요. 변경사항 취소는 그 자리의 수정을 버리고 원본으로 되돌립니다. 이 버전으로 통일은 그 사용본을 새 원본으로 삼아 나머지 위치에 배포하고, 이전 원본은 휴지통으로 이동합니다.",
+        "These installs differ from the archived source. Choose a direction for each one. Discard changes throws away the edits at that location and restores the source. Apply this version makes that install the new source, deploys it to the other locations, and moves the previous source to the trash.",
       )}</p>
       <div className="skill-divergent-list">
         {divergentInstalls.map(({ provider, install }) => {
@@ -2524,11 +2485,20 @@ function SkillDivergentSection({
               >
                 <FileDiff size={13} aria-hidden="true" />{compareSkillId === install.skillId ? text("변경 내용 닫기", "Hide changes") : text("변경 내용 보기", "Show changes")}
               </button>
-              {stale && (
-                <button className="button compact primary" type="button" disabled={disabled} onClick={() => onRedeploy(provider, install)}>
-                  <Send size={13} aria-hidden="true" />{busy === "redeploy" ? text("배포 중…", "Deploying…") : text("원본 배포", "Deploy source")}
-                </button>
-              )}
+              <button
+                className={`button compact${stale ? " primary" : ""}`}
+                type="button"
+                disabled={disabled}
+                title={stale
+                  ? undefined
+                  : text(
+                      "이 자리를 보관 원본으로 되돌립니다. 원본보다 나중에 고친 내용은 버려집니다.",
+                      "Restores the archived source here. Edits made after the source are discarded.",
+                    )}
+                onClick={() => onRevertInstall(provider, install)}
+              >
+                <Undo2 size={13} aria-hidden="true" />{busy === "revert" ? text("되돌리는 중…", "Reverting…") : text("변경사항 취소", "Discard changes")}
+              </button>
               <button
                 className="button compact"
                 type="button"
@@ -2539,9 +2509,9 @@ function SkillDivergentSection({
                       "Adopts the out-of-date copy as the new source. The newer source content moves to the trash.",
                     )
                   : undefined}
-                onClick={() => onSync(install)}
+                onClick={() => onSync(provider, install)}
               >
-                <RefreshCw size={13} aria-hidden="true" />{busy === "sync" ? text("동기화 중…", "Syncing…") : text("이 버전으로 동기화", "Sync to this version")}
+                <RefreshCw size={13} aria-hidden="true" />{busy === "sync" ? text("통일하는 중…", "Applying…") : text("이 버전으로 통일", "Apply this version")}
               </button>
             </div>
             <small className="skill-divergent-hint">

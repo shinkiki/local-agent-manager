@@ -34,7 +34,17 @@ mkdir -p "$POOL/.lease"
 # 주 워크트리의 git status에 그대로 올라온다.
 EXCLUDE="/${POOL#"$MAIN"/}/"
 grep -qx "$EXCLUDE" "$MAIN/.git/info/exclude" 2>/dev/null || echo "$EXCLUDE" >> "$MAIN/.git/info/exclude"
-find "$POOL/.lease" -maxdepth 1 -type d -name 'lane-*' -mmin +180 -exec rm -rf {} + 2>/dev/null
+# 회수선은 120분이다. 긴 cargo 빌드가 이것을 넘길 수 있으므로 살아 있는 회차는
+# 반드시 아래 keepalive 규칙대로 `lane-$LANE/at` 을 찍어 시각을 갱신해야 한다.
+find "$POOL/.lease" -mindepth 1 -maxdepth 1 -type d -name 'lane-*' -mmin +120 -exec rm -rf {} + 2>/dev/null
+# `lane-*`이 디렉터리가 아니면 그것은 점유가 아니라 교착이다 — keepalive `touch`가 이미
+# 반납된 lease를 0바이트 일반 파일로 되살린 자리다. 그 파일이 있는 한 `mkdir`은 영원히
+# 실패하는데, 바로 위 스윙은 `-type d`라 파일을 집지 않아 스스로 풀리지 않는다. 그래서
+# 시각과 무관하게 지운다(2026-10-06 실측 — 좀비 keepalive 루프 하나가 L01을 6시간 막았다).
+find "$POOL/.lease" -mindepth 1 -maxdepth 1 ! -type d -name 'lane-*' -delete 2>/dev/null
+# 지난 회차가 `rm -rf` 대신 이름만 바꿔 둔 잔재. 쌓이면 `mkdir` 대신 `ls`로 점유를
+# 가날하려는 회차가 전 레인이 찬 것으로 오독한다(2026-10-06 실측 — 38건 쌓여 있었다).
+find "$POOL/.lease" -mindepth 1 -maxdepth 1 -type d \( -name 'released-*' -o -name 'returned-*' \) -mmin +1440 -exec rm -rf {} + 2>/dev/null
 ORDER=$(seq -f 'L%02g' 1 "$LANES" | awk -v n=$(( ${RANDOM:-0} % LANES )) '{a[NR]=$0} END{for(i=1;i<=NR;i++) print a[((i+n-1)%NR)+1]}')
 LANE=""; for n in $ORDER; do
   [ -e "$POOL/.lease/blocked-$n" ] && continue
@@ -45,10 +55,24 @@ date > "$POOL/.lease/lane-$LANE/at"; echo "LANE=$LANE"
 ```
 
 - 시작 지점을 무작위로 돌려 회차들이 앞에서부터 줄서지 않게 한다.
+- **점유 여부는 `mkdir`의 성패로만 판단한다.** `ls`로 먼저 훑어 "차 있어 보인다"로
+  물러나지 않는다 — `.lease`에는 점유가 아닌 이름(`items`·`push`·`blocked-*`·잔재)이
+  섞여 있어 눈으로 세면 틀린다. `NO-FREE-LANE`은 레인 전부에서 `mkdir`이 실제로
+  실패했을 때만 쓴다.
 - `blocked-<레인>`은 사람이 손봐야 하는 레인이라 건너뛴다(6-3).
 - `NO-FREE-LANE`이면 **작업을 시작하지 말고** 점유·차단 목록과 함께 보고하고 끝낸다.
-- 180분 넘게 그대로인 점유는 죽은 회차로 보고 회수한다. 긴 빌드 전에는
-  `touch "$POOL/.lease/lane-$LANE"`로 살아 있다는 표시를 남긴다.
+- **120분** 넘게 그대로인 점유는 죽은 회차로 보고 회수한다. 그러므로 **120분을 넘길 일을
+  할 때는 keepalive가 선택이 아니다** — 긴 빌드·연속 측정 앞뒤에서
+  `touch "$POOL/.lease/lane-$LANE/at"`로 살아 있다는 표시를 남긴다. **디렉터리가 아니라
+  그 안의 파일을 찍는다.** 디렉터리 이름을 찍으면 7절에서 반납한 뒤에 그 이름이 0바이트
+  일반 파일로 되살아나 그 레인이 영구히 막힌다.
+- **keepalive를 백그라운드 루프로 돌리지 않는다.** 긴 명령 앞뒤에서 전경으로 한 번씩
+  찍는다. 루프는 회차가 끝나도 살아남아 남의 레인을 막는다 — 기다리던 산출물이 끝내
+  나오지 않은 `until [ -f <파일> ]; do touch ...; sleep 20; done` 하나가 6시간 동안 L01을
+  막았다(2026-10-06 실측). 꼭 필요하면 pid를 잡아 두고 7절에서 죽인다.
+  ```sh
+  ( while :; do touch "$POOL/.lease/lane-$LANE/at"; sleep 60; done ) & KEEPALIVE=$!
+  ```
 - 레인을 잡았으면 **어떤 경로로 끝나든 7절에서 반납한다.**
 
 ## 금지 — 주 워크트리에서 작업하지 않는다
@@ -96,7 +120,9 @@ git rev-list --count "$DEV".."round/lane-$LANE"    # 0이 아니면 아래
 ```sh
 # 되감기 전에 여기가 레인 워크트리인지 확인한다. `cd`가 실패했거나 워크트리가 사라졌으면
 # 아래 세 줄은 **사용자의 주 워크트리를 비운다.**
-[ "$(git rev-parse --show-toplevel)" = "$(cd "$WT" && pwd -P)" ] || { echo NOT-IN-LANE; exit 6; }
+# Windows(MSYS)에서는 pwd -P 가 /f/... 를, git 은 F:/... 를 돌려줘 문자열 비교가 언제나 어긋난다.
+# cygpath -m 으로 git 과 같은 표기에 맞춘다. cygpath 가 없는 OS 에서는 pwd -P 그대로다(2026-10-05).
+[ "$(git rev-parse --show-toplevel)" = "$(cd "$WT" && { cygpath -m "$(pwd -P)" 2>/dev/null || pwd -P; })" ] || { echo NOT-IN-LANE; exit 6; }
 git reset --hard -q && git clean -fdq
 git checkout -q -B "round/lane-$LANE" "$DEV"
 git status --short        # 비어 있어야 한다. 아니면 멈추고 보고
@@ -122,15 +148,17 @@ ln -sfn "$MAIN/node_modules" node_modules   # 있는 프로젝트만
 ```sh
 ITEM=<고른 항목 id>
 mkdir -p "$POOL/.lease/items"
-find "$POOL/.lease/items" -maxdepth 1 -type d -mmin +180 -exec rm -rf {} + 2>/dev/null
+# `-mindepth 1`이 없으면 find가 items 디렉터리 **자신**을 지워 동시에 도는 다른 레인의
+# 점유가 통째로 날아간다(2026-10-06 실측).
+find "$POOL/.lease/items" -mindepth 1 -maxdepth 1 -type d -mmin +120 -exec rm -rf {} + 2>/dev/null
 mkdir "$POOL/.lease/items/$ITEM" 2>/dev/null || { echo ITEM-TAKEN; }   # 다른 항목을 고른다
 ```
 
 `ITEM-TAKEN`이면 다른 항목으로 넘어간다. 잡을 항목이 하나도 없으면 아무것도 만들지 말고
 "남은 항목 없음"으로 보고하고 끝낸다. 항목 점유는 7절에서 레인과 함께 반납한다.
 
-경로는 겹칠 수 있다. 겹친 결과는 6절의 rebase가 정리하고, 거기서 충돌하면 다음 회차가
-이어받는다.
+경로는 겹칠 수 있다. 겹친 결과는 6절의 rebase가 정리하고, 거기서 충돌하면 그 회차가
+그 자리에서 푼다(6-3).
 
 ### 경로 소유(`분할: 경로 소유`)
 
@@ -147,8 +175,10 @@ mkdir "$POOL/.lease/items/$ITEM" 2>/dev/null || { echo ITEM-TAKEN; }   # 다른 
   ```sh
   export CARGO_TARGET_DIR="$POOL/target/$LANE" CARGO_BUILD_JOBS=2
   df -g / | tail -1      # 여유가 40G 미만이면 빌드하지 말고 그대로 보고하고 끝낸다
-  touch "$POOL/.lease/lane-$LANE"
+  touch "$POOL/.lease/lane-$LANE/at"     # 디렉터리가 아니라 그 안의 파일을 찍는다(0절)
   ```
+  빌드나 연속 측정이 120분을 넘길 수 있으면 **중간에도 한 번씩 더 찍는다** —
+  회수선이 120분이라 그렇게 하지 않으면 살아 있는 내 레인을 남이 가져간다.
 - 포트를 여는 검증(e2e·개발 서버)은 레인마다 다른 포트를 쓴다.
 - 레인의 빌드 디렉터리는 회차가 끝나도 지우지 않는다. 디스크가 부족할 때만 자기 것을 비운다.
 
@@ -179,16 +209,26 @@ git commit -m "<프로젝트 규칙에 맞는 제목>"
 
 ### 6-1. 락을 잡고 작업브랜치 위로 옮긴다
 
+남은 변경이 있으면 먼저 커밋한다. rebase 는 더러운 워크트리에서 시작하지 않으므로, 여기서
+멈추면 반영이 통째로 밀린다. 이 레인에서 만들어진 것은 이 회차의 일감이니 버리지 않는다 —
+소유 밖 경로만 4절 규칙대로 되돌리고 나머지는 커밋에 담는다.
+
 ```sh
 cd "$WT" || exit 1
-find "$POOL/.lease" -maxdepth 1 -type d -name push -mmin +15 -exec rm -rf {} + 2>/dev/null
+if [ -n "$(git status --porcelain)" ]; then
+  git add -A && git commit -q -m "<회차 제목> (레인 $LANE 잔여분)"
+fi
+find "$POOL/.lease" -mindepth 1 -maxdepth 1 -type d -name push -mmin +15 -exec rm -rf {} + 2>/dev/null
 mkdir "$POOL/.lease/push" 2>/dev/null || { echo LOCK-BUSY; exit 4; }
 echo "$LANE" > "$POOL/.lease/push/owner"
 [ -n "$REMOTE" ] && { git fetch -q "$REMOTE" || git fetch -q "$REMOTE"; }
 BASE=$(git merge-base HEAD "$DEV")
 echo "INCOMING>>"; git log --name-only --pretty= "$BASE".."$DEV" | sort -u; echo "<<"
-if git rebase -q "$DEV"; then echo REBASED-OK; else git rebase --abort; echo REBASE-CONFLICT; fi
+if git rebase -q "$DEV"; then echo REBASED-OK; else echo REBASE-CONFLICT; git status --short; fi
 ```
+
+`REBASE-CONFLICT`면 **되돌리지 말고 그 자리에서 푼다.** 예전에는 `--abort` 하고 다음
+회차에 넘겼는데, 그러면 같은 자리가 회차마다 다시 충돌해 레인이 막히고 반영이 계속 밀린다.
 
 `LOCK-BUSY`면 다른 레인이 반영 중이다. **같은 블록을 다시 실행한다(최대 5회).** 5회 모두
 실패하면 커밋을 레인 브랜치에 남긴 채 보고하고 끝낸다 — 다음 회차 1절이 이어받는다.
@@ -214,15 +254,37 @@ rm -rf "$POOL/.lease/push"
 
 push가 경합 오류로 실패하면 한 번 더 실행한다. 비속행 거부는 6-3으로 간다.
 
-### 6-3. 충돌·거부는 힘으로 풀지 않는다
+### 6-3. 충돌은 푼다 — 다만 힘으로 밀지는 않는다
+
+충돌한 파일마다 **양쪽을 다 읽고** 합친다. 내 변경으로 덮거나(`--ours`) 들어온 변경으로
+덮는(`--theirs`) 일괄 처리는 하지 않는다 — 그건 푸는 것이 아니라 한쪽을 버리는 것이고,
+버려진 쪽은 이미 작업브랜치에 반영된 남의 변경이다.
 
 ```sh
+git diff --name-only --diff-filter=U        # 충돌한 파일
+# 파일마다 열어서 양쪽 의도를 살려 고친다
+git add <푼 파일>
+git rebase --continue
+```
+
+푼 뒤에는 **반드시 3절 검증을 다시 돌린다.** 충돌을 풀었다는 것은 코드가 방금 바뀌었다는
+뜻이라, 풀기 전의 통과 기록은 더 이상 이 커밋을 보증하지 않는다. 검증까지 통과하면
+6-1부터 다시 실행해 반영한다.
+
+보고에는 **어떤 파일에서 무엇과 무엇이 부딪혔고 어느 쪽을 어떻게 살렸는지** 적는다.
+무인 실행이라 사람이 나중에 읽고 판단할 근거가 이 기록뿐이다.
+
+풀 수 없을 때만 물러난다 — 양쪽 의도가 정말로 배타적이거나, 들어온 변경의 맥락을 알 수
+없어 살릴 방법을 모르겠을 때다.
+
+```sh
+git rebase --abort
 rm -rf "$POOL/.lease/push"
 ```
 
-**`--force`도 재리베이스도 하지 않는다.** 커밋은 레인 브랜치에 남기고 어떤 파일이
-충돌했는지 보고한다. 다음 회차 1절이 그 브랜치를 이어받아 다시 반영을 시도하고, 거기서도
-실패하면 그 레인을 막고 다른 레인으로 옮긴다.
+**`--force`는 어느 경우에도 하지 않는다.** 커밋은 레인 브랜치에 남기고 무엇이 왜 풀리지
+않았는지 보고한다. 다음 회차 1절이 그 브랜치를 이어받고, 거기서도 실패하면 그 레인을 막고
+다른 레인으로 옮긴다.
 
 ```sh
 touch "$POOL/.lease/blocked-$LANE"     # 다음 회차들은 이 레인을 건너뛴다
@@ -234,9 +296,16 @@ rm -rf "$POOL/.lease/lane-$LANE"       # 점유 반납 뒤 0절부터 새 레인
 ## 7. 반납 — 어떤 경로로 끝나든 한다
 
 ```sh
+[ -n "$KEEPALIVE" ] && kill "$KEEPALIVE" 2>/dev/null   # 0절에서 띄웠으면 반드시 죽인다
 rm -rf "$POOL/.lease/lane-$LANE"
 [ -n "$ITEM" ] && rm -rf "$POOL/.lease/items/$ITEM"
 ```
+
+**반납은 이름을 바꾸는 것이 아니라 지우는 것이다.** `released-*`·`returned-*`로 바꿔 두면
+`.lease`에 잔재가 쌓여 다음 회차가 점유 상황을 오독한다(0절).
+
+반납 전에 **이 회차가 띄운 백그라운드 프로세스가 하나도 남지 않았는지** 확인한다.
+keepalive·감시 루프·`tail -f`가 살아남으면 레인을 반납해도 레인이 열리지 않는다.
 
 워크트리와 빌드 디렉터리는 남긴다. 다음 회차가 재사용한다.
 
@@ -250,8 +319,9 @@ rm -rf "$POOL/.lease/lane-$LANE"
 - 실행한 검증과 결과 줄
 - 커밋 해시와 반영 결과(`REBASED-OK`/`REBASE-CONFLICT`/`LOCK-BUSY`, 민 해시)
 - 외부 상태를 바꿨는지(반영 뒤에만)
-- 레인·항목을 반납했는지
+- 레인·항목을 반납했는지, 띄운 백그라운드 프로세스를 전부 거뒀는지
 - 다음 회차 몫으로 남긴 것
 
 `NO-FREE-LANE`·`WORKTREE-FAILED`·디스크 부족·검증 실패·반영 실패로 끝났을 때도 무엇을
-확인하고 왜 멈췄는지 같은 형식으로 보고한다.
+확인하고 왜 멈췄는지 같은 형식으로 보고한다. `NO-FREE-LANE`을 적을 때는 `ls "$POOL/.lease"`
+결과를 그대로 붙인다 — 몇 번 레인에서 `mkdir`이 실패했는지가 사람이 볼 증거다.

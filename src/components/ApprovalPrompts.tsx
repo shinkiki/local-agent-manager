@@ -13,6 +13,7 @@ import type { ChatApprovalDecision, ChatApprovalQuestion } from "../types";
 import { useI18n } from "../lib/i18n";
 
 import { runtimeCatalogText } from "../lib/i18nRuntime";
+import { recommendedPicks, splitRecommendedLabel } from "../lib/approvalQuestions";
 export interface ChatApprovalPrompt {
   id: string;
   /**
@@ -97,7 +98,9 @@ export function ChatApprovalCard({ prompt, onDecision }: { prompt: ChatApprovalP
   // 고른 선택지는 라벨 목록으로 들고 있다가 보낼 때만 한 줄로 잇는다. 이어 붙인 문자열을
   // 상태로 두면 라벨에 콤마가 든 선택지("예, 그대로 둡니다")를 다시 갈라낼 수 없어, 고른
   // 선택지가 골라지지 않은 것처럼 보였다.
-  const [picks, setPicks] = useState<Record<string, string[]>>({});
+  // 모델이 추천으로 표시한 선택지는 미리 골라 둔다. 답이 없으면 추천값으로 진행한다는 회차
+  // 문진 규칙과 같은 방향이라, 동의할 때는 "답변 보내기" 한 번이면 된다.
+  const [picks, setPicks] = useState<Record<string, string[]>>(() => (prompt.interactive && !prompt.resolved ? recommendedPicks(questions) : {}));
   // C9-19. sudo 비밀번호. 카드가 사라지면 함께 사라지고, 어떤 이벤트에도 되비치지 않는다.
   const [secret, setSecret] = useState("");
   // C17. 이 값을 기기 보관으로도 옮길지. 저장은 값이 들어오는 이 순간에만 할 수 있어서
@@ -370,6 +373,7 @@ function joinedAnswers(picks: Record<string, string[]>): Record<string, string> 
 }
 
 function ChatApprovalQuestionField({ question, answer, onAnswer }: { question: ChatApprovalQuestion; answer: string[]; onAnswer: (labels: string[]) => void }) {
+  const { text } = useI18n();
   const name = useId();
   const [custom, setCustom] = useState("");
   const [customPicked, setCustomPicked] = useState(false);
@@ -408,17 +412,23 @@ function ChatApprovalQuestionField({ question, answer, onAnswer }: { question: C
   return (
     <div className="chat-approval-question" role="group" aria-labelledby={`${name}-label`}>
       <p id={`${name}-label`}>{question.header && <em>{question.header}</em>}<span>{question.question}</span></p>
-      {question.options.map((option) => (
-        <label key={option.label}>
-          <input
-            type={question.multiSelect ? "checkbox" : "radio"}
-            name={name}
-            checked={picked.has(option.label)}
-            onChange={() => toggle(option.label)}
-          />
-          <span><b>{option.label}</b>{option.description && <small>{option.description}</small>}</span>
-        </label>
-      ))}
+      {question.options.map((option) => {
+        const { display, recommended } = splitRecommendedLabel(option.label);
+        return (
+          <label key={option.label}>
+            <input
+              type={question.multiSelect ? "checkbox" : "radio"}
+              name={name}
+              checked={picked.has(option.label)}
+              onChange={() => toggle(option.label)}
+            />
+            <span>
+              <b>{display}{recommended && <i className="chat-approval-recommended">{text("추천", "Recommended")}</i>}</b>
+              {option.description && <small>{option.description}</small>}
+            </span>
+          </label>
+        );
+      })}
       <label className="chat-approval-question-custom">
         <input
           type={question.multiSelect ? "checkbox" : "radio"}

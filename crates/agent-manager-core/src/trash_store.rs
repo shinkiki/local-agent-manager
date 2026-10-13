@@ -191,9 +191,16 @@ pub(crate) fn purge(root: &Path, id: Option<&str>) -> Result<usize, CoreError> {
     }
 }
 
-/// 검증한 항목 ID 하나만 지운다. 경로 구분자를 막아 휴지통 밖 삭제를 차단한다.
+/// 검증한 항목 ID 하나만 지운다. 경로 구분자를 막아 휴지통 밖 삭제를 차단하고, 단일
+/// 일반 경로 성분만 받는다 — `.`은 구분자도 `..`도 아니지만 `root.join(".")`이 휴지통
+/// 루트 자체라 항목 하나 대신 휴지통 전체를 지우게 된다(G10).
 fn purge_entry(root: &Path, id: &str) -> Result<usize, CoreError> {
-    if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
+    let mut components = Path::new(id).components();
+    let single_normal = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if !single_normal || id.contains(['/', '\\']) || id.contains("..") {
         return Err(CoreError::InvalidInput(
             "휴지통 항목 ID가 올바르지 않습니다".to_owned(),
         ));
@@ -460,7 +467,15 @@ mod tests {
         let root = directory.path().join("trash");
         fs::create_dir_all(root.join("kept")).expect("kept entry");
 
-        for escaping in ["", "../outside", "nested/entry", "..\\outside"] {
+        for escaping in [
+            "",
+            ".",
+            "./",
+            "kept/.",
+            "../outside",
+            "nested/entry",
+            "..\\outside",
+        ] {
             assert!(matches!(
                 purge(&root, Some(escaping)),
                 Err(CoreError::InvalidInput(_))

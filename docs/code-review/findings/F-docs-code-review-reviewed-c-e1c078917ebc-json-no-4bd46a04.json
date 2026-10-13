@@ -1,0 +1,22 @@
+{
+  "findingId": "F-docs-code-review-reviewed-c-e1c078917ebc-json-no-4bd46a04",
+  "file": "docs/code-review/reviewed/C-e1c078917ebc.json",
+  "symbol": "notes",
+  "symptom": "장부 본문이 JSON 으로 읽히지 않는다",
+  "severity": "P2",
+  "state": "fixed",
+  "agentsRules": [],
+  "detail": "notes 에 정규식을 날것으로 적으면서 \\b·\\d·\\[ 가 홑백슬래시로 들어갔다. JSON 에서 \\d 와 \\[ 는 없는 escape 라 JSON.parse 가 던진다. 재현: node -e \"JSON.parse(require('fs').readFileSync('docs/code-review/reviewed/C-e1c078917ebc.json','utf8'))\" 가 SyntaxError 로 떨어진다. 그런데 러너(scripts/code-review-queue.mjs 의 readLedger)는 본문이 깨져도 이름만으로 리뷰된 것으로 세고 넘어가도록 일부러 catch 해 두어 아무 소리도 나지 않는다 — 그래서 itemId 대조·kind·reviewedAt 가 조용히 사라지고, 장부를 읽는 쪽은 verdict 와 notes 를 영영 보지 못한다.",
+  "occurrences": [
+    {
+      "itemId": "C-10d2fdc0d5ff",
+      "at": "2026-10-05T21:00:00Z"
+    },
+    {
+      "itemId": "C-6dbb32d16159",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L02"
+    }
+  ],
+  "fixCommits": []
+}

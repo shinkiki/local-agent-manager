@@ -1,0 +1,12 @@
+{
+  "itemId": "C-52724c79607d",
+  "kind": "commit",
+  "ref": "52724c79607d907a5d76388b202e7dd2b74191e4",
+  "reviewedAt": "2026-10-06T03:10:00Z",
+  "lane": "L09",
+  "source": "claude",
+  "verdict": "결함 0건",
+  "findings": [],
+  "commits": [],
+  "notes": "장부 C-e1c078917ebc.json 의 notes 백슬래시 escape 교정과, reviewed/·findings/ 전 파일을 JSON 으로 읽어 이름과 본문 id 를 대조하는 시험(src/lib/codeReviewQueue.test.mjs)을 세운 커밋. 정확성: 시험이 .json 만 거르므로 두 폴더의 .gitkeep 이 오탐으로 떨어지지 않는 것을 실측 확인했다(필터를 빼면 .gitkeep 두 건이 바로 떨어진다). name.slice(0, -'.json'.length) 는 readLedger 가 쓰는 식과 같아 id 대조가 러너와 어긋나지 않는다. assert.doesNotThrow 의 두 번째 문자열 인자는 Node 22 에서 message 로 쓰이고 원래 SyntaxError 본문도 'Actual message:' 로 함께 남아, 깨진 파일 이름과 원인이 둘 다 출력된다(실측). 보안 불변식: 문서 JSON 과 시험 파일만 건드려 자격증명·공급자 소유 저장소·셸 문자열·경로 정규화·쓰기 게이트에 닿지 않는다(G1~G11 해당 없음). 계약: README 의 장부 모양(itemId·findingId 가 파일 이름과 같다)을 시험이 그대로 집행하고, readLedger 가 깨진 본문을 이름만으로 세는 catch 는 중복 방지를 위해 일부러 남긴 것이라 그대로 두는 것이 맞다 — 그 catch 가 삼키던 신호를 시험이 바깥에서 받는 모양이다. 검증 없음: 해당 없음. 시험이 수정 전 본문에서 실제로 떨어지는 것을 되짚었다(doesNotThrow 로 실패, 복원 후 통과). 시험 파일이 npm run test:unit 의 src/lib/*.test.mjs 글롭과 --experimental-strip-types 안에 들어 있어 회차마다 실제로 돈다. 단순화: 중복 없음."
+}

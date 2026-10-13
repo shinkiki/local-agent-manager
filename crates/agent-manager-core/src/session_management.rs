@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::identity;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
@@ -14,7 +14,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::app_data_file::{read_private_json, read_private_json_or_default, write_private_json};
+use crate::app_data_file::{
+    open_private_append_file, open_private_file, read_private_json, read_private_json_or_default,
+    write_private_json,
+};
 use crate::catalog::{INTERRUPTED_ROLE, RUNTIME_FAILURE_ROLE};
 use crate::chat::ResumeInputs;
 use crate::clock::now_ms;
@@ -1472,14 +1475,20 @@ fn rebindable_sessions(
     // 사용자가 직접 멈춘 다른 채팅은 계속 live 목록만 본다.
     let candidates = if signal.reason == AutoSwitchReason::AgentLimited && signal.chat_id.is_some()
     {
+        // 제한 응답을 낸 정확한 채팅은 종료 직후 live 목록에서 빠질 수 있다. AIA도 같은
+        // 계정별 런타임을 쓰므로 프로필을 가르지 않고 전체에서 chat_id로 다시 좁힌다.
         chats.all_chats()?
     } else {
-        chats.live_chats(ChatProfile::Standard)?
+        let mut candidates = Vec::new();
+        for profile in auto_switch_live_profiles(signal.reason) {
+            candidates.extend(chats.live_chats(profile)?);
+        }
+        candidates
     };
     Ok(candidates
         .into_iter()
         .filter(|info| {
-            info.profile == ChatProfile::Standard
+            matches!(info.profile, ChatProfile::Standard | ChatProfile::Aia)
                 && info.source == signal.provider
                 && info.provider_session_id.is_some()
                 && info.account_id.as_deref() == Some(signal.account_id.as_str())
@@ -1520,6 +1529,17 @@ fn rebindable_sessions(
         .collect())
 }
 
+/// 사용량 갱신 신호가 훑을 live 프로필. 사용량 분산은 지금까지처럼 일반 유휴 채팅만
+/// 옮기고, 계정이 실제로 소진된 경우에만 같은 계정에 갇힌 AIA 런타임까지 복구한다.
+fn auto_switch_live_profiles(reason: AutoSwitchReason) -> Vec<ChatProfile> {
+    match reason {
+        AutoSwitchReason::UsageExhausted => vec![ChatProfile::Standard, ChatProfile::Aia],
+        AutoSwitchReason::UsageSpread | AutoSwitchReason::AgentLimited => {
+            vec![ChatProfile::Standard]
+        }
+    }
+}
+
 /// 전환 직전에 캡처한 세션들을 새 활성 계정에서 resume으로 재시작하고, 한도로
 /// 응답을 받지 못한 사용자 입력을 새 세션에 순서대로 다시 보낸다.
 /// 실패한 세션은 카탈로그에 남아 있어 수동으로 다시 열 수 있으므로 로그만 남긴다.
@@ -1553,34 +1573,7 @@ fn resume_interrupted_sessions(
                 continue;
             }
         }
-        let request = ChatStartRequest {
-            // 다시 붙이는 것이지 새로 여는 것이 아니다. 원래 채팅이 쥐고 있던 것을 그대로
-            // 물려준다 — 계정만 바꾸는 자리에서 권한이 조용히 달라지면 안 된다.
-            system_tools: info.system_tools,
-            source: info.source,
-            account_id: account_id.map(str::to_owned),
-            cwd: info.cwd,
-            model: info.model,
-            local_connection_id: info.local_connection_id,
-            reasoning_effort: info.reasoning_effort,
-            mode: info.mode,
-            approval_mode: info.approval_mode,
-            resume_session_id: session_id.clone(),
-            handoff_origin: None,
-            fork_session_id: None,
-            origin: None,
-            capture_id: None,
-            unattended: false,
-            // 재바인딩은 세션을 다른 계정으로 옮기는 복구다. 여기서 고정하면 자동전환이
-            // 옮긴 계정을 그대로 못 박아 다음 페일오버를 막는다.
-            pin_account: false,
-            profile: ChatProfile::Standard,
-            decision_policy: Default::default(),
-            aia_runtime: None,
-            record_session: false,
-            settings: info.settings,
-            startup_cancel: None,
-        };
+        let request = auto_switch_resume_request(info, session_id.clone(), account_id);
         match chats.start(request) {
             Ok(attachment) => {
                 // start()가 돌려주는 화면 연결은 즉시 분리해, 다른 detached
@@ -1624,6 +1617,50 @@ fn resume_interrupted_sessions(
         }
     }
     resumed
+}
+
+/// 계정만 바꿔 세션을 재개할 요청. AIA는 프로필 하나가 시스템 도구·작업공간·지시문과
+/// 기록 정책을 함께 결정하므로 일반 채팅으로 낮추지 않고 직전 런타임의 신뢰된 설정을
+/// 그대로 옮긴다.
+fn auto_switch_resume_request(
+    info: ChatSessionInfo,
+    session_id: Option<String>,
+    account_id: Option<&str>,
+) -> ChatStartRequest {
+    let profile = info.profile;
+    let decision_policy = info
+        .aia_runtime
+        .as_ref()
+        .map(|runtime| runtime.decision_policy);
+    let record_session = info.record_session;
+    ChatStartRequest {
+        // 다시 붙이는 것이지 새로 여는 것이 아니다. 원래 채팅이 쥐고 있던 것을 그대로
+        // 물려준다 — 계정만 바꾸는 자리에서 권한이 조용히 달라지면 안 된다.
+        system_tools: info.system_tools,
+        source: info.source,
+        account_id: account_id.map(str::to_owned),
+        cwd: info.cwd,
+        model: info.model,
+        local_connection_id: info.local_connection_id,
+        reasoning_effort: info.reasoning_effort,
+        mode: info.mode,
+        approval_mode: info.approval_mode,
+        resume_session_id: session_id,
+        handoff_origin: None,
+        fork_session_id: None,
+        origin: None,
+        capture_id: None,
+        unattended: false,
+        // 재바인딩은 세션을 다른 계정으로 옮기는 복구다. 여기서 고정하면 자동전환이
+        // 옮긴 계정을 그대로 못 박아 다음 페일오버를 막는다.
+        pin_account: false,
+        profile,
+        decision_policy,
+        aia_runtime: info.aia_runtime,
+        record_session,
+        settings: info.settings,
+        startup_cancel: None,
+    }
 }
 
 /// 이어가기 기록에 남길, 옮기기 전 채팅의 값.
@@ -1790,7 +1827,7 @@ fn append_audit_as(
     };
     let result = (|| {
         let path = app_data_dir.join(AUDIT_FILE);
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = open_private_append_file(&path)?;
         serde_json::to_writer(&mut file, &record)?;
         file.write_all(b"\n")?;
         file.sync_data()?;
@@ -2445,13 +2482,10 @@ fn with_idempotency_store<T>(
     result
 }
 
+/// G10: 앱 데이터의 잠금 파일은 공용 열기(`O_NOFOLLOW`, 0600)를 거친다. 그 자리에 놓인
+/// 심볼릭 링크를 따라가 앱 데이터 밖 파일을 잠그거나 만들지 않는다.
 fn open_lock(path: &Path) -> Result<File, CoreError> {
-    Ok(OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(path)?)
+    open_private_file(path, false)
 }
 
 fn canonical_filter_path(path: Option<&str>) -> Result<Option<PathBuf>, CoreError> {
@@ -2741,6 +2775,79 @@ impl CursorPager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{AiaRuntimeSettings, AiaUiClickPolicy};
+
+    #[test]
+    fn exhausted_usage_includes_aia_but_usage_spread_keeps_existing_scope() {
+        assert_eq!(
+            auto_switch_live_profiles(AutoSwitchReason::UsageExhausted),
+            [ChatProfile::Standard, ChatProfile::Aia]
+        );
+        assert_eq!(
+            auto_switch_live_profiles(AutoSwitchReason::UsageSpread),
+            [ChatProfile::Standard]
+        );
+    }
+
+    #[test]
+    fn aia_auto_switch_resume_preserves_the_trusted_runtime_contract() {
+        let aia_runtime = AiaRuntimeSettings {
+            model: Some("gpt-test".to_owned()),
+            local_connection_id: None,
+            reasoning_effort: Some(crate::ReasoningEffort::High),
+            mode: crate::ChatMode::FullAccess,
+            approval_mode: crate::ChatApprovalMode::AutoReview,
+            decision_policy: crate::AiaDecisionPolicy::Recommended,
+            ui_click_policy: AiaUiClickPolicy::All,
+            settings: BTreeMap::from([("web_search".to_owned(), "live".to_owned())]),
+        };
+        let info = ChatSessionInfo {
+            chat_id: "old-chat".to_owned(),
+            started_at: 1,
+            source: ProviderId::Codex,
+            account_id: Some("exhausted".to_owned()),
+            resuming: false,
+            provider_session_id: Some("session-1".to_owned()),
+            cwd: "/tmp/aia".to_owned(),
+            model: aia_runtime.model.clone(),
+            local_connection_id: None,
+            reasoning_effort: aia_runtime.reasoning_effort.clone(),
+            mode: aia_runtime.mode,
+            approval_mode: aia_runtime.approval_mode,
+            plan_auto_approval: false,
+            state: ChatPhase::Ready,
+            turn_count: 1,
+            last_turn_status: Some("failed".to_owned()),
+            last_activity_at: 1,
+            idle_ms: 0,
+            replay_truncated: false,
+            unattended: false,
+            origin: None,
+            attached: true,
+            interactive_approvals: false,
+            profile: ChatProfile::Aia,
+            system_tools: true,
+            settings: aia_runtime.settings.clone(),
+            aia_runtime: Some(aia_runtime.clone()),
+            record_session: true,
+            context_used_tokens: None,
+            context_window_tokens: None,
+        };
+
+        let request = auto_switch_resume_request(info, Some("session-1".to_owned()), Some("ready"));
+
+        assert_eq!(request.account_id.as_deref(), Some("ready"));
+        assert_eq!(request.resume_session_id.as_deref(), Some("session-1"));
+        assert_eq!(request.profile, ChatProfile::Aia);
+        assert!(request.system_tools);
+        assert!(request.record_session);
+        assert_eq!(
+            request.decision_policy,
+            Some(crate::AiaDecisionPolicy::Recommended)
+        );
+        assert_eq!(request.aia_runtime, Some(aia_runtime));
+        assert!(!request.pin_account);
+    }
 
     /// 기록의 목적지는 실제로 움직인 쪽이다. 결과가 0건인 신호는 사유와 무관하게 전환으로
     /// 남지 않는다 — 소진·한도 신호에 예외를 다시 두면 계정 배치가 그대로인데 "A → B" 알림이
@@ -2909,6 +3016,42 @@ mod tests {
 
         assert_eq!(executions, 1);
         assert_eq!(replay, first);
+    }
+
+    /// G10. 감사 기록의 잠금 파일과 기록 파일 자리에 심볼릭 링크가 놓여 있으면 따라가지 않는다.
+    /// 앱 데이터 밖 파일은 잠기지도, 기록이 덧붙지도, 새로 만들어지지도 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn g10_audit_append_refuses_symlinked_lock_and_log() {
+        let data = tempfile::tempdir().expect("app data");
+        let outside = tempfile::tempdir().expect("outside");
+        let append = |dir: &Path| {
+            append_system_audit(
+                dir,
+                "send_chat_message",
+                &json!({}),
+                SystemAuditPhase::Completed,
+                Some(true),
+                None,
+                None,
+            )
+        };
+
+        let lock_target = outside.path().join("victim.lock");
+        std::os::unix::fs::symlink(&lock_target, data.path().join(AUDIT_LOCK_FILE))
+            .expect("lock link");
+        assert!(append(data.path()).is_err());
+        assert!(!lock_target.exists(), "링크 너머에 잠금 파일이 생겼다");
+
+        fs::remove_file(data.path().join(AUDIT_LOCK_FILE)).expect("unlink");
+        let log_target = outside.path().join("victim.jsonl");
+        fs::write(&log_target, "original\n").expect("victim");
+        std::os::unix::fs::symlink(&log_target, data.path().join(AUDIT_FILE)).expect("log link");
+        assert!(append(data.path()).is_err());
+        assert_eq!(
+            fs::read_to_string(&log_target).expect("victim"),
+            "original\n"
+        );
     }
 
     #[test]

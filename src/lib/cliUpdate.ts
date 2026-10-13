@@ -11,8 +11,14 @@ export { cliUpdateAlert, hasCliUpdateAlert, shouldShowCliUpdatePanel } from "./c
 export type { CliUpdateAlert, CliUpdatePanelActivity } from "./cliUpdateAlerts.ts";
 
 export interface CliActionAccess {
-  /** 변경 권한이 있는지. 원격은 write 모드일 때만 확인·업데이트·캐시 정리를 실행한다. */
-  writable: boolean;
+  /**
+   * 데스크톱 셸이 없는 서버 단독 기동인지(`/api/access`의 `headless`). 컨테이너 배포에서
+   * CLI는 이미지 빌드 시점에 고정되므로 brew·npm 업데이트가 성립하지 않는다 —
+   * 돌더라도 다음 컨테이너 재생성에서 이미지 버전으로 되돌아간다. 그래서 헤드리스에서는
+   * 업데이트 버튼을 막고 "이미지 재빌드"를 갱신 경로로 안내한다
+   * (docs/headless-linux-gaps.md H11).
+   */
+  headless?: boolean;
   busy?: boolean;
 }
 
@@ -32,7 +38,14 @@ type CliActionBlock =
   | "updateUnsupported"
   | "cacheUnsupported"
   | "nothingToClear"
-  | "remoteWrite";
+  | "headlessImage";
+
+/**
+ * 헤드리스 배포에서 CLI를 갱신하는 유일한 경로. 화면의 업데이트 구획과 수동 안내가 같은
+ * 문장을 써야 해서 문구를 여기 한 번만 적는다.
+ */
+export const CLI_HEADLESS_IMAGE_HINT =
+  "컨테이너 이미지에 포함된 CLI입니다. 이미지를 다시 빌드해 갱신하세요.";
 
 /**
  * 막힘 갈래를 사용자에게 보일 문구로 옮기는 표. `null`인 갈래는 문구를 내지 않는다 —
@@ -51,8 +64,8 @@ const CLI_ACTION_BLOCK_REASONS: Record<
   cacheUnsupported: (status) =>
     status.modelCacheUnsupportedReason ?? "이 공급자는 자동 캐시 정리를 지원하지 않습니다.",
   nothingToClear: null,
-  // 원격 편집이 꺼져 있어 막힌 경우. 업데이트와 캐시 정리가 같은 문구를 쓴다.
-  remoteWrite: () => "원격 변경이 비활성화되어 있습니다.",
+  // 헤드리스(컨테이너) 배포. 갱신 경로가 brew·npm이 아니라 이미지 재빌드다.
+  headlessImage: () => CLI_HEADLESS_IMAGE_HINT,
 };
 
 /**
@@ -64,10 +77,13 @@ function executableActionBlock(
   supported: boolean,
   unsupported: CliActionBlock,
   access: CliActionAccess,
+  headlessBlocks = false,
 ): CliActionBlock | null {
   if (!cliDetected(status)) return "noExecutable";
+  // 헤드리스는 지원 여부보다 앞선다. 컨테이너에서는 설치 출처가 brew든 npm이든 갱신이
+  // 이미지 재빌드이므로, 공급자별 미지원 사유 대신 재빌드 안내 하나만 나가야 한다.
+  if (headlessBlocks && access.headless === true) return "headlessImage";
   if (!supported) return unsupported;
-  if (!access.writable) return "remoteWrite";
   return null;
 }
 
@@ -92,14 +108,15 @@ const CLI_ACTION_BLOCKS: Record<
 > = {
   check: (status, access) =>
     executableActionBlock(status, status.checkSupported, "checkUnsupported", access),
+  // 확인(읽기)과 캐시 정리(앱 데이터)는 헤드리스에서도 그대로 동작한다. 이미지에 고정된
+  // 것은 실행 파일뿐이므로 헤드리스가 막는 작업은 업데이트 하나다.
   update: (status, access) =>
-    executableActionBlock(status, status.updateSupported, "updateUnsupported", access),
+    executableActionBlock(status, status.updateSupported, "updateUnsupported", access, true),
   // 지울 대상이 없는 상태는 막힘과 나란히 두되 문구를 내지 않는 갈래(`nothingToClear`)로
   // 적어, 지울 것이 없을 뿐인 버튼에 경고가 붙지 않게 한다.
-  clearModelCaches: (status, access) => {
+  clearModelCaches: (status) => {
     if (status.modelCaches.length === 0) return "cacheUnsupported";
     if (!hasModelCacheCleanupTargets(status)) return "nothingToClear";
-    if (!access.writable) return "remoteWrite";
     return null;
   },
 };
@@ -144,6 +161,30 @@ export function cliUpdateBlockedReason(
   access: CliActionAccess,
 ): string | null {
   return cliActionBlockedReason("update", status, access);
+}
+
+/**
+ * 이 업데이트 사유가 헤드리스(이미지 재빌드) 사유인지. 화면은 이 자리에만 영어 짝을
+ * 붙이므로 문구를 문자열로 비교하는 대신 판정을 여기서 한 번만 한다 — 비교로 고르면
+ * 문구를 다듬는 순간 안내가 조용히 한국어로 돌아간다.
+ */
+export function isHeadlessImageUpdateBlock(
+  status: ProviderCliUpdateStatus,
+  access: CliActionAccess,
+): boolean {
+  return CLI_ACTION_BLOCKS.update(status, access) === "headlessImage";
+}
+
+/**
+ * brew·npm 수동 업데이트 안내를 보일지. 헤드리스에서는 갱신 경로가 이미지 재빌드뿐이라
+ * 수동 명령을 함께 적으면 서로 다른 두 경로를 동시에 말하게 된다. 판정을 JSX에 두면
+ * 시험이 닿지 않아 조건이 사라져도 전부 녹색이므로 여기서 정한다.
+ */
+export function shouldShowManualUpdateHint(
+  status: ProviderCliUpdateStatus,
+  access: CliActionAccess,
+): boolean {
+  return Boolean(status.manualUpdateHint) && access.headless !== true;
 }
 
 /** 캐시 정리 버튼을 누를 수 있는지. */

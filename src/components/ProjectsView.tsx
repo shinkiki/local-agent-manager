@@ -1,4 +1,4 @@
-import { FolderTree, GitBranch, Settings } from "lucide-react";
+import { FolderTree, GitBranch, Layers, Settings } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { errorText } from "../lib/errorText";
 import { useI18n } from "../lib/i18n";
@@ -9,12 +9,13 @@ import type { TabRequest } from "../lib/uiGuide";
 import type { ProjectRegistryEntry } from "../types";
 import { ProjectFilesPanel } from "./ProjectFilesPanel";
 import { ProjectGitPanel } from "./ProjectGitPanel";
+import { ProjectOverlayPanel } from "./ProjectOverlayPanel";
 import { ProjectRegistryCard } from "./ProjectRegistryCard";
 import { SettingsSubTabPanel, SettingsSubTabs, type SettingsSubTab } from "./SettingsSubTabs";
 import { EmptyState, ErrorBanner, LoadingState } from "./Shared";
 import { useStoredChoice } from "./SkillLibraryPanel";
 
-export type ProjectsTabId = "files" | "git" | "settings";
+export type ProjectsTabId = "files" | "git" | "overlay" | "settings";
 
 // 키에 "settings"가 들어가면 안 된다 — 설정 화면은 탭을 저장하지 않는다는 성질을 E2E가
 // "settings와 tab을 함께 담은 localStorage 키가 없다"로 보고 있다(am20260907-settings-tab-retention).
@@ -25,6 +26,7 @@ const PROJECTS_SELECTED_PATH_KEY = "agent-manager.projects-selected-path.v1";
 const projectsTabs: readonly SettingsSubTab<ProjectsTabId>[] = [
   { id: "files", icon: FolderTree, ko: "프로젝트", en: "Files", anchor: "projects.tab.files" },
   { id: "git", icon: GitBranch, ko: "형상관리", en: "Source control", anchor: "projects.tab.git" },
+  { id: "overlay", icon: Layers, ko: "Overlay", en: "Overlay", anchor: "projects.tab.overlay" },
   { id: "settings", icon: Settings, ko: "설정", en: "Settings", anchor: "projects.tab.settings" },
 ];
 
@@ -66,7 +68,7 @@ export function ProjectsView({ active, tabRequest = null, registryRevision, onRe
     writeStoredText(PROJECTS_SELECTED_PATH_KEY, path);
   };
 
-  const needsProject = tab === "files" || tab === "git";
+  const needsProject = tab === "files" || tab === "git" || tab === "overlay";
   return (
     // 파일·형상관리 탭은 창 높이를 채우고 안에서 스크롤하지만, 설정 탭은 카드가 흐르며
     // 바깥 패널이 스크롤한다 — 높이를 고정하면 설정 탭의 긴 목록이 잘린다.
@@ -90,6 +92,11 @@ export function ProjectsView({ active, tabRequest = null, registryRevision, onRe
       <SettingsSubTabPanel idPrefix="projects" id="git" active={tab === "git"}>
         <ProjectPanelBody registry={registry} selectedPath={selectedPath} onOpenSettings={() => setTab("settings")}>
           {(path) => <ProjectGitPanel key={path} projectPath={path} active={active && tab === "git"} onRequestAiaPrompt={onRequestAiaPrompt} />}
+        </ProjectPanelBody>
+      </SettingsSubTabPanel>
+      <SettingsSubTabPanel idPrefix="projects" id="overlay" active={tab === "overlay"}>
+        <ProjectPanelBody registry={registry} selectedPath={selectedPath} onOpenSettings={() => setTab("settings")}>
+          {(path) => <ProjectOverlayPanel key={path} projectPath={path} active={active && tab === "overlay"} />}
         </ProjectPanelBody>
       </SettingsSubTabPanel>
       <SettingsSubTabPanel idPrefix="projects" id="settings" active={tab === "settings"}>

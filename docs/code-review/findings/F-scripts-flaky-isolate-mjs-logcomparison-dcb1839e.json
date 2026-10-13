@@ -1,0 +1,13 @@
+{
+  "findingId": "F-scripts-flaky-isolate-mjs-logcomparison-dcb1839e",
+  "file": "scripts/flaky-isolate.mjs",
+  "symbol": "logComparison",
+  "symptom": "기준선 파일이 없을 때도 축이 없다고 찍는다",
+  "severity": "P3",
+  "state": "fixed",
+  "agentsRules": [],
+  "detail": "6b44077e 가 더한 logComparison 은 comparison === null 을 한 문장으로 뭉쳐 '기준선에 이 축이 없어 견주지 않았다'로 찍는다. 그 null 은 두 가지다 — docs/flaky-tests/baseline.json 이 아예 없을 때(readBaseline 이 ENOENT 로 null 을 돌려줌)와, 기준선은 있는데 그 축(failureKinds·diagnosticKinds)을 갖기 전에 적힌 것일 때. 기준선이 없는 첫 측정(baseline.json 을 지우고 --mode=suite 로 돌리면 재현)에서도 '기준선에 이 축이 없다'고 나와, 사람이 멀쩡한 기준선을 낡은 것으로 읽고 --write-baseline 으로 덮게 만든다. 또 이 글 만들기는 판정을 읽는 규칙인데 러너 안의 비공개 함수에 있어 시험이 닿지 않았다 — flaky-isolate.mjs 머리말이 '판정 규칙은 src/lib/flakyTestReport.ts 에 있고 여기서는 돌리고 모으기만 한다'로 적어 둔 계약과 어긋난다.",
+  "fix": "comparisonLines() 를 src/lib/flakyTestReport.ts 로 옮겨 내보내고 hasBaseline 을 받아 두 null 을 가른다. 러너는 기준선에서 분모만 꺼내 넘기고 찍기만 한다. payload 의 저장 형식(comparedToBaseline·comparedToBaselineDiagnostics)과 기존 문구는 그대로 두었다 — 기준선 파일의 계약이다.",
+  "occurrences": [{ "itemId": "C-6b44077e65c2", "at": "2026-10-05T20:40:00Z" }],
+  "fixCommits": ["fb82dc4c"]
+}

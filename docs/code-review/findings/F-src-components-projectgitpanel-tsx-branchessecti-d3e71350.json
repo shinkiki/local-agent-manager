@@ -1,0 +1,12 @@
+{
+  "findingId": "F-src-components-projectgitpanel-tsx-branchessecti-d3e71350",
+  "file": "src/components/ProjectGitPanel.tsx",
+  "symbol": "BranchesSection.fetchRemote",
+  "symptom": "원격 브랜치 우클릭 Fetch에 시험이 없고 원격 접두사 추출이 switchTo와 중복이다",
+  "detail": "af9507eabc40이 우클릭 메뉴에 더한 두 동작 중 Pull만 cypress/e2e/am20260928-projects-view-git.cy.ts가 덮는다. 원격 브랜치를 우클릭해 \"이 원격 가져오기\"를 눌렀을 때 fetch_project_git이 {remote, prune:true}로 불리는지 재는 시험이 없어, remoteFor가 null을 돌려 버튼이 아무 일도 하지 않는 회귀가 조용히 지나간다(리모트 이름이 브랜치 접두사와 다른 저장소에서 드러난다). 같은 줄의 `remoteNames.find((name) => branch.name.startsWith(`${name}/`))`는 바로 위 switchTo(1093줄)에 이미 있던 식을 다시 적은 것이다.",
+  "severity": "P3",
+  "state": "open",
+  "agentsRules": ["V2"],
+  "occurrences": [{ "itemId": "C-af9507eabc40", "at": "2026-10-06T00:00:00Z", "lane": "L07" }],
+  "triage": "정확성 결함이 아니라 시험 공백과 중복이라 이번 회차가 고치지 않았다. 고치려면 Cypress 한 칸(rung 4)을 돌려야 하는데, 이 회차가 실제로 고친 자리는 빌드 스크립트뿐이라 그 칸이 이 커밋을 보증하지 못한다. 다음 회차가 시험과 함께 remoteFor 한 곳으로 합치는 것을 권한다."
+}

@@ -432,6 +432,7 @@ mod tests {
             terminal_enabled: false,
             unrestricted_commands: false,
             updated_at: 0,
+            project_git_enabled: false,
         }
     }
 

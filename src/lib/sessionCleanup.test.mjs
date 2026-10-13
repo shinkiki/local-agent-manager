@@ -19,9 +19,9 @@ import {
 test("조건이 하나도 없으면 실행을 막고 이유를 말한다", () => {
   const empty = cleanupStatus({ policy: cleanupPolicy(NO_CLEANUP_CONDITIONS) });
   assert.equal(hasAnyCondition(empty.policy), false);
-  assert.equal(canRunCleanup(empty, { writable: true }), false);
+  assert.equal(canRunCleanup(empty, {}), false);
   assert.equal(
-    cleanupBlockedReason(empty, { writable: true }),
+    cleanupBlockedReason(empty, {}),
     "정리 조건을 하나 이상 켜야 실행할 수 있습니다.",
   );
 });
@@ -37,16 +37,16 @@ test("정리 조건 키 중 어느 하나라도 켜져 있으면 조건 활성�
 
 test("원격 변경이 꺼져 있으면 조건과 무관하게 막힌다", () => {
   const ready = cleanupStatus();
-  assert.equal(canRunCleanup(ready, { writable: false }), false);
-  assert.equal(cleanupBlockedReason(ready, { writable: false }), "원격 변경이 비활성화되어 있습니다.");
-  assert.equal(canRunCleanup(ready, { writable: true }), true);
-  assert.equal(cleanupBlockedReason(ready, { writable: true }), null);
+  assert.equal(canRunCleanup(ready, { busy: true }), false);
+  assert.equal(cleanupBlockedReason(ready, { busy: true }), "다른 작업이 진행 중입니다.");
+  assert.equal(canRunCleanup(ready, {}), true);
+  assert.equal(cleanupBlockedReason(ready, {}), null);
 });
 
 test("정리 기록이 없으면 되돌리기 버튼을 열지 않는다", () => {
-  assert.equal(canClearTombstones(cleanupStatus(), { writable: true }), false);
-  assert.equal(canClearTombstones(cleanupStatus({ tombstoneCount: 2146 }), { writable: true }), true);
-  assert.equal(canClearTombstones(cleanupStatus({ tombstoneCount: 2146 }), { writable: false }), false);
+  assert.equal(canClearTombstones(cleanupStatus(), {}), false);
+  assert.equal(canClearTombstones(cleanupStatus({ tombstoneCount: 2146 }), {}), true);
+  assert.equal(canClearTombstones(cleanupStatus({ tombstoneCount: 2146 }), { busy: true }), false);
 });
 
 test("영수증 성패는 예외가 아니라 실패 건수로 가른다", () => {

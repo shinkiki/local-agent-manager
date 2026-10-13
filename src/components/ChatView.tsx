@@ -42,7 +42,7 @@ import type {
 import { ChatApprovalDock, ChatContextMeter, ErrorBanner, EmptyState, FileDropOverlay, NoticeBanner, useConfirm, useFileDropZone } from "./Shared";
 import { LinkedFilePreview } from "./LinkedFilePreview";
 import { useChatLinkedFiles } from "./ChatLinkedFiles";
-import { ChatRuntimeList, chatCatalogSession, chatTabTitle, phaseLabel, useChatListPane } from "./ChatRuntimeList";
+import { ChatRuntimeList, chatCatalogSession, chatLivenessTitle, chatTabTitle, phaseLabel, phaseWithIdleLabel, useChatListPane } from "./ChatRuntimeList";
 import { ChatRuntimeSettingsMenu, useCatalogReasoningOptions, type ChatAgentChoice } from "./ChatRuntimeSettingsMenu";
 import {
   addAttachmentDrafts,
@@ -1648,6 +1648,9 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
   const runningAccountLabel = session.accountId && session.accountId !== activeAccountId(accounts, session.source)
     ? accountName(accounts, session.source, session.accountId)
     : null;
+  // 머리말의 유휴는 3초마다 도는 라이브 목록에서 읽는다. `session`은 state 이벤트가 올 때만
+  // 갱신되는데, 유휴란 곧 이벤트가 없는 구간이라 그 값으로는 시간이 멈춰 보인다.
+  const headerChat = openChats.find((chat) => chat.chatId === session.chatId) ?? session;
 
   return (
     <div className={`chat-hub${popout ? " popout" : ""}`}>
@@ -1657,7 +1660,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
         <section className="structured-chat chat-drop-zone" {...chatDropProps}>
         {chatDropTarget && <FileDropOverlay />}
         <header className="chat-session-header">
-          <div><span className={`terminal-status terminal-status-${phase}`} /><div><strong>{sourceName(session.source)} · {phaseLabel(phase, text)}</strong><small>{displayPath(session.cwd)}{runningAccountLabel ? ` · ${text("계정", "Account")} ${runningAccountLabel}` : ""}</small></div></div>
+          <div title={chatLivenessTitle(headerChat, text, phase)}><span className={`terminal-status terminal-status-${phase}`} /><div><strong>{sourceName(session.source)} · {phaseWithIdleLabel(headerChat, text, phase)}</strong><small>{displayPath(session.cwd)}{runningAccountLabel ? ` · ${text("계정", "Account")} ${runningAccountLabel}` : ""}</small></div></div>
           <div className="chat-session-actions">
             {(phase === "stopped" || phase === "failed") && session.providerSessionId && <button className="button primary" type="button" disabled={!canResumeChat} onClick={() => void resumeChat()} title={text("같은 공급자 대화를 다시 띄워 이어갑니다", "Reopens the same provider conversation and continues it")}><RotateCw size={13} />{resuming ? text("이어가는 중…", "Resuming…") : text("이어가기", "Resume")}</button>}
             {/* 좁은 화면에서 팝아웃은 같은 탭을 밀어내는 꼴이라 쓸모가 없다. 그 자리를 새 채팅이 대신 쓰고,

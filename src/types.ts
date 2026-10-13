@@ -678,6 +678,9 @@ export interface SshEndpointView {
   terminalEnabled: boolean;
   /** 무제한 명령 허용. 켜면 허용 목록 대조와 1회 승인이 빠지고 차단 목록·하드 거부만 남는다. */
   unrestrictedCommands: boolean;
+  /** 프로젝트 git의 네트워크 작업(fetch·pull·push)에만 이 키를 신원으로 넘길지(C16-10).
+   *  에이전트 권한이 아니라 사용자 자신의 git이 쓰는 키라 agentEnabled에 묶이지 않는다. */
+  projectGitEnabled: boolean;
   updatedAt: number;
 }
 
@@ -694,6 +697,7 @@ export interface SetSshKeyEndpointRequest {
   transferRoot: string;
   terminalEnabled: boolean;
   unrestrictedCommands: boolean;
+  projectGitEnabled: boolean;
 }
 
 /** 새 연결 서버에 채워 넣는 기본 명령 정책. 백엔드가 소유한다. */
@@ -830,6 +834,8 @@ export interface ExternalPluginOAuthStart {
   expiresAt: number;
   /** 디바이스 인가에서 사용자가 승인 화면에 입력할 코드. 그 외에는 없다. */
   userCode?: string | null;
+  /** 승인 뒤 브라우저가 멈춘 콜백 주소를 붙여 넣어 끝낼 수 있는지(콜백형). */
+  acceptsCallbackPaste?: boolean;
 }
 
 export interface RegisterExternalPluginRequest {
@@ -881,6 +887,8 @@ export interface AccountLoginSessionView {
   environmentVariable: string;
   profilePath: string;
   command: string;
+  /** 임시 프로필에 저장 가능한 자격증명이 들어왔는지. 터미널 종료 이벤트를 놓쳐도 이 값으로 저장을 연다. */
+  credentialsReady: boolean;
 }
 
 export interface TokenUsage {
@@ -1009,8 +1017,21 @@ export interface SessionSummary {
   model: string | null;
   gitBranch: string | null;
   isSubagent: boolean;
-  /** AIA 전용 작업공간에서 오간 대화. 목록에서는 배지·필터로 구분한다. */
+  /**
+   * AIA 전용 작업공간 경로에서 오간 대화. 앱 소유 경로라 새 채팅의 프로젝트 후보와
+   * 스킬·지침 스캔에서 뺀다. 배지·필터는 이 값이 아니라 `aiaChat`을 본다.
+   */
   aiaWorkspace: boolean;
+  /**
+   * AIA 와 나눈 대화. 세션이 적어 둔 프로필을 먼저 보고 기록이 없는 옛 세션만 경로로
+   * 판정한다. 이 값을 실을 줄 모르는 이전 버전 백엔드에서는 없다.
+   */
+  aiaChat?: boolean;
+  /**
+   * AIA 대화지만 이 실행본은 일반 채팅으로 연다 — 다른 app-data(형제 실행본)의 AIA
+   * 작업공간에서 만든 대화라 재개가 프로필을 올리지 않는다. 배지 설명에만 쓴다.
+   */
+  aiaChatOpensAsStandard?: boolean;
   /** 작업 경로 없이 시작해 앱의 기본 작업공간에서 오간 대화. 새 채팅의 프로젝트 후보에서 뺀다. */
   defaultWorkspace?: boolean;
   archived: boolean;
@@ -1298,6 +1319,12 @@ export interface GitBranchComparison {
   outgoingCount: number;
   incomingTruncated: boolean;
   outgoingTruncated: boolean;
+  /** B8. 수신 커밋이 합쳐서 바꾸는 파일(merge-base..upstream). */
+  incomingFiles: GitCommitFile[];
+  /** B8. 송신 커밋이 합쳐서 바꾸는 파일(merge-base..branch). */
+  outgoingFiles: GitCommitFile[];
+  incomingFilesTruncated: boolean;
+  outgoingFilesTruncated: boolean;
   /** 양쪽 모두 0이 아니다 — fast-forward로 정리되지 않는다. */
   diverged: boolean;
   /** `FETCH_HEAD` 수정 시각(unix 초). 한 번도 fetch하지 않았으면 null. */
@@ -1365,6 +1392,112 @@ export interface ProjectOverlaySets {
   unreadable: string[];
 }
 
+/** 보관한 patch 본문을 읽는 요청(C19-5). */
+export interface ReadProjectOverlayPatchRequest {
+  projectPath: string;
+  setId: string;
+}
+
+/**
+ * 보관한 patch 본문 하나(C19-5).
+ *
+ * 스냅샷이 끝나면 작업 트리는 HEAD 원본으로 돌아가므로, 그 변경의 **유일한 사본**은 앱
+ * 데이터 안의 patch다. 검사가 `overlayNeedsResolution`으로 막혔을 때 `affected`의 경로에
+ * 무엇이 들어 있었는지는 이 본문에서만 확인된다.
+ */
+export interface ProjectOverlayPatch {
+  schemaVersion: number;
+  setId: string;
+  name: string;
+  repositoryId: string;
+  repositoryRoot: string;
+  state: "registered" | "stored" | "applied";
+  snapshotId: string | null;
+  /** patch를 뜰 때의 기준 HEAD. */
+  baseHead: string | null;
+  /** 장부가 적어 둔 digest. */
+  patchDigest: string | null;
+  /** 지금 디스크에 있는 patch의 digest. */
+  storedDigest: string | null;
+  /** 두 digest가 같은가. 거짓이면 적용도 거절되는 상태다. */
+  digestMatches: boolean;
+  paths: string[];
+  /** 디스크에 있는 patch의 바이트 수. 끊긴 경우에도 원본 크기다. */
+  bytes: number;
+  truncated: boolean;
+  /** 통일 diff 본문. 보관된 patch가 없거나 UTF-8이 아니면 null. */
+  text: string | null;
+  /** 본문을 싣지 못하거나 끊은 사유. 온전히 실었으면 null. */
+  reason: string | null;
+}
+
+/**
+ * 외부 Git 작업을 보고 재적용을 **내밀어야 하는지**만 묻는 조회의 답(C19-3).
+ *
+ * 실리는 것은 patch가 보관된 세트(`state: "stored"`)뿐이다. 장부만 있는 세트는 뜬 patch가
+ * 없고, 이미 적용된 세트는 작업 트리에 들어가 있어 내밀 버튼이 없다.
+ */
+export interface ProjectOverlayDrift {
+  schemaVersion: number;
+  repositoryId: string;
+  repositoryRoot: string;
+  /** 지금 HEAD. 커밋이 하나도 없으면 null. */
+  currentHead: string | null;
+  sets: ProjectOverlayDriftEntry[];
+  unreadable: string[];
+}
+
+export interface ProjectOverlayDriftEntry {
+  setId: string;
+  name: string;
+  state: "registered" | "stored" | "applied";
+  baseHead: string | null;
+  /** 기준 HEAD와 지금 HEAD가 다른가. 이것이 "외부 Git 작업이 있었다"의 신호다. */
+  headMoved: boolean;
+  /** `external`이면 화면은 **자동으로 적용하지 않고** 검사와 적용 버튼만 내민다(C19-3). */
+  trigger: "app" | "external";
+}
+
+/** 앱이 시작한 Git 작업 뒤의 일괄 재적용 요청(C19-3). 세트는 고르지 않는다 — 무엇을 다시
+ * 넣을지는 장부의 상태(`stored`)가 정한다. */
+export interface ReapplyProjectOverlaysRequest {
+  projectPath: string;
+  /** 직전 Git 작업이 **실패해서** 이전 브랜치 위에서 되돌리는 중인가(C19-3의 실행 규칙 7).
+   * 다시 넣는 일은 성공한 뒤와 같고, 갈리는 것은 영수증이 말하는 사실이다 — 실패한 switch는
+   * HEAD를 움직이지 않으므로 "브랜치를 옮긴 뒤"라는 문장이 거짓이 된다. */
+  recovery?: boolean;
+}
+
+/**
+ * 앱이 시작한 Git 작업 뒤의 일괄 재적용 결과(C19-3, C19-5). 세트마다의 영수증을 그대로
+ * 싣고, 화면이 한 줄로 요약할 수 있도록 결말 수를 따로 센다.
+ */
+export interface ProjectOverlayReapply {
+  schemaVersion: number;
+  repositoryId: string;
+  repositoryRoot: string;
+  /** 재적용을 마친 뒤의 HEAD. 재적용은 HEAD를 움직이지 않는다. */
+  head: string | null;
+  /** 언제나 `app`이다 — 외부 Git 작업 뒤의 자동 적용은 C19-3이 금지한다. */
+  trigger: "app" | "external";
+  receipts: ProjectOverlayReceipt[];
+  applied: number;
+  needsResolution: number;
+  busy: number;
+  /** 다시 넣기 자체가 오류로 끝난 세트. `needsResolution`(검사 실패, 아무것도 적용하지 않은
+   * 정상 결말)과 다른 종류다. 어느 쪽이든 patch는 앱 데이터에 그대로 남는다. */
+  failed: ProjectOverlayReapplyFailure[];
+  /** 직전 Git 작업이 실패해 되돌리는 중이었는가. */
+  recovery: boolean;
+  unreadable: string[];
+}
+
+/** 다시 넣기가 오류로 끝난 세트 하나(C19-5). patch 본문도 파일 내용도 들어가지 않는다. */
+export interface ProjectOverlayReapplyFailure {
+  setId: string;
+  reason: string;
+}
+
 /** overlay 변경 하나의 결말(C19-5). git 영수증과 같은 틀이라 화면이 같은 모양으로 그린다. */
 export interface ProjectOverlayReceipt {
   action: string;
@@ -1403,6 +1536,19 @@ export interface SaveProjectOverlaySetRequest {
 export interface DeleteProjectOverlaySetRequest {
   projectPath: string;
   setId: string;
+}
+
+/**
+ * 세트에서 경로 몇 개를 빼는 요청(C19-3 충돌 해결).
+ *
+ * 적용이 `overlayNeedsResolution`으로 막았을 때 쓰는 자리다. 막은 경로를 그대로 여기 넘기면
+ * 그 경로만 세트와 보관한 patch에서 빠지고, 막지 않은 나머지 경로의 변경은 그대로 남는다.
+ * 세트에 없는 경로가 하나라도 섞이면 아무것도 바뀌지 않는다.
+ */
+export interface ExcludeProjectOverlayPathsRequest {
+  projectPath: string;
+  setId: string;
+  paths: string[];
 }
 
 export interface CheckProjectOverlayApplyRequest {
@@ -1510,6 +1656,9 @@ export interface ProjectGitDiffRequest {
   staged?: boolean;
   /** 지정하면 그 커밋이 부모 대비 바꾼 내용. staged는 무시된다. */
   commit?: string | null;
+  /** B9. 둘을 함께 주면 `<from>...<to>` 범위. staged·commit과 상호배타다. */
+  rangeFrom?: string | null;
+  rangeTo?: string | null;
 }
 
 export interface ProjectGitCommitFilesRequest {
@@ -2548,6 +2697,16 @@ export interface TerminalAccountLoginRequest {
   loginId: string;
   cols: number;
   rows: number;
+  /** Codex 로그인 방식. 없으면 원격은 기기 코드, 호스트는 브라우저다. */
+  codexMethod?: CodexLoginMethod;
+}
+
+/** Codex 계정 로그인의 두 갈래. `browser`는 다른 기기에서 승인하면 콜백 주소를 붙여 넣어 끝낸다. */
+export type CodexLoginMethod = "device" | "browser";
+
+/** 붙여 넣은 Codex 로그인 콜백을 로그인 CLI에 전달한 결과. */
+export interface AccountLoginCallbackRelay {
+  status: number;
 }
 
 /** 저장된 SSH 연결 서버로 사용자가 직접 붙는 대화형 터미널. 호스트 화면에서만 열린다. */
@@ -2713,6 +2872,16 @@ export interface ChatSessionInfo {
   state: ChatPhase;
   turnCount: number;
   lastTurnStatus: string | null;
+  /**
+   * 이 실행이 마지막으로 움직인 시각(ms). 턴이 한 번도 없었으면 실행 시작 시각이다.
+   * 유휴 시간을 실을 줄 모르는 이전 버전 백엔드에서는 없다.
+   */
+  lastActivityAt?: number;
+  /**
+   * 그 뒤로 흐른 시간(ms). 백엔드가 응답을 만드는 시점에 재므로 원격 화면의 시계가
+   * 달라도 같은 값을 읽는다. state가 ready인데 이 값이 크면 종료가 아니라 방치다.
+   */
+  idleMs?: number;
   /** 리플레이 버퍼가 오래된 이벤트를 밀어냈는지. true면 attach로 받는 스트림에 앞부분이 없다. */
   replayTruncated: boolean;
   unattended: boolean;
@@ -3059,8 +3228,13 @@ export interface ScheduleRunRound {
   launchedRuns: number;
   /** 지난 회차에서 남아 정리한 런타임 수. */
   staleRuns: number;
-  /** 이 회차의 병렬 상한. */
+  /** 이 회차의 병렬 상한. 장비가 감당하는 최대치지 매 회차 채우는 목표가 아니다. */
   maxRuns: number;
+  /**
+   * 계획 전에 센 남은 일감. 계약이 세는 자리를 지목한 회차만 값이 있고, 그 수가 상한보다
+   * 작으면 이번 회차는 그만큼만 띄운다. null이면 세지 않았다는 뜻이지 0건이 아니다.
+   */
+  remainingWork?: number | null;
 }
 
 /** get_scheduled_run_detail 응답. 폴링 스냅샷과 달리 본문 전문을 담는다. */
@@ -3156,7 +3330,7 @@ export interface SystemAgentRuntime {
 }
 
 /**
- * 애드온 → 자동화 탭의 온보딩 카드 한 벌(W6). 백엔드 `aia_onboarding.rs`가 번들 기본
+ * 워크플로 → 자동화 탭의 온보딩 카드 한 벌(W6). 백엔드 `aia_onboarding.rs`가 번들 기본
  * 팩과 공통 스킬 저장소의 팩을 검증해 내주는 구조를 그대로 받는다. 화면은 이 데이터만
  * 보고 카드를 그리므로, 카드를 더하는 일이 화면 코드를 고치는 일이 아니다.
  */
@@ -3770,6 +3944,8 @@ export interface RoundGoalScheduleChange {
   enabled: boolean;
 }
 
+export type RoundDecisionMode = "manual" | "automatic";
+
 export interface RoundGoal {
   id: string;
   title: string;
@@ -3778,6 +3954,7 @@ export interface RoundGoal {
   verification: string;
   cadence: string;
   status: RoundGoalStatus;
+  decisionMode: RoundDecisionMode;
   skillKey?: string | null;
   workflowId?: string | null;
   scheduleId?: string | null;
@@ -3804,6 +3981,7 @@ export interface RoundGoalPatch {
   verification?: string;
   cadence?: string;
   status?: RoundGoalStatus;
+  decisionMode?: RoundDecisionMode;
   skillKey?: string | null;
   workflowId?: string | null;
   scheduleId?: string | null;
@@ -3914,6 +4092,8 @@ export interface StorageUsageItem {
   id: string;
   label: string;
   description: string;
+  /** 백엔드가 이 항목을 잰 자리. 헤드리스 배포에서는 컨테이너 안 경로다(L09). */
+  rootPath: string;
   sizeBytes: number;
   fileCount: number;
 }
@@ -4179,6 +4359,8 @@ export interface SystemWorkflowExecution {
   paced?: boolean;
   round?: {
     maxRuns: number;
+    /** 계획 전에 센 남은 일감. 세지 않았으면 null이다. */
+    remainingWork?: number | null;
     plannedRuns: number;
     launchedRuns: number;
     staleRuns: number;
@@ -4356,6 +4538,15 @@ export interface CypressRunStatus {
 export interface CypressInstallReceipt {
   workspace: CypressWorkspace;
   output: string;
+}
+
+/** `cypress verify` 결과. 모듈이 있어도 브라우저를 띄울 시스템 패키지가 없으면 ok가 false다. */
+export interface CypressEnvironmentCheck {
+  ok: boolean;
+  output: string;
+  /** 출력에서 읽어 낸 원인과 조치. 원인을 못 읽었으면 null. */
+  hint: string | null;
+  checkedAt: number;
 }
 
 /** 앱이 에이전트에 붙여 주는 기본도구 하나. 도구 정의는 상태와 무관한 고정 계약이다. */

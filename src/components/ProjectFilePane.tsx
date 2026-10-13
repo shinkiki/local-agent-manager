@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { File, FileWarning } from "lucide-react";
 import { codeLanguageForPath } from "../lib/codeLanguages";
 import { documentFileName } from "../lib/documentWorkspace";
@@ -13,13 +14,14 @@ import { MarkdownPreview } from "./MarkdownPreview";
  * 편집 갈래를 여기 붙이면 `DocumentFilePane`의 초안·편집 상태를 통째로 끌어와야 한다. 그
  * 창을 일반화하는 대신 읽기 갈래만 따로 둔다.
  */
-export function ProjectFilePane({ file }: { file: ProjectFileView }) {
+export function ProjectFilePane({ file, headerLeading = null }: { file: ProjectFileView; headerLeading?: ReactNode }) {
   const { text } = useI18n();
   const name = documentFileName(file.relativePath);
   return (
     <>
       <header className="doc-header project-file-header">
         <div className="doc-header-leading">
+          {headerLeading}
           <div className="doc-header-title">
             <strong data-user-content>{name}</strong>
             <span data-user-content>{file.relativePath} · {formatBytes(file.sizeBytes)} · {formatDate(file.modifiedAt)}</span>

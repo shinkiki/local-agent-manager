@@ -1,0 +1,12 @@
+{
+  "itemId": "C-0ba6ef4c1122",
+  "kind": "commit",
+  "ref": "0ba6ef4c1122b3d8909722323d109637e6c2adc2",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L08",
+  "source": "codex",
+  "verdict": "신규 결함 0건",
+  "note": "커밋 diff와 닿는 장부 맥락을 다섯 축으로 검토했다. 정확성: C-799eee85e78b가 검토한 799eee85의 원문 수치(799eee85 부모의 reviewed 39에서 해당 트리 40으로 증가, 그 트리 reviewed 40건)와 0ba6ef4c가 갱신한 queue.json의 40에서 41 증가를 구분해 재확인했으며, 기존 finding에 더한 C-799eee85e78b 관측도 그 reviewed 파일과 일치한다. 보안: docs/code-review 아래의 파생 장부 JSON만 바뀌므로 AGENTS.md G1~G11 및 C 예외에 닿지 않는다. 계약: 새 reviewed 파일의 itemId/ref 접두/문자열 reviewedAt/findings 참조와 queue.json counts를 러너 및 원문으로 확인했다. 검증: codeReviewQueue.test.mjs가 장부 러너 계약을 덮으며 이 변경에 별도 실행 경로는 없다. 단순화·중복: ledgerDuplicates가 없고, 기존 F-docs-code-review-readme-md-commits-6f902967의 commits/fixCommits 빈 배열 관측은 이미 열린 저장 형식 결정의 기존 finding에만 추가돼 새 결함을 중복 생성하지 않았다. 신규 결함 0건.",
+  "findings": [],
+  "commits": []
+}

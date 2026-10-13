@@ -1,0 +1,25 @@
+{
+  "itemId": "C-a52e664a3563",
+  "kind": "commit",
+  "ref": "a52e664a3563a72673bef0b2f49c5a65f852682a",
+  "reviewedAt": "2026-10-05T17:50:00Z",
+  "lane": "L02",
+  "source": "claude",
+  "verdict": "결함 1건 / 수정 1건 (정확성·보안 불변식 결함 없음. 범위를 줄여 적은 결함 기록을 사실로 고쳤고, 빈 칸을 메우는 일은 열려 있는 결정의 몫이라 손대지 않았다)",
+  "axes": {
+    "정확성": "장부 데이터만 바꾸는 커밋이라 실행 경로가 없다. 적힌 값이 사실인지를 대신 쟀다. (1) reviewed/C-af9507eabc40.json 에 넣은 `commits: [\"b7d9df2a\"]` 는 맞다 — `git log --diff-filter=A -1 -- docs/code-review/reviewed/C-af9507eabc40.json` 이 b7d9df2a 를 돌려준다. (2) findings/F-scripts-generate-ui-catalog-mjs-check-4e045831.json 의 `fixCommits: [\"b7d9df2a\"]` 도 맞다 — b7d9df2a 가 generate-ui-catalog.mjs 의 줄끝 비교를 실제로 고친 커밋이다. (3) 새 결함 id 가 손으로 지어진 것이 아닌지 생성기로 다시 돌렸다 — findings/ 아홉 건 전부 findingId({file,symbol,symptom}) 의 출력과 파일 이름·본문이 일치한다(불일치 0). (4) queue.json 의 reviewed 12 가 reviewed/ 의 C-*.json 파일 수와 맞는다. (5) 장부 상호참조를 전수로 걸었다 — reviewed 의 findings[] 가 가리키는 결함 파일이 모두 있고, 결함의 occurrences[].itemId 가 모두 reviewed 에 있고, 어느 reviewed 도 참조하지 않는 고아 결함이 없고, itemId 가 파일 이름과 `commitItemId(ref)` 양쪽과 일치한다(불일치 0).",
+    "보안 불변식": "해당 없음. docs/code-review/ 아래 JSON 다섯 개만 바꾼다. 실행 코드·설정·시험을 건드리지 않아 G1~G11 과 3절 C 예외에 닿는 자리가 없다 — 자격증명·공급자 소유 저장소를 읽지 않고(G1·G2·G4), 셸 문자열을 만들지 않고(G9), 경로를 받아 쓰지 않는다(G10).",
+    "계약": "어긋났다 — F-docs-code-review-findings-f-docs-code-review-rev-d9517df9. 이 커밋은 'README 가 정한 commits·fixCommits 가 비어 추적성이 끊긴다' 를 결함으로 적었는데, 기록한 재현 절차('여섯 파일 중 다섯')가 b7d9df2a 시점의 수라 정작 착지한 부모(reviewed 열한 건)에서는 재현되지 않는다. 증상을 '키 없음' 으로만 잡아 범위가 한 건으로 줄었고, 키는 있되 빈 배열인 열 건은 같은 증상인데도 남았다. findings 쪽도 state=fixed 인데 fixCommits 가 빈 세 건 중 한 건만 채워졌다. 빈 칸을 메우는 쪽은 이번 회차가 손대지 않았다 — 같은 자리가 F-docs-code-review-readme-md-commits-6f902967 에 이미 open 으로 있고 그 결정(round-383bc1ee75694815bbb5add11d45bfc9)이 답을 기다리는 중이라, 선택지 하나가 바로 '러너로 빈 칸을 메운다' 다. 이 회차가 고친 것은 범위를 줄여 적은 기록 자체다. 그 밖의 계약은 일치한다 — `commits` 의 뜻('그 회차가 만든 커밋', 24184188 이 정함)을 이 커밋이 어기지 않았고, 값이 있는 두 건 모두 그 장부 항목을 더한 커밋과 같다.",
+    "검증 없음": "장부 데이터에는 단위 시험이 걸리지 않는다(modules.json 도 docs/ 를 모듈로 두지 않는다). 그래서 기록이 틀렸다는 것은 명령으로 쟀다 — `git ls-tree -r --name-only a52e664a^ docs/code-review/reviewed` 가 11 건을 돌려주는데 기록은 6 건이라 적혀 있고, 같은 리비전에서 `commits` 를 읽으면 착지 커밋을 적은 항목이 0 건이다. 빈 칸 자체는 고치지 않았으므로 수치의 전후 변화가 없다. 새 자동화를 들이지 않는다는 회차 규칙(7절)에 따라 장부 모양을 검사하는 시험 파일을 새로 만들지 않았다 — 만들면 README 의 모양을 기계가 강제하는 쪽으로 계약이 바뀌므로 보고의 decisions 로 올린다.",
+    "단순화·중복": "중복 없음. 이 커밋이 더한 칸은 README 가 이미 정한 `commits`·`fixCommits` 두 개뿐이고 새 칸을 만들지 않았다. 다만 findings/F-scripts-generate-ui-catalog-mjs-check-4e045831.json 은 서술형 `fix` 문자열과 `fixCommits` 가 같은 사실을 두 모양으로 들고 있다 — 지적까지만 남긴다. `fix` 는 README 밖의 칸이고 지우는 것은 저장 형식을 좁히는 결정이라 이 회차의 몫이 아니다."
+  },
+  "findings": ["F-docs-code-review-findings-f-docs-code-review-rev-d9517df9"],
+  "verification": [
+    "node --experimental-strip-types --test --test-reporter=dot src/lib/codeReviewQueue.test.ts src/lib/*.test.mjs",
+    "npx tsc --noEmit",
+    "node --experimental-strip-types scripts/code-review-queue.mjs --json (ledgerDuplicates 빈 배열 확인)",
+    "장부 전수 상호참조·id 재생성 점검 (불일치 0)",
+    "git ls-tree a52e664a^ docs/code-review/reviewed → 11 건 (기록이 적은 6 건과 다름)"
+  ],
+  "commits": []
+}

@@ -23,11 +23,9 @@ export {
 } from "./skillLibraryInput.ts";
 export {
   isSkillProviderDeployed,
-  latestSkillVersion,
   skillSyncCounts,
   skillSyncState,
   type SkillDivergentInstall,
-  type SkillLatestVersion,
   type SkillSyncState,
 } from "./skillSyncState.ts";
 export {
@@ -70,15 +68,15 @@ const DIVERGENT_TEXTS: Record<SkillDivergence, { label: LabelSpec; hint: LabelSp
   behind: {
     label: (text) => text("뒤처짐", "Out of date"),
     hint: (text) => text(
-      "이 사용본이 보관 원본보다 오래됐습니다. 원본을 다시 배포하면 맞춰집니다.",
-      "This install is older than the archived source. Redeploy the source to catch it up.",
+      "이 사용본이 보관 원본보다 오래됐습니다. 변경사항 취소를 누르면 원본으로 맞춰집니다.",
+      "This install is older than the archived source. Use Discard changes to restore the source here.",
     ),
   },
   edited: {
     label: (text) => text("외부 수정 감지", "Externally edited"),
     hint: (text) => text(
-      "이 사용본이 보관 원본보다 나중에 수정됐습니다. 채택하거나 원본을 다시 배포해 덮으세요.",
-      "This install was edited after the archived source. Adopt it, or redeploy the source over it.",
+      "이 사용본이 보관 원본보다 나중에 수정됐습니다. 이 버전으로 통일하거나, 변경사항 취소로 원본으로 되돌리세요.",
+      "This install was edited after the archived source. Apply this version, or discard the changes to restore the source.",
     ),
   },
   unknown: {

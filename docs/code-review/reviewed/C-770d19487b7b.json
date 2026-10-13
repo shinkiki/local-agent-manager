@@ -1,0 +1,19 @@
+{
+  "itemId": "C-770d19487b7b",
+  "kind": "commit",
+  "ref": "770d19487b7ba46ea2b61a5b7bb90bf448e5a132",
+  "reviewedAt": "2026-10-06T05:10:00Z",
+  "lane": "L06",
+  "source": "claude",
+  "verdict": "결함 0건",
+  "axes": {
+    "정확성": "장부 reviewed/C-bab3b297860e.json 한 건과 러너가 다시 생성한 queue.json 만 담은 데이터 커밋이다. 적힌 ref bab3b297860e851c08cf225630dcd8514ac4b7e2 는 실제 커밋이고(제목 '리뷰: 수정 커밋 해시를 장부에 잇는 커밋을 검토한다') origin/dev-history 의 조상이며, 항목 id C-bab3b297860e 와 ref 앞 12자가 맞는다. 그 장부가 주장하는 사슬도 되짚어 전부 참이다 — bab3b297 이 적은 reviewed/C-6d3061609fd5.json 의 ref 6d3061609fd5fe4b4282a97f53ac39640d304e3d 는 실제 커밋 '리뷰 장부에 C-6b44077e65c2 의 수정 커밋 해시를 적는다' 이고, 거기 이어진 fixCommits 의 fb82dc4c 도 실제 커밋 '기준선이 없을 때도 \"축이 없다\"고 찍던 비교 줄을 가른다' 로 dev-history 에 착지해 있다. 수를 되잰 주장도 트리에서 직접 다시 셌다 — 이 커밋 시점 reviewed/ 의 .json 이 56건이고 queue.json 의 reviewed 56 과 맞으며, 한 걸 앞 bab3b297 시점도 53건/53 으로 맞는다. remaining 459 = commit 225 + module 234 로 자기 안에서도 맞는다. 틀린 해시나 틀린 셈이었다면 장부에서 항목과 수정이 끊기거나 러너가 다시 생성할 때 수가 튀는데 그 경우가 아니다.",
+    "보안불변식": "JSON 데이터 파일 두 개만 바뀐다. 자격증명·공급자 소유 저장소·셸 문자열·경로 정규화·쓰기 게이트 어디에도 닿지 않아 AGENTS.md 2절 G1~G11 과 3절 C 예외의 범위 밖이다.",
+    "계약": "docs/code-review/README.md 의 장부 모양과 맞는다 — 파일 이름과 본문 itemId 가 일치하고(어긋나면 러너가 둘 다 리뷰된 것으로 세어 다시 집히지 않는다), kind·ref·reviewedAt·lane·source·verdict·findings·commits 가 다 있고, 결함 0건이라 findings·commits 가 빈 배열인 것도 규약대로다. queue.json 은 센 수만 담고 items 를 담지 않는다는 규약도 지켰다. 작업트리 현재 상태의 reviewed/ 58건 전건을 다시 파싱해 파싱 실패 0건·이름과 본문 id 불일치 0건·필수 키 누락 0건·커밋 항목의 id 와 ref 앞 12자 불일치 0건을 확인했다.",
+    "검증없음": "코드가 아니라 장부 데이터만 바뀌어 재현할 실패가 없다. 장부를 실제로 읽는 쪽인 러너의 순수 함수에 시험이 붙어 있어 그것을 돌렸고 회귀가 없다. 러너도 돌려 ledgerDuplicates 가 빈 것을 확인했다.",
+    "단순화중복": "새 함수·새 파일 없음. queue.json 의 수는 reviewed/ 에서 파생되지만 러너가 --write 로 다시 생성하는 파생값이라 같은 사실을 두 곳에 적은 자리가 아니다."
+  },
+  "verification": "node --experimental-strip-types --test src/lib/codeReviewQueue.test.mjs → # tests 13 / # pass 13 / # fail 0",
+  "findings": [],
+  "commits": []
+}

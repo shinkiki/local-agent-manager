@@ -6,6 +6,7 @@ mod acp;
 mod agent_builtin_tools;
 mod aia_onboarding;
 mod aia_suggestions;
+mod antigravity_mcp_sync;
 mod antigravity_usage;
 mod app_data_file;
 mod app_error;
@@ -48,6 +49,9 @@ mod instruction_trash;
 mod json_store;
 mod linked_file;
 mod local_llm;
+mod login_auth;
+mod login_sessions;
+mod login_totp;
 mod loopback_host;
 mod markdown_plain;
 mod mcp_registry;
@@ -145,8 +149,7 @@ pub use antigravity_usage::{
 pub use app_error::{AppError, AppErrorKind};
 pub use backend_ownership::BackendOwnershipLease;
 pub use backend_service_settings::{
-    load_backend_service_settings, save_backend_service_remote_write,
-    save_backend_service_settings, BackendServiceSettings, DEFAULT_BACKEND_REMOTE_WRITE,
+    load_backend_service_settings, save_backend_service_settings, BackendServiceSettings,
     DEFAULT_BACKEND_SERVICE_PORT, MAX_BACKEND_SERVICE_PORT, MIN_BACKEND_SERVICE_PORT,
 };
 pub use catalog::{
@@ -242,7 +245,7 @@ pub use external_plugins::{
     ExternalPluginRegistry, ExternalPluginToolCallRequest, ExternalPluginView,
     ExternalPluginsSnapshot, PluginAuthKind, PluginToolPolicy, SetExternalPluginEnabledRequest,
     SetExternalPluginTokenRequest, SetExternalPluginToolPoliciesRequest,
-    SetExternalPluginToolPolicyRequest,
+    SetExternalPluginToolPolicyRequest, SubmitExternalPluginOAuthCallbackRequest,
 };
 pub use external_processes::{
     list_external_provider_processes, terminate_external_provider_processes,
@@ -264,6 +267,11 @@ pub use local_llm::{
     LocalLlmConnectionEntry, LocalLlmConnectionIdRequest, LocalLlmConnections, LocalLlmProbeResult,
     SetLocalLlmConnectionRequest, UpsertLocalLlmConnectionRequest, DEFAULT_CONNECTION_ID,
 };
+pub use login_auth::{
+    reset_login_files, ChannelRequirements, LoginAuth, LoginChannel, LoginMethod, LoginRequirement,
+    LoginSettingsView, OtpSecretStorage, OtpSetup, Reauth,
+};
+pub use login_sessions::{LoginSessionView, SESSION_ABSOLUTE_MS, SESSION_IDLE_MS};
 pub use power::{
     apply_saved_sleep_prevention, release_sleep_prevention, set_sleep_prevention,
     sleep_prevention_status, SleepPreventionStatus,
@@ -317,12 +325,16 @@ pub use project_instructions::{
 };
 pub use project_overlays::{
     apply_project_overlay, check_project_overlay_apply, delete_project_overlay_set,
-    list_project_overlay_sets, overlay_repository_id, save_project_overlay_set,
-    snapshot_project_overlay, ApplyProjectOverlayRequest, CheckProjectOverlayApplyRequest,
-    DeleteProjectOverlaySetRequest, ProjectOverlayOutcome, ProjectOverlayReceipt,
-    ProjectOverlayRejection, ProjectOverlaySet, ProjectOverlaySets, ProjectOverlayState,
-    ProjectOverlayTarget, ProjectOverlayTrigger, SaveProjectOverlaySetRequest,
-    SnapshotProjectOverlayRequest,
+    exclude_project_overlay_paths, get_project_overlay_drift, list_project_overlay_sets,
+    overlay_repository_id, read_project_overlay_patch, reapply_project_overlays,
+    save_project_overlay_set, snapshot_project_overlay, ApplyProjectOverlayRequest,
+    CheckProjectOverlayApplyRequest, DeleteProjectOverlaySetRequest,
+    ExcludeProjectOverlayPathsRequest, ProjectOverlayDrift, ProjectOverlayDriftEntry,
+    ProjectOverlayOutcome, ProjectOverlayPatch, ProjectOverlayReapply,
+    ProjectOverlayReapplyFailure, ProjectOverlayReceipt, ProjectOverlayRejection,
+    ProjectOverlaySet, ProjectOverlaySets, ProjectOverlayState, ProjectOverlayTarget,
+    ProjectOverlayTrigger, ReadProjectOverlayPatchRequest, ReapplyProjectOverlaysRequest,
+    SaveProjectOverlaySetRequest, SnapshotProjectOverlayRequest,
 };
 pub use provider_telemetry::{
     load_provider_telemetry, set_provider_telemetry_option, ProviderTelemetryFile,
@@ -332,7 +344,7 @@ pub use providers::inspect_local_environment;
 pub use remote::{
     decode_percent_header, load_tailscale_backend_launch, run_remote_server_from_args,
     RemoteAccessPhase, RemoteAccessSettingsInput, RemoteAccessStatus, RemoteAccessSupervisor,
-    TailscaleBackendLaunch,
+    TailscaleBackendLaunch, DESKTOP_SHELL_ARG,
 };
 pub use resource_repository::{
     load_resource_repository_settings, set_resource_repository, HostPlatform,
@@ -341,8 +353,10 @@ pub use resource_repository::{
 pub use rounds::{
     create_round_goal, delete_round_goal, delete_round_report, get_round_goal, get_round_report,
     list_round_goals, list_round_reports, record_round_report, resolve_round_decision,
-    update_round_goal, RoundDecision, RoundFailureKind, RoundGoal, RoundGoalInput, RoundGoalPatch,
-    RoundGoalStatus, RoundMeasure, RoundOutcome, RoundReport, RoundReportInput, RoundReportQuery,
+    round_decision_automation_brief, update_round_goal, RoundDecision,
+    RoundDecisionAutomationBrief, RoundDecisionMode, RoundFailureKind, RoundGoal, RoundGoalInput,
+    RoundGoalPatch, RoundGoalStatus, RoundMeasure, RoundOutcome, RoundReport, RoundReportInput,
+    RoundReportQuery,
 };
 pub use saved_secrets::{
     list_saved_secrets, remove_saved_secret, save_secret, set_saved_secret_agent_enabled,
@@ -445,9 +459,10 @@ pub use store::{
 };
 pub use system_mcp::SystemMcpServer;
 pub use terminal::{
-    StopProviderTerminalsReport, StopTerminalFailure, TerminalAccountLoginRequest,
-    TerminalAttachment, TerminalEvent, TerminalOpenRequest, TerminalPhase, TerminalSessionInfo,
-    TerminalSetupRequest, TerminalSshRequest, TerminalSupervisor,
+    AccountLoginCallbackRelay, CodexLoginMethod, StopProviderTerminalsReport, StopTerminalFailure,
+    TerminalAccountLoginRequest, TerminalAttachment, TerminalEvent, TerminalOpenRequest,
+    TerminalPhase, TerminalSessionInfo, TerminalSetupRequest, TerminalSshRequest,
+    TerminalSupervisor,
 };
 pub use translation::TranslationSupervisor;
 pub use translation::{AiaBackgroundAnalysis, AiaBackgroundAnalysisRequest};

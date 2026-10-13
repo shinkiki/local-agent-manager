@@ -410,7 +410,22 @@ fn prepare_repository_root(root: &Path) -> Result<PathBuf, CoreError> {
     let resolved = fs::canonicalize(&resolved)?;
     reject_unsafe_root(&resolved)?;
     for dir in REPOSITORY_SUBDIRECTORIES {
-        fs::create_dir_all(resolved.join(dir))?;
+        let directory = resolved.join(dir);
+        // G10 / C3-7 / C3-8: 루트를 정규화해도 관리 하위 폴더의 링크는
+        // 남는다. 기존 링크를 따라가면 마이그레이션이 저장소 밖에 쓴다.
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) => ensure_directory(
+                &metadata,
+                &format!(
+                    "저장소 관리 폴더는 심볼릭 링크가 아닌 디렉터리여야 합니다: {}",
+                    directory.display()
+                ),
+            )?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&directory)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(resolved)
 }
@@ -608,6 +623,28 @@ mod tests {
         );
     }
 
+    /// H12: 헤드리스 컨테이너는 `--app-data-dir /data`로 뜨고 저장소 경로 선택은
+    /// 호스트 전용이라(C3-14) 사용자가 고를 길이 없다. 저장된 값이 없을 때 설정이
+    /// 그 앱 데이터 아래 기본 저장소를 그대로 보고하고 `custom`이 꺼져 있다는 것이
+    /// 그 배포가 동작하는 근거이므로, 2026-10-10 NAS 실측값을 여기에 고정한다.
+    #[test]
+    fn settings_report_the_app_data_default_when_nothing_is_stored() {
+        let app_data = tempfile::tempdir().expect("temp");
+        let settings = load_resource_repository_settings(app_data.path()).unwrap();
+        let default = app_data.path().join(DEFAULT_DIRECTORY);
+        assert_eq!(settings.root_path, default.to_string_lossy());
+        assert_eq!(settings.default_root_path, default.to_string_lossy());
+        assert!(!settings.custom);
+        assert_eq!(
+            settings.skills_path,
+            default.join(SKILLS_DIRECTORY).to_string_lossy()
+        );
+        assert_eq!(
+            settings.instructions_path,
+            default.join(INSTRUCTIONS_DIRECTORY).to_string_lossy()
+        );
+    }
+
     #[test]
     fn manifest_without_platforms_is_portable() {
         let manifest = ResourcePlatformManifest::default();
@@ -758,6 +795,84 @@ mod tests {
             prepare_repository_root(&link),
             Err(CoreError::InvalidInput(_))
         ));
+    }
+
+    /// G10 / C3-8: 루트 안의 관리 폴더도 링크를 따라가면 안 된다.
+    #[cfg(unix)]
+    #[test]
+    fn g10_c3_8_repository_managed_subdirectory_links_are_rejected() {
+        for name in REPOSITORY_SUBDIRECTORIES {
+            for target_exists in [true, false] {
+                let temp = tempfile::tempdir().expect("temp");
+                let root = temp.path().join("repository");
+                let outside = temp.path().join("outside");
+                fs::create_dir(&root).expect("repository");
+                if target_exists {
+                    fs::create_dir(&outside).expect("outside");
+                }
+                std::os::unix::fs::symlink(&outside, root.join(name)).expect("link");
+
+                assert!(
+                    matches!(
+                        prepare_repository_root(&root),
+                        Err(CoreError::InvalidInput(_))
+                    ),
+                    "{name}, target_exists={target_exists}"
+                );
+                assert!(fs::symlink_metadata(root.join(name))
+                    .expect("link metadata")
+                    .file_type()
+                    .is_symlink());
+                if target_exists {
+                    assert_eq!(fs::read_dir(&outside).expect("outside contents").count(), 0);
+                } else {
+                    assert!(!outside.exists());
+                }
+            }
+        }
+    }
+
+    /// G10 / C3-7: 공개 경로 전환이 외부 링크를 통한 복사·교체에 도달하지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn g10_c3_7_repository_migration_refuses_linked_managed_subdirectories() {
+        for name in REPOSITORY_SUBDIRECTORIES {
+            let temp = tempfile::tempdir().expect("temp");
+            let app_data = temp.path().join("app-data");
+            let previous = prepare_repository_root(&default_repository_root(&app_data))
+                .expect("previous repository");
+            let source = previous.join("skills/review");
+            fs::create_dir(&source).expect("source");
+            fs::write(source.join("SKILL.md"), "# review\n").expect("skill");
+            let custom = temp.path().join("custom");
+            let outside = temp.path().join("outside");
+            fs::create_dir(&custom).expect("custom");
+            fs::create_dir(&outside).expect("outside");
+            std::os::unix::fs::symlink(&outside, custom.join(name)).expect("link");
+
+            assert!(matches!(
+                set_resource_repository(
+                    &app_data,
+                    &SetResourceRepositoryRequest {
+                        root_path: Some(custom.to_string_lossy().into_owned()),
+                        migrate_existing: true,
+                    },
+                ),
+                Err(CoreError::InvalidInput(_))
+            ));
+            // `previous`는 정규화된 경로다. macOS 임시 폴더는 `/var`가 `/private/var`의 링크라
+            // 그대로 견주면 같은 자리가 다르게 보인다.
+            assert_eq!(
+                fs::canonicalize(repository_root(&app_data)).expect("repository root"),
+                previous
+            );
+            assert!(!settings_path(&app_data).exists());
+            assert_eq!(
+                fs::read_to_string(source.join("SKILL.md")).unwrap(),
+                "# review\n"
+            );
+            assert_eq!(fs::read_dir(&outside).expect("outside contents").count(), 0);
+        }
     }
 
     #[test]

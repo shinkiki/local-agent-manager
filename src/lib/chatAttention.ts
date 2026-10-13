@@ -90,9 +90,11 @@ export function markAttentionReadLocally(
 export function markAllAttentionReadLocally(
   snapshot: ChatAttentionSnapshot,
   excludeProfiles: ChatProfile[] = [],
+  excludeChatIds: string[] = [],
 ): ChatAttentionSnapshot {
   const excluded = new Set(excludeProfiles);
-  return markAttentionRead(snapshot, (item) => !excluded.has(item.profile));
+  const excludedChats = new Set(excludeChatIds);
+  return markAttentionRead(snapshot, (item) => !excluded.has(item.profile) && !excludedChats.has(item.chatId));
 }
 
 /**

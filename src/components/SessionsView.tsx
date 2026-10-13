@@ -316,7 +316,9 @@ const SESSION_LIST_FILTER_AXES: SessionListFilterAxis[] = [
   (session, filters) => filters.showHidden === session.meta.hidden,
   (session, filters) => filters.includeArchived || !session.archived,
   (session, filters) => filters.includeSubagents || !session.isSubagent,
-  (session, filters) => filters.includeAia || !session.aiaWorkspace,
+  // 'AIA 대화 포함'은 대화의 성격을 묻는 칩이라 경로 표시(aiaWorkspace)가 아니라 aiaChat 을
+  // 본다. AIA 작업공간 경로를 골라 연 일반 채팅은 이 칩을 꺼도 남아야 한다.
+  (session, filters) => filters.includeAia || !session.aiaChat,
   // 출처는 채팅을 만들 때 서버가 한 번만 적는다. 반복 요청이 돌린 회차 세션은 여기서만
   // 가려낼 수 있다 — 숨긴 '반복 요청' 폴더는 그 폴더를 직접 고르면 다시 열리기 때문이다.
   (session, filters) => filters.includeSchedule || !startedBySchedule(session),
@@ -1071,8 +1073,13 @@ function SessionTableTitleCell({
             <Star size={11} fill="currentColor" strokeWidth={0} />
           </span>
         )}
-        {session.aiaWorkspace && (
-          <span className="session-aia-chip" title={text("AIA 작업공간에서 오간 대화입니다", "Conversation from AIA workspace")}>
+        {session.aiaChat && (
+          <span
+            className="session-aia-chip"
+            title={session.aiaChatOpensAsStandard
+              ? text("다른 실행본에서 만든 AIA 대화입니다. 여기서 이어가면 일반 채팅으로 열립니다", "AIA conversation from another app instance. Resuming here opens it as a standard chat")
+              : text("AIA와 나눈 대화입니다", "Conversation with AIA")}
+          >
             AIA
           </span>
         )}

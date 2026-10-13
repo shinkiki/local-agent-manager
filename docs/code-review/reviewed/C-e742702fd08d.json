@@ -1,0 +1,14 @@
+{
+  "itemId": "C-e742702fd08d",
+  "kind": "commit",
+  "ref": "e742702fd08d1404baca9b4ac6048f982945e21f",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L02",
+  "source": "claude",
+  "verdict": "신규 결함 0건 / 기존 open 결함 occurrences 1건 추가",
+  "note": "docs/code-review 아래 세 파일(queue.json · reviewed/C-1b9c1f165bfb.json 신규 · findings/F-docs-code-review-readme-md-commits-6f902967.json)만 바뀐 장부 전용 커밋이다. 정확성: 그 장부가 사실로 적은 것을 원문으로 되짚었다. (가) 리뷰 대상 1b9c1f16 이 queue.json 과 reviewed/C-83ba812102a2.json 두 파일만 바꿨다 — git show --stat 로 2 files changed 확인. 참. (나) 그 커밋의 queue.json 에서 reviewed 21→22 이고 remaining 453 · commit 219 가 그대로다 — diff 원문 확인. 참. 리뷰된 항목이 커밋 종류인데 commit 수가 줄지 않은 것은 같은 사이에 새 커밋이 작업브랜치에 착지한 결과로, 모순이 아니다. (다) 이 커밋이 적은 교차검증 수(이 커밋 부모 트리 기준 reviewed 24 중 commits 가 빈 것 22, findings 14 중 state=\"fixed\" 인데 fixCommits 가 빈 것 6)를 장부 전체를 독립적으로 다시 세어 확인했다 — 24·22·14·6 그대로다. ls-tree 가 25·15 를 세는 것은 양쪽 .gitkeep 를 포함한 수다. 계약: 이 커밋 트리에서 reviewed 25건·findings 14건 전부를 열어 파일 이름=itemId/findingId, 커밋 항목 ref 가 파일 이름 해시로 시작, findings 가 가리키는 결함 파일에 끊긴 참조 없음을 다시 계산했다(위반 0건). queue.json 의 reviewed 24→25 도 트리의 reviewed json 25 와 맞는다. 보안 불변식: docs/code-review 아래 JSON 문자열만 바뀌어 AGENTS.md 2절 G1~G11 과 3절 C 예외 어느 조건에도 닿지 않는다. 자격증명·공급자 소유 저장소·셸 문자열·경로 정규화·쓰기 게이트 어디에도 닿지 않는다. 검증 없음: 장부 문자열에는 재현 시험을 둘 자리가 없고 이 장부를 읽는 러너는 src/lib/codeReviewQueue.test.mjs 가 덮는다 — tests 12 · pass 12 · fail 0. 단순화·중복: 러너의 ledgerDuplicates 가 비어 있고 같은 항목의 reviewed 파일도 하나뿐이다. 다만 이 커밋은 기존 occurrences 세 건을 한 줄 표기에서 여러 줄 표기로 통째로 다시 적었다 — 값은 같고 JSON.stringify(...,2) 결과라 틀린 것은 아니지만, 결함 파일은 레인 열 개가 동시에 occurrences 를 덧붙이는 공유 파일이라 배열 전체를 다시 쓰면 rebase 충돌 면적이 한 줄에서 배열 전체로 넓어진다. 이번에는 충돌이 나지 않았고 되돌리는 것 자체가 같은 폭의 재작성이라 손대지 않았다 — 표기를 못박는 것은 저장 형식 결정이므로 보고로 올린다. 신규 결함은 없다. 이 커밋이 더한 reviewed/C-1b9c1f165bfb.json 의 commits 도 빈 배열이라 기존 open 결함 F-docs-code-review-readme-md-commits-6f902967 의 다섯 번째 관측이다 — 새 결함을 만들지 않고 occurrences 에 덧붙였다. 그 결함은 저장 형식 변경이라 고치지 않았고, 같은 주제의 결정이 이미 열려 있어 다시 올리지 않았다.",
+  "findings": [
+    "F-docs-code-review-readme-md-commits-6f902967"
+  ],
+  "commits": []
+}

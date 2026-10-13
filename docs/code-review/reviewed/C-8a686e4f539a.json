@@ -1,0 +1,12 @@
+{
+  "itemId": "C-8a686e4f539a",
+  "kind": "commit",
+  "ref": "8a686e4f539ae74e3756096e1596a65121bcdad3",
+  "reviewedAt": "2026-10-05T17:25:05Z",
+  "lane": "L05",
+  "source": "codex",
+  "verdict": "결함 0건 — 장부 추가와 파생 큐 집계의 일관성을 확인",
+  "note": "정확성: C-74272c9dfc06 장부 한 건 추가에 맞춰 reviewed가 2에서 3으로 증가하고 remaining은 455로 유지된다. 계약: queue.json은 러너가 만든 센 수만 보관하며 ledgerDuplicates는 빈 배열이다. 보안: 코드·자격증명·공급자 저장소·경로·쓰기 게이트에 닿지 않는 장부/파생 수치 변경이다(G1~G11/C 예외 해당 없음). 검증: node --experimental-strip-types --test-reporter=dot --test src/lib/flakyTestReport.test.mjs (14 tests 통과). 단순화·중복: 장부 규약의 항목별 파일 구조를 그대로 따른다.",
+  "findings": [],
+  "commits": []
+}

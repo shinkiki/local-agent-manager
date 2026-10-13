@@ -350,21 +350,41 @@ const LOGIN_SHELL_PATH_MARKER: &str = "__AGENT_MANAGER_PATH_PROBE__";
 
 #[cfg(unix)]
 fn probe_login_shell_path() -> Option<Vec<PathBuf>> {
-    let shell = login_shell_executable()?;
+    probe_login_shell_path_with(&login_shell_executable()?, LOGIN_SHELL_PROBE_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn probe_login_shell_path_with(shell: &Path, timeout: Duration) -> Option<Vec<PathBuf>> {
+    use std::os::unix::process::CommandExt;
+
     // 프로필이 stdout에 무엇을 찍든(배너·fetch 출력) 표식 사이만 읽는다. 셸 변수
     // 확장은 셸마다 달라(fish의 `$PATH`는 목록) 값을 직접 찍지 않고 `env`로 받는다.
     let script = format!(
         "printf '\n{marker}\n'; /usr/bin/env; printf '\n{marker}\n'",
         marker = LOGIN_SHELL_PATH_MARKER
     );
-    let mut child = Command::new(&shell)
+    let mut command = Command::new(shell);
+    command
         .args(["-i", "-l", "-c", &script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .env("TERM", "dumb")
-        .spawn()
-        .ok()?;
+        .env("TERM", "dumb");
+    // 시간 초과 때 셸 하나만 죽이면 프로필이 띄운 자손(멈춘 `nvm`·네트워크 명령 등)이
+    // 고아로 살아남아 파이프를 쥔 채 남는다. 새 세션으로 띄워 그 PID를 그룹 ID로 삼고
+    // 그룹째 끝낸다. 그룹만이 아니라 세션을 새로 여는 것은 제어 터미널을 떼기 위해서다 —
+    // 터미널에서 띄운 앱의 배경 그룹에서 `-i` 셸이 터미널을 잡으려 하면 SIGTTOU로 멈춘다.
+    // SAFETY: fork와 exec 사이에서 `setsid` 하나만 부른다.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
     // 프로필이 stdout을 물려받은 데몬을 남기면 파이프가 닫히지 않는다. 읽기 스레드를
     // join하지 않고 채널로 기다려, 그런 경우에도 상한 시간 뒤에는 포기한다.
@@ -377,17 +397,18 @@ fn probe_login_shell_path() -> Option<Vec<PathBuf>> {
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() < LOGIN_SHELL_PROBE_TIMEOUT => {
+            Ok(None) if started.elapsed() < timeout => {
                 std::thread::sleep(Duration::from_millis(20));
             }
             _ => {
+                let _ = crate::process_signal::signal_process_group(child.id(), libc::SIGKILL);
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
             }
         }
     }
-    let remaining = LOGIN_SHELL_PROBE_TIMEOUT.saturating_sub(started.elapsed());
+    let remaining = timeout.saturating_sub(started.elapsed());
     let output = receiver.recv_timeout(remaining).ok()?;
     parse_login_shell_path(&String::from_utf8_lossy(&output))
 }
@@ -1002,6 +1023,65 @@ mod tests {
         let truncated = format!("{m}\nPATH=/usr/bin\n", m = LOGIN_SHELL_PATH_MARKER);
         assert_eq!(parse_login_shell_path(&truncated), None);
         assert_eq!(parse_login_shell_path("PATH=/usr/bin\n"), None);
+    }
+
+    /// 프로필이 멈추면 셸만이 아니라 프로필이 띄운 자손까지 함께 끝나야 한다. 셸 하나만
+    /// 죽이던 때는 파이프를 쥔 손자가 고아로 남았다.
+    #[test]
+    #[cfg(unix)]
+    fn login_shell_probe_timeout_kills_profile_descendants() {
+        let root = temporary_directory();
+        let pid_file = root.join("grandchild.pid");
+        let shell = root.join("hanging-shell");
+        fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nsleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .expect("fixture shell must be written");
+        make_executable_mode(&shell);
+
+        let started = Instant::now();
+        assert_eq!(
+            probe_login_shell_path_with(&shell, Duration::from_secs(2)),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+
+        let grandchild: u32 = fs::read_to_string(&pid_file)
+            .expect("grandchild pid must be recorded")
+            .trim()
+            .parse()
+            .expect("grandchild pid must parse");
+        // 고아가 된 손자는 init이 거두므로 잠깐 좀비로 보일 수 있다.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(grandchild) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!process_alive(grandchild), "profile descendant survived");
+        fs::remove_dir_all(root).expect("temporary directory must be removed");
+    }
+
+    #[cfg(unix)]
+    fn make_executable_mode(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .expect("fixture permissions must be set");
+    }
+
+    /// 좀비는 살아 있는 것으로 치지 않는다(`/proc` 없는 유닉스에서는 존재 여부만 본다).
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z')),
+            Err(_) if Path::new("/proc/self").exists() => false,
+            Err(_) => crate::process_signal::pid_exists(pid).unwrap_or(false),
+        }
     }
 
     /// nvm은 버전별 디렉터리만 두므로 설치된 버전을 최신부터 모두 넣고, 버전 이름이

@@ -1,6 +1,6 @@
 import { Blocks, LoaderCircle, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { getClaudePluginBranchRules, getClaudeSettingsStates, getProjectRegistry, getWebAccessStatus, removeClaudePluginBranchRule, setClaudePluginBranchRule, setClaudePluginEnabled, type WebAccessStatus } from "../lib/ipc";
+import { getClaudePluginBranchRules, getClaudeSettingsStates, getProjectRegistry, removeClaudePluginBranchRule, setClaudePluginBranchRule, setClaudePluginEnabled } from "../lib/ipc";
 import { useI18n } from "../lib/i18n";
 import { branchMatches } from "../lib/branchPattern";
 import type { ClaudePluginBranchProject, ClaudePluginBranchRule, ClaudePluginBranchRulesSnapshot, ClaudeSettingsSnapshot, ProjectRegistryEntry } from "../types";
@@ -53,7 +53,7 @@ const branchRuleKey = (pluginId: string, projectPath: string, branch: string): s
   `${pluginProjectKey(pluginId, projectPath)}:${branch}`;
 
 /**
- * 카드가 백엔드에서 읽어 오는 값 다섯과 "한 번에 한 동작" 껍데기. 이웃한 두 플러그인 카드
+ * 카드가 백엔드에서 읽어 오는 값 넷과 "한 번에 한 동작" 껍데기. 이웃한 두 플러그인 카드
  * (`useExternalPluginsData`·`useSshKeysData`)는 이미 같은 자리를 훅으로 갈라 두었는데 이
  * 카드만 본문에 펼쳐 두고 있어, 화면을 읽으려면 적재 깃발·busy 토큰·오류 배너 배선을 먼저
  * 지나쳐야 했다.
@@ -70,7 +70,6 @@ function useClaudePluginsData(active: boolean) {
   const [projects, setProjects] = useState<ProjectRegistryEntry[]>([]);
   const [projectSnapshots, setProjectSnapshots] = useState<Record<string, ClaudeSettingsSnapshot>>({});
   const [branchRules, setBranchRules] = useState<ClaudePluginBranchRulesSnapshot | null>(null);
-  const [access, setAccess] = useState<WebAccessStatus | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const loadedRef = useRef(false);
@@ -81,15 +80,15 @@ function useClaudePluginsData(active: boolean) {
     loadedRef.current = true;
     void (async () => {
       try {
-        const [global, entries, writable] = await Promise.all([
+        // C20: 로그인한 채널은 호스트와 같은 권한이라 접근 상태는 읽지 않는다. 토글을 잠그는
+        // 것은 플러그인 자체의 잠금(C8-1 정책·사용자 지정 값)과 진행 중인 쓰기뿐이다.
+        const [global, entries] = await Promise.all([
           getClaudeSettingsStates(null),
           getProjectRegistry(),
-          getWebAccessStatus(),
         ]);
         const activeProjects = entries.filter((entry) => entry.active && entry.exists);
         setSnapshot(global);
         setProjects(activeProjects);
-        setAccess(writable);
         // 브랜치 규칙은 플러그인 목록과 저장소가 다르다. 여기서 실패해도 카드가 로딩에
         // 머무르지 않도록 목록을 먼저 세우고 따로 읽는다.
         void getClaudePluginBranchRules().then(setBranchRules).catch((cause) => setError(errorText(cause)));
@@ -126,7 +125,7 @@ function useClaudePluginsData(active: boolean) {
     setProjectSnapshots((current) => ({ ...current, [projectPath]: next }));
   };
 
-  return { snapshot, projects, projectSnapshots, branchRules, access, busy, error, run, runBranch, updateProjectSnapshot };
+  return { snapshot, projects, projectSnapshots, branchRules, busy, error, run, runBranch, updateProjectSnapshot };
 }
 
 /**
@@ -135,10 +134,9 @@ function useClaudePluginsData(active: boolean) {
  */
 export function ClaudePluginsCard({ active }: { active: boolean }) {
   const { text } = useI18n();
-  const { snapshot, projects, projectSnapshots, branchRules, access, busy, error, run, runBranch, updateProjectSnapshot } = useClaudePluginsData(active);
+  const { snapshot, projects, projectSnapshots, branchRules, busy, error, run, runBranch, updateProjectSnapshot } = useClaudePluginsData(active);
   const [pluginScopes, setPluginScopes] = useState<Record<string, PluginScope>>(loadPluginScopes);
   const [branchDrafts, setBranchDrafts] = useState<Record<string, BranchDraft>>({});
-  const canWrite = access?.writable === true;
 
   const setPluginScope = (pluginId: string, scope: PluginScope) => {
     setPluginScopes((current) => {
@@ -204,7 +202,6 @@ export function ClaudePluginsCard({ active }: { active: boolean }) {
                 plugin={plugin}
                 scope={pluginScopes[plugin.pluginId] ?? "global"}
                 busy={busy}
-                canWrite={canWrite}
                 projects={projects}
                 projectSnapshots={projectSnapshots}
                 branchRules={branchRules}
@@ -239,7 +236,6 @@ interface ClaudePluginProjectSectionProps {
   projects: ProjectRegistryEntry[];
   projectSnapshots: Record<string, ClaudeSettingsSnapshot>;
   busy: string | null;
-  canWrite: boolean;
   onToggleProject: (projectPath: string, enabled: boolean) => void;
 }
 
@@ -249,7 +245,6 @@ function ClaudePluginProjectSection({
   projects,
   projectSnapshots,
   busy,
-  canWrite,
   onToggleProject,
 }: ClaudePluginProjectSectionProps) {
   const { text } = useI18n();
@@ -269,7 +264,7 @@ function ClaudePluginProjectSection({
               <input
                 type="checkbox"
                 checked={projectPlugin?.effectiveEnabled ?? false}
-                disabled={!canWrite || projectBusy || pluginLocked || !projectPlugin}
+                disabled={projectBusy || pluginLocked || !projectPlugin}
                 onChange={(event) => onToggleProject(project.path, event.target.checked)}
               />
               <span>{displayPath(project.name)}</span>
@@ -289,7 +284,6 @@ interface ClaudePluginBranchSectionProps {
   branchDrafts: Record<string, BranchDraft>;
   projectSnapshots: Record<string, ClaudeSettingsSnapshot>;
   busy: string | null;
-  canWrite: boolean;
   branchHandlers: BranchRuleHandlers;
 }
 
@@ -300,7 +294,6 @@ function ClaudePluginBranchSection({
   branchDrafts,
   projectSnapshots,
   busy,
-  canWrite,
   branchHandlers,
 }: ClaudePluginBranchSectionProps) {
   const { text } = useI18n();
@@ -357,7 +350,6 @@ function ClaudePluginBranchSection({
               inherited={enabledProjects.has(project.path)}
               draft={branchDrafts[pluginProjectKey(pluginId, project.path)] ?? EMPTY_DRAFT}
               busy={busy}
-              canWrite={canWrite}
               branchHandlers={branchHandlers}
             />
           ))}
@@ -377,7 +369,6 @@ interface ClaudePluginBranchProjectRowProps {
   inherited: boolean;
   draft: BranchDraft;
   busy: string | null;
-  canWrite: boolean;
   branchHandlers: BranchRuleHandlers;
 }
 
@@ -453,13 +444,12 @@ function ClaudePluginBranchProjectRow({
   inherited,
   draft,
   busy,
-  canWrite,
   branchHandlers: { onDraftChange, onAddBranchRule, onToggleBranchRule, onRemoveBranchRule },
 }: ClaudePluginBranchProjectRowProps) {
   const { text } = useI18n();
   const [query, setQuery] = useState("");
   const draftKey = pluginProjectKey(pluginId, project.path);
-  const locked = !canWrite || pluginLocked;
+  const locked = pluginLocked;
   // 지금 체크아웃한 브랜치를 맨 위로 올린다. 나머지는 사전순 그대로다.
   const branches = useMemo(
     () => prioritizeCurrentBranch(project.branches, project.currentBranch),
@@ -566,7 +556,6 @@ interface ClaudePluginRowProps {
   plugin: ClaudeSettingsSnapshot["plugins"][number];
   scope: PluginScope;
   busy: string | null;
-  canWrite: boolean;
   projects: ProjectRegistryEntry[];
   projectSnapshots: Record<string, ClaudeSettingsSnapshot>;
   branchRules: ClaudePluginBranchRulesSnapshot | null;
@@ -581,7 +570,6 @@ function ClaudePluginRow({
   plugin,
   scope,
   busy,
-  canWrite,
   projects,
   projectSnapshots,
   branchRules,
@@ -622,7 +610,7 @@ function ClaudePluginRow({
           <span>{text("사용여부", "Enabled")}</span>
           <AppToggle
             checked={plugin.effectiveEnabled}
-            disabled={!canWrite || rowBusy || plugin.locked}
+            disabled={rowBusy || plugin.locked}
             label={text(`${plugin.name} 사용여부`, `${plugin.name} enabled`)}
             onChange={onToggleUserEnabled}
           />
@@ -650,7 +638,6 @@ function ClaudePluginRow({
           projects={projects}
           projectSnapshots={projectSnapshots}
           busy={busy}
-          canWrite={canWrite}
           onToggleProject={onToggleProject}
         />
       )}
@@ -662,7 +649,6 @@ function ClaudePluginRow({
           branchDrafts={branchDrafts}
           projectSnapshots={projectSnapshots}
           busy={busy}
-          canWrite={canWrite}
           branchHandlers={branchHandlers}
         />
       )}

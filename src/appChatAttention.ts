@@ -21,6 +21,7 @@ import {
   markAllAttentionReadLocally,
   markAttentionReadLocally,
 } from "./lib/chatAttention";
+import { ownedAiaWindowChatId } from "./lib/aiaWindowSession";
 import type { AppToastRequest } from "./components/AppToasts";
 import { errorText } from "./lib/errorText";
 import { runtimeText } from "./lib/i18nRuntime";
@@ -147,12 +148,12 @@ export function useChatAttentionCenter({ popoutRequest, snapshotRef, activateVie
     () => markChatAttentionRead(id),
   ), [applyAttentionMutation]);
 
-  const markAllAttentionRead = useCallback(() => {
-    // AIA 알림은 인앱 알림창 목록에서 빠져 AIA 패널이 따로 관리한다. 화면에 없는 알림을
-    // 읽음 처리하지 않도록 제외 프로필을 서버에도 그대로 넘긴다.
+  const markAllAttentionRead = useCallback((excludeChatIds: string[] = []) => {
+    // AIA 패널이 숨긴 것은 그 창이 소유한 대화뿐이다. 프로필 전체를 제외하면 세션 화면에
+    // 남아 보이는 다른 AIA 대화도 읽음 처리되지 않으므로, 숨긴 항목만 ID로 보존한다.
     void applyAttentionMutation(
-      (current) => markAllAttentionReadLocally(current, ["aia"]),
-      () => markAllChatAttentionRead(["aia"]),
+      (current) => markAllAttentionReadLocally(current, [], excludeChatIds),
+      () => markAllChatAttentionRead([], excludeChatIds),
     );
   }, [applyAttentionMutation]);
 
@@ -282,6 +283,12 @@ export function useChatAttentionCenter({ popoutRequest, snapshotRef, activateVie
     activateView("sessions");
   })(), [activateView, attentionTarget, findIndexedSession, findProviderSession, notify, openAttachedChat, setSelectedSession, syncSessionCatalog]);
 
+  /** 이 창의 AIA 팝업이 쓰는 대화인지. 팝업이 붙을 때마다 남기는 핀을 그대로 읽는다. */
+  const isOwnAiaChat = useCallback((chatId: string) => {
+    const windowId = popoutRequest?.kind === "aia" ? popoutRequest.windowId : null;
+    return ownedAiaWindowChatId(windowId) === chatId;
+  }, [popoutRequest]);
+
   // 알림 한 건이 어느 화면으로 가는지만 정한다. 실제로 여는 일은 갈래별 함수가 맡고,
   // 비동기로 가는 두 갈래의 실패는 여기서 한 번만 오류로 올린다.
   const openAttentionItem = useCallback((item: ChatAttentionItem) => {
@@ -299,7 +306,11 @@ export function useChatAttentionCenter({ popoutRequest, snapshotRef, activateVie
       activateView("workflows");
       return;
     }
-    if (item.profile === "aia") {
+    // AIA 프로필이어도 **이 창이 소유한** 대화일 때만 팝업으로 연다. 소유 판정은 클릭하는
+    // 그 순간 저장소에서 읽는다 — 팝업이 다른 대화에 붙은 직후에도 어긋나지 않아야 한다.
+    // 소유하지 않은 AIA 대화(세션 화면에서 재개한 세션, ↻ 로 떼어 두고 계속 도는 대화)는
+    // 아래 일반 갈래로 내려가 세션 화면에서 열린다.
+    if (item.profile === "aia" && isOwnAiaChat(item.chatId)) {
       setAiaAttentionTarget(attentionTarget(item));
       openAia();
       return;
@@ -317,7 +328,7 @@ export function useChatAttentionCenter({ popoutRequest, snapshotRef, activateVie
     ).catch((cause: unknown) => {
       setError(errorText(cause));
     });
-  }, [activateView, attentionTarget, markAttentionRead, openAia, openAttachedChat, openRoutedAttention, openUnattendedSessionAttention, requestSettingsTab, requestWorkflowsTab, setError]);
+  }, [activateView, attentionTarget, isOwnAiaChat, markAttentionRead, openAia, openAttachedChat, openRoutedAttention, openUnattendedSessionAttention, requestSettingsTab, requestWorkflowsTab, setError]);
 
   // 기기 알림으로 들어온 대상은 인앱 알림창에서 그 항목을 누른 것과 같이 연다. 알림이 그새
   // 지워졌으면 알림 목록에 없으므로 채팅 ID로 대화만 연다.

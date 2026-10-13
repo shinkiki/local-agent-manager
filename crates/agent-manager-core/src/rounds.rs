@@ -58,6 +58,18 @@ pub enum RoundGoalStatus {
     Done,
 }
 
+/// 회차가 보고에 남긴 선택 요청을 누가 처리하는지.
+///
+/// 기존 저장소에는 이 칸이 없으므로 수동이 기본이다. 자동 모드는 다음 회차 에이전트에게
+/// 판단·기록·후속 실행을 맡길 뿐, 새 권한이나 작업 범위를 부여하지 않는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum RoundDecisionMode {
+    #[default]
+    Manual,
+    Automatic,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoundGoal {
@@ -75,6 +87,8 @@ pub struct RoundGoal {
     pub cadence: String,
     #[serde(default)]
     pub status: RoundGoalStatus,
+    #[serde(default)]
+    pub decision_mode: RoundDecisionMode,
     /// 설계가 만든 것들. AIA 가 등록한 뒤 여기 적는다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_key: Option<String>,
@@ -117,6 +131,8 @@ pub struct RoundGoalPatch {
     pub cadence: Option<String>,
     #[serde(default)]
     pub status: Option<RoundGoalStatus>,
+    #[serde(default)]
+    pub decision_mode: Option<RoundDecisionMode>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub skill_key: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
@@ -222,7 +238,7 @@ pub struct RoundReport {
     pub title: String,
     #[serde(default)]
     pub outcome: RoundOutcome,
-    /// 한 문단 요약.
+    /// 요약. `\n` 으로 나눈 3~5줄을 기대한다 — 화면은 줄바꿈 없는 긴 글도 문장 끝에서 문단으로 나눠 보인다.
     #[serde(default)]
     pub summary: String,
     #[serde(default)]
@@ -389,6 +405,7 @@ pub fn create_round_goal(
         verification: clean_text(&input.verification, MAX_TEXT_CHARS, "검증 방식")?,
         cadence: clean_text(&input.cadence, 200, "주기")?,
         status: RoundGoalStatus::Draft,
+        decision_mode: RoundDecisionMode::Manual,
         skill_key: None,
         workflow_id: None,
         schedule_id: None,
@@ -480,6 +497,9 @@ pub fn update_round_goal(
         }
         if let Some(value) = patch.status {
             goal.status = value;
+        }
+        if let Some(value) = patch.decision_mode {
+            goal.decision_mode = value;
         }
         if let Some(value) = notes.clone() {
             goal.notes = value;
@@ -628,7 +648,64 @@ pub fn get_round_report(app_data_dir: &Path, id: &str) -> Result<RoundReport, Co
         .ok_or_else(|| CoreError::NotFound(format!("회차 보고 {id} 이(가) 없습니다")))
 }
 
-/// 사람이 결정을 적는다. 결정은 사용자 몫이라 AIA 카탈로그에는 열지 않는다.
+/// 워크플로가 띄울 다음 회차에 붙일 자동 결정 안내의 최소 정보.
+/// 질문 원문은 프롬프트에 복제하지 않고 에이전트가 읽기 도구로 최신 저장소를 조회한다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoundDecisionAutomationBrief {
+    pub goal_id: String,
+    pub goal_title: String,
+    pub pending_count: usize,
+}
+
+/// 반복 요청 id가 있으면 그것을 우선하고, 수동 실행이면 워크플로 id로 목표를 찾는다.
+/// 자동 모드인 목표가 아니면 안내를 만들지 않는다.
+pub fn round_decision_automation_brief(
+    app_data_dir: &Path,
+    schedule_id: Option<&str>,
+    workflow_id: &str,
+) -> Result<Option<RoundDecisionAutomationBrief>, CoreError> {
+    let goals = list_round_goals(app_data_dir)?;
+    let goal = match schedule_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(schedule_id) => goals
+            .into_iter()
+            .find(|goal| goal.schedule_id.as_deref() == Some(schedule_id)),
+        None => goals.into_iter().find(|goal| {
+            goal.workflow_id.as_deref() == Some(workflow_id.trim())
+                && goal.status == RoundGoalStatus::Active
+        }),
+    };
+    let Some(goal) = goal.filter(|goal| {
+        goal.status == RoundGoalStatus::Active && goal.decision_mode == RoundDecisionMode::Automatic
+    }) else {
+        return Ok(None);
+    };
+    let pending_count = list_round_reports(
+        app_data_dir,
+        RoundReportQuery {
+            goal_id: Some(goal.id.clone()),
+            pending_decisions: true,
+            limit: None,
+        },
+    )?
+    .iter()
+    .map(|report| {
+        report
+            .decisions
+            .iter()
+            .filter(|decision| decision.resolved.is_none())
+            .count()
+    })
+    .sum();
+    Ok(Some(RoundDecisionAutomationBrief {
+        goal_id: goal.id,
+        goal_title: goal.title,
+        pending_count,
+    }))
+}
+
+/// 결정을 한 번 닫는다. 수동 모드에서는 사람이, 완전자동 모드에서는 회차 에이전트가 적는다.
+/// 병렬 회차가 같은 질문을 함께 읽어도 먼저 쓴 답을 나중 답이 덮어쓰지 못한다.
 pub fn resolve_round_decision(
     app_data_dir: &Path,
     report_id: &str,
@@ -646,6 +723,14 @@ pub fn resolve_round_decision(
         let decision = report.decisions.get_mut(index).ok_or_else(|| {
             CoreError::NotFound(format!("보고에 {}번째 결정이 없습니다", index + 1))
         })?;
+        if let Some(resolved) = &decision.resolved {
+            if resolved == &answer {
+                return Ok(false);
+            }
+            return Err(CoreError::Conflict(
+                "이 선택 요청은 다른 회차에서 이미 처리했습니다".to_owned(),
+            ));
+        }
         decision.resolved = Some(answer.clone());
         Ok(true)
     })?;
@@ -698,6 +783,7 @@ mod tests {
         let dir = temp_dir();
         let goal = create_round_goal(dir.path(), goal_input()).unwrap();
         assert_eq!(goal.status, RoundGoalStatus::Draft);
+        assert_eq!(goal.decision_mode, RoundDecisionMode::Manual);
         assert!(goal.skill_key.is_none());
         let linked = update_round_goal(
             dir.path(),
@@ -717,6 +803,16 @@ mod tests {
             Some("local-model-finetune-round")
         );
         assert_eq!(linked.schedule_id.as_deref(), Some("schedule-1"));
+        let automatic = update_round_goal(
+            dir.path(),
+            &goal.id,
+            RoundGoalPatch {
+                decision_mode: Some(RoundDecisionMode::Automatic),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(automatic.decision_mode, RoundDecisionMode::Automatic);
         // 빈 문자열로 지운다. 다른 칸은 그대로다.
         let cleared = update_round_goal(
             dir.path(),
@@ -790,6 +886,11 @@ mod tests {
         assert_eq!(pending.len(), 1);
         let answered = resolve_round_decision(dir.path(), &report.id, 0, "둔다").unwrap();
         assert_eq!(answered.decisions[0].resolved.as_deref(), Some("둔다"));
+        assert!(resolve_round_decision(dir.path(), &report.id, 0, "둔다").is_ok());
+        assert!(matches!(
+            resolve_round_decision(dir.path(), &report.id, 0, "바꾼다"),
+            Err(CoreError::Conflict(message)) if message.contains("이미 처리")
+        ));
         assert!(list_round_reports(
             dir.path(),
             RoundReportQuery {
@@ -828,6 +929,66 @@ mod tests {
         );
         delete_round_report(dir.path(), &report.id).unwrap();
         assert!(get_round_report(dir.path(), &report.id).is_err());
+    }
+
+    #[test]
+    fn automatic_decision_brief_matches_the_owned_schedule_and_counts_pending_questions() {
+        let dir = temp_dir();
+        let goal = create_round_goal(dir.path(), goal_input()).unwrap();
+        update_round_goal(
+            dir.path(),
+            &goal.id,
+            RoundGoalPatch {
+                status: Some(RoundGoalStatus::Active),
+                decision_mode: Some(RoundDecisionMode::Automatic),
+                workflow_id: Some(Some("round-workflow".to_owned())),
+                schedule_id: Some(Some("schedule-1".to_owned())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        record_round_report(
+            dir.path(),
+            RoundReportInput {
+                goal_id: Some(goal.id.clone()),
+                title: "판단 대기".to_owned(),
+                decisions: vec![
+                    RoundDecision {
+                        question: "첫째".to_owned(),
+                        options: vec!["A".to_owned()],
+                        recommendation: Some("A".to_owned()),
+                        resolved: None,
+                    },
+                    RoundDecision {
+                        question: "둘째".to_owned(),
+                        options: vec![],
+                        recommendation: None,
+                        resolved: None,
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let scheduled =
+            round_decision_automation_brief(dir.path(), Some("schedule-1"), "unrelated-workflow")
+                .unwrap()
+                .expect("automatic brief");
+        assert_eq!(scheduled.goal_id, goal.id);
+        assert_eq!(scheduled.pending_count, 2);
+        assert!(round_decision_automation_brief(
+            dir.path(),
+            Some("another-schedule"),
+            "round-workflow"
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            round_decision_automation_brief(dir.path(), None, "round-workflow")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

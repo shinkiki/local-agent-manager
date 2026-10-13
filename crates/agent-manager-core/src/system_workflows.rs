@@ -272,6 +272,23 @@ struct WorkflowChatRuntime {
     decision_policy: Option<AiaDecisionPolicy>,
 }
 
+/// 회차가 남은 일감을 어디서 세는지. 선언하면 봉투가 계획 **전에** 그 파일을 읽어 이번 회차
+/// 기동 건수를 자른다 — 병렬 실행 설정은 장비가 감당하는 최대치지 매 회차 채워야 할 목표가
+/// 아니다(`usage_pacing::remaining_work_limit`).
+///
+/// 세는 법은 회차마다 다르므로 계약이 자리를 지목하고 봉투는 읽기만 한다. 읽지 못하면 회차를
+/// 막지 않고 종전대로 계정 여력과 상한으로만 돈다 — 수요를 모르는 것과 일이 없는 것은 다르다.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct WorkflowRemainingWork {
+    /// 작업 경로(`projectPath`) 기준 상대 경로의 JSON 파일.
+    pub file: String,
+    /// 그 JSON에서 남은 일감 수를 읽을 키 경로. 점으로 중첩을 가른다(`summary.open`).
+    /// 가리킨 값은 세 가지로 읽는다: 숫자는 그대로, 배열은 길이, `"통과/전체"` 꼴의
+    /// 문자열은 전체에서 통과를 뺀 수.
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SystemWorkflowContract {
@@ -300,6 +317,11 @@ pub(crate) struct SystemWorkflowContract {
     /// (계약은 `deny_unknown_fields`다).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) required_skills: Vec<String>,
+    /// 남은 일감을 세는 자리. 페이싱 회차 계약만 쓴다. 값이 없으면 직렬화하지 않는다 —
+    /// 이 필드를 모르는 이전 판이 공통 저장소의 `workflow.json`을 읽어도 그대로 가져갈 수
+    /// 있어야 한다(계약은 `deny_unknown_fields`다).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remaining_work: Option<WorkflowRemainingWork>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -991,6 +1013,7 @@ impl SystemWorkflowRegistry {
         let mut step_reports: Vec<Value> = Vec::new();
         let mut total_calls = 0usize;
         let mut failed_step: Option<FailedStep> = None;
+        let run_context = self.execution_run_context(request)?;
 
         for step in &version.contract.steps {
             let runner = StepRun {
@@ -1003,7 +1026,7 @@ impl SystemWorkflowRegistry {
                 inputs: &inputs,
                 execution_id: &short_execution,
                 round_execution_id: request.round_execution_id.as_deref(),
-                run: request.paced_run.as_ref(),
+                run: run_context.as_ref(),
                 mutating: crate::system_mcp::system_operation_kind(&step.operation)
                     .unwrap_or(false),
             };
@@ -1043,6 +1066,32 @@ impl SystemWorkflowRegistry {
             execution_summary(&receipt, version.version),
         );
         Ok(receipt)
+    }
+
+    /// 회차 목표의 완전자동 결정 모드를 실행 문맥에 싣는다. 계약 인자가 아니라 앱이 저장한
+    /// 목표와 위조할 수 없는 트리거를 보고 붙이므로 워크플로 작성자가 다른 목표의 모드를
+    /// 빌려 쓸 수 없다. 직접 실행은 활성 목표의 workflowId가 정확히 맞을 때만 붙는다.
+    fn execution_run_context(
+        &self,
+        request: &WorkflowExecuteRequest,
+    ) -> Result<Option<Value>, CoreError> {
+        let schedule_id = request
+            .trigger
+            .as_ref()
+            .map(|trigger| trigger.schedule_id.as_str());
+        let brief = crate::round_decision_automation_brief(
+            &self.app_data_dir,
+            schedule_id,
+            &request.workflow_id,
+        )?;
+        if request.paced_run.is_none() && brief.is_none() {
+            return Ok(None);
+        }
+        let mut run = request.paced_run.clone().unwrap_or_else(|| json!({}));
+        if let (Some(fields), Some(brief)) = (run.as_object_mut(), brief) {
+            fields.insert("decisionAutomationBrief".to_owned(), json!(brief));
+        }
+        Ok(Some(run))
     }
 
     /// 페이싱 회차 계약(`paced`)을 봉투로 돌린다: 사용량 갱신 → 기동 수 계산(이 회차의 예약
@@ -1113,8 +1162,15 @@ impl SystemWorkflowRegistry {
         };
 
         // 1. 갱신 → 2. 계산. 계산이 실패하면 기동할 목록 자체가 없다.
-        let mut plan =
-            self.plan_paced_round(&env, request, &inputs, &project_path, options, &mut round);
+        let mut plan = self.plan_paced_round(
+            &env,
+            request,
+            &version.contract,
+            &inputs,
+            &project_path,
+            options,
+            &mut round,
+        );
         if let Some(plan) = &mut plan {
             // 3. 정리. 정리 실패는 기동을 막지 않는다.
             self.stop_stale_paced_runs(&env, plan, &mut round);
@@ -1242,10 +1298,12 @@ impl SystemWorkflowRegistry {
 
     /// 1. 갱신 → 2. 계산. 갱신은 실패해도 마지막 표본으로 계산을 이어가므로 삼키고, 계산은
     ///    디스패처가 출처(회차 실행 id·반복 요청)로 소비자와 예약을 기록한다.
+    #[allow(clippy::too_many_arguments)]
     fn plan_paced_round(
         &self,
         env: &RoundEnvelope<'_>,
         request: &WorkflowExecuteRequest,
+        contract: &SystemWorkflowContract,
         inputs: &BTreeMap<String, Value>,
         project_path: &str,
         options: PacedRoundOptions,
@@ -1263,6 +1321,12 @@ impl SystemWorkflowRegistry {
             "projectPath": project_path,
             "maxRuns": options.max_runs,
         });
+        // 2-0. 남은 일감. 계획보다 먼저 재야 이번 회차의 상한을 자를 수 있다. 세지 못하면
+        // 싣지 않는다 — 계산은 빈 칸을 "모른다"로 읽고 종전대로 돈다.
+        round.remaining_work = self.measure_remaining_work(env, contract, project_path, round);
+        if let Some(remaining) = round.remaining_work {
+            plan_request["remainingWork"] = json!(remaining);
+        }
         for name in PACED_MODEL_INPUTS {
             if let Some(model) = inputs.get(*name) {
                 plan_request[*name] = model.clone();
@@ -1280,6 +1344,38 @@ impl SystemWorkflowRegistry {
                 None
             }
         }
+    }
+
+    /// 계약이 지목한 자리에서 남은 일감을 센다. 선언이 없거나 읽지 못하면 `None`이고, 그
+    /// 회차는 종전대로 계정 여력과 상한으로만 돈다 — 수요를 **모르는 것**과 일이 **없는 것**은
+    /// 다르다. 0으로 가정하면 수요를 선언하지 않은 회차가 전부 한 건으로 줄어든다.
+    ///
+    /// 읽기 실패를 첫 실패로 기록하지 않는 이유는 이것이 기동의 전제가 아니기 때문이다.
+    /// 단계 행은 `env.call`이 남기므로 영수증에서는 보인다.
+    fn measure_remaining_work(
+        &self,
+        env: &RoundEnvelope<'_>,
+        contract: &SystemWorkflowContract,
+        project_path: &str,
+        round: &mut PacedRoundProgress,
+    ) -> Option<usize> {
+        let declared = contract.remaining_work.as_ref()?;
+        let view = env
+            .call(
+                "remaining-work",
+                "read_project_file",
+                json!({
+                    "request": {
+                        "projectPath": project_path,
+                        "relativePath": declared.file,
+                    }
+                }),
+                round,
+            )
+            .ok()?;
+        let content = view["content"].as_str()?;
+        let document: Value = serde_json::from_str(content).ok()?;
+        remaining_work_count(&document, &declared.path)
     }
 
     /// 2.5. 소진 모드에서 더 비울 수 없는 계정의 한도를 리셋 크레딧으로 되돌린다.
@@ -1646,6 +1742,8 @@ struct PacedRoundProgress {
     planned: usize,
     stale: usize,
     manual_override: bool,
+    /// 계획 전에 센 남은 일감. 계약이 세는 자리를 지목한 회차만 값이 있다.
+    remaining_work: Option<usize>,
 }
 
 /// 기동에 넘길 목록. 계획이 0건인데 사용자가 `지금 실행`을 눌렀으면 페이싱에 등록되지 않은
@@ -1677,6 +1775,32 @@ fn planned_paced_runs(
     }
     round.planned = planned.len();
     planned
+}
+
+/// 계약이 지목한 값을 남은 일감 수로 읽는다. 아는 꼴은 셋뿐이고 그 밖은 `None`이다 —
+/// 세지 못한 것을 0으로 읽으면 회차가 한 건으로 줄어든다.
+///
+/// | 값 | 읽는 법 | 쓰는 자리 |
+/// | --- | --- | --- |
+/// | `3` | 그대로 | 남은 수를 직접 적는 장부 |
+/// | `["a", "b"]` | 길이 | 실패 목록·열린 항목 목록 |
+/// | `"42/44"` | 전체 - 통과 | 수용 점검표의 기준선 |
+fn remaining_work_count(document: &Value, path: &str) -> Option<usize> {
+    let mut cursor = document;
+    for key in path.split('.') {
+        cursor = cursor.get(key)?;
+    }
+    match cursor {
+        Value::Number(number) => number.as_u64().map(|count| count as usize),
+        Value::Array(items) => Some(items.len()),
+        Value::String(text) => {
+            let (passed, total) = text.split_once('/')?;
+            let passed: usize = passed.trim().parse().ok()?;
+            let total: usize = total.trim().parse().ok()?;
+            Some(total.saturating_sub(passed))
+        }
+        _ => None,
+    }
 }
 
 /// 기동 순번에 따라 앞에 둘 대기 시간. 첫 건은 읽을 캐시가 없으므로 기다리지 않는다.
@@ -1758,6 +1882,7 @@ fn paced_round_receipt(
         planned,
         stale,
         manual_override,
+        remaining_work,
     } = round;
     let mut fields = ExecutionReceipt {
         workflow_id: &request.workflow_id,
@@ -1774,6 +1899,7 @@ fn paced_round_receipt(
         "round".to_owned(),
         json!({
             "maxRuns": options.max_runs,
+            "remainingWork": remaining_work,
             "plannedRuns": planned,
             "launchedRuns": launched,
             "staleRuns": stale,
@@ -2105,6 +2231,9 @@ impl StepRun<'_> {
             apply_chat_runtime(&mut arguments, ctx.chat_runtime)?;
             if let Some(brief) = ctx.run.and_then(|run| run.get("completionBrief")) {
                 append_completion_brief(&mut arguments, brief);
+            }
+            if let Some(brief) = ctx.run.and_then(|run| run.get("decisionAutomationBrief")) {
+                append_decision_automation_brief(&mut arguments, brief);
             }
         }
         let site = WorkflowCallSite {
@@ -2536,6 +2665,7 @@ fn paced_contract_from_legacy(
             paced: true,
             chat_runtime: contract.chat_runtime.clone(),
             required_skills: contract.required_skills.clone(),
+            remaining_work: contract.remaining_work.clone(),
         },
         legacy_default,
     ))
@@ -3881,6 +4011,44 @@ fn append_completion_brief(arguments: &mut Value, brief: &Value) {
     *message = Value::String(text);
 }
 
+/// 목표의 완전자동 결정 모드를 회차 에이전트 지침으로 붙인다. 이것은 권한 승인이 아니라
+/// 이미 허용된 목표 범위 안의 기술 판단을 이어 가는 정책이다. 새 권한·외부 공개·파괴적
+/// 변경이 필요하면 기존 승인 경계를 그대로 지키도록 문구에도 명시한다.
+fn append_decision_automation_brief(arguments: &mut Value, brief: &Value) {
+    let Some(goal_id) = brief.get("goalId").and_then(Value::as_str) else {
+        return;
+    };
+    let goal_title = brief
+        .get("goalTitle")
+        .and_then(Value::as_str)
+        .unwrap_or(goal_id);
+    let pending_count = brief
+        .get("pendingCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let Some(message) = arguments
+        .pointer_mut("/request/message")
+        .filter(|message| message.is_string())
+    else {
+        return;
+    };
+    let mut text = message.as_str().unwrap_or_default().to_owned();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "\n---\n[회차 완전자동 결정] 목표: {goal_title} ({goal_id})\n\
+         현재 확인된 미결 선택 요청: {pending_count}건. 작업을 시작하기 전에 `list_round_reports`로 이 목표의 \
+         `pendingDecisions=true` 보고를 최신 상태로 읽으세요. 각 질문은 보고의 요약·측정·실패 종류·수정·다음 \
+         항목과 함께 분석하고, 선택지 중 가장 타당한 답을 고르거나 선택지가 부족하면 목표를 전진시키는 구체적인 \
+         추가 요청을 직접 작성해 `resolve_round_decision`으로 기록하세요. 추천안은 근거이지 의무가 아닙니다. 기록한 \
+         답은 이번 회차의 추가 지시로 간주해 가능한 작업까지 이어서 수행하세요. 일상적인 기술 판단은 새 선택 요청으로 \
+         남기지 말고 스스로 판단해 진행하세요. 이 모드는 새 권한을 주지 않습니다. 목표 범위를 넓히거나 외부 공개, \
+         복구하기 어려운 변경, 비밀 접근처럼 별도 사용자 권한이 필요한 일은 기존 승인·안전 규칙을 그대로 지키세요.\n"
+    ));
+    *message = Value::String(text);
+}
+
 /// 변경 작업 인자에서 대상 식별자만 추출한다. 메시지 원문 등은 수집하지 않는다.
 fn collect_changed_targets(arguments: &Value, targets: &mut Vec<String>) {
     const TARGET_KEYS: &[&str] = &["id", "chatId", "accountId", "workflowId", "provider"];
@@ -4594,6 +4762,157 @@ mod tests {
         })
     }
 
+    /// 계약이 세는 자리를 지목하면 봉투는 **계획보다 먼저** 그 자리를 읽고, 센 수를 계산에
+    /// 넘긴다. 상한은 장비가 감당하는 최대치지 매 회차 채워야 할 목표가 아니다.
+    #[test]
+    fn a_round_counts_remaining_work_before_planning_and_hands_it_to_the_plan() {
+        let (_dir, registry) = registry();
+        let mut contract = usage_paced_round_contract();
+        contract.remaining_work = Some(WorkflowRemainingWork {
+            file: "docs/project-menu/baseline.json".to_owned(),
+            path: "itemsPassed".to_owned(),
+        });
+        register_approved(&registry, contract).expect("register");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let invoker = |operation: &str, arguments: Value, _: &WorkflowCallSite<'_>| {
+            seen.borrow_mut()
+                .push((operation.to_owned(), arguments.clone()));
+            match operation {
+                "read_project_file" => Ok(json!({
+                    "content": r#"{"itemsPassed": "42/44", "checksPassed": "142/142"}"#
+                })),
+                "plan_usage_paced_runs" => Ok(fake_plan(&[("a", "claude")])),
+                _ => Ok(json!({"ok": true})),
+            }
+        };
+        let request = WorkflowExecuteRequest {
+            workflow_id: "usage-paced-round".to_owned(),
+            arguments: json!({"projectPath": "/tmp/project", "message": "go"}),
+            idempotency_key: "round-remaining".to_owned(),
+            ..Default::default()
+        };
+        let receipt = registry
+            .execute_paced_round(request, PacedRoundOptions { max_runs: 9 }, &invoker)
+            .expect("round");
+
+        let calls = seen.borrow();
+        let operations: Vec<&str> = calls
+            .iter()
+            .map(|(operation, _)| operation.as_str())
+            .collect();
+        let read_at = operations
+            .iter()
+            .position(|operation| *operation == "read_project_file")
+            .expect("남은 일감을 읽는다");
+        let plan_at = operations
+            .iter()
+            .position(|operation| *operation == "plan_usage_paced_runs")
+            .expect("계획을 센다");
+        assert!(
+            read_at < plan_at,
+            "계획 뒤에 읽으면 이번 회차 상한을 자를 수 없다: {operations:?}"
+        );
+        let read_args = &calls[read_at].1["request"];
+        assert_eq!(read_args["projectPath"], "/tmp/project");
+        assert_eq!(read_args["relativePath"], "docs/project-menu/baseline.json");
+        // 42/44 → 남은 둘. 계산이 이 수로 상한을 자른다.
+        assert_eq!(calls[plan_at].1["request"]["remainingWork"], 2);
+        assert_eq!(receipt["round"]["remainingWork"], 2);
+    }
+
+    /// 세는 자리를 지목하지 않은 회차는 종전대로 돈다 — 읽지도 않고, 계산에 빈 칸을 넘긴다.
+    /// 모르는 것을 0으로 넘기면 선언하지 않은 회차가 전부 한 건으로 줄어든다.
+    #[test]
+    fn a_round_without_a_declared_count_sends_no_remaining_work() {
+        let (_dir, registry) = registry();
+        register_approved(&registry, usage_paced_round_contract()).expect("register");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let invoker = |operation: &str, arguments: Value, _: &WorkflowCallSite<'_>| {
+            seen.borrow_mut()
+                .push((operation.to_owned(), arguments.clone()));
+            match operation {
+                "plan_usage_paced_runs" => Ok(fake_plan(&[("a", "claude")])),
+                _ => Ok(json!({"ok": true})),
+            }
+        };
+        let request = WorkflowExecuteRequest {
+            workflow_id: "usage-paced-round".to_owned(),
+            arguments: json!({"projectPath": "/tmp/project", "message": "go"}),
+            idempotency_key: "round-no-remaining".to_owned(),
+            ..Default::default()
+        };
+        let receipt = registry
+            .execute_paced_round(request, PacedRoundOptions { max_runs: 9 }, &invoker)
+            .expect("round");
+
+        let calls = seen.borrow();
+        assert!(
+            !calls
+                .iter()
+                .any(|(operation, _)| operation == "read_project_file"),
+            "선언이 없으면 읽지 않는다"
+        );
+        let plan = calls
+            .iter()
+            .find(|(operation, _)| operation == "plan_usage_paced_runs")
+            .expect("계획");
+        assert!(plan.1["request"]["remainingWork"].is_null());
+        assert!(receipt["round"]["remainingWork"].is_null());
+    }
+
+    /// 읽기가 실패해도 회차는 돈다. 남은 일감은 기동의 전제가 아니라 상한을 깎는 참고값이다.
+    #[test]
+    fn a_round_still_launches_when_the_count_cannot_be_read() {
+        let (_dir, registry) = registry();
+        let mut contract = usage_paced_round_contract();
+        contract.remaining_work = Some(WorkflowRemainingWork {
+            file: "docs/missing.json".to_owned(),
+            path: "itemsPassed".to_owned(),
+        });
+        register_approved(&registry, contract).expect("register");
+        let invoker = |operation: &str, _arguments: Value, _: &WorkflowCallSite<'_>| match operation
+        {
+            "read_project_file" => Err(CoreError::InvalidInput("그런 파일이 없습니다".to_owned())),
+            "plan_usage_paced_runs" => Ok(fake_plan(&[("a", "claude")])),
+            _ => Ok(json!({"ok": true})),
+        };
+        let request = WorkflowExecuteRequest {
+            workflow_id: "usage-paced-round".to_owned(),
+            arguments: json!({"projectPath": "/tmp/project", "message": "go"}),
+            idempotency_key: "round-unreadable".to_owned(),
+            ..Default::default()
+        };
+        let receipt = registry
+            .execute_paced_round(request, PacedRoundOptions { max_runs: 9 }, &invoker)
+            .expect("round");
+        assert_eq!(receipt["succeeded"], true);
+        assert!(receipt["round"]["remainingWork"].is_null());
+        assert_eq!(receipt["round"]["launchedRuns"], 1);
+    }
+
+    #[test]
+    fn remaining_work_reads_the_three_shapes_and_refuses_the_rest() {
+        let document = json!({
+            "open": 3,
+            "failures": ["a", "b"],
+            "itemsPassed": "42/44",
+            "done": "44/44",
+            "nested": {"left": 1},
+            "odd": {"a": 1},
+            "text": "곧 끝난다"
+        });
+        assert_eq!(remaining_work_count(&document, "open"), Some(3));
+        assert_eq!(remaining_work_count(&document, "failures"), Some(2));
+        assert_eq!(remaining_work_count(&document, "itemsPassed"), Some(2));
+        // 전건 통과는 0이다. 상한을 1로 깎는 일은 계산 쪽이 한다.
+        assert_eq!(remaining_work_count(&document, "done"), Some(0));
+        assert_eq!(remaining_work_count(&document, "nested.left"), Some(1));
+        // 세지 못하는 꼴은 0이 아니라 "모름"이다.
+        assert_eq!(remaining_work_count(&document, "odd"), None);
+        assert_eq!(remaining_work_count(&document, "text"), None);
+        assert_eq!(remaining_work_count(&document, "nowhere"), None);
+    }
+
     #[test]
     fn a_paced_contract_is_registered_with_run_tokens_and_without_envelope_steps() {
         let (_dir, registry) = registry();
@@ -4935,6 +5254,23 @@ mod tests {
         let message = text["request"]["message"].as_str().unwrap();
         assert!(message.starts_with("지시문\n"));
         assert!(message.contains("누적 성공 실행: 4건"));
+    }
+
+    #[test]
+    fn automatic_decision_brief_explains_analysis_follow_up_and_permission_boundary() {
+        let brief = json!({
+            "goalId": "goal-1",
+            "goalTitle": "리팩토링 회차",
+            "pendingCount": 2
+        });
+        let mut arguments = json!({"request": {"message": "원래 회차 지시"}});
+        append_decision_automation_brief(&mut arguments, &brief);
+        let message = arguments["request"]["message"].as_str().unwrap();
+        assert!(message.starts_with("원래 회차 지시\n"));
+        assert!(message.contains("[회차 완전자동 결정]"));
+        assert!(message.contains("pendingDecisions=true"));
+        assert!(message.contains("구체적인 추가 요청"));
+        assert!(message.contains("새 권한을 주지 않습니다"));
     }
 
     #[test]

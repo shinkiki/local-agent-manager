@@ -609,6 +609,10 @@ pub struct AccountLoginSessionView {
     pub environment_variable: String,
     pub profile_path: String,
     pub command: String,
+    /// 임시 프로필에 저장 가능한 자격증명이 이미 들어 있는지. 화면은 로그인 CLI의 종료
+    /// 이벤트를 놓쳐도(원격 탭의 소켓이 잠깐 끊긴 뒤 유예가 지난 경우) 이 값으로 "로그인
+    /// 완료 저장"을 열 수 있다. 판정만 하고 값은 돌려주지 않는다(G4).
+    pub credentials_ready: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1794,7 +1798,8 @@ impl AccountSupervisor {
             // 되므로 자식이 읽을 수 있는 모양이어야 한다.
             profile_path: crate::path_guard::canonical_child_facing(profile_path)?,
         };
-        let view = login_view(&login);
+        // 방금 만든 빈 프로필이라 자격증명은 아직 없다. 디스크를 다시 읽지 않는다.
+        let view = login_view(&login, false);
         lock(&self.inner.state, "계정 로그인 상태")?
             .logins
             .insert(id, login);
@@ -1802,12 +1807,37 @@ impl AccountSupervisor {
     }
 
     pub fn login_session(&self, id: &str) -> Result<AccountLoginSessionView, CoreError> {
-        let state = lock(&self.inner.state, "계정 로그인 상태")?;
-        state
-            .logins
-            .get(id)
-            .map(login_view)
-            .ok_or_else(|| CoreError::NotFound("계정 로그인 세션을 찾을 수 없습니다".to_owned()))
+        let login = {
+            let state = lock(&self.inner.state, "계정 로그인 상태")?;
+            state.logins.get(id).cloned().ok_or_else(|| {
+                CoreError::NotFound("계정 로그인 세션을 찾을 수 없습니다".to_owned())
+            })?
+        };
+        // 프로필 읽기는 잠금 밖에서 한다 — 볼트·파일 읽기를 잠금 안에서 하면 스냅샷 경로와
+        // 순서가 엇갈린다(`account_record`와 같은 이유).
+        let credentials_ready = self.login_credentials_ready(&login);
+        Ok(login_view(&login, credentials_ready))
+    }
+
+    /// 로그인 프로필에 `finish_login`이 받아들일 자격증명이 들어 있는지. `capture_credentials`와
+    /// 같은 자리(프로필 파일, Antigravity는 기계 전역 항목까지)를 읽고 `credential_is_complete`로
+    /// 온전성까지 본다. 신원 조회는 하지 않는다 — 공급자 서버를 부르지 않고도 "지금 저장을
+    /// 눌러도 되는가"만 답하면 된다.
+    fn login_credentials_ready(&self, login: &AccountLoginSession) -> bool {
+        let secret = match self.read_credentials(login.provider, Some(&login.profile_path)) {
+            Ok(secret) => secret,
+            Err(_) if login.provider == ProviderId::Antigravity => {
+                match credential_profiles::read_antigravity_global_login() {
+                    Ok(Some(global)) => match antigravity_envelope_from_global_login(&global) {
+                        Ok(secret) => secret,
+                        Err(_) => return false,
+                    },
+                    _ => return false,
+                }
+            }
+            Err(_) => return false,
+        };
+        credential_is_complete(login.provider, &secret)
     }
 
     pub fn finish_login(
@@ -4176,9 +4206,10 @@ fn login_capture_error(provider: ProviderId, profile_path: &Path, error: CoreErr
     ))
 }
 
-fn login_view(login: &AccountLoginSession) -> AccountLoginSessionView {
+fn login_view(login: &AccountLoginSession, credentials_ready: bool) -> AccountLoginSessionView {
     AccountLoginSessionView {
         id: login.id.clone(),
+        credentials_ready,
         provider: login.provider,
         account_id: login.account_id.clone(),
         environment_variable: match login.provider {
@@ -4686,16 +4717,17 @@ fn antigravity_authenticated_email_from_cli_log(home: &Path) -> Option<String> {
     antigravity_authenticated_email_from_log_text(&String::from_utf8_lossy(&bytes))
 }
 
+/// 마지막 표식 **하나만** 본다. 그 줄의 이메일이 비어 있거나 읽을 수 없으면 더 앞의 줄로
+/// 내려가지 않고 `None`(`Pending`)이다 — 앞의 줄은 이전 프로세스의 인증이라, 내려가면 이번
+/// 프로세스가 아닌 계정으로 `Matched`를 내릴 수 있다.
 fn antigravity_authenticated_email_from_log_text(text: &str) -> Option<String> {
-    text.rmatch_indices(ANTIGRAVITY_AUTH_RESULT_MARKER)
-        .find_map(|(index, _)| {
-            let rest = &text[index + ANTIGRAVITY_AUTH_RESULT_MARKER.len()..];
-            let email = rest
-                .split(|c: char| c == ',' || c.is_whitespace())
-                .next()?
-                .trim();
-            email.contains('@').then(|| email.to_owned())
-        })
+    let index = text.rfind(ANTIGRAVITY_AUTH_RESULT_MARKER)?;
+    let rest = &text[index + ANTIGRAVITY_AUTH_RESULT_MARKER.len()..];
+    let email = rest
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .next()?
+        .trim();
+    email.contains('@').then(|| email.to_owned())
 }
 
 /// 이메일 비교는 대소문자를 가리지 않는다 — 구글은 로컬 파트 대소문자를 구분하지 않고, 로그와
@@ -11440,6 +11472,48 @@ mod tests {
         assert_eq!(snapshot.accounts[0].display_name, "추가 계정");
     }
 
+    /// 원격 탭이 CLI 종료 이벤트를 놓쳐도 저장할 수 있어야 한다(2026-10-10 NAS 실측: 승인은
+    /// 끝나 auth.json이 생겼는데 화면의 저장 버튼이 꺼진 채였다). 세션 조회가 프로필의
+    /// 자격증명 유무를 직접 답하면 화면은 그 값으로 버튼을 연다.
+    #[test]
+    fn login_session_reports_credentials_once_the_cli_has_written_them() {
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let supervisor = AccountSupervisor::open_with(
+            data.path(),
+            home.path(),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+        let login = supervisor.begin_login(ProviderId::Codex, None).unwrap();
+        assert!(!login.credentials_ready);
+        assert!(
+            !supervisor
+                .login_session(&login.id)
+                .unwrap()
+                .credentials_ready
+        );
+
+        let profile = PathBuf::from(&login.profile_path);
+        fs::write(profile.join("auth.json"), "not a credential").unwrap();
+        assert!(
+            !supervisor
+                .login_session(&login.id)
+                .unwrap()
+                .credentials_ready,
+            "검증을 통과하지 못하는 파일은 준비된 것으로 보지 않는다"
+        );
+
+        fs::write(profile.join("auth.json"), codex_secret("account-ready")).unwrap();
+        assert!(
+            supervisor
+                .login_session(&login.id)
+                .unwrap()
+                .credentials_ready
+        );
+        supervisor.cancel_login(&login.id).unwrap();
+    }
+
     /// 로그인 프로필 경로는 로그인 CLI의 작업 경로이자 `CODEX_HOME` 값이 된다.
     /// Windows 확장 경로(`\\?\C:\…`)를 그대로 주면 npm 배치 셈(`codex.cmd`)을
     /// 도는 `cmd.exe`가 `UNC 경로는 지원되지 않습니다`로 물러난 뒤 `지정된 경로를 찾을
@@ -13907,6 +13981,14 @@ mod tests {
         assert_eq!(
             antigravity_authenticated_email_from_log_text(
                 "applyAuthResult: email=, authMethod=consumer"
+            ),
+            None
+        );
+        // 마지막 줄의 이메일이 비면 이전 프로세스의 계정으로 내려가지 않는다.
+        assert_eq!(
+            antigravity_authenticated_email_from_log_text(
+                "applyAuthResult: email=first@example.com, authMethod=consumer\n\
+                 applyAuthResult: email=, authMethod=consumer\n"
             ),
             None
         );

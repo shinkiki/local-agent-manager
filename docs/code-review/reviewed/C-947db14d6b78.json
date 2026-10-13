@@ -1,0 +1,14 @@
+{
+  "itemId": "C-947db14d6b78",
+  "kind": "commit",
+  "ref": "947db14d6b78cd72b63e06aec855c833ddfa91d1",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L08",
+  "source": "claude",
+  "verdict": "신규 결함 0건 / 기존 open 결함 occurrences 1건 추가",
+  "note": "docs/code-review 아래 세 파일(queue.json · reviewed/C-7602d3093d32.json 신규 · findings/F-docs-code-review-readme-md-commits-6f902967.json occurrences+note)만 바뀐 장부 전용 커밋이다. 정확성: 이 커밋의 장부와 커밋 본문이 사실로 적은 수를 전부 원문으로 다시 셌다. (가) 리뷰 대상 7602d309 가 세 파일을 바꿨다 — git show --stat 로 3 files changed 확인. 참. (나) 7602d309 트리의 queue.json reviewed 30 이 그 트리의 reviewed json 30 과 맞고, 그 중 commits 가 빈 것 28, findings 14 중 state=\"fixed\" 인데 fixCommits 가 빈 것 6 이다 — 이 커밋이 결함 note 에 적은 30·28·14·6 과 일치한다. 참. (다) e742702f 가 세 파일, 1b9c1f16 이 두 파일을 바꿨다는 것도 --stat 로 확인했다(3 files / 2 files). (라) 1b9c1f16 의 queue.json 이 reviewed 21→22 한 쌍만 바꾸고 remaining 453 · commit 219 를 유지한다는 것도 그 커밋 diff 로 확인했다. (마) 교차검증 수 e742702f 25·23·14·6, 부모 24·22·14·6 을 ls-tree 와 JSON 파싱으로 독립 재계산해 그대로 맞췄다. (바) 이 커밋이 민 queue.json reviewed 는 rebase 전 base(947db14d) 기준 31→32 였고, 착지한 모양은 34→35 다 — 착지 트리의 reviewed 장부 35 건과 맞는다. remaining 453 · commit 219 · module 234 · expired 37 은 그대로다. 아래 교차검증 수는 모두 rebase 전 base 에서 잰 것이라 착지 트리의 수와 다르다(C-f6dc7dc50379 리뷰에서 교정 — 원문은 31→32 가 착지 수치인 것처럼 적혀 있었다). 틀린 수는 한 건도 없다. 계약: rebase 전 base 트리의 reviewed 32 건·findings 14 건 전부를 열어 파일 이름=itemId/findingId, 커밋 항목 ref 가 파일 이름 해시로 시작, findings 가 가리키는 결함 파일에 끊긴 참조 없음, reviewedAt 이 문자열임을 재계산했다 — 위반 0 건. 보안 불변식: docs/code-review 아래 JSON 문자열만 바뀌어 AGENTS.md 2절 G1~G11 과 3절 C 예외 어느 조건에도 닿지 않는다(자격증명·공급자 소유 저장소·셸 문자열·경로 정규화·쓰기 게이트 무관). 검증 없음: 장부 문자열에는 재현 시험 자리가 없고 이 장부를 읽는 러너는 src/lib/codeReviewQueue.test.mjs 가 덮는다 — tests 12 · pass 12 · fail 0. 단순화·중복: 러너의 ledgerDuplicates 가 비어 있고 같은 항목의 reviewed 파일도 하나뿐이다. 결함 파일에 한 줄만 덧붙여 occurrences 전체 재작성을 되풀이하지 않았다. 신규 결함 0 건. 다만 이 커밋이 더한 reviewed/C-7602d3093d32.json 의 commits 도 빈 배열이라 기존 open 결함 F-docs-code-review-readme-md-commits-6f902967 의 또 한 번의 관측이다 — 새 결함을 만들지 않고 occurrences 에 덧붙였다. 저장 형식 변경이라 고치지 않았고 같은 주제의 결정이 이미 열려 있어 다시 올리지 않았다.",
+  "findings": [
+    "F-docs-code-review-readme-md-commits-6f902967"
+  ],
+  "commits": []
+}

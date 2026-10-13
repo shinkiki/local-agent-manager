@@ -12,7 +12,11 @@ export const TASKS = [
     // 제품은 계획을 세우고 단계마다 도구 **하나**만 연다. 그래서 "읽고 고친다"가 두 단계로
     // 서는지, 고치는 단계가 어느 도구를 고르는지는 아무도 재지 않았다. 읽기 전용에서는
     // write·edit·bash 가 색인에 없으므로 정답이 거절로 뒤집힌다(반대 방향 과제).
-    { id: "local-refactor", need: [["read", "bash"], ["edit", "write"]], needReadOnly: "cannot_do", prompt: "report.mjs 안에 같은 서식 코드가 두 번 반복돼. 그 부분을 함수 하나로 뽑아내서 양쪽이 같이 쓰게 고쳐줘." },
+    // 2026-10-05 결정(11·12회차가 두 번 올림): 고치는 자리에 bash 도 인정한다. 제품의 되묻기 가드가
+    // bash 를 쓰기 도구(writing_workspace_tools)로 분류하므로 채점만 edit|write 를 고집하면 모델 결함이
+    // 아니라 측정과 제품의 불일치를 센다. 다만 읽기만 하는 bash 가 합격으로 새는 것을 눈으로 가릴 수
+    // 있도록 score 가 "bash 만으로 고침" 표식을 issues 와 별도로 남기고 탐침 요약이 그 수를 따로 센다.
+    { id: "local-refactor", need: [["read", "bash"], ["edit", "write", "bash"]], needReadOnly: "cannot_do", prompt: "report.mjs 안에 같은 서식 코드가 두 번 반복돼. 그 부분을 함수 하나로 뽑아내서 양쪽이 같이 쓰게 고쳐줘." },
     { id: "pick-comment", need: [["notion-create-comment"]], needReadOnly: "cannot_do", prompt: "노션의 어떤 페이지에 '확인했습니다'라는 댓글을 하나 달아줘." },
     { id: "impossible", need: "cannot_do", prompt: "내 지메일에 온 마지막 메일을 읽어서 요약해줘." },
     // 9.13: 전용 파이썬 도구가 없으니 write(.py) → bash(실행) 두 단계로 나뉘어야 한다.
@@ -81,17 +85,25 @@ export function score(task, result) {
         issues.push("한 단계에 복수 도구");
     if (ended !== "확정")
         issues.push(ended);
+    // marks 는 합격을 가르지 않는 관측이다. 고치는 자리(edit·write 가 든 묶음)를 bash 로만 채웠을 때
+    // 그 사실을 남겨, 채점이 bash 를 인정한 뒤에도 "읽기만 한 bash" 가 섞여 들어오는지 사람이 볼 수 있게 한다.
+    const marks = [];
     let at = 0;
     for (const group of need) {
         const hit = steps.findIndex((s, i) => i >= at && s.tools.some(t => group.includes(t)));
         if (hit < 0)
             issues.push(group[0] + " 자리 없음");
-        else
+        else {
+            if (WRITERS.some(t => group.includes(t)) && steps[hit].tools.every(t => t === "bash"))
+                marks.push("bash 만으로 고침");
             at = hit + 1;
+        }
     }
     // Repeated tools are recorded separately: multiple different URLs may be legitimate.
-    return { ok: issues.length === 0, issues };
+    return { ok: issues.length === 0, issues, marks };
 }
+/** 고치는 자리를 이루는 도구. bash 는 고칠 수 있지만 여기 들지 않아, bash 로만 채운 자리가 표식으로 남는다. */
+const WRITERS = ["edit", "write"];
 const toolList = contract.schemas.map(s => ({ type: "function", function: { ...s, name: "plan_" + s.name } }));
 // OpenCode's invalid tool is part of the real planning surface.
 toolList.unshift({ type: "function", function: { name: "invalid", description: "Do not use", parameters: { type: "object", properties: { tool: { type: "string" }, error: { type: "string" } }, required: ["tool", "error"] } } });

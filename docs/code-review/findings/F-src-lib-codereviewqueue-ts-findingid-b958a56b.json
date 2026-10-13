@@ -1,0 +1,17 @@
+{
+  "findingId": "F-src-lib-codereviewqueue-ts-findingid-b958a56b",
+  "file": "src/lib/codeReviewQueue.ts",
+  "symbol": "findingId",
+  "symptom": "한글 증상은 슬러그가 비어 지문에 들어가지 않는다",
+  "severity": "P2",
+  "state": "open",
+  "agentsRules": [],
+  "occurrences": [
+    {
+      "itemId": "C-1186bef6c8a7",
+      "at": "2026-10-06T00:00:00Z"
+    }
+  ],
+  "fixCommits": [],
+  "note": "findingId 는 key 를 `file::symbol::slug(symptom)` 으로 만드는데 slug 가 [^a-z0-9]+ 를 전부 지운다. 이 저장소의 증상 문구는 전부 한글이라 slug(symptom) 이 늘 빈 문자열이고, 같은 파일·심볼의 서로 다른 결함이 **같은 id** 를 받는다. 실측: findingId({file:'src/lib/gitBranchTree.ts',symbol:'toNode',symptom:'외자식 폴더 압축이 …'}) 와 symptom 을 '완전히 다른 증상이다' 로 바꾼 호출이 둘 다 F-src-lib-gitbranchtree-ts-tonode-e552d7a4 를 돌려준다. 결과로 두 번째 결함은 첫 결함 파일의 occurrences 에 덧붙여져 증상이 묻힌다. 고치면 이미 적힌 결함 파일의 이름(=정체)이 바뀌므로 저장 형식 변경에 해당해 이번 회차가 고치지 않고 보고의 decisions 로 올린다(회차 절차 4절 3번)."
+}

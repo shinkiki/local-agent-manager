@@ -18,6 +18,13 @@ const PROMPT_EXCLUSIONS = new Set([
   // 회차 점검표의 채점 규칙. 한국어 문자열은 전부 실패 사유이고 이 파일을 읽는 것은
   // DOM 이 아니라 scripts/project-menu-conformance.mjs 다.
   "src/lib/projectMenuConformance.ts",
+  // Git 충돌·막힘을 AIA 에게 넘길 때 쓰는 요청문.
+  // projectAiaHandoff.ts 와 같은 범주다 — 결과가 화면이 아니라 에이전트에게 간다.
+  "src/lib/gitConflictAiaPrompt.ts",
+  // 회차 도구의 판정 규칙. 읽는 쪽은 DOM 이 아니라 scripts/code-review-queue.mjs 와
+  // scripts/flaky-isolate.mjs 이고, 한국어 문자열은 전부 그 스크립트의 출력·오류다.
+  "src/lib/codeReviewQueue.ts",
+  "src/lib/flakyTestReport.ts",
 ]);
 const SOURCE_EXTENSIONS = new Set([".ts", ".tsx"]);
 /** 생성 파일. 소스의 `text(ko, en)` 짝을 그대로 옮겨 적은 것이라 다시 세면 같은 문구를 두 번 센다. */

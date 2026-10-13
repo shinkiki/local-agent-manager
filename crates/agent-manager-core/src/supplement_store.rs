@@ -10,7 +10,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::app_data_file::read_private_json_or_default;
+use crate::app_data_file::{read_private_json_or_default, write_private_json};
 use crate::domain::{wire_enum, ProviderId, SupplementStorageStats};
 use crate::identifier::validate_identifier;
 use crate::json_store;
@@ -216,8 +216,11 @@ fn with_supplement_store<T>(
     let _lock = store_lock::acquire(app_data_dir, SUPPLEMENT_LOCK_FILE_NAME, "보완 저장소")?;
     let mut store = load_supplement_store(app_data_dir)?;
     let value = action(&mut store)?;
-    let text = serde_json::to_string_pretty(&store)?;
-    fs::write(app_data_dir.join(SUPPLEMENT_STORE_FILE_NAME), text)?;
+    // G7·G10: 보완 저장소는 캡처한 응답 본문을 담는 앱 소유 파일이다. 그 자리에 바로
+    // 쓰면 끊긴 쓰기가 반쪽 JSON을 남기고 다음 읽기가 그것을 기본값으로 삼아 보관한
+    // 응답을 말없이 잃는다. 또 그 자리의 심볼릭 링크를 따라가 앱 데이터 밖 파일을
+    // 덮어쓰고, 새 파일은 0600이 아니라 umask 권한으로 생긴다.
+    write_private_json(&app_data_dir.join(SUPPLEMENT_STORE_FILE_NAME), &store)?;
     Ok(value)
 }
 
@@ -274,6 +277,37 @@ pub(crate) fn prune_supplements_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G10: 저장소 자리에 놓인 심볼릭 링크는 따라가지 않고 링크 자체를 새 파일로
+    /// 바꾼다. 링크 대상(앱 데이터 밖 파일)은 그대로 남고, 새 저장소는 0600이다.
+    #[cfg(unix)]
+    #[test]
+    fn supplement_store_write_replaces_a_symlink_instead_of_following_it_g10() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        let outside = tempfile::tempdir().expect("outside dir");
+        let victim = outside.path().join("victim.json");
+        fs::write(&victim, b"{}").expect("victim");
+        let path = temp.path().join(SUPPLEMENT_STORE_FILE_NAME);
+        std::os::unix::fs::symlink(&victim, &path).expect("symlink");
+
+        persist_captured_turn(
+            temp.path(),
+            ProviderId::Claude,
+            "session-1234567890",
+            "turn-1234567890abcd",
+            1,
+            "응답".to_owned(),
+            SupplementOrigin::Chat,
+        )
+        .expect("turn must save");
+
+        assert_eq!(fs::read(&victim).expect("victim read"), b"{}");
+        let meta = fs::symlink_metadata(&path).expect("store meta");
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
 
     #[test]
     fn pruning_supplements_drops_only_the_cleaned_sessions_turns() {

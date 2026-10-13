@@ -11,7 +11,7 @@ import {
   sendWithAttachmentDrafts,
   type ChatAttachmentDraft,
 } from "./ChatAttachments";
-import { enableAiaWindowSessions, rememberAiaWindowSession, selectAiaWindowSession } from "../lib/aiaWindowSession";
+import { enableAiaWindowSessions, forgetAiaWindowSession, rememberAiaWindowSession, selectAiaWindowSession } from "../lib/aiaWindowSession";
 import { openPopoutWindow } from "../lib/popoutWindow";
 import { submitComposerOnEnter } from "../lib/composerKeys";
 import { attachPastedFiles, useComposerSendState, type ChatComposerDraftHandles } from "./ChatComposer";
@@ -95,6 +95,11 @@ interface AiaChatPopupProps {
    * 남은 AIA 알림을 걷어, 상단바 트리거가 버린 대화로 되돌아가지 않게 한다.
    */
   onDiscardChat: (chatId: string) => void;
+  /**
+   * 이 창이 맡은 대화가 바뀌었음을 알린다. 앱은 이 값으로 "AIA 트리거가 맡을 알림"을 가른다
+   * — 저장소 쓰기는 렌더를 부르지 않으므로 앱이 핀을 직접 읽으면 한 박자 늦는다.
+   */
+  onOwnChatChange: (chatId: string | null) => void;
   /** 팝업이 닫혀 있어도 상단바 트리거가 진행 중 표시를 켤 수 있도록 실행 상태를 알린다. */
   onBusyChange: (busy: boolean) => void;
   /** AIA가 show_ui_guide로 보낸 화면 안내를 앱에 넘긴다. false가 오면 대상을 화면에서 찾지 못한 것이다. */
@@ -120,10 +125,11 @@ export interface AiaAutoPrompt {
   requestId: number;
 }
 
-export function AiaChatPopup({ open, provider, runtime, providerName, providerConnected, attentionTarget, autoPrompt, suggestions, onClose, onConnectProvider, onAttentionTargetHandled, onAutoPromptHandled, onDismissSuggestion, onDiscardChat, onBusyChange, onUiGuide, onUiQuery, onUiClick, yieldForGuide = false, windowId = null }: AiaChatPopupProps) {
+export function AiaChatPopup({ open, provider, runtime, providerName, providerConnected, attentionTarget, autoPrompt, suggestions, onClose, onConnectProvider, onAttentionTargetHandled, onAutoPromptHandled, onDismissSuggestion, onDiscardChat, onOwnChatChange, onBusyChange, onUiGuide, onUiQuery, onUiClick, yieldForGuide = false, windowId = null }: AiaChatPopupProps) {
   const { text } = useI18n();
   const [session, setSession] = useState<ChatSessionInfo | null>(null);
-  const [phase, setPhase] = useState<ChatPhase | "connecting">("connecting");
+  // 떼어 내는 절차가 렌더를 기다리지 않고 "지금 턴이 도는가"를 읽어야 하므로 ref에도 담는다.
+  const [phase, phaseRef, setPhase] = useMirroredState<ChatPhase | "connecting">("connecting");
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [queue, setQueue] = useState<QueuedChatMessage[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -148,9 +154,10 @@ export function AiaChatPopup({ open, provider, runtime, providerName, providerCo
 
   const applySession = useCallback((next: ChatSessionInfo) => {
     try { rememberAiaWindowSession(window.localStorage, window.sessionStorage, windowId, next.chatId); } catch { /* 저장이 막혀도 현재 연결은 유지한다. */ }
+    onOwnChatChange(next.chatId);
     setSession(next);
     setPhase(next.state);
-  }, [windowId]);
+  }, [onOwnChatChange, windowId]);
 
   const {
     connectionRef,
@@ -319,20 +326,43 @@ export function AiaChatPopup({ open, provider, runtime, providerName, providerCo
    * 뗀 대화를 버릴 때는 다시 고르지 않도록 표시하고, 정지하고, 그 대화에 남은 알림까지
    * 걷는다. 알림을 남겨 두면 상단바 트리거가 팝업을 여는 대신 버린 대화로 전환해
    * (`toggleAia`), 새로 시작한 대화를 닫았다 열었을 때 이전 대화가 돌아온다.
+   *
+   * `keepRunningTurn`은 **돌고 있는 턴을 살려 둘 것인가**를 호출부가 정하는 자리다. 새
+   * 대화 버튼은 참이다 — 사용자가 턴 중에도 누를 수 있어야 하고, 그때 하던 작업은 계속
+   * 돌아 세션 화면에서 이어 봐야 한다(2026-10-04 사용자 결정). 실행설정이 어긋나 다시
+   * 시작하는 쪽은 거짓이다 — 거기서 떼어만 두면 사용자가 **거둬들인 권한·모델 그대로**
+   * 도는 런타임이 화면 없이 남는다. 지금은 `aiaStaleSendAction`이 턴 중의 재시작을
+   * 막으므로 그 갈래가 닿지 않지만, 무엇을 원하는지는 먼 가드가 아니라 여기 적힌다.
    */
-  const discardCurrentConversation = useCallback(async (): Promise<ChatConnection | null> => {
+  const discardCurrentConversation = useCallback(async (keepRunningTurn: boolean): Promise<ChatConnection | null> => {
     const connection = takeConnection();
     if (connection) {
       discardedChatsRef.current.add(connection.info.chatId);
-      await shutdownConnection(connection);
-      onDiscardChat(connection.info.chatId);
+      // 떼어 내는 그 자리에서 소유를 내려놓는다. 다음 대화가 붙을 때까지 미루면, 그사이
+      // 떼어 낸 대화의 알림이 일반 목록 대신 트리거로 가고 트리거가 그 대화로 되돌아간다 —
+      // 새 대화 시작이 실패하면 그대로 굳는다.
+      try { forgetAiaWindowSession(window.localStorage, window.sessionStorage, windowId); } catch { /* 저장이 막혀도 떼어 내는 일은 그대로 끝낸다. */ }
+      onOwnChatChange(null);
+      // 돌고 있는 턴은 정지하지 않는다(2026-10-04 사용자 결정). 정지는 CLI 프로세스를 죽여
+      // 하던 작업과 승인 요청이 그 자리에서 사라지고 되돌릴 방법이 없다 — 이 버튼은 턴
+      // 중에도 눌리므로 그 손실이 실수 한 번에 일어난다. 떼어만 두면 그 대화는 계속 돌아
+      // 세션 화면에서 이어 볼 수 있다. 쉬고 있는 대화는 종전대로 정지해 빈 런타임을 남기지
+      // 않는다.
+      if (keepRunningTurn && (phaseRef.current === "running" || phaseRef.current === "waitingApproval")) {
+        await detachQuietly(connection);
+      } else {
+        await shutdownConnection(connection);
+        // 알림을 걷는 것은 정지한 대화뿐이다. 계속 도는 대화의 완료 알림까지 걷으면 그
+        // 대화가 어디에도 뜨지 않아, 떼어 둔 작업이 끝난 것을 알 길이 사라진다.
+        onDiscardChat(connection.info.chatId);
+      }
     }
     setSession(null);
     setTurns([]);
     setQueue([]);
     autoStartedRef.current = true;
     return connection;
-  }, [onDiscardChat, takeConnection]);
+  }, [onDiscardChat, onOwnChatChange, phaseRef, takeConnection, windowId]);
 
   /**
    * 어긋난 대화를 정지하고 새 설정으로 다시 시작한 뒤, 요청을 보낼 새 연결을 돌려준다.
@@ -347,7 +377,7 @@ export function AiaChatPopup({ open, provider, runtime, providerName, providerCo
     restartingRef.current = true;
     try {
       activeTurnRef.current = null;
-      await discardCurrentConversation();
+      await discardCurrentConversation(false);
       await restoreOrStartConversation();
       return connectionRef.current;
     } finally {
@@ -544,7 +574,7 @@ export function AiaChatPopup({ open, provider, runtime, providerName, providerCo
   };
 
   const newConversation = async () => {
-    const connection = await discardCurrentConversation();
+    const connection = await discardCurrentConversation(true);
     draft.clear();
     // 연결이 없던 상태(시작 실패 후 재시도)라면 백엔드에 남아 있는 AIA 대화 복원을 먼저 시도한다.
     if (connection) await startConversation();

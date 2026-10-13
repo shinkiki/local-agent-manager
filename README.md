@@ -414,9 +414,9 @@ Claude Code, OpenAI Codex, Google Antigravity와 직접 띄운 로컬 LLM의 로
 
 ![이 기기와 Tailscale 너머의 Ollama 서버를 여러 개 등록하고 점검](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-settings-local-llm.png)
 
-**Tailscale 서비스와 원격 편집 허용으로 휴대폰에서 원격 사용**
+**Tailscale 서비스와 로그인 설정(ID/비밀번호·OTP, 접근 채널별)으로 휴대폰에서 원격 사용**
 
-![Tailscale 서비스와 원격 편집 허용으로 휴대폰에서 원격 사용](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-settings-backend.png)
+![Tailscale 서비스와 로그인 설정으로 휴대폰에서 원격 사용](https://github.com/shinkiki/local-agent-manager/releases/download/v0.3.0/am-030-settings-backend.png)
 
 </details>
 

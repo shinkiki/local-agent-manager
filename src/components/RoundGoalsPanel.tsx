@@ -3,8 +3,9 @@
  *
  * 사용자는 목표만 적는다. "설계 시작"을 누르면 AIA 가 회차 설계 스킬(round-designer)을 따라
  * 스킬·스크립트·시험·워크플로 계약·반복 요청을 만들고, 등록은 승인 카드로 끝난다. 그 뒤 회차가
- * 남긴 구조화된 보고와 사람이 정할 것은 목표 카드의 "회차 상세" 모달(RoundReportsModal)에서
- * 읽고 답한다. 카드에는 "결정 대기 N" 배지만 올라와 어느 목표를 열어야 하는지 알린다.
+ * 남긴 구조화된 보고와 선택 요청은 목표 카드의 "회차 상세" 모달(RoundReportsModal)에서
+ * 직접 답하거나 목표별 완전자동 모드로 다음 회차에 맡긴다. 카드에는 "결정 대기 N" 배지만
+ * 올라와 어느 목표를 열어야 하는지 알린다.
  *
  * 스크립트를 여기서 돌리지 않는다. 회차는 워크플로가 띄운 에이전트 채팅이 돈다.
  */
@@ -21,7 +22,7 @@ import {
 } from "../lib/ipc";
 import { roundDesignPrompt } from "../lib/roundDesign";
 import type { RoundGoal, RoundGoalInput, RoundGoalStatus, RoundReport } from "../types";
-import { pendingDecisionCount, RoundReportsModal } from "./RoundReportsModal";
+import { pendingDecisionCount, RoundReportsModal, RoundText } from "./RoundReportsModal";
 import { ErrorBanner, useConfirm } from "./Shared";
 
 function errorMessage(error: unknown): string {
@@ -137,7 +138,7 @@ export function RoundGoalsPanel({ onRequestAiaPrompt, refreshNonce = 0 }: { onRe
     // *안에* 서는 조각이라 단독으로 두면 테두리도 표제 띠도 없이 배경 위에 떠 버린다.
     // 본문은 subsection으로 한 겹 감싸, 안쪽 여백 규칙(.settings-subsection > .detail-card)을
     // 그대로 물려받게 한다.
-    <section className="settings-card" data-ui-anchor="addons.round-goals">
+    <section className="settings-card" data-ui-anchor="workflows.round-goals">
       <header className="plugin-page-header">
         <div className="plugin-page-title">
           <i><Target size={18} /></i>
@@ -148,8 +149,8 @@ export function RoundGoalsPanel({ onRequestAiaPrompt, refreshNonce = 0 }: { onRe
           {busy && <LoaderCircle className="spin" size={14} />}
         </div>
         <p>{text(
-          "목표만 적으면 AIA 가 회차 설계 스킬을 따라 스킬·스크립트·시험·워크플로·반복 요청을 만들고, 등록은 승인 카드로 끝납니다. 회차가 남긴 보고와 사람이 정할 것은 각 목표의 회차 상세에서 읽고 결정합니다.",
-          "Write the goal; AIA follows the round-designer skill to create the skill, scripts, tests, workflow, and recurring request, and registration ends with approval cards. Read each goal's round reports and answer its decisions in its round detail.",
+          "목표만 적으면 AIA 가 회차 설계 스킬을 따라 스킬·스크립트·시험·워크플로·반복 요청을 만들고, 등록은 승인 카드로 끝납니다. 회차 상세에서 선택 요청에 직접 답하거나 목표별 완전자동 결정을 켤 수 있습니다.",
+          "Write the goal; AIA follows the round-designer skill to create the skill, scripts, tests, workflow, and recurring request, and registration ends with approval cards. In round detail, answer requests yourself or enable fully automatic decisions for that goal.",
         )}</p>
       </header>
       <div className="settings-subsection">
@@ -178,13 +179,13 @@ export function RoundGoalsPanel({ onRequestAiaPrompt, refreshNonce = 0 }: { onRe
                   {goal.scheduleId && <span className="db-badge">{text("반복 요청", "Recurring")}</span>}
                   {(pendingByGoal[goal.id] ?? 0) > 0 && <span className="db-badge round-goal-pending">{text(`결정 대기 ${pendingByGoal[goal.id]}`, `${pendingByGoal[goal.id]} pending`)}</span>}
                 </div>
-                <p>{goal.goal}</p>
+                <RoundText text={goal.goal} />
                 <small className="db-connection-meta">
                   {goal.targetPath}
                   {goal.cadence ? ` · ${text("주기", "Cadence")} ${goal.cadence}` : ""}
                   {goal.verification ? ` · ${text("검증", "Verification")} ${goal.verification}` : ""}
                 </small>
-                {goal.notes && <small className="db-connection-meta">{goal.notes}</small>}
+                <RoundText text={goal.notes} className="db-connection-meta" />
                 <div className="db-connection-actions">
                   {onRequestAiaPrompt && (goal.status === "draft" || goal.status === "designing") && (
                     <button className="button compact primary" type="button" disabled={busy} onClick={() => design(goal)}>
@@ -218,7 +219,7 @@ export function RoundGoalsPanel({ onRequestAiaPrompt, refreshNonce = 0 }: { onRe
           </div>
         )}
         {draft && (
-          <div className="detail-card" data-ui-anchor="addons.round-goals.editor">
+          <div className="detail-card" data-ui-anchor="workflows.round-goals.editor">
             <div className="form-row">
               <label htmlFor="round-goal-title">{text("이름", "Name")}</label>
               <div><input id="round-goal-title" type="text" value={draft.title} disabled={busy} onChange={(event) => setDraft({ ...draft, title: event.target.value })} /></div>
@@ -253,7 +254,12 @@ export function RoundGoalsPanel({ onRequestAiaPrompt, refreshNonce = 0 }: { onRe
           </div>
         )}
       </div>
-      {detailGoal && <RoundReportsModal goal={detailGoal} onClose={() => setDetailGoal(null)} onResolved={() => { void load(); }} />}
+      {detailGoal && <RoundReportsModal
+        goal={detailGoal}
+        onClose={() => setDetailGoal(null)}
+        onResolved={() => { void load(); }}
+        onGoalUpdated={(updated) => { setDetailGoal(updated); void load(); }}
+      />}
       {confirmDialog}
     </section>
   );

@@ -3,8 +3,17 @@ export const LEGACY_BACKEND_SERVICE_PORT = 4_178;
 export const MIN_BACKEND_SERVICE_PORT = 1024;
 export const MAX_BACKEND_SERVICE_PORT = 65_535;
 
+import { loginSessionToken } from "./loginSession.ts";
+
 let backendServicePort: number | null = null;
 let backendStoreId: string | null = null;
+
+/**
+ * C20. 헤더를 못 붙이는 요청만 세션 토큰을 쿼리로 싣는다 — WebSocket 업그레이드와 `<img>`가
+ * 직접 여는 두 자산 경로. `fetch`는 `ipcTransport`가 헤더로 싣는다.
+ */
+const SESSION_QUERY_PATHS = ["/api/session-image/", "/api/chat-attachment/"];
+const SESSION_QUERY_KEY = "session";
 
 const BACKEND_STORE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -120,8 +129,9 @@ export function resolveBackendHttpUrl(
   nativeShell: boolean,
   location: BrowserEndpoint,
   nativePort?: number,
+  sessionToken: string | null = null,
 ): string {
-  return resolveBackendUrl(HTTP_SCHEME, path, nativeShell, location, nativePort);
+  return resolveBackendUrl(HTTP_SCHEME, path, nativeShell, location, nativePort, sessionToken);
 }
 
 export function resolveBackendWebSocketUrl(
@@ -129,8 +139,9 @@ export function resolveBackendWebSocketUrl(
   nativeShell: boolean,
   location: BrowserEndpoint,
   nativePort?: number,
+  sessionToken: string | null = null,
 ): string {
-  return resolveBackendUrl(WEB_SOCKET_SCHEME, path, nativeShell, location, nativePort);
+  return resolveBackendUrl(WEB_SOCKET_SCHEME, path, nativeShell, location, nativePort, sessionToken);
 }
 
 /** 지금 실행 중인 환경(네이티브 셸 여부와 시작 시 고정한 포트)으로 대상 URL을 만듭니다. */
@@ -142,6 +153,7 @@ function currentBackendUrl(scheme: BackendScheme, path: string): string {
     nativeShell,
     window.location,
     nativeShell ? initializedBackendServicePort() : undefined,
+    loginSessionToken(),
   );
 }
 
@@ -151,11 +163,24 @@ function resolveBackendUrl(
   nativeShell: boolean,
   location: BrowserEndpoint,
   nativePort?: number,
+  sessionToken: string | null = null,
 ): string {
   const origin = nativeShell
     ? `${scheme.loopback}//127.0.0.1:${validBackendServicePort(nativePort)}`
     : `${scheme.fromPage(location.protocol)}//${location.host}`;
-  return `${origin}${normalizeBackendPath(path)}`;
+  return `${origin}${withSessionQuery(normalizeBackendPath(path), scheme, sessionToken)}`;
+}
+
+/** WebSocket과 자산 GET에만 `?session=`을 붙인다. 기존 쿼리는 그대로 둔다. */
+function withSessionQuery(path: string, scheme: BackendScheme, sessionToken: string | null): string {
+  if (!sessionToken) return path;
+  const [pathname, query = ""] = path.split("?", 2);
+  const wantsQuery = scheme === WEB_SOCKET_SCHEME
+    || SESSION_QUERY_PATHS.some((prefix) => pathname.startsWith(prefix));
+  if (!wantsQuery) return path;
+  const params = new URLSearchParams(query);
+  params.set(SESSION_QUERY_KEY, sessionToken);
+  return `${pathname}?${params.toString()}`;
 }
 
 function initializedBackendServicePort(): number {

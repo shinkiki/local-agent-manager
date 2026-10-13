@@ -22,15 +22,11 @@ export {
 } from "./sessionCleanupText.ts";
 
 export interface CleanupAccess {
-  /** 변경 권한. 원격은 write 모드일 때만 조건 저장·실행을 받는다. */
-  writable: boolean;
   busy?: boolean;
 }
 
-const REMOTE_WRITE_BLOCKED = "원격 변경이 비활성화되어 있습니다.";
-
 function actionAllowed(access: CleanupAccess): boolean {
-  return access.writable && !access.busy;
+  return !access.busy;
 }
 
 /**
@@ -65,7 +61,6 @@ export function cleanupBlockedReason(
   status: SessionCleanupStatus,
   access: CleanupAccess,
 ): string | null {
-  if (!access.writable) return REMOTE_WRITE_BLOCKED;
   if (!hasAnyCondition(status.policy)) return "정리 조건을 하나 이상 켜야 실행할 수 있습니다.";
   if (access.busy) return "다른 작업이 진행 중입니다.";
   return null;

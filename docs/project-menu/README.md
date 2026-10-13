@@ -51,8 +51,7 @@ npm run conformance:project-menu
 | `rustSymbol` | 지정한 `.rs` | `fn`/`struct`/`enum`/`const` **선언**이 있다. 호출만 있는 것은 통과가 아니다 |
 | `frontendSymbol` | 지정한 `.ts`/`.tsx` | 이름이 나온다 |
 | `remoteDispatch` | `remote.rs` | `"<명령>" =>` 갈래가 있다 |
-| `remoteWriteGate` | `remote.rs` | `is_write_command` 블록 안에 있다(`expect: false`면 없어야 한다) |
-| `remoteHostOnly` | `remote.rs` | `is_host_only_command` 블록 안에 있다 |
+| `remoteWriteGate` | `remote.rs` | 변경 명령 분류표 `is_write_command` 블록 안에 있다(`expect: false`면 없어야 한다). C20 뒤 이 블록은 게이트가 아니라 어느 명령이 변경인지 적는 분류표이고, 호스트 전용 목록(`is_host_only_command`)은 삭제됐다 |
 | `aiaCapability` | `system_mcp.rs` | `capability!(<등급>, "<명령>"` 로 등록돼 있다 |
 | `ipcWrapper` | `src/lib/ipcProjects.ts` | 명령 이름이 나온다 |
 | `agentsRule` | `AGENTS.md` | `### <ID> —` 절이 있다 |

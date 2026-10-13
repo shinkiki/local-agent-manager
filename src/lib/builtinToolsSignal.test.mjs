@@ -66,6 +66,7 @@ const SILENT = {
   "src/lib/ipcExternalPlugins.ts": [
     "get_external_plugins", "set_external_plugin_tool_policy",
     "set_external_plugin_tool_policies", "begin_external_plugin_oauth",
+    "submit_external_plugin_oauth_callback",
   ],
 };
 

@@ -49,6 +49,10 @@ pub enum AppErrorKind {
     NotFound,
     /// 지금 상태와 충돌해 받을 수 없다.
     Conflict,
+    /// 이 접근 채널의 로그인 요구를 아직 만족하지 못했다(C20).
+    Unauthorized,
+    /// 같은 채널에서 실패가 잇따라 잠시 받지 않는다. `retryAfterSeconds`를 함께 나른다.
+    RateLimited,
 }
 
 /// 코드와 파라미터를 함께 나르는 실패 하나.
@@ -84,6 +88,14 @@ impl AppError {
 
     pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(AppErrorKind::Conflict, code, message)
+    }
+
+    pub fn unauthorized(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(AppErrorKind::Unauthorized, code, message)
+    }
+
+    pub fn rate_limited(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(AppErrorKind::RateLimited, code, message)
     }
 
     /// 문장에 끼워 넣을 값 하나. 같은 이름을 두 번 주면 나중 값이 남는다.

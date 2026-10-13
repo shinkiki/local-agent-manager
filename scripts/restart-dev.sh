@@ -30,9 +30,10 @@ Manager frontend/backend processes, then starts one standalone backend and the
 Tauri development frontend. Ctrl+C stops both processes.
 
   --remote-write  Require the current Tailscale identity and Serve target, and
-                  expose the backend with remote write access. The flag records
-                  that choice in the stored backend service setting, which the
-                  Settings → 백엔드 서비스 toggle also owns.
+                  start the backend accepting Tailscale requests. What a remote
+                  visitor may do is no longer a flag: after the C20 sign-in
+                  (Settings → 시스템 → 로그인 설정) every channel has the same
+                  authority, so this flag only wires the tailnet identity.
 EOF
 }
 
@@ -253,7 +254,7 @@ wait_for_backend() {
     access="$(local_access_json 2>/dev/null || true)"
     if [ -n "$access" ] && printf '%s' "$access" | jq -e \
       --argjson protocol "$EXPECTED_PROTOCOL" \
-      '.protocolVersion == $protocol and .writable == true' >/dev/null 2>&1; then
+      '.protocolVersion == $protocol' >/dev/null 2>&1; then
       expected_store_id="$(jq -er '.storeId' "$SETTINGS_FILE")"
       printf '%s' "$access" | jq -e --arg store_id "$expected_store_id" \
         '.storeId == $store_id' >/dev/null 2>&1 \
@@ -275,9 +276,9 @@ verify_remote_write() {
   access="$(curl -fsS --max-time 15 "https://$TAILNET_HOST/api/access")"
   printf '%s' "$access" | jq -e \
     --argjson protocol "$EXPECTED_PROTOCOL" \
-    '.protocolVersion == $protocol and .mode == "tailscale" and .remote == true and .writable == true' \
+    '.protocolVersion == $protocol and .mode == "tailscale" and .remote == true' \
     >/dev/null \
-    || fail "Tailnet 백엔드가 remote-write 상태가 아닙니다."
+    || fail "Tailnet 백엔드가 원격 요청을 받는 상태가 아닙니다."
 }
 
 wait_for_frontend() {
@@ -334,7 +335,6 @@ if [ "$REMOTE_WRITE" = true ]; then
   backend_args+=(
     --tailscale-host "$TAILNET_HOST"
     --tailscale-user "$TAILNET_LOGIN"
-    --remote-write
   )
 fi
 
@@ -353,7 +353,7 @@ echo "Agent Manager 개발 환경이 시작되었습니다."
 echo "  backend pid=$BACKEND_PID port=$PORT protocol=$EXPECTED_PROTOCOL"
 echo "  frontend pid=$FRONTEND_PID url=http://localhost:$FRONTEND_PORT"
 if [ "$REMOTE_WRITE" = true ]; then
-  echo "  Tailnet remote-write 검증 완료"
+  echo "  Tailnet 원격 수락 검증 완료"
 fi
 echo "Ctrl+C를 누르면 프런트엔드와 백엔드를 함께 종료합니다."
 

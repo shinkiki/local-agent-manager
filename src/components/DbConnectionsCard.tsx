@@ -1,6 +1,6 @@
-import { Database, LoaderCircle, Plus, PlugZap, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import { Database, LoaderCircle, Plus, PlugZap, RefreshCw, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type PropsWithChildren } from "react";
-import { checkDbConnection, getDbConnections, getWebAccessStatus, hasTauriRuntime, removeDbConnection, setDbConnection, setDbConnectionEnabled, type WebAccessStatus } from "../lib/ipc";
+import { checkDbConnection, getDbConnections, removeDbConnection, setDbConnection, setDbConnectionEnabled } from "../lib/ipc";
 import { useI18n } from "../lib/i18n";
 import type { DbConnectionCheckReceipt, DbConnectionsSnapshot, DbConnectionView, DbCredentialSource, DbEngineKind, DbEnvironment, DbWriteMode } from "../types";
 import { ErrorBanner, useBusyAction, useConfirm } from "./Shared";
@@ -145,12 +145,10 @@ function isValid(draft: Draft): boolean {
 }
 
 /** 목록의 연결 한 줄. 배지·접속 대상·자격증명 요약과 네 가지 동작이 여기서 끝난다. */
-function DbConnectionRow({ connection, receipt, busy, canWrite, canManage, onToggle, onCheck, onEdit, onRemove }: {
+function DbConnectionRow({ connection, receipt, busy, onToggle, onCheck, onEdit, onRemove }: {
   connection: DbConnectionView;
   receipt: DbConnectionCheckReceipt | null;
   busy: string | null;
-  canWrite: boolean;
-  canManage: boolean;
   onToggle: () => void;
   onCheck: () => void;
   onEdit: () => void;
@@ -182,14 +180,14 @@ function DbConnectionRow({ connection, receipt, busy, canWrite, canManage, onTog
         <input
           type="checkbox"
           checked={connection.agentEnabled}
-          disabled={!canWrite || busy !== null}
+          disabled={busy !== null}
           onChange={() => onToggle()}
         />
         <span>{text("에이전트 사용", "Agent use")}</span>
       </label>
-      <button className="button compact" type="button" disabled={!canWrite || busy !== null} onClick={() => onCheck()}><PlugZap size={13} />{text("연결 확인", "Check")}</button>
-      <button className="button compact" type="button" disabled={!canManage || busy !== null} onClick={() => onEdit()}>{text("편집", "Edit")}</button>
-      <button className="button compact danger" type="button" disabled={!canManage || busy !== null} onClick={() => onRemove()}><Trash2 size={13} />{text("삭제", "Remove")}</button>
+      <button className="button compact" type="button" disabled={busy !== null} onClick={() => onCheck()}><PlugZap size={13} />{text("연결 확인", "Check")}</button>
+      <button className="button compact" type="button" disabled={busy !== null} onClick={() => onEdit()}>{text("편집", "Edit")}</button>
+      <button className="button compact danger" type="button" disabled={busy !== null} onClick={() => onRemove()}><Trash2 size={13} />{text("삭제", "Remove")}</button>
     </div>
     {receipt?.id === connection.id && (
       <p className={`db-connection-receipt${receipt.reachable ? " ok" : " failed"}`}>
@@ -206,11 +204,10 @@ function DbConnectionRow({ connection, receipt, busy, canWrite, canManage, onTog
  * 연결 하나를 만들거나 고치는 편집기. 어떤 칸이 서는지는 엔진과 자격증명 출처가 정한다 —
  * 파일 엔진은 호스트·사용자·자격증명이 없고, 운영 환경은 쓰기 모드를 잠근다.
  */
-function DbConnectionEditor({ draft, snapshot, busy, canManage, patchDraft, onCancel, onSave }: {
+function DbConnectionEditor({ draft, snapshot, busy, patchDraft, onCancel, onSave }: {
   draft: Draft;
   snapshot: DbConnectionsSnapshot;
   busy: string | null;
-  canManage: boolean;
   patchDraft: (patch: Partial<Draft>) => void;
   onCancel: () => void;
   onSave: () => void;
@@ -299,7 +296,7 @@ function DbConnectionEditor({ draft, snapshot, busy, canManage, patchDraft, onCa
       <DraftTextField label={text("메모", "Note")} value={draft.note} maxLength={200} onChange={(note) => patchDraft({ note })} />
       <div className="db-connection-editor-actions">
         <button className="button compact" type="button" onClick={() => onCancel()}>{text("취소", "Cancel")}</button>
-        <button className="button compact primary" type="button" disabled={!canManage || !isValid(draft) || busy !== null} onClick={() => onSave()}>{text("저장", "Save")}</button>
+        <button className="button compact primary" type="button" disabled={!isValid(draft) || busy !== null} onClick={() => onSave()}>{text("저장", "Save")}</button>
       </div>
     </div>
   );
@@ -309,25 +306,21 @@ function DbConnectionEditor({ draft, snapshot, busy, canManage, patchDraft, onCa
 /**
  * 애드온의 데이터베이스 탭. 연결을 등록하고 에이전트에게 열어 주는 자리다.
  *
- * SSH 카드와 나뉘는 자리가 하나 있다 — 여기서는 비밀번호가 오갈 수 있다. 그래서 등록·
- * 삭제는 호스트 전용이고(원격 편집이 켜져 있어도 잠긴다), 에이전트 사용 토글과 연결
- * 확인만 원격에서 열린다. 저장된 비밀번호는 어느 응답으로도 돌아오지 않으므로 입력칸은
- * 언제나 비어 있고, 저장돼 있다는 사실만 표시한다.
+ * 여기서는 비밀번호가 오갈 수 있지만, 로그인한 채널은 데스크톱과 같은 권한을 가지므로(C20)
+ * 등록·편집·비밀번호 입력·삭제·에이전트 사용 토글·연결 확인이 원격 화면에서도 전부 열린다.
+ * 그래서 접근 채널을 따로 묻지 않는다 — 버튼을 잠그는 것은 진행 중인 작업뿐이다. 저장된
+ * 비밀번호는 어느 응답으로도 돌아오지 않으므로 입력칸은 언제나 비어 있고, 저장돼 있다는
+ * 사실만 표시한다.
  */
 export function DbConnectionsCard({ active }: { active: boolean }) {
   const { text } = useI18n();
   const { confirm, confirmDialog } = useConfirm();
   const [snapshot, setSnapshot] = useState<DbConnectionsSnapshot | null>(null);
-  const [access, setAccess] = useState<WebAccessStatus | null>(null);
   const { busy, error, setError, run: runAction } = useBusyAction();
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState<Draft>(draftOf(null, null));
   const [receipt, setReceipt] = useState<DbConnectionCheckReceipt | null>(null);
   const loadedRef = useRef(false);
-  const canWrite = access?.writable === true;
-  const isRemote = !hasTauriRuntime() && access?.remote === true;
-  /** 등록·삭제·비밀번호 입력은 호스트 화면 전용이다(C10-5). */
-  const canManage = canWrite && !isRemote;
   const fileEngine = isFileEngine(draft.engine);
   const patchDraft = (patch: Partial<Draft>) => setDraft({ ...draft, ...patch });
 
@@ -347,8 +340,7 @@ export function DbConnectionsCard({ active }: { active: boolean }) {
     if (!active) { loadedRef.current = false; return; }
     if (loadedRef.current) return;
     loadedRef.current = true;
-    void Promise.all([load(), getWebAccessStatus().then(setAccess)])
-      .catch((cause: unknown) => setError(errorText(cause)));
+    void load();
   }, [active, load]);
 
   // 이 카드는 한 번에 하나만 돌린다. 봉투 자체는 공용이고, 무엇을 막을지만 여기서 정한다.
@@ -428,18 +420,6 @@ export function DbConnectionsCard({ active }: { active: boolean }) {
           "Agents can query registered databases and change data after approval. Passwords never reach the agent — the app connects on its behalf. Reads run inside an engine-level read-only transaction; writes are previewed for affected rows before the approval card.",
         )}</p>
       </header>
-      {isRemote && (
-        <div className="plugin-host-notice" role="note">
-          <ShieldCheck size={16} aria-hidden="true" />
-          <span>
-            <strong>{text("연결 등록은 호스트 화면에서만 합니다", "Connections are registered on the host")}</strong>
-            <small>{text(
-              "비밀번호를 받는 자리라 등록·수정·삭제는 원격에서 열지 않습니다. 원격에서는 목록 확인과 에이전트 사용 토글, 연결 확인만 할 수 있습니다.",
-              "Registration, editing and removal stay on the host because they accept passwords. From remote you can read the list, toggle agent use, and check a connection.",
-            )}</small>
-          </span>
-        </div>
-      )}
       {error && <ErrorBanner message={error} />}
       {snapshot === null
         ? <div className="plugin-loading-state">{!error && <LoaderCircle size={16} className="spin" />}<span>{text("연결을 확인하는 중…", "Checking connections…")}</span></div>
@@ -457,8 +437,6 @@ export function DbConnectionsCard({ active }: { active: boolean }) {
                   connection={connection}
                   receipt={receipt}
                   busy={busy}
-                  canWrite={canWrite}
-                  canManage={canManage}
                   onToggle={() => void toggle(connection)}
                   onCheck={() => void check(connection)}
                   onEdit={() => openEditor(connection)}
@@ -469,16 +447,13 @@ export function DbConnectionsCard({ active }: { active: boolean }) {
           {snapshot.issues.map((issue) => <p key={issue} className="db-connection-receipt failed">{issue}</p>)}
           {editing === null
             ? <div className="settings-update-body">
-              <span className="settings-update-status"><strong>{text("새 연결", "New connection")}</strong><small>{canManage
-                ? text("호스트·스키마와 자격증명 출처를 정하고, 무엇까지 허용할지 함께 정합니다.", "Set the host, schema and credential source, and decide how far an agent may go.")
-                : text("연결 등록은 호스트 화면에서만 할 수 있습니다.", "Connections can only be registered on the host.")}</small></span>
-              <button className="button compact primary" type="button" data-ui-anchor="addons.db.add" disabled={!canManage} onClick={() => openEditor(null)}><Plus size={13} />{text("연결 추가", "Add connection")}</button>
+              <span className="settings-update-status"><strong>{text("새 연결", "New connection")}</strong><small>{text("호스트·스키마와 자격증명 출처를 정하고, 무엇까지 허용할지 함께 정합니다.", "Set the host, schema and credential source, and decide how far an agent may go.")}</small></span>
+              <button className="button compact primary" type="button" data-ui-anchor="addons.db.add" onClick={() => openEditor(null)}><Plus size={13} />{text("연결 추가", "Add connection")}</button>
             </div>
             : <DbConnectionEditor
               draft={draft}
               snapshot={snapshot}
               busy={busy}
-              canManage={canManage}
               patchDraft={patchDraft}
               onCancel={() => setEditing(null)}
               onSave={() => void save()}

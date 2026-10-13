@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 #[cfg(windows)]
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -16,6 +16,7 @@ use portable_pty::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::app_data_file::open_private_file;
 use crate::catalog::{load_session_summary, SessionCatalog};
 use crate::chat::{chat_string_enum, resolve_executable};
 use crate::credential_profiles::CLAUDE_SECURESTORAGE_CONFIG_DIR;
@@ -64,6 +65,60 @@ pub struct TerminalAccountLoginRequest {
     pub login_id: String,
     pub cols: u16,
     pub rows: u16,
+    /// Codex 로그인 방식. 적지 않으면 원격은 기기 코드, 호스트는 브라우저다. 다른 공급자는 무시한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_method: Option<CodexLoginMethod>,
+}
+
+/// Codex 계정 로그인의 두 갈래.
+///
+/// `Browser`는 기본 `codex login`(loopback PKCE)이다. 로그인 서버가 CLI가 도는 기기의
+/// `127.0.0.1:1455`에만 떠서, 브라우저가 다른 기기(원격 화면·NAS)에 있으면 승인 뒤 콜백이
+/// 닿지 않는다 — 그때는 브라우저가 멈춘 주소를 붙여 넣으면 백엔드가 그 요청을 대신 전달한다
+/// ([`TerminalSupervisor::relay_codex_login_callback`]). `Device`는 `codex login --device-auth`로
+/// loopback 없이 어느 브라우저에서나 일회용 코드를 넣어 끝난다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CodexLoginMethod {
+    Device,
+    Browser,
+}
+
+impl CodexLoginMethod {
+    /// 요청이 고르지 않았을 때의 기본값. 원격은 붙여넣기 없이 끝나는 기기 코드가 손이 덜 간다.
+    fn resolve(requested: Option<Self>, remote: bool) -> Self {
+        requested.unwrap_or(if remote { Self::Device } else { Self::Browser })
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Device => "device",
+            Self::Browser => "browser",
+        }
+    }
+
+    fn other(self) -> Self {
+        match self {
+            Self::Device => Self::Browser,
+            Self::Browser => Self::Device,
+        }
+    }
+}
+
+/// `codex login` 로그인 서버가 받는 콜백. CLI가 고정으로 쓰는 값이다.
+const CODEX_LOGIN_CALLBACK_PORT: u16 = 1455;
+const CODEX_LOGIN_CALLBACK_PATH: &str = "/auth/callback";
+/// 붙여 넣는 콜백 주소의 상한. 실제 주소는 1~2 KB다.
+const MAX_LOGIN_CALLBACK_BYTES: usize = 8 * 1024;
+/// 로그인 서버는 콜백을 받은 자리에서 토큰 교환까지 마친 뒤 답한다.
+const LOGIN_CALLBACK_RELAY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 붙여 넣은 콜백을 로그인 CLI에 전달한 결과.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLoginCallbackRelay {
+    /// 로그인 서버가 돌려준 HTTP 상태. 2xx·3xx만 성공으로 돌아온다.
+    pub status: u16,
 }
 
 /// C9-19. 저장된 SSH 연결 서버로 사용자가 직접 붙는 대화형 터미널.
@@ -204,6 +259,15 @@ impl SessionKey {
 
     fn account_login(source: ProviderId, login_id: &str) -> Self {
         Self::provider(source, format!("account-login-{login_id}"))
+    }
+
+    /// Codex 로그인 터미널은 방식마다 따로 둔다. 같은 키로 두면 방식을 바꿔 다시 열어도
+    /// 앞서 띄운 다른 방식의 CLI에 그대로 다시 붙는다.
+    fn codex_login(login_id: &str, method: CodexLoginMethod) -> Self {
+        Self::provider(
+            ProviderId::Codex,
+            format!("account-login-{login_id}-{}", method.as_str()),
+        )
     }
 
     fn ssh(fingerprint: &str, mode: TerminalSshMode) -> Self {
@@ -493,15 +557,84 @@ impl TerminalSupervisor {
             CoreError::Conflict("계정 로그인은 로컬 데스크톱에서만 사용할 수 있습니다".to_owned())
         })?;
         let login = accounts.login_session(&request.login_id)?;
-        let key = SessionKey::account_login(login.provider, &request.login_id);
         let provider = login.provider;
+        let codex_method = (provider == ProviderId::Codex)
+            .then(|| CodexLoginMethod::resolve(request.codex_method, remote));
+        let key = match codex_method {
+            Some(method) => {
+                // 방식을 바꿔 다시 열면 앞 방식의 CLI는 끝낸다. 두 로그인이 같은 임시 프로필에
+                // 자격증명을 쓰려 다투지 않게 한다.
+                self.terminate_session(&SessionKey::codex_login(
+                    &request.login_id,
+                    method.other(),
+                ))?;
+                SessionKey::codex_login(&request.login_id, method)
+            }
+            None => SessionKey::account_login(provider, &request.login_id),
+        };
         self.open_with(
             key,
             request.cols,
             request.rows,
-            || resolve_account_login_launch_spec(login, remote),
+            || resolve_account_login_launch_spec(login, codex_method),
             || self.unscoped_lease(provider, UnscopedRuntimeKind::IsolatedLogin),
         )
+    }
+
+    /// 브라우저 방식 Codex 로그인에서, 승인 뒤 브라우저가 멈춘 콜백 주소를 이 기기의 로그인
+    /// 서버에 대신 전달한다. 브라우저가 CLI와 다른 기기에 있을 때 로그인을 끝내는 유일한 길이다 —
+    /// CLI는 터미널 입력으로 코드를 받지 않는다.
+    ///
+    /// 전달하는 곳은 고정이다: 이 로그인 세션의 브라우저 방식 터미널이 살아 있을 때만,
+    /// `http://127.0.0.1:1455/auth/callback`에 붙여 넣은 주소의 query만 실어 보낸다. 주소의
+    /// host가 loopback이고 port·path가 그 자리와 같아야 받는다 — 붙여넣기를 임의의 loopback
+    /// 요청 통로로 쓰지 못하게 한다. state 대조와 토큰 교환은 CLI 로그인 서버가 한다.
+    pub fn relay_codex_login_callback(
+        &self,
+        login_id: &str,
+        callback_url: &str,
+    ) -> Result<AccountLoginCallbackRelay, CoreError> {
+        validate_identifier(login_id)?;
+        let accounts = self.inner.accounts.as_ref().ok_or_else(|| {
+            CoreError::Conflict("계정 로그인은 로컬 데스크톱에서만 사용할 수 있습니다".to_owned())
+        })?;
+        let login = accounts.login_session(login_id)?;
+        if login.provider != ProviderId::Codex {
+            return Err(CoreError::InvalidInput(
+                "콜백 주소 전달은 Codex 브라우저 로그인에서만 씁니다".to_owned(),
+            ));
+        }
+        let key = SessionKey::codex_login(login_id, CodexLoginMethod::Browser);
+        let running = {
+            let sessions = lock(&self.inner.sessions)?;
+            sessions.get(&key).cloned()
+        };
+        let active = match running {
+            Some(runtime) => runtime.phase()?.is_active(),
+            None => false,
+        };
+        if !active {
+            return Err(CoreError::Conflict(
+                "브라우저 방식 로그인 터미널이 실행 중이 아닙니다. 로그인을 다시 시작해 주세요"
+                    .to_owned(),
+            ));
+        }
+        let query = codex_login_callback_query(callback_url)?;
+        relay_login_callback(&query)
+    }
+
+    /// 이 키의 터미널이 살아 있으면 끝낸다. 없으면 아무것도 하지 않는다.
+    fn terminate_session(&self, key: &SessionKey) -> Result<(), CoreError> {
+        let existing = {
+            let sessions = lock(&self.inner.sessions)?;
+            sessions.get(key).cloned()
+        };
+        if let Some(runtime) = existing {
+            if runtime.phase()?.is_active() {
+                runtime.terminate();
+            }
+        }
+        Ok(())
     }
 
     /// C9-19. 저장된 SSH 연결 서버로 사용자가 직접 붙는 대화형 터미널을 연다. 같은 서버의
@@ -1235,27 +1368,28 @@ fn resolve_ssh_launch_spec(
 
 fn resolve_account_login_launch_spec(
     login: crate::AccountLoginSessionView,
-    remote: bool,
+    codex_method: Option<CodexLoginMethod>,
 ) -> Result<LaunchSpec, CoreError> {
     let executable = resolve_executable(login.provider)?;
     let cwd = canonical_dir(
         &login.profile_path,
         "계정 로그인 실행 경로가 올바르지 않습니다",
     )?;
-    let args = account_login_args(login.provider, remote)?;
+    let args = account_login_args(login.provider, codex_method)?;
     Ok(LaunchSpec::new(executable, cwd, args).with_env(account_login_env(&login)))
 }
 
 /// 로그인 CLI 인자.
 ///
-/// Codex는 원격 요청일 때만 `--device-auth`를 쓴다. 기본 `codex login`은 loopback PKCE라
-/// `redirect_uri`가 `http://localhost:1455/auth/callback`으로 고정되고 로그인 서버도
-/// 그 머신의 localhost에만 뜬다. 브라우저가 호스트에 있는 로컬 UI에서는 이 콜백이 그대로
-/// 닿아 브라우저가 알아서 끝내주므로 기본 방식이 손이 덜 간다. 반대로 Tailscale 경유 웹 UI는
-/// 브라우저가 다른 기기에 있어 콜백이 CLI에 절대 도달하지 못하고, CLI가 stdin의 코드
-/// 붙여넣기를 읽지 않으므로 터미널 입력으로도 우회할 수 없다. 그래서 원격에서만 로컬 콜백이
-/// 필요 없는 device 코드 방식으로 바꾼다.
-fn account_login_args(provider: ProviderId, remote: bool) -> Result<Vec<String>, CoreError> {
+/// Codex는 고른 방식([`CodexLoginMethod`])을 따른다. 기본 `codex login`은 loopback PKCE라
+/// `redirect_uri`가 `http://127.0.0.1:1455/auth/callback`(예전 CLI는 `localhost`)으로 고정되고
+/// 로그인 서버도 그 머신의 127.0.0.1에만 뜬다(codex-cli 0.159.2 실측). 브라우저가 호스트에 있으면 이 콜백이 그대로 닿아 손이 덜
+/// 가고, 다른 기기에 있으면 멈춘 주소를 붙여 넣어 백엔드가 대신 전달한다. `--device-auth`는
+/// loopback이 필요 없어 원격의 기본값이다. Codex가 아니면 `codex_method`는 None이다.
+fn account_login_args(
+    provider: ProviderId,
+    codex_method: Option<CodexLoginMethod>,
+) -> Result<Vec<String>, CoreError> {
     Ok(match provider {
         // 계정이 없어 로그인 명령 자체가 없다.
         ProviderId::Local => {
@@ -1263,8 +1397,10 @@ fn account_login_args(provider: ProviderId, remote: bool) -> Result<Vec<String>,
                 "로컬 공급자는 로그인이 필요하지 않습니다".to_owned(),
             ))
         }
-        ProviderId::Codex if remote => vec!["login".to_owned(), "--device-auth".to_owned()],
-        ProviderId::Codex => vec!["login".to_owned()],
+        ProviderId::Codex => match codex_method.unwrap_or(CodexLoginMethod::Browser) {
+            CodexLoginMethod::Device => vec!["login".to_owned(), "--device-auth".to_owned()],
+            CodexLoginMethod::Browser => vec!["login".to_owned()],
+        },
         ProviderId::Claude => vec![
             "auth".to_owned(),
             "login".to_owned(),
@@ -1281,6 +1417,83 @@ fn account_login_args(provider: ProviderId, remote: bool) -> Result<Vec<String>,
             "text".to_owned(),
         ],
     })
+}
+
+/// 붙여 넣은 Codex 로그인 콜백 주소에서 전달할 query를 꺼낸다. host는 loopback, port·path는
+/// CLI 로그인 서버의 자리와 같아야 하고, `code`(또는 인증 서버의 `error`)와 `state`가 있어야 한다.
+fn codex_login_callback_query(pasted: &str) -> Result<String, CoreError> {
+    let pasted = pasted.trim();
+    let expected =
+        format!("http://127.0.0.1:{CODEX_LOGIN_CALLBACK_PORT}{CODEX_LOGIN_CALLBACK_PATH}");
+    if pasted.is_empty() {
+        return Err(CoreError::InvalidInput(
+            "승인 뒤 브라우저 주소창의 주소를 붙여 넣어 주세요".to_owned(),
+        ));
+    }
+    if pasted.len() > MAX_LOGIN_CALLBACK_BYTES {
+        return Err(CoreError::InvalidInput(
+            "붙여 넣은 내용이 너무 깁니다. 주소창의 주소 한 줄만 붙여 넣어 주세요".to_owned(),
+        ));
+    }
+    let url = reqwest::Url::parse(pasted).map_err(|_| {
+        CoreError::InvalidInput(format!(
+            "주소로 읽을 수 없습니다. {expected}로 시작하는 주소창 전체를 붙여 넣어 주세요"
+        ))
+    })?;
+    let loopback = url
+        .host_str()
+        .is_some_and(crate::loopback_host::is_loopback_url_host);
+    if url.scheme() != "http"
+        || !loopback
+        || url.port() != Some(CODEX_LOGIN_CALLBACK_PORT)
+        || url.path() != CODEX_LOGIN_CALLBACK_PATH
+    {
+        return Err(CoreError::InvalidInput(format!(
+            "Codex 로그인 콜백 주소가 아닙니다. {expected}로 시작하는 주소를 붙여 넣어 주세요"
+        )));
+    }
+    let has = |name: &str| {
+        url.query_pairs()
+            .any(|(key, value)| key == name && !value.is_empty())
+    };
+    if !has("state") || !(has("code") || has("error")) {
+        return Err(CoreError::InvalidInput(
+            "주소에 인증 코드(code)와 state가 없습니다. 승인을 마친 뒤의 주소를 붙여 넣어 주세요"
+                .to_owned(),
+        ));
+    }
+    Ok(url.query().unwrap_or_default().to_owned())
+}
+
+/// 이 기기의 Codex 로그인 서버에 콜백 한 건을 보낸다. 리디렉트는 따라가지 않는다 — 로그인
+/// 서버는 성공하면 완료 화면으로 302를 돌려주며, 그 응답을 받은 것으로 충분하다.
+fn relay_login_callback(query: &str) -> Result<AccountLoginCallbackRelay, CoreError> {
+    let target =
+        format!("http://127.0.0.1:{CODEX_LOGIN_CALLBACK_PORT}{CODEX_LOGIN_CALLBACK_PATH}?{query}");
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(LOGIN_CALLBACK_RELAY_TIMEOUT)
+        .no_proxy()
+        .build()
+        .map_err(|error| CoreError::Runtime(format!("콜백 전달 준비에 실패했습니다: {error}")))?;
+    let response = client.get(&target).send().map_err(|error| {
+        CoreError::Conflict(format!(
+            "로그인 CLI의 콜백 서버(127.0.0.1:{CODEX_LOGIN_CALLBACK_PORT})에 닿지 못했습니다. 로그인 터미널이 브라우저 방식으로 실행 중인지 확인하세요: {}",
+            error.without_url()
+        ))
+    })?;
+    let status = response.status();
+    if status.is_success() || status.is_redirection() {
+        return Ok(AccountLoginCallbackRelay {
+            status: status.as_u16(),
+        });
+    }
+    let body = response.text().unwrap_or_default();
+    Err(CoreError::Conflict(format!(
+        "로그인 CLI가 콜백을 거절했습니다(HTTP {}): {}",
+        status.as_u16(),
+        crate::text_limit::truncate_chars(body.trim(), 200)
+    )))
 }
 
 /// 로그인 CLI를 임시 프로필에 가두는 환경변수.
@@ -1359,13 +1572,8 @@ fn resume_args(source: ProviderId, session_id: &str) -> Vec<String> {
 }
 
 fn acquire_session_lock(lock_dir: &Path, key: &SessionKey) -> Result<File, CoreError> {
-    let path = key.lock_path(lock_dir);
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(path)?;
+    // G10: 공용 열기(O_NOFOLLOW, 새 파일 0600)를 따라 잠금 자리에 놓인 링크를 거절한다.
+    let file = open_private_file(&key.lock_path(lock_dir), false)?;
     FileExt::try_lock(&file).map_err(|error| {
         if matches!(error, fs4::TryLockError::WouldBlock) {
             CoreError::Conflict("이 세션의 터미널이 다른 프로세스에서 실행 중입니다".to_owned())
@@ -1482,6 +1690,7 @@ mod tests {
             environment_variable: environment_variable.to_owned(),
             profile_path: "/tmp/login-profile".to_owned(),
             command: String::new(),
+            credentials_ready: false,
         }
     }
 
@@ -1516,27 +1725,85 @@ mod tests {
     /// Codex 계정 로그인은 원격 웹 UI에서도 완주해야 하므로 그때만 loopback 콜백이 필요한
     /// 기본 `codex login`을 버리고 device 코드로 간다. 로컬 UI는 콜백이 닿으므로 그대로 둔다.
     #[test]
-    fn codex_account_login_uses_device_code_flow_only_when_remote() {
+    fn codex_account_login_follows_the_chosen_method() {
+        // 원격은 기본이 기기 코드, 호스트는 기본이 브라우저다. 고르면 채널과 무관하게 따른다.
         assert_eq!(
-            account_login_args(ProviderId::Codex, true).expect("codex remote args"),
+            CodexLoginMethod::resolve(None, true),
+            CodexLoginMethod::Device
+        );
+        assert_eq!(
+            CodexLoginMethod::resolve(None, false),
+            CodexLoginMethod::Browser
+        );
+        assert_eq!(
+            CodexLoginMethod::resolve(Some(CodexLoginMethod::Browser), true),
+            CodexLoginMethod::Browser
+        );
+        assert_eq!(
+            CodexLoginMethod::resolve(Some(CodexLoginMethod::Device), false),
+            CodexLoginMethod::Device
+        );
+        assert_eq!(
+            account_login_args(ProviderId::Codex, Some(CodexLoginMethod::Device))
+                .expect("codex device args"),
             ["login", "--device-auth"]
         );
         assert_eq!(
-            account_login_args(ProviderId::Codex, false).expect("codex local args"),
+            account_login_args(ProviderId::Codex, Some(CodexLoginMethod::Browser))
+                .expect("codex browser args"),
             ["login"]
         );
-        for remote in [true, false] {
-            assert_eq!(
-                account_login_args(ProviderId::Claude, remote).expect("claude args"),
-                ["auth", "login", "--claudeai"]
-            );
-            // Antigravity에는 로그인 전용 명령이 없어, 토큰으로 서버에 묻는 가장 가벼운
-            // 요청을 쓴다. 성공하면 잔량이 찍혀 로그인 완료가 눈으로 확인된다.
-            assert_eq!(
-                account_login_args(ProviderId::Antigravity, remote).expect("antigravity args"),
-                ["--print", "/usage", "--output-format", "text"]
-            );
+        assert_eq!(
+            account_login_args(ProviderId::Claude, None).expect("claude args"),
+            ["auth", "login", "--claudeai"]
+        );
+        // Antigravity에는 로그인 전용 명령이 없어, 토큰으로 서버에 묻는 가장 가벼운
+        // 요청을 쓴다. 성공하면 잔량이 찍혀 로그인 완료가 눈으로 확인된다.
+        assert_eq!(
+            account_login_args(ProviderId::Antigravity, None).expect("antigravity args"),
+            ["--print", "/usage", "--output-format", "text"]
+        );
+        // 방식마다 터미널을 따로 둔다 — 같은 키면 방식을 바꿔도 앞 CLI에 다시 붙는다.
+        assert_ne!(
+            SessionKey::codex_login("l1", CodexLoginMethod::Device),
+            SessionKey::codex_login("l1", CodexLoginMethod::Browser)
+        );
+    }
+
+    #[test]
+    fn codex_login_callback_is_relayed_only_for_the_cli_callback_address() {
+        let query = codex_login_callback_query(
+            "  http://localhost:1455/auth/callback?code=ac_1&scope=openid&state=st-1\n",
+        )
+        .expect("CLI 콜백 주소");
+        assert_eq!(query, "code=ac_1&scope=openid&state=st-1");
+        codex_login_callback_query("http://127.0.0.1:1455/auth/callback?code=c&state=s")
+            .expect("127.0.0.1도 loopback이다");
+        // 인증 서버의 거절도 CLI가 알아야 끝나므로 넘긴다.
+        codex_login_callback_query(
+            "http://localhost:1455/auth/callback?error=access_denied&state=s",
+        )
+        .expect("error 응답");
+
+        for wrong in [
+            "",
+            "code=c&state=s",
+            "https://localhost:1455/auth/callback?code=c&state=s",
+            "http://localhost:1456/auth/callback?code=c&state=s",
+            "http://localhost/auth/callback?code=c&state=s",
+            "http://localhost:1455/success?code=c&state=s",
+            "http://example.com:1455/auth/callback?code=c&state=s",
+            "http://10.0.0.5:1455/auth/callback?code=c&state=s",
+            "http://localhost:1455/auth/callback?code=c",
+            "http://localhost:1455/auth/callback?state=s",
+        ] {
+            assert!(codex_login_callback_query(wrong).is_err(), "{wrong}");
         }
+        let long = format!(
+            "http://localhost:1455/auth/callback?state=s&code={}",
+            "a".repeat(MAX_LOGIN_CALLBACK_BYTES)
+        );
+        assert!(codex_login_callback_query(&long).is_err());
     }
 
     #[test]
@@ -1693,6 +1960,19 @@ mod tests {
         ));
         drop(first);
         assert!(acquire_session_lock(directory.path(), &key).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_session_lock_refuses_symlinked_lock_file() {
+        let directory = tempfile::tempdir().expect("lock dir");
+        let outside = tempfile::tempdir().expect("outside");
+        let key = SessionKey::provider(ProviderId::Codex, "symlinked");
+        let target = outside.path().join("victim.lock");
+        std::os::unix::fs::symlink(&target, key.lock_path(directory.path())).expect("link");
+
+        assert!(acquire_session_lock(directory.path(), &key).is_err());
+        assert!(!target.exists(), "링크 너머에 잠금 파일이 생겼다");
     }
 
     #[test]

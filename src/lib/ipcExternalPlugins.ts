@@ -58,12 +58,21 @@ export function setExternalPluginToken(id: string, token: string): Promise<Exter
 }
 
 /**
- * OAuth 승인 주소를 받는다. 호스트 화면이 브라우저로 열고, 콜백은 백엔드 loopback이 받는다.
- * 그래서 이 명령만 호스트 전용으로 남는다 — 원격 브라우저에서 승인하면 리디렉트가 닿을 곳이
- * 없어, 끝낼 수 없는 대기 상태만 생긴다.
+ * OAuth 승인 주소를 받는다. 콜백형은 승인 결과가 백엔드 loopback으로 돌아오고, 브라우저가
+ * 다른 기기(원격 화면·NAS)에 있으면 `submitExternalPluginOAuthCallback`으로 그 주소를 넘겨
+ * 끝낸다. 기기 코드 흐름(`oauthDevice`)은 loopback을 쓰지 않는다(H03).
  */
 export function beginExternalPluginOAuth(id: string): Promise<ExternalPluginOAuthStart> {
   return call<ExternalPluginOAuthStart>("begin_external_plugin_oauth", { id }, { timeoutMs: PLUGIN_OAUTH_BEGIN_TIMEOUT_MS });
+}
+
+/**
+ * 승인 뒤 브라우저 주소창에 남은 `http://127.0.0.1:<포트>/callback?code=…` 주소를 진행 중인
+ * 콜백형 흐름에 넘긴다. 백엔드는 redirect 주소·state를 대조만 하고 돌아오며, 토큰 교환 결과는
+ * 목록의 대기 상태가 풀리는 것으로 드러난다. 붙을 플러그인 표는 그 전환을 관찰한 자리가 알린다.
+ */
+export function submitExternalPluginOAuthCallback(id: string, callbackUrl: string): Promise<ExternalPluginView> {
+  return call<ExternalPluginView>("submit_external_plugin_oauth_callback", { id, callbackUrl });
 }
 
 export function cancelExternalPluginOAuth(id: string): Promise<ExternalPluginView> {

@@ -8,117 +8,15 @@ import {
   type UsageLevel,
 } from "./accountUsage.ts";
 import { formatCountdown } from "./format.ts";
-import type { AccountSnapshot, AccountUsageView, LocalLlmConnection, ProviderId } from "../types";
-
-export interface SidebarUsageSource {
-  key: string;
-  provider: ProviderId;
-  /**
-   * `default`·`home`은 계정 레지스트리에서 온 계정이고, `provider`는 계정을 관리하지
-   * 않는 공급자(Antigravity)의 공급자 단위 쿼터다. 이름이 없어 공급자 이름만 쓴다.
-   */
-  kind: "default" | "home" | "provider";
-  displayName: string | null;
-  usage: AccountUsageView;
-  /**
-   * 사용량 한도가 없는 공급자. 창이 없는 것이 정상이므로 "확인 불가"가 아니라 "무제한"으로
-   * 적는다 — 둘을 같게 그리면 쓸 수 있는 공급자가 고장 난 것처럼 보인다.
-   */
-  unlimited?: boolean;
-}
+import type { SidebarUsageSource } from "./sidebarUsageSources.ts";
+import type { AccountUsageView, ProviderId } from "../types";
 
 /**
- * 공급자 스냅샷에서 메뉴에 올릴 사용량 소스를 고른다.
- * 등록된 활성 계정이 우선하고, 활성 계정이 없으면 공유 CLI 홈의 검증된 계정을 쓴다.
+ * 어느 계정이 메뉴에 오르는지는 `sidebarUsageSources`가 소유한다. 상태바가 보는 입구는
+ * 이 모듈 하나로 둔다 — 나눈 쪽의 사정이 앱 셸의 import 목록으로 새어 나가면 다음에 다시
+ * 나눌 때마다 셸을 함께 고쳐야 한다.
  */
-function resolveProviderSource(
-  provider: AccountSnapshot["providers"][number],
-  accounts: AccountSnapshot["accounts"],
-): SidebarUsageSource | null {
-  const defaultAccount = accounts.find((account) => (
-    account.id === provider.activeAccountId && account.provider === provider.provider
-  ));
-  if (defaultAccount) {
-    return {
-      key: `account:${defaultAccount.id}`,
-      provider: provider.provider,
-      kind: "default",
-      displayName: defaultAccount.displayName,
-      usage: defaultAccount.usage,
-    };
-  }
-
-  if (provider.home.state !== "verified") return null;
-  return {
-    key: `home:${provider.provider}`,
-    provider: provider.provider,
-    kind: "home",
-    displayName: provider.home.email ?? provider.home.displayName ?? provider.home.providerAccountId,
-    usage: provider.home.usage,
-  };
-}
-
-/**
- * 사용량 한도가 없는 공급자의 상태바 자리. 창이 아니라 "무제한" 한 줄을 세운다.
- * 연결이 꺼져 있거나 주소가 비어 있으면 아예 붙이지 않는다 — 쓸 수 없는 공급자가
- * 상태바만 차지하면 안 된다.
- */
-function resolveLocalSource(connection: LocalLlmConnection | null): SidebarUsageSource | null {
-  if (!connection?.enabled || connection.baseUrl === "") return null;
-  return {
-    key: "provider:local",
-    provider: "local",
-    kind: "provider",
-    displayName: null,
-    // 창이 없는 사용량. 조회 자체가 없으므로 실패도 아니다.
-    usage: { status: "ok", windows: [], updatedAt: null, error: null, rateLimited: false, retryAt: null, resetCredits: null, tokenRefreshLimited: false },
-    unlimited: true,
-  };
-}
-
-/**
- * Antigravity는 계정 레지스트리에 없어 별도 쿼터로 받는다.
- * 표시할 창이 있을 때만 소스로 취급한다.
- */
-function resolveAntigravitySource(antigravity: AccountUsageView | null): SidebarUsageSource | null {
-  if (!antigravity || antigravity.windows.length === 0) return null;
-  return {
-    key: "provider:antigravity",
-    provider: "antigravity",
-    kind: "provider",
-    displayName: null,
-    usage: antigravity,
-  };
-}
-
-/**
- * 좌측 메뉴의 공급자별 사용량 소스. 계정 레지스트리 밖에 있는 Antigravity는
- * 별도 쿼터를 받으며, 표시할 창이 있을 때만 추가한다.
- *
- * 단, Antigravity 계정이 레지스트리에 등록돼 계정(또는 홈) 소스가 이미 나왔으면 공급자
- * 단위 쿼터는 붙이지 않는다. 두 소스는 같은 공유 홈 토큰을 읽어 값이 똑같으므로, 둘 다
- * 내면 같은 쿼터 카드가 두 장 겹친다. 백엔드 페이싱 목록의 `antigravity_resource_rows`와
- * 같은 규칙이다.
- */
-export function sidebarUsageSources(
-  snapshot: AccountSnapshot | null | undefined,
-  antigravity: AccountUsageView | null = null,
-  localConnection: LocalLlmConnection | null = null,
-): SidebarUsageSource[] {
-  if (!snapshot) return [];
-
-  const sources: SidebarUsageSource[] = [];
-  for (const provider of snapshot.providers) {
-    const source = resolveProviderSource(provider, snapshot.accounts);
-    if (source) sources.push(source);
-  }
-  const antigravityRegistered = sources.some((source) => source.provider === "antigravity");
-  const antigravitySource = antigravityRegistered ? null : resolveAntigravitySource(antigravity);
-  if (antigravitySource) sources.push(antigravitySource);
-  const localSource = resolveLocalSource(localConnection);
-  if (localSource) sources.push(localSource);
-  return sources;
-}
+export { sidebarUsageSources, type SidebarUsageSource } from "./sidebarUsageSources.ts";
 
 export interface SidebarUsageWindowMeter {
   label: string;

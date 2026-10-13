@@ -7,7 +7,7 @@ import { ProjectRegistryMain } from "./ProjectRegistryCard";
 
 /**
  * 새로 감지된 프로젝트의 초기값(활성 유지/제외)을 묻는 알림. 프로젝트는 이미 활성으로 보이는
- * 상태이고, 여기서 정한 값은 설정 › 라이브러리에서 언제든 바꿀 수 있다. "나중에"는 이번
+ * 상태이고, 여기서 정한 값은 프로젝트 › 설정에서 언제든 바꿀 수 있다. "나중에"는 이번
  * 집합에 대해서만 닫고, 다른 프로젝트가 더 감지되면 다시 뜬다.
  */
 export function NewProjectsModal({ projects, busyPath, failure = null, onDecide, onKeepAll, onLater }: {
@@ -35,8 +35,8 @@ export function NewProjectsModal({ projects, busyPath, failure = null, onDecide,
       </>}
     >
       <p className="new-projects-intro">{text(
-        "세션에서 새 프로젝트를 확인했습니다. 지금은 활성 상태로 보이며, 제외하면 세션·스킬·지침·대시보드에서 빠집니다. 설정 › 라이브러리에서 언제든 바꿀 수 있습니다.",
-        "New projects were found in sessions. They are active right now; excluding one removes it from sessions, skills, instructions, and the dashboard. You can change this any time in Settings › Library.",
+        "세션에서 새 프로젝트를 확인했습니다. 지금은 활성 상태로 보이며, 제외하면 세션·스킬·지침·대시보드에서 빠집니다. 프로젝트 › 설정에서 언제든 바꿀 수 있습니다.",
+        "New projects were found in sessions. They are active right now; excluding one removes it from sessions, skills, instructions, and the dashboard. You can change this any time in Projects › Settings.",
       )}</p>
       {failure && <>
         <ErrorBanner message={failure.message} />

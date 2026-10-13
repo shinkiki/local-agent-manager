@@ -1,0 +1,12 @@
+{
+  "itemId": "C-43d6a7a0e5bc",
+  "kind": "commit",
+  "ref": "43d6a7a0e5bcc9bba7a1509a8988d9f4b5fb3bbd",
+  "reviewedAt": "2026-10-06T00:15:00Z",
+  "lane": "L03",
+  "source": "codex",
+  "verdict": "결함 0건 — 장부와 큐 파생값 확인",
+  "note": "커밋 diff와 C-f9894717b7b7 원본·장부를 함께 검토했다. queue.json은 러너가 쓰는 파생 집계이며, reviewed 항목 1건과 당시 커밋 창의 counts가 일치한다. reviewed 파일의 itemId·ref는 파일명·대상 커밋과 같고 findings는 비어 있어 장부 규약을 지킨다. 기준선 측정 기록만 다루며 G1~G11·C 직접변경 예외·쓰기 게이트에 닿지 않는다.",
+  "findings": [],
+  "commits": []
+}

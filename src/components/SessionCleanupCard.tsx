@@ -7,7 +7,7 @@
  */
 import { Eraser, RefreshCw, Undo2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { clearSessionCleanupTombstones, getSessionCleanupStatus, getWebAccessStatus, runSessionCleanup, setSessionCleanupPolicy, type WebAccessStatus } from "../lib/ipc";
+import { clearSessionCleanupTombstones, getSessionCleanupStatus, runSessionCleanup, setSessionCleanupPolicy } from "../lib/ipc";
 import { useI18n } from "../lib/i18n";
 import { canClearTombstones, canRunCleanup, cleanupBlockedReason, formatBytes, hasAnyCondition, previewSummary, reasonHint, receiptFailed, receiptSummary, shrinkFactor, type CleanupAccess } from "../lib/sessionCleanup";
 import type { SessionCleanupPolicy, SessionCleanupPreview, SessionCleanupReceipt, SessionCleanupStatus } from "../types";
@@ -16,33 +16,11 @@ import { errorText } from "../lib/errorText";
 
 import { formatDateTime } from "../lib/format";
 /*
- * 아래 세 껍데기(`loadWhileMounted`·`useCardTask`·`useLoadOnActiveEntry`)는 SettingsView.tsx의
+ * 아래 두 껍데기(`useCardTask`·`useLoadOnActiveEntry`)는 SettingsView.tsx의
  * 같은 이름 함수를 그대로 옮겨 적은 것이다. 설정 화면의 다른 카드들이 아직 그쪽 것을 쓰고,
  * 이 카드가 설정 화면 모듈 전체를 끌어오지 않게 하려고 여기 한 벌을 더 둔다. 공용 자리
  * (`src/lib/`)로 걷어 올리는 일은 별도 작업이다.
  */
-/**
- * 화면을 떠난 뒤 늦게 도착한 응답은 버리는 조회 한 건.
- *
- * 설정 화면의 카드들은 상태 조회마다 `let disposed = false`를 세우고, then·catch 양쪽에서
- * 그 깃발을 확인하고, effect 정리에서 내리는 껍데기를 똑같이 되풀이했다. 껍데기만 여기로
- * 모은다 — 무엇을 읽고 어디에 적을지, 실패를 어느 자리에 남길지는 부르는 쪽이 그대로 정한다.
- *
- * 돌려주는 함수가 그 깃발을 내리는 정리 함수라 `useEffect`가 그대로 반환하면 된다. 조회를
- * 여러 건 걸었으면 반환받은 함수들을 모아 한 번에 부른다.
- */
-function loadWhileMounted<T>(
-  fetchStatus: () => Promise<T>,
-  apply: (value: T) => void,
-  fail?: (message: string) => void,
-): () => void {
-  let disposed = false;
-  void fetchStatus()
-    .then((next) => { if (!disposed) apply(next); })
-    .catch((cause) => { if (!disposed) fail?.(errorText(cause)); });
-  return () => { disposed = true; };
-}
-
 /**
  * 설정 화면 카드들의 "한 번에 한 동작" 껍데기 — busy 키를 걸고, 지난 오류·안내를 지우고,
  * 무엇으로 끝나든 busy를 푼다. 라이브러리 저장소·세션 자동정리·CLI 연결 세 카드가 같은 모양을
@@ -97,7 +75,7 @@ function useCardTask<Key extends string>(clearNotice: () => void) {
  * CLI 업데이트 세 자리가 "활성이 아니면 읽었다는 표시를 풀고, 이미 읽었으면 넘기고, 아니면
  * 표시를 세우고 읽는다"를 각자 적어 두고 있었다. 그 껍데기만 여기로 모은다.
  *
- * `load`가 정리 함수를 돌려주면(예: `loadWhileMounted`) 효과의 정리로 그대로 쓰인다. 함께
+ * `load`가 정리 함수를 돌려주면 효과의 정리로 그대로 쓰인다. 함께
  * 넘겨받는 `forget`과 이 훅이 돌려주는 값은 같은 함수로, 부르면 "읽었다"는 표시가 풀려 다음
  * 진입을 기다리지 않고 다시 읽을 수 있다 — 실패한 조회를 읽은 것으로 치지 않으려는 자리가 쓴다.
  * `onLeave`는 화면을 벗어날 때 함께 풀어야 하는 다른 표시가 있는 자리를 위한 것이다.
@@ -222,12 +200,9 @@ function CleanupConditionRow({ label, hint, value, unit, min, max, fallback, dis
 export function SessionCleanupCard({ active }: { active: boolean }) {
   const { text } = useI18n();
   const { confirm, confirmDialog } = useConfirm();
-  const [access, setAccess] = useState<WebAccessStatus | null>(null);
   const [status, setStatus] = useState<SessionCleanupStatus | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const { busy, error, setError, run: runCleanupTask } = useCardTask<"save" | "run" | "clear">(() => setNotice(null));
-
-  useEffect(() => loadWhileMounted(getWebAccessStatus, setAccess), []);
 
   const loadStatus = useCallback((forget: () => void) => {
     setError(null);
@@ -265,8 +240,10 @@ export function SessionCleanupCard({ active }: { active: boolean }) {
     );
   }
   const { policy, preview } = status;
-  const cleanupAccess = { writable: access?.writable === true, busy: busy !== null };
-  const locked = !cleanupAccess.writable || busy !== null;
+  // C20: 로그인한 채널은 호스트와 같은 권한이라 접근 상태는 보지 않는다. 잠그는 것은
+  // 진행 중인 작업 하나뿐이다.
+  const cleanupAccess: CleanupAccess = { busy: busy !== null };
+  const locked = busy !== null;
   const blocked = cleanupBlockedReason(status, cleanupAccess);
 
   /** 작업이 바꾼 결과를 다시 펴는 자리. 정책 저장은 응답 자체가 최신 상태라 여기를 거치지 않는다. */
@@ -379,7 +356,6 @@ export function SessionCleanupCard({ active }: { active: boolean }) {
         onPatch={patchPolicy}
         onToggleEnabled={(checked) => void toggleEnabled(checked)}
       />
-      {!cleanupAccess.writable && <small className="settings-storage-note">{text("원격 변경이 비활성화되어 있습니다.", "Remote changes are disabled.")}</small>}
 
       <SessionCleanupReceipts receipts={status.receipts} />
 

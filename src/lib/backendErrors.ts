@@ -25,6 +25,21 @@ const BACKEND_ERROR_EN: Record<string, string> = {
   SESSION_FOLDER_PARENT_IS_SELF: "A folder cannot be moved inside itself.",
   SESSION_FOLDER_PARENT_IS_DESCENDANT: "A folder cannot be moved below one of its own subfolders.",
   SESSION_FOLDER_UNKNOWN_MOVE_DIRECTION: "Unknown folder move direction: {direction}. Use up or down.",
+  // C20. 접근 채널 로그인.
+  LOGIN_REQUIRED: "Sign in to continue.",
+  LOGIN_INVALID: "The user ID, password, or OTP code is incorrect.",
+  LOGIN_LOCKED: "Too many sign-in attempts. Try again in {retryAfterSeconds} seconds.",
+  LOGIN_NOTHING_REQUIRED: "This access channel does not require a sign-in.",
+  LOGIN_METHOD_NOT_CONFIGURED: "Set up this method before requiring it on a channel.",
+  LOGIN_METHOD_IN_USE: "This method is still required on: {channels}. Turn it off there first.",
+  LOGIN_REAUTH_REQUIRED: "Enter your current password (or OTP code) to change the sign-in settings.",
+  LOGIN_REAUTH_INVALID: "The current password or OTP code is incorrect.",
+  LOGIN_USER_ID_REQUIRED: "Set a user ID before setting a password.",
+  LOGIN_USER_ID_INVALID: "A user ID is 1 to {max} characters with no control characters.",
+  LOGIN_PASSWORD_INVALID: "A password is {min} to {max} characters.",
+  LOGIN_OTP_SETUP_MISSING: "No OTP enrollment is in progress. Start it again.",
+  LOGIN_OTP_SETUP_EXPIRED: "The OTP enrollment timed out. Start it again.",
+  LOGIN_OTP_CODE_INVALID: "The OTP code is incorrect. Enter the current code from your authenticator app.",
 };
 
 /** 백엔드 실패에 딸려 온 코드와 파라미터. 코드화되지 않은 실패에는 아예 없다. */

@@ -1,0 +1,25 @@
+{
+  "itemId": "C-175a354f70af",
+  "kind": "commit",
+  "ref": "175a354f70af55f051c334b8565ee521ec91526b",
+  "reviewedAt": "2026-10-06T05:10:00Z",
+  "lane": "L02",
+  "source": "claude",
+  "verdict": "결함 0건 (수치 주장 다섯 개를 전부 실측으로 되재 일치. 보안 불변식·계약·중복 결함 없음)",
+  "axes": {
+    "정확성": "결함 없음. docs/code-review 아래 JSON 넷만 바꾸는 커밋이라 실행 경로가 없고, 이 커밋의 가치는 전부 '적힌 수치가 실측과 맞는가' 에 있으므로 주장마다 명령으로 되쟀다. (1) 이 커밋이 고친 detail 의 '넷뿐' → `git show --name-only --pretty= 288072c685d2` 가 정확히 넷(findings 둘·queue.json·reviewed 하나). 교정이 맞다. (2) 'a52e664a 부모의 reviewed 열한 건' → 11. (3) '288072 리비전 queue.json reviewed 17 이 파일 수와 맞는다' → 둘 다 17. (4) '6542f512 리비전의 19 도 맞는다' → 둘 다 19. (5) 핵심 근거 '288072 리비전에서 빈 commits 15 건 · state=fixed 인데 빈 fixCommits 3 건' → 그 리비전의 reviewed·findings 를 하나씩 풀어 세니 15 와 3. 다섯 주장 모두 재현된다. 이 커밋 리비전의 queue.json(remaining 453 = 219+234, reviewed 23)도 reviewed/ 파일 수 23 과 맞는다.",
+    "보안 불변식": "해당 없음. 장부 JSON 만 바꾸고 실행 코드·설정·시험·의존성을 건드리지 않는다. 자격증명이나 공급자 소유 저장소를 읽지 않고(G1·G2·G4), 셸 문자열을 만들지 않고(G9), 외부에서 받은 경로를 정규화 없이 쓰지 않는다(G10). 쓰기 게이트에 닿는 자리도 없어 3절 C 예외 대상이 아니다.",
+    "계약": "일치한다. 고친 detail('넷뿐')과 그 결함을 지적하는 새 기록 F-...ecd6c2ef 의 detail·fix, 커밋 본문이 모두 같은 수치를 말한다. 장부 전수를 findingId({file,symbol,symptom})·commitItemId(ref) 로 재생성해 대조하니 findings 14 건·reviewed 24 건 모두 본문 id 불일치 0, 파일 이름 어긋남 0, 중복 itemId 0 이다. 리뷰 기록이 자기 교차검사 범위를 '결함 13 건·reviewed 21 건' 으로 적은 것은 틀린 수치가 아니라 레인의 rebase 전 기준 리비전(83ba8121)의 실제 수다 — 그 리비전을 세어 확인했고, 그래서 결함으로 올리지 않는다. queue.json 을 손으로 고치지 않고 러너로 갱신한 점도 README 규약과 맞다.",
+    "검증 없음": "장부 데이터에는 단위 시험이 걸리지 않고(modules.json 이 docs/ 를 모듈로 두지 않는다) 회차 7절이 새 자동화를 금한다. 대신 위 다섯 주장을 전부 git 명령과 node 집계로 재현해 검증을 대신했고, 러너를 돌려 ledgerDuplicates 가 빈 배열임을 확인했다. 장부 수치를 기계가 강제하는 검사 시험을 들이는 것은 저장 형식을 좁히는 결정이라 보고의 decisions 몫이고 여기서 하지 않았다.",
+    "단순화·중복": "중복 없음. 새 결함을 만들 때 기존 F-...1812038c 에 occurrences 를 덧붙이지 않고 별도 파일로 만든 것은 file·symbol 이 다르므로(지적 대상이 다른 파일이다) README 규약대로다. 새 결함의 fixCommits 와 이 장부의 commits 가 빈 것은 장부가 자기 커밋 해시를 적을 수 없는 구조적 자리라 F-docs-code-review-readme-md-commits-6f902967 에 open 으로 있어 여기서 다시 적지 않는다."
+  },
+  "findings": [],
+  "verification": [
+    "node --experimental-strip-types scripts/code-review-queue.mjs --json (ledgerDuplicates 빈 배열)",
+    "장부 전수 findingId/commitItemId 재생성 대조 — findings=14 bad=0 reviewed=24 bad=0",
+    "git show --name-only --pretty= 288072c685d2 → 4 (고친 '넷뿐' 이 맞음)",
+    "288072 리비전 빈 commits/fixCommits 실측 → 15건·3건 (커밋의 핵심 근거 재현)",
+    "a52e664a^ reviewed 11 · 288072 queue 17=17 · 6542f512 queue 19=19 · 175a354f queue 23=23"
+  ],
+  "commits": []
+}

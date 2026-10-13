@@ -19,6 +19,16 @@ import { collectTextPairs } from "./check-i18n-static-ui.mjs";
 const ROOT = path.resolve(import.meta.dirname, "..");
 const OUTPUT = path.join(ROOT, "src/lib/i18nGeneratedUiCatalog.ts");
 
+/**
+ * 2026-10-06: `core.autocrlf=true`(Windows 기본)로 받은 작업 트리에서는 체크아웃이 이 파일을
+ * CRLF로 풀어 놓는데 생성기는 늘 LF로 적는다. 바이트로 비교하면 소스와 한 글자도 다르지
+ * 않은데도 `--check`가 매번 "소스와 다릅니다"로 떨어져, 갓 받은 저장소에서 `npm run check`가
+ * 코드와 무관하게 실패했다. 줄끝은 저장 형식이지 카탈로그의 내용이 아니므로 비교에서 지운다.
+ */
+export function generatedCatalogMatches(current, next) {
+  return current.replace(/\r\n/g, "\n") === next.replace(/\r\n/g, "\n");
+}
+
 function render(pairs) {
   const entries = [...pairs].map(([ko, en]) => `  ${JSON.stringify(ko)}: ${JSON.stringify(en)},`).join("\n");
   return `/**
@@ -31,18 +41,22 @@ ${entries}
 `;
 }
 
-const pairs = collectTextPairs(ROOT);
-const next = render(pairs);
-const current = fs.existsSync(OUTPUT) ? fs.readFileSync(OUTPUT, "utf8") : "";
+// 시험이 위 비교 함수만 가져다 쓸 수 있도록, 거두고 쓰는 일은 이 파일을 직접 실행했을 때만
+// 한다. 가져오기만 해도 본문이 돌면 시험이 생성 파일을 다시 쓴다.
+if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === path.resolve(import.meta.filename)) {
+  const pairs = collectTextPairs(ROOT);
+  const next = render(pairs);
+  const current = fs.existsSync(OUTPUT) ? fs.readFileSync(OUTPUT, "utf8") : "";
 
-if (process.argv.includes("--check")) {
-  if (current !== next) {
-    console.error(`UI 번역 카탈로그 생성 파일이 소스와 다릅니다. npm run i18n:catalog을 실행하세요: ${path.relative(ROOT, OUTPUT)}`);
-    process.exitCode = 1;
+  if (process.argv.includes("--check")) {
+    if (!generatedCatalogMatches(current, next)) {
+      console.error(`UI 번역 카탈로그 생성 파일이 소스와 다릅니다. npm run i18n:catalog을 실행하세요: ${path.relative(ROOT, OUTPUT)}`);
+      process.exitCode = 1;
+    } else {
+      console.log(`ui catalog generated pairs: ${pairs.size} (up to date)`);
+    }
   } else {
-    console.log(`ui catalog generated pairs: ${pairs.size} (up to date)`);
+    if (!generatedCatalogMatches(current, next)) fs.writeFileSync(OUTPUT, next);
+    console.log(`ui catalog generated pairs: ${pairs.size} -> ${path.relative(ROOT, OUTPUT)}`);
   }
-} else {
-  if (current !== next) fs.writeFileSync(OUTPUT, next);
-  console.log(`ui catalog generated pairs: ${pairs.size} -> ${path.relative(ROOT, OUTPUT)}`);
 }

@@ -1,0 +1,25 @@
+{
+  "itemId": "C-a72039df6fbf",
+  "kind": "commit",
+  "ref": "a72039df6fbf5639eb1cd20562ecb27efd53483d",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L03",
+  "source": "claude",
+  "verdict": "결함 0건 / 수정 0건 (기존 결함에 관측 1건 덧붙임)",
+  "axes": {
+    "정확성": "결함 없음. 이 커밋은 장부 reviewed/C-e7a9cab64cff.json 을 더하고 queue.json 의 counts.reviewed 를 19→20 으로 올린다. 두 축을 모두 실측했다. (1) 장부가 리뷰 대상으로 적은 e7a9cab6 을 직접 읽었다 — findings/F-docs-code-review-readme-md-commits-6f902967.json 의 note 한 줄만 '보고의 decisions 로 올렸다' 에서 '이미 round-383bc1ee… 의 결정으로 열려 있어 다시 올리지 않았다' 로 바꾸는 1파일 1줄 커밋이고, findingId·file·symbol·symptom·severity·state·occurrences·fixCommits 는 그대로다. 장부가 '축 다섯 어디에도 결함이 없다' 고 적은 판정을 같은 diff 를 다시 읽어 확인했다. (2) 장부가 근거로 든 주장도 재확인했다 — list_round_reports(pendingDecisions=true) 에 round-383bc1ee75694815bbb5add11d45bfc9 이 실재하고 goalId 가 goal-15945736ed2c475dbf2b54bfa0c581c4 로 같으며, 그 보고의 열린 결정 질문이 'README 가 정한 reviewed 의 commits 와 결함의 fixCommits 는 그 장부를 담은 커밋 자신을 가리키므로 장부 전용 회차는 한 커밋 안에서 그 칸을 적을 수 없다' 로 이 결함과 같은 자리를 가리킨다. 따라서 e7a9cab6 이 지운 문구가 사실이 아니었고 새 문구가 사실이다.",
+    "보안 불변식": "해당 없음. 추적되는 문서 JSON 두 개(장부 한 건 추가 · 러너가 다시 쓴 queue.json)만 바꾼다. 실행 코드·스크립트·설정·자격증명·공급자 소유 저장소·셸 문자열·경로 정규화·쓰기 게이트 어디에도 닿지 않아 AGENTS.md 2절 G1~G11 과 3절 C 예외에서 인용할 조건 ID 가 없다.",
+    "계약": "일치. (1) queue.json 의 counts 가 착지한 트리와 맞는다 — 이 커밋 시점 docs/code-review/reviewed 의 .json 파일은 20 개(.gitkeep 제외)이고 counts.reviewed 도 20 이다. remaining 453 = commit 219 + module 234 로 자기 안에서도 맞는다. (2) 장부 전수 검사를 이 커밋 시점 트리에서 다시 돌렸다 — reviewed 20 · findings 13 전부 JSON 파싱 성공, 파일 이름 대 본문 itemId/findingId 불일치 0건. (3) 파일 이름 C-e7a9cab64cff 가 commitItemId('e7a9cab64cff…') 와 같다. (4) 장부 본문이 적은 수('reviewed 17 · findings 11')는 착지한 트리의 20 · 13 과 다르지만, 본문이 그 수를 '이번 리뷰 시점의 수' 라고 스스로 밝히고 있고 레인 워크트리에서 rebase 전에 잰 값이다. 계약 어긋남으로 세지 않았다 — 다만 장부에 적히는 전역 집계는 rebase 뒤 값과 반드시 어긋난다는 점은 아래 결함과 같은 뿌리다.",
+    "검증 없음": "문서 JSON 변경이라 코드 시험이 걸리는 자리가 없다. 대신 그 JSON 을 읽는 쪽을 직접 돌려 메웠다 — 러너 단위 시험(tests 12 / pass 12 / fail 0), 러너 --json 이 ledgerDuplicates 0, 그리고 위 계약 항의 장부 전수 JSON·id 검사. 커밋이 근거로 삼은 보고·결정의 실재는 list_round_reports 로 재현했다. 새 자동화는 들이지 않았다.",
+    "단순화·중복": "지적 없음. 장부 한 파일 추가와 러너가 생성한 queue.json 갱신뿐이라 되풀이한 코드가 없다. 중복 리뷰 흔적도 없다 — 이 항목의 장부는 점유 직후와 반영 직전 두 번 확인했을 때 모두 없었고 러너의 ledgerDuplicates 도 비어 있다."
+  },
+  "findings": ["F-docs-code-review-readme-md-commits-6f902967"],
+  "verification": [
+    "node --experimental-strip-types --test src/lib/codeReviewQueue.test.mjs (tests 12 / pass 12 / fail 0)",
+    "node --experimental-strip-types scripts/code-review-queue.mjs --json (ledgerDuplicates 0)",
+    "장부 전수 검사(a72039df 시점 트리): reviewed 20 · findings 13 의 JSON 파싱과 파일 이름 대 itemId/findingId 일치 — 위반 0건",
+    "list_round_reports(pendingDecisions=true) — round-383bc1ee75694815bbb5add11d45bfc9 과 그 결정이 같은 주제로 열려 있음을 확인"
+  ],
+  "note": "F-docs-code-review-readme-md-commits-6f902967 이 이 항목에서 또 드러나 occurrences 에 세 번째 관측을 덧붙였다 — 이 커밋이 더한 reviewed/C-e7a9cab64cff.json 의 `commits` 가 빈 배열이다. 고치는 길이 모두 저장 형식 변경이라 이번에도 고치지 않았고, 같은 주제의 결정이 round-383bc1ee… 로 이미 열려 있어 다시 올리지 않았다. 이 항목 시점의 수: reviewed 20 중 `commits` 가 빈 것 18, findings 13 중 state=\"fixed\" 인데 `fixCommits` 가 빈 것 5. 결함이 처음 적힌 시점(10/12 · 2)보다 양쪽 모두 늘었다.",
+  "commits": []
+}

@@ -67,6 +67,18 @@ pub const AIA_WORKSPACE_DIR: &str = "aia-workspace";
 pub const DEFAULT_WORKSPACE_DIR: &str = "default-workspace";
 const EVENT_QUEUE_CAPACITY: usize = 512;
 const MAX_REPLAY_EVENTS: usize = 2_000;
+/// 도구 카드 한 칸(`detail`·`output`)이 화면으로 나가는 글자 상한. 세션 기록 화면의 블록
+/// 상한(`catalog::MAX_BLOCK_TEXT`)과 같은 값이다.
+///
+/// 카드는 표시 사본이고 기록은 공급자 세션 파일이 쥔다. Codex는 `파일 변경` 카드에 diff
+/// 전체를, `명령 실행`·시스템 도구 카드에 출력 전체를 싣는데, 한 AIA 대화의 리플레이가
+/// 도구 이벤트 187개에 10MB였고 카드 하나가 54만 바이트였다(2026-10-05 실측). 그 크기가
+/// 재연결마다 소켓을 지나고 원격 화면까지 간다. 넘는 만큼은 잘라 알리고, 전체는 세션
+/// 기록에서 본다.
+const MAX_TOOL_CARD_CHARS: usize = 100_000;
+/// 도구 카드 글이 상한에서 잘렸음을 알리는 꼬리. SSH 터미널의 생략 안내와 같은 어조다.
+const TOOL_CARD_TRUNCATION_MARKER: &str =
+    "\n[출력이 길어 이후는 생략합니다 — 전체 내용은 세션 기록에서 확인하세요]";
 /// 무인 턴 출력 회수 상한. 한 턴이 컨텍스트 창을 가득 채워도 회수하는 쪽 대화를
 /// 통째로 밀어내지 않도록 여기서 끊는다.
 const MAX_LAST_TURN_OUTPUT_BYTES: usize = 64 * 1024;
@@ -823,6 +835,11 @@ pub struct ChatSessionInfo {
     pub state: ChatPhase,
     pub turn_count: u64,
     pub last_turn_status: Option<String>,
+    /// 이 런타임이 마지막으로 움직인 시각(ms). 턴이 한 번도 없었으면 실행 시작 시각이다.
+    pub last_activity_at: i64,
+    /// 그 뒤로 흐른 시간(ms). `state`가 `ready`인데 이 값이 크면 종료가 아니라 방치다 —
+    /// 화면과 AIA가 "살아 있지만 유휴"를 "종료"와 갈라 읽으라고 응답 시점에 함께 잰다.
+    pub idle_ms: i64,
     /// 리플레이 버퍼가 오래된 이벤트를 밀어냈는지. true면 attach로 받는 라이브 스트림이
     /// 이 대화의 앞부분을 담지 못하므로, 화면은 세션 파일 원문을 함께 읽어 보여 준다.
     pub replay_truncated: bool,
@@ -840,6 +857,10 @@ pub struct ChatSessionInfo {
     /// 화면은 저장본과 비교해 달라졌으면 정지 후 새 설정으로 다시 시작한다.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aia_runtime: Option<AiaRuntimeSettings>,
+    /// 계정 페일오버가 AIA 런타임을 다시 띄울 때 기존 세션 기록 정책을 유지한다. 실행
+    /// 복구에만 필요한 값이라 화면 계약에는 노출하지 않는다.
+    #[serde(skip_serializing)]
+    pub(crate) record_session: bool,
     /// 마지막 턴 요청 기준 컨텍스트 사용량 추정(토큰). 공급자 압축 직후에는 None.
     pub context_used_tokens: Option<u64>,
     /// 공급자가 알려준 모델 컨텍스트 창 크기(토큰).
@@ -1224,6 +1245,32 @@ pub enum ChatEvent {
 /// `append: false` 같은 기본값을 매번 손으로 적고 있었다. 어느 자리가 무엇을 실어
 /// 보내는지가 기본값에 파묻히지 않도록 기본값을 여기 한 번만 두고, 자리마다 다른
 /// 필드만 얹어 보내게 한다.
+/// 카드 한 칸을 `MAX_TOOL_CARD_CHARS` 안으로 묶는다. 상한 아래면 그대로다.
+fn bound_tool_card_text(value: Option<String>) -> Option<String> {
+    value.map(|text| {
+        // 바이트 수가 글자 수 이상이므로, 바이트가 상한 안이면 세어 볼 것도 없다.
+        if text.len() <= MAX_TOOL_CARD_CHARS {
+            return text;
+        }
+        text_limit::truncate_chars_with(&text, MAX_TOOL_CARD_CHARS, TOOL_CARD_TRUNCATION_MARKER)
+    })
+}
+
+/// 리플레이 항목에 이어 붙는 조각을 더한다. 이미 상한에서 잘린 칸은 더 받지 않는다 —
+/// 잘린 뒤에도 조각마다 글자를 세면 조각 수 × 본문 길이가 되고, 잘린 꼬리 뒤에 붙은
+/// 글은 어차피 화면에 보이지 않는다.
+fn append_bounded_tool_text(target: &mut Option<String>, chunk: &str) {
+    let text = target.get_or_insert_with(String::new);
+    if text.ends_with(TOOL_CARD_TRUNCATION_MARKER) {
+        return;
+    }
+    text.push_str(chunk);
+    if text.len() > MAX_TOOL_CARD_CHARS {
+        *text =
+            text_limit::truncate_chars_with(text, MAX_TOOL_CARD_CHARS, TOOL_CARD_TRUNCATION_MARKER);
+    }
+}
+
 struct ToolCard {
     id: String,
     name: String,
@@ -1953,6 +2000,12 @@ struct RuntimeState {
     claude_message_id: Option<String>,
     turn_count: u64,
     last_turn_status: Option<String>,
+    /// 이 런타임이 마지막으로 움직인 시각(ms). 턴 경계와 단계 전이뿐 아니라 턴 안의 공급자
+    /// 진행(`chat_event_is_response_progress`)도 함께 적는다 — `state`만으로는 "입력 대기"가
+    /// 방금 끝난 것인지 몇 시간 방치된 것인지 갈리지 않고, 턴 경계에서만 적으면 "응답 중"이
+    /// 흐르고 있는 것인지 굳은 것인지 갈리지 않는다. 아직 아무 일도 없었으면 `None`이고
+    /// 요약은 실행 시작 시각으로 메운다.
+    last_activity_at: Option<i64>,
     next_request_id: u64,
     pending_approvals: HashMap<String, PendingApproval>,
     provider_tool_blocks: HashMap<u64, ProviderToolBlock>,
@@ -2092,6 +2145,7 @@ impl RuntimeState {
             active_turn_id: None,
             turn_count: 0,
             last_turn_status: None,
+            last_activity_at: None,
             next_request_id: 3,
             pending_approvals: HashMap::new(),
             provider_tool_blocks: HashMap::new(),
@@ -2198,6 +2252,7 @@ impl RuntimeState {
         self.turn_count = self.turn_count.saturating_add(1);
         self.active_turn_id = Some(turn_id.clone());
         self.active_turn_started_at = Some(now_ms());
+        self.last_activity_at = Some(now_ms());
         self.turn_assistant_started = false;
         self.last_turn_status = None;
         self.reset_captured_output();
@@ -2329,10 +2384,10 @@ impl RuntimeState {
                 }
                 *last_status = status.clone();
                 if let Some(detail) = detail {
-                    last_detail.get_or_insert_with(String::new).push_str(detail);
+                    append_bounded_tool_text(last_detail, detail);
                 }
                 if let Some(output) = output {
-                    last_output.get_or_insert_with(String::new).push_str(output);
+                    append_bounded_tool_text(last_output, output);
                 }
             }
             // 상태 스냅숏이 연달아 오면(컨텍스트 게이지 갱신 등) 마지막 것만 남겨
@@ -2615,16 +2670,20 @@ impl ChatAttentionStore {
         })
     }
 
-    /// `exclude_profiles`에 든 프로필은 건드리지 않는다. 인앱 알림창은 AIA 알림을
-    /// 목록에서 빼고 AIA 패널이 따로 관리하므로, 화면에 없는 알림까지 "모두 읽음"이
-    /// 읽음 처리하면 안 된다. 목록을 비우면 승인 대기를 뺀 전부가 대상이다.
+    /// 제외 프로필이나 개별 알림 ID는 건드리지 않는다. 인앱 알림창은 자기 AIA 대화만
+    /// 목록에서 빼고 AIA 패널이 따로 관리하므로, 화면에 없는 알림만 ID로 보존한다.
+    /// 목록을 비우면 승인 대기를 뺀 전부가 대상이다.
     fn mark_all_read(
         &self,
         exclude_profiles: &[ChatProfile],
+        exclude_chat_ids: &[String],
     ) -> Result<ChatAttentionSnapshot, CoreError> {
         self.with_items(|items| {
             for item in items.iter_mut() {
-                if item.kind.is_pending_approval() || exclude_profiles.contains(&item.profile) {
+                if item.kind.is_pending_approval()
+                    || exclude_profiles.contains(&item.profile)
+                    || exclude_chat_ids.contains(&item.chat_id)
+                {
                     continue;
                 }
                 item.read = true;
@@ -3416,12 +3475,31 @@ fn effective_chat_profile(
     request: &ChatStartRequest,
     app_data_dir: Option<&PathBuf>,
 ) -> Result<ChatProfile, CoreError> {
-    if request.profile == ChatProfile::Aia || request.resume_session_id.is_none() {
+    if request.profile == ChatProfile::Aia {
         return Ok(request.profile);
     }
+    let Some(resume_session_id) = request.resume_session_id.as_deref() else {
+        return Ok(request.profile);
+    };
     let Some(app_data_dir) = app_data_dir else {
         return Ok(request.profile);
     };
+    // 세션이 적어 둔 프로필이 먼저다. 경로 비교는 그 기록이 없는 옛 세션만 받는다 —
+    // AIA 작업공간 경로는 앱 데이터 폴더마다 다르므로(개발 실행, 데이터 이전), 경로로만
+    // 판정하면 같은 세션이 실행 환경에 따라 AIA 대화였다가 일반 대화가 된다. 사용자가 보는
+    // 것은 "쓰던 대화에서 시스템 도구가 사라졌다"이고, 그 자리를 되찾을 길이 화면에 없다.
+    if let Ok(meta) = store::session_meta(app_data_dir, request.source, resume_session_id) {
+        if let Some(profile) = meta.profile {
+            return Ok(profile);
+        }
+    }
+    // 여기는 자기 app-data 의 작업공간 하나만 본다. 카탈로그는 형제 app-data 까지 넓게
+    // 본다(`catalog::sibling_app_data_dirs`)지만 그쪽은 표시고 이 자리는 권한이다 — AIA
+    // 프로필은 aia_system MCP 와 프로젝트 루트 전체를 받는다. 비교 대상을 폴더 이름 규칙으로
+    // 넓히면 그 규칙에 맞는 폴더를 만들 수 있는 누구나(원격 쓰기가 켜진 기기라면 원격에서도)
+    // 재개 요청 하나로 시스템 도구를 얻는다. 그래서 목록에는 AIA 칩이 붙는데 여기서 열면
+    // 일반 채팅인 세션이 생기고, 카탈로그가 그 사실을 `aia_chat_opens_as_standard` 로 실어
+    // 화면이 칩 설명으로 알린다. 그 비대칭은 고칠 결함이 아니라 지켜야 할 경계다.
     let aia_workspace = app_data_dir.join(AIA_WORKSPACE_DIR);
     if !aia_workspace.is_dir() {
         return Ok(request.profile);
@@ -4223,7 +4301,9 @@ impl ChatSupervisor {
                 })
                 .into_iter()
                 .map(|(id, tool_policies)| AttachableMcpServer {
-                    url: format!("{base}/{id}"),
+                    // P12. 주소에 공급자를 실어 프록시가 그 공급자의 승인 통로에 맞춰 도구를
+                    // 보이게 한다. Antigravity 전역 등록도 같은 함수로 주소를 만든다.
+                    url: crate::external_plugins::plugin_proxy_url(&base, source, &id),
                     id,
                     tool_policies,
                 })
@@ -4465,6 +4545,17 @@ impl ChatSupervisor {
             plan_steps,
         )?;
         let executable = resolve_executable(request.source)?;
+        // P12. Antigravity는 실행 단위 MCP가 없어 전역 설정이 이 채팅이 볼 플러그인을 정한다.
+        // CLI가 시작할 때 목록을 고정하므로 띄우기 직전에 앱의 애드온 상태로 맞춘다.
+        if request.source == ProviderId::Antigravity && profile == ChatProfile::Standard {
+            if let Some(app_data_dir) = self.inner.app_data_dir.as_deref() {
+                crate::antigravity_mcp_sync::sync_before_start(
+                    app_data_dir,
+                    &executable,
+                    self.plugin_mcp_base(),
+                );
+            }
+        }
         startup_not_cancelled(
             startup_cancel.as_ref(),
             "CLI 탐색 중 provider startup 요청이 취소되었습니다",
@@ -4900,8 +4991,11 @@ impl ChatSupervisor {
     pub fn mark_all_attention_read(
         &self,
         exclude_profiles: &[ChatProfile],
+        exclude_chat_ids: &[String],
     ) -> Result<ChatAttentionSnapshot, CoreError> {
-        self.inner.attention.mark_all_read(exclude_profiles)
+        self.inner
+            .attention
+            .mark_all_read(exclude_profiles, exclude_chat_ids)
     }
 
     pub fn clear_read_attention(&self) -> Result<ChatAttentionSnapshot, CoreError> {
@@ -7514,6 +7608,7 @@ impl ChatRuntime {
     fn set_phase(&self, phase: ChatPhase) {
         self.with_state(|state| {
             state.phase = phase;
+            state.last_activity_at = Some(now_ms());
             if !phase.is_active() {
                 state.current_turn_id = None;
                 state.active_turn_input = None;
@@ -7638,6 +7733,19 @@ impl ChatRuntime {
                     self.source,
                     session_id,
                     &self.local_connection_id,
+                );
+            }
+            // 프로필은 이 실행이 세션의 정체를 **아는 때**만 적는다. 새로 시작한 실행은
+            // 요청이 곧 정체라 그대로 적고, 재개는 추측이 섞이므로 AIA 로 풀렸을 때만 적어
+            // 기록을 메운다. 추측으로 얻은 Standard 까지 적으면 그 기록이 다음 이어가기의
+            // 추측을 이겨, 한 번 어긋난 판정이 세션에 굳는다 — 적지 않으면 종전의 경로
+            // 추측으로 떨어질 뿐이라 잃는 것이 없다.
+            if !self.resuming || self.profile == ChatProfile::Aia {
+                let _ = store::persist_session_profile(
+                    app_data_dir,
+                    self.source,
+                    session_id,
+                    self.profile,
                 );
             }
             if !self.resuming {
@@ -7805,7 +7913,13 @@ impl ChatRuntime {
     }
 
     fn info_from(&self, state: &RuntimeState) -> ChatSessionInfo {
+        // 한 번도 움직이지 않은 실행은 시작한 순간이 마지막 활동이다. 유휴는 응답을 만드는
+        // 지금 기준으로 재야 원격 화면의 시계가 달라도 같은 값을 읽는다. 시계가 뒤로 간
+        // 기기에서 음수가 나오지 않게 0에서 자른다.
+        let last_activity_at = state.last_activity_at.unwrap_or(self.started_at);
         ChatSessionInfo {
+            last_activity_at,
+            idle_ms: now_ms().saturating_sub(last_activity_at).max(0),
             chat_id: self.chat_id.clone(),
             started_at: self.started_at,
             source: self.source,
@@ -7839,6 +7953,7 @@ impl ChatRuntime {
             system_tools: self.system_tools,
             settings: self.dynamic_settings.clone(),
             aia_runtime: self.aia_runtime.clone(),
+            record_session: self.record_session,
             context_used_tokens: state.context_used_tokens,
             context_window_tokens: state.context_window_tokens,
         }
@@ -7945,7 +8060,19 @@ impl ChatRuntime {
         (preview.request.is_some() || preview.response.is_some()).then_some(preview)
     }
 
-    fn emit(&self, event: ChatEvent) {
+    fn emit(&self, mut event: ChatEvent) {
+        // 도구 카드의 통째 스냅숏은 여기서 한 번 묶는다. 이어 붙는 조각은 낱개가 작고
+        // 누적은 리플레이 버퍼(`push_replay_event`)와 화면(`toolCardText.ts`)이 각자 묶는다.
+        if let ChatEvent::Tool {
+            detail,
+            output,
+            append: false,
+            ..
+        } = &mut event
+        {
+            *detail = bound_tool_card_text(detail.take());
+            *output = bound_tool_card_text(output.take());
+        }
         let Some(pending) = self.apply_event_to_state(&event) else {
             return;
         };
@@ -8084,6 +8211,11 @@ impl ChatRuntime {
         let mut state = self.state.lock().ok()?;
         if chat_event_is_response_progress(event) {
             state.response_progress_seq = state.response_progress_seq.saturating_add(1);
+            // 턴 안에서도 활동 표식을 옮긴다. 턴 경계에서만 적으면 `running`의 유휴가
+            // "마지막 활동 이후"가 아니라 "턴을 연 뒤 흐른 시간"이 되어, 토큰이 계속
+            // 흐르는 긴 작업과 한 시간째 굳어 있는 턴이 같은 숫자로 보인다. 기준은 첫
+            // 응답 워치독이 쓰는 것과 같다 — 앱이 만료로 닫은 카드는 진행이 아니다.
+            state.last_activity_at = Some(now_ms());
             if chat_event_is_assistant_output(event) {
                 state.turn_assistant_started = true;
             }
@@ -8175,6 +8307,7 @@ impl ChatRuntime {
         completion_note: Option<String>,
     ) {
         state.last_turn_status = (status != "started").then(|| status.to_owned());
+        state.last_activity_at = Some(now_ms());
         if self.unattended && status != "started" {
             // 정상 종료(자동 거절이 섞인 completedWithDenials 포함)만 성공으로 센다. 실패·중단
             // 턴의 표식은 결론이 아니라 끊긴 조각일 수 있어 완료로 읽지 않는다.
@@ -8676,6 +8809,12 @@ fn spawn_managed_chat_child(
         // C9-18. 이 대화가 띄운 셸에서 `<CLI> ssh exec`를 부르면 출력이 이 대화로 돌아오게
         // 하는 표식. 비밀값이 아니고 대화 id만 담는다.
         .env(RELAY_CHAT_ID_ENV, &runtime.chat_id);
+    // 그 셸에서 스킬이 부르는 CLI가 이 백엔드의 앱 데이터를 읽게 하는 표식
+    // (`remote::APP_DATA_DIR_ENV`). 플랫폼 기본 폴더가 아닌 곳으로 뜬 백엔드(NAS의 `/data`,
+    // 개발 접미 폴더) 아래에서 스킬이 백엔드를 못 찾거나 남의 빈 폴더를 읽지 않게 한다.
+    if let Some(app_data_dir) = runtime.app_data_dir.as_deref() {
+        command.env(crate::remote::APP_DATA_DIR_ENV, app_data_dir);
+    }
     // 이 채팅만의 설정. OpenCode 가 마지막에 병합하므로 공유 설정의 항을 덮되 남의 항은
     // 건드리지 않는다(2026-09-27 실측: 에이전트 항 15 → 16, 기존 것 유지).
     if let Some(app_data_dir) = runtime.app_data_dir.as_deref() {
@@ -13203,6 +13342,56 @@ mod tests {
     }
 
     #[test]
+    fn a_recorded_aia_profile_survives_a_different_app_data_dir() {
+        // 개발 실행처럼 앱 데이터 폴더가 다르면 세션에 박힌 cwd 는 그 폴더의 AIA 작업공간과
+        // 다르다. 경로로만 판정하던 동안에는 그 차이 하나로 AIA 대화가 일반 대화로 열렸고,
+        // 시스템 도구가 붙지 않아 사용자가 쓰던 자리가 사라졌다. 세션이 적어 둔 프로필이
+        // 있으면 경로는 보지 않는다.
+        let data = tempfile::tempdir().expect("app data");
+        let other_workspace = data.path().join("other-aia-workspace");
+        fs::create_dir(&other_workspace).expect("다른 작업공간");
+        fs::create_dir(data.path().join(AIA_WORKSPACE_DIR)).expect("이 실행의 작업공간");
+
+        let mut request = fixture_start_request(ProviderId::Claude, &other_workspace);
+        request.resume_session_id = Some("11111111-1111-4111-8111-111111111111".to_owned());
+        assert_eq!(
+            effective_chat_profile(&request, Some(&data.path().to_path_buf())).expect("profile"),
+            ChatProfile::Standard,
+            "기록이 없으면 종전대로 경로만 본다"
+        );
+
+        store::persist_session_profile(
+            data.path(),
+            ProviderId::Claude,
+            "11111111-1111-4111-8111-111111111111",
+            ChatProfile::Aia,
+        )
+        .expect("프로필 기록");
+        assert_eq!(
+            effective_chat_profile(&request, Some(&data.path().to_path_buf())).expect("profile"),
+            ChatProfile::Aia,
+            "적어 둔 프로필이 경로 추측을 이긴다"
+        );
+
+        // 반대 방향도 지킨다 — 일반 대화로 적힌 세션이 AIA 작업공간에서 재개돼도 승격되지
+        // 않는다. 그러지 않으면 기록이 추측에 지는 쪽이 하나 남는다.
+        let mut standard =
+            fixture_start_request(ProviderId::Claude, &data.path().join(AIA_WORKSPACE_DIR));
+        standard.resume_session_id = Some("22222222-2222-4222-8222-222222222222".to_owned());
+        store::persist_session_profile(
+            data.path(),
+            ProviderId::Claude,
+            "22222222-2222-4222-8222-222222222222",
+            ChatProfile::Standard,
+        )
+        .expect("프로필 기록");
+        assert_eq!(
+            effective_chat_profile(&standard, Some(&data.path().to_path_buf())).expect("profile"),
+            ChatProfile::Standard
+        );
+    }
+
+    #[test]
     fn resumed_codex_session_in_aia_workspace_restores_aia_profile() {
         let data = tempfile::tempdir().expect("app data");
         let aia_workspace = data.path().join("aia-workspace");
@@ -15589,7 +15778,7 @@ mod tests {
         }
 
         let excluded = store
-            .mark_all_read(&[ChatProfile::Aia])
+            .mark_all_read(&[ChatProfile::Aia], &[])
             .expect("mark all read");
         let read_ids = |snapshot: &ChatAttentionSnapshot| {
             snapshot
@@ -15604,12 +15793,53 @@ mod tests {
         assert_eq!(excluded.unread_count, 2);
         assert_eq!(excluded.pending_count, 1);
 
-        let all = store.mark_all_read(&[]).expect("mark all read");
+        let all = store.mark_all_read(&[], &[]).expect("mark all read");
         assert_eq!(
             read_ids(&all),
             vec!["standard-completed".to_owned(), "aia-completed".to_owned()]
         );
         assert_eq!(all.unread_count, 1);
+    }
+
+    #[test]
+    fn mark_all_attention_read_skips_only_the_hidden_aia_chat() {
+        let store = ChatAttentionStore::default();
+        let item = |id: &str| ChatAttentionItem {
+            id: id.to_owned(),
+            chat_id: id.to_owned(),
+            source: ProviderId::Claude,
+            provider_session_id: None,
+            cwd: "/tmp".to_owned(),
+            resuming: false,
+            unattended: false,
+            profile: ChatProfile::Aia,
+            origin: None,
+            kind: ChatAttentionKind::Completed,
+            title: id.to_owned(),
+            detail: None,
+            approval_id: None,
+            needs_secret: false,
+            preview: None,
+            created_at: 0,
+            read: false,
+        };
+        {
+            let mut items = store.items.lock().expect("attention items");
+            items.push_back(item("hidden-aia"));
+            items.push_back(item("visible-aia"));
+        }
+
+        let result = store
+            .mark_all_read(&[], &["hidden-aia".to_owned()])
+            .expect("mark visible items read");
+        let read_ids = result
+            .items
+            .iter()
+            .filter(|item| item.read)
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(read_ids, vec!["visible-aia"]);
+        assert_eq!(result.unread_count, 1);
     }
 
     #[test]
@@ -16313,6 +16543,109 @@ mod tests {
             .expect("AIA live chats");
         assert_eq!(aia.len(), 1);
         assert_eq!(aia[0].chat_id, "aia");
+    }
+
+    /// 단계만으로는 방금 답을 끝낸 실행과 한 시간 방치된 실행이 모두 `ready`라 갈리지
+    /// 않았다. 부르는 쪽이 둘을 "종료됐나?"로 되묻던 자리다.
+    #[test]
+    fn idle_ms_separates_a_fresh_ready_runtime_from_an_abandoned_one() {
+        let supervisor = ChatSupervisor::new();
+        let mut fresh = fixture_runtime(ProviderId::Codex);
+        fresh.chat_id = "fresh".to_owned();
+        fresh.started_at = now_ms();
+
+        let mut stale = fixture_runtime(ProviderId::Codex);
+        stale.chat_id = "stale".to_owned();
+        stale.started_at = now_ms() - 3_600_000;
+
+        supervisor.set_test_chats([fresh, stale]);
+        let chats = supervisor
+            .live_chats(ChatProfile::Standard)
+            .expect("live chats");
+        let fresh = chats
+            .iter()
+            .find(|chat| chat.chat_id == "fresh")
+            .expect("fresh runtime");
+        let stale = chats
+            .iter()
+            .find(|chat| chat.chat_id == "stale")
+            .expect("stale runtime");
+
+        assert_eq!(fresh.state, ChatPhase::Ready);
+        assert_eq!(stale.state, ChatPhase::Ready);
+        // 아직 턴이 없으면 실행을 시작한 순간이 마지막 활동이다.
+        assert_eq!(fresh.last_activity_at, fresh.started_at);
+        assert!(fresh.idle_ms < 60_000, "idle_ms={}", fresh.idle_ms);
+        assert!(stale.idle_ms >= 3_600_000, "idle_ms={}", stale.idle_ms);
+    }
+
+    /// 턴이 끝나면 표식이 실행 시작 시각 자리를 떠난다 — 그래야 오래 전에 시작해 방금
+    /// 답을 마친 실행이 방치로 읽히지 않는다.
+    #[test]
+    fn a_finished_turn_moves_the_activity_mark_off_the_start_time() {
+        let mut runtime = fixture_runtime(ProviderId::Codex);
+        runtime.started_at = now_ms() - 3_600_000;
+        assert_eq!(runtime.test_state().last_activity_at, None);
+
+        runtime.emit_turn("completed");
+
+        let marked = runtime
+            .test_state()
+            .last_activity_at
+            .expect("턴이 끝나면 활동 표식이 적힌다");
+        assert!(marked > runtime.started_at, "marked={marked}");
+        assert_eq!(
+            runtime.info_from(&runtime.test_state()).last_activity_at,
+            marked
+        );
+    }
+
+    /// 턴 안에서 토큰이 흐르는 동안에도 표식이 따라 움직인다. 턴 경계에서만 적으면
+    /// `running`의 유휴가 "턴을 연 뒤 흐른 시간"이 되어, 답이 계속 나오는 긴 작업과 한
+    /// 시간째 굳은 턴이 같은 숫자로 보인다.
+    #[test]
+    fn provider_progress_inside_a_turn_moves_the_activity_mark() {
+        let runtime = fixture_runtime(ProviderId::Codex);
+        runtime.set_test_phase(ChatPhase::Running);
+        runtime.test_state().last_activity_at = Some(now_ms() - 3_600_000);
+
+        runtime.apply_event_to_state(&ChatEvent::MessageDelta {
+            id: "message-1".to_owned(),
+            role: "assistant".to_owned(),
+            kind: "message".to_owned(),
+            delta: "답".to_owned(),
+        });
+
+        let idle = runtime.info_from(&runtime.test_state()).idle_ms;
+        assert!(idle < 60_000, "idle_ms={idle}");
+    }
+
+    /// 앱이 만료로 닫은 승인 카드는 CLI가 한 일이 아니라 진행이 아니다. 굳은 턴을 살아
+    /// 있는 것처럼 보이게 하면 안 된다 — 첫 응답 워치독이 쓰는 기준과 같다.
+    #[test]
+    fn an_app_closed_approval_card_does_not_move_the_activity_mark() {
+        let runtime = fixture_runtime(ProviderId::Codex);
+        runtime.set_test_phase(ChatPhase::Running);
+        let stale = now_ms() - 3_600_000;
+        runtime.test_state().last_activity_at = Some(stale);
+
+        runtime.apply_event_to_state(&ChatEvent::ApprovalResolved {
+            id: "approval-1".to_owned(),
+            decision: ChatApprovalDecision::Cancel,
+            answers: BTreeMap::new(),
+            note: Some("만료로 닫음".to_owned()),
+        });
+
+        assert_eq!(runtime.test_state().last_activity_at, Some(stale));
+    }
+
+    /// 시계가 뒤로 간 기기에서 표식이 미래가 되어도 음수 유휴를 내보내지 않는다.
+    #[test]
+    fn idle_ms_floors_at_zero_when_the_activity_mark_is_in_the_future() {
+        let runtime = fixture_runtime(ProviderId::Codex);
+        runtime.test_state().last_activity_at = Some(now_ms() + 600_000);
+
+        assert_eq!(runtime.info_from(&runtime.test_state()).idle_ms, 0);
     }
 
     #[test]
@@ -18051,6 +18384,45 @@ mod tests {
         assert!(config["mcpServers"].get("aia_system").is_none());
     }
 
+    /// P12. CLI에 붙이는 플러그인 주소는 공급자 조각을 싣는다. 조각 없는 주소로 돌아가면
+    /// 프록시가 호출자를 모르게 되므로 주소 모양을 직접 확인한다.
+    #[test]
+    fn p12_attached_plugin_urls_carry_the_provider_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::external_plugins::ExternalPluginRegistry::new(dir.path().to_path_buf())
+            .register(crate::ExternalPluginManifestRequest {
+                id: "mock".to_owned(),
+                display_name: "Mock".to_owned(),
+                names: None,
+                url: Some("http://127.0.0.1:3000/mcp".to_owned()),
+                auth: crate::external_plugins::PluginAuthKind::None,
+                token: None,
+                client_id: None,
+                client_secret: None,
+                scope: None,
+            })
+            .unwrap();
+        let supervisor = ChatSupervisor::with_app_data_dir(dir.path().to_path_buf()).unwrap();
+        supervisor
+            .set_plugin_mcp_base("http://127.0.0.1:12345/plugins/test".to_owned())
+            .unwrap();
+        for source in [ProviderId::Claude, ProviderId::Codex, ProviderId::Local] {
+            let injected = supervisor
+                .resolve_mcp_injection(false, ChatProfile::Standard, source, "test", false)
+                .unwrap();
+            assert_eq!(
+                injected.plugin_servers,
+                vec![(
+                    "mock".to_owned(),
+                    format!(
+                        "http://127.0.0.1:12345/plugins/test/{}/mock",
+                        source.as_str()
+                    )
+                )]
+            );
+        }
+    }
+
     #[test]
     fn cypress_is_injected_only_when_enabled_with_fallback_for_all_providers() {
         let dir = tempfile::tempdir().unwrap();
@@ -19524,6 +19896,8 @@ mod tests {
             git_branch: None,
             is_subagent: false,
             aia_workspace: false,
+            aia_chat: false,
+            aia_chat_opens_as_standard: false,
             default_workspace: false,
             archived: false,
             readable: true,
@@ -19891,5 +20265,69 @@ mod tests {
             runtime.state.lock().expect("state").provider_session_id = Some("session-a".to_owned());
             assert!(!antigravity_conversation_diverged(&runtime, "session-b"));
         }
+    }
+
+    /// 도구 카드 통째 스냅숏은 `MAX_TOOL_CARD_CHARS`에서 잘려 리플레이에 남는다.
+    #[test]
+    fn tool_card_snapshot_is_capped_before_it_reaches_the_screen() {
+        let runtime = fixture_runtime(ProviderId::Codex);
+        let long = "가".repeat(MAX_TOOL_CARD_CHARS + 5_000);
+        runtime.emit(ChatEvent::Tool {
+            id: "exec-1".to_owned(),
+            name: "명령 실행".to_owned(),
+            status: "completed".to_owned(),
+            detail: Some("ls".to_owned()),
+            output: Some(long),
+            append: false,
+        });
+
+        let state = runtime.test_state();
+        let output = state
+            .replay
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::Tool { id, output, .. } if id == "exec-1" => output.clone(),
+                _ => None,
+            })
+            .expect("tool card in replay");
+        assert!(output.ends_with(TOOL_CARD_TRUNCATION_MARKER));
+        assert_eq!(
+            output.chars().count(),
+            MAX_TOOL_CARD_CHARS + TOOL_CARD_TRUNCATION_MARKER.chars().count()
+        );
+        assert!(output.starts_with("가가가"));
+    }
+
+    /// 이어 붙는 조각은 리플레이 항목 하나에 모이되, 상한을 넘으면 더 자라지 않는다.
+    #[test]
+    fn appended_tool_chunks_stop_growing_the_replay_entry_past_the_cap() {
+        let runtime = fixture_runtime(ProviderId::Codex);
+        let chunk = "x".repeat(30_000);
+        for _ in 0..6 {
+            runtime.emit(ChatEvent::Tool {
+                id: "exec-2".to_owned(),
+                name: "명령 실행".to_owned(),
+                status: "running".to_owned(),
+                detail: None,
+                output: Some(chunk.clone()),
+                append: true,
+            });
+        }
+
+        let state = runtime.test_state();
+        let outputs = state
+            .replay
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::Tool { id, output, .. } if id == "exec-2" => output.clone(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 1, "조각은 리플레이 항목 하나로 모인다");
+        assert!(outputs[0].ends_with(TOOL_CARD_TRUNCATION_MARKER));
+        assert_eq!(
+            outputs[0].chars().count(),
+            MAX_TOOL_CARD_CHARS + TOOL_CARD_TRUNCATION_MARKER.chars().count()
+        );
     }
 }

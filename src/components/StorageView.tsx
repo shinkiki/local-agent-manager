@@ -1,23 +1,27 @@
-import { Database, KeyRound } from "lucide-react";
+import { Database, KeyRound, Library } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { formatBytes, formatTimeOnly } from "../lib/format";
 import { useI18n, type UiText } from "../lib/i18n";
 import { getStorageOverview } from "../lib/ipc";
 import { usePoll } from "../lib/poll";
 import type { TabRequest } from "../lib/uiGuide";
-import type { StorageOverview, StorageUsageItem } from "../types";
+import type { StorageOverview, StorageUsageItem, SystemAutomationSnapshot } from "../types";
 import { ErrorBanner, LoadingState } from "./Shared";
 import { errorText } from "../lib/errorText";
+import { ResourceRepositoryCard } from "./ResourceRepositoryCard";
 import { SessionCleanupCard } from "./SessionCleanupCard";
 import { SettingsSubTabPanel, SettingsSubTabs, type SettingsSubTab } from "./SettingsSubTabs";
 import { StorageSecretsTab } from "./StorageSecretsTab";
 
-export type StorageTabId = "data" | "secrets";
+export type StorageTabId = "data" | "library" | "secrets";
 
-// 설정·애드온 화면과 같은 중메뉴. 용량·정리(데이터)와 채팅 비밀값(비밀정보)은 서로 다른
-// 저장 위치를 다루므로 한 화면에 쌓지 않고 탭으로 나눈다.
+// 설정·애드온 화면과 같은 중메뉴. 용량·정리(데이터), 스킬·지침 원본을 두는 자리(라이브러리),
+// 채팅 비밀값(비밀정보)은 서로 다른 저장 위치를 다루므로 한 화면에 쌓지 않고 탭으로 나눈다.
+// 라이브러리 탭은 설정 화면에서 옮겨 왔다 — 무엇이 어디에 쌓이는지 묻는 사람은 설정이 아니라
+// 이 화면을 열기 때문이다.
 const storageTabs: readonly SettingsSubTab<StorageTabId>[] = [
   { id: "data", icon: Database, ko: "데이터", en: "Data", anchor: "storage.tab.data" },
+  { id: "library", icon: Library, ko: "라이브러리", en: "Library", anchor: "storage.tab.library" },
   { id: "secrets", icon: KeyRound, ko: "비밀정보", en: "Secrets", anchor: "storage.tab.secrets" },
 ];
 
@@ -67,8 +71,17 @@ function StorageRefreshStatus({ stale, measuredAtText }: { stale: boolean; measu
 /**
  * 저장소 화면. `active`는 App이 이 화면을 보이고 있는지다 — 세션 자동정리 카드가 탭 진입마다
  * 다시 읽고, 비밀정보 탭이 보일 때만 폴링하는 데 쓴다(설정 화면이 넘기는 방식과 같다).
+ *
+ * 라이브러리 탭이 받는 세 값은 전부 그 카드의 것이다. 공통 저장소 경로가 바뀌면 스킬·지침
+ * 화면이 다시 읽어야 하고(`onRepositoryChanged`), 백업·복구는 AIA 입력창으로 넘긴다.
  */
-export function StorageView({ active = true, tabRequest = null }: { active?: boolean; tabRequest?: TabRequest<StorageTabId> | null }) {
+export function StorageView({ active = true, tabRequest = null, automation = null, onRequestAiaPrompt, onRepositoryChanged }: {
+  active?: boolean;
+  tabRequest?: TabRequest<StorageTabId> | null;
+  automation?: SystemAutomationSnapshot | null;
+  onRequestAiaPrompt?: (prompt: string) => void;
+  onRepositoryChanged?: () => void;
+}) {
   const { text } = useI18n();
   const [tab, setTab] = useState<StorageTabId>("data");
   // AIA가 저장된 비밀값 카드를 가리키려면 비밀정보 탭이 먼저 열려야 한다(C17-4).
@@ -83,6 +96,14 @@ export function StorageView({ active = true, tabRequest = null }: { active?: boo
       <SettingsSubTabs idPrefix="storage" tabs={storageTabs} value={tab} onChange={setTab} label={text("저장소 메뉴", "Storage menu")} />
       <SettingsSubTabPanel idPrefix="storage" id="data" active={tab === "data"}>
         <StorageDataTab active={active && tab === "data"} />
+      </SettingsSubTabPanel>
+      {/* 라이브러리 카드만 탭을 떠날 때 내려놓는다. 카드는 뜰 때 한 번만 저장소 설정을 읽으므로,
+          숨긴 채 남겨 두면 첫 조회가 실패했을 때 "불러오는 중"에 갇히고 바깥에서 바뀐 경로도
+          낡은 채 남는다. 설정 탭에 있던 시절과 같은 수명(탭에 들어올 때 뜨고 나갈 때 내려감)을
+          그대로 쓰면 탭을 다시 여는 것이 곧 다시 읽기다. 화면을 다녀오는 것만으로는 탭이
+          그대로라 내려가지 않으므로 저장하지 않은 편집은 종전처럼 남는다. */}
+      <SettingsSubTabPanel idPrefix="storage" id="library" active={tab === "library"}>
+        {tab === "library" && <ResourceRepositoryCard onChanged={onRepositoryChanged} automation={automation} onRequestAiaPrompt={onRequestAiaPrompt} />}
       </SettingsSubTabPanel>
       <SettingsSubTabPanel idPrefix="storage" id="secrets" active={tab === "secrets"}>
         <StorageSecretsTab active={active && tab === "secrets"} />
@@ -229,11 +250,18 @@ function StoragePanel({ title, detail, items, footer }: { title: string; detail:
   );
 }
 
+// 잰 자리를 행마다 적는다. 헤드리스(NAS) 배포에서 이 화면을 보는 사람은 원격 브라우저 앞에
+// 있으므로, 수치만 보이면 자기 컴퓨터의 세션 용량으로 읽는다. 실제로는 백엔드가 도는 컨테이너
+// 안(`/root/.claude/projects`)이다(L09). 번역하지 않는 경로 문자열이라 i18n 카탈로그를 늘리지 않는다.
 function StorageRow({ item }: { item: StorageUsageItem }) {
   const { text } = useI18n();
   return (
     <div className="storage-row">
-      <div><strong>{item.label}</strong><span>{item.description}</span></div>
+      <div>
+        <strong>{item.label}</strong>
+        <span>{item.description}</span>
+        {item.rootPath && <code className="storage-row-path" title={item.rootPath}>{item.rootPath}</code>}
+      </div>
       <div><strong>{formatBytes(item.sizeBytes)}</strong><span>{text(`${item.fileCount.toLocaleString()}개 파일`, `${item.fileCount.toLocaleString()} files`)}</span></div>
     </div>
   );

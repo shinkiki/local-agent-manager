@@ -559,6 +559,11 @@ fn matches_provider_command(provider: ProviderId, command: &str) -> bool {
     }
     if let Some(runtime) = RuntimeWrapper::from_executable(&first) {
         while let Some(token) = tokens.next() {
+            if runtime.executes_inline_code(&token) {
+                // C1-9: 인라인 코드 뒤의 위치 인자는 실행할 CLI 스크립트가 아니다.
+                // 이를 스크립트로 오인하면 무관한 Node 프로세스와 그 자손까지 종료한다.
+                return false;
+            }
             if runtime.consumes_next_argument(&token) {
                 let _ = tokens.next();
                 continue;
@@ -620,17 +625,20 @@ impl RuntimeWrapper {
         }
     }
 
+    fn executes_inline_code(self, option: &str) -> bool {
+        matches!(self, Self::Node)
+            && (matches!(option, "-e" | "--eval" | "-p" | "--print" | "-pe")
+                || option.starts_with("--eval=")
+                || option.starts_with("--print="))
+    }
+
     /// 런타임 옵션 중 다음 토큰을 값으로 소비하는, 명시적으로 알고 있는 옵션만
     /// 건너뛴다. 알 수 없는 옵션은 소비하지 않아 실제 스크립트를 놓치지 않는다.
     fn consumes_next_argument(self, option: &str) -> bool {
         match self {
             Self::Node => matches!(
                 option,
-                "-e" | "--eval"
-                    | "-p"
-                    | "--print"
-                    | "-r"
-                    | "--require"
+                "-r" | "--require"
                     | "--import"
                     | "--loader"
                     | "--experimental-loader"
@@ -895,6 +903,55 @@ mod tests {
         assert!(!matches_provider_command(claude, "grep claude"));
     }
 
+    #[test]
+    fn c1_9_node_inline_arguments_are_not_provider_scripts() {
+        for provider in [ProviderId::Claude, ProviderId::Codex] {
+            for inline in [
+                r#"-e "setInterval(() => {}, 1000)""#,
+                r#"--eval "setInterval(() => {}, 1000)""#,
+                "--eval=setInterval(()=>{},1000)",
+                r#"-p "setInterval(() => {}, 1000)""#,
+                r#"--print "setInterval(() => {}, 1000)""#,
+                "--print=setInterval(()=>{},1000)",
+                r#"-pe "setInterval(() => {}, 1000)""#,
+            ] {
+                let command = format!("node {inline} /opt/tools/{}", provider.as_str());
+                assert!(
+                    !matches_provider_command(provider, &command),
+                    "인라인 코드의 argv를 CLI로 매칭하면 안 된다: {command}"
+                );
+            }
+        }
+        // 옵션의 값에 인라인 옵션과 같은 이름이 있어도, 실제 스크립트는 계속 인식한다.
+        assert!(matches_provider_command(
+            ProviderId::Codex,
+            "node --require --eval /opt/tools/codex"
+        ));
+        assert!(matches_provider_command(
+            ProviderId::Codex,
+            "node -- /opt/tools/codex --eval prompt"
+        ));
+    }
+
+    #[test]
+    fn c1_9_c1_10_node_inline_process_and_its_tree_are_not_selected() {
+        let entries = vec![
+            entry(100, 1, 501, "agent-manager"),
+            entry(
+                200,
+                1,
+                501,
+                r#"node --eval "setInterval(() => {}, 1000)" /opt/tools/codex"#,
+            ),
+            entry(201, 200, 501, "worker"),
+            entry(300, 1, 501, "node --require preload /opt/tools/codex"),
+            entry(301, 300, 501, "mcp-server"),
+        ];
+        let selected = select_external_processes(ProviderId::Codex, &entries, 100, 501);
+        let pids: Vec<u32> = selected.iter().map(|process| process.pid).collect();
+        assert_eq!(pids, vec![300, 301]);
+    }
+
     /// 윈도우 조회 스크립트가 명령줄까지 읽을 이름 목록과, 매칭이 실제로 인식하는
     /// 이름이 갈라지면 그 설치 형태만 조용히 보이지 않게 된다. 한쪽만 고치지 못하게 묶는다.
     #[test]
@@ -1032,6 +1089,57 @@ mod tests {
         ];
         let selected = select_external_processes(ProviderId::Claude, &entries, 100, 501);
         assert!(selected.is_empty());
+    }
+
+    /// L05. 헤드리스 컨테이너(시놀로지 NAS, procps-ng 4.0.2, compose `init: true`)에서
+    /// `ps -axo pid=,ppid=,uid=,args=`가 실제로 뱉은 표를 그대로 통과시킨다. 2026-10-10
+    /// 실측본이고, 데스크톱과 다른 점 셋이 여기서 고정된다.
+    ///
+    /// - PID 1이 `launchd`가 아니라 `docker-init`이고 **모든 것의 공통 조상**이다.
+    ///   조상을 자손까지 통째로 제외하면 표 전체가 사라지므로, 제외되는 것은 PID 1 자신뿐이다.
+    /// - 컨테이너의 모든 프로세스가 uid 0이다. 소유자 비교가 0을 정상 소유자로 받아야 한다.
+    /// - `docker exec`로 바깥에서 띄운 프로세스는 PID 1의 자식이 아니라 **ppid 0**으로 보인다.
+    ///   조상 추적이 거기서 멈추고, 그 세션이 외부 공급자 프로세스로 잡혀야 한다 —
+    ///   헤드리스에서 외부 CLI가 들어오는 유일한 통로가 이것이다.
+    #[cfg(unix)]
+    #[test]
+    fn container_ps_table_selects_only_docker_exec_sessions() {
+        // 실측 표의 구조 그대로다. 329번의 `--append-system-prompt` 본문(수 KB)은
+        // 줄였고, 테일넷 호스트와 세션 id는 CONTRIBUTING.md대로 자리표시자로 바꿨다 —
+        // 매칭은 첫 토큰을 보므로 판정에는 영향이 없다.
+        //
+        // 수용 기준의 나머지 절반인 "강제 종료 뒤 좀비가 남지 않는다"는 이 시험이
+        // 지지 않는다. 실측 시점 좀비는 0건이었으나 그 공은 compose `init: true`의
+        // docker-init와 [`wait_for_exit`]의 `reap_zombie_child` 중 어느 쪽인지
+        // 가려지지 않았다. `init: true` 없이 띄우는 배포에서는 PID 7 자신이
+        // 거두어야 하므로 그 경로는 따로 검증해야 한다.
+        let table = concat!(
+            "    1     0     0 /sbin/docker-init -- /usr/local/bin/entrypoint.sh\n",
+            "    7     1     0 /usr/local/bin/agent-manager-server --port 4178",
+            " --app-data-dir /data --tailscale-host device.example.ts.net --remote-write\n",
+            "   12     1     0 /usr/bin/dbus-daemon --syslog --fork --session\n",
+            "   17     1     0 gnome-keyring-daemon --unlock --components=secrets\n",
+            "  329     7     0 /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+            " --print --verbose --session-id 00000000-0000-4000-8000-000000000000\n",
+            // 사용자가 `docker exec`로 직접 띄운 세션. ppid가 0이다.
+            "  811     0     0 /usr/local/bin/claude --continue\n",
+            "  812   811     0 /bin/sh -c ls\n",
+        );
+        let entries: Vec<PsEntry> = table.lines().filter_map(parse_ps_line).collect();
+        assert_eq!(entries.len(), 7, "일곱 줄이 모두 파싱돼야 한다");
+        assert!(entries.iter().all(|entry| entry.owner == 0));
+        assert_eq!(entries[5].pid, 811);
+        assert_eq!(entries[5].ppid, 0);
+
+        // 서버 자신이 PID 7이다.
+        let selected = select_external_processes(ProviderId::Claude, &entries, 7, 0);
+        let pids: Vec<u32> = selected.iter().map(|process| process.pid).collect();
+        assert_eq!(
+            pids,
+            vec![811, 812],
+            "관리 채팅(329)·서버 자신(7)·공통 조상 PID 1은 빠지고, \
+             docker exec 세션과 그 자손만 남아야 한다"
+        );
     }
 
     #[test]

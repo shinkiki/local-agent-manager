@@ -1,0 +1,25 @@
+{
+  "itemId": "C-e7a9cab64cff",
+  "kind": "commit",
+  "ref": "e7a9cab64cff102b74f0869fdcb31a4dbe961579",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L03",
+  "source": "claude",
+  "verdict": "결함 0건 / 수정 0건",
+  "axes": {
+    "정확성": "결함 없음. 이 커밋이 주장하는 사실 두 가지를 모두 실측했다. (1) 바꿔 적은 회차 보고 id round-383bc1ee75694815bbb5add11d45bfc9 가 실재한다 — list_round_reports(pendingDecisions=true) 에 그 id 가 있고 goalId 도 이 회차와 같은 goal-15945736ed2c475dbf2b54bfa0c581c4 다. (2) 그 보고의 열린 결정이 실제로 같은 주제다 — 질문이 'README 가 정한 reviewed 의 commits 와 결함의 fixCommits 는 그 장부를 담은 커밋 자신을 가리키므로 장부 전용 회차는 한 커밋 안에서 그 칸을 적을 수 없다' 로, 이 결함 파일의 symptom 과 같은 자리를 가리킨다. 따라서 지워진 문구('보고의 decisions 로 올렸다')가 사실이 아니었고 새 문구가 사실이다. 바뀐 것은 note 문자열 한 줄뿐이고 findingId·file·symbol·symptom·severity·state·occurrences·fixCommits 는 그대로라 결함의 정체가 바뀌지 않았다.",
+    "보안 불변식": "해당 없음. 추적되는 문서 JSON 한 개의 문자열 값 하나만 바꾼다. 실행 코드·스크립트·설정을 건드리지 않아 AGENTS.md 2절 G1~G11 과 3절 C 예외가 다루는 자격증명·공급자 소유 저장소·셸 문자열·경로 정규화·쓰기 게이트 어디에도 닿지 않는다. 인용할 조건 ID 가 없다.",
+    "계약": "일치. 파일 이름과 본문 findingId 가 같고(장부 전수 검사 — reviewed 17 · findings 11 전부에서 BAD-JSON 0 · ID-MISMATCH 0), 고친 JSON 이 여전히 파싱된다. 회차 지시문의 '같은 결정을 두 번 올리지 않는다' 와 장부 기록이 이 커밋으로 비로소 일치한다 — 고치기 전에는 장부만 읽는 사람이 이 주제의 결정이 두 번 올라간 줄로 읽었다. 열려 있는 결정의 보기 세 가지와 note 가 적은 길 (가)(나)(다) 가 글자 그대로 같지는 않지만(보고 쪽은 README 한 줄 추가 · --backfill-commits · 두 커밋 절차화, note 쪽은 commits 제거 · 레인/회차 id · 두 커밋 절차화), 둘 다 '같은 자리를 어떻게 닫을지' 를 묻고 있어 중복 상정이 아니다. note 는 결정을 대체하지 않고 가리키기만 하므로 계약 어긋남으로 세지 않았다.",
+    "검증 없음": "문서 JSON 의 설명 문자열 변경이라 코드 시험이 걸리는 자리가 없다. 대신 장부를 읽는 쪽을 직접 돌려 메웠다 — 러너 단위 시험 12/12, 러너 --json 이 ledgerDuplicates 0, 그리고 장부 전수 JSON·id 검사. 커밋이 적은 사실 자체는 보고 조회(list_round_reports)로 재현해 확인했다. 새 자동화는 들이지 않았다 — '열린 결정을 가리키는 문구가 사실인가' 를 기계가 재는 검사는 그 결정이 답을 받은 뒤에야 모양이 정해진다.",
+    "단순화·중복": "지적 없음. 한 줄 값 변경뿐이라 되풀이한 코드가 없다."
+  },
+  "findings": [],
+  "verification": [
+    "node --experimental-strip-types --test --test-reporter=dot src/lib/codeReviewQueue.test.mjs (tests 12 / pass 12 / fail 0)",
+    "node --experimental-strip-types scripts/code-review-queue.mjs --json (ledgerDuplicates 0)",
+    "장부 전수 검사: reviewed 17 · findings 11 의 JSON 파싱과 파일 이름 대 itemId/findingId 일치 (위반 0건)",
+    "list_round_reports(pendingDecisions=true) — round-383bc1ee75694815bbb5add11d45bfc9 의 결정이 같은 주제로 열려 있음을 확인"
+  ],
+  "note": "F-docs-code-review-readme-md-commits-6f902967 은 여전히 open 이다. 이번 리뷰 시점의 수는 reviewed 17 중 commits 가 빈 것 15, findings 11 중 state=fixed 인데 fixCommits 가 빈 것 3 으로, 결함이 적은 시점(10/12 · 2)보다 늘었다. 회차가 돌수록 벌어지는 자리라는 것을 수가 받친다. 고치는 길이 모두 저장 형식 변경이라 이번 회차도 고치지 않았고, 같은 주제의 결정이 이미 열려 있어 다시 올리지 않았다.",
+  "commits": []
+}

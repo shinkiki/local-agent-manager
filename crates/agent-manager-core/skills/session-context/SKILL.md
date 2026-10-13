@@ -11,18 +11,30 @@ Agent Manager가 수집한 다른 대화의 기록을 읽는다. 실행 파일 �
 ## 실행 파일 찾기
 
 ```sh
-eval "$(python3 -c 'import json,os,shlex
-p=os.path.expanduser("~/Library/Application Support/com.shinc.agentmanager/session-read-cli-v1.json")
-d=json.load(open(p))
+eval "$(python3 -c 'import json,os,shlex,sys
+e=os.environ.get("AGENT_MANAGER_APP_DATA_DIR","")
+h=os.path.expanduser("~")
+x=os.environ.get("XDG_DATA_HOME","")
+c=[e] if os.path.isabs(e) else [os.path.join(h,"Library/Application Support/com.shinc.agentmanager"),
+   os.path.join(os.environ.get("APPDATA") or os.path.join(h,"AppData/Roaming"),"com.shinc.agentmanager"),
+   os.path.join(x if os.path.isabs(x) else os.path.join(h,".local/share"),"com.shinc.agentmanager")]
+p=next((f for f in (os.path.join(d,"session-read-cli-v1.json") for d in c) if os.path.isfile(f)),None)
+if not p: sys.exit("Agent Manager 백엔드 위치 파일이 없습니다: " + ", ".join(c))
+d=json.load(open(p,encoding="utf-8"))
 print("CLI=" + shlex.quote(d["executable"]))
 print("CLI_PREFIX=" + shlex.quote(" ".join(d.get("argvPrefix", []))))')"
 ```
 
+`AGENT_MANAGER_APP_DATA_DIR`는 이 대화를 띄운 백엔드가 셸에 심어 둔 **자기 앱 데이터 폴더**다.
+NAS처럼 백엔드가 플랫폼 기본 폴더가 아닌 곳(`--app-data-dir /data`)으로 떠 있어도 이 값이 그
+자리를 가리키고, CLI도 같은 값을 읽으므로 `--app-data-dir`를 따로 붙이지 않는다. 지우거나
+바꾸지 않는다. 값이 없는 셸(사용자가 직접 연 터미널)에서만 플랫폼 기본 폴더를 본다.
+
 이후 호출은 항상 `"$CLI" $CLI_PREFIX sessions ...` 형태로 쓴다. 데스크톱 앱은 자기 바이너리를
 `--backend`로 다시 띄워 백엔드를 돌리므로, 접두사를 빼면 실행 파일이 `sessions`를 받지 않는다.
 
-파일이 없으면 Agent Manager 백엔드가 한 번도 실행되지 않은 것이다. 그때는 사용자에게
-Agent Manager를 실행해 달라고 말하고, 추측으로 다른 경로를 찾지 않는다.
+파일이 없으면 오류에 살펴본 폴더가 나온다. 그 폴더를 함께 알리고 사용자에게 Agent Manager가
+떠 있는지 확인해 달라고 말하며, 추측으로 다른 경로를 찾지 않는다.
 
 ## 조회 범위(정책)를 먼저 정한다
 

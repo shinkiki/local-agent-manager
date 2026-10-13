@@ -328,13 +328,110 @@ pub(crate) struct CappedOptions<'a> {
 
 /// 프로세스 그룹 전체에 강제 종료를 보낸다. 실행 시간을 넘긴 자식을 정리하는 마지막
 /// 수단이라, 이미 사라졌거나 신호를 보내지 못해도 더 할 일이 없다.
+///
+/// 유닉스 전용이다. 윈도우에는 그룹 신호가 없으므로 호출자는 이 함수 대신
+/// [`ProcessGroup`]을 쓴다 — 예전의 빈 윈도우 본문은 부르는 쪽이 아무 일도 안 일어났다는
+/// 것을 모르게 만들었다(cypress 실행기가 그 함정에 걸려 있었다).
 #[cfg(unix)]
-pub(crate) fn kill_process_group(pid: u32) {
+fn kill_process_group(pid: u32) {
     let _ = crate::process_signal::signal_process_group(pid, libc::SIGKILL);
 }
 
-#[cfg(not(unix))]
-pub(crate) fn kill_process_group(_pid: u32) {}
+/// 제한 시간에 자식 **하나가 아니라 그 자손까지** 함께 끝내기 위한 손잡이.
+///
+/// 왜 이것이 따로 필요한가. `Child::kill`은 어느 플랫폼에서도 그 프로세스 하나만 끝낸다.
+/// 그런데 이 모듈이 띄우는 명령 가운데 `git fetch`·`git pull`·`git push`는 다시 자식을
+/// 띄우고(`ssh`, 자격증명 도우미), 그 손자는 부모가 사라져도 살아남는다. C16-3이
+/// "제한 시간은 프로세스 그룹을 죽여 `ssh`와 자격증명 도우미가 함께 죽게 한다"고 적어 둔
+/// 자리가 여기다.
+///
+/// **2026-10-05까지 그 약속은 유닉스에서만 지켜지고 있었다.** `own_process_group`가 거는
+/// 두 장치가 모두 `#[cfg(unix)]`였다 — `Command::process_group(0)`도, `kill_process_group`도
+/// (후자는 `#[cfg(not(unix))]`에서 본문이 빈 함수였다). 그래서 윈도우에서 이 선택지는
+/// **아무 일도 하지 않았고**, 결과는 떠도는 `ssh.exe` 하나로 끝나지 않는다. 손자가 자식의
+/// stdout·stderr 쓰기 핸들을 물려받은 채 살아 있으면 파이프에 EOF가 오지 않고,
+/// 출력을 끝까지 읽는 `CappedOutputReaders::finish`가 **영원히 막힌다** — 제한 시간이
+/// 도는 대신 `run_capped_with` 자체가 돌아오지 않는다. 비대화 실행이 "멈추지 않고 빨리
+/// 실패한다"(C16-3)는 약속이 그 자리에서 뒤집힌다.
+///
+/// 윈도우에는 프로세스 그룹에 보내는 신호가 없으므로 job 객체를 쓴다. 자식을 이름 없는
+/// job 하나에 넣어 두면 그 자식이 띄우는 프로세스도 같은 job에 딸려 들어가고,
+/// `TerminateJobObject` 한 번이 그 전부를 끝낸다.
+///
+/// 정상 경로는 건드리지 않는다. job은 만들어 두기만 하고, 제한 시간을 넘겼을 때만
+/// 종료를 보낸다(`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`를 걸지 않는 이유다 — 걸면 손잡이가
+/// 떨어지는 순간이 곧 종료라, 제때 끝난 자식의 뒷정리까지 이 구조체의 수명에 묶인다).
+pub(crate) struct ProcessGroup {
+    #[cfg(unix)]
+    pid: u32,
+    #[cfg(windows)]
+    job: windows_sys::Win32::Foundation::HANDLE,
+}
+
+// SAFETY: job 핸들은 커널 객체 핸들이라 스레드를 가리지 않는다. 이 구조체는 자기 핸들
+// 하나만 소유하고 `Drop`에서 한 번 닫는다.
+#[cfg(windows)]
+unsafe impl Send for ProcessGroup {}
+
+impl ProcessGroup {
+    /// 방금 띄운 자식을 그룹에 묶는다. 묶지 못하면 `None`이고, 그때는 예전처럼 자식
+    /// 하나만 끝낸다 — 손자를 놓치는 것이 실행 자체를 거절할 이유는 아니다.
+    #[cfg(unix)]
+    pub(crate) fn attach(child: &std::process::Child) -> Option<Self> {
+        // 유닉스에서는 `Command::process_group(0)`이 spawn 시점에 이미 걸려 있다.
+        Some(Self { pid: child.id() })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn attach(child: &std::process::Child) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+
+        // SAFETY: 이름도 보안 서술자도 없는 job을 하나 만든다. 실패는 널 핸들이다.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return None;
+        }
+        let handle = child.as_raw_handle().cast();
+        // SAFETY: 방금 만든 job과, 아직 기다리지 않아 살아 있는 자식 핸들 하나만 다룬다.
+        if unsafe { AssignProcessToJobObject(job, handle) } == 0 {
+            // SAFETY: 이 함수가 만든 핸들을 그대로 닫는다.
+            unsafe { CloseHandle(job) };
+            return None;
+        }
+        Some(Self { job })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn attach(_child: &std::process::Child) -> Option<Self> {
+        None
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn kill(&self) {
+        kill_process_group(self.pid);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn kill(&self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        // SAFETY: 이 구조체가 소유한 job 핸들 하나에만 보낸다. 이미 비어 있어도 성공이다.
+        unsafe { TerminateJobObject(self.job, 1) };
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn kill(&self) {}
+}
+
+#[cfg(windows)]
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        // SAFETY: `attach`가 만든 핸들을 한 번만 닫는다.
+        unsafe { CloseHandle(self.job) };
+    }
+}
 
 /// 환경변수를 얹어 실행한다. 계정별 홈으로 공급자 CLI에 묻는 조회가 쓴다 — 계정을 인자로
 /// 받는 명령이 없는 공급자에서는 홈을 바꾸는 것이 곧 계정을 고르는 일이다.
@@ -416,6 +513,12 @@ pub(crate) fn run_capped_with(
             executable.to_string_lossy()
         ))
     })?;
+    // 출력 파이프를 읽기 **전에** 묶는다. 손자가 먼저 태어나면 그 손자는 job 밖에 남고,
+    // 제한 시간에 살아남아 파이프를 쥔 채 `finish`를 막는 바로 그 경우가 된다.
+    let group = options
+        .own_process_group
+        .then(|| ProcessGroup::attach(&child))
+        .flatten();
     // 출력 회수를 먼저 띄운 뒤 stdin을 별도 스레드에서 쓴다. 자식이 stdin을 읽기 전에
     // 파이프 한 통 넘게 출력하면(커밋 훅의 lint 출력) 이 스레드가 쓰기에서 막힌 채 제한
     // 시간조차 시작되지 않는다. 쓰기 스레드는 다 쓰면 곧바로 닫고, 자식이 죽으면 파이프가
@@ -440,8 +543,10 @@ pub(crate) fn run_capped_with(
             Some(status) => break Some(status),
             None => {
                 if started.elapsed() >= timeout {
-                    if options.own_process_group {
-                        kill_process_group(child.id());
+                    // 그룹을 먼저 끝낸다. 자식만 먼저 죽이면 손자가 파이프를 쥔 채 남고
+                    // 아래 `finish`가 EOF를 기다리며 막힌다.
+                    if let Some(group) = group.as_ref() {
+                        group.kill();
                     }
                     let _ = child.kill();
                     let _ = child.wait();
@@ -468,6 +573,7 @@ pub(crate) fn run_capped_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// Claude Code 2.1.233 `--help`의 실제 형식(commander, 줄바꿈 래핑).
     const CLAUDE_HELP: &str = r#"Usage: claude [options] [command] [prompt]
@@ -564,5 +670,158 @@ Options:
     fn unparsable_help_is_reported_as_unreliable() {
         assert!(!CliInterface::parse("").is_reliable());
         assert!(!CliInterface::parse("완전히 다른 형식의 출력입니다").is_reliable());
+    }
+
+    // -----------------------------------------------------------------------
+    // C16-3 / C7-5 — 제한 시간은 자식 **하나가 아니라 그 자손까지** 끝낸다
+    // -----------------------------------------------------------------------
+
+    /// 아래 두 보조 시험을 깨우는 환경변수. 값은 표식과 심박을 적을 폴더다.
+    const SPAWNER_ENV: &str = "AGENT_MANAGER_PG_TEST_SPAWNER_DIR";
+    const BEAT_ENV: &str = "AGENT_MANAGER_PG_TEST_BEAT_DIR";
+
+    /// 자식이 끝까지 가서 손자를 띄웠다는 표식. `--exact`가 아무 시험도 고르지 못하면
+    /// 시험 바이너리는 "0 passed"로 **성공 종료**하므로, 종료 코드만 보는 부모는 아무것도
+    /// 돌지 않은 것을 통과로 읽는다. 그 구멍을 이 표식이 막는다.
+    const SPAWNED_MARK: &str = "spawned";
+    /// 손자가 살아 있는 동안 계속 길어지는 파일. 이 길이가 **더 자라지 않는 것**이
+    /// "손자가 죽었다"의 증거다.
+    const HEARTBEAT: &str = "heartbeat";
+
+    /// 가운데 자식 노릇. `run_capped_with`가 띄우는 쪽이고, 손자를 하나 띄운 뒤 스스로는
+    /// 제한 시간을 넘기도록 그냥 잔다. 환경변수가 없으면 평소 시험 실행에서는 아무 일도
+    /// 하지 않고 지나간다.
+    #[test]
+    fn process_group_spawner_helper() {
+        let Ok(dir) = std::env::var(SPAWNER_ENV) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let exe = std::env::current_exe().expect("시험 바이너리 경로");
+        let mut grandchild = Command::new(exe);
+        grandchild
+            .args(["--exact", "cli_interface::tests::process_group_beat_helper"])
+            .env(BEAT_ENV, &dir)
+            .env_remove(SPAWNER_ENV)
+            // 손자의 출력은 버린다. 물려받게 두면 손자가 살아남았을 때 파이프에 EOF가
+            // 오지 않아 `finish`가 막히고, 이 시험은 **실패가 아니라 멈춤**이 된다.
+            // 멈추는 시험은 무인 실행에서 아무것도 알려 주지 않으므로 그 길을 닫는다.
+            // 파이프가 막히는 것 자체는 `ProcessGroup` 문서주석에 결과로 적어 두었다.
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // 기다리지 않는 것이 이 시험의 전제다 — 손자는 부모보다 오래 살아남아야 하고,
+        // 부모가 `wait()`로 막히면 그룹 종료를 재는 자리 자체가 사라진다. 좀비는 이
+        // 보조 프로세스가 곧 끝나면서 init이 거둔다.
+        #[allow(
+            clippy::zombie_processes,
+            reason = "손자는 부모보다 오래 살아남아야 한다"
+        )]
+        let _grandchild = grandchild.spawn().expect("손자를 띄우지 못했습니다");
+        std::fs::write(dir.join(SPAWNED_MARK), b"1").expect("표식을 쓰지 못했습니다");
+        // 부모의 제한 시간보다 한참 길게 잔다. 스스로 끝나면 이 시험은 "제한 시간이
+        // 걸렸다"가 아니라 "자식이 알아서 끝났다"를 재게 된다.
+        thread::sleep(Duration::from_secs(120));
+    }
+
+    /// 손자 노릇. 부모가 사라져도 계속 심박을 적는다 — 윈도우에서 `TerminateProcess`는
+    /// 그 프로세스 하나만 끝내므로, 그룹 종료가 없으면 이 반복은 멈추지 않는다.
+    #[test]
+    fn process_group_beat_helper() {
+        let Ok(dir) = std::env::var(BEAT_ENV) else {
+            return;
+        };
+        let path = PathBuf::from(dir).join(HEARTBEAT);
+        for _ in 0..1_200 {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = file.write_all(b".");
+                let _ = file.flush();
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn heartbeat_len(dir: &Path) -> u64 {
+        std::fs::metadata(dir.join(HEARTBEAT))
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+    }
+
+    /// C16-3은 "제한 시간은 프로세스 그룹을 죽여 `ssh`와 자격증명 도우미가 함께 죽게
+    /// 한다"고 적어 두었고, C7-5도 같은 말을 Cypress 런너에 적어 두었다.
+    ///
+    /// **2026-10-05까지 그 약속은 유닉스에서만 지켜졌다.** `own_process_group`가 거는
+    /// 장치 둘이 모두 `#[cfg(unix)]`였다 — spawn 시점의 `Command::process_group(0)`과
+    /// 제한 시간의 `kill_process_group`(윈도우 본문은 빈 함수였다). 어떤 시험도
+    /// "손자가 죽었는가"를 묻지 않았으므로 그 빈 함수는 조용히 통과했다. 이 회차가
+    /// 그 본문을 job 객체로 채우고, 이 시험이 그것을 지킨다.
+    ///
+    /// **판정은 영수증이 아니라 디스크다.** 손자는 50ms마다 파일 하나를 길게 만들고,
+    /// 시험은 제한 시간 뒤에 그 길이가 **더 자라지 않는지**를 본다. `timed_out`만 보면
+    /// 손자가 멀쩡히 돌고 있어도 통과한다.
+    ///
+    /// 짝으로 세 가지를 더 본다. (1) 자식이 끝까지 가서 손자를 실제로 띄웠다는 표식 —
+    /// 없으면 아무것도 재지 않은 것이다. (2) 심박이 한 번이라도 찍혔다 — 손자가 애초에
+    /// 돌지 않았으면 "멈췄다"는 저절로 참이다. (3) `timed_out`이 참이고 실행이 제한
+    /// 시간 근처에서 돌아왔다 — 막히지 않았다는 뜻이다.
+    ///
+    /// **검출력(2026-10-05, 윈도우 11).** `ProcessGroup::attach`가 `None`을 돌려주게
+    /// 되돌리면(= 고치기 전 상태) 이 시험이 FAILED 한다. 그 상태의 제품은 `git fetch`가
+    /// 120초 제한에 걸렸을 때 `ssh.exe`를 호스트에 남기고, 그 `ssh.exe`가 물려받은
+    /// 출력 파이프를 쥐고 있으면 `CappedOutputReaders::finish`에 EOF가 오지 않아
+    /// `run_capped_with`가 **돌아오지 않는다** — 제한 시간이 있는데도 프로젝트 git
+    /// 화면이 멈춘다.
+    #[test]
+    fn c16_3_a_timeout_kills_the_child_and_its_grandchild() {
+        let dir = tempfile::tempdir().expect("임시 폴더");
+        let exe = std::env::current_exe().expect("시험 바이너리 경로");
+        let path = dir.path().to_path_buf();
+        let env = [(SPAWNER_ENV.to_owned(), path.display().to_string())];
+        let timeout = Duration::from_secs(3);
+
+        let started = Instant::now();
+        let outcome = run_capped_with(
+            &exe,
+            &[
+                "--exact",
+                "cli_interface::tests::process_group_spawner_helper",
+            ],
+            timeout,
+            &CappedOptions {
+                env: &env,
+                own_process_group: true,
+                ..CappedOptions::default()
+            },
+        )
+        .expect("자식을 띄우지 못했습니다");
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.timed_out,
+            "제한 시간이 걸리지 않았습니다: {outcome:?}"
+        );
+        assert!(
+            elapsed < timeout + Duration::from_secs(20),
+            "제한 시간 뒤에도 돌아오지 못했습니다({elapsed:?}) — 손자가 출력 파이프를 쥐고 있습니다"
+        );
+        assert!(
+            path.join(SPAWNED_MARK).exists(),
+            "자식이 손자를 띄운 표식이 없습니다 — 이 시험은 아무것도 재지 않았습니다"
+        );
+        let at_kill = heartbeat_len(&path);
+        assert!(at_kill > 0, "손자가 한 번도 심박을 찍지 않았습니다");
+
+        // 손자가 살아 있다면 이 사이에 수십 번 더 찍는다(50ms 주기).
+        thread::sleep(Duration::from_secs(2));
+        let later = heartbeat_len(&path);
+        assert_eq!(
+            later, at_kill,
+            "제한 시간 뒤에도 손자가 살아 있습니다 — 그룹 종료가 듣지 않았습니다"
+        );
     }
 }

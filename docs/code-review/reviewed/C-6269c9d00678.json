@@ -1,0 +1,23 @@
+{
+  "itemId": "C-6269c9d00678",
+  "kind": "commit",
+  "ref": "6269c9d00678dc008d6a12a076c9e2dd2a6b7b31",
+  "reviewedAt": "2026-10-05T19:55:43Z",
+  "lane": "L03",
+  "source": "codex",
+  "verdict": "결함 0건 / 수정 0건",
+  "axes": {
+    "정확성": "결함 없음. 이 커밋이 더한 reviewed/C-ae2027083ed7.json 의 원본 커밋 ae202708 및 그 부모, 그리고 장부가 다시 인용한 cdc280d4·0fc5b0eb 각 부모를 재측정했다. reviewed JSON 수와 queue.json counts.reviewed 는 37/36, 33/32, 29/28로 모두 일치한다. 6269c9d0 자신의 착지 트리도 38 대 38이고 부모는 37 대 37이다. occurrences에는 C-ae2027083ed7 관측 하나가 존재하며, 6269c9d0은 그것을 중복으로 추가하지 않았다.",
+    "보안 불변식": "해당 없음. 이 커밋은 docs/code-review 아래 장부 JSON만 변경하며, AGENTS.md 2절 G1~G11 및 3절 C 직접변경 예외가 다루는 실행 코드·공급자 저장소·자격증명·경로·쓰기 게이트에 닿지 않는다.",
+    "계약": "일치. 새 장부의 itemId와 ref 앞 12자는 C-ae2027083ed7 및 ae2027083ed7과 각각 일치하고, C-6269c9d00678의 reviewedAt은 커밋 시각보다 앞선 실제 리뷰 시각이다. 6269c9d0의 Co-Authored-By도 Git trailer로 파싱된다. 기존 F-docs-code-review-readme-md-commits-6f902967 관측은 이미 열린 저장 형식 결정의 같은 주제여서 중복 결정을 만들지 않는다.",
+    "검증 없음": "문서 장부 변경이라 제품 시험 대상은 없다. 장부를 읽는 러너 단위 시험과 원본 트리 수치 재계산으로 검증했다.",
+    "단순화·중복": "지적 없음. 신규 장부 한 파일, 기존 finding occurrence 한 건, 러너가 만든 queue.json만 바꾼다. 이번 항목 장부는 점유 뒤 존재하지 않았고 ledgerDuplicates도 없었다."
+  },
+  "findings": [],
+  "verification": [
+    "node --experimental-strip-types --test-reporter=dot src/lib/codeReviewQueue.test.mjs (tests 12 / pass 12 / fail 0)",
+    "6269c9d0·부모, ae202708·부모, cdc280d4·부모, 0fc5b0eb·부모의 reviewed JSON 수와 queue.json counts.reviewed 재측정: 38/38, 37/37, 37/37, 36/36, 33/33, 32/32, 29/29, 28/28",
+    "6269c9d0 트리의 F-docs-code-review-readme-md-commits-6f902967 occurrences에서 C-ae2027083ed7 관측 1건 확인"
+  ],
+  "commits": []
+}

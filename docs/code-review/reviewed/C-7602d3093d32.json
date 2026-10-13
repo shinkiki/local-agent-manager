@@ -1,0 +1,14 @@
+{
+  "itemId": "C-7602d3093d32",
+  "kind": "commit",
+  "ref": "7602d3093d32487bb81eab76a360175d41f6da26",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L02",
+  "source": "claude",
+  "verdict": "신규 결함 0건 / 기존 open 결함 occurrences 1건 추가",
+  "note": "docs/code-review 아래 세 파일(queue.json · reviewed/C-e742702fd08d.json 신규 · findings/F-docs-code-review-readme-md-commits-6f902967.json occurrences+note)만 바뀐 장부 전용 커밋이다. 정확성: 이 커밋의 장부가 사실로 적은 것을 전부 원문으로 되짚었다. (가) 리뷰 대상 e742702f 가 세 파일을 바꿨다 — git show --stat 로 3 files changed 확인. 참. (나) 그 안에서 e742702f 가 1b9c1f16 에 대해 적은 \"두 파일만 바꿨다\"도 참이다(2 files changed: queue.json · reviewed/C-83ba812102a2.json). (다) \"1b9c1f16 의 queue.json 이 reviewed 21→22 이면서 remaining 453 · commit 219 를 유지한다\"도 참이다 — 그 커밋의 queue.json diff 에 reviewed 줄 한 쌍만 들어 있다. (라) 교차검증 수를 독립적으로 다시 셌다: e742702f 트리는 reviewed json 25 · findings json 14 이고, 그 중 commits 가 빈 것 23 · state=\"fixed\" 인데 fixCommits 가 빈 것 6 이다. 이 커밋이 적은 25·23·14·6 과 일치한다. 부모 트리 기준 24·22·14·6 도 ls-tree 로 확인했다(ls-tree 가 25·15 를 세는 것은 양쪽 .gitkeep 포함). (마) 이 커밋이 민 queue.json 의 reviewed 30 이 이 커밋 트리의 reviewed json 30 과 맞는다. 계약: 이 커밋 트리의 reviewed 30 건·findings 14 건 전부를 열어 파일 이름=itemId/findingId, 커밋 항목 ref 가 파일 이름 해시로 시작, findings 가 가리키는 결함 파일에 끊긴 참조 없음, reviewedAt 이 문자열임을 다시 계산했다 — 위반 0 건. 보안 불변식: docs/code-review 아래 JSON 문자열만 바뀌어 AGENTS.md 2절 G1~G11 과 3절 C 예외 어느 조건에도 닿지 않는다. 자격증명·공급자 소유 저장소·셸 문자열·경로 정규화·쓰기 게이트 어디에도 닿지 않는다. 검증 없음: 장부 문자열에는 재현 시험을 둘 자리가 없고 이 장부를 읽는 러너는 src/lib/codeReviewQueue.test.mjs 가 덮는다 — tests 12 · pass 12 · fail 0. 단순화·중복: 러너의 ledgerDuplicates 가 비어 있고 같은 항목의 reviewed 파일도 하나뿐이다. 이 커밋은 앞 회차가 표기 결정으로 올렸던 occurrences 전체 재작성을 되풀이하지 않고 한 줄만 더했다 — 지적이 실제로 좁혀진 자리다. 신규 결함은 없다. 이 커밋이 더한 reviewed/C-e742702fd08d.json 의 commits 가 빈 배열이라 기존 open 결함 F-docs-code-review-readme-md-commits-6f902967 의 여섯 번째 관측이다 — 새 결함을 만들지 않고 occurrences 에 덧붙였다. 그 결함은 저장 형식 변경이라 고치지 않았고, 같은 주제의 결정이 이미 열려 있어 다시 올리지 않았다.",
+  "findings": [
+    "F-docs-code-review-readme-md-commits-6f902967"
+  ],
+  "commits": []
+}

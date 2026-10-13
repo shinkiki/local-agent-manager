@@ -1619,6 +1619,7 @@ mod tests {
             transfer_root: String::new(),
             terminal_enabled: false,
             unrestricted_commands: false,
+            project_git_enabled: false,
         }
     }
 
@@ -2490,7 +2491,7 @@ mod tests {
         let scp_ready = script(
             bin.path(),
             "scp-ready",
-            &format!("printf '{payload}' > \"${{@: -1}}\""),
+            &format!("for last; do :; done\nprintf '{payload}' > \"$last\""),
         );
         let receipt = download_ssh_file_with(
             home.path(),
@@ -2580,7 +2581,7 @@ mod tests {
         let scp_partial = script(
             bin.path(),
             "scp-partial",
-            "printf 'half' > \"${@: -1}\"\necho 'Host key verification failed.' >&2\nexit 255",
+            "for last; do :; done\nprintf 'half' > \"$last\"\necho 'Host key verification failed.' >&2\nexit 255",
         );
         let receipt = download_ssh_file_with(
             home.path(),

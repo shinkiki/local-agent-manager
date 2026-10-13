@@ -1,0 +1,12 @@
+{
+  "itemId": "C-d9bd0b63a4da",
+  "kind": "commit",
+  "ref": "d9bd0b63a4dababf70fecc4808e67f4ebb1c9d48",
+  "reviewedAt": "2026-10-05T17:09:40Z",
+  "lane": "L06",
+  "source": "codex",
+  "verdict": "결함 1건 / 수정 1건",
+  "note": "정확성·계약 축에서 3회차 기록이 2회차와 모듈이 겹치지 않는다고 단정한 사실을 검증했다. 2회차 표에도 backend_service_settings가 있어 단정은 거짓이었다. 새로 나타난 두 모듈이라는 실제 관측으로 문장을 좁혔다. 보안 불변식, 직접 변경 예외, 실행 계약에는 닿지 않았다.",
+  "findings": ["F-docs-flaky-tests-readme-md-2026-10-06-3-640e3a1c"],
+  "commits": []
+}

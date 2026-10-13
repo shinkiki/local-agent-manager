@@ -1,0 +1,11 @@
+{
+  "itemId": "C-a441a6ad22aa",
+  "kind": "commit",
+  "ref": "a441a6ad22aa0d7c76baf532bf6a3cd8d5d7b39a",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L07",
+  "source": "claude",
+  "verdict": "결함 0건",
+  "findings": [],
+  "commits": []
+}

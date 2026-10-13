@@ -1,0 +1,24 @@
+{
+  "itemId": "C-af0d45c3be75",
+  "kind": "commit",
+  "ref": "af0d45c3be7535cf826f60acf53fe42da0b9596d",
+  "reviewedAt": "2026-10-06T06:20:00Z",
+  "lane": "L07",
+  "source": "claude",
+  "verdict": "결함 0건 (장부 JSON 둘만 바꾸는 커밋. 적힌 수치 전부를 그 리비전에서 실측해 일치)",
+  "axes": {
+    "정확성": "결함 없음. 바꾼 파일은 docs/code-review/queue.json 과 새 장부 reviewed/C-175a354f70af.json 둘뿐이라 실행 경로가 없고, 검증할 것은 '적힌 수가 그 리비전의 실측과 맞는가' 다. (1) 이 커밋 리비전의 queue.json reviewed=26 → `git ls-tree -r --name-only <rev> docs/code-review/reviewed/ | grep -c '\\.json$'` 가 26(.gitkeep 제외). 파일 수로 세면 27 이지만 러너의 readLedger 가 `.json` 아닌 이름을 건너뛰므로 26 이 맞는 값이다. (2) remaining 453 = commit 219 + module 234 로 buildQueue 의 remaining=items.length 와 일치. (3) 새 장부가 주장하는 다섯 수치를 모두 되쟀다 — 175a354f 리비전 queue.json reviewed=23 이고 그 리비전 reviewed/*.json 도 23, findings/*.json 은 14, 288072c685d2 가 바꾼 파일은 정확히 넷, a52e664a 부모의 reviewed 는 11. 전부 재현된다.",
+    "보안 불변식": "해당 없음. 장부 JSON 만 바꾸고 실행 코드·설정·시험·의존성을 건드리지 않는다. 자격증명이나 공급자 소유 저장소를 읽지 않고(G1·G2·G4), 셸 문자열을 조립하지 않으며(G9), 외부 입력 경로를 정규화 없이 쓰지 않는다(G10). 쓰기 게이트에 닿지 않아 3절 C 예외 대상도 아니다.",
+    "계약": "일치한다. 새 장부 파일은 README '장부 파일의 모양' 의 필수 키(itemId·kind·ref·reviewedAt·lane·source·verdict·findings·commits)를 모두 갖고, 파일 이름과 본문 itemId 가 같아 러너의 이름-본문 어긋남 보정에 걸리지 않는다. ref 도 commitItemId(ref) 로 되돌리면 C-175a354f70af 로 파일 이름과 맞는다. queue.json 은 손으로 고치지 않고 러너 --write 가 쓴 모양(항목 목록 없이 센 수만)이라 README 의 queue.json 규약과도 맞다.",
+    "검증 없음": "docs/ 는 modules.json 의 모듈이 아니라 단위 시험이 걸리지 않고, 회차 7절이 새 자동화 도입을 금한다. 대신 위 다섯 수치를 git ls-tree·git show 로 그 리비전에서 직접 세어 재현했고, 러너를 돌려 ledgerDuplicates 가 빈 배열임을 확인했다.",
+    "단순화·중복": "중복 없음. 이 커밋은 결함 파일을 새로 만들지 않아 findings 중복 여지가 없고, 장부 전체에 같은 itemId 가 두 번 적힌 자리도 없다(러너 ledgerDuplicates=[]). 새 장부의 commits 가 빈 것은 장부가 자기 커밋 해시를 적을 수 없는 구조적 자리라 F-docs-code-review-readme-md-commits-6f902967 에 open 으로 이미 있어 여기서 다시 적지 않는다. 새 장부 본문이 자기 교차검사 범위를 '결함 13 건·reviewed 21 건' 과 'findings 14 건·reviewed 24 건' 으로 다르게 적지만, 둘 다 그 레인이 rebase 전후로 실제로 본 리비전의 수이고 기계가 읽는 필드가 아닌 산문이라 결함으로 올리지 않는다."
+  },
+  "findings": [],
+  "verification": [
+    "node --experimental-strip-types scripts/code-review-queue.mjs --json (ledgerDuplicates 빈 배열)",
+    "af0d45c3 리비전 reviewed/*.json = 26 = queue.json reviewed (.gitkeep 제외 기준이 러너와 같음)",
+    "remaining 453 = commit 219 + module 234",
+    "175a354f 리비전 queue reviewed 23 = reviewed/*.json 23 · findings/*.json 14 · a52e664a^ reviewed 11 · 288072c685d2 변경 파일 4"
+  ],
+  "commits": []
+}

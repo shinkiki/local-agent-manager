@@ -1,0 +1,134 @@
+{
+  "findingId": "F-docs-code-review-readme-md-commits-6f902967",
+  "file": "docs/code-review/README.md",
+  "symbol": "commits",
+  "symptom": "장부가 자기를 담은 커밋 해시를 같은 커밋 안에 적을 수 없다",
+  "detail": "README '장부 파일의 모양'은 reviewed 에 `commits`, 결함에 `fixCommits` 를 두고 거기에 그 장부를 착지시킨 커밋 해시를 적게 한다. 그런데 해시는 커밋을 만든 뒤에야 생기므로 장부를 담은 그 커밋 안에서는 채울 수 없다. 채우는 길은 두 번째 커밋을 더 미는 것뿐이고, 이 항목(19a40411)이 바로 그 두 번째 커밋이다. 재현: origin/dev-history 19a40411 에서 reviewed/*.json 의 `commits` 를 세면 12 건 중 10 건이 빈 배열이다(C-1186bef6c8a7·C-2a8660b57a49·C-41b5da9e9b6c·C-43d6a7a0e5bc·C-569fb7a2a444·C-58b9841163b8·C-6d9bce30495f·C-74272c9dfc06·C-8a686e4f539a·C-f9894717b7b7 — 레인 L02·L03·L04·L05·L08·L10 이 제각기 남긴 것). findings 에서도 `state:\"fixed\"` 인데 `fixCommits` 가 빈 것이 2 건이다(F-docs-code-review-findings-f-src-lib-gitbranchtre-adf1be4f, F-src-lib-codereviewqueue-ts-ledgerentry-b20c8696). 한 레인이 손으로 뒤따라 채워도 다음 회차가 같은 자리를 또 비우므로, 이것은 특정 회차의 실수가 아니라 규약이 요구할 수 없는 값을 요구하는 자리다. 러너는 itemId 만 읽으므로 큐 집계와 중복 방지는 틀리지 않는다 — 끊기는 것은 사람이 읽는 추적성이다.",
+  "severity": "P3",
+  "state": "open",
+  "agentsRules": [],
+  "occurrences": [
+    {
+      "itemId": "C-19a40411d2d6",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L03"
+    },
+    {
+      "itemId": "C-d11932ad31dd",
+      "at": "2026-10-05T18:11:06Z",
+      "lane": "L06"
+    },
+    {
+      "itemId": "C-a72039df6fbf",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L03"
+    },
+    {
+      "itemId": "C-1b9c1f165bfb",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L03"
+    },
+    {
+      "itemId": "C-3871e69c8d6d",
+      "at": "2026-10-05T18:44:24Z",
+      "lane": "L08"
+    },
+    {
+      "itemId": "C-07f5f7a3c5b7",
+      "at": "2026-10-05T18:55:35Z",
+      "lane": "L04"
+    },
+    {
+      "itemId": "C-e742702fd08d",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L02"
+    },
+    {
+      "itemId": "C-7602d3093d32",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L02"
+    },
+    {
+      "itemId": "C-0fc5b0eb9522",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L03"
+    },
+    {
+      "itemId": "C-4ebe28fa93c1",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L06"
+    },
+    {
+      "itemId": "C-947db14d6b78",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L08"
+    },
+    {
+      "itemId": "C-bd0ac165f76e",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L06"
+    },
+    {
+      "itemId": "C-cdc280d4556f",
+      "at": "2026-10-05T19:20:32Z",
+      "lane": "L04"
+    },
+    {
+      "itemId": "C-ae2027083ed7",
+      "at": "2026-10-05T19:42:00Z",
+      "lane": "L02"
+    },
+    {
+      "itemId": "C-ee868f04ef8a",
+      "at": "2026-10-05T19:40:00Z",
+      "lane": "L06"
+    },
+    {
+      "itemId": "C-f6dc7dc50379",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L03"
+    },
+    {
+      "itemId": "C-799eee85e78b",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L06"
+    },
+    {
+      "itemId": "C-b25bd2aeea7f",
+      "at": "2026-10-05T20:05:00Z",
+      "lane": "L02"
+    },
+    {
+      "itemId": "C-28d5bd6240ea",
+      "at": "2026-10-05T20:20:00Z",
+      "lane": "L02"
+    },
+    {
+      "itemId": "C-104b9820044f",
+      "at": "2026-10-05T20:40:00Z",
+      "lane": "L06"
+    },
+    {
+      "itemId": "C-b01ef8054c58",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L10"
+    },
+    {
+      "itemId": "C-4cf3d6225c2b",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L09"
+    },
+    {
+      "itemId": "C-a98b11da45f7",
+      "at": "2026-10-06T00:00:00Z",
+      "lane": "L02"
+    },
+    {
+      "itemId": "C-ee3fc77e0cea",
+      "at": "2026-10-06T06:40:00Z",
+      "lane": "L05"
+    }
+  ],
+  "fixCommits": [],
+  "note": "고치지 않았다. 고치는 길이 모두 저장 형식이나 회차 계약을 바꾼다 — (가) `commits` 를 README 에서 빼고 추적을 `git log -- <장부파일>` 로 돌리기, (나) 커밋 해시 대신 레인·회차 id 를 적기, (다) 회차마다 두 번째 커밋을 미는 것을 절차로 못박기. 스킬 4절 3번(저장 형식 변경)에 걸린다. 같은 주제가 이미 회차 보고 round-383bc1ee75694815bbb5add11d45bfc9 의 결정으로 열려 있어 다시 올리지 않았다 — 그 결정이 답을 받으면 이 결함도 같이 닫힌다. 사람이 고르기 전에 이미 비어 있는 10 건을 손으로 채우면 고른 방향과 어긋날 수 있어 손대지 않았다. 2026-10-05 C-d11932ad31dd 리뷰에서 같은 자리가 또 비어 나왔다 — 그 커밋이 더한 reviewed/C-d9bd0b63a4da.json 의 `commits` 와 findings/F-docs-flaky-tests-readme-md-2026-10-06-3-640e3a1c 의 `fixCommits`(state 는 \"fixed\") 가 둘 다 빈 배열이다. 특정 회차의 실수가 아니라는 위 판단이 한 번 더 확인됐다. 2026-10-06 C-a72039df6fbf 리뷰에서 세 번째로 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-e7a9cab64cff.json 의 `commits` 가 빈 배열이다. 그 시점 트리의 수는 reviewed 20 중 `commits` 가 빈 것 18, findings 13 중 state=\"fixed\" 인데 `fixCommits` 가 빈 것 5 로, 결함이 처음 적힌 시점(10/12 · 2)보다 둘 다 늘었다. 회차가 돌수록 벌어지는 자리라는 것을 세 번째 관측이 받친다. 2026-10-06 C-1b9c1f165bfb 리뷰에서 네 번째로 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-83ba812102a2.json 의 `commits` 가 빈 배열이다. 그 시점 트리의 수는 reviewed 24 중 `commits` 가 빈 것 22, findings 14 중 state=\"fixed\" 인데 `fixCommits` 가 빈 것 6 으로, 세 번째 관측(20·18 / 13·5)보다 또 늘었다. 결정이 열려 있는 동안에는 비율이 줄지 않는다. 2026-10-06 C-e742702fd08d 리뷰에서 또 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-1b9c1f165bfb.json 의 `commits` 가 빈 배열이다. 그 커밋 트리의 수는 reviewed 25 중 `commits` 가 빈 것 23, findings 14 중 state=\"fixed\" 인데 `fixCommits` 가 빈 것 6 이다. 네 번째 관측(24·22)에서 분모·분자가 나란히 하나씩 늘어, 새로 적히는 장부는 예외 없이 빈 채로 들어온다는 것이 다시 확인됐다. 2026-10-06 C-7602d3093d32 리뷰에서 여섯 번째로 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-e742702fd08d.json 의 `commits` 가 빈 배열이다. 그 커밋 트리의 수는 reviewed 30 중 `commits` 가 빈 것 28, findings 14 중 state=\"fixed\" 인데 `fixCommits` 가 빈 것 6 이다. 다섯 번째 관측(25·23)에서 분모·분자가 나란히 다섯씩 늘어 비율이 그대로다. 2026-10-06 C-4ebe28fa93c1 리뷰에서 일곱 번째로 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-175c75ac0bd3.json 의 `commits` 가 빈 배열이다. 그 커밋 트리의 수는 reviewed 31 중 `commits` 가 빈 것 29, findings 14 중 state=\"fixed\" 인데 `fixCommits` 가 빈 것 6 이다. 2026-10-06 C-947db14d6b78 리뷰에서 또 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-7602d3093d32.json 의 `commits` 가 빈 배열이다. 그 커밋 트리의 수는 reviewed 32 중 `commits` 가 빈 것 30, findings 14 중 state=\"fixed\" 인데 `fixCommits` 가 빈 것 6 이다. 분모·분자가 나란히 늘어 비율이 그대로이고, 결정이 열려 있는 동안 새로 적히는 장부는 예외 없이 빈 채로 들어온다는 관측이 또 한 번 받쳐졌다. 2026-10-06 C-bd0ac165f76e 리뷰에서 또 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-4ebe28fa93c1.json 의 commits 가 빈 배열이다. 그 커밋 트리의 수는 reviewed 34 중 commits 가 빈 것 32, findings 15 중 state=fixed 인데 fixCommits 가 빈 것 6 이다. 앞선 관측들과 비율이 그대로다. 이번 관측은 그 커밋이 새로 만든 finding(F-...-fd0f34ac) 이 아니라 reviewed 쪽에서 나온 것이다. 2026-10-06 C-ee868f04ef8a 리뷰에서 또 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-bd0ac165f76e.json 의 commits 가 빈 배열이다. 그 커밋 트리의 수는 reviewed(.json) 36 중 commits 가 빈 것 34, findings 15 중 state=fixed 인데 fixCommits 가 빈 것 6 이다. 분모만 늘고 분자 비율은 그대로여서, 결정이 열려 있는 동안 새로 적히는 장부가 예외 없이 빈 채로 들어온다는 관측이 다시 받쳐졌다. 2026-10-06 C-f6dc7dc50379 리뷰에서 또 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-947db14d6b78.json 의 commits 가 빈 배열이다. 그 커밋 트리의 수는 reviewed 35 중 commits 가 빈 것 33, findings 15 중 state=fixed 인데 fixCommits 가 빈 것 6 이다. reviewed 쪽 분모·분자가 나란히 늘고 fixed 쪽은 그대로여서, 비는 쪽은 새로 적히는 reviewed 장부임이 또 확인됐다. 2026-10-06 C-799eee85e78b 리뷰에서 또 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-f6dc7dc50379.json 의 commits 와, 같은 커밋이 새로 만든 findings/F-docs-code-review-reviewed-c-947db14d6b78-json-no-edaf05b6.json 의 fixCommits(state 는 fixed) 가 둘 다 빈 배열이다. 그 커밋 트리의 수는 reviewed 40 중 commits 가 빈 것 38, findings 16 중 state=fixed 인데 fixCommits 가 빈 것 7 이다. 앞 관측(35·33 / 15·6)에서 양쪽 분모·분자가 나란히 늘어 비율이 그대로다. 2026-10-06 C-b25bd2aeea7f 리뷰에서 또 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-ee868f04ef8a.json 의 commits 가 빈 배열이다. 그 커밋 트리의 수는 reviewed(.json) 39 중 commits 가 빈 것 37, findings 15 중 state=fixed 인데 fixCommits 가 빈 것 6 이다. 결정이 열려 있는 동안 새로 적히는 장부가 예외 없이 빈 채로 들어온다는 관측이 또 받쳐졌다. 2026-10-06 C-28d5bd6240ea 리뷰에서 또 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-b25bd2aeea7f.json 의 commits 가 빈 배열이다(그 커밋 트리: reviewed 44 중 commits 가 빈 것 42, findings 17 중 state=fixed 인데 fixCommits 가 빈 것 8). 덧붙이는 문장은 note 가 occurrences 와 겹쳐 자라는 것을 줄이려 한 문장으로만 남긴다. 2026-10-06 C-104b9820044f 리뷰에서 또 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-28d5bd6240ea.json 의 commits 가 빈 배열이다(그 커밋 트리: reviewed 46 중 commits 가 빈 것 44, findings 17 중 state=fixed 인데 fixCommits 가 빈 것 8). 2026-10-06 C-b01ef8054c58 리뷰에서 또 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-6dbb32d16159.json 의 commits 와, 그 커밋이 occurrences 를 덧붙인 findings/F-docs-code-review-reviewed-c-e1c078917ebc-json-no-4bd46a04.json 의 fixCommits(state 는 fixed) 가 둘 다 빈 배열이다(그 커밋 트리: reviewed 51 중 commits 가 빈 것 49, findings 18 중 state=fixed 인데 fixCommits 가 빈 것 9). 2026-10-06 C-4cf3d6225c2b 리뷰에서 또 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-b01ef8054c58.json 의 commits 가 빈 배열이다(그 커밋 트리: reviewed 55 중 commits 가 빈 것 52, findings 19 중 state=fixed 인데 fixCommits 가 빈 것 9). 2026-10-06 C-a98b11da45f7 리뷰에서 또 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-4cf3d6225c2b.json 의 commits 가 빈 배열이다(그 커밋 트리: reviewed 57 중 commits 가 빈 것 54, findings 19 중 state=fixed 인데 fixCommits 가 빈 것 9). 2026-10-06 C-ee3fc77e0cea 리뷰에서 또 같은 자리가 비어 나왔다 — 그 커밋이 더한 reviewed/C-a98b11da45f7.json 의 commits 가 빈 배열이다(그 커밋 트리: reviewed 60 중 commits 가 빈 것 57, findings 19 중 state=fixed 인데 fixCommits 가 빈 것 9)."
+}

@@ -1,0 +1,23 @@
+{
+  "itemId": "C-19a40411d2d6",
+  "kind": "commit",
+  "ref": "19a40411d2d6be46307a31de5bdf85fc0daeea7d",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L03",
+  "source": "claude",
+  "verdict": "결함 1건 / 수정 0건 (계약 1건 — 저장 형식을 바꾸는 설계 결정이라 고치지 않고 보고의 decisions 로 올렸다)",
+  "axes": {
+    "정확성": "결함 없음. 이 커밋이 채운 두 해시를 실측으로 검사했다. (1) `a52e664a` 는 실재하는 커밋이고 19a40411 의 조상이다(`git cat-file -e` · `git merge-base --is-ancestor` 둘 다 0). (2) 그 커밋이 실제로 reviewed/C-b7d9df2a5a50.json 과 findings/F-...e744c33b.json 두 파일을 만든 커밋이다(`git show --stat a52e664a`) — 가리키는 곳이 맞다. (3) 고친 두 파일이 여전히 올바른 JSON 이고 파일 이름과 본문 itemId·findingId 가 같다. (4) 장부 전체를 훑어 적힌 커밋 해시가 전부 실재·조상인지 확인했다 — BAD-HASH·NOT-ANCESTOR·ID-MISMATCH 0건.",
+    "보안 불변식": "해당 없음. 추적되는 문서 JSON 두 개의 값만 바꾼다. 실행 코드·설정·스크립트를 건드리지 않아 G1~G11 과 3절 C 예외 어디에도 닿지 않는다. 자격증명·공급자 소유 저장소·셸 문자열·경로 정규화·쓰기 게이트가 모두 무관하다.",
+    "계약": "이 커밋 자체는 README 를 따른다 — 비어 있던 `commits`·`fixCommits` 를 README '장부 파일의 모양'대로 채웠고, 짧은 해시 8자 표기도 이웃 장부(C-af9507eabc40 의 `b7d9df2a`)와 같다. 다만 이 커밋이 존재해야만 했다는 사실 자체가 규약의 구멍을 드러낸다: `commits` 는 그 장부를 담은 커밋 자신을 가리키므로 장부를 쓰는 커밋 안에서는 채울 수 없고, 채우려면 매 회차가 뒤따르는 두 번째 커밋을 밀어야 한다. 실제로 reviewed 12 건 중 10 건의 `commits` 가 비어 있고(L02·L03·L04·L05·L08·L10 의 항목들), `state:\"fixed\"` 인데 `fixCommits` 가 빈 결함도 2 건이다 — F-docs-code-review-readme-md-commits-6f902967. 저장 형식을 바꾸는 결정이라 이번 회차가 고치지 않았다.",
+    "검증 없음": "문서 JSON 값 변경이라 코드 시험이 걸리는 자리가 없다. 대신 장부를 읽는 쪽인 러너를 돌려 집계가 멀쩡한지 재고(`node --test src/lib/codeReviewQueue.test.mjs` 12/12, 러너 `--json` 이 ledgerDuplicates 0), 위 정확성 (1)(4)의 해시·id 검사를 명령으로 직접 돌려 메웠다. 새 자동화는 들이지 않았다 — 빈 `commits` 를 기계가 막는 검사는 위 계약 결정이 난 뒤에야 모양이 정해진다.",
+    "단순화·중복": "지적 없음. 두 줄 값 변경뿐이라 되풀이한 코드가 없다."
+  },
+  "findings": ["F-docs-code-review-readme-md-commits-6f902967"],
+  "verification": [
+    "node --experimental-strip-types --test --test-reporter=dot src/lib/codeReviewQueue.test.mjs (tests 12 / pass 12 / fail 0)",
+    "node --experimental-strip-types scripts/code-review-queue.mjs --json (ledgerDuplicates 0)",
+    "장부 전수 검사: 적힌 커밋 해시의 실재·조상 여부와 파일 이름 대 itemId/findingId 일치 (위반 0건)"
+  ],
+  "commits": []
+}

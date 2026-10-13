@@ -27,7 +27,6 @@ use std::time::{Duration, Instant};
 
 #[cfg(not(target_os = "macos"))]
 use keyring::Entry;
-#[cfg(target_os = "macos")]
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
@@ -48,7 +47,26 @@ const MAX_KEYCHAIN_COMMAND_OUTPUT_BYTES: u64 = 1024 * 1024;
 
 #[cfg(not(target_os = "macos"))]
 fn vault_error(prefix: &'static str) -> impl FnOnce(keyring::Error) -> CoreError {
-    move |error| CoreError::Runtime(format!("{prefix}: {error}"))
+    move |error| match error {
+        // 저장소 자체가 없거나 닿을 수 없다(헤드리스 리눅스의 Secret Service 부재 등).
+        // 호출자 대부분은 Runtime과 같게 보이지만, C20 OTP 비밀처럼 파일 폴백을 가진
+        // 호출자는 이 코드로 "다른 자리에 두어도 된다"를 가른다.
+        keyring::Error::PlatformFailure(_) | keyring::Error::NoStorageAccess(_) => {
+            CoreError::Coded(crate::app_error::AppError::conflict(
+                KEYCHAIN_UNAVAILABLE_CODE,
+                format!("{prefix}: {error}"),
+            ))
+        }
+        error => CoreError::Runtime(format!("{prefix}: {error}")),
+    }
+}
+
+/// OS 보안 저장소에 닿을 수 없을 때의 코드. 값이 없는 것(`NoEntry`)과는 다르다.
+pub(crate) const KEYCHAIN_UNAVAILABLE_CODE: &str = "KEYCHAIN_UNAVAILABLE";
+
+/// 저장소 부재로 실패했는지. 파일 폴백을 가진 호출자만 이 판정을 쓴다.
+pub(crate) fn is_keychain_unavailable(error: &CoreError) -> bool {
+    matches!(error, CoreError::Coded(coded) if coded.code() == KEYCHAIN_UNAVAILABLE_CODE)
 }
 
 #[cfg(target_os = "macos")]
@@ -407,9 +425,21 @@ fn read_keyring_entry(
     match entry.get_password() {
         Ok(value) => Ok(Some(Zeroizing::new(value))),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(CoreError::Runtime(format!(
-            "OS 보안 저장소를 읽지 못했습니다: {error}"
-        ))),
+        Err(mut error) => {
+            scrub_keyring_error(&mut error);
+            Err(vault_error("OS 보안 저장소를 읽지 못했습니다")(
+                error,
+            ))
+        }
+    }
+}
+
+/// `BadEncoding`은 UTF-8로 풀지 못한 저장 값 **그 자체**를 들고 온다. 오류 문구에는
+/// 실리지 않지만, 그대로 버리면 비밀 바이트가 지워지지 않은 채 해제된다(`G4`).
+#[cfg(not(target_os = "macos"))]
+fn scrub_keyring_error(error: &mut keyring::Error) {
+    if let keyring::Error::BadEncoding(bytes) = error {
+        bytes.zeroize();
     }
 }
 
@@ -496,9 +526,9 @@ fn delete_keyring_entry(service: &str, account: &str) -> Result<(), CoreError> {
         .delete_credential()
     {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(CoreError::Runtime(format!(
-            "OS 보안 저장소에서 삭제하지 못했습니다: {error}"
-        ))),
+        Err(error) => Err(vault_error("OS 보안 저장소에서 삭제하지 못했습니다")(
+            error,
+        )),
     }
 }
 
@@ -901,6 +931,20 @@ pub(crate) fn delete_os_keychain_password(service: &str, account: &str) -> Resul
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn g4_bad_encoding_secret_bytes_are_wiped_before_the_error_leaves() {
+        let mut error = keyring::Error::BadEncoding(vec![0xff, b's', b'e', b'c']);
+        super::scrub_keyring_error(&mut error);
+        match &error {
+            // `Vec::zeroize`는 0을 쓴 뒤 비운다. 지워진 메모리 자체는 안전한 Rust에서 볼 수
+            // 없으므로, 값이 오류 안에 남지 않는다는 것까지만 고정한다.
+            keyring::Error::BadEncoding(bytes) => assert!(bytes.is_empty()),
+            other => panic!("unexpected {other}"),
+        }
+        assert_eq!(error.to_string(), "Data is not UTF-8 encoded");
+    }
+
     #[cfg(target_os = "macos")]
     use super::*;
     #[cfg(target_os = "macos")]

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::chat::{ChatApprovalMode, ChatMode, ReasoningEffort};
+use crate::chat::{ChatApprovalMode, ChatMode, ChatProfile, ReasoningEffort};
 
 /// 저장본·요청 본문에서 오가는 문자열 표현이 하나뿐인 enum의 `as_str`·`Display`·
 /// `FromStr` 세 벌을 변이-문자열 표 하나에서 만든다. 세 벌이 각자 적혀 있으면 값을
@@ -156,6 +156,16 @@ impl ProviderId {
     /// CLI 전역 설정에 한 번 등록해 두는 길(`externalMcpConfig`)을 쓴다. 전자를 그대로
     /// 후자의 답으로 쓰던 탓에 로컬 채팅에는 외부 플러그인이 한 번도 붙지 않았다.
     pub fn supports_run_scoped_mcp(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex | Self::Local)
+    }
+
+    /// 외부 플러그인의 `ask` 도구를 실행 전에 앱 승인 카드로 물을 수 있는지(P12).
+    ///
+    /// Claude는 `can_use_tool`, Codex는 MCP 승인 요청, 로컬은 ACP 권한 요청으로 앱에 닿는다.
+    /// Antigravity print 모드에는 승인 통로가 없어, 확인이 필요한 요청을 스스로 거절해 턴을
+    /// 실패시키거나 `--dangerously-skip-permissions`면 묻지 않고 실행한다. 그래서 프록시는
+    /// 이 값이 거짓인 쪽에 확인이 필요한 쓰기 도구를 보이지 않는다.
+    pub fn confirms_plugin_tools(self) -> bool {
         matches!(self, Self::Claude | Self::Codex | Self::Local)
     }
 
@@ -361,6 +371,13 @@ pub struct SessionMeta {
     pub custom_title: Option<String>,
     #[serde(default)]
     pub folder_ids: Vec<String>,
+    /// 이 세션이 어떤 프로필로 돌았는지. 이어가기는 경로 추측 대신 이 값을 먼저 본다.
+    ///
+    /// AIA 작업공간 경로는 앱 데이터 폴더마다 다르다(개발 실행, 데이터 이전, 경로 표기
+    /// 차이). 경로로만 판정하던 동안에는 그 차이 하나로 AIA 대화가 조용히 일반 대화로
+    /// 떨어졌다 — 시스템 도구가 붙지 않은 채 열려, 사용자가 쓰던 자리가 사라졌다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ChatProfile>,
     /// 이 세션이 마지막으로 실행된 추론 수준. 이어가기 때 기본값으로 쓴다.
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -453,6 +470,19 @@ pub struct SessionSummary {
     /// 아니라 스냅샷을 만들 때 앱 데이터 경로로 다시 판정하므로, 저장본에 남은 값은 읽지 않는다.
     #[serde(default)]
     pub aia_workspace: bool,
+    /// AIA 와 나눈 대화인가. 칩과 "AIA 대화 포함" 필터가 보는 값으로, 세션이 적어 둔
+    /// 프로필을 먼저 보고 기록이 없는 옛 세션만 작업 경로로 판정한다. `aia_workspace`가
+    /// "앱 소유 경로인가"(프로젝트·스킬·지침 스캔에서 뺄 대상)를 묻는 것과는 다른 질문이다
+    /// — AIA 작업공간을 작업 경로로 고른 일반 채팅은 경로는 맞지만 AIA 대화가 아니고, 한
+    /// 필드로 둘을 겸하게 하면 어느 한쪽 소비처가 틀린다.
+    #[serde(default)]
+    pub aia_chat: bool,
+    /// AIA 대화지만 이 실행본은 일반 채팅으로 연다. 프로필 기록이 없고 작업 경로가 다른
+    /// app-data(형제 실행본)의 AIA 작업공간일 때다. 재개가 프로필을 가리는 자리는 권한을
+    /// 정하는 곳이라 자기 app-data 만 보고, 그 좁은 판정은 넓히지 않는다 — 화면은 이 값으로
+    /// 칩 설명을 바꿔 그 비대칭이 버그가 아님을 알린다.
+    #[serde(default)]
+    pub aia_chat_opens_as_standard: bool,
     /// 작업 경로 없이 시작해 앱이 마련한 기본 작업공간(`<app data>/default-workspace`)에서
     /// 오간 대화. `aia_workspace`처럼 스냅샷마다 앱 데이터 경로로 다시 판정한다. 목록에는
     /// 남기되 새 채팅의 프로젝트 후보에서는 뺀다 — 사용자가 고른 경로가 아니다.
@@ -1083,6 +1113,10 @@ pub struct StorageUsageItem {
     pub id: String,
     pub label: String,
     pub description: String,
+    /// 이 항목을 실제로 잰 자리. 헤드리스 배포에서는 화면을 보는 사람의 컴퓨터가 아니라
+    /// 백엔드가 도는 컨테이너의 경로(`/root/.claude/projects` 등)이므로, 수치만 보이면
+    /// 자기 맥의 세션을 보고 있다고 오해한다(L09).
+    pub root_path: String,
     pub size_bytes: u64,
     pub file_count: u64,
 }

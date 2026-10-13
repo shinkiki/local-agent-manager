@@ -1,0 +1,18 @@
+{
+  "itemId": "C-06ca35604bf4",
+  "kind": "commit",
+  "ref": "06ca35604bf4017c0b6fd4274b864274a10d5eb5",
+  "reviewedAt": "2026-10-06T00:40:00Z",
+  "lane": "L10",
+  "source": "claude",
+  "verdict": "결함 없음",
+  "axes": {
+    "정확성": "장부 전용 커밋이라 정확성은 '적힌 말이 코드와 트리에 맞는가'다. 이 커밋이 만든 C-6d76507597da.json 이 되짚었다고 적은 인용을 다시 원본에서 되짚어 전부 맞았다 — readBaseline 은 scripts/flaky-isolate.mjs 230~237줄이고 `error.code === 'ENOENT'` 일 때만 null, 그 밖은 throw 다. 245줄이 `baselineRuns: baseline?.summary?.measuredRuns ?? null`, 328줄이 `baseline && baseline.failureKinds`, 334줄이 `baseline && baseline.diagnosticKinds` 로 줄 번호까지 현재 트리와 일치한다. 결함 없음.",
+    "보안불변식": "diff 가 docs/code-review/queue.json 과 docs/code-review/reviewed/C-6d76507597da.json 둘뿐이다. 실행 코드가 한 줄도 없어 자격증명·공급자 소유 저장소·셸 문자열 조립·경로 정규화·쓰기 게이트 어디에도 닿지 않는다. AGENTS.md 2절 G1~G11 과 3절 C 예외의 범위 밖이다.",
+    "계약": "파일 이름과 본문 itemId 가 C-6d76507597da 로 같고 ref 6d76507597daabb748eef4ef14e826b2c9704d1b 가 실재하며 README '장부 파일의 모양'의 칸(itemId·kind·ref·reviewedAt·lane·source·verdict·findings·commits)을 모두 갖춘다. 장부가 적은 수치도 원본 6d765075 의 diff 와 맞다 — queue.json reviewed 57→58, 바뀐 파일이 queue.json 과 reviewed/C-933065d97068.json 둘, 그리고 그 안에서 되짚은 933065d9 의 diff 도 reviewed 53→54 · 만든 장부 C-fb82dc4c8690.json 하나 · reviewedAt 2026-10-06T00:00:00Z 로 전부 맞았다. 이 커밋 자신의 queue.json 은 reviewed 58→59 인데 그 시점 reviewed/ 의 트리 항목 60 에서 .gitkeep 하나를 빼면 59 라 맞는다(러너는 .gitkeep 을 세지 않는다).",
+    "검증없음": "실행 코드가 한 줄도 바뀌지 않아 새 시험이 필요한 자리가 없다. 바뀐 두 파일은 src/lib/codeReviewQueue.test.mjs 의 장부 전수 검사(파일 이름과 본문 itemId 일치·JSON 파싱)가 덮는다.",
+    "단순화중복": "C-6d76507597da.json 을 건드린 커밋은 git log -S 로 이 커밋 하나뿐이고 reviewed/ 에 같은 항목의 다른 파일이 없다. 러너의 ledgerDuplicates 도 비어 있다. 같은 지적을 되풀이한 자리가 없다."
+  },
+  "findings": [],
+  "commits": []
+}

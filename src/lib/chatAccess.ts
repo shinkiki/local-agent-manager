@@ -1,16 +1,11 @@
 import { getWebAccessStatus, type WebAccessStatus } from "./ipc.ts";
 
-const REMOTE_WRITE_DISABLED_MESSAGE =
-  "원격 편집이 꺼져 있어 채팅 세션을 시작할 수 없습니다. 호스트의 설정 → 백엔드 서비스에서 원격 편집 허용을 켠 뒤 다시 시도하세요.";
-
 /**
- * 채팅을 시작하거나 첨부를 올리기 전 이 화면에 쓰기 권한이 있는지 확인한다. 소켓 연결과
- * 첨부 파일 API가 같은 관문을 지나야 하므로 두 모듈이 함께 쓰는 이곳에 둔다.
+ * 채팅을 시작하거나 첨부를 올리기 전에 백엔드 악수를 확인한다. 소켓 연결과 첨부 파일
+ * API가 같은 관문을 지나야 하므로 두 모듈이 함께 쓰는 이곳에 둔다. 권한은 더 이상 여기서
+ * 가르지 않는다 — 로그인 뒤에는 모든 채널이 같고(C20), 로그인이 없으면 악수 자체가 게이트를
+ * 띄운다.
  */
 export async function assertRemoteChatAccess(): Promise<WebAccessStatus> {
-  const access = await getWebAccessStatus();
-  if (access.remote && !access.writable) {
-    throw new Error(REMOTE_WRITE_DISABLED_MESSAGE);
-  }
-  return access;
+  return getWebAccessStatus();
 }

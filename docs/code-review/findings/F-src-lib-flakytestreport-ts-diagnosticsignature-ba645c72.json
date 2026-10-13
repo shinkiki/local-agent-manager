@@ -1,0 +1,12 @@
+{
+  "findingId": "F-src-lib-flakytestreport-ts-diagnosticsignature-ba645c72",
+  "file": "src/lib/flakyTestReport.ts",
+  "symbol": "diagnosticSignature",
+  "symptom": "IPv6 루프백 포트가 지문에서 지워지지 않는다",
+  "severity": "P2",
+  "state": "fixed",
+  "agentsRules": [],
+  "detail": "LOOPBACK_PORT 가 /\\b(127.0.0.1|\\[::1\\]|localhost):\\d+/g 라 `\\b` 가 세 갈래 전부에 걸린다. `[` 는 낱말 문자가 아니어서 앞이 `/` 거나 줄머리면 경계가 서지 않아 `[::1]` 갈래가 한 번도 맞지 않는다. 입력 `fetch 실패: unable to access 'http://[::1]:6401/repo.git/'` 에서 포트가 그대로 남아, IPv6 루프백으로 뜬 시험 서버는 고치기 전과 똑같이 실행마다 다른 지문으로 갈린다.",
+  "occurrences": [{ "itemId": "C-4ccc192750e0", "at": "2026-10-06T00:00:00Z" }],
+  "fixCommits": []
+}

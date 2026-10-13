@@ -1,0 +1,16 @@
+{
+  "findingId": "F-docs-code-review-reviewed-c-af9507eabc40-json-co-e744c33b",
+  "file": "docs/code-review/reviewed/C-af9507eabc40.json",
+  "symbol": "commits",
+  "symptom": "장부가 리뷰와 수정을 착지시킨 커밋을 적지 않아 결함과 고친 커밋이 끊긴다",
+  "detail": "docs/code-review/README.md 의 '장부 파일의 모양'은 reviewed 항목에 `commits`, 결함에 `fixCommits` 를 둔다. b7d9df2a 가 더한 두 장부 파일만 그 칸이 비어 있다 — reviewed/C-af9507eabc40.json 은 `axes`·`verification` 으로 바꿔 적으며 `commits` 를 뺐고, findings/F-scripts-generate-ui-catalog-mjs-check-4e045831.json 은 `state:\"fixed\"` 인데 `fixCommits` 대신 서술형 `fix` 문자열만 두었다. 재현: `node -e \"for(f of fs.readdirSync('docs/code-review/reviewed'))...\"` 로 키를 세면 a52e664a 의 부모에 있던 reviewed 열한 건 중 C-af9507eabc40.json 만 `commits` 키가 아예 없고 나머지 열 건은 키는 있되 모두 빈 배열이라, 착지 커밋을 적은 항목이 한 건도 없다(처음 적힌 '여섯 중 다섯'은 b7d9df2a 시점의 수이고 착지한 트리에서는 재현되지 않는다 — C-a52e664a3563 리뷰에서 실측). 결과로 'F-...4e045831 을 어느 커밋이 고쳤나'·'C-af9507eabc40 리뷰는 어느 커밋으로 착지했나'를 장부만 보고 답할 수 없고, 사람이 git log 를 증상 문구로 되짚어야 한다. 러너(src/lib/codeReviewQueue.ts)는 itemId 만 읽으므로 큐 집계는 틀리지 않는다 — 깨지는 것은 사람이 읽는 추적성뿐이라 P3 이다.",
+  "severity": "P3",
+  "state": "fixed",
+  "agentsRules": [],
+  "occurrences": [
+    { "itemId": "C-b7d9df2a5a50", "at": "2026-10-06T00:00:00Z", "lane": "L07" },
+    { "itemId": "C-a52e664a3563", "at": "2026-10-05T17:50:00Z", "lane": "L02" }
+  ],
+  "fixCommits": ["a52e664a"],
+  "note": "README 가 정한 칸을 되살리는 것뿐이라 장부 형식을 새로 정하지 않았다. `axes`·`verification`·`fix` 같은 덧붙인 칸은 README 의 모양을 넓히는 쪽이라 그대로 두었다. C-a52e664a3563 리뷰에서 같은 드리프트가 reviewed 열 건과 findings 두 건에 더 있는 것을 확인했지만 채우지는 않았다 — 그 빈 칸을 어떻게 메울지가 round-383bc1ee75694815bbb5add11d45bfc9 에 열린 결정이라 사람이 고른 뒤의 몫이다. F-docs-code-review-findings-f-docs-code-review-rev-d9517df9 참고."
+}

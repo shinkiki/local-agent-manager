@@ -1,0 +1,12 @@
+{
+  "itemId": "C-2418418877b5",
+  "kind": "commit",
+  "ref": "2418418877b5427dd3adfca82abd51fe9c0f6e6d",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L05",
+  "source": "codex",
+  "verdict": "결함 0건 — 같은 장부의 반영 커밋 식별자 계약은 이미 열린 결정으로 중복 등록하지 않음",
+  "note": "정확성: 1186bef 리뷰가 재현되지 않은 gitBranchTree 결함을 unconfirmed 로 되돌린 근거(잎 label 은 prefixLength 를 쓰지 않음)를 원 커밋과 대조해 확인했고, state·occurrences·fixCommits 정정은 주장과 일치한다. 보안: 변경은 저장소의 docs/code-review JSON뿐이며 G1~G11 및 C 직접변경 예외가 다루는 provider 저장소·자격증명·경로·프로세스에 닿지 않는다. 계약: 새 finding/reviewed 의 state=fixed 이면서 fixCommits/commits 가 비어 있어 README 예시의 반영 커밋 추적과 어긋날 수 있으나, 장부 자신을 담은 커밋 해시를 한 커밋에서 쓸 수 없다는 동일 주제의 pending decision 이 이미 있어 다시 올리지 않는다. 검증 없음: 이 장부 전용 정정은 원인을 재현 스크립트로 확인한 C-1186 리뷰의 결과를 보존하며, 그 재현은 codeReviewQueue 단위 시험과 러너가 덮는 id/집계 경로를 벗어나지 않는다. 단순화·중복: 결함 id 생성의 한글 symptom 충돌은 기존 pending decision 이며 새 결함을 만들지 않았다.",
+  "findings": [],
+  "commits": []
+}

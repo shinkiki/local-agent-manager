@@ -31,6 +31,7 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::app_data_file::write_private_bytes;
+use crate::cli_interface::ProcessGroup;
 use crate::clock::now_ms;
 use crate::credential_profiles;
 use crate::cypress_workspaces::{
@@ -50,6 +51,8 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// 하지만, 한나절 걸리는 수동 점검을 앱이 먼저 끊어서는 안 된다.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(8 * 60 * 60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// `cypress verify` 상한. 첫 점검은 바이너리 캐시를 풀어 보므로 느린 디스크에서 1분을 넘긴다.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_RUNS: usize = 20;
 const MAX_ARTIFACT_INLINE_BYTES: u64 = 64 * 1024;
 const OUTPUT_TAIL_CHARS: usize = 1_500;
@@ -301,6 +304,20 @@ pub struct CypressInstallReceipt {
     pub output: String,
 }
 
+/// `cypress verify` 결과. 모듈이 설치됐어도 브라우저를 띄울 시스템 패키지가 없으면 실행은
+/// 시작 전에 멈추는데(헤드리스 리눅스: `missing the dependency: Xvfb`, 2026-10-10 NAS 실측),
+/// 그걸 실행을 눌러서야 알게 하지 않으려고 설치 직후와 요청 시에 미리 점검한다.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CypressEnvironmentCheck {
+    pub ok: bool,
+    /// 점검 출력 꼬리. 비밀값은 지워져 있다.
+    pub output: String,
+    /// 출력에서 읽어 낸 원인과 사람이 할 일. 원인을 못 읽었으면 None.
+    pub hint: Option<String>,
+    pub checked_at: i64,
+}
+
 #[derive(Default)]
 pub struct CypressRuns {
     runs: Mutex<VecDeque<Arc<Mutex<CypressRunStatus>>>>,
@@ -531,6 +548,9 @@ fn spawn_capped(
     let mut child = command.spawn().map_err(|error| {
         CoreError::Runtime(format!("Cypress 러너를 시작하지 못했습니다: {error}"))
     })?;
+    // stdin을 주기 **전에** 묶는다. 러너가 job을 읽고 브라우저를 띄우면 그 손자는 묶기 전에
+    // 태어난 셈이라 윈도우 job 밖에 남는다(C7-5).
+    let group = ProcessGroup::attach(&child);
     if let (Some(payload), Some(mut stdin)) = (stdin_payload, child.stdin.take()) {
         // 자식이 다 읽기 전에 죽어도 쓰기 오류로 우리가 죽으면 안 된다.
         let _ = stdin.write_all(&payload);
@@ -543,13 +563,13 @@ fn spawn_capped(
         match child.try_wait()? {
             Some(status) => break Some(status),
             None if stop.load(Ordering::Relaxed) => {
-                kill_group(child.id());
+                kill_group(group.as_ref());
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
             }
             None if started.elapsed() >= timeout => {
-                kill_group(child.id());
+                kill_group(group.as_ref());
                 let _ = child.kill();
                 let _ = child.wait();
                 timed_out = true;
@@ -570,8 +590,15 @@ fn spawn_capped(
 
 /// 실행 시간을 넘긴 자식을 그룹째 정리한다. 같은 마지막 수단을 git 실행기도 쓰므로
 /// 본체는 `cli_interface`에 한 벌만 둔다.
-fn kill_group(pid: u32) {
-    crate::cli_interface::kill_process_group(pid);
+///
+/// 예전에는 pid로 `kill_process_group`을 불렀는데, 그 함수는 윈도우에서 본문이 비어
+/// 있었다. 그래서 윈도우에서는 제한 시간·중지가 러너 하나만 끝내고 Cypress가 띄운
+/// 브라우저가 살아남았으며, 그 손자가 출력 파이프를 쥔 채 남아 `finish`가 돌아오지
+/// 않았다. git 실행기가 2026-10-05에 job 객체로 고친 같은 결함이라 같은 손잡이를 쓴다.
+fn kill_group(group: Option<&ProcessGroup>) {
+    if let Some(group) = group {
+        group.kill();
+    }
 }
 
 /// 러너 실행 갈래. 무인·수동을 가리지 않고 결과를 내는 `Run`과, 사람이 런처에서 스펙을
@@ -1326,10 +1353,146 @@ pub fn install_module(
     })
 }
 
+/// 모듈 위치의 Cypress로 `cypress verify`를 돌려 바이너리와 시스템 의존성을 점검한다.
+/// 설치와 같은 자리(모듈 `node_modules`)의 CLI를 node로 직접 부른다 — `npx`는 PATH와 캐시에
+/// 따라 다른 버전을 고를 수 있다.
+pub fn verify_environment(
+    workspace: &CypressWorkspace,
+) -> Result<CypressEnvironmentCheck, CoreError> {
+    let module_dir = child_facing(&workspace.module_dir());
+    let cli = module_dir
+        .join("node_modules")
+        .join("cypress")
+        .join("bin")
+        .join("cypress");
+    if !cli.is_file() {
+        return Err(CoreError::NotFound(
+            "Cypress 모듈이 설치되어 있지 않습니다. 먼저 설치하세요".to_owned(),
+        ));
+    }
+    let node = crate::providers::resolve_named_executable(&["node"])?;
+    let mut command = command_on_resolved_path(&node);
+    command.arg(&cli).arg("verify").current_dir(&module_dir);
+    configure_module_search_path(&mut command, &module_dir);
+    let outcome = spawn_capped(command, None, VERIFY_TIMEOUT, true, &AtomicBool::new(false))?;
+    let output = outcome.scrubbed_tail(&[]);
+    let ok = outcome.success && !outcome.timed_out;
+    let hint = if ok {
+        None
+    } else {
+        environment_hint(&output, outcome.timed_out)
+    };
+    Ok(CypressEnvironmentCheck {
+        ok,
+        output,
+        hint,
+        checked_at: now_ms(),
+    })
+}
+
+/// 점검 출력에서 흔한 실패 원인을 읽어 조치를 적는다. 순수 함수라 시험이 출력 조각으로
+/// 고정한다. 모르는 출력에는 아무것도 지어내지 않는다.
+pub(crate) fn environment_hint(output: &str, timed_out: bool) -> Option<String> {
+    if timed_out {
+        return Some(format!(
+            "점검이 {}분 안에 끝나지 않았습니다. 느린 디스크에서는 바이너리 압축 해제가 오래 걸리니 다시 시도하세요",
+            VERIFY_TIMEOUT.as_secs() / 60
+        ));
+    }
+    let lower = output.to_ascii_lowercase();
+    if lower.contains("xvfb")
+        || lower.contains("missing the dependency")
+        || lower.contains("shared libraries")
+        || lower.contains("cannot open shared object")
+    {
+        return Some(
+            "브라우저를 띄울 시스템 패키지가 없습니다. Debian/Ubuntu: apt-get install -y xvfb xauth libgtk-3-0 libgbm1 libnotify4 libnss3 libxss1 libasound2 libxtst6. Agent Manager 헤드리스 컨테이너라면 이미지(deploy/synology/Dockerfile)에 들어 있어야 하며, 컨테이너 안에서 설치한 것은 재생성 때 사라집니다"
+                .to_owned(),
+        );
+    }
+    if lower.contains("no version of cypress is installed")
+        || lower.contains("cypress binary")
+        || lower.contains("cypress install")
+    {
+        return Some(
+            "Cypress 바이너리 캐시가 없거나 깨졌습니다. 모듈을 다시 설치하거나 모듈 폴더에서 `npx cypress install`을 실행하세요"
+                .to_owned(),
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// C7-5. 제한 시간은 러너만이 아니라 러너가 띄운 손자(브라우저)까지 끝내야 한다. 손자가
+    /// 출력 파이프를 쥔 채 살아남으면 `finish`가 그 손자가 끝날 때까지 돌아오지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn c7_5_timeout_ends_the_grandchild_holding_the_output_pipe() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & wait"]);
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        let outcome =
+            spawn_capped(command, None, Duration::from_millis(300), true, &stop).expect("실행");
+        assert!(outcome.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "손자가 살아남아 출력 회수가 막혔습니다: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 2026-10-10 NAS 실측 출력. Xvfb가 없으면 Cypress 자체 점검이 여기서 멈춘다.
+    #[test]
+    fn environment_hint_names_the_missing_system_packages() {
+        let output = "Cypress failed to start.\n\nYour system is missing the dependency: Xvfb\n\nspawn Xvfb ENOENT";
+        let hint = environment_hint(output, false).expect("힌트");
+        assert!(hint.contains("xvfb"), "{hint}");
+        assert!(hint.contains("Dockerfile"), "{hint}");
+    }
+
+    #[test]
+    fn environment_hint_points_at_the_binary_cache_when_it_is_missing() {
+        let hint = environment_hint(
+            "No version of Cypress is installed in: /root/.cache/Cypress/15.21.1/Cypress",
+            false,
+        )
+        .expect("힌트");
+        assert!(hint.contains("cypress install"), "{hint}");
+    }
+
+    #[test]
+    fn environment_hint_reports_a_timeout_and_stays_quiet_on_unknown_output() {
+        assert!(environment_hint("", true)
+            .expect("힌트")
+            .contains("분 안에"));
+        assert_eq!(
+            environment_hint("something unrelated went wrong", false),
+            None
+        );
+    }
+
+    /// 모듈이 없으면 점검할 CLI도 없다. 설치부터 하라고 바로 말하고 node를 띄우지 않는다.
+    #[test]
+    fn verify_environment_refuses_without_an_installed_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = CypressWorkspace {
+            id: "ws".to_owned(),
+            name: "ws".to_owned(),
+            path: dir.path().to_string_lossy().into_owned(),
+            module_dir: None,
+            execution_type: CypressExecutionType::Standard,
+            record_video: false,
+            headed: false,
+            created_at: 0,
+        };
+        let error = verify_environment(&workspace).unwrap_err();
+        assert!(matches!(error, CoreError::NotFound(_)), "{error:?}");
+    }
 
     #[test]
     fn summary_json_from_the_runner_parses_and_tolerates_missing_fields() {

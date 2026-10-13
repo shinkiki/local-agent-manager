@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   isSkillProviderDeployed,
-  latestSkillVersion,
   skillSyncCounts,
   skillSyncState,
 } from "./skillSyncState.ts";
@@ -141,61 +140,4 @@ test("상태별 항목 수는 다섯 갈래를 모두 들고 시작한다", () =
     unpublished: 0,
     unmanaged: 1,
   });
-});
-
-test("갈라진 자리가 없으면 원본 방향이고, 시각을 모르면 아무 쪽도 고르지 않는다", () => {
-  assert.deepEqual(latestSkillVersion(null, []), { kind: "source" });
-  // 원본 시각을 모르는데 갈라진 자리가 있으면 고를 근거가 없다. 0으로 깔면 원본이
-  // 항상 지므로, 실제로는 가장 새로운 사본이 조용히 덮인다.
-  assert.deepEqual(latestSkillVersion(null, [{ provider: "claude", install: install() }]), {
-    kind: "unknown",
-  });
-  // 사본 하나라도 시각을 모르면 나머지가 아무리 새로워도 고르지 않는다.
-  assert.deepEqual(
-    latestSkillVersion(100, [
-      { provider: "claude", install: install({ modifiedAtMs: 200 }) },
-      { provider: "codex", install: install({ modifiedAtMs: null }) },
-    ]),
-    { kind: "unknown" },
-  );
-});
-
-test("동시각은 원본이 이기고, 더 새로운 사본만 채택 후보가 된다", () => {
-  // 배포는 원본의 수정 시각을 사본에 넘겨주지 않으므로 동시각은 사람이 고친 흔적이 아니다.
-  assert.deepEqual(
-    latestSkillVersion(100, [{ provider: "claude", install: install({ modifiedAtMs: 100 }) }]),
-    { kind: "source" },
-  );
-  assert.deepEqual(
-    latestSkillVersion(100, [{ provider: "claude", install: install({ modifiedAtMs: 99 }) }]),
-    { kind: "source" },
-  );
-
-  const newer = install({ modifiedAtMs: 101 });
-  assert.deepEqual(latestSkillVersion(100, [{ provider: "claude", install: newer }]), {
-    kind: "install",
-    provider: "claude",
-    install: newer,
-  });
-});
-
-test("더 새로운 사본이 여럿이면 가장 나중 것이, 동시각이면 먼저 나온 쪽이 이긴다", () => {
-  const first = install({ modifiedAtMs: 300 });
-  const second = install({ modifiedAtMs: 500 });
-  assert.equal(
-    latestSkillVersion(100, [
-      { provider: "claude", install: first },
-      { provider: "codex", install: second },
-    ]).install,
-    second,
-  );
-  const tieFirst = install({ modifiedAtMs: 300 });
-  const tieSecond = install({ modifiedAtMs: 300 });
-  assert.equal(
-    latestSkillVersion(100, [
-      { provider: "claude", install: tieFirst },
-      { provider: "codex", install: tieSecond },
-    ]).install,
-    tieFirst,
-  );
 });

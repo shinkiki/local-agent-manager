@@ -4587,6 +4587,8 @@ mod tests {
             git_branch: None,
             is_subagent: false,
             aia_workspace,
+            aia_chat: false,
+            aia_chat_opens_as_standard: false,
             default_workspace: false,
             archived: false,
             readable: true,
@@ -4597,6 +4599,42 @@ mod tests {
                 ..SessionMeta::default()
             },
             last_failure: None,
+        }
+    }
+
+    /// `path_guard::assert_within_root`는 끊어진 링크를 아직 없는 경로로 보고 루트 안으로
+    /// 통과시킨다(C3-12 링크 삭제가 그 동작에 기댄다). 그래서 쓰기 자리가 직접 링크를 거절해야
+    /// 한다(G10, C5-4). 이 시험은 링크가 교체되지 않고 `InvalidInput`으로 거절되는 것을 못 박는다.
+    #[cfg(unix)]
+    #[test]
+    fn publish_refuses_dangling_symlink_target_pointing_outside_root() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).expect("root");
+        fs::create_dir(&outside).expect("outside");
+        let source = temp.path().join("source.md");
+        fs::write(&source, "# 지침\n").expect("source");
+        let escaped = outside.join("AGENTS.md");
+        let target = root.join("AGENTS.md");
+        std::os::unix::fs::symlink(&escaped, &target).expect("dangling link");
+
+        assert!(assert_within_root(&root, &target).is_ok());
+        for labels in [INSTRUCTION_PUBLISH_LABELS, LINKED_DOC_PUBLISH_LABELS] {
+            let result = publish_replaceable_file(
+                &root,
+                &source,
+                &target,
+                SkillOverwritePolicy::Replace,
+                labels,
+                || Ok(root.clone()),
+            );
+            assert!(matches!(result, Err(CoreError::InvalidInput(_))));
+            assert!(!escaped.exists(), "루트 밖에 파일이 생겼습니다");
+            assert!(fs::symlink_metadata(&target)
+                .expect("link kept")
+                .file_type()
+                .is_symlink());
         }
     }
 

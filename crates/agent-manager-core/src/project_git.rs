@@ -83,6 +83,13 @@ const REMOVED_ENV: &[&str] = &[
     "SSH_ASKPASS",
     "SSH_ASKPASS_REQUIRE",
     "DISPLAY",
+    // C16-10. 물려받은 신원 설정은 어느 호출에도 닿지 않는다. 네트워크 작업이 쓸 신원은
+    // 사용자가 애드온에서 켠 키 하나뿐이고, 그 값만 `env`로 다시 얹는다(제거가 먼저 돈다).
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    // 이 값은 git이 우리 명령에 포트·사용자 인수를 **어떤 모양으로** 덧붙일지를 바꾼다.
+    // 물려받은 값 하나가 사용자가 고른 연결을 조용히 다른 모양으로 만든다.
+    "GIT_SSH_VARIANT",
 ];
 
 const LABELS: RootLabels = RootLabels {
@@ -112,6 +119,12 @@ pub struct ProjectGitDiffRequest {
     /// 지정하면 작업 트리·인덱스가 아니라 그 커밋이 부모 대비 바꾼 내용을 본다.
     #[serde(default)]
     pub commit: Option<String>,
+    /// B9. 둘을 함께 주면 `<from>...<to>` 범위의 변경을 본다. 수신·송신 요약이 집은 파일을
+    /// 그 요약과 **같은 범위**로 열기 위한 자리다. `staged`·`commit`과는 상호배타다.
+    #[serde(default)]
+    pub range_from: Option<String>,
+    #[serde(default)]
+    pub range_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -542,6 +555,13 @@ pub struct GitBranchComparison {
     pub outgoing_count: u32,
     pub incoming_truncated: bool,
     pub outgoing_truncated: bool,
+    /// B8. 수신 커밋들이 합쳐서 바꾸는 파일(merge-base..upstream). 커밋 목록만으로는
+    /// "pull하면 내 작업 파일이 건드려지는가"를 답할 수 없어, 방향마다 따로 싣는다.
+    pub incoming_files: Vec<GitCommitFile>,
+    /// B8. 송신 커밋들이 합쳐서 바꾸는 파일(merge-base..branch).
+    pub outgoing_files: Vec<GitCommitFile>,
+    pub incoming_files_truncated: bool,
+    pub outgoing_files_truncated: bool,
     /// 양쪽 모두 0이 아니다 — fast-forward로 정리되지 않는다.
     pub diverged: bool,
     /// `FETCH_HEAD`의 수정 시각(unix 초). 한 번도 fetch하지 않았으면 null이다.
@@ -622,6 +642,65 @@ impl From<GitOpenFailure> for CoreError {
     }
 }
 
+// C16-4가 "제공하지 않는다"고 이름으로 적어 둔 인수들이 실제로 자식에게 가는 argv에
+// 오르지 않는지를 재기 위한 **시험 전용** 기록기. 제품 빌드에는 존재하지 않는다.
+//
+// 이 자리에 두는 이유: C16-4는 "어떤 인수를 만들지 않는다"는 약속이고, 그 약속이 깨지는
+// 지점은 인수 벡터가 완성되는 `GitRunner::run` 한 곳뿐이다. 빌더를 따로 읽는 시험은
+// 사용자 입력과 git 출력에서 흘러들어온 값(해석된 원격, refspec, 시작점)을 보지 못한다.
+// 스레드 지역이라 `cargo test`의 병렬 실행에서 시험끼리 섞이지 않는다.
+#[cfg(test)]
+#[derive(Clone)]
+struct RecordedCall {
+    argv: Vec<String>,
+    /// 자식의 stdin으로 넘어간 바이트. C16-5는 "경로와 커밋 메시지는 argv가 아니라
+    /// stdin으로 간다"고 적어 두었는데, argv만 기록하면 "argv에 없다"까지만 물을 수
+    /// 있고 "그래서 stdin으로 갔다"는 물을 수 없다. 둘을 함께 재야 인수를 지운 것과
+    /// 경로를 옮긴 것이 갈린다.
+    input: Option<Vec<u8>>,
+    /// 자식에게 **설정한** 환경변수. C16-3은 비대화 실행을 여섯 가지 변수로 걸어
+    /// 두었는데(`GIT_TERMINAL_PROMPT`·`GIT_ASKPASS`·`GIT_EDITOR`·`GIT_SEQUENCE_EDITOR`·
+    /// `LC_ALL`·읽기의 `GIT_OPTIONAL_LOCKS`), argv만 기록하면 그 여섯이 실제로
+    /// 자식에게 갔는지 물을 수 없다.
+    env: Vec<(String, String)>,
+    /// 자식에게서 **지운** 변수(C16-2의 상속 리디렉션과 askpass 계열). 설정한 것과
+    /// 지운 것은 같은 자리에서 결정되므로 함께 기록해야 "지우고 다시 설정했다"는
+    /// 자기모순을 잴 수 있다.
+    env_remove: Vec<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECORDED_CALLS: std::cell::RefCell<Option<Vec<RecordedCall>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_NETWORK_IDENTITY: std::cell::RefCell<
+        Option<crate::ssh_endpoints::ProjectGitIdentity>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_network_identity() -> Option<crate::ssh_endpoints::ProjectGitIdentity> {
+    TEST_NETWORK_IDENTITY.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(test)]
+fn record_call(argv: &[&str], input: Option<&[u8]>, env: &[(String, String)], env_remove: &[&str]) {
+    RECORDED_CALLS.with(|cell| {
+        if let Some(log) = cell.borrow_mut().as_mut() {
+            log.push(RecordedCall {
+                argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
+                input: input.map(<[u8]>::to_vec),
+                env: env.to_vec(),
+                env_remove: env_remove.iter().map(|key| (*key).to_owned()).collect(),
+            });
+        }
+    });
+}
+
 /// 검증을 마친 저장소 하나에 붙은 git 실행기. `root`는 저장소 최상위(자식에게 넘길 모양),
 /// `git_dir`는 이 워크트리의 git 디렉터리다.
 pub(crate) struct GitRunner {
@@ -632,6 +711,8 @@ pub(crate) struct GitRunner {
     version: String,
     ceiling: Option<String>,
     extra_env: Vec<(String, String)>,
+    /// C16-10. 네트워크 작업 직전에 "git 원격용" 키를 찾아보기 위한 앱 데이터 경로.
+    app_data_dir: PathBuf,
 }
 
 impl GitRunner {
@@ -664,6 +745,7 @@ impl GitRunner {
                     .into_owned()
             }),
             extra_env,
+            app_data_dir: app_data_dir.to_path_buf(),
         };
         runner.version = git_version_for(&runner)?;
         // 흔한 경우(작업 트리 안)는 한 번의 rev-parse로 끝난다. `--show-toplevel`은 bare
@@ -743,7 +825,7 @@ impl GitRunner {
         self.root.to_string_lossy().into_owned()
     }
 
-    fn env(&self, write: bool) -> Vec<(String, String)> {
+    fn env(&self, write: bool, extra: &[(String, String)]) -> Vec<(String, String)> {
         let mut env: Vec<(String, String)> = vec![
             ("GIT_TERMINAL_PROMPT".into(), "0".into()),
             // 빈 값은 askpass 프로그램을 쓰지 않는다는 뜻이다. 그러면 git은 꺼진 터미널
@@ -763,6 +845,7 @@ impl GitRunner {
             env.push(("GIT_OPTIONAL_LOCKS".into(), "0".into()));
         }
         env.extend(self.extra_env.iter().cloned());
+        env.extend(extra.iter().cloned());
         env
     }
 
@@ -773,9 +856,22 @@ impl GitRunner {
         timeout: Duration,
         write: bool,
     ) -> Result<CommandOutcome, CoreError> {
+        self.run_with(args, input, timeout, write, &[])
+    }
+
+    fn run_with(
+        &self,
+        args: &[&str],
+        input: Option<&[u8]>,
+        timeout: Duration,
+        write: bool,
+        extra: &[(String, String)],
+    ) -> Result<CommandOutcome, CoreError> {
         let mut argv: Vec<&str> = GIT_BASE_ARGS.to_vec();
         argv.extend_from_slice(args);
-        let env = self.env(write);
+        let env = self.env(write, extra);
+        #[cfg(test)]
+        record_call(&argv, input, &env, REMOVED_ENV);
         run_capped_with(
             &self.executable,
             &argv,
@@ -915,9 +1011,23 @@ impl GitRunner {
             ],
             READ_TIMEOUT,
         )?;
+        // `rev-parse`는 `--verify` 없이 부르면 **자기가 받은 플래그를 그대로 한 줄 찍는다.**
+        // 그래서 여기 stdout은 "--end-of-options\norigin/main"이고, 통째로 trim하면 업스트림
+        // 이름이 "--end-of-options\norigin/main"이 되어 어떤 원격 접두사와도 맞지 않는다
+        // (2026-10-04 실측). 그 결과 push의 refspec이 `HEAD`로 떨어져 업스트림이 아니라
+        // **로컬 브랜치 이름의 새 원격 브랜치**로 나갔다. `--end-of-options`는 C16-5대로
+        // 남기고, 답은 마지막 줄에서 읽는다.
         Ok(upstream
             .success
-            .then(|| upstream.stdout.trim().to_owned())
+            .then(|| {
+                upstream
+                    .stdout
+                    .lines()
+                    .map(str::trim)
+                    .rfind(|line| !line.is_empty() && !line.starts_with('-'))
+                    .unwrap_or_default()
+                    .to_owned()
+            })
             .filter(|name| !name.is_empty()))
     }
 
@@ -994,6 +1104,44 @@ impl GitRunner {
     ) -> Result<GitActionReceipt, CoreError> {
         let head_before = self.head_sha()?;
         let outcome = self.write(args, input, timeout)?;
+        let head_after = self.head_sha()?;
+        self.receipt(action, outcome, head_before, head_after)
+    }
+
+    /// 네트워크 작업이 쓸 신원. 시험은 홈을 갈아 끼울 수 없으므로 여기 한 자리만 덮어쓴다 —
+    /// 덮어쓰지 않으면 제품 경로가 그대로 돈다.
+    fn network_identity(&self) -> Option<crate::ssh_endpoints::ProjectGitIdentity> {
+        #[cfg(test)]
+        if let Some(identity) = test_network_identity() {
+            return Some(identity);
+        }
+        crate::ssh_endpoints::project_git_identity(&self.app_data_dir)
+            .ok()
+            .flatten()
+    }
+
+    /// C16-10. 원격과 말을 주고받는 변경(fetch·pull·push) 하나. `mutate`와 다른 것은 둘뿐이다
+    /// — 사용자가 "git 원격용"으로 켠 SSH 키가 있으면 그 신원을 `GIT_SSH_COMMAND`로 **이
+    /// 호출에만** 얹고, 그 키 경로가 `ssh`의 경고를 타고 영수증에 묻어 나오지 않도록 지운다.
+    /// 읽기와 로컬 변경은 이 경로를 지나지 않으므로 신원도 받지 않는다.
+    fn network_mutate(
+        &self,
+        action: &str,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<GitActionReceipt, CoreError> {
+        // 신원을 못 만들면 인증을 더하지 못할 뿐이므로 변경 자체를 막지 않는다. git은
+        // 지금까지처럼 자기 기본값으로 붙고, 자격증명이 없으면 `authFailed`로 끝난다.
+        let identity = self.network_identity();
+        let extra = identity
+            .as_ref()
+            .map(|identity| vec![("GIT_SSH_COMMAND".to_owned(), identity.ssh_command.clone())])
+            .unwrap_or_default();
+        let head_before = self.head_sha()?;
+        let mut outcome = self.run_with(args, None, timeout, true, &extra)?;
+        if let Some(identity) = &identity {
+            redact_identity_path(&mut outcome, &identity.identity_path);
+        }
         let head_after = self.head_sha()?;
         self.receipt(action, outcome, head_before, head_after)
     }
@@ -1294,7 +1442,39 @@ fn diff_with(runner: &GitRunner, request: &ProjectGitDiffRequest) -> Result<GitD
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let mut args: Vec<&str> = if let Some(commit) = commit {
+    let trimmed = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let range = match (trimmed(&request.range_from), trimmed(&request.range_to)) {
+        (Some(from), Some(to)) => {
+            // 한쪽만 온 요청을 반대쪽 기본값으로 메우지 않는다. 어느 끝점을 가정해도 호출자가
+            // 믿는 범위와 다른 diff 가 열리고, 그것이 B9 가 없애려는 바로 그 거짓말이다.
+            if commit.is_some() || request.staged {
+                return Err(CoreError::InvalidInput(
+                    "범위 비교는 staged·commit 과 함께 쓸 수 없습니다.".into(),
+                ));
+            }
+            runner.verify_commit_ref(&from)?;
+            runner.verify_commit_ref(&to)?;
+            // 세 점이다. `range_files`(B8)가 세 점으로 목록을 뽑으므로 두 점으로 본문을 열면
+            // 목록에 있는 파일과 본문이 어긋난다 — 수신 쪽에서는 내 커밋이 만든 파일이
+            // '삭제'로 보인다.
+            Some(format!("{from}...{to}"))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(CoreError::InvalidInput(
+                "범위 비교에는 rangeFrom 과 rangeTo 가 둘 다 필요합니다.".into(),
+            ))
+        }
+    };
+    let mut args: Vec<&str> = if range.is_some() {
+        vec!["diff"]
+    } else if let Some(commit) = commit {
         // `show`는 첫 커밋(부모 없음)과 병합 커밋(combined diff)을 모두 알아서 다룬다.
         runner.verify_commit_ref(commit)?;
         vec!["show", "--format="]
@@ -1305,7 +1485,9 @@ fn diff_with(runner: &GitRunner, request: &ProjectGitDiffRequest) -> Result<GitD
     };
     args.extend(["--no-ext-diff", "--no-color", "--no-textconv", "-M"]);
     args.push("--end-of-options");
-    if let Some(commit) = commit {
+    if let Some(range) = range.as_deref() {
+        args.push(range);
+    } else if let Some(commit) = commit {
         args.push(commit);
     }
     args.push("--");
@@ -1320,29 +1502,30 @@ fn diff_with(runner: &GitRunner, request: &ProjectGitDiffRequest) -> Result<GitD
             first_line(&outcome.stderr)
         )));
     }
-    let untracked = if request.staged || commit.is_some() || !outcome.stdout.is_empty() {
-        false
-    } else {
-        // 추적되지 않는 파일은 diff에 안 나온다. 본문은 프로젝트 파일 화면이 보여 준다.
-        let listed = runner.read(
-            &[
-                "ls-files",
-                "--others",
-                "--exclude-standard",
-                "-z",
-                "--",
-                &path,
-            ],
-            READ_TIMEOUT,
-        )?;
-        // `status`는 추적되지 않는 폴더를 `docs/` 한 항목으로 내므로, 그 아래 파일이 하나라도
-        // 나오면 폴더 자체가 추적되지 않는 것이다.
-        let prefix = format!("{}/", path.trim_end_matches('/'));
-        listed
-            .stdout
-            .split('\0')
-            .any(|listed| listed == path || listed.starts_with(&prefix))
-    };
+    let untracked =
+        if request.staged || commit.is_some() || range.is_some() || !outcome.stdout.is_empty() {
+            false
+        } else {
+            // 추적되지 않는 파일은 diff에 안 나온다. 본문은 프로젝트 파일 화면이 보여 준다.
+            let listed = runner.read(
+                &[
+                    "ls-files",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                    "--",
+                    &path,
+                ],
+                READ_TIMEOUT,
+            )?;
+            // `status`는 추적되지 않는 폴더를 `docs/` 한 항목으로 내므로, 그 아래 파일이 하나라도
+            // 나오면 폴더 자체가 추적되지 않는 것이다.
+            let prefix = format!("{}/", path.trim_end_matches('/'));
+            listed
+                .stdout
+                .split('\0')
+                .any(|listed| listed == path || listed.starts_with(&prefix))
+        };
     let kind = if untracked {
         GitDiffKind::Untracked
     } else if outcome.stdout.is_empty() {
@@ -1526,6 +1709,10 @@ fn branch_comparison_with(
         outgoing_count: 0,
         incoming_truncated: false,
         outgoing_truncated: false,
+        incoming_files: Vec::new(),
+        outgoing_files: Vec::new(),
+        incoming_files_truncated: false,
+        outgoing_files_truncated: false,
         diverged: false,
         last_fetched_at,
     };
@@ -1574,6 +1761,8 @@ fn branch_comparison_with(
     let (incoming_count, outgoing_count) = left_right_counts(runner, &branch, &upstream)?;
     let incoming = range_commits(runner, &branch, &upstream, limit)?;
     let outgoing = range_commits(runner, &upstream, &branch, limit)?;
+    let (incoming_files, incoming_files_truncated) = range_files(runner, &branch, &upstream)?;
+    let (outgoing_files, outgoing_files_truncated) = range_files(runner, &upstream, &branch)?;
     Ok(GitBranchComparison {
         project_path: runner.root_string(),
         branch: Some(branch),
@@ -1586,8 +1775,50 @@ fn branch_comparison_with(
         outgoing,
         incoming_count,
         outgoing_count,
+        incoming_files,
+        outgoing_files,
+        incoming_files_truncated,
+        outgoing_files_truncated,
         last_fetched_at,
     })
+}
+
+/// B8. 한 방향이 합쳐서 바꾸는 파일 목록. 커밋 목록을 뽑는 `range_commits`가 `from..to`를 쓰는
+/// 것과 달리 여기서는 **세 점**(`from...to`)을 쓴다. `git diff from..to`는 두 끝점을 그냥 비교해
+/// 반대편에만 있는 변경까지 뒤집어 싣는데, 수신 요약이 답해야 하는 것은 "받으면 무엇이 바뀌는가"
+/// 즉 merge-base부터 `to`까지이고 그것이 커밋 목록과 같은 범위다.
+///
+/// 상태 해석은 커밋 파일 목록과 같은 `parse_name_status`를 그대로 쓴다. 두 자리가 따로 파싱하면
+/// rename(`R100` + 경로 둘) 한 자리만 고쳐져 한쪽 화면에서만 경로가 밀린다.
+fn range_files(
+    runner: &GitRunner,
+    from: &str,
+    to: &str,
+) -> Result<(Vec<GitCommitFile>, bool), CoreError> {
+    let range = format!("{from}...{to}");
+    let outcome = runner.read(
+        &[
+            "diff",
+            "--name-status",
+            "-z",
+            "-M",
+            "--end-of-options",
+            &range,
+            "--",
+        ],
+        READ_TIMEOUT,
+    )?;
+    if !outcome.success {
+        return Err(CoreError::Runtime(format!(
+            "git diff 실패: {}",
+            first_line(&outcome.stderr)
+        )));
+    }
+    let (files, truncated) = parse_name_status(&outcome.stdout);
+    Ok((
+        files,
+        truncated || outcome.stdout.len() >= MAX_CAPTURED_OUTPUT_BYTES,
+    ))
 }
 
 /// `branch.<name>.remote` + `merge`가 아니라 `for-each-ref`에 묻는다. 두 설정을 손으로 합치면
@@ -2164,15 +2395,22 @@ pub fn fetch_project_git(
     request: &ProjectGitFetchRequest,
 ) -> Result<GitActionReceipt, CoreError> {
     mutate_project(app_data_dir, project_root, "fetch", |runner| {
-        let remote = runner.resolve_remote(request.remote.as_deref())?;
-        let mut args: Vec<&str> = vec!["fetch"];
-        if request.prune {
-            args.push("--prune");
-        }
-        args.push("--end-of-options");
-        args.push(&remote);
-        runner.mutate("fetch", &args, None, NETWORK_TIMEOUT)
+        fetch_with(runner, request)
     })
+}
+
+fn fetch_with(
+    runner: &GitRunner,
+    request: &ProjectGitFetchRequest,
+) -> Result<GitActionReceipt, CoreError> {
+    let remote = runner.resolve_remote(request.remote.as_deref())?;
+    let mut args: Vec<&str> = vec!["fetch"];
+    if request.prune {
+        args.push("--prune");
+    }
+    args.push("--end-of-options");
+    args.push(&remote);
+    runner.network_mutate("fetch", &args, NETWORK_TIMEOUT)
 }
 
 pub fn pull_project_git(
@@ -2181,17 +2419,24 @@ pub fn pull_project_git(
     request: &ProjectGitPullRequest,
 ) -> Result<GitActionReceipt, CoreError> {
     mutate_project(app_data_dir, project_root, "pull", |runner| {
-        require_branch_head(runner)?;
-        let remote = runner.resolve_remote(request.remote.as_deref())?;
-        let mut args: Vec<&str> = vec!["pull"];
-        match request.mode {
-            GitPullMode::FfOnly => args.extend(["--ff-only", "--no-rebase"]),
-            GitPullMode::Rebase => args.extend(["--rebase", "--no-autostash"]),
-        }
-        args.push("--end-of-options");
-        args.push(&remote);
-        runner.mutate("pull", &args, None, NETWORK_TIMEOUT)
+        pull_with(runner, request)
     })
+}
+
+fn pull_with(
+    runner: &GitRunner,
+    request: &ProjectGitPullRequest,
+) -> Result<GitActionReceipt, CoreError> {
+    require_branch_head(runner)?;
+    let remote = runner.resolve_remote(request.remote.as_deref())?;
+    let mut args: Vec<&str> = vec!["pull"];
+    match request.mode {
+        GitPullMode::FfOnly => args.extend(["--ff-only", "--no-rebase"]),
+        GitPullMode::Rebase => args.extend(["--rebase", "--no-autostash"]),
+    }
+    args.push("--end-of-options");
+    args.push(&remote);
+    runner.network_mutate("pull", &args, NETWORK_TIMEOUT)
 }
 
 pub fn push_project_git(
@@ -2200,24 +2445,43 @@ pub fn push_project_git(
     request: &ProjectGitPushRequest,
 ) -> Result<GitActionReceipt, CoreError> {
     mutate_project(app_data_dir, project_root, "push", |runner| {
-        require_branch_head(runner)?;
-        let remote = runner.resolve_remote(request.remote.as_deref())?;
-        // 업스트림이 같은 원격에 있으면 그 브랜치로 보낸다. `HEAD`만 주면 같은 이름의 원격
-        // 브랜치로 가서, 확인창이 보여 준 업스트림(`feature → origin/dev`)과 실제 대상이
-        // 갈린다. 업스트림이 없거나 다른 원격이면 같은 이름으로 올린다.
-        let refspec = match runner.upstream_branch_on(&remote)? {
-            Some(branch) => format!("HEAD:refs/heads/{branch}"),
-            None => "HEAD".to_owned(),
-        };
-        let mut args: Vec<&str> = vec!["push"];
-        if request.set_upstream {
-            args.push("--set-upstream");
-        }
-        args.push("--end-of-options");
-        args.push(&remote);
-        args.push(&refspec);
-        runner.mutate("push", &args, None, NETWORK_TIMEOUT)
+        push_with(runner, request)
     })
+}
+
+fn push_with(
+    runner: &GitRunner,
+    request: &ProjectGitPushRequest,
+) -> Result<GitActionReceipt, CoreError> {
+    require_branch_head(runner)?;
+    let remote = runner.resolve_remote(request.remote.as_deref())?;
+    // 업스트림이 같은 원격에 있으면 그 브랜치로 보낸다. `HEAD`만 주면 같은 이름의 원격
+    // 브랜치로 가서, 확인창이 보여 준 업스트림(`feature → origin/dev`)과 실제 대상이
+    // 갈린다. 업스트림이 없거나 다른 원격이면 같은 이름으로 올린다.
+    let refspec = match runner.upstream_branch_on(&remote)? {
+        Some(branch) => format!("HEAD:refs/heads/{branch}"),
+        None => "HEAD".to_owned(),
+    };
+    let mut args: Vec<&str> = vec!["push"];
+    if request.set_upstream {
+        args.push("--set-upstream");
+    }
+    args.push("--end-of-options");
+    args.push(&remote);
+    args.push(&refspec);
+    runner.network_mutate("push", &args, NETWORK_TIMEOUT)
+}
+
+/// C16-10. 영수증에서 개인키 경로를 가린다. `ssh`는 읽지 못하는 신원 파일을 경고하면서
+/// 경로를 그대로 적고, 그 영수증은 원격 화면까지 간다. 경로는 비밀값이 아니지만 사용자의
+/// 홈 구조와 키 이름을 드러내므로, 수용 기준대로 자리표시자로 바꾼다.
+fn redact_identity_path(outcome: &mut CommandOutcome, identity_path: &str) {
+    const PLACEHOLDER: &str = "<git 원격용 SSH 키>";
+    if identity_path.is_empty() {
+        return;
+    }
+    outcome.stdout = outcome.stdout.replace(identity_path, PLACEHOLDER);
+    outcome.stderr = outcome.stderr.replace(identity_path, PLACEHOLDER);
 }
 
 /// pull·push는 브랜치 위에서만 뜻이 있다. detached HEAD와 첫 커밋 전 저장소는 거절한다.
@@ -3451,6 +3715,8 @@ def456\x1fdef\x1f\x1fAn\x1fan@x\x1f1699999999\x1fCn\x1f1699999999\x1f\x1fRoot\x1
                 original_path: None,
                 staged: false,
                 commit: None,
+                range_from: None,
+                range_to: None,
             },
         )
         .expect("diff");
@@ -3498,6 +3764,8 @@ def456\x1fdef\x1f\x1fAn\x1fan@x\x1f1699999999\x1fCn\x1f1699999999\x1f\x1fRoot\x1
                 original_path: None,
                 staged: false,
                 commit: Some(first_sha.clone()),
+                range_from: None,
+                range_to: None,
             },
         )
         .expect("commit diff");
@@ -3515,6 +3783,8 @@ def456\x1fdef\x1f\x1fAn\x1fan@x\x1f1699999999\x1fCn\x1f1699999999\x1f\x1fRoot\x1
                 original_path: None,
                 staged: false,
                 commit: None,
+                range_from: None,
+                range_to: None,
             },
         )
         .expect("diff");
@@ -3710,6 +3980,314 @@ def456\x1fdef\x1f\x1fAn\x1fan@x\x1f1699999999\x1fCn\x1f1699999999\x1f\x1fRoot\x1
 
         // 존재하지 않는 ref.
         assert!(git.verify_commit_ref("nope").is_err());
+    }
+
+    /// B8. 비교는 커밋만이 아니라 **방향마다 바뀌는 파일 요약**도 갈라 싣는다.
+    ///
+    /// 2026-10-04에 이 시험이 붙은 이유: B6이 커밋 목록을 갈라 주고 나서도 화면이 답하지 못하는
+    /// 질문이 하나 남아 있었다 — "지금 pull하면 내가 건드리고 있는 파일이 바뀌는가". 커밋 제목
+    /// 세 줄로는 알 수 없고, 사용자는 pull을 누른 뒤에야 충돌로 그 사실을 알게 된다.
+    ///
+    /// 고정하는 것은 문구가 아니라 **범위**다. 구현은 `git diff from...to`(세 점)를 쓴다.
+    /// 두 점(`from..to`)으로 쓰면 git은 두 끝점을 그냥 비교하므로, 수신 요약에 **내 쪽에만 있는
+    /// 커밋이 만든 파일이 반대 상태로 섞여 들어온다** — 여기서는 c.txt·d.txt가 수신 쪽에 삭제로
+    /// 찍힌다. 그래서 이 시험은 양쪽이 분기한 상태를 실제 git으로 만들어 두고, 수신 요약이
+    /// 정확히 그쪽 커밋이 만든 파일 하나뿐임을 본다. 한 글자(`.`)만 빠져도 여기서 걸린다.
+    #[test]
+    fn project_branch_comparison_summarizes_files_per_direction() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let git = runner(&repo);
+        let write = |name: &str, body: &str| {
+            std::fs::write(repo.root.join(name), body).expect("write");
+            stage_with(&git, &[name.to_owned()]).expect("stage");
+        };
+        write(
+            "a.txt", "one
+",
+        );
+        commit_with(&git, "base").expect("base");
+
+        let branched = git
+            .read(
+                &["branch", "upstream-side", "--end-of-options"],
+                READ_TIMEOUT,
+            )
+            .expect("branch");
+        assert!(branched.success, "{}", branched.stderr);
+
+        // upstream 쪽: 파일 하나를 새로 만든다 — 받으면 생기는 파일.
+        let switched = switch_with(
+            &git,
+            &ProjectGitSwitchRequest {
+                project_path: String::new(),
+                branch: "upstream-side".into(),
+                create: false,
+                start_point: None,
+            },
+        )
+        .expect("switch");
+        assert!(switched.succeeded, "{}", switched.stderr);
+        write(
+            "theirs.txt",
+            "theirs
+",
+        );
+        commit_with(&git, "그쪽 커밋").expect("theirs");
+
+        // 내 쪽: 기존 파일을 고치고 새 파일 하나를 만든다 — 보내면 반영되는 파일 둘.
+        switch_with(
+            &git,
+            &ProjectGitSwitchRequest {
+                project_path: String::new(),
+                branch: "main".into(),
+                create: false,
+                start_point: None,
+            },
+        )
+        .expect("switch back");
+        write(
+            "a.txt",
+            "one
+mine
+",
+        );
+        write(
+            "mine.txt", "mine
+",
+        );
+        commit_with(&git, "내 커밋").expect("mine");
+
+        let split = branch_comparison_with(
+            &git,
+            &ProjectGitComparisonRequest {
+                project_path: String::new(),
+                branch: None,
+                upstream: Some("upstream-side".into()),
+                limit: None,
+            },
+        )
+        .expect("comparison");
+        assert!(split.diverged, "양쪽 다 커밋이 있어야 범위가 갈라진다");
+
+        let incoming: Vec<&str> = split
+            .incoming_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(
+            incoming,
+            vec!["theirs.txt"],
+            "수신 요약은 merge-base..upstream이다 — 내 쪽 커밋이 만든 파일이 섞이면 두 점 범위를 쓴 것이다"
+        );
+        assert_eq!(split.incoming_files[0].status, GitChangeKind::Added);
+
+        let mut outgoing: Vec<&str> = split
+            .outgoing_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        outgoing.sort_unstable();
+        assert_eq!(
+            outgoing,
+            vec!["a.txt", "mine.txt"],
+            "송신 요약은 merge-base..branch다"
+        );
+        assert!(!split.incoming_files_truncated && !split.outgoing_files_truncated);
+
+        // 방향을 바꿔 물으면 파일 요약도 커밋 목록과 같이 자리를 맞바꾼다.
+        let mirrored = branch_comparison_with(
+            &git,
+            &ProjectGitComparisonRequest {
+                project_path: String::new(),
+                branch: Some("upstream-side".into()),
+                upstream: Some("main".into()),
+                limit: None,
+            },
+        )
+        .expect("mirrored");
+        let mirrored_incoming: Vec<&str> = mirrored
+            .incoming_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert!(
+            mirrored_incoming.contains(&"mine.txt"),
+            "기준을 바꾸면 내 파일이 수신 쪽으로 간다"
+        );
+
+        // upstream이 없는 빈 비교에는 요약도 비어 있다 — 오류가 아니다.
+        let none = branch_comparison_with(
+            &git,
+            &ProjectGitComparisonRequest {
+                project_path: String::new(),
+                branch: None,
+                upstream: None,
+                limit: None,
+            },
+        )
+        .expect("no upstream");
+        assert!(none.no_upstream);
+        assert!(none.incoming_files.is_empty() && none.outgoing_files.is_empty());
+    }
+
+    /// B9. 비교 요약이 집은 파일을 **그 요약과 같은 범위로** 연다.
+    ///
+    /// 2026-10-04에 이 시험이 붙은 이유: B8이 방향별 파일 목록을 실었지만 화면은 그것을
+    /// `<span>`으로만 그렸고, 바로 위 주석이 왜 버튼이 아닌지 적어 두었다 — "요약은 merge-base
+    /// 부터 끝점까지 한 범위라 커밋 하나의 diff를 여는 버튼으로 만들면 그 커밋이 건드리지 않은
+    /// 파일에도 빈 diff가 열려 거짓말이 된다". 진단은 맞았고, 답은 버튼을 포기하는 것이 아니라
+    /// 범위를 여는 길을 내는 것이었다. `ProjectGitDiffRequest`는 작업 트리·인덱스·커밋 하나까지만
+    /// 볼 수 있었다.
+    ///
+    /// 고정하는 것은 셋이고, 전부 **틀렸을 때 조용한** 자리다.
+    ///
+    /// 1. **세 점이어야 한다.** `range_files`(B8)가 `from...to`로 목록을 뽑으므로 본문을 두 점
+    ///    (`from..to`)으로 열면 목록과 본문이 어긋난다. 수신 쪽에서 특히 나쁘다 — 두 점은 내
+    ///    커밋이 만든 파일을 반대 방향으로 뒤집어 싣기 때문에, "받으면 생긴다"고 요약이 말한
+    ///    파일을 눌렀을 때 "삭제된다"는 diff가 열린다. 여기서는 내 쪽에만 있는 `mine.txt`를
+    ///    수신 범위로 열어 **빈 diff**가 나오는지 본다. 두 점으로 바꾸면 이 단언이 삭제
+    ///    패치를 받아 실패한다.
+    /// 2. **반쪽 요청은 거절한다.** 한쪽 끝점만 온 요청을 반대쪽 기본값(HEAD 등)으로 메우면
+    ///    호출자가 믿는 범위와 다른 diff가 열리는데, 그것이 1번이 막으려는 거짓말과 같은
+    ///    모양이다. 오류가 아니라 가정으로 때우는 쪽이 더 나쁘다.
+    /// 3. **`staged`·`commit`과 섞이지 않는다.** 셋 다 argv의 같은 자리를 다투므로 조용히
+    ///    한쪽이 이기면 어느 범위가 열렸는지 아무도 모른다.
+    #[test]
+    fn project_branch_comparison_opens_range_diff_for_each_file() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let git = runner(&repo);
+        let write = |name: &str, body: &str| {
+            std::fs::write(repo.root.join(name), body).expect("write");
+            stage_with(&git, &[name.to_owned()]).expect("stage");
+        };
+        write(
+            "a.txt", "one
+",
+        );
+        commit_with(&git, "base").expect("base");
+        let branched = git
+            .read(
+                &["branch", "upstream-side", "--end-of-options"],
+                READ_TIMEOUT,
+            )
+            .expect("branch");
+        assert!(branched.success, "{}", branched.stderr);
+
+        // upstream 쪽에만 있는 파일.
+        switch_with(
+            &git,
+            &ProjectGitSwitchRequest {
+                project_path: String::new(),
+                branch: "upstream-side".into(),
+                create: false,
+                start_point: None,
+            },
+        )
+        .expect("switch");
+        write(
+            "theirs.txt",
+            "theirs
+",
+        );
+        commit_with(&git, "그쪽 커밋").expect("theirs");
+
+        // 내 쪽에만 있는 파일.
+        switch_with(
+            &git,
+            &ProjectGitSwitchRequest {
+                project_path: String::new(),
+                branch: "main".into(),
+                create: false,
+                start_point: None,
+            },
+        )
+        .expect("switch back");
+        write(
+            "mine.txt", "mine
+",
+        );
+        commit_with(&git, "내 커밋").expect("mine");
+
+        let range = |path: &str, from: &str, to: &str| {
+            diff_with(
+                &git,
+                &ProjectGitDiffRequest {
+                    project_path: String::new(),
+                    path: path.into(),
+                    original_path: None,
+                    staged: false,
+                    commit: None,
+                    range_from: Some(from.into()),
+                    range_to: Some(to.into()),
+                },
+            )
+        };
+
+        // 수신 범위(main...upstream-side)에서 그쪽 파일은 추가로 열린다.
+        let theirs = range("theirs.txt", "main", "upstream-side").expect("incoming diff");
+        assert_eq!(theirs.kind, GitDiffKind::Text);
+        assert!(
+            theirs.patch.contains("+theirs"),
+            "수신 요약이 '추가'라고 한 파일은 추가 패치로 열려야 한다: {}",
+            theirs.patch
+        );
+
+        // 같은 범위에서 **내 쪽에만 있는** 파일은 비어 있다. 두 점으로 열면 여기에 삭제
+        // 패치가 실려 요약과 반대되는 화면이 된다.
+        let mine_in_incoming = range("mine.txt", "main", "upstream-side").expect("three-dot");
+        assert_eq!(
+            mine_in_incoming.kind,
+            GitDiffKind::Empty,
+            "세 점이 아니면 내 커밋이 만든 파일이 수신 범위에서 '삭제'로 열린다: {}",
+            mine_in_incoming.patch
+        );
+
+        // 방향을 바꾸면 그 파일이 송신 범위에서 추가로 열린다.
+        let mine_out = range("mine.txt", "upstream-side", "main").expect("outgoing diff");
+        assert!(mine_out.patch.contains("+mine"), "{}", mine_out.patch);
+
+        // 반쪽 요청은 거절한다 — 반대쪽을 가정해 메우지 않는다.
+        let half = diff_with(
+            &git,
+            &ProjectGitDiffRequest {
+                project_path: String::new(),
+                path: "a.txt".into(),
+                original_path: None,
+                staged: false,
+                commit: None,
+                range_from: Some("main".into()),
+                range_to: None,
+            },
+        );
+        assert!(
+            matches!(half, Err(CoreError::InvalidInput(_))),
+            "끝점 하나만 온 요청은 거절해야 한다"
+        );
+
+        // staged·commit 과는 상호배타다.
+        let mixed = diff_with(
+            &git,
+            &ProjectGitDiffRequest {
+                project_path: String::new(),
+                path: "a.txt".into(),
+                original_path: None,
+                staged: true,
+                commit: None,
+                range_from: Some("main".into()),
+                range_to: Some("upstream-side".into()),
+            },
+        );
+        assert!(
+            matches!(mixed, Err(CoreError::InvalidInput(_))),
+            "staged 와 범위를 함께 받으면 어느 범위가 열렸는지 알 수 없다"
+        );
+
+        // 끝점은 C16-5 대로 검증된다 — 없는 ref 는 거절한다.
+        assert!(range("a.txt", "main", "없는가지").is_err());
     }
 
     /// B6/B7. 비교는 수신(`HEAD..upstream`)과 송신(`upstream..HEAD`)으로 갈려 나온다.
@@ -3943,5 +4521,1998 @@ def456\x1fdef\x1f\x1fAn\x1fan@x\x1f1699999999\x1fCn\x1f1699999999\x1f\x1fRoot\x1
         assert!(BusyGuard::acquire(&root).is_none());
         drop(first);
         assert!(BusyGuard::acquire(&root).is_some());
+    }
+
+    /// C16-4/C16-6. `pull`은 실제 원격을 상대로 한 번도 돌아 본 적이 없었다.
+    ///
+    /// 2026-10-04 실측으로 확인한 공백: 이 모듈의 실제 git 왕복 시험들은 **원격을 만들지
+    /// 않는다.** `c16_real_git_round_trip`은 "원격이 없으니 fetch는 remote 해석에서 실패한다"로
+    /// 끝나고, 비교 시험 셋은 원격 대신 같은 저장소의 다른 브랜치를 upstream 자리에 세운다.
+    /// 그래서 `fetch_project_git`·`pull_project_git`의 인수 벡터는 `resolve_remote`가 거절하는
+    /// 지점 너머로 단 한 번도 실행된 적이 없었다.
+    ///
+    /// 그 공백이 가리는 것이 둘이다.
+    ///
+    /// 첫째, **C16-4의 pull 모드**다. 기본은 `--ff-only --no-rebase`이고 요청이 있을 때만
+    /// `--rebase --no-autostash`인데, 어느 쪽도 실행된 적이 없으니 두 인수가 실제로 그 효과를
+    /// 내는지는 아무도 확인하지 않았다. `--ff-only`가 빠지면 분기한 상태에서 pull이 **병합
+    /// 커밋을 만들며 성공한다** — 사용자가 고르지 않은 병합이 조용히 생기는 것이고, 영수증은
+    /// 그것을 성공으로 적는다.
+    ///
+    /// 둘째, **C16-6의 결말 분류**다. `failures_are_classified_from_git_wording`은
+    /// `classify_failure`에 손으로 적은 문자열을 먹인다. 그 문자열이 **지금 이 git이 실제로
+    /// 뱉는 말**과 같은지는 그 시험이 답할 수 없다. 여기서는 진짜로 분기시킨 저장소에
+    /// `pull --ff-only`를 걸어, git이 내는 출력 그대로가 `NotFastForward`로 읽히는지 본다.
+    /// 어긋나면 `Failed`로 떨어지고, 화면은 "리베이스로 당겨 보라"는 안내 대신 일반 오류를
+    /// 띄운다.
+    ///
+    /// 고정하는 것은 문구가 아니라 **결말과 앵커**다: 분기한 pull은 오류가 아니라 영수증이고
+    /// (C16-6), 실패한 pull은 `head_before == head_after`로 HEAD를 움직이지 않으며, 성공한
+    /// pull만 HEAD를 옮긴다.
+    #[test]
+    fn c16_pull_against_a_real_remote_fast_forwards_and_reports_divergence() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let Ok(executable) = resolve_named_executable(&["git"]) else {
+            return;
+        };
+        let git = runner(&repo);
+        let workspace = repo.root.parent().expect("workspace").to_path_buf();
+        // 원격은 네트워크가 아니라 같은 디스크의 bare 저장소다. git에게 경로 원격과 URL
+        // 원격은 같은 자리를 지나므로, 이 시험은 오프라인에서도 pull 경로를 끝까지 민다.
+        let remote_path = workspace.join("remote.git");
+        let other_path = workspace.join("other");
+        let raw = |dir: &Path, args: &[&str]| {
+            let outcome = run_capped_with(
+                &executable,
+                args,
+                READ_TIMEOUT,
+                &CappedOptions {
+                    current_dir: Some(dir),
+                    env: &test_env(),
+                    ..CappedOptions::default()
+                },
+            )
+            .expect("git");
+            assert!(outcome.success, "{args:?}: {}", outcome.stderr);
+        };
+        // 캐노니컬 경로는 Windows에서 \\?\ 접두사를 달고 나오는데, 그대로 슬래시로
+        // 바꾸면 git이 //?/C:/... 를 원격으로 읽지 못한다. 자식에게 넘기는 경로는 이미
+        // path_guard가 그 접두사를 떼는 자리를 갖고 있으므로 같은 것을 쓴다.
+        let remote_arg = path_guard::child_facing(&remote_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        // 내 쪽 첫 커밋 → bare 원격을 만들고 밀어 둔다.
+        std::fs::write(
+            repo.root.join("a.txt"),
+            "one
+",
+        )
+        .expect("a");
+        stage_with(&git, &["a.txt".into()]).expect("stage");
+        let first = commit_with(&git, "첫 커밋").expect("commit");
+        assert!(first.succeeded, "{}", first.stderr);
+        raw(
+            &workspace,
+            &["init", "-q", "--bare", "-b", "main", "remote.git"],
+        );
+        raw(&repo.root, &["remote", "add", "origin", &remote_arg]);
+        let pushed = git
+            .read(&["push", "-u", "origin", "main"], NETWORK_TIMEOUT)
+            .expect("push");
+        assert!(pushed.success, "{}", pushed.stderr);
+
+        // 다른 사람 쪽 작업장. 같은 bare를 복제해 커밋 하나를 올린다.
+        raw(&workspace, &["clone", "-q", &remote_arg, "other"]);
+        let push_from_other = |name: &str, body: &str, message: &str| {
+            std::fs::write(other_path.join(name), body).expect("other write");
+            raw(&other_path, &["add", "-A"]);
+            raw(&other_path, &["commit", "-q", "-m", message]);
+            raw(&other_path, &["push", "-q", "origin", "main"]);
+        };
+        push_from_other(
+            "b.txt",
+            "theirs
+",
+            "그쪽 커밋",
+        );
+
+        // fetch는 resolve_remote 너머까지 실제로 간다.
+        let fetched = fetch_with(
+            &git,
+            &ProjectGitFetchRequest {
+                project_path: String::new(),
+                remote: None,
+                prune: false,
+            },
+        )
+        .expect("fetch");
+        assert!(fetched.succeeded, "{}", fetched.stderr);
+        assert_eq!(fetched.outcome, GitOutcome::Completed);
+
+        // 앞서 있기만 한 상태의 pull은 fast-forward로 끝나고 HEAD가 움직인다.
+        let pulled = pull_with(
+            &git,
+            &ProjectGitPullRequest {
+                project_path: String::new(),
+                mode: GitPullMode::FfOnly,
+                remote: None,
+            },
+        )
+        .expect("ff pull");
+        assert!(pulled.succeeded, "{}", pulled.stderr);
+        assert_eq!(pulled.outcome, GitOutcome::Completed);
+        assert_ne!(
+            pulled.head_before, pulled.head_after,
+            "fast-forward는 HEAD를 옮긴다"
+        );
+        assert!(repo.root.join("b.txt").exists(), "받은 파일이 트리에 있다");
+
+        // 양쪽이 갈라진다 — 내 쪽 커밋 하나, 그쪽 커밋 하나.
+        std::fs::write(
+            repo.root.join("c.txt"),
+            "mine
+",
+        )
+        .expect("c");
+        stage_with(&git, &["c.txt".into()]).expect("stage mine");
+        let mine = commit_with(&git, "내 커밋").expect("mine");
+        assert!(mine.succeeded, "{}", mine.stderr);
+        let diverged_head = mine.head_after.clone().expect("mine sha");
+        push_from_other(
+            "d.txt",
+            "theirs two
+",
+            "그쪽 두 번째 커밋",
+        );
+
+        // C16-6: 분기한 --ff-only pull은 Err가 아니라 영수증이고, HEAD를 건드리지 않는다.
+        // 이 단언이 `classify_failure`의 문구를 실제 git 출력에 묶는 자리다.
+        let blocked = pull_with(
+            &git,
+            &ProjectGitPullRequest {
+                project_path: String::new(),
+                mode: GitPullMode::FfOnly,
+                remote: None,
+            },
+        )
+        .expect("분기한 pull은 오류가 아니라 영수증이다");
+        assert!(!blocked.succeeded);
+        assert_eq!(
+            blocked.outcome,
+            GitOutcome::NotFastForward,
+            "실제 git 출력이 NotFastForward로 읽혀야 한다: {}",
+            blocked.stderr
+        );
+        assert_eq!(
+            blocked.head_before, blocked.head_after,
+            "실패한 pull은 HEAD를 옮기지 않는다"
+        );
+        assert_eq!(blocked.head_after.as_deref(), Some(diverged_head.as_str()));
+        assert!(
+            !repo.root.join("d.txt").exists(),
+            "거절된 pull은 작업 트리에 아무것도 남기지 않는다"
+        );
+
+        // --rebase는 같은 분기를 통과시키고, 양쪽 파일이 모두 남는다.
+        let rebased = pull_with(
+            &git,
+            &ProjectGitPullRequest {
+                project_path: String::new(),
+                mode: GitPullMode::Rebase,
+                remote: None,
+            },
+        )
+        .expect("rebase pull");
+        assert!(rebased.succeeded, "{}", rebased.stderr);
+        assert_eq!(rebased.outcome, GitOutcome::Completed);
+        assert_ne!(rebased.head_before, rebased.head_after);
+        assert!(repo.root.join("c.txt").exists(), "내 변경이 살아 있다");
+        assert!(repo.root.join("d.txt").exists(), "그쪽 변경을 받았다");
+        // 리베이스로 당겼으므로 병합 커밋이 아니다 — 부모가 하나다.
+        let parents = git
+            .read(&["rev-list", "--parents", "-n", "1", "HEAD"], READ_TIMEOUT)
+            .expect("parents");
+        assert_eq!(
+            parents.stdout.split_whitespace().count(),
+            2,
+            "--rebase는 병합 커밋을 만들지 않는다: {}",
+            parents.stdout
+        );
+    }
+
+    /// C16-4/C16-6. `push`의 refspec 선택은 한 번도 실행된 적이 없었다.
+    ///
+    /// 2026-10-04 실측. 직전 회차가 `pull`을 실제 bare 원격에 걸면서 "push는 자격증명이
+    /// 없어 잴 수 없다"고 적고 `push_with`를 떼지 않았다. 그 판단이 틀렸다 — 경로 원격은
+    /// 자격증명을 묻지 않으므로 push 경로도 같은 설비로 끝까지 민다. 그래서 이 모듈에서
+    /// `push_project_git`의 본문은 `resolve_remote` 너머로 **단 한 번도 돌아 본 적이 없었다.**
+    ///
+    /// 그 분기가 무엇을 막고 있는지는 제품 주석이 이미 구체적으로 적어 두었다. 업스트림이
+    /// 같은 원격에 있으면 refspec은 `HEAD:refs/heads/<업스트림 브랜치>`이고, 없으면 `HEAD`다.
+    /// 이 선택이 중요한 이유는 **로컬 브랜치 이름과 업스트림 브랜치 이름이 다를 때**다.
+    /// `HEAD`만 넘기면 git은 같은 이름의 원격 브랜치로 보내므로, 확인창이 "feature →
+    /// origin/main"이라고 보여 준 뒤 실제로는 `origin/feature`라는 **새 브랜치를 만든다.**
+    /// 사용자가 보낸 적 없는 브랜치가 원격에 생기고, 보내려던 곳은 그대로 뒤처진다.
+    /// push는 호스트 전용이고(C16-7) 바깥으로 나가는 유일한 명령이라, 그 대상이 갈리는 것은
+    /// 이 어댑터가 낼 수 있는 결과 중 가장 되돌리기 어려운 쪽이다.
+    ///
+    /// 여기서 고정하는 것은 문구가 아니라 **원격에 실제로 생긴 ref**다. 이름이 다른 업스트림
+    /// 위에서 push한 뒤 bare 원격의 ref 목록을 직접 읽어, 업스트림 브랜치만 움직였고
+    /// 로컬 이름의 브랜치는 생기지 않았음을 본다. refspec 계산을 `HEAD`로 되돌리면 그 순간
+    /// `refs/heads/feature`가 나타나므로 이 시험만 깨진다.
+    ///
+    /// 두 번째 단언은 C16-6의 `RejectedNonFastForward`를 **실제 git 출력**에 묶는다.
+    /// `failures_are_classified_from_git_wording`은 `classify_failure`에 손으로 적은 문자열을
+    /// 먹이므로, 그 문구가 지금 이 git이 뱉는 말과 같은지 답할 수 없다. 어긋나면 `Failed`로
+    /// 떨어지고 화면은 "먼저 가져와 리베이스하세요" 대신 일반 오류를 띄운다.
+    #[test]
+    fn c16_push_targets_the_upstream_branch_and_reports_rejection() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let Ok(executable) = resolve_named_executable(&["git"]) else {
+            return;
+        };
+        let git = runner(&repo);
+        let workspace = repo.root.parent().expect("workspace").to_path_buf();
+        let remote_path = workspace.join("remote.git");
+        let other_path = workspace.join("other");
+        let raw = |dir: &Path, args: &[&str]| {
+            let outcome = run_capped_with(
+                &executable,
+                args,
+                READ_TIMEOUT,
+                &CappedOptions {
+                    current_dir: Some(dir),
+                    env: &test_env(),
+                    ..CappedOptions::default()
+                },
+            )
+            .expect("git");
+            assert!(outcome.success, "{args:?}: {}", outcome.stderr);
+        };
+        // 캐노니컬 경로의 접두사를 그대로 슬래시로 바꾸면 git이 //?/C:/... 를 원격으로
+        // 읽지 못한다(직전 회차의 실측). 자식에게 넘기는 경로를 다듬는 자리를 그대로 쓴다.
+        let remote_arg = path_guard::child_facing(&remote_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let remote_refs = || {
+            let outcome = run_capped_with(
+                &executable,
+                &["for-each-ref", "--format=%(refname)", "refs/heads"],
+                READ_TIMEOUT,
+                &CappedOptions {
+                    current_dir: Some(remote_path.as_path()),
+                    env: &test_env(),
+                    ..CappedOptions::default()
+                },
+            )
+            .expect("for-each-ref");
+            assert!(outcome.success, "{}", outcome.stderr);
+            outcome
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+
+        std::fs::write(repo.root.join("a.txt"), "one\n").expect("a");
+        stage_with(&git, &["a.txt".into()]).expect("stage");
+        let first = commit_with(&git, "첫 커밋").expect("commit");
+        assert!(first.succeeded, "{}", first.stderr);
+        raw(
+            &workspace,
+            &["init", "-q", "--bare", "-b", "main", "remote.git"],
+        );
+        raw(&repo.root, &["remote", "add", "origin", &remote_arg]);
+        let pushed = git
+            .read(&["push", "-u", "origin", "main"], NETWORK_TIMEOUT)
+            .expect("push");
+        assert!(pushed.success, "{}", pushed.stderr);
+
+        // 이름이 다른 로컬 브랜치를 만들고 업스트림은 origin/main 으로 둔다. 화면의 확인창이
+        // "feature → origin/main"이라고 말하게 되는 바로 그 상태다.
+        let switched = switch_with(
+            &git,
+            &ProjectGitSwitchRequest {
+                project_path: String::new(),
+                branch: "feature".to_owned(),
+                create: true,
+                start_point: None,
+            },
+        )
+        .expect("switch");
+        assert!(switched.succeeded, "{}", switched.stderr);
+        raw(&repo.root, &["branch", "--set-upstream-to=origin/main"]);
+        std::fs::write(repo.root.join("b.txt"), "mine\n").expect("b");
+        stage_with(&git, &["b.txt".into()]).expect("stage mine");
+        let mine = commit_with(&git, "내 커밋").expect("mine");
+        assert!(mine.succeeded, "{}", mine.stderr);
+        let mine_sha = mine.head_after.clone().expect("mine sha");
+
+        let sent = push_with(
+            &git,
+            &ProjectGitPushRequest {
+                project_path: String::new(),
+                remote: None,
+                set_upstream: false,
+            },
+        )
+        .expect("push");
+        assert!(sent.succeeded, "{}", sent.stderr);
+        assert_eq!(sent.outcome, GitOutcome::Completed);
+
+        // 원격에 실제로 생긴 ref 가 판정이다. 로컬 이름으로 새 브랜치가 생기면 안 된다.
+        assert_eq!(
+            remote_refs(),
+            vec!["refs/heads/main".to_owned()],
+            "업스트림 브랜치만 움직여야 한다 — 로컬 이름의 브랜치가 생기면 사용자가 보낸 적 없는 브랜치가 원격에 남는다"
+        );
+        let landed = run_capped_with(
+            &executable,
+            &["rev-parse", "refs/heads/main"],
+            READ_TIMEOUT,
+            &CappedOptions {
+                current_dir: Some(remote_path.as_path()),
+                env: &test_env(),
+                ..CappedOptions::default()
+            },
+        )
+        .expect("rev-parse");
+        assert_eq!(
+            landed.stdout.trim(),
+            mine_sha,
+            "업스트림 브랜치가 내 커밋을 가리켜야 한다"
+        );
+
+        // C16-6: 원격이 앞서면 push 는 Err 가 아니라 RejectedNonFastForward 영수증이다.
+        raw(&workspace, &["clone", "-q", &remote_arg, "other"]);
+        std::fs::write(other_path.join("c.txt"), "theirs\n").expect("other write");
+        raw(&other_path, &["add", "-A"]);
+        raw(&other_path, &["commit", "-q", "-m", "그쪽 커밋"]);
+        raw(&other_path, &["push", "-q", "origin", "main"]);
+        std::fs::write(repo.root.join("d.txt"), "mine two\n").expect("d");
+        stage_with(&git, &["d.txt".into()]).expect("stage d");
+        let second = commit_with(&git, "내 두 번째 커밋").expect("second");
+        assert!(second.succeeded, "{}", second.stderr);
+
+        let rejected = push_with(
+            &git,
+            &ProjectGitPushRequest {
+                project_path: String::new(),
+                remote: None,
+                set_upstream: false,
+            },
+        )
+        .expect("거절된 push 는 오류가 아니라 영수증이다");
+        assert!(!rejected.succeeded);
+        assert_eq!(
+            rejected.outcome,
+            GitOutcome::RejectedNonFastForward,
+            "실제 git 출력이 RejectedNonFastForward 로 읽혀야 한다: {}",
+            rejected.stderr
+        );
+        assert_eq!(
+            rejected.head_before, rejected.head_after,
+            "거절된 push 는 로컬 HEAD 를 움직이지 않는다"
+        );
+        // 거절은 원격도 그대로 둔다 — C16-4 가 어떤 --force* 도 내밀지 않는 이유가 이것이다.
+        assert_eq!(
+            remote_refs(),
+            vec!["refs/heads/main".to_owned()],
+            "거절된 push 가 원격에 브랜치를 남기지 않는다"
+        );
+
+        // 같은 `upstream_short` 를 쓰는 두 번째 자리. 원격이 둘이면 `resolve_remote` 는
+        // 업스트림이 가리키는 원격을 골라야 하고, 고르지 못하면 "원격을 지정하세요" 로
+        // 거절한다. 업스트림 이름이 깨져 있던 동안에는 원격이 하나일 때만 우연히 돌았다.
+        raw(
+            &workspace,
+            &["init", "-q", "--bare", "-b", "main", "spare.git"],
+        );
+        let spare_arg = path_guard::child_facing(&workspace.join("spare.git"))
+            .to_string_lossy()
+            .replace('\\', "/");
+        raw(&repo.root, &["remote", "add", "spare", &spare_arg]);
+        let fetched = fetch_with(
+            &git,
+            &ProjectGitFetchRequest {
+                project_path: String::new(),
+                remote: None,
+                prune: false,
+            },
+        )
+        .expect("원격이 둘이어도 업스트림의 원격을 고른다");
+        assert!(fetched.succeeded, "{}", fetched.stderr);
+    }
+
+    /// C16-10 — "git 원격용" SSH 키가 닿는 범위를 자식이 실제로 받은 환경으로 잰다.
+    ///
+    /// 수용 기준의 핵심은 "**프로젝트 git의 네트워크 작업에만**"이다. 그 문장은 소스를
+    /// 읽어서는 확인되지 않는다 — `env()` 한 자리를 고치면 읽기와 로컬 변경까지 같은 변수를
+    /// 받게 되고, 그래도 어떤 시험도 깨지지 않았다. 그래서 여기서는 한 번의 왕복에서 읽기
+    /// (`status`), 로컬 변경(`stage`·`commit`), 네트워크 변경(`fetch`)을 모두 돌리고, 기록된
+    /// 호출마다 `GIT_SSH_COMMAND`가 있는지를 argv의 앞머리로 가른다.
+    ///
+    /// 상속분도 함께 본다. 백엔드가 `GIT_SSH_COMMAND`를 물려받고 있으면 그것이 모든 호출에
+    /// 적용되어 사용자가 고른 키와 다른 신원으로 붙는다. 그래서 그 이름이 `REMOVED_ENV`에
+    /// 있는지도 같은 자리에서 못박는다 — 제거가 설정보다 먼저 도므로 우리 값은 살아남는다.
+    #[test]
+    fn c16_10_git_identity_reaches_only_network_calls_and_inherited_ones_are_removed() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let Ok(executable) = resolve_named_executable(&["git"]) else {
+            return;
+        };
+        let git = runner(&repo);
+        let workspace = repo.root.parent().expect("workspace").to_path_buf();
+        let remote_path = workspace.join("remote.git");
+        let outcome = run_capped_with(
+            &executable,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                remote_path.to_string_lossy().as_ref(),
+            ],
+            READ_TIMEOUT,
+            &CappedOptions {
+                current_dir: Some(&workspace),
+                env: &test_env(),
+                ..CappedOptions::default()
+            },
+        )
+        .expect("git init --bare");
+        assert!(outcome.success, "{}", outcome.stderr);
+        let remote_arg = path_guard::child_facing(&remote_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let added = git
+            .write(
+                &["remote", "add", "origin", &remote_arg],
+                None,
+                READ_TIMEOUT,
+            )
+            .expect("remote add");
+        assert!(added.success, "{}", added.stderr);
+
+        let identity_path = "/tmp/am-test/.ssh/id_project_git".to_owned();
+        let ssh_command = format!("'/usr/bin/ssh' -i '{identity_path}' -o IdentitiesOnly=yes");
+        TEST_NETWORK_IDENTITY.with(|cell| {
+            *cell.borrow_mut() = Some(crate::ssh_endpoints::ProjectGitIdentity {
+                identity_path: identity_path.clone(),
+                ssh_command: ssh_command.clone(),
+            });
+        });
+        struct ClearIdentity;
+        impl Drop for ClearIdentity {
+            fn drop(&mut self) {
+                TEST_NETWORK_IDENTITY.with(|cell| *cell.borrow_mut() = None);
+            }
+        }
+        let _reset = ClearIdentity;
+
+        std::fs::write(repo.root.join("a.txt"), "a\n").expect("a.txt");
+        let recorder = ArgvRecorder::start();
+        status_with(&git).expect("status");
+        stage_with(&git, &["a.txt".to_owned()]).expect("stage");
+        assert!(
+            commit_with(&git, "신원 범위 시험")
+                .expect("commit")
+                .succeeded
+        );
+        fetch_with(
+            &git,
+            &ProjectGitFetchRequest {
+                project_path: repo.root.to_string_lossy().into_owned(),
+                remote: Some("origin".to_owned()),
+                prune: false,
+            },
+        )
+        .expect("fetch");
+        let calls = recorder.taken_calls();
+        assert!(!calls.is_empty(), "기록된 호출이 없다 — 설비가 깨졌다");
+
+        let mut carried = Vec::new();
+        for call in &calls {
+            let value = call
+                .env
+                .iter()
+                .find(|(name, _)| name == "GIT_SSH_COMMAND")
+                .map(|(_, value)| value.clone());
+            // argv는 언제나 `GIT_BASE_ARGS` 다음에 하위 명령이 온다. 앞머리를 글자 모양으로
+            // 찾으면 `-c`의 값(`color.ui=never`)을 하위 명령으로 읽는다.
+            let head = call.argv[GIT_BASE_ARGS.len()].clone();
+            // 어느 호출에서도 제거 목록은 같다 — 상속분은 전부 끊는다. 제거와 설정의
+            // 순서는 `cli_interface::run_capped_with`가 쥐고 있고, 그 순서는 아래의
+            // `c16_10_our_identity_survives_the_removal_of_the_inherited_one`이 실제
+            // 자식으로 잰다. 여기서 재는 것은 "무엇을 끊어 달라고 했는가"까지다.
+            assert!(
+                call.env_remove.iter().any(|key| key == "GIT_SSH_COMMAND")
+                    && call.env_remove.iter().any(|key| key == "GIT_SSH"),
+                "상속된 신원 변수를 끊지 않았다: {:?}",
+                call.argv
+            );
+            match value {
+                Some(value) => {
+                    assert_eq!(value, ssh_command, "우리가 만든 값이 아니다");
+                    carried.push(head);
+                }
+                None => assert_ne!(head, "fetch", "fetch에 신원이 가지 않았다"),
+            }
+        }
+        // 네트워크 작업 하나만 신원을 받는다. 읽기(`status`·`rev-parse`)도 로컬 변경
+        // (`add`·`commit`)도 받지 않는다.
+        assert_eq!(
+            carried,
+            vec!["fetch".to_owned()],
+            "신원이 닿은 호출: {carried:?}"
+        );
+    }
+
+    /// C16-10 — 가림이 `network_mutate`에 **배선되어 있는지**를 진짜 영수증으로 잰다.
+    ///
+    /// 함수를 직접 불러 재는 시험은 함수가 맞다는 것만 말한다. 호출부에서 그 한 줄을 지워도
+    /// 그런 시험은 통과하고, 경로는 그대로 원격 화면까지 간다. 그래서 여기서는 신원이 실제로
+    /// 자기 경로를 출력에 적게 만들고(`GIT_SSH_COMMAND`는 셸이 해석하므로 `echo` 한 줄이면
+    /// 된다) `ssh://` 원격으로 fetch를 돌린 **영수증**에서 그 경로가 사라졌는지 본다.
+    #[test]
+    fn c16_10_identity_path_is_redacted_from_the_receipt_of_a_real_fetch() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let git = runner(&repo);
+        let identity_path = "/tmp/am-test/.ssh/id_redaction_probe".to_owned();
+        TEST_NETWORK_IDENTITY.with(|cell| {
+            *cell.borrow_mut() = Some(crate::ssh_endpoints::ProjectGitIdentity {
+                identity_path: identity_path.clone(),
+                // git은 이 값을 셸에 넘긴다. `ssh` 자리에 `echo`를 두면 `ssh`가 읽지 못하는
+                // 신원 파일을 경고할 때와 같은 자리에 같은 경로가 찍힌다.
+                ssh_command: format!("echo '{identity_path}' >&2; false"),
+            });
+        });
+        struct ClearIdentity;
+        impl Drop for ClearIdentity {
+            fn drop(&mut self) {
+                TEST_NETWORK_IDENTITY.with(|cell| *cell.borrow_mut() = None);
+            }
+        }
+        let _reset = ClearIdentity;
+
+        let added = git
+            .write(
+                &["remote", "add", "origin", "ssh://invalid.invalid/repo.git"],
+                None,
+                READ_TIMEOUT,
+            )
+            .expect("remote add");
+        assert!(added.success, "{}", added.stderr);
+        let receipt = fetch_with(
+            &git,
+            &ProjectGitFetchRequest {
+                project_path: repo.root.to_string_lossy().into_owned(),
+                remote: Some("origin".to_owned()),
+                prune: false,
+            },
+        )
+        .expect("fetch");
+        assert!(!receipt.succeeded, "실패해야 신원 경고가 나온다");
+        let seen = format!("{} {} {}", receipt.stdout, receipt.stderr, receipt.message);
+        assert!(
+            seen.contains("<git 원격용 SSH 키>"),
+            "신원이 출력에 나오지도 않았다 — 설비가 깨졌다: {seen}"
+        );
+        assert!(
+            !seen.contains(&identity_path),
+            "개인키 경로가 영수증에 남았다: {seen}"
+        );
+    }
+
+    /// C16-10 — 같은 이름이 `env_remove`와 `env`에 함께 있을 때 **우리 값이 살아남는지**를
+    /// 진짜 자식으로 잰다. 이 순서는 `cli_interface::run_capped_with`가 쥐고 있어, 설정이
+    /// 먼저 돌도록 뒤집히면 사용자가 고른 키 대신 백엔드가 물려받은 신원으로 붙는다.
+    #[test]
+    fn c16_10_our_identity_survives_the_removal_of_the_inherited_one() {
+        let Ok(executable) = resolve_named_executable(&["git"]) else {
+            return;
+        };
+        let outcome = run_capped_with(
+            &executable,
+            &["var", "GIT_EDITOR"],
+            READ_TIMEOUT,
+            &CappedOptions {
+                env: &[("GIT_EDITOR".to_owned(), "am-sentinel".to_owned())],
+                env_remove: &["GIT_EDITOR"],
+                ..CappedOptions::default()
+            },
+        )
+        .expect("git var");
+        assert!(outcome.success, "{}", outcome.stderr);
+        assert_eq!(outcome.stdout.trim(), "am-sentinel");
+    }
+
+    /// C16-10. 가림 자체가 두 스트림을 모두 지나는지.
+    #[test]
+    fn c16_10_identity_path_is_redacted_from_both_streams() {
+        let identity = "/Users/someone/.ssh/id_project_git";
+        let mut outcome = CommandOutcome {
+            success: false,
+            timed_out: false,
+            stdout: format!("ok {identity}\n"),
+            stderr: format!(
+                "Warning: Identity file {identity} not accessible: No such file or directory.\n"
+            ),
+        };
+        redact_identity_path(&mut outcome, identity);
+        assert!(!outcome.stdout.contains(identity) && !outcome.stderr.contains(identity));
+        assert!(outcome.stderr.contains("<git 원격용 SSH 키>"));
+    }
+
+    /// C16-4 — `fetch`의 `--prune`은 인수 벡터에만 있었고 실행된 적이 없었다.
+    ///
+    /// 2026-10-04 실측. 이 모듈이 실제 bare 원격을 상대로 `fetch`를 미는 자리는 둘이지만
+    /// (`c16_pull_against_a_real_remote_...`, `c16_push_targets_the_upstream_...`) 둘 다
+    /// `prune: false`로만 민다. 그래서 `ProjectGitFetchRequest::prune`이 `--prune`을 붙이는
+    /// 분기는 한 번도 돌아 본 적이 없었고, 붙인 인수가 **실제로 그 효과를 내는지**는 아무도
+    /// 확인하지 않았다. 직전 두 회차가 같은 모양에서 진짜 제품 결함을 하나씩 찾았다 —
+    /// 약속이 산문과 인수 벡터에만 있으면 실측되지 않는다.
+    ///
+    /// 여기서 고정하는 것은 인수가 아니라 **원격 추적 ref 목록**이다. 원격에서 사라진
+    /// 브랜치를 만들어 두고 양쪽을 갈라 잰다.
+    ///
+    /// - `prune: false`의 fetch는 `origin/gone`을 **남긴다.** 이 단언이 없으면 뒤의 단언은
+    ///   "원래 없었다"로도 통과한다 — prune을 실제로 재려면 prune하지 않는 쪽이 남긴다는
+    ///   사실이 먼저 서야 한다.
+    /// - `prune: true`의 fetch만 `origin/gone`을 걷어 내고, `origin/main`은 그대로 둔다.
+    ///
+    /// `--prune`을 떼면 두 번째 단언만 깨진다. 그 상태의 제품은 사용자가 "정리"를 골랐는데
+    /// 아무것도 정리하지 않으면서 영수증은 성공으로 적는다 — 화면의 브랜치 목록에 서버에서
+    /// 지워진 지 오래인 이름이 계속 남고, 사용자는 그것이 아직 있는 줄 안다.
+    #[test]
+    fn c16_fetch_prune_removes_only_branches_gone_from_the_remote() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let Ok(executable) = resolve_named_executable(&["git"]) else {
+            return;
+        };
+        let git = runner(&repo);
+        let workspace = repo.root.parent().expect("workspace").to_path_buf();
+        let remote_path = workspace.join("remote.git");
+        let other_path = workspace.join("other");
+        let raw = |dir: &Path, args: &[&str]| {
+            let outcome = run_capped_with(
+                &executable,
+                args,
+                READ_TIMEOUT,
+                &CappedOptions {
+                    current_dir: Some(dir),
+                    env: &test_env(),
+                    ..CappedOptions::default()
+                },
+            )
+            .expect("git");
+            assert!(outcome.success, "{args:?}: {}", outcome.stderr);
+        };
+        // 캐노니컬 경로의 접두사를 그대로 슬래시로 바꾸면 git이 //?/C:/... 를 원격으로
+        // 읽지 못한다(앞선 회차의 실측). 자식에게 넘기는 경로를 다듬는 자리를 그대로 쓴다.
+        let remote_arg = path_guard::child_facing(&remote_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        // 판정은 제품의 영수증이 아니라 내 저장소에 실제로 남은 원격 추적 ref다.
+        let tracking = || {
+            let outcome = git
+                .read(
+                    &["for-each-ref", "--format=%(refname)", "refs/remotes/origin"],
+                    READ_TIMEOUT,
+                )
+                .expect("for-each-ref");
+            assert!(outcome.success, "{}", outcome.stderr);
+            let mut refs = outcome
+                .stdout
+                .lines()
+                .map(str::trim)
+                // git 2.48부터 fetch가 원격 HEAD 심볼릭 ref를 스스로 만든다
+                // (`fetch.followRemoteHEAD`). git 버전마다 있다 없다 하는 이 ref는 prune
+                // 대상도 아니므로 견주지 않는다.
+                .filter(|line| !line.is_empty() && *line != "refs/remotes/origin/HEAD")
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            refs.sort();
+            refs
+        };
+
+        std::fs::write(repo.root.join("a.txt"), "one\n").expect("a");
+        stage_with(&git, &["a.txt".into()]).expect("stage");
+        let first = commit_with(&git, "첫 커밋").expect("commit");
+        assert!(first.succeeded, "{}", first.stderr);
+        raw(
+            &workspace,
+            &["init", "-q", "--bare", "-b", "main", "remote.git"],
+        );
+        raw(&repo.root, &["remote", "add", "origin", &remote_arg]);
+        let pushed = git
+            .read(&["push", "-u", "origin", "main"], NETWORK_TIMEOUT)
+            .expect("push");
+        assert!(pushed.success, "{}", pushed.stderr);
+
+        // 다른 사람이 브랜치를 하나 올렸다가 다시 지운다. 원격에서 사라지는 ref를 만드는
+        // 유일한 방법이고, 이것이 `--prune`이 존재하는 이유 그 자체다.
+        raw(&workspace, &["clone", "-q", &remote_arg, "other"]);
+        raw(&other_path, &["switch", "-q", "-c", "gone"]);
+        std::fs::write(other_path.join("b.txt"), "theirs\n").expect("other write");
+        raw(&other_path, &["add", "-A"]);
+        raw(&other_path, &["commit", "-q", "-m", "그쪽 브랜치"]);
+        raw(&other_path, &["push", "-q", "origin", "gone"]);
+
+        let fetch = |prune: bool| {
+            fetch_with(
+                &git,
+                &ProjectGitFetchRequest {
+                    project_path: String::new(),
+                    remote: None,
+                    prune,
+                },
+            )
+            .expect("fetch")
+        };
+
+        let picked_up = fetch(false);
+        assert!(picked_up.succeeded, "{}", picked_up.stderr);
+        assert_eq!(
+            tracking(),
+            vec![
+                "refs/remotes/origin/gone".to_owned(),
+                "refs/remotes/origin/main".to_owned(),
+            ],
+            "fetch가 새 원격 브랜치를 받아 온다"
+        );
+
+        raw(&other_path, &["push", "-q", "origin", "--delete", "gone"]);
+
+        // prune하지 않는 fetch는 사라진 ref를 **그대로 둔다.** 이 단언이 뒤의 단언에
+        // 의미를 준다 — 이것이 없으면 "원래 없었다"로도 통과한다.
+        let kept = fetch(false);
+        assert!(kept.succeeded, "{}", kept.stderr);
+        assert!(
+            tracking().contains(&"refs/remotes/origin/gone".to_owned()),
+            "prune 없는 fetch는 사라진 브랜치를 걷어 내지 않는다: {:?}",
+            tracking()
+        );
+
+        // prune을 고른 fetch만 걷어 내고, 살아 있는 브랜치는 건드리지 않는다.
+        let pruned = fetch(true);
+        assert!(pruned.succeeded, "{}", pruned.stderr);
+        assert_eq!(pruned.outcome, GitOutcome::Completed);
+        assert_eq!(
+            tracking(),
+            vec!["refs/remotes/origin/main".to_owned()],
+            "prune은 사라진 브랜치만 걷어 낸다: {}",
+            pruned.stderr
+        );
+    }
+
+    /// C16-6 — `BlockedByLocalChanges`는 손으로 적은 문구였지 실제 git 출력에 묶인 적이 없었다.
+    ///
+    /// 2026-10-04 실측. `failures_are_classified_from_git_wording`은 `classify_failure`에
+    /// 사람이 적은 문자열을 먹이므로, 그 문구가 **지금 이 git이 실제로 뱉는 말**과 같은지는
+    /// 답할 수 없다. 원격이 필요한 `AuthFailed`와 달리 이 결말은 오프라인에서 그대로 만들 수
+    /// 있어서 먼저 닫는다. 입력은 둘이다 — 덮어써질 추적 파일을 둔 채 `switch`, 그리고 같은
+    /// 상태에서 `rebase --no-autostash`. 앞은 `would be overwritten by`, 뒤는
+    /// `cannot rebase: You have unstaged changes.`라서 분류 가지가 서로 다르다.
+    ///
+    /// 문구만 보지 않고 **영수증과 작업 트리**를 같이 본다. 이 결말에서 중요한 것은 git이
+    /// 거절했다는 사실이 아니라 거절이 아무것도 바꾸지 않았다는 것이다 — 분류가 어긋나면
+    /// 화면은 "커밋하거나 스태시하세요" 대신 일반 오류를 띄우고, 사용자는 자기 변경이 아직
+    /// 거기 있는지를 영수증에서 읽지 못한다. 그래서 `head_before == head_after`, 브랜치 그대로,
+    /// 그리고 파일 내용이 손대지 않은 그대로임을 함께 못박는다.
+    ///
+    /// `blocked_files`는 git이 탭으로 들여 쓴 목록에서 온다(`blocked_files_from_output`).
+    /// 그 줄의 모양이 바뀌면 화면의 "어느 파일이 막았는지"가 조용히 빈 목록이 되므로
+    /// 여기서 실제 출력으로 잰다.
+    #[test]
+    fn c16_local_changes_block_switch_and_rebase_with_a_receipt() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let git = runner(&repo);
+        std::fs::write(
+            repo.root.join("a.txt"),
+            "one
+",
+        )
+        .expect("a1");
+        stage_with(&git, &["a.txt".into()]).expect("stage");
+        commit_with(&git, "첫 커밋").expect("commit");
+
+        // 같은 파일을 다르게 바꾼 두 번째 브랜치. 전환이 반드시 이 파일을 덮어쓰게 된다.
+        switch_with(
+            &git,
+            &ProjectGitSwitchRequest {
+                project_path: String::new(),
+                branch: "other".into(),
+                create: true,
+                start_point: Some("HEAD".into()),
+            },
+        )
+        .expect("switch -c other");
+        std::fs::write(
+            repo.root.join("a.txt"),
+            "other
+",
+        )
+        .expect("a-other");
+        stage_with(&git, &["a.txt".into()]).expect("stage other");
+        commit_with(&git, "다른 브랜치").expect("commit other");
+        switch_with(
+            &git,
+            &ProjectGitSwitchRequest {
+                project_path: String::new(),
+                branch: "main".into(),
+                create: false,
+                start_point: None,
+            },
+        )
+        .expect("switch main");
+
+        // 커밋하지 않은 로컬 변경을 둔다.
+        std::fs::write(
+            repo.root.join("a.txt"),
+            "dirty
+",
+        )
+        .expect("dirty");
+        let before = overview_with(&git).expect("overview").head.sha;
+
+        let blocked = switch_with(
+            &git,
+            &ProjectGitSwitchRequest {
+                project_path: String::new(),
+                branch: "other".into(),
+                create: false,
+                start_point: None,
+            },
+        )
+        .expect("막힌 전환도 Err가 아니라 영수증이다");
+        assert!(!blocked.succeeded);
+        assert_eq!(
+            blocked.outcome,
+            GitOutcome::BlockedByLocalChanges,
+            "실제 git 출력: {}",
+            blocked.stderr
+        );
+        assert_eq!(
+            blocked.blocked_files,
+            vec!["a.txt".to_owned()],
+            "실제 git 출력: {}",
+            blocked.stderr
+        );
+        assert_eq!(blocked.head_before, blocked.head_after);
+        assert_eq!(blocked.head_before, before);
+
+        // 같은 상태에서 리베이스는 다른 문구로 막힌다 — 분류 가지가 하나 더 있다.
+        let rebase_blocked = rebase_with(
+            &git,
+            &ProjectGitRebaseRequest {
+                project_path: String::new(),
+                action: GitRebaseAction::Start,
+                onto: Some("other".into()),
+            },
+        )
+        .expect("막힌 리베이스도 영수증이다");
+        assert!(!rebase_blocked.succeeded);
+        assert_eq!(
+            rebase_blocked.outcome,
+            GitOutcome::BlockedByLocalChanges,
+            "실제 git 출력: {}",
+            rebase_blocked.stderr
+        );
+        assert_eq!(rebase_blocked.head_before, rebase_blocked.head_after);
+        assert!(
+            git.in_progress().is_none(),
+            "리베이스가 진행 중으로 남지 않는다"
+        );
+
+        // 거절은 아무것도 바꾸지 않는다.
+        let after = overview_with(&git).expect("overview");
+        assert_eq!(after.head.branch.as_deref(), Some("main"));
+        assert_eq!(after.head.sha, before);
+        assert_eq!(
+            std::fs::read_to_string(repo.root.join("a.txt")).expect("read"),
+            "dirty
+"
+        );
+    }
+
+    /// C16-6 — `AuthFailed`는 `classify_failure`의 결말 중 **마지막으로** 실제 git 출력에
+    /// 묶이지 않고 남아 있던 하나다.
+    ///
+    /// 2026-10-04 실측. 앞선 두 회차가 `BlockedByLocalChanges`와 `RejectedNonFastForward`를
+    /// 실제 git 출력에 묶으면서 `AuthFailed`만은 "원격 인증 실패를 오프라인에서 만들 수
+    /// 없다"는 이유로 남겨 두었다. 그 전제가 틀렸다. 인증 실패는 **네트워크가 아니라 401
+    /// 응답 하나**로 만들어진다 — `WWW-Authenticate` 헤더를 돌려주는 순간 git은 자격증명을
+    /// 채우려 하고, C16-3이 `GIT_TERMINAL_PROMPT=0`을 걸어 두었으므로 물을 곳이 없어
+    /// 그 자리에서 실패한다. 그래서 루프백에 401만 돌려주는 가장 작은 TCP 응답기를 세운다.
+    /// 실제 출력(git 2.x, `LC_ALL=C`)은 이렇다:
+    ///
+    /// ```text
+    /// fatal: could not read Username for 'http://127.0.0.1:<포트>': terminal prompts disabled
+    /// ```
+    ///
+    /// `classify_failure`가 보는 `could not read username`·`terminal prompts disabled`
+    /// 두 바늘이 모두 이 한 줄에 들어 있다. 어느 쪽이 사라져도 결말은 `Failed`로 떨어지고,
+    /// 그때 화면은 "터미널에서 같은 명령을 한 번 실행해 인증을 마치세요"라는 **유일하게
+    /// 쓸모 있는 안내** 대신 git stderr 첫 줄을 그대로 띄운다. 자격증명을 묻지 않는 것은
+    /// 이 어댑터의 설계(C16-3)이므로, 사용자가 빠져나갈 길을 아는 자리는 이 분류뿐이다.
+    ///
+    /// 세 명령을 모두 민다. fetch·pull·push는 각각 다른 인수 벡터를 지나지만 결말 분류는
+    /// 한 자리를 공유하므로, 셋이 같은 결말로 모이는지가 이 분류가 "네트워크 명령의 결말"
+    /// 인지 "fetch의 결말"인지를 가른다. push는 바깥으로 나가는 유일한 명령이고 호스트
+    /// 전용이라(C16-7) 인증 안내가 가장 필요한 자리다.
+    ///
+    /// 문구만 보지 않고 **영수증과 저장소 상태**를 같이 본다. 인증 실패는 아무것도 바꾸지
+    /// 않아야 하므로 `head_before == head_after`이고, 원격 추적 ref가 하나도 생기지 않는다.
+    ///
+    /// 검출력 실측(2026-10-04, project_git 28건 기준). 주입 셋을 넣어 봤다.
+    ///
+    /// - 두 바늘을 `classify_failure`에서 빼면 이 시험과 `failures_are_classified_from_git_wording`
+    ///   **둘 다** 잡는다. 그 가지는 이미 지켜지고 있었다.
+    /// - `GIT_TERMINAL_PROMPT=0`을 지워도 28건이 모두 통과한다. 제품이 그만큼 튼튼했다 —
+    ///   `GIT_ASKPASS`가 비어 있고 자식에 tty가 없어 git은 그래도 같은 말로 실패한다.
+    ///   그러니 이 시험이 지키는 것은 그 변수 하나가 아니라 **비대화 실행 전체의 결과**다.
+    /// - 바늘을 "그럴듯하지만 git이 쓰지 않는 말"(`could not read the username` /
+    ///   `terminal prompts are disabled`)로 바꾸고 **기존 문구 시험의 고정값도 같이** 맞추면
+    ///   — 문구를 고치는 사람이 실제로 하는 일이다 — 28건 중 **이 시험 하나만** FAILED 한다.
+    ///   그것이 이 시험이 닫는 공백이다. 손으로 적은 문자열을 자기가 다시 먹이는 시험은
+    ///   "둘이 서로 맞는가"만 답할 수 있고 "그 말을 git이 하는가"는 답할 수 없다.
+    #[test]
+    fn c16_auth_failure_against_a_real_remote_keeps_head_and_reports_auth_failed() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let Ok(executable) = resolve_named_executable(&["git"]) else {
+            return;
+        };
+
+        // 401 + `WWW-Authenticate`만 돌려주는 응답기. git의 http 전송은 이 응답을 받고서야
+        // 자격증명을 채우려 하므로, 이것이 오프라인에서 인증 실패를 만드는 최소 설비다.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        listener.set_nonblocking(true).expect("nonblocking");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serving = std::sync::Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while !serving.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                        // 요청 헤더를 **끝까지** 읽은 뒤에 답한다. 한 번만 읽고 바로 쓰고
+                        // 닫으면 아직 보내는 중이던 쪽이 `Recv failure: Connection was
+                        // reset`을 받고, 그러면 결말이 인증이 아니라 전송 오류로 떨어진다.
+                        // push에서 네 번에 한 번꼴로 실제로 그랬다(2026-10-04 실측) — 요청이
+                        // 가장 길어서 한 번의 read에 다 담기지 않을 때가 있기 때문이다.
+                        let mut request = Vec::new();
+                        let mut scratch = [0u8; 1024];
+                        while let Ok(read) = stream.read(&mut scratch) {
+                            if read == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&scratch[..read]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        // `Connection: close`로 keep-alive 재사용을 막는다. 응답마다 소켓을
+                        // 닫을 것이므로, 재사용하겠다고 믿게 두면 다음 요청이 닫힌 소켓으로
+                        // 가서 같은 reset이 난다.
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"am\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        let _ = stream.flush();
+                        // 답한 뒤에도 **읽기를 멈추지 않는다.** 받은 쪽이 아직 보내지 않은
+                        // 바이트(push의 요청 본문)를 남긴 채 소켓을 닫으면 Windows는 FIN이
+                        // 아니라 RST를 보내고, 그러면 응답을 읽고 있던 git이 그것을
+                        // `Recv failure: Connection was reset`으로 본다. 끝까지 비우고
+                        // 상대가 먼저 닫게 둔 뒤에 쓰기 쪽만 닫는다.
+                        while let Ok(read) = stream.read(&mut scratch) {
+                            if read == 0 {
+                                break;
+                            }
+                        }
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // 이 시험만 프록시를 끈다. 사용자 환경에 `http_proxy`가 걸려 있으면 루프백 요청이
+        // 그쪽으로 새어 나가 401이 아닌 다른 실패가 되고, 그러면 이 시험은 분류가 아니라
+        // 그 사람의 네트워크 설정을 재게 된다. 공용 `test_env`는 건드리지 않는다.
+        let mut env = test_env();
+        env.push(("NO_PROXY".into(), "*".into()));
+        env.push(("no_proxy".into(), "*".into()));
+        let git = match GitRunner::open_with_env(&repo.app_data, &repo.root, env) {
+            Ok(runner) => runner,
+            Err(failure) => panic!("{}", CoreError::from(failure)),
+        };
+        let raw = |dir: &Path, args: &[&str]| {
+            let outcome = run_capped_with(
+                &executable,
+                args,
+                READ_TIMEOUT,
+                &CappedOptions {
+                    current_dir: Some(dir),
+                    env: &test_env(),
+                    ..CappedOptions::default()
+                },
+            )
+            .expect("git");
+            assert!(outcome.success, "{args:?}: {}", outcome.stderr);
+        };
+
+        std::fs::write(repo.root.join("a.txt"), "one\n").expect("a");
+        stage_with(&git, &["a.txt".into()]).expect("stage");
+        let first = commit_with(&git, "첫 커밋").expect("commit");
+        assert!(first.succeeded, "{}", first.stderr);
+        let head = first.head_after.clone().expect("head");
+        raw(
+            &repo.root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("http://127.0.0.1:{port}/am.git"),
+            ],
+        );
+
+        let tracking = || {
+            let outcome = git
+                .read(
+                    &["for-each-ref", "--format=%(refname)", "refs/remotes"],
+                    READ_TIMEOUT,
+                )
+                .expect("for-each-ref");
+            assert!(outcome.success, "{}", outcome.stderr);
+            outcome.stdout.trim().to_owned()
+        };
+
+        let expect_auth_failure = |receipt: &GitActionReceipt, label: &str| {
+            assert!(
+                !receipt.succeeded,
+                "{label}: 인증 실패가 성공으로 적혔다: {}",
+                receipt.stderr
+            );
+            assert_eq!(
+                receipt.outcome,
+                GitOutcome::AuthFailed,
+                "{label}: 실제 git 출력이 AuthFailed로 분류되지 않는다: {}",
+                receipt.stderr
+            );
+            // 분류가 맞아야만 나오는 안내다. `Failed`로 떨어지면 git stderr 첫 줄이 대신 온다.
+            assert!(
+                receipt.message.contains("터미널"),
+                "{label}: 인증 안내가 영수증에 없다: {}",
+                receipt.message
+            );
+            assert_eq!(
+                receipt.head_before, receipt.head_after,
+                "{label}: 인증 실패가 HEAD를 움직였다"
+            );
+            assert_eq!(
+                receipt.head_after.as_deref(),
+                Some(head.as_str()),
+                "{label}: HEAD가 첫 커밋 그대로여야 한다"
+            );
+            assert!(
+                !receipt.timed_out,
+                "{label}: 자격증명을 물으며 멈춰 섰다 — C16-3의 비대화 실행이 깨졌다"
+            );
+        };
+
+        let fetched = fetch_with(
+            &git,
+            &ProjectGitFetchRequest {
+                project_path: String::new(),
+                remote: None,
+                prune: false,
+            },
+        )
+        .expect("fetch");
+        expect_auth_failure(&fetched, "fetch");
+
+        let pulled = pull_with(
+            &git,
+            &ProjectGitPullRequest {
+                project_path: String::new(),
+                mode: GitPullMode::FfOnly,
+                remote: None,
+            },
+        )
+        .expect("pull");
+        expect_auth_failure(&pulled, "pull");
+
+        let pushed = push_with(
+            &git,
+            &ProjectGitPushRequest {
+                project_path: String::new(),
+                remote: None,
+                set_upstream: false,
+            },
+        )
+        .expect("push");
+        expect_auth_failure(&pushed, "push");
+
+        // 인증 앞에서 멈췄으므로 원격 추적 ref는 하나도 생기지 않는다.
+        assert_eq!(tracking(), "", "인증 실패가 원격 추적 ref를 남겼다");
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().expect("server");
+    }
+    // -----------------------------------------------------------------------
+    // C16-4 — 제공하지 않는 인수
+    // -----------------------------------------------------------------------
+
+    /// 기록된 argv 하나가 C16-4의 금지 목록에 걸리면 그 사유를 돌려준다.
+    ///
+    /// `--end-of-options` 뒤는 인수가 아니라 값이다(C16-5). git이 그 뒤의 낱말을 플래그로
+    /// 읽지 않으므로 플래그 검사는 그 앞에서만 하고, 값 자리로 흘러든 플래그 모양의 입력은
+    /// 시험 본문이 따로 본다.
+    fn c16_4_forbidden_reason(argv: &[String]) -> Option<String> {
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let rest = &args[GIT_BASE_ARGS.len()..];
+        let subcommand = rest.first().copied().unwrap_or_default();
+        let flag_zone = rest
+            .iter()
+            .position(|arg| *arg == "--end-of-options")
+            .unwrap_or(rest.len());
+        for arg in &rest[..flag_zone] {
+            // `--no-autostash`는 금지가 아니라 금지를 **지키는** 인수다. 접두사로 보면
+            // 둘을 가르지 못하므로 `--autostash`만 정확히 일치로 본다.
+            if arg.starts_with("--force")
+                || *arg == "-f"
+                || *arg == "--hard"
+                || *arg == "--amend"
+                || *arg == "--autostash"
+                || *arg == "--discard-changes"
+            {
+                return Some(format!("{subcommand}: {arg}"));
+            }
+            if subcommand == "rebase" && (*arg == "-i" || *arg == "--interactive") {
+                return Some(format!("{subcommand}: {arg}"));
+            }
+            if subcommand == "branch" && *arg == "-D" {
+                return Some(format!("{subcommand}: {arg}"));
+            }
+        }
+        match subcommand {
+            "reset" | "clean" | "checkout" => Some(format!("{subcommand} 자체가 금지다")),
+            // C16-4가 막는 것은 **작업 트리** 파일의 되돌림이다. 인덱스만 되돌리는
+            // `restore --staged`는 unstage가 쓰는 허용된 갈래이고, 작업 트리를 되돌리는
+            // `restore --source=HEAD --worktree`는 이 어댑터가 아니라 C19 overlay
+            // 어댑터만 지나간다(`overlay_write_with_input`).
+            "restore" if !rest.contains(&"--staged") => {
+                Some("restore 가 --staged 없이 작업 트리를 되돌린다".to_owned())
+            }
+            _ => None,
+        }
+    }
+
+    /// 기록을 켜고, 떨어질 때 반드시 끈다. 끄지 않으면 같은 스레드에서 뒤에 도는 시험이
+    /// 남의 argv를 자기 것으로 본다.
+    struct ArgvRecorder;
+
+    impl ArgvRecorder {
+        fn start() -> Self {
+            RECORDED_CALLS.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
+            Self
+        }
+
+        fn taken_calls(&self) -> Vec<RecordedCall> {
+            RECORDED_CALLS.with(|cell| {
+                cell.borrow_mut()
+                    .as_mut()
+                    .map(std::mem::take)
+                    .unwrap_or_default()
+            })
+        }
+
+        fn taken(&self) -> Vec<Vec<String>> {
+            self.taken_calls()
+                .into_iter()
+                .map(|call| call.argv)
+                .collect()
+        }
+    }
+
+    impl Drop for ArgvRecorder {
+        fn drop(&mut self) {
+            RECORDED_CALLS.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    /// C16-4는 "되돌릴 수 없는 명령은 **제공하지 않는다**"고 이름으로 적어 두었다 —
+    /// 어떤 `--force*`도, `reset --hard`도, `clean`도, 작업 트리 `restore`/`checkout`도,
+    /// `branch -D`도, `--amend`도, 대화형 rebase도, `--autostash`도.
+    ///
+    /// **2026-10-04까지 그 목록 가운데 실제로 실행된 적이 있는 것은 `--autostash` 하나뿐이었다**
+    /// (두 회차 전의 `c16_local_changes_block_switch_and_rebase_with_a_receipt`). 나머지는
+    /// AGENTS.md 산문과 인수 벡터 리터럴에만 있었고, 아무 시험도 "이 어댑터가 그 인수를
+    /// 만들지 않는다"를 묻지 않았다. 리터럴을 다시 읽는 시험으로는 답할 수 없는데, 인수
+    /// 벡터에는 사용자 입력과 git 출력에서 흘러들어온 값(해석된 원격, push refspec,
+    /// 전환 시작점)도 함께 들어가기 때문이다 — 직전 회차가 고친 push refspec 결함이
+    /// 정확히 그 자리에서 나왔다.
+    ///
+    /// 그래서 이 시험은 **제공되는 변경을 전부 실제로 밀고**, 자식에게 넘어간 argv를
+    /// `GitRunner::run`에서 그대로 받아 금지 목록에 건다. 두 방향을 같이 본다.
+    ///
+    /// 1. 금지된 인수가 **없다** — 어떤 변경도 그것을 만들지 않는다.
+    /// 2. 금지를 지키는 인수가 **있다** — `rebase --no-autostash`, `pull --rebase
+    ///    --no-autostash`, `restore --staged`. 1번만 두면 그 인수를 통째로 지워도 조용히
+    ///    통과한다. 없음을 재는 시험은 언제나 그 짝이 필요하다.
+    ///
+    /// 그리고 플래그 모양의 사용자 입력(`--force`를 브랜치 이름으로, `--hard`를 시작점으로,
+    /// `-rf`를 경로로, `--upload-pack=…`을 원격으로)이 거절되어 **argv의 어느 자리에도
+    /// 낱말로 나타나지 않는지**를 본다. C16-5의 "`-`로 시작하면 거절"과 C16-4의 금지 목록이
+    /// 서로 맞물리는 자리가 여기다.
+    ///
+    /// 이 시험이 없는 제품은 이렇게 된다: 누군가 "리베이스가 자꾸 막혀서 불편하다"는 보고를
+    /// 받고 `--no-autostash`를 `--autostash`로 바꾸거나, "push가 거절된다"는 보고에
+    /// `--force-with-lease`를 더한다. 둘 다 한 낱말이고, 둘 다 사용자가 고르지 않은
+    /// 되돌릴 수 없는 일을 하며, 영수증은 성공으로 적힌다.
+    #[test]
+    fn c16_4_no_offered_mutation_ever_builds_a_forbidden_argument() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let Ok(executable) = resolve_named_executable(&["git"]) else {
+            return;
+        };
+        let git = runner(&repo);
+        let workspace = repo.root.parent().expect("workspace").to_path_buf();
+        let remote_path = workspace.join("remote.git");
+        let raw = |dir: &Path, args: &[&str]| {
+            let outcome = run_capped_with(
+                &executable,
+                args,
+                READ_TIMEOUT,
+                &CappedOptions {
+                    current_dir: Some(dir),
+                    env: &test_env(),
+                    ..CappedOptions::default()
+                },
+            )
+            .expect("git");
+            assert!(outcome.success, "{args:?}: {}", outcome.stderr);
+        };
+        // 원격은 네트워크가 아니라 같은 디스크의 bare 저장소다(앞선 세 시험과 같은 설비).
+        let remote_arg = path_guard::child_facing(&remote_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        // --- 설비: 커밋 하나, bare 원격, 업스트림. 여기까지는 기록하지 않는다. ---
+        std::fs::write(repo.root.join("a.txt"), "one\n").expect("a");
+        stage_with(&git, &["a.txt".into()]).expect("stage");
+        assert!(commit_with(&git, "첫 커밋").expect("commit").succeeded);
+        raw(
+            &workspace,
+            &["init", "-q", "--bare", "-b", "main", "remote.git"],
+        );
+        raw(&repo.root, &["remote", "add", "origin", &remote_arg]);
+        raw(&repo.root, &["push", "-q", "-u", "origin", "main"]);
+        // 리베이스가 반드시 충돌하도록 같은 파일을 다르게 바꾼 브랜치를 하나 둔다.
+        raw(&repo.root, &["switch", "-q", "-c", "other"]);
+        std::fs::write(repo.root.join("a.txt"), "other\n").expect("a-other");
+        raw(&repo.root, &["commit", "-q", "-a", "-m", "다른 쪽"]);
+        raw(&repo.root, &["switch", "-q", "main"]);
+        std::fs::write(repo.root.join("a.txt"), "mine\n").expect("a-mine");
+        raw(&repo.root, &["commit", "-q", "-a", "-m", "내 쪽"]);
+
+        let recorder = ArgvRecorder::start();
+
+        // --- 제공되는 변경을 전부 민다. 성공·실패는 여기서 묻지 않는다 — 이 시험이 재는
+        // 것은 결말이 아니라 자식에게 넘어간 인수다. 다른 시험들이 결말을 맡는다. ---
+        std::fs::write(repo.root.join("b.txt"), "b\n").expect("b");
+        stage_with(&git, &["b.txt".to_owned()]).expect("stage b");
+        unstage_with(&git, &["b.txt".to_owned()]).expect("unstage b");
+        stage_with(&git, &["b.txt".to_owned()]).expect("stage b again");
+        commit_with(&git, "두 번째 커밋").expect("commit b");
+
+        for (branch, create) in [("feature", true), ("main", false)] {
+            switch_with(
+                &git,
+                &ProjectGitSwitchRequest {
+                    project_path: String::new(),
+                    branch: branch.to_owned(),
+                    create,
+                    start_point: create.then(|| "HEAD".to_owned()),
+                },
+            )
+            .expect("switch");
+        }
+
+        std::fs::write(repo.root.join("a.txt"), "dirty\n").expect("dirty");
+        let stash = |action, index, message: Option<&str>| ProjectGitStashRequest {
+            project_path: String::new(),
+            action,
+            message: message.map(str::to_owned),
+            include_untracked: true,
+            index,
+            expected_sha: None,
+        };
+        stash_with(&git, &stash(GitStashAction::Push, None, Some("보관"))).expect("stash push");
+        stash_with(&git, &stash(GitStashAction::Apply, Some(0), None)).expect("stash apply");
+        // apply는 스태시를 남기므로, 작업 트리를 비우고 같은 항목을 pop으로 한 번 더 민다.
+        raw(&repo.root, &["checkout", "--", "a.txt"]);
+        stash_with(&git, &stash(GitStashAction::Pop, Some(0), None)).expect("stash pop");
+        stash_with(&git, &stash(GitStashAction::Push, None, None)).expect("stash push 2");
+        stash_with(&git, &stash(GitStashAction::Drop, Some(0), None)).expect("stash drop");
+
+        for prune in [false, true] {
+            fetch_with(
+                &git,
+                &ProjectGitFetchRequest {
+                    project_path: String::new(),
+                    remote: None,
+                    prune,
+                },
+            )
+            .expect("fetch");
+        }
+        for mode in [GitPullMode::FfOnly, GitPullMode::Rebase] {
+            pull_with(
+                &git,
+                &ProjectGitPullRequest {
+                    project_path: String::new(),
+                    mode,
+                    remote: None,
+                },
+            )
+            .expect("pull");
+        }
+        for set_upstream in [false, true] {
+            push_with(
+                &git,
+                &ProjectGitPushRequest {
+                    project_path: String::new(),
+                    remote: None,
+                    set_upstream,
+                },
+            )
+            .expect("push");
+        }
+
+        // 리베이스 네 갈래. 충돌을 만들어 두었으므로 start 뒤에도 진행 중이라
+        // continue·skip·abort가 모두 제 조건에서 돈다.
+        let rebase = |action| ProjectGitRebaseRequest {
+            project_path: String::new(),
+            action,
+            onto: Some("other".to_owned()),
+        };
+        rebase_with(&git, &rebase(GitRebaseAction::Start)).expect("rebase start");
+        assert!(
+            git.in_progress().is_some(),
+            "설비가 충돌을 만들지 못했다 — 나머지 세 갈래가 돌지 않는다"
+        );
+        rebase_with(&git, &rebase(GitRebaseAction::Continue)).expect("rebase continue");
+        if git.in_progress().is_some() {
+            rebase_with(&git, &rebase(GitRebaseAction::Skip)).expect("rebase skip");
+        }
+        if git.in_progress().is_some() {
+            rebase_with(&git, &rebase(GitRebaseAction::Abort)).expect("rebase abort");
+        }
+
+        let recorded = recorder.taken();
+
+        // --- 1. 금지된 인수가 하나도 없다 ---
+        let offending: Vec<String> = recorded
+            .iter()
+            .filter_map(|argv| {
+                c16_4_forbidden_reason(argv).map(|reason| format!("{reason} — argv: {argv:?}"))
+            })
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "C16-4가 제공하지 않는다고 적은 인수가 argv에 올랐다:\n{}",
+            offending.join("\n")
+        );
+
+        // --- 2. 금지를 지키는 인수가 실제로 있다 (1번이 공허하게 통과하지 않도록) ---
+        let has = |needle: &str| {
+            recorded
+                .iter()
+                .any(|argv| argv.iter().any(|arg| arg == needle))
+        };
+        assert!(
+            has("--no-autostash"),
+            "rebase·pull의 autostash 금지가 사라졌다"
+        );
+        assert!(
+            has("--staged"),
+            "unstage가 인덱스만 되돌리는 갈래가 사라졌다"
+        );
+        assert!(has("--ff-only"), "pull의 기본 갈래가 사라졌다");
+        let subcommands: Vec<&str> = recorded
+            .iter()
+            .filter_map(|argv| argv.get(GIT_BASE_ARGS.len()).map(String::as_str))
+            .collect();
+        for expected in [
+            "add", "restore", "commit", "switch", "stash", "rebase", "fetch", "pull", "push",
+        ] {
+            assert!(
+                subcommands.contains(&expected),
+                "{expected} 가 한 번도 돌지 않았다 — 이 시험이 그 갈래를 재지 못한다"
+            );
+        }
+
+        // --- 3. 플래그 모양의 입력은 argv의 어느 자리에도 낱말로 나타나지 않는다 ---
+        assert!(
+            recorder.taken().is_empty(),
+            "기록이 비워지지 않아 앞 단계의 argv가 뒤 단계로 샌다"
+        );
+        assert!(
+            switch_with(
+                &git,
+                &ProjectGitSwitchRequest {
+                    project_path: String::new(),
+                    branch: "--force".to_owned(),
+                    create: false,
+                    start_point: None,
+                },
+            )
+            .is_err(),
+            "브랜치 이름 자리의 --force 가 거절되지 않았다"
+        );
+        assert!(
+            switch_with(
+                &git,
+                &ProjectGitSwitchRequest {
+                    project_path: String::new(),
+                    branch: "ok-name".to_owned(),
+                    create: true,
+                    start_point: Some("--hard".to_owned()),
+                },
+            )
+            .is_err(),
+            "시작점 자리의 --hard 가 거절되지 않았다"
+        );
+        assert!(
+            stage_with(&git, &["-rf".to_owned()]).is_err(),
+            "경로 자리의 -rf 가 거절되지 않았다"
+        );
+        assert!(
+            fetch_with(
+                &git,
+                &ProjectGitFetchRequest {
+                    project_path: String::new(),
+                    remote: Some("--upload-pack=echo".to_owned()),
+                    prune: false,
+                },
+            )
+            .is_err(),
+            "원격 자리의 --upload-pack= 이 거절되지 않았다"
+        );
+        let refused = recorder.taken();
+        for needle in ["--force", "--hard", "-rf", "--upload-pack=echo"] {
+            assert!(
+                !refused
+                    .iter()
+                    .any(|argv| argv.iter().any(|arg| arg == needle)),
+                "거절했어야 할 {needle} 가 argv에 실려 나갔다: {refused:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // C16-2 / C16-5 — 전역 옵션과 stdin 계약
+    // -----------------------------------------------------------------------
+
+    /// C16-3은 "실행은 비대화다"라고 적고 그 뜻을 변수 여섯 가지로 못박아 두었다 —
+    /// `GIT_TERMINAL_PROMPT=0`, 빈 `GIT_ASKPASS`, `GIT_EDITOR=true`,
+    /// `GIT_SEQUENCE_EDITOR=true`, `LC_ALL=C`, 읽기의 `GIT_OPTIONAL_LOCKS=0`. C16-2는
+    /// 그 짝으로 상속된 리디렉션(`GIT_DIR`·`GIT_WORK_TREE`·`GIT_INDEX_FILE`·
+    /// `GIT_OBJECT_DIRECTORY`·`GIT_COMMON_DIR`·`GIT_NAMESPACE`·`GIT_PREFIX`)과 askpass
+    /// 계열을 자식에서 **지운다**고 적는다.
+    ///
+    /// **2026-10-05까지 그 전부가 `GitRunner::env`의 리터럴과 `REMOVED_ENV` 상수에만
+    /// 있었다.** 직전 회차가 argv와 stdin을 실행된 호출에서 재도록 설비를 넓혔지만
+    /// 환경은 기록되지 않았고, 그래서 "자식이 실제로 그것을 받았는가"를 묻는 시험이
+    /// 하나도 없었다. 같은 모양의 공백이 직전 다섯 회차에서 다섯 번 나왔고 그중 셋은
+    /// 진짜 제품 결함이었다.
+    ///
+    /// **이 시험이 무엇이고 무엇이 아닌지.** 이것은 실행 시점의 **계약** 측정이지
+    /// 효과 측정이 아니다. `env_remove`는 부모가 그 변수를 **들고 있을 때만** 효과가
+    /// 있는데, 그것을 실제로 재려면 시험이 자기 프로세스의 환경을 바꿔야 한다 —
+    /// `cargo test`는 시험을 같은 프로세스의 여러 스레드로 돌리므로 그 변경은 옆
+    /// 시험에 새어 나간다. 흔들리는 시험을 반영하지 않기로 한 자리라(2026-10-04,
+    /// 401 응답기 회차) 여기서는 인수 벡터가 완성되는 **한 곳**에서 환경을 함께
+    /// 기록하는 데까지만 간다. 상수 선언을 다시 읽는 것보다는 엄격하다 — 읽기와
+    /// 변경이 서로 다른 집합을 받는지, 지운 변수를 같은 자리에서 되살리지 않는지는
+    /// 선언만 보아서는 갈리지 않는다.
+    ///
+    /// 네 가지를 **실행된 호출에서** 잰다.
+    ///
+    /// 1. **비대화 네 가지는 예외가 없다.** `GIT_TERMINAL_PROMPT=0`·빈 `GIT_ASKPASS`·
+    ///    `LC_ALL=C`·`GIT_PAGER=cat`이 읽기든 변경이든 모든 호출에 붙는다. 한 호출만
+    ///    빠지면 그 호출이 자격증명을 물으려다 멈추거나(C16-3이 "즉시 실패하고 결코
+    ///    멈추지 않는다"고 적은 바로 그 반대), 번역된 문구를 뱉어 `classify_failure`의
+    ///    영어 바늘이 전부 빗나간다.
+    /// 2. **편집기 차단과 읽기 전용 잠금 해제는 배타적이다.** 변경에는
+    ///    `GIT_EDITOR`/`GIT_SEQUENCE_EDITOR`가 붙고 `GIT_OPTIONAL_LOCKS`는 붙지 않으며,
+    ///    읽기는 그 반대다. 둘을 `^`로 묶는 이유는 한쪽만 세면 "둘 다 붙었다"가 통과해
+    ///    읽기가 인덱스 잠금을 잡는 상태를 놓치기 때문이다.
+    /// 3. **지운 변수를 같은 호출에서 되살리지 않는다.** `run_capped_with`는
+    ///    `env_remove`를 **먼저** 적용하고 `env`를 나중에 설정한다
+    ///    (`cli_interface.rs`). 그래서 `REMOVED_ENV`에 있는 이름을 `env`에 한 줄
+    ///    더하면 지움이 조용히 무효가 되고, 사용자의 `GIT_DIR`이 아니라 그 한 줄이
+    ///    대상을 옮긴다. 목록 포함과 부재를 한 쌍으로 둔다.
+    /// 4. **천장이 저장소 부모다.** `GIT_CEILING_DIRECTORIES`가 비어 있으면 git이
+    ///    위로 올라가 다른 저장소를 집을 수 있다.
+    ///
+    /// 그리고 읽기와 변경이 **둘 다** 한 번은 돌았는지 본다. 한쪽만 돌면 2번은
+    /// 공집합을 검사하면서 통과한다 — 없음을 재는 단언에는 언제나 그 짝이 필요하다.
+    ///
+    /// **검출력 실측(2026-10-05, `project_git` 31건).**
+    ///
+    /// - 주입 A(`env`에서 `GIT_TERMINAL_PROMPT=0` 한 줄 제거): 31건 중 **이 시험 하나만**
+    ///   FAILED. 두 회차 전 같은 자리를 주입했을 때 28건이 전부 통과했던 바로 그 공백이다.
+    ///   그 상태의 제품은 자격증명을 묻는 원격 앞에서 빈 `GIT_ASKPASS`와 tty 부재에만
+    ///   기대게 된다 — 그 둘 중 하나라도 어긋나면 120초 제한까지 프롬프트를 띄운 채 멈추고,
+    ///   사용자는 응답 없는 화면만 본다.
+    /// - 주입 B(`GIT_PAGER` 아래에 `GIT_DIR=.git` 한 줄 추가): 2건 탐지(이 시험 +
+    ///   `c16_1_subfolder_targets_the_enclosing_repository_and_bare_is_refused`). 하위 폴더
+    ///   대상 시험이 함께 잡으므로 그 자리는 공백이 아니었다 — 없는 결함을 찾은 것처럼
+    ///   적지 않는다.
+    /// - 주입 C(`GIT_OPTIONAL_LOCKS=0`을 읽기 분기 밖으로 빼 무조건 설정): 31건 중 **이
+    ///   시험 하나만** FAILED. 그 상태의 제품은 커밋·스테이지 같은 변경도 선택적 잠금 없이
+    ///   돌아 인덱스 갱신이 조용히 생략된다. 2번 단언을 `^`로 묶은 이유가 이것이다.
+    ///
+    /// 세 주입 모두 측정 직후 `/tmp` 사본으로 복원하고 `diff -q`로 바이트 일치를 확인했다
+    /// (주입과 산출물이 같은 파일이라 파일 단위 `git checkout`은 쓰지 않는다).
+    #[test]
+    fn c16_3_non_interactive_env_reaches_every_child_and_redirections_are_removed() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let git = runner(&repo);
+        std::fs::write(repo.root.join("a.txt"), "a\n").expect("a.txt");
+
+        let recorder = ArgvRecorder::start();
+        status_with(&git).expect("status");
+        stage_with(&git, &["a.txt".to_owned()]).expect("stage");
+        assert!(
+            commit_with(&git, "비대화 환경 시험")
+                .expect("commit")
+                .succeeded
+        );
+        let calls = recorder.taken_calls();
+        assert!(!calls.is_empty(), "기록된 호출이 없다 — 설비가 깨졌다");
+
+        let value = |call: &RecordedCall, key: &str| -> Option<String> {
+            call.env
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        let ceiling = git
+            .root
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned());
+
+        for call in &calls {
+            let argv = call.argv.clone();
+
+            // --- 1. 비대화 네 가지는 예외가 없다 ---
+            for (key, expected) in [
+                ("GIT_TERMINAL_PROMPT", "0"),
+                ("GIT_ASKPASS", ""),
+                ("LC_ALL", "C"),
+                ("GIT_PAGER", "cat"),
+            ] {
+                assert_eq!(
+                    value(call, key).as_deref(),
+                    Some(expected),
+                    "{key} 가 자식에게 가지 않았다: {argv:?}"
+                );
+            }
+
+            // --- 2. 편집기 차단과 읽기 전용 잠금 해제는 배타적이다 ---
+            let is_write = value(call, "GIT_EDITOR").is_some();
+            let is_read = value(call, "GIT_OPTIONAL_LOCKS").is_some();
+            assert!(
+                is_write ^ is_read,
+                "읽기/변경 환경이 갈리지 않았다 (편집기={is_write}, 잠금해제={is_read}): {argv:?}"
+            );
+            if is_write {
+                assert_eq!(
+                    value(call, "GIT_EDITOR").as_deref(),
+                    Some("true"),
+                    "{argv:?}"
+                );
+                assert_eq!(
+                    value(call, "GIT_SEQUENCE_EDITOR").as_deref(),
+                    Some("true"),
+                    "대화형 rebase 를 막는 변수가 변경 호출에 없다: {argv:?}"
+                );
+            } else {
+                assert_eq!(
+                    value(call, "GIT_OPTIONAL_LOCKS").as_deref(),
+                    Some("0"),
+                    "{argv:?}"
+                );
+                assert!(
+                    value(call, "GIT_SEQUENCE_EDITOR").is_none(),
+                    "읽기에 편집기 변수가 붙었다: {argv:?}"
+                );
+            }
+
+            // --- 3. 지운 변수를 같은 호출에서 되살리지 않는다 ---
+            for key in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_COMMON_DIR",
+                "GIT_NAMESPACE",
+                "GIT_PREFIX",
+                "SSH_ASKPASS",
+                "SSH_ASKPASS_REQUIRE",
+                "DISPLAY",
+            ] {
+                assert!(
+                    call.env_remove.iter().any(|name| name == key),
+                    "{key} 가 자식에서 지워지지 않는다: {argv:?}"
+                );
+                assert!(
+                    value(call, key).is_none(),
+                    "{key} 를 지우고 같은 호출에서 다시 설정한다 — 지움이 무효다: {argv:?}"
+                );
+            }
+
+            // --- 4. 천장이 저장소 부모다 ---
+            assert_eq!(
+                value(call, "GIT_CEILING_DIRECTORIES"),
+                ceiling,
+                "천장이 저장소 부모가 아니다: {argv:?}"
+            );
+        }
+
+        // --- 짝: 읽기와 변경이 둘 다 한 번은 돌았다 ---
+        assert!(
+            calls
+                .iter()
+                .any(|call| value(call, "GIT_OPTIONAL_LOCKS").is_some()),
+            "읽기 호출이 하나도 기록되지 않아 2번 단언이 공집합이다"
+        );
+        assert!(
+            calls.iter().any(|call| value(call, "GIT_EDITOR").is_some()),
+            "변경 호출이 하나도 기록되지 않아 2번 단언이 공집합이다"
+        );
+    }
+
+    /// C16-2는 "모든 호출에 `GIT_BASE_ARGS`를 앞세운다 — 그 안에 `--literal-pathspecs`가
+    /// 있다"고, C16-5는 "경로와 커밋 메시지는 argv가 아니라 stdin으로 간다"고 적어 두었다.
+    ///
+    /// **2026-10-04까지 둘 다 리터럴로만 있었다.** `GIT_BASE_ARGS`는 상수 선언에,
+    /// `--pathspec-from-file=-`은 `stage_with`·`unstage_with`의 인수 배열에 있었고, 어느
+    /// 시험도 "자식이 실제로 그것을 받았는가"를 묻지 않았다. 같은 모양의 공백이 직전 네
+    /// 회차에서 네 번 나왔고 그중 둘은 진짜 제품 결함이었다.
+    ///
+    /// 세 가지를 **실행된 git 호출에서** 잰다.
+    ///
+    /// 1. **접두사(C16-2).** 기록된 모든 argv가 `GIT_BASE_ARGS`로 시작한다. 읽기든
+    ///    변경이든 예외가 없어야 한다 — 한 호출만 빠져도 그 호출의 pathspec은 glob으로
+    ///    풀리고 색·페이저가 붙어 파서가 깨진다.
+    /// 2. **`--literal-pathspecs`가 실제로 듣는다.** 글자 그대로 `a[1].txt`라는 파일과
+    ///    `a1.txt`를 함께 두고 `a[1].txt` 하나만 스테이지한다. 이 옵션이 없으면 git은 그
+    ///    낱말을 glob으로 읽어 `a1.txt`까지 스테이지한다 — 사용자가 고르지 않은 파일이
+    ///    커밋에 들어간다. 접두사 단언만으로는 이 결과를 물을 수 없다.
+    /// 3. **경로와 메시지는 stdin으로 간다(C16-5).** 그 두 낱말이 argv의 어느 자리에도
+    ///    나타나지 않고, 같은 호출의 stdin에는 NUL로 끊긴 경로와 메시지 본문이 그대로
+    ///    들어 있다. 한쪽만 보면 갈리지 않는다 — "argv에 없다"는 인수를 통째로 지워도
+    ///    참이고, "stdin에 있다"는 argv에도 함께 실어도 참이다.
+    ///
+    /// 이 시험이 없는 제품은 이렇게 된다: 누군가 `--pathspec-from-file=-`이 낯설어
+    /// 경로를 argv 끝에 붙이는 평범한 모양으로 바꾼다. 로컬 저장소에서는 똑같이 돌고,
+    /// 공백·따옴표·대시로 시작하는 이름에서만 깨지며, 그 이름을 만드는 것은 사용자다.
+    ///
+    /// **검출력 실측(2026-10-04, `project_git` 30건).**
+    ///
+    /// - 주입 A(`GIT_BASE_ARGS`에서 `--literal-pathspecs` 제거): 30건 중 **이 시험 하나만**
+    ///   FAILED. 그 상태의 제품은 사용자가 고른 파일 하나를 스테이지할 때 이름이 glob으로
+    ///   읽혀 다른 파일까지 끌고 들어가고, 영수증은 성공으로 적힌다.
+    /// - 주입 B(`commit -F -` → `commit -m <message>`): 2건 탐지(이 시험 + 인증 실패 시험).
+    ///   그 상태의 제품은 커밋 메시지를 `ps` 에 그대로 노출한다.
+    /// - 주입 C(stage 의 경로를 stdin 대신 `--end-of-options` 뒤 argv 로): 30건 중 **이 시험
+    ///   하나만** FAILED — C16-5 의 stdin 계약은 여기가 공백이었다.
+    ///
+    /// 세 주입 모두 측정 직후 `/tmp` 사본으로 복원하고 `diff -q` 로 바이트 일치를 확인했다
+    /// (주입과 산출물이 같은 파일이라 파일 단위 `git checkout` 은 쓰지 않는다).
+    #[test]
+    fn c16_global_options_and_stdin_payloads_reach_the_child() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let git = runner(&repo);
+
+        // `a[1].txt`는 Windows에서도 쓸 수 있는 이름이고, git의 기본 pathspec 문법에서는
+        // `a1.txt`에 걸리는 glob이다. 둘을 함께 두는 것이 2번 단언의 전부다.
+        let glob_like = "a[1].txt";
+        let decoy = "a1.txt";
+        std::fs::write(repo.root.join(glob_like), "glob\n").expect("glob-like");
+        std::fs::write(repo.root.join(decoy), "decoy\n").expect("decoy");
+
+        let message = "메시지는 argv에 실리지 않는다";
+        let recorder = ArgvRecorder::start();
+        stage_with(&git, &[glob_like.to_owned()]).expect("stage");
+        let staged: Vec<String> = status_with(&git)
+            .expect("status")
+            .entries
+            .iter()
+            // 인덱스에 **올라간** 것만 센다. `Untracked`까지 세면 스테이지하지 않은
+            // 미끼 파일이 함께 잡혀 이 단언이 glob 이 아니라 상태 표시를 재게 된다
+            // (2026-10-04 실측: 첫 판이 그래서 거짓 실패했다).
+            .filter(|entry| entry.index_status == GitChangeKind::Added)
+            .map(|entry| entry.path.clone())
+            .collect();
+        assert!(commit_with(&git, message).expect("commit").succeeded);
+        let calls = recorder.taken_calls();
+
+        // --- 1. 모든 호출이 전역 옵션을 앞세운다 ---
+        assert!(!calls.is_empty(), "기록된 호출이 없다 — 설비가 깨졌다");
+        for call in &calls {
+            assert!(
+                call.argv.len() > GIT_BASE_ARGS.len()
+                    && call.argv[..GIT_BASE_ARGS.len()] == *GIT_BASE_ARGS,
+                "전역 옵션 없이 돈 호출이 있다: {:?}",
+                call.argv
+            );
+        }
+
+        // --- 2. --literal-pathspecs 가 실제로 듣는다 ---
+        assert_eq!(
+            staged,
+            vec![glob_like.to_owned()],
+            "--literal-pathspecs 가 듣지 않아 고르지 않은 파일까지 스테이지됐다"
+        );
+
+        // --- 3. 경로와 메시지는 argv가 아니라 stdin으로 간다 ---
+        let mentions = |needle: &str| {
+            calls
+                .iter()
+                .any(|call| call.argv.iter().any(|arg| arg.contains(needle)))
+        };
+        assert!(
+            !mentions(glob_like),
+            "경로가 argv에 실렸다: {calls:?}",
+            calls = calls
+                .iter()
+                .map(|call| call.argv.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !mentions(message),
+            "커밋 메시지가 argv에 실렸다 — ps 에 그대로 보인다"
+        );
+        let stdin_of = |subcommand: &str| -> Vec<u8> {
+            calls
+                .iter()
+                .find(|call| {
+                    call.argv.get(GIT_BASE_ARGS.len()).map(String::as_str) == Some(subcommand)
+                })
+                .unwrap_or_else(|| panic!("{subcommand} 호출이 기록되지 않았다"))
+                .input
+                .clone()
+                .unwrap_or_else(|| panic!("{subcommand} 가 stdin 없이 돌았다"))
+        };
+        assert_eq!(
+            stdin_of("add"),
+            {
+                let mut expected = glob_like.as_bytes().to_vec();
+                expected.push(0);
+                expected
+            },
+            "stage 의 stdin 이 NUL 로 끊긴 경로가 아니다"
+        );
+        // `validate_commit_message`가 끝에 줄바꿈 하나를 붙인다(git 이 커밋 메시지에
+        // 요구하는 모양). 본문이 그대로 갔는지를 묻는 자리이므로 그 한 글자는 벗긴다.
+        assert_eq!(
+            String::from_utf8(stdin_of("commit"))
+                .expect("utf-8")
+                .trim_end_matches('\n'),
+            message,
+            "commit 의 stdin 이 메시지 본문이 아니다"
+        );
+    }
+    /// 이 시험이 자식 역할로 다시 실행되고 있음을 알리는 변수. 값은 실제 저장소의 경로다.
+    const C16_2_CHILD_ROOT: &str = "AM_C16_2_CHILD_ROOT";
+    const C16_2_CHILD_APP_DATA: &str = "AM_C16_2_CHILD_APP_DATA";
+    /// 자식이 끝까지 갔을 때만 찍는 표식. `--exact` 가 아무 시험도 고르지 못하면 시험
+    /// 바이너리는 "0 passed" 로 **성공 종료**하므로, 종료 코드만 보는 부모는 아무것도
+    /// 돌지 않은 것을 통과로 읽는다. 표식이 그 구멍을 막는다.
+    const C16_2_CHILD_SENTINEL: &str = "AM-C16-2-CHILD-OK";
+
+    /// C16-2가 적어 둔 나머지 절반 — "상속된 리디렉션(`GIT_DIR`, `GIT_WORK_TREE`,
+    /// `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_COMMON_DIR`, `GIT_NAMESPACE`,
+    /// `GIT_PREFIX`)과 askpass 변수는 자식에서 제거한다".
+    ///
+    /// **공백(2026-10-05 실측).** `REMOVED_ENV`는 제품 코드 전체에서 단 한 번,
+    /// `GitRunner::run`의 `CappedOptions { env_remove: REMOVED_ENV, .. }` 에만 나타나고
+    /// 어떤 시험도 그 배열을 읽거나 효과를 재지 않았다. 직전 회차가 닫은 것은 C16-2의
+    /// 앞 절반(전역 인수 접두사와 `--literal-pathspecs`)이고, 뒤 절반인 이 자리는
+    /// 배열 리터럴로만 있었다. 리터럴을 다시 읽는 시험으로는 물을 수 없다 — 제거가
+    /// 실제로 듣는지는 **부모 프로세스에 그 변수가 실제로 설정되어 있을 때만** 갈린다.
+    ///
+    /// **그래서 시험 프로세스를 하나 더 띄운다.** `std::env::set_var` 로 이 프로세스의
+    /// 환경을 바꾸면 `cargo test` 가 같은 프로세스의 다른 스레드에서 돌리는 2천여 건이
+    /// 그 `GIT_DIR` 를 함께 물려받아 흔들린다(project_git 시험 대부분이 실제 git 을
+    /// 띄운다). 대신 `current_exe()` 를 `--exact` 로 다시 실행하고 리디렉션 변수를
+    /// **그 자식 프로세스에만** 건다. 그러면 자식 안에서는 상속이 진짜로 일어나고,
+    /// 다른 시험은 그 변수를 한 번도 보지 않는다.
+    ///
+    /// 판정은 영수증이 아니라 **디스크**다. 제거가 듣지 않는 제품은 사용자가 프로젝트
+    /// 화면에서 고른 저장소가 아니라 백엔드가 물려받은 `GIT_DIR` 가 가리키는 저장소를
+    /// 스테이지하고 커밋한다 — 그러고도 영수증은 성공으로 적힌다. 그래서 "진짜 저장소에
+    /// 커밋 하나가 생겼다" 와 "미끼 저장소는 한 글자도 바뀌지 않았다" 를 한 쌍으로 둔다.
+    /// 앞만 보면 양쪽에 썼을 때도 통과하고, 뒤만 보면 아무 데도 쓰지 않았을 때도 통과한다.
+    ///
+    /// **검출력(2026-10-05, project_git 31건).**
+    /// - 주입 A — `env_remove: REMOVED_ENV` 를 `&[]` 로: **이 시험 하나만** FAILED(오탐 0).
+    ///   그 상태의 제품은 `GitRunner::open` 에서 이미 넘어져 사용자에게 "이 프로젝트는 git
+    ///   저장소가 아닙니다" 라고 말한다 — 멀쩡한 저장소를 연 프로젝트 화면이 git 탭을
+    ///   통째로 잃는다.
+    /// - 주입 B — 목록에서 `GIT_INDEX_FILE` **한 줄만** 뺌: 이 시험 하나만 FAILED(오탐 0).
+    ///   스테이지가 사용자의 인덱스가 아니라 물려받은 인덱스 파일에 떨어진다.
+    /// - 주입 C — 목록에서 `GIT_OBJECT_DIRECTORY` **한 줄만** 뺌: 이 시험이 FAILED.
+    ///   같은 판에서 `c16_auth_failure_...` 도 한 번 떨어졌는데, 그 변수는 이 시험의 **자식
+    ///   프로세스에만** 걸리므로 인과가 없다. 깨끗한 상태에서 4판 연속 31건 통과를 확인했고,
+    ///   그 시험은 전부터 루프백 응답기 쪽으로 간헐적으로 흔들린 자리라 검출이 아니라
+    ///   무관한 간헐 실패로 적는다.
+    ///
+    /// 한 줄씩 빼는 주입이 전부 갈린다는 것이 이 시험의 모양이다 — 목록 전체를 한 덩어리로
+    /// 재면 한 이름이 빠진 것은 잡히지 않는다.
+    #[test]
+    fn c16_2_inherited_git_redirections_never_reach_the_child() {
+        // --- 자식 역할 ---
+        if let Ok(real_root) = std::env::var(C16_2_CHILD_ROOT) {
+            let real_root = PathBuf::from(real_root);
+            let app_data = PathBuf::from(
+                std::env::var(C16_2_CHILD_APP_DATA).expect("자식에게 app data 경로가 없다"),
+            );
+            // 여기까지 왔다는 것은 리디렉션 변수가 이 프로세스에 실제로 걸려 있다는 뜻이다.
+            assert!(
+                std::env::var_os("GIT_DIR").is_some(),
+                "자식에 GIT_DIR 가 없다 — 설비가 깨졌다"
+            );
+
+            let git = GitRunner::open_with_env(&app_data, &real_root, test_env())
+                .unwrap_or_else(|failure| panic!("{}", CoreError::from(failure)));
+
+            // 1. 연 저장소가 사용자가 고른 그곳이다.
+            let overview = overview_with(&git).expect("overview");
+            assert_eq!(
+                std::fs::canonicalize(&overview.repository_root).expect("canonical"),
+                std::fs::canonicalize(&real_root).expect("canonical"),
+                "GIT_DIR 가 가리키는 곳을 저장소로 열었다"
+            );
+            assert!(
+                overview.head.unborn,
+                "진짜 저장소는 아직 커밋이 없어야 한다"
+            );
+
+            // 2. 상태가 진짜 저장소의 파일을 본다.
+            let seen: Vec<String> = status_with(&git)
+                .expect("status")
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect();
+            assert_eq!(
+                seen,
+                vec!["only-in-real.txt".to_owned()],
+                "상태가 진짜 저장소의 작업 트리를 보지 않았다"
+            );
+
+            // 3. 쓰기가 진짜 저장소에 떨어진다.
+            assert!(
+                stage_with(&git, &["only-in-real.txt".to_owned()])
+                    .expect("stage")
+                    .succeeded
+            );
+            let receipt = commit_with(&git, "C16-2 자식 커밋").expect("commit");
+            assert!(receipt.succeeded, "{}", receipt.message);
+            assert!(receipt.head_after.is_some(), "커밋 뒤 HEAD 가 없다");
+
+            println!("{C16_2_CHILD_SENTINEL}");
+            return;
+        }
+
+        // --- 부모 역할 ---
+        let Some(real) = init_repo() else {
+            return;
+        };
+        let Some(decoy) = init_repo() else {
+            return;
+        };
+        std::fs::write(real.root.join("only-in-real.txt"), "real\n").expect("real file");
+        std::fs::write(decoy.root.join("only-in-decoy.txt"), "decoy\n").expect("decoy file");
+
+        let decoy_git_dir = decoy.root.join(".git");
+        let decoy_index = decoy_git_dir.join("am-c16-2-index");
+        assert!(!decoy_index.exists());
+
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("시험 바이너리 경로"));
+        child
+            .arg("--exact")
+            .arg("project_git::tests::c16_2_inherited_git_redirections_never_reach_the_child")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(C16_2_CHILD_ROOT, &real.root)
+            .env(C16_2_CHILD_APP_DATA, &real.app_data)
+            // C16-2가 이름으로 적은 리디렉션을 전부 미끼로 돌려 둔다. 제거가 한 자리라도
+            // 빠지면 아래 자식 단언 가운데 하나가 그 자리에서 갈린다.
+            .env("GIT_DIR", &decoy_git_dir)
+            .env("GIT_WORK_TREE", &decoy.root)
+            .env("GIT_INDEX_FILE", &decoy_index)
+            .env("GIT_OBJECT_DIRECTORY", decoy_git_dir.join("objects"))
+            .env("GIT_COMMON_DIR", &decoy_git_dir)
+            .env("GIT_NAMESPACE", "am-c16-2-decoy")
+            .env("GIT_PREFIX", "am-c16-2-prefix/");
+        let output = child.output().expect("자식 시험 프로세스");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "자식 시험이 실패했다\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains(C16_2_CHILD_SENTINEL),
+            "자식이 이 시험을 고르지 못했다(이름이 바뀌었는가). --exact 는 0건을 성공으로 \
+             끝내므로 표식이 없으면 아무것도 재지 않은 것이다\n--- stdout ---\n{stdout}"
+        );
+
+        // --- 디스크로 판정한다 ---
+        let count = |root: &PathBuf| -> String {
+            let executable = resolve_named_executable(&["git"]).expect("git");
+            let outcome = run_capped_with(
+                &executable,
+                &["rev-list", "--count", "--all"],
+                READ_TIMEOUT,
+                &CappedOptions {
+                    current_dir: Some(root),
+                    env: &test_env(),
+                    ..CappedOptions::default()
+                },
+            )
+            .expect("rev-list");
+            assert!(outcome.success, "{}", outcome.stderr);
+            outcome.stdout.trim().to_owned()
+        };
+        assert_eq!(count(&real.root), "1", "진짜 저장소에 커밋이 생기지 않았다");
+        assert_eq!(
+            count(&decoy.root),
+            "0",
+            "미끼 저장소에 커밋이 생겼다 — 상속된 GIT_DIR 가 자식에 그대로 갔다"
+        );
+        assert!(
+            !decoy_index.exists(),
+            "상속된 GIT_INDEX_FILE 이 자식에 그대로 가 미끼 인덱스가 만들어졌다"
+        );
+        assert!(
+            !decoy_git_dir.join("refs/namespaces").exists(),
+            "상속된 GIT_NAMESPACE 가 자식에 그대로 갔다"
+        );
     }
 }

@@ -8,10 +8,13 @@
 //!
 //! 설계 결정(2026-08-30, 사용자):
 //! - **기기 단위**다. 토큰은 공급자 계정과 무관하게 이 기기에서 하나만 갖는다.
-//! - **OAuth 승인은 호스트에서만 끝난다.** 콜백이 호스트의 loopback으로만 돌아오기
-//!   때문이다. 2026-09-30 결정으로 등록·편집·토큰 입력·삭제는 원격 write에서도 되지만,
-//!   `begin_oauth`만은 여전히 호스트 전용이다 — 자세한 근거는 `remote.rs`의
-//!   `is_host_only_command` 머리말에 적는다.
+//! - 2026-09-30 결정으로 등록·편집·토큰 입력·삭제는 원격 write에서도 되고, 기기 코드
+//!   흐름(`OAuthDevice`)은 loopback을 쓰지 않아 원격에서도 끝난다(H03).
+//! - 2026-10-11 결정(사용자)으로 **콜백형 OAuth도 원격에서 끝난다.** 승인 뒤 브라우저가
+//!   멈춘 `http://127.0.0.1:<포트>/callback?code=…&state=…` 주소를 사용자가 붙여 넣으면,
+//!   진행 중인 흐름이 loopback 요청을 받은 것과 같은 자리에서 code를 교환한다
+//!   ([`ExternalPluginRegistry::submit_oauth_callback`]). PKCE verifier·state는 처음부터
+//!   백엔드에만 있으므로, 넘어오는 것은 일회용 code 하나뿐이다.
 //! - Notion은 두 방식을 모두 지원한다. 호스팅 서버(`mcp.notion.com`)는 OAuth 전용이고
 //!   내부 통합 토큰(`ntn_…`)을 받지 않으므로, 토큰 방식은 노션의 공식 오픈소스 서버
 //!   `@notionhq/notion-mcp-server`를 이 백엔드가 loopback HTTP 모드로 띄워 연결한다.
@@ -55,6 +58,7 @@ use crate::accounts::{
 };
 use crate::clock::now_ms;
 use crate::credential_profiles;
+use crate::domain::ProviderId;
 use crate::json_store::{JsonStore, SchemaVersioned};
 use crate::loopback_host::{is_loopback_url_host, validate_mcp_endpoint};
 use crate::mcp_registry::{parse_tools, McpHttpSession, McpRemoteTool};
@@ -72,6 +76,7 @@ const STORE: JsonStore = JsonStore {
 };
 /// OS 보안 저장소 항목의 service. account는 플러그인 id다.
 const KEYCHAIN_SERVICE: &str = "Agent Manager External Plugins";
+
 pub const MAX_PLUGINS: usize = 16;
 /// 프록시가 원격에서 받아 CLI로 넘기는 응답 본문 상한. Notion 페이지 본문은 수백 KB가
 /// 흔해 AIA 인터페이스(512 KB)보다 넉넉히 잡는다.
@@ -81,6 +86,8 @@ const PROXY_TIMEOUT: Duration = Duration::from_secs(120);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// 브라우저 승인을 기다리는 최대 시간.
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// 붙여 넣는 콜백 주소의 상한. 실제 주소는 수백 바이트이고, 그보다 큰 입력은 잘못 붙인 것이다.
+const MAX_PASTED_CALLBACK_BYTES: usize = 8 * 1024;
 /// 만료 이 시간 전부터는 access token을 미리 갱신한다.
 const ACCESS_TOKEN_REFRESH_MARGIN_MS: i64 = 60_000;
 /// 내장 Notion 서버가 포트를 열기까지 기다리는 시간. 첫 실행은 npx가 패키지를 내려받는다.
@@ -650,6 +657,14 @@ pub struct ExternalPluginIdRequest {
     pub id: String,
 }
 
+/// 승인 뒤 브라우저 주소창에 남은 콜백 주소를 진행 중인 흐름에 넘기는 요청.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitExternalPluginOAuthCallbackRequest {
+    pub id: String,
+    pub callback_url: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPluginToolCallRequest {
@@ -698,6 +713,9 @@ pub struct ExternalPluginOAuthStart {
     /// 디바이스 인가에서 사용자가 승인 화면에 입력할 코드. 그 외에는 None.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_code: Option<String>,
+    /// 승인 뒤 브라우저가 멈춘 콜백 주소를 붙여 넣어 끝낼 수 있는지. 콜백형이면 참이다 —
+    /// 브라우저가 이 백엔드와 다른 기기(원격 화면·NAS)에 있으면 이것이 유일한 길이다.
+    pub accepts_callback_paste: bool,
 }
 
 /// 보안 저장소에 한 줄 JSON으로 두는 비밀 문서.
@@ -725,6 +743,16 @@ struct SecretDocument {
 struct PendingOAuth {
     cancel: Arc<AtomicBool>,
     expires_at: i64,
+    /// 콜백형 흐름의 붙여넣기 자리. 기기 코드 흐름은 받을 콜백이 없어 None이다.
+    paste: Option<Arc<CallbackPaste>>,
+}
+
+/// 붙여 넣은 콜백이 대기 스레드로 건너가는 자리. 대조에 쓰는 redirect 주소와 state는
+/// 흐름을 시작할 때 고정되고, `code`는 한 번만 채워진다.
+struct CallbackPaste {
+    redirect_uri: String,
+    state: String,
+    code: Mutex<Option<String>>,
 }
 
 fn pending_oauth() -> &'static Mutex<HashMap<String, PendingOAuth>> {
@@ -783,6 +811,39 @@ pub(crate) struct ProxyResponse {
     pub(crate) session_id: Option<String>,
     pub(crate) body: Vec<u8>,
 }
+
+/// 플러그인 프록시를 부른 쪽 — 주소의 `<agent>` 조각(P12).
+///
+/// 인증이 아니라 노출 규칙을 고르는 값이다. 경계는 여전히 라우트 키이고, 라우트 키를 아는
+/// 로컬 프로세스는 어떤 조각이든 적을 수 있다(C20-5의 native와 같은 신뢰 수준). 그래서 이
+/// 값은 좁히는 쪽으로만 쓰고, 조각 없는 옛 주소가 지금까지 하던 것보다 넓히는 일은 없다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyCaller {
+    /// 앱 자신(AIA 프록시 작업·로컬 껍데기·연결 확인)과 조각 없는 옛 주소. 앞의 셋은 각자의
+    /// 승인 절차(P10)를 지난다.
+    Internal,
+    /// 그 공급자의 CLI에 건넨 주소.
+    Agent(ProviderId),
+}
+
+impl ProxyCaller {
+    /// `ask` 도구를 사용자에게 물을 수 있는 쪽인지.
+    fn confirms_tools(self) -> bool {
+        match self {
+            Self::Internal => true,
+            Self::Agent(provider) => provider.confirms_plugin_tools(),
+        }
+    }
+}
+
+/// CLI에 건네는 플러그인 주소 `<base>/<agent>/<id>`. 채팅마다 붙이는 공급자와 Antigravity
+/// 전역 등록이 이 함수 하나로 주소를 만든다.
+pub(crate) fn plugin_proxy_url(base: &str, agent: ProviderId, id: &str) -> String {
+    format!("{base}/{}/{id}", agent.as_str())
+}
+
+/// `tools/call` 전에 상류의 `readOnlyHint`를 읽을 때 따라가는 목록 쪽수 상한.
+const MAX_TOOL_LIST_PAGES: usize = 20;
 
 #[derive(Clone)]
 pub struct ExternalPluginRegistry {
@@ -1232,15 +1293,19 @@ impl ExternalPluginRegistry {
     /// 두 OAuth 갈래가 공통으로 거치는 앞자락 — 진행 중인 인가를 끊고, 플러그인이 OAuth
     /// 방식인지와 서버 주소를 확인하고, 인증 서버 메타데이터와 scope를 확정한다. 갈래별
     /// 몸통은 [`Self::begin_device_oauth`]와 [`Self::begin_callback_oauth`]에 있다.
+    ///
+    /// 어느 채널에서 불렀는지는 묻지 않는다. 기기 코드 흐름(RFC 8628)은 loopback을 쓰지
+    /// 않고(H03), 콜백형은 승인 결과가 백엔드 loopback에 닿지 못하는 화면이라도 사용자가
+    /// 그 주소를 붙여 넣어 끝낸다([`Self::submit_oauth_callback`], 2026-10-11).
     pub fn begin_oauth(&self, id: &str) -> Result<ExternalPluginOAuthStart, CoreError> {
         validate_plugin_id(id)?;
-        cancel_pending_oauth(id);
         let plugin = self.find_plugin(id)?;
         if !plugin.auth.is_oauth() {
             return Err(CoreError::InvalidInput(
                 "이 플러그인은 OAuth 방식이 아닙니다".to_owned(),
             ));
         }
+        cancel_pending_oauth(id);
         let url = plugin.url.clone().ok_or_else(|| {
             CoreError::InvalidInput("OAuth 플러그인에 서버 주소가 없습니다".to_owned())
         })?;
@@ -1309,7 +1374,12 @@ impl ExternalPluginRegistry {
         }
 
         let expires_at = now_ms() + OAUTH_CALLBACK_TIMEOUT.as_millis() as i64;
-        let cancel = register_pending_oauth(id, expires_at);
+        let paste = Arc::new(CallbackPaste {
+            redirect_uri: redirect_uri.clone(),
+            state: state.clone(),
+            code: Mutex::new(None),
+        });
+        let cancel = register_pending_oauth(id, expires_at, Some(Arc::clone(&paste)));
         let exchange = OAuthExchange {
             token_endpoint: metadata.token_endpoint,
             client_id,
@@ -1325,7 +1395,7 @@ impl ExternalPluginRegistry {
             cancel,
             CALLBACK_OAUTH_LABELS,
             move |cancel| {
-                wait_for_callback(&listener, &exchange.state, cancel)
+                wait_for_callback(&listener, &exchange.state, &paste, cancel)
                     .and_then(|code| exchange_code(&exchange, &code))
             },
         )?;
@@ -1334,6 +1404,7 @@ impl ExternalPluginRegistry {
             authorization_url: authorization_url.to_string(),
             expires_at,
             user_code: None,
+            accepts_callback_paste: true,
         })
     }
 
@@ -1380,7 +1451,7 @@ impl ExternalPluginRegistry {
         // 승인 대기 상한은 콜백 방식과 같게 두되, 서버가 더 짧은 만료를 주면 그쪽을 따른다.
         let expires_at = now_ms()
             + (authorization.expires_in * 1000).min(OAUTH_CALLBACK_TIMEOUT.as_millis() as i64);
-        let cancel = register_pending_oauth(&id, expires_at);
+        let cancel = register_pending_oauth(&id, expires_at, None);
         let token_endpoint = metadata.token_endpoint.clone();
         let device_code = authorization.device_code.clone();
         let interval = authorization.interval;
@@ -1408,7 +1479,43 @@ impl ExternalPluginRegistry {
             authorization_url: verification_url,
             expires_at,
             user_code: Some(user_code),
+            accepts_callback_paste: false,
         })
+    }
+
+    /// 승인 뒤 브라우저가 멈춘 콜백 주소를 진행 중인 콜백형 흐름에 넘긴다. loopback 요청을
+    /// 받은 것과 똑같이 대기 스레드가 code를 교환해 토큰을 저장하므로, 이 호출은 대조만 하고
+    /// 돌아온다 — 교환 결과는 목록의 대기·실패 상태로 드러난다.
+    ///
+    /// 받는 것은 그 흐름이 등록한 redirect 주소(scheme·host·port·path)와 같은 주소이고 state가
+    /// 일치하는 것뿐이다. 다른 흐름의 주소나 엉뚱한 붙여넣기는 흐름을 건드리지 않고 거절해
+    /// 사용자가 다시 붙여 넣을 수 있게 한다.
+    pub fn submit_oauth_callback(
+        &self,
+        id: &str,
+        callback_url: &str,
+    ) -> Result<ExternalPluginView, CoreError> {
+        validate_plugin_id(id)?;
+        let paste = pending_callback_paste(id).ok_or_else(|| {
+            CoreError::Conflict(
+                "진행 중인 브라우저 승인이 없습니다. [인증]을 다시 눌러 주세요".to_owned(),
+            )
+        })?;
+        let code = parse_pasted_callback(callback_url, &paste.redirect_uri, &paste.state)?;
+        {
+            let mut slot = paste
+                .code
+                .lock()
+                .map_err(|_| CoreError::Runtime("OAuth 대기 상태를 읽을 수 없습니다".to_owned()))?;
+            if slot.is_some() {
+                return Err(CoreError::Conflict(
+                    "이미 받은 승인을 처리하는 중입니다".to_owned(),
+                ));
+            }
+            *slot = Some(code);
+        }
+        let plugin = self.find_plugin(id)?;
+        Ok(plugin_view_with_pending(&plugin))
     }
 
     pub fn cancel_oauth(&self, id: &str) -> Result<ExternalPluginView, CoreError> {
@@ -1441,7 +1548,11 @@ impl ExternalPluginRegistry {
             })?
             .ok_or_else(plugin_not_found)?;
             Ok(())
-        })
+        })?;
+        // P12. 인증이 끝나 붙을 수 있게 됐다. 화면에서 시작한 명령이 아니라 콜백·폴링이 끝낸
+        // 자리라 명령 뒤의 동기화가 닿지 않으므로 여기서 Antigravity 등록을 맞춘다.
+        crate::antigravity_mcp_sync::sync_in_background(self.app_data_dir.clone(), None);
+        Ok(())
     }
 
     // -- 프록시 ---------------------------------------------------------------
@@ -1451,6 +1562,7 @@ impl ExternalPluginRegistry {
     pub(crate) fn proxy(
         &self,
         id: &str,
+        caller: ProxyCaller,
         request: ProxyRequest,
     ) -> Result<ProxyResponse, CoreError> {
         validate_plugin_id(id)?;
@@ -1461,13 +1573,74 @@ impl ExternalPluginRegistry {
         // 제한한 도구는 상류에 닿기 전에 막는다. 목록에서도 지우므로 CLI는 그런 도구가
         // 있다는 사실조차 모르지만, 이전 턴의 목록을 들고 있는 실행이 뒤늦게 부를 수 있다.
         let intent = ProxyIntent::of(&request.body);
-        if let ProxyIntent::CallTool(tool) = &intent {
-            if plugin.tool_policies.get(tool) == Some(&PluginToolPolicy::Deny) {
-                return Ok(denied_tool_response(&request.body, tool));
-            }
+        // P12. 승인 통로가 없는 쪽은 읽지 못한 본문을 넘기지 않는다. 판정은 본문을 JSON으로
+        // 읽어야 할 수 있는데, 이 프록시가 못 읽는 본문을 상류가 관대하게 읽으면(BOM 등) 판정을
+        // 건너뛴 호출이 된다.
+        if !caller.confirms_tools() && request.method == reqwest::Method::POST && !intent.parsed {
+            return Ok(ProxyResponse {
+                status: 400,
+                content_type: Some("application/json".to_owned()),
+                session_id: None,
+                body: json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": {"code": -32700, "message": "JSON-RPC 본문을 읽지 못했습니다"},
+                })
+                .to_string()
+                .into_bytes(),
+            });
+        }
+        if let Some(tool) = intent
+            .calls
+            .iter()
+            .find(|tool| plugin.tool_policies.get(tool.as_str()) == Some(&PluginToolPolicy::Deny))
+        {
+            return Ok(denied_tool_response(&request.body, tool));
         }
         let (upstream, authorization) = self.upstream_for(&plugin)?;
         let client = proxy_client()?;
+        // P12. 승인 통로가 없는 쪽은 `allow`가 아닌 도구를 상류의 현재 `readOnlyHint`가 읽기
+        // 전용이라고 할 때만 넘긴다. 목록에서 감춘 것과 같은 판정이지만, 이전 목록을 들고
+        // 있는 실행이나 이름을 짐작한 호출을 막으려면 호출 자리에서 다시 봐야 한다.
+        if !caller.confirms_tools() {
+            let unconfirmed: Vec<&str> = intent
+                .calls
+                .iter()
+                .map(String::as_str)
+                .filter(|tool| {
+                    plugin.tool_policies.get(*tool).copied().unwrap_or_default()
+                        != PluginToolPolicy::Allow
+                })
+                .collect();
+            if !unconfirmed.is_empty() {
+                let read_only = upstream_read_only_tools(
+                    &client,
+                    &upstream,
+                    authorization.as_ref().map(|value| value.as_str()),
+                    &request,
+                );
+                match &read_only {
+                    Ok(read_only) => {
+                        if let Some(tool) =
+                            unconfirmed.iter().find(|tool| !read_only.contains(**tool))
+                        {
+                            return Ok(unconfirmable_tool_response(&request.body, tool));
+                        }
+                    }
+                    // 판정할 수 없으면 막는다. 쓰기일 수도 있는 도구를 묻지 않고 넘기지 않는다.
+                    Err(error) => {
+                        return Ok(tool_error_response(
+                            &request.body,
+                            &format!(
+                                "도구('{}')가 읽기 전용인지 플러그인 서버에서 확인하지 못해 호출하지 않았습니다. 잠시 뒤 다시 시도하세요: {}",
+                                unconfirmed[0],
+                                text_limit::truncate_chars(&error.to_string(), 200)
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
         let response = send_proxy_request(
             &client,
             &upstream,
@@ -1479,7 +1652,12 @@ impl ExternalPluginRegistry {
                 Ok(Some(refreshed)) => {
                     let retried =
                         send_proxy_request(&client, &upstream, Some(&refreshed), &request)?;
-                    return Ok(hide_denied_tools(retried, &intent, &plugin.tool_policies));
+                    return Ok(hide_unexposed_tools(
+                        retried,
+                        &intent,
+                        &plugin.tool_policies,
+                        caller,
+                    ));
                 }
                 Ok(None) => {}
                 // 실패 사유는 refresh_oauth_access가 이미 last_error에 남겼다. 상류 401 응답을
@@ -1487,7 +1665,12 @@ impl ExternalPluginRegistry {
                 Err(_) => {}
             }
         }
-        Ok(hide_denied_tools(response, &intent, &plugin.tool_policies))
+        Ok(hide_unexposed_tools(
+            response,
+            &intent,
+            &plugin.tool_policies,
+            caller,
+        ))
     }
 
     fn upstream_for(
@@ -1933,7 +2116,11 @@ fn restore_edited_secret(id: &str, previous: Option<SecretDocument>) -> Result<(
 }
 
 /// 인가 대기 목록에 이 플러그인을 올리고 취소 신호를 돌려준다.
-fn register_pending_oauth(id: &str, expires_at: i64) -> Arc<AtomicBool> {
+fn register_pending_oauth(
+    id: &str,
+    expires_at: i64,
+    paste: Option<Arc<CallbackPaste>>,
+) -> Arc<AtomicBool> {
     let cancel = Arc::new(AtomicBool::new(false));
     if let Ok(mut pending) = pending_oauth().lock() {
         pending.insert(
@@ -1941,10 +2128,22 @@ fn register_pending_oauth(id: &str, expires_at: i64) -> Arc<AtomicBool> {
             PendingOAuth {
                 cancel: Arc::clone(&cancel),
                 expires_at,
+                paste,
             },
         );
     }
     cancel
+}
+
+/// 이 플러그인의 살아 있는 콜백형 흐름이 가진 붙여넣기 자리. 만료·취소된 흐름은 없는 것으로 본다.
+fn pending_callback_paste(id: &str) -> Option<Arc<CallbackPaste>> {
+    let now = now_ms();
+    let pending = pending_oauth().lock().ok()?;
+    let flow = pending.get(id)?;
+    if flow.expires_at <= now || flow.cancel.load(Ordering::Acquire) {
+        return None;
+    }
+    flow.paste.clone()
 }
 
 /// 사용자를 보낼 authorize 주소를 만든다.
@@ -3219,10 +3418,12 @@ fn bind_callback_listener(preferred_port: Option<u16>) -> Result<TcpListener, Co
 }
 
 /// 브라우저가 돌려주는 `GET /callback?code=…&state=…` 한 건을 기다린다. state가 다르거나
-/// 오류 응답이면 실패로 끝내고, 그 외 경로(favicon 등)는 404로 흘려보낸다.
+/// 오류 응답이면 실패로 끝내고, 그 외 경로(favicon 등)는 404로 흘려보낸다. 같은 대기 중에
+/// 사용자가 콜백 주소를 붙여 넣으면(`paste`, 이미 대조를 마친 code) 그 code로 끝낸다.
 fn wait_for_callback(
     listener: &TcpListener,
     expected_state: &str,
+    paste: &CallbackPaste,
     cancel: &AtomicBool,
 ) -> Result<String, CoreError> {
     listener.set_nonblocking(true)?;
@@ -3232,6 +3433,9 @@ fn wait_for_callback(
             return Err(CoreError::Conflict(
                 "OAuth 인증이 취소되었습니다".to_owned(),
             ));
+        }
+        if let Some(code) = paste.code.lock().ok().and_then(|slot| slot.clone()) {
+            return Ok(code);
         }
         if Instant::now() >= deadline {
             return Err(CoreError::Conflict(
@@ -3326,6 +3530,65 @@ fn parse_callback_target(target: &str) -> Option<CallbackQuery> {
     if url.path() != "/callback" {
         return None;
     }
+    Some(callback_query(&url))
+}
+
+/// 사용자가 붙여 넣은 콜백 주소에서 code를 꺼낸다. 흐름이 등록한 redirect 주소와
+/// scheme·port·path가 같고 host가 loopback이어야 하며(브라우저는 `localhost`로 보여 주기도
+/// 한다), state가 일치해야 한다. 인증 서버의 거절(`error`)은 그 사유를 그대로 돌려준다.
+fn parse_pasted_callback(
+    pasted: &str,
+    redirect_uri: &str,
+    expected_state: &str,
+) -> Result<String, CoreError> {
+    let pasted = pasted.trim();
+    if pasted.is_empty() {
+        return Err(CoreError::InvalidInput(
+            "승인 뒤 브라우저 주소창의 주소를 붙여 넣어 주세요".to_owned(),
+        ));
+    }
+    if pasted.len() > MAX_PASTED_CALLBACK_BYTES {
+        return Err(CoreError::InvalidInput(
+            "붙여 넣은 내용이 너무 깁니다. 주소창의 주소 한 줄만 붙여 넣어 주세요".to_owned(),
+        ));
+    }
+    let expected = Url::parse(redirect_uri)
+        .map_err(|_| CoreError::Runtime("등록된 redirect 주소를 읽을 수 없습니다".to_owned()))?;
+    let url = Url::parse(pasted).map_err(|_| {
+        CoreError::InvalidInput(format!(
+            "주소로 읽을 수 없습니다. {}로 시작하는 주소창 전체를 붙여 넣어 주세요",
+            expected.as_str()
+        ))
+    })?;
+    let same_target = url.scheme() == expected.scheme()
+        && url.host_str().is_some_and(is_loopback_url_host)
+        && url.port_or_known_default() == expected.port_or_known_default()
+        && url.path() == expected.path();
+    if !same_target {
+        return Err(CoreError::InvalidInput(format!(
+            "이 인증의 콜백 주소가 아닙니다. {}로 시작하는 주소를 붙여 넣어 주세요",
+            expected.as_str()
+        )));
+    }
+    let query = callback_query(&url);
+    if let Some(error) = query.error {
+        return Err(CoreError::Conflict(format!(
+            "인증 서버가 거절했습니다: {error}"
+        )));
+    }
+    if query.state.as_deref() != Some(expected_state) {
+        return Err(CoreError::Conflict(
+            "state가 이 인증과 맞지 않습니다. 가장 최근에 연 승인 화면의 주소를 붙여 넣어 주세요"
+                .to_owned(),
+        ));
+    }
+    query
+        .code
+        .filter(|code| !code.is_empty())
+        .ok_or_else(|| CoreError::InvalidInput("주소에 인증 코드(code)가 없습니다".to_owned()))
+}
+
+fn callback_query(url: &Url) -> CallbackQuery {
     let mut query = CallbackQuery::default();
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
@@ -3343,7 +3606,7 @@ fn parse_callback_target(target: &str) -> Option<CallbackQuery> {
             _ => {}
         }
     }
-    Some(query)
+    query
 }
 
 fn respond_html(stream: &mut TcpStream, status: u16, message: &str) -> std::io::Result<()> {
@@ -3368,25 +3631,31 @@ fn respond_html(stream: &mut TcpStream, status: u16, message: &str) -> std::io::
 // ---------------------------------------------------------------------------
 
 /// 프록시가 알아봐야 하는 요청 종류. 도구 정책은 이 둘에만 관여한다.
-#[derive(Debug, PartialEq)]
-enum ProxyIntent {
-    ListTools,
-    CallTool(String),
-    Other,
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProxyIntent {
+    /// 본문이 JSON으로 읽혔는지.
+    parsed: bool,
+    /// 본문에 `tools/list`가 있는지. 응답의 도구 목록을 거를지 정한다.
+    lists_tools: bool,
+    /// 본문이 부르는 도구 이름 전부.
+    calls: Vec<String>,
 }
 
 impl ProxyIntent {
-    /// CLI가 보낸 JSON-RPC 본문에서 의도를 읽는다. 배치(JSON 배열)는 요소를 모두 훑어
-    /// 하나라도 도구 호출이면 그 이름을 돌려준다 — 배치에 섞어 제한을 피하지 못하게 한다.
+    /// CLI가 보낸 JSON-RPC 본문에서 의도를 읽는다. 배치(JSON 배열)는 요소를 모두 훑어 부르는
+    /// 도구를 **전부** 모은다 — 첫 이름만 보면 허용된 호출 뒤에 제한한 호출을 붙여 피할 수 있다.
     fn of(body: &[u8]) -> Self {
         let Ok(payload) = serde_json::from_slice::<Value>(body) else {
-            return ProxyIntent::Other;
+            return ProxyIntent::default();
         };
         let entries: Vec<&Value> = match &payload {
             Value::Array(items) => items.iter().collect(),
             value => vec![value],
         };
-        let mut list = false;
+        let mut intent = ProxyIntent {
+            parsed: true,
+            ..ProxyIntent::default()
+        };
         for entry in entries {
             match entry.get("method").and_then(Value::as_str) {
                 Some("tools/call") => {
@@ -3395,24 +3664,29 @@ impl ProxyIntent {
                         .and_then(|params| params.get("name"))
                         .and_then(Value::as_str)
                     {
-                        return ProxyIntent::CallTool(name.to_owned());
+                        intent.calls.push(name.to_owned());
                     }
                 }
-                Some("tools/list") => list = true,
+                Some("tools/list") => intent.lists_tools = true,
                 _ => {}
             }
         }
-        if list {
-            ProxyIntent::ListTools
-        } else {
-            ProxyIntent::Other
-        }
+        intent
     }
 }
 
 /// 제한한 도구 호출에 상류 대신 돌려주는 응답. 프로토콜 오류가 아니라 도구 오류로 주어야
 /// CLI가 대화를 끊지 않고 모델에게 거절 사유를 전달한다.
 fn denied_tool_response(body: &[u8], tool: &str) -> ProxyResponse {
+    tool_error_response(
+        body,
+        &format!(
+            "Agent Manager 설정에서 이 도구('{tool}')를 제한했습니다. 사용자가 설정에서 허용하거나 확인으로 바꾸기 전에는 호출할 수 없습니다."
+        ),
+    )
+}
+
+fn tool_error_response(body: &[u8], text: &str) -> ProxyResponse {
     let id = serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|payload| payload.get("id").cloned())
@@ -3424,9 +3698,7 @@ fn denied_tool_response(body: &[u8], tool: &str) -> ProxyResponse {
             "isError": true,
             "content": [{
                 "type": "text",
-                "text": format!(
-                    "Agent Manager 설정에서 이 도구('{tool}')를 제한했습니다. 사용자가 설정에서 허용하거나 확인으로 바꾸기 전에는 호출할 수 없습니다."
-                ),
+                "text": text,
             }],
         }
     });
@@ -3438,22 +3710,57 @@ fn denied_tool_response(body: &[u8], tool: &str) -> ProxyResponse {
     }
 }
 
-/// `tools/list` 응답에서 제한한 도구를 지운다. 스트리밍 응답(`text/event-stream`)은
-/// `data:` 줄마다 JSON이 실려 오므로 줄 단위로 다시 쓴다.
-fn hide_denied_tools(
+/// 승인 통로가 없는 에이전트가 확인이 필요한 쓰기 도구를 부를 때 상류 대신 돌려주는 응답(P12).
+/// 제한(`deny`)과 문구를 가른다 — 사용자가 막은 것이 아니라, 물을 길이 없어 열지 않은 것이다.
+fn unconfirmable_tool_response(body: &[u8], tool: &str) -> ProxyResponse {
+    tool_error_response(
+        body,
+        &format!(
+            "이 에이전트는 실행 전에 사용자 확인을 받을 수 없어, 확인이 필요한 쓰기 도구('{tool}')를 열지 않습니다. 사용자가 Agent Manager 애드온 → 외부 MCP에서 이 도구를 '허용'으로 바꾸면 쓸 수 있습니다."
+        ),
+    )
+}
+
+/// 도구 하나가 이 호출자에게 보이는지(P11·P12). 제한은 누구에게도 보이지 않고 허용은 누구에게나
+/// 보인다. 확인(기본값)은 물을 수 있는 쪽에는 그대로, 물을 수 없는 쪽에는 상류가 읽기 전용이라고
+/// 밝힌 도구만 보인다.
+fn tool_is_exposed(
+    tool: &Value,
+    policies: &BTreeMap<String, PluginToolPolicy>,
+    caller: ProxyCaller,
+) -> bool {
+    let Some(name) = tool.get("name").and_then(Value::as_str) else {
+        return true;
+    };
+    match policies.get(name).copied().unwrap_or_default() {
+        PluginToolPolicy::Deny => false,
+        PluginToolPolicy::Allow => true,
+        PluginToolPolicy::Ask => caller.confirms_tools() || tool_is_read_only(tool),
+    }
+}
+
+fn tool_is_read_only(tool: &Value) -> bool {
+    tool.get("annotations")
+        .and_then(|annotations| annotations.get("readOnlyHint"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// `tools/list` 응답에서 이 호출자에게 보이지 않는 도구를 지운다. 스트리밍 응답
+/// (`text/event-stream`)은 `data:` 줄마다 JSON이 실려 오므로 줄 단위로 다시 쓴다.
+fn hide_unexposed_tools(
     response: ProxyResponse,
     intent: &ProxyIntent,
     policies: &BTreeMap<String, PluginToolPolicy>,
+    caller: ProxyCaller,
 ) -> ProxyResponse {
-    if *intent != ProxyIntent::ListTools {
+    if !intent.lists_tools {
         return response;
     }
-    let denied: BTreeSet<&str> = policies
-        .iter()
-        .filter(|(_, policy)| **policy == PluginToolPolicy::Deny)
-        .map(|(tool, _)| tool.as_str())
-        .collect();
-    if denied.is_empty() {
+    let has_denied = policies
+        .values()
+        .any(|policy| *policy == PluginToolPolicy::Deny);
+    if !has_denied && caller.confirms_tools() {
         return response;
     }
     let Ok(text) = std::str::from_utf8(&response.body) else {
@@ -3463,6 +3770,7 @@ fn hide_denied_tools(
         .content_type
         .as_deref()
         .is_some_and(|value| value.contains("text/event-stream"));
+    let keep = |tool: &Value| tool_is_exposed(tool, policies, caller);
     let rewritten = if is_event_stream {
         let mut lines = Vec::new();
         for line in text.split_inclusive('\n') {
@@ -3473,7 +3781,7 @@ fn hide_denied_tools(
             match line
                 .strip_prefix("data:")
                 .and_then(|payload| serde_json::from_str::<Value>(payload.trim()).ok())
-                .map(|payload| without_denied_tools(payload, &denied))
+                .map(|payload| retain_listed_tools(payload, &keep))
             {
                 Some(payload) => lines.push(format!("data: {payload}{ending}")),
                 None => lines.push(format!("{line}{ending}")),
@@ -3482,7 +3790,7 @@ fn hide_denied_tools(
         lines.concat()
     } else {
         match serde_json::from_str::<Value>(text) {
-            Ok(payload) => without_denied_tools(payload, &denied).to_string(),
+            Ok(payload) => retain_listed_tools(payload, &keep).to_string(),
             Err(_) => return response,
         }
     };
@@ -3492,7 +3800,7 @@ fn hide_denied_tools(
     }
 }
 
-fn without_denied_tools(mut payload: Value, denied: &BTreeSet<&str>) -> Value {
+fn retain_listed_tools(mut payload: Value, keep: &dyn Fn(&Value) -> bool) -> Value {
     let entries: Vec<&mut Value> = match &mut payload {
         Value::Array(items) => items.iter_mut().collect(),
         value => vec![value],
@@ -3503,14 +3811,91 @@ fn without_denied_tools(mut payload: Value, denied: &BTreeSet<&str>) -> Value {
             .and_then(|result| result.get_mut("tools"))
             .and_then(Value::as_array_mut)
         {
-            tools.retain(|tool| {
-                tool.get("name")
-                    .and_then(Value::as_str)
-                    .is_none_or(|name| !denied.contains(name))
-            });
+            tools.retain(|tool| keep(tool));
         }
     }
     payload
+}
+
+/// 응답 본문(JSON 또는 `text/event-stream`)에서 JSON-RPC `result`를 꺼낸다.
+fn rpc_result(response: &ProxyResponse) -> Option<Value> {
+    let text = std::str::from_utf8(&response.body).ok()?;
+    let result_of = |payload: Value| -> Option<Value> {
+        match payload {
+            Value::Array(items) => items
+                .into_iter()
+                .find_map(|item| item.get("result").cloned()),
+            value => value.get("result").cloned(),
+        }
+    };
+    if let Ok(payload) = serde_json::from_str::<Value>(text) {
+        return result_of(payload);
+    }
+    text.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|payload| serde_json::from_str::<Value>(payload.trim()).ok())
+        .find_map(result_of)
+}
+
+/// `tools/call`을 넘기기 전에 상류의 현재 `readOnlyHint`를 읽는다(P12). CLI가 맺은 세션
+/// 그대로 `tools/list`를 한 번 더 보낸다 — 목록이 지날 때 기억해 둔 값에 기대면 상류가 주석을
+/// 바꾼 뒤에도 옛 판정으로 통과시킨다.
+fn upstream_read_only_tools(
+    client: &Client,
+    upstream: &str,
+    authorization: Option<&str>,
+    request: &ProxyRequest,
+) -> Result<BTreeSet<String>, CoreError> {
+    let mut read_only = BTreeSet::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_TOOL_LIST_PAGES {
+        let mut params = json!({});
+        if let Some(cursor) = &cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let list = ProxyRequest {
+            method: reqwest::Method::POST,
+            content_type: Some("application/json".to_owned()),
+            accept: None,
+            session_id: request.session_id.clone(),
+            protocol_version: request.protocol_version.clone(),
+            body: json!({
+                "jsonrpc": "2.0",
+                // 세션 안에서 요청 id를 다시 쓰지 않는다(MCP). 병렬 호출 둘이 같은 id로 판정을
+                // 물으면 응답을 id로 잇는 서버가 한쪽을 잃는다.
+                "id": format!("agent-manager-tool-policy-{}", Uuid::new_v4().simple()),
+                "method": "tools/list",
+                "params": params,
+            })
+            .to_string()
+            .into_bytes(),
+        };
+        let response = send_proxy_request(client, upstream, authorization, &list)?;
+        let result = (response.status < 300)
+            .then(|| rpc_result(&response))
+            .flatten()
+            .ok_or_else(|| CoreError::Runtime("플러그인 도구 목록을 읽지 못했습니다".to_owned()))?;
+        for tool in result
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                if tool_is_read_only(tool) {
+                    read_only.insert(name.to_owned());
+                }
+            }
+        }
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(read_only)
 }
 
 fn send_proxy_request(
@@ -4589,6 +4974,96 @@ mod tests {
         assert!(!view.credential_ready && !view.attachable);
     }
 
+    /// 2026-10-11. 콜백형 OAuth는 승인 뒤 브라우저가 멈춘 콜백 주소를 붙여 넣어 끝낸다.
+    /// 대조에 실패한 붙여넣기는 흐름을 건드리지 않아 다시 붙여 넣을 수 있고, 그 흐름이
+    /// 등록한 redirect 주소·state와 맞는 code만 대기 스레드로 건너간다.
+    #[test]
+    fn pasted_callback_reaches_only_the_matching_pending_flow() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let registry = ExternalPluginRegistry::new(directory.path().to_path_buf());
+        registry
+            .register(ExternalPluginManifestRequest {
+                id: "pasted".to_owned(),
+                display_name: "Pasted callback".to_owned(),
+                names: None,
+                url: Some("http://127.0.0.1:1/mcp".to_owned()),
+                auth: PluginAuthKind::OAuth,
+                token: None,
+                client_id: None,
+                client_secret: None,
+                scope: None,
+            })
+            .expect("callback plugin");
+        let matching = "http://127.0.0.1:43123/callback?code=the-code&state=s1";
+
+        let idle = registry
+            .submit_oauth_callback("pasted", matching)
+            .expect_err("진행 중인 흐름이 없으면 받을 자리가 없다");
+        assert!(matches!(idle, CoreError::Conflict(_)), "{idle:?}");
+
+        let paste = Arc::new(CallbackPaste {
+            redirect_uri: "http://127.0.0.1:43123/callback".to_owned(),
+            state: "s1".to_owned(),
+            code: Mutex::new(None),
+        });
+        let cancel = register_pending_oauth("pasted", now_ms() + 60_000, Some(Arc::clone(&paste)));
+
+        for wrong in [
+            "",
+            "code=the-code&state=s1",
+            "http://127.0.0.1:43124/callback?code=the-code&state=s1",
+            "http://127.0.0.1:43123/other?code=the-code&state=s1",
+            "http://example.com:43123/callback?code=the-code&state=s1",
+            "https://127.0.0.1:43123/callback?code=the-code&state=s1",
+            "http://127.0.0.1:43123/callback?code=the-code&state=other",
+            "http://127.0.0.1:43123/callback?code=the-code",
+            "http://127.0.0.1:43123/callback?state=s1",
+            "http://127.0.0.1:43123/callback?error=access_denied&state=s1",
+        ] {
+            registry
+                .submit_oauth_callback("pasted", wrong)
+                .expect_err(wrong);
+        }
+        assert!(paste.code.lock().expect("slot").is_none());
+        assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
+
+        // 브라우저는 127.0.0.1을 localhost로 보여 주기도 하고, 복사하면 공백이 묻는다.
+        let view = registry
+            .submit_oauth_callback(
+                "pasted",
+                "  http://localhost:43123/callback?code=the-code&state=s1\n",
+            )
+            .expect("맞는 주소는 받는다");
+        assert!(view.oauth_pending);
+        assert_eq!(
+            paste.code.lock().expect("slot").as_deref(),
+            Some("the-code")
+        );
+        registry
+            .submit_oauth_callback("pasted", matching)
+            .expect_err("한 흐름의 code는 한 번만 받는다");
+
+        cancel_pending_oauth("pasted");
+        registry
+            .submit_oauth_callback("pasted", matching)
+            .expect_err("취소된 흐름에는 넘기지 않는다");
+    }
+
+    /// 붙여 넣은 code는 loopback 요청이 오지 않아도 대기 루프를 끝낸다.
+    #[test]
+    fn callback_wait_ends_with_a_pasted_code() {
+        let listener =
+            TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("listener");
+        let paste = CallbackPaste {
+            redirect_uri: "http://127.0.0.1:1/callback".to_owned(),
+            state: "s1".to_owned(),
+            code: Mutex::new(Some("pasted-code".to_owned())),
+        };
+        let cancel = AtomicBool::new(false);
+        let code = wait_for_callback(&listener, "s1", &paste, &cancel).expect("pasted code");
+        assert_eq!(code, "pasted-code");
+    }
+
     #[test]
     fn denied_tools_are_hidden_from_the_list_and_refused_on_call() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -4637,7 +5112,7 @@ mod tests {
         let list_body = json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})
             .to_string()
             .into_bytes();
-        assert_eq!(ProxyIntent::of(&list_body), ProxyIntent::ListTools);
+        assert!(ProxyIntent::of(&list_body).lists_tools);
         let upstream = ProxyResponse {
             status: 200,
             content_type: Some("text/event-stream".to_owned()),
@@ -4655,7 +5130,12 @@ mod tests {
             )
             .into_bytes(),
         };
-        let filtered = hide_denied_tools(upstream, &ProxyIntent::ListTools, &policies);
+        let filtered = hide_unexposed_tools(
+            upstream,
+            &ProxyIntent::of(&list_body),
+            &policies,
+            ProxyCaller::Agent(ProviderId::Claude),
+        );
         let text = String::from_utf8(filtered.body).expect("utf8");
         assert!(text.contains("notion-search"));
         assert!(!text.contains("notion-create-pages"));
@@ -4670,13 +5150,275 @@ mod tests {
         .to_string()
         .into_bytes();
         assert_eq!(
-            ProxyIntent::of(&call_body),
-            ProxyIntent::CallTool("notion-create-pages".to_owned())
+            ProxyIntent::of(&call_body).calls,
+            vec!["notion-create-pages".to_owned()]
         );
         let refusal = denied_tool_response(&call_body, "notion-create-pages");
         let payload: Value = serde_json::from_slice(&refusal.body).expect("json");
         assert_eq!(payload["id"], json!(3));
         assert_eq!(payload["result"]["isError"], json!(true));
+    }
+
+    /// 배치 안의 호출은 첫 이름만이 아니라 전부 모은다. 허용된 호출 뒤에 제한한 호출을 붙여
+    /// 제한을 피하지 못하게 한다.
+    #[test]
+    fn proxy_intent_collects_every_call_in_a_batch() {
+        let body = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "notion-search"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "notion-create-pages"}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/list"}
+        ])
+        .to_string()
+        .into_bytes();
+        let intent = ProxyIntent::of(&body);
+        assert!(intent.lists_tools);
+        assert_eq!(
+            intent.calls,
+            vec!["notion-search".to_owned(), "notion-create-pages".to_owned()]
+        );
+    }
+
+    /// P12. 승인 통로가 없는 Antigravity 경로에는 확인(기본값) 도구 중 상류가 읽기 전용이라고
+    /// 밝힌 것만 보이고, 허용한 쓰기 도구는 보이며, 제한은 누구에게도 보이지 않는다. 승인할 수
+    /// 있는 쪽과 앱 내부 경로는 지금까지와 같다.
+    #[test]
+    fn p12_unconfirmable_callers_see_only_read_only_or_allowed_tools() {
+        let policies = BTreeMap::from([
+            ("notion-update-page".to_owned(), PluginToolPolicy::Allow),
+            ("notion-move-pages".to_owned(), PluginToolPolicy::Deny),
+        ]);
+        let list_body = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            .to_string()
+            .into_bytes();
+        let upstream = || ProxyResponse {
+            status: 200,
+            content_type: Some("application/json".to_owned()),
+            session_id: None,
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [
+                    {"name": "notion-search", "annotations": {"readOnlyHint": true}},
+                    {"name": "notion-create-pages", "annotations": {"readOnlyHint": false}},
+                    {"name": "notion-fetch"},
+                    {"name": "notion-update-page"},
+                    {"name": "notion-move-pages", "annotations": {"readOnlyHint": true}}
+                ]}
+            })
+            .to_string()
+            .into_bytes(),
+        };
+        let names = |caller| -> Vec<String> {
+            let filtered =
+                hide_unexposed_tools(upstream(), &ProxyIntent::of(&list_body), &policies, caller);
+            let payload: Value = serde_json::from_slice(&filtered.body).expect("json");
+            payload["result"]["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .map(|tool| tool["name"].as_str().expect("name").to_owned())
+                .collect()
+        };
+        assert_eq!(
+            names(ProxyCaller::Agent(ProviderId::Antigravity)),
+            vec!["notion-search".to_owned(), "notion-update-page".to_owned()]
+        );
+        let full = vec![
+            "notion-search".to_owned(),
+            "notion-create-pages".to_owned(),
+            "notion-fetch".to_owned(),
+            "notion-update-page".to_owned(),
+        ];
+        for caller in [
+            ProxyCaller::Internal,
+            ProxyCaller::Agent(ProviderId::Claude),
+            ProxyCaller::Agent(ProviderId::Codex),
+            ProxyCaller::Agent(ProviderId::Local),
+        ] {
+            assert_eq!(names(caller), full, "{caller:?}");
+        }
+    }
+
+    /// P12. 호출 자리에서도 같은 판정이다. 승인 통로가 없는 쪽의 쓰기 호출은 상류의 현재
+    /// `tools/list`만 읽고 넘기지 않으며, 읽기 전용 호출은 넘긴다. 승인할 수 있는 쪽은 미리
+    /// 읽지 않고 그대로 넘긴다.
+    #[test]
+    fn p12_unconfirmable_callers_cannot_call_ask_write_tools() {
+        use std::net::TcpListener as MockListener;
+        let listener = MockListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorder = Arc::clone(&seen);
+        let server = thread::spawn(move || {
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let body = read_mock_body(&mut stream);
+                let payload: Value = serde_json::from_slice(&body).expect("json");
+                let method = payload["method"].as_str().expect("method").to_owned();
+                let result = match method.as_str() {
+                    "tools/list" => json!({"tools": [
+                        {"name": "search", "annotations": {"readOnlyHint": true}},
+                        {"name": "create", "annotations": {"readOnlyHint": false}}
+                    ]}),
+                    _ => json!({"content": [{"type": "text", "text": "done"}], "isError": false}),
+                };
+                recorder.lock().expect("seen").push(method);
+                let response =
+                    json!({"jsonrpc": "2.0", "id": payload["id"], "result": result}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .expect("write");
+            }
+        });
+        let directory = tempfile::tempdir().expect("tempdir");
+        let registry = ExternalPluginRegistry::new(directory.path().to_path_buf());
+        registry
+            .register(ExternalPluginManifestRequest {
+                id: "mock".to_owned(),
+                display_name: "Mock".to_owned(),
+                names: None,
+                url: Some(format!("http://{address}/mcp")),
+                auth: PluginAuthKind::None,
+                token: None,
+                client_id: None,
+                client_secret: None,
+                scope: None,
+            })
+            .expect("register");
+        let call = |tool: &str| {
+            ProxyRequest {
+            method: reqwest::Method::POST,
+            content_type: Some("application/json".to_owned()),
+            accept: None,
+            session_id: Some("session-1".to_owned()),
+            protocol_version: None,
+            body: json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": tool, "arguments": {}}})
+                .to_string()
+                .into_bytes(),
+        }
+        };
+        let is_error = |response: ProxyResponse| -> bool {
+            let payload: Value = serde_json::from_slice(&response.body).expect("json");
+            payload["result"]["isError"].as_bool().unwrap_or(false)
+        };
+        let antigravity = ProxyCaller::Agent(ProviderId::Antigravity);
+        let refused = registry
+            .proxy("mock", antigravity, call("create"))
+            .expect("refused");
+        assert!(is_error(refused));
+        assert_eq!(*seen.lock().expect("seen"), vec!["tools/list".to_owned()]);
+        let allowed = registry
+            .proxy("mock", antigravity, call("search"))
+            .expect("search");
+        assert!(!is_error(allowed));
+        // 배치에 읽기 호출을 앞세워도 뒤의 쓰기 호출이 막힌다.
+        let batch = ProxyRequest {
+            body: json!([
+                {"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {"name": "search", "arguments": {}}},
+                {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "create", "arguments": {}}}
+            ])
+            .to_string()
+            .into_bytes(),
+            ..call("search")
+        };
+        let refused = registry.proxy("mock", antigravity, batch).expect("batch");
+        assert!(String::from_utf8_lossy(&refused.body).contains("'create'"));
+        // 읽지 못한 본문은 상류에 닿기 전에 막힌다.
+        let garbled = ProxyRequest {
+            body: b"\xef\xbb\xbf{}".to_vec(),
+            ..call("search")
+        };
+        assert_eq!(
+            registry
+                .proxy("mock", antigravity, garbled)
+                .expect("garbled")
+                .status,
+            400
+        );
+        let claude = registry
+            .proxy(
+                "mock",
+                ProxyCaller::Agent(ProviderId::Claude),
+                call("create"),
+            )
+            .expect("claude");
+        assert!(!is_error(claude));
+        server.join().expect("server");
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![
+                "tools/list".to_owned(),
+                "tools/list".to_owned(),
+                "tools/call".to_owned(),
+                "tools/list".to_owned(),
+                "tools/call".to_owned(),
+            ]
+        );
+    }
+
+    fn read_mock_body(stream: &mut TcpStream) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).expect("read");
+            assert!(read > 0, "request ended before headers");
+            bytes.extend_from_slice(&chunk[..read]);
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]).to_ascii_lowercase();
+        let length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .map(|value| value.trim().parse::<usize>().expect("length"))
+            .unwrap_or(0);
+        while bytes.len() < header_end + length {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).expect("read");
+            assert!(read > 0, "request ended before body");
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        bytes[header_end..header_end + length].to_vec()
+    }
+
+    #[test]
+    fn p12_plugin_proxy_url_carries_the_agent_segment() {
+        assert_eq!(
+            plugin_proxy_url(
+                "http://127.0.0.1:4179/plugins/key",
+                ProviderId::Antigravity,
+                "github"
+            ),
+            "http://127.0.0.1:4179/plugins/key/antigravity/github"
+        );
+    }
+
+    #[test]
+    fn p12_reads_the_rpc_result_from_json_and_event_streams() {
+        let tools = json!({"tools": [{"name": "a"}]});
+        let json_body = ProxyResponse {
+            status: 200,
+            content_type: Some("application/json".to_owned()),
+            session_id: None,
+            body: json!({"jsonrpc": "2.0", "id": 1, "result": tools})
+                .to_string()
+                .into_bytes(),
+        };
+        assert_eq!(rpc_result(&json_body), Some(tools.clone()));
+        let stream_body = ProxyResponse {
+            content_type: Some("text/event-stream".to_owned()),
+            body: format!(
+                "event: message\ndata: {}\n\n",
+                json!({"jsonrpc": "2.0", "id": 1, "result": tools})
+            )
+            .into_bytes(),
+            ..json_body
+        };
+        assert_eq!(rpc_result(&stream_body), Some(tools));
     }
 
     #[test]

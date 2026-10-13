@@ -51,44 +51,6 @@ export interface SkillDivergentInstall {
   install: SkillInstallView;
 }
 
-/**
- * 갈라진 자리들 중 가장 나중에 고쳐진 쪽.
- * - `source`: 보관 원본이 가장 새롭다. 갈라진 사용본에 원본을 다시 배포하면 통일된다.
- * - `install`: 어느 사용본이 가장 새롭다. 그것을 원본으로 채택하면 나머지가 따라온다.
- * - `unknown`: 시각을 모르는 자리가 섞여 있어 고를 수 없다.
- */
-export type SkillLatestVersion =
-  | { kind: "source" }
-  | ({ kind: "install" } & SkillDivergentInstall)
-  | { kind: "unknown" };
-
-/**
- * 원본과 갈라진 사용본들 가운데 최신본을 고른다. "가장 앞선 것으로 전부 맞춘다"는 한 번의
- * 조치가 어느 방향으로 가야 하는지는 이 선택 하나로 정해진다 — 방향을 사람이 읽고 고르게
- * 두면 뒤처진 사본을 채택해 최신 원본을 덮는 실수가 그대로 남는다.
- *
- * 시각을 하나라도 모르면 `unknown`이다. 모르는 값을 0으로 깔면 그 자리는 항상 지므로,
- * 실제로는 가장 새로운 사본이 조용히 덮인다. 고르지 않는 편이 낫다.
- *
- * 같은 시각이면 원본이 이긴다. 배포는 원본의 수정 시각을 사본에 넘겨주지 않으므로 동시각은
- * 사람이 고친 흔적이 아니고, 원본을 그대로 펴는 쪽이 잃는 것이 없다.
- */
-export function latestSkillVersion(
-  sourceModifiedAtMs: number | null,
-  divergents: readonly SkillDivergentInstall[],
-): SkillLatestVersion {
-  if (divergents.length === 0) return { kind: "source" };
-  if (sourceModifiedAtMs === null) return { kind: "unknown" };
-  let winner: SkillDivergentInstall | null = null;
-  for (const candidate of divergents) {
-    const modifiedAtMs = candidate.install.modifiedAtMs;
-    if (modifiedAtMs === null) return { kind: "unknown" };
-    if (modifiedAtMs <= sourceModifiedAtMs) continue;
-    if (!winner || modifiedAtMs > (winner.install.modifiedAtMs ?? 0)) winner = candidate;
-  }
-  return winner ? { kind: "install", ...winner } : { kind: "source" };
-}
-
 /** 상태별 항목 수. 상단 요약 줄에 쓴다. */
 export function skillSyncCounts(entries: SkillLibraryEntry[]): Record<SkillSyncState, number> {
   const counts: Record<SkillSyncState, number> = {

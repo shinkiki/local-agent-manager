@@ -1,0 +1,18 @@
+{
+  "itemId": "C-6d3061609fd5",
+  "kind": "commit",
+  "ref": "6d3061609fd5fe4b4282a97f53ac39640d304e3d",
+  "reviewedAt": "2026-10-06T04:10:00Z",
+  "lane": "L06",
+  "source": "claude",
+  "verdict": "결함 0건",
+  "axes": {
+    "정확성": "장부 두 파일에 fixCommits/commits 로 적힌 fb82dc4c 가 실제 수정 커밋이다 — git log 로 확인했고 origin/dev-history 에 착지해 있다(제목 '기준선이 없을 때도 \"축이 없다\"고 찍던 비교 줄을 가른다'). 결함 F-scripts-flaky-isolate-mjs-logcomparison-dcb1839e 의 fix 설명(comparisonLines 를 flakyTestReport.ts 로 옮김)과도 같은 커밋이다. 틀린 해시를 적었다면 장부에서 결함과 수정이 끊기는데, 그 경우가 아니다.",
+    "보안불변식": "데이터 파일 두 줄만 바뀐다. 자격증명·공급자 소유 저장소·셸 문자열·경로 정규화·쓰기 게이트 어디에도 닿지 않아 G1~G11 범위 밖이다.",
+    "계약": "docs/code-review/README.md 의 장부 모양과 맞는다 — reviewed 는 commits, findings 는 fixCommits 에 짧은 해시 배열로 적는다. 파일 이름과 본문 itemId/findingId 도 일치한다. reviewed/ 52건과 findings/ 전건을 다시 읽어 JSON 파싱 실패 0건·이름 불일치 0건을 확인했다.",
+    "검증없음": "코드가 아니라 장부 데이터만 바뀌어 재현할 실패가 없다. 러너가 이 두 필드를 읽지 않는 것도 확인했다(fixCommits 를 읽는 코드는 저장소에 없다) — 사람이 읽는 추적 기록이다. 대신 장부를 읽는 쪽인 codeReviewQueue 시험을 돌려 회귀가 없음을 확인했다.",
+    "단순화중복": "새로 만든 함수·파일이 없다. 중복 없음."
+  },
+  "findings": [],
+  "commits": []
+}

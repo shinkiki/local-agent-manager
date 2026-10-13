@@ -37,16 +37,6 @@ type TerminalConnector<T> = (
  */
 type TerminalKind = "session" | "setup" | "accountLogin" | "ssh";
 
-/**
- * 원격(웹) 화면에서 열 수 없는 갈래와 그 이유. 백엔드도 같은 판정으로 거절하지만,
- * 소켓을 열기 전에 같은 문구로 알려 헛되이 연결을 시도하지 않게 한다. 표에 없는
- * 갈래는 원격에서도 연다.
- */
-const HOST_ONLY_TERMINALS: Partial<Record<TerminalKind, string>> = {
-  ssh: "SSH 터미널은 백엔드 서비스가 실행 중인 로컬 컴퓨터에서만 열 수 있습니다.",
-  setup: "CLI 설정 터미널은 백엔드 서비스가 실행 중인 로컬 컴퓨터에서만 열 수 있습니다.",
-};
-
 /** 호출부가 요청 종류를 잘못 섞지 않도록 이름과 요청 타입만 따로 두고, 절차는 한 벌만 쓴다. */
 function terminalConnector<T extends TerminalRequest>(kind: TerminalKind): TerminalConnector<T> {
   return (request, onEvent) => connectWebSocket(kind, request, onEvent);
@@ -55,21 +45,16 @@ function terminalConnector<T extends TerminalRequest>(kind: TerminalKind): Termi
 export const connectTerminal = terminalConnector<TerminalOpenRequest>("session");
 export const connectSetupTerminal = terminalConnector<TerminalSetupRequest>("setup");
 export const connectAccountLoginTerminal = terminalConnector<TerminalAccountLoginRequest>("accountLogin");
+// C9-19/C9-20: both user-driven SSH modes open on every signed-in channel (C20).
 export const connectSshTerminal = terminalConnector<TerminalSshRequest>("ssh");
 
 /**
- * 원격(웹) 화면에서 열 수 없는 요청인지 먼저 가른다. 소켓을 열기 전에 거절해야 하는 것은
- * 두 가지다 — 원격 편집이 꺼져 있는 상태와 호스트 전용 갈래. 백엔드도 같은 판정을 하지만
- * 여기서 먼저 걸러 헛된 연결과 그만큼 늦게 오는 오류 문구를 없앤다.
+ * 소켓을 열기 전에 백엔드 악수를 확인한다. 채널별 제한은 더 이상 없다 — 로그인 뒤에는
+ * 모든 채널이 같고(C20), 로그인이 없으면 악수가 게이트를 띄운다. 갈래 이름은 백엔드
+ * 거절 문구를 읽는 호출부를 위해 남긴다.
  */
-async function assertTerminalAllowed(kind: TerminalKind): Promise<void> {
-  const access = await getWebAccessStatus();
-  if (!access.remote) return;
-  if (!access.writable) {
-    throw new Error("원격 편집이 꺼져 있어 터미널을 시작할 수 없습니다. 호스트의 설정 → 백엔드 서비스에서 원격 편집 허용을 켠 뒤 다시 시도하세요.");
-  }
-  const hostOnly = HOST_ONLY_TERMINALS[kind];
-  if (hostOnly) throw new Error(hostOnly);
+async function assertTerminalAllowed(_kind: TerminalKind): Promise<void> {
+  await getWebAccessStatus();
 }
 
 /**

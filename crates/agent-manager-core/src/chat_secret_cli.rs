@@ -210,10 +210,7 @@ impl SecretCliOptions {
             content,
             content_stdin,
             overwrite,
-            app_data_dir: match app_data_dir {
-                Some(path) => path,
-                None => crate::remote::default_app_data_dir().map_err(CoreError::InvalidInput)?,
-            },
+            app_data_dir: crate::remote::cli_app_data_dir(app_data_dir)?,
             chat_id,
         })
     }

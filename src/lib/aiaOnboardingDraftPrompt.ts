@@ -56,7 +56,7 @@ export function onboardingDraftPrompt(
 
   return text(
     [
-      `애드온 → 자동화의 '${cardTitle}' 온보딩을 채우는 중인데 '${fieldLabel}'에서 읽을 것이 아직 없다. 지금 있는 값을 근거로 만들어 달라.`,
+      `워크플로 → 자동화의 '${cardTitle}' 온보딩을 채우는 중인데 '${fieldLabel}'에서 읽을 것이 아직 없다. 지금 있는 값을 근거로 만들어 달라.`,
       "",
       "지금까지 적은 값:",
       known,
@@ -69,7 +69,7 @@ export function onboardingDraftPrompt(
       "5. 다 만들었으면 만들어진 위치를 한 줄로 알려 준다. 나는 그 값을 온보딩 카드에 적고 이어서 만들기를 누른다.",
     ].join("\n"),
     [
-      `I'm filling in the '${cardTitle}' onboarding under Add-ons → Automation, and there is nothing yet for '${fieldLabel}'. Create it from what I've entered so far.`,
+      `I'm filling in the '${cardTitle}' onboarding under Workflows → Automation, and there is nothing yet for '${fieldLabel}'. Create it from what I've entered so far.`,
       "",
       "What I've entered:",
       known,

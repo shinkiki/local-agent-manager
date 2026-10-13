@@ -1,6 +1,6 @@
 import { Bot, Eye, KeyRound, ShieldAlert, LoaderCircle, NotebookPen, Plus, PlugZap, RefreshCw, RotateCcw, Server, ShieldCheck, Terminal, Trash2, Upload, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { checkSshEndpoint, deleteSshKey, generateSshKey, getSshKeys, getWebAccessStatus, hasTauriRuntime, readSshPublicKey, setSshKeyEndpoint, setSshKeyNote, type WebAccessStatus } from "../lib/ipc";
+import { checkSshEndpoint, deleteSshKey, generateSshKey, getSshKeys, readSshPublicKey, setSshKeyEndpoint, setSshKeyNote } from "../lib/ipc";
 import { useI18n } from "../lib/i18n";
 import type { SshCommandPolicyDefaults, SshEndpointCheckReceipt, SshEndpointView, SshKeysSnapshot, SshKeyView, SshPublicKeyView, TerminalSshMode } from "../types";
 import { CopyAction } from "./CopyAction";
@@ -57,6 +57,7 @@ function endpointDraftOf(endpoint: SshEndpointView | null, defaults: SshCommandP
     transferRoot: endpoint?.transferRoot ?? "",
     terminalEnabled: endpoint?.terminalEnabled ?? false,
     unrestrictedCommands: endpoint?.unrestrictedCommands ?? false,
+    projectGitEnabled: endpoint?.projectGitEnabled ?? false,
   };
 }
 
@@ -77,7 +78,8 @@ function sameEndpoint(draft: EndpointDraft, endpoint: SshEndpointView | null): b
     && draft.fileTransferEnabled === saved.fileTransferEnabled
     && draft.transferRoot.trim() === saved.transferRoot
     && draft.terminalEnabled === saved.terminalEnabled
-    && draft.unrestrictedCommands === saved.unrestrictedCommands;
+    && draft.unrestrictedCommands === saved.unrestrictedCommands
+    && draft.projectGitEnabled === saved.projectGitEnabled;
 }
 
 interface EndpointDraft {
@@ -91,6 +93,7 @@ interface EndpointDraft {
   transferRoot: string;
   terminalEnabled: boolean;
   unrestrictedCommands: boolean;
+  projectGitEnabled: boolean;
 }
 
 /** 메모 편집기가 열렸을 때만 대상 키와 입력 중인 초안을 함께 둔다. */
@@ -121,6 +124,8 @@ function toSshEndpointPayload(fingerprint: string, draft: EndpointDraft, clear =
     transferRoot: clear ? "" : draft.transferRoot.trim(),
     terminalEnabled: clear ? false : draft.agentEnabled && draft.terminalEnabled,
     unrestrictedCommands: clear ? false : draft.agentEnabled && draft.unrestrictedCommands,
+    // 이 토글만 agentEnabled에 곱하지 않는다 — 에이전트 권한이 아니라 사용자 git의 신원이다(C16-10).
+    projectGitEnabled: clear ? false : draft.projectGitEnabled,
   };
 }
 
@@ -134,7 +139,6 @@ function toSshEndpointPayload(fingerprint: string, draft: EndpointDraft, clear =
  */
 function useSshKeysData(active: boolean) {
   const [snapshot, setSnapshot] = useState<SshKeysSnapshot | null>(null);
-  const [access, setAccess] = useState<WebAccessStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<SshTask | null>(null);
@@ -156,8 +160,7 @@ function useSshKeysData(active: boolean) {
     if (!active) { loadedRef.current = false; return; }
     if (loadedRef.current) return;
     loadedRef.current = true;
-    void Promise.all([load(), getWebAccessStatus().then(setAccess)])
-      .catch((cause: unknown) => setError(errorText(cause)));
+    void load();
   }, [active, load]);
 
   /** 한 번에 한 동작만 돌리고, 실패 문구는 배너 한 곳에 모은다. */
@@ -175,7 +178,7 @@ function useSshKeysData(active: boolean) {
     }
   };
 
-  return { snapshot, setSnapshot, access, error, notice, setNotice, busy, load, run };
+  return { snapshot, setSnapshot, error, notice, setNotice, busy, load, run };
 }
 
 /**
@@ -287,7 +290,6 @@ interface SshKeyEndpointBinding {
 }
 
 interface SshKeyTerminalBinding {
-  available: boolean;
   openMode: TerminalSshMode | null;
   onToggle: (mode: TerminalSshMode) => void;
 }
@@ -297,21 +299,21 @@ interface SshKeyTerminalBinding {
  * 공개키 본문 확인·키 삭제·기기 단위 메모·키별 연결 서버까지 여기서 하며, 개인키는 어떤
  * 경로로도 열지 않는다 — 삭제도 ~/.ssh 안 휴지통으로 옮기는 것이라 되돌릴 수 있다.
  *
- * 2026-09-03 결정으로 이 카드에는 호스트 전용 작업이 없다(C9-5/C9-10). 생성은 검증된 새
- * 경로에만 만들고 삭제는 휴지통으로 옮기는 것이라 되돌릴 수 있어, 원격 편집이 켜져 있으면
- * 전부 호스트와 같이 동작한다. 고급 설정의 명령 목록은 그 서버에서 무엇까지 하게 할지에
- * 대한 사용자 결정이고, 스킬이 에이전트에게 지켜야 할 규칙으로 전달한다.
+ * 이 카드에는 호스트 전용 작업이 없다(C9-5/C9-10). 생성은 검증된 새 경로에만 만들고 삭제는
+ * 휴지통으로 옮기는 것이라 되돌릴 수 있고, 로그인한 채널은 데스크톱과 같은 권한을 가지므로
+ * (C20) 원격 화면에서도 메모·연결 서버·키 생성·삭제·터미널·공개키 등록이 전부 호스트와
+ * 같이 동작한다. 그래서 접근 채널을 따로 묻지 않는다 — 버튼을 잠그는 것은 진행 중인 작업뿐이다.
+ * 고급 설정의 명령 목록은 그 서버에서 무엇까지 하게 할지에 대한 사용자 결정이고, 스킬이
+ * 에이전트에게 지켜야 할 규칙으로 전달한다.
  */
 export function SshKeysCard({ active }: { active: boolean }) {
   const { text } = useI18n();
   const { confirm, confirmDialog } = useConfirm();
-  const { snapshot, setSnapshot, access, error, notice, setNotice, busy, load, run } = useSshKeysData(active);
+  const { snapshot, setSnapshot, error, notice, setNotice, busy, load, run } = useSshKeysData(active);
   const editors = useSshKeyRowEditors();
   const [adding, setAdding] = useState(false);
   const [fileName, setFileName] = useState(DEFAULT_FILE_NAME);
   const [comment, setComment] = useState(DEFAULT_COMMENT);
-  const canWrite = access?.writable === true;
-  const isRemote = !hasTauriRuntime() && access?.remote === true;
 
   const create = () => run("create", async () => {
     await generateSshKey({ fileName: fileName.trim(), comment: comment.trim() });
@@ -419,7 +421,6 @@ export function SshKeysCard({ active }: { active: boolean }) {
   });
 
   const terminalBindingFor = (key: SshKeyView): SshKeyTerminalBinding => ({
-    available: !isRemote,
     openMode: editors.openTerminalModeOf(key.fingerprint),
     onToggle: (mode) => editors.toggleTerminal(key.fingerprint, mode),
   });
@@ -436,21 +437,6 @@ export function SshKeysCard({ active }: { active: boolean }) {
           "Inspect public-key algorithms and fingerprints in the local .ssh folder. Public-key bodies are shown on request; private-key contents are never read or sent to the UI. Give a key an endpoint and turn on agent use, and agents may connect to that server with it.",
         )}</p>
       </header>
-      {/* 원격 편집이 켜져 있으면 이 카드는 호스트와 같다. 꺼져 있을 때만, 왜 버튼이
-          눌리지 않는지 카드가 직접 말한다 — 손가락으로 쓰는 화면에는 hover가 없어
-          title 속성의 설명은 보이지 않는다. */}
-      {isRemote && !canWrite && (
-        <div className="plugin-host-notice" role="note">
-          <ShieldCheck size={16} aria-hidden="true" />
-          <span>
-            <strong>{text("이 원격 연결은 읽기 전용입니다", "This remote connection is read-only")}</strong>
-            <small>{text(
-              "공개키와 지문은 그대로 볼 수 있습니다. 메모·연결 서버·키 생성·삭제를 하려면 호스트의 설정 → 백엔드 서비스에서 원격 편집 허용을 켠 뒤 다시 연결하세요.",
-              "Public keys and fingerprints stay visible. To use notes, endpoints, key generation or removal, turn on remote editing in Settings → Backend service on the host and reconnect.",
-            )}</small>
-          </span>
-        </div>
-      )}
       {snapshot === null
         ? <div className="plugin-loading-state">{!error && <LoaderCircle size={16} className="spin" />}<span>{text("SSH 키를 확인하는 중…", "Checking SSH keys…")}</span></div>
         : <>
@@ -465,7 +451,6 @@ export function SshKeysCard({ active }: { active: boolean }) {
                 <SshKeyRow
                   key={key.path}
                   sshKey={key}
-                  canWrite={canWrite}
                   busy={busy}
                   note={noteBindingFor(key)}
                   endpoint={endpointBindingFor(key)}
@@ -478,10 +463,8 @@ export function SshKeysCard({ active }: { active: boolean }) {
           {notice && <p className="ssh-key-notice">{notice}</p>}
           {snapshot.issues.length > 0 && <div className="ssh-key-issues"><strong>{text("읽지 못한 공개키", "Public keys not read")}</strong>{snapshot.issues.map((issue) => <small key={`${issue.path}:${issue.message}`}><code>{displayPath(issue.path)}</code>{issue.message}</small>)}</div>}
           {!adding && <div className="settings-update-body">
-            <span className="settings-update-status"><strong>{text("새 SSH 키", "New SSH key")}</strong><small>{canWrite
-              ? text("기존 파일을 덮어쓰지 않고 Ed25519 키 쌍을 생성합니다.", "Create an Ed25519 key pair without overwriting existing files.")
-              : text("읽기 전용 접속에서는 키를 생성할 수 없습니다.", "Keys cannot be generated from a read-only connection.")}</small></span>
-            <button className="button compact primary" type="button" disabled={!canWrite || !snapshot.keygenAvailable} onClick={() => setAdding(true)}><Plus size={13} />{text("키 생성", "Generate key")}</button>
+            <span className="settings-update-status"><strong>{text("새 SSH 키", "New SSH key")}</strong><small>{text("기존 파일을 덮어쓰지 않고 Ed25519 키 쌍을 생성합니다.", "Create an Ed25519 key pair without overwriting existing files.")}</small></span>
+            <button className="button compact primary" type="button" disabled={!snapshot.keygenAvailable} onClick={() => setAdding(true)}><Plus size={13} />{text("키 생성", "Generate key")}</button>
           </div>}
           {adding && <SshKeyCreateCard
             fileName={fileName}
@@ -658,6 +641,17 @@ function SshEndpointEditor({
         )}
       />}
       <SshEndpointToggleField
+        id={fieldId("project-git")}
+        title={text("git 원격용", "Use for project git remotes")}
+        help={text(
+          "프로젝트 화면의 git이 원격과 주고받을 때(가져오기·끌어오기·푸시) 이 키로 인증합니다. 그 세 작업에만 쓰이고 에이전트가 실행하는 명령에는 들어가지 않으며, 개인키는 복사되지 않고 경로만 git에 넘어갑니다. 기기 전체에서 한 키만 켤 수 있습니다.",
+          "The git panel authenticates with this key when it talks to a remote (fetch, pull, push). It is used for those three operations only, never for commands an agent runs, and the private key is not copied — only its path is handed to git. Only one key on this device can carry this.",
+        )}
+        checked={binding.draft.projectGitEnabled}
+        disabled={!sshKey.hasPrivateKey}
+        onChange={(projectGitEnabled) => updateEndpointDraft({ projectGitEnabled })}
+      />
+      <SshEndpointToggleField
         id={fieldId("terminal")}
         title={text("출력 표시", "Stream command output")}
         help={text(
@@ -798,7 +792,6 @@ function SshNoteEditor({
 
 interface SshKeyRowProps {
   sshKey: SshKeyView;
-  canWrite: boolean;
   busy: SshTask | null;
   note: SshKeyNoteBinding;
   endpoint: SshKeyEndpointBinding;
@@ -837,7 +830,6 @@ function SshKeyEndpointSummary({ endpoint }: { endpoint: SshEndpointView }) {
 
 interface SshKeyRowActionsProps {
   sshKey: SshKeyView;
-  canWrite: boolean;
   busy: SshTask | null;
   note: SshKeyNoteBinding;
   endpoint: SshKeyEndpointBinding;
@@ -848,11 +840,11 @@ interface SshKeyRowActionsProps {
 
 /**
  * SSH 키 행 액션 버튼 그룹. 공개키 보기, 메모 편집, 연결 서버 편집, 공개키 등록, 터미널
- * 열기, 키 삭제 액션을 제공한다.
+ * 열기, 키 삭제 액션을 제공한다. 접근 채널로 잠그는 버튼은 없다 — 로그인한 원격 화면도
+ * 호스트와 같은 권한이다(C20, C9-19/C9-20).
  */
 function SshKeyRowActions({
   sshKey,
-  canWrite,
   busy,
   note,
   endpoint,
@@ -878,10 +870,8 @@ function SshKeyRowActions({
         <button
           className="button compact"
           type="button"
-          disabled={!canWrite || busy !== null}
-          title={canWrite
-            ? text("이 기기에만 저장되는 메모입니다", "A note stored on this device only")
-            : text("읽기 전용 접속에서는 메모를 바꿀 수 없습니다", "Notes cannot be changed from a read-only connection")}
+          disabled={busy !== null}
+          title={text("이 기기에만 저장되는 메모입니다", "A note stored on this device only")}
           onClick={note.onToggle}
         >
           <NotebookPen size={13} />
@@ -890,16 +880,14 @@ function SshKeyRowActions({
         <button
           className="button compact"
           type="button"
-          disabled={!canWrite || busy !== null}
-          title={canWrite
-            ? text("이 키로 붙을 서버를 적고, 에이전트에게 열어 줄지 정합니다", "Set the server this key connects to and whether agents may use it")
-            : text("읽기 전용 접속에서는 연결 서버를 바꿀 수 없습니다", "Servers cannot be changed from a read-only connection")}
+          disabled={busy !== null}
+          title={text("이 키로 붙을 서버를 적고, 에이전트에게 열어 줄지 정합니다", "Set the server this key connects to and whether agents may use it")}
           onClick={endpoint.onToggle}
         >
           <Server size={13} />
           {sshKey.endpoint ? text("연결 서버 편집", "Edit server") : text("연결 서버", "Add server")}
         </button>
-        {terminal.available && canOpenSshTerminal(sshKey) && <>
+        {canOpenSshTerminal(sshKey) && <>
           <button
             className="button compact"
             type="button"
@@ -934,11 +922,9 @@ function SshKeyRowActions({
         <button
           className="plugin-remove-button"
           type="button"
-          disabled={!canWrite || busy !== null}
+          disabled={busy !== null}
           aria-label={text(`${sshKey.fileName} 삭제`, `Delete ${sshKey.fileName}`)}
-          title={canWrite
-            ? text("키 쌍을 .ssh 안 휴지통으로 옮깁니다", "Moves the key pair to the trash folder inside .ssh")
-            : text("읽기 전용 접속에서는 키를 지울 수 없습니다", "Keys cannot be removed from a read-only connection")}
+          title={text("키 쌍을 .ssh 안 휴지통으로 옮깁니다", "Moves the key pair to the trash folder inside .ssh")}
           onClick={onRemove}
         >
           {isKeyTask(busy, "delete", sshKey.fingerprint) ? <LoaderCircle size={14} className="spin" /> : <Trash2 size={14} />}
@@ -951,7 +937,6 @@ function SshKeyRowActions({
 /** 단일 SSH 키 행 컴포넌트. 키 정보 요약과 액션 버튼, 메모·연결 서버 편집 영역을 렌더링한다. */
 function SshKeyRow({
   sshKey,
-  canWrite,
   busy,
   note,
   endpoint,
@@ -976,7 +961,6 @@ function SshKeyRow({
       </div>
       <SshKeyRowActions
         sshKey={sshKey}
-        canWrite={canWrite}
         busy={busy}
         note={note}
         endpoint={endpoint}
