@@ -45,7 +45,7 @@
   "dependencies": {
     "@iconify-json/logos": "^1.2.14",
     "@shikijs/core": "^4.4.3",
-    "@shikijs/engine-javascript": "^4.4.3",
+    "@shikijs/engine-javascript": "^4.5.0",
     "@shikijs/langs": "^4.4.3",
     "@shikijs/themes": "^4.4.3",
     "@tauri-apps/api": "^2",
