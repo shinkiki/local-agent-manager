@@ -1,0 +1,11 @@
+{
+  "findingId": "F-docs-flaky-tests-readme-md-2026-10-06-3-640e3a1c",
+  "file": "docs/flaky-tests/README.md",
+  "symbol": "2026-10-06 3회차 실측",
+  "symptom": "2회차와 겹치는 backend_service_settings를 모듈 비중첩으로 기록한다",
+  "severity": "P2",
+  "state": "fixed",
+  "agentsRules": [],
+  "occurrences": [{ "itemId": "C-d9bd0b63a4da", "at": "2026-10-05T17:09:40Z" }],
+  "fixCommits": []
+}

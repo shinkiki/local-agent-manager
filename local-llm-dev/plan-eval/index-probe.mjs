@@ -23,7 +23,7 @@ async function complete(body) {
 }
 console.log(JSON.stringify({ model, repeats, startTrial, variants, indexChars: contract.index.length }));
 for (const task of TASKS.filter(t => !only || only.split(",").includes(t.id))) {
-    const summary = Object.fromEntries(variants.map(v => [v, { ok: 0, total: 0, issues: {}, nudges: 0, repairs: 0, turns: 0 }]));
+    const summary = Object.fromEntries(variants.map(v => [v, { ok: 0, total: 0, issues: {}, marks: {}, nudges: 0, repairs: 0, turns: 0 }]));
     for (let i = startTrial - 1; i < repeats; i++) {
         const marker = randomUUID();
         for (const variant of i % 2 ? [...variants].reverse() : variants) {
@@ -49,7 +49,9 @@ for (const task of TASKS.filter(t => !only || only.split(",").includes(t.id))) {
             sum.turns += result.turns;
             for (const why of s.issues)
                 sum.issues[why] = (sum.issues[why] ?? 0) + 1;
-            console.log(JSON.stringify({ task: task.id, variant, trial: i + 1, ok: s.ok, issues: s.issues, ended: result.ended, tools: result.steps.map(s => s.tools.join("+")), nudges: result.nudges, turns: result.turns }));
+            for (const mark of s.marks ?? [])
+                sum.marks[mark] = (sum.marks[mark] ?? 0) + 1;
+            console.log(JSON.stringify({ task: task.id, variant, trial: i + 1, ok: s.ok, issues: s.issues, marks: s.marks ?? [], ended: result.ended, tools: result.steps.map(s => s.tools.join("+")), nudges: result.nudges, turns: result.turns }));
         }
     }
     console.log("SUMMARY " + JSON.stringify({ model, task: task.id, startTrial, repeats, summary }));

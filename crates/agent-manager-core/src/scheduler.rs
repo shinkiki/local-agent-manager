@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::app_data_file::{read_private_json_or_default, write_private_json};
+use crate::app_data_file::{open_private_file, read_private_json_or_default, write_private_json};
 use crate::clock::now_ms;
 use crate::domain::{wire_enum, ChatOrigin, ChatOriginKind};
 use crate::quiet_hours::QuietSchedule;
@@ -3357,14 +3357,10 @@ fn save_store_unlocked(app_data_dir: &Path, store: &SchedulerStore) -> Result<()
     write_private_json(&app_data_dir.join(STORE_FILE_NAME), store)
 }
 
+/// G10: 앱 데이터의 잠금 파일은 공용 열기(`O_NOFOLLOW`, 0600)를 거친다. 그 자리에 놓인
+/// 심볼릭 링크를 따라가 앱 데이터 밖 파일을 잠그거나 만들지 않는다.
 fn open_lock(path: &Path) -> Result<File, CoreError> {
-    OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(path)
-        .map_err(CoreError::Io)
+    open_private_file(path, false)
 }
 
 fn trim_runs(store: &mut SchedulerStore) {

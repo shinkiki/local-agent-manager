@@ -21,7 +21,26 @@ services:
       TS_AUTHKEY: ${TS_AUTHKEY:?TS_AUTHKEY가 필요합니다}
       TS_STATE_DIR: /var/lib/tailscale
       TS_SERVE_CONFIG: /config/serve.json
-      TS_USERSPACE: "false"
+      # 커널 모드와 사용자 공간 모드 중 어느 쪽으로 띄울지. 기본은 사용자 공간 모드
+      # (`true`)다 — L10 실측으로 기본을 옮겼다(L21, 2026-10-11). 커널 모드로 돌리려면
+      # `.env`에 TS_USERSPACE=false 한 줄을 적는다.
+      #
+      # 2026-10-11 NAS 실측(커널 4.4.302+, iptables 1.8.11 legacy, tailscale 1.102.5):
+      # 커널 모드에서 tailscaled가 mangle/PREROUTING에 connmark 복원 규칙을 넣지 못한다
+      # ("Extension connmark revision 0 not supported", `--nfmask` 미지원). 이것은 기동 시
+      # 한 번 나오는 경고가 아니라 `tailscale status --json`의 Health에 계속 올라와 있는
+      # 상태다. 그래도 tailscale0 인터페이스는 올라오고 `tailscale serve`는
+      # https://<host>.ts.net → http://127.0.0.1:4178로 정상 프록시된다.
+      # 허용 값은 `true`/`false`뿐이고 그 밖의 값은 앱 컨테이너가 기동을 거부한다
+      # (근거는 entrypoint.sh의 L10 블록에 한 번만 적는다). 비워 두는 것(unset)은 안전하다
+      # — 여기서 `true`가 들어간다.
+      # 2026-10-11 NAS 실측(L10): 사용자 공간 모드에서 tailnet 가입, `tailscale serve`
+      # 프록시, 서버가 받는 Tailscale-User-Login 신원 헤더, `/api/access`가 모두 정상이고
+      # connmark 경고는 사라진다. 그래서 기본을 이쪽으로 옮겼다(L21).
+      # 아래 `devices: /dev/net/tun`과 `cap_add: NET_ADMIN, NET_RAW`는 그대로 둔다 —
+      # 커널 모드로 되돌릴 때 필요하고, 이 변수만으로는 `/dev/net/tun`이 없는 호스트를
+      # 지나가지 못한다. 그 호스트까지 열려면 둘을 함께 걷어내야 한다(별도 항목).
+      TS_USERSPACE: ${TS_USERSPACE:-true}
     volumes:
       - ./data/tailscale:/var/lib/tailscale
       - ./serve.json:/config/serve.json:ro
@@ -37,6 +56,9 @@ services:
       context: ../..
       dockerfile: deploy/synology/Dockerfile
     image: agent-manager-server:local
+    # NAS는 x86_64다. Apple Silicon 개발 머신에서 그냥 빌드하면 arm64 이미지가 나와 NAS에서
+    # 돌지 않으므로 빌드·실행 플랫폼을 고정한다.
+    platform: linux/amd64
     container_name: agent-manager
     depends_on:
       - tailscale
@@ -53,9 +75,24 @@ services:
       TAILSCALE_HOST: ${TAILSCALE_HOST:?TAILSCALE_HOST가 필요합니다}
       TAILSCALE_USER: ${TAILSCALE_USER:?TAILSCALE_USER가 필요합니다}
       AGENT_MANAGER_PORT: "4178"
+      # 위 사이드카와 같은 값이어야 한다. 이 컨테이너는 쓰지 않고 검사만 한다 — 받지 않는
+      # 값이면 엔트리포인트가 기동을 거부해서, 오타가 사이드카를 조용히 사용자 공간 모드로
+      # 떨어뜨리는 것을 막는다(L10). 거부해도 사이드카는 계속 떠 있으므로 증상은 "tailnet에
+      # 이름은 보이는데 연결 거부"이고, 원인은 이 agent-manager 컨테이너 로그에 있다.
+      # 기본값은 위 사이드카와 같은 `true`여야 한다(L21).
+      TS_USERSPACE: ${TS_USERSPACE:-true}
       # 원격에서 변경 작업까지 허용할지. 기본은 읽기 전용이다.
-      AGENT_MANAGER_REMOTE_WRITE: ${AGENT_MANAGER_REMOTE_WRITE:-false}
+      # 서버·키링·CLI가 돌 전용 사용자. 엔트리포인트가 root로 볼륨 소유권만 맞춘 뒤
+      # setpriv로 이 uid/gid로 내려간다. 공유 폴더 소유자가 1000이 아니면 여기서 맞춘다.
+      # root로 돌지 않으므로 Claude CLI의 --dangerously-skip-permissions 거부를 우회하는
+      # IS_SANDBOX=1은 더 이상 필요 없다(2026-10-10 실측으로 들어갔던 줄을 L13이 걷어냈다).
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
     volumes:
       - ./data/agent-manager:/data
+      # HOME 전체. 자격증명 볼트(.local/share/keyrings)와 공급자 홈(.claude·.codex)이 여기
+      # 있어, 이 마운트가 없으면 컨테이너를 다시 만들 때 등록한 계정과 세션이 사라진다.
+      # 전용 사용자의 HOME은 /root가 아니라 /home/agent다(L13).
+      - ./data/home:/home/agent
       - ${WORKSPACE_DIR:-./workspace}:/workspace
     restart: unless-stopped

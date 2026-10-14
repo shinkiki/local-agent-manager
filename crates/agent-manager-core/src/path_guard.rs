@@ -216,11 +216,12 @@ mod tests {
         escaped: "시험 경로가 허용된 루트를 벗어납니다",
     };
 
-    fn temp_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("agent-manager-path-guard-{name}"));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("temp root");
-        fs::canonicalize(&root).expect("canonical temp root")
+    /// 고정 이름의 `/tmp` 폴더는 다른 사용자가 먼저 만들거나 링크로 바꿔 둘 수 있고, 다른
+    /// 레인의 같은 시험과도 부딪친다. 매번 새 임시 디렉터리를 받는다.
+    fn temp_root() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("temp root");
+        let root = fs::canonicalize(dir.path()).expect("canonical temp root");
+        (dir, root)
     }
 
     #[test]
@@ -253,7 +254,7 @@ mod tests {
 
     #[test]
     fn missing_tail_is_resolved_against_the_nearest_existing_ancestor() {
-        let root = temp_root("missing-tail");
+        let (_dir, root) = temp_root();
         let resolved = resolve_existing_ancestor(
             &root.join("absent/child.md"),
             MissingTail::SkipAnyError,
@@ -261,12 +262,34 @@ mod tests {
         )
         .expect("resolved");
         assert_eq!(resolved, root.join("absent/child.md"));
-        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `SkipNotFound`는 없는 대상만 건너뛰고 다른 입출력 오류는 그대로 올린다. 쓰기 대상을
+    /// 정하는 호출부가 읽을 수 없는 조상을 "없는 경로"로 오인해 그 위에 이름을 붙이면 안 된다.
+    #[cfg(unix)]
+    #[test]
+    fn skip_not_found_surfaces_other_io_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, root) = temp_root();
+        let locked = root.join("locked");
+        fs::create_dir_all(locked.join("inner")).expect("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("잠금");
+        // 권한을 무시하는 실행자(root)라면 확인할 오류가 생기지 않는다.
+        let bypasses_permissions = fs::metadata(locked.join("inner")).is_ok();
+        let target = locked.join("inner/child.md");
+        let strict = resolve_existing_ancestor(&target, MissingTail::SkipNotFound, "시험 경로");
+        let lenient = resolve_existing_ancestor(&target, MissingTail::SkipAnyError, "시험 경로");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("잠금 해제");
+        if bypasses_permissions {
+            return;
+        }
+        assert!(matches!(strict, Err(CoreError::Io(_))), "{strict:?}");
+        assert_eq!(lenient.expect("상위로 올라감"), target);
     }
 
     #[test]
     fn a_symlink_escaping_the_root_is_rejected() {
-        let root = temp_root("escaping-symlink");
+        let (_dir, root) = temp_root();
         let inside = root.join("inside");
         let outside = root.join("outside");
         fs::create_dir_all(&inside).expect("inside");
@@ -281,7 +304,6 @@ mod tests {
                 .starts_with("시험 경로가 허용된 루트를 벗어납니다")));
         }
         assert_within_root(&inside, &inside.join("file.md"), LABELS).expect("inside root");
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

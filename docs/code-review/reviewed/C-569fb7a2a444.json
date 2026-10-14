@@ -1,0 +1,14 @@
+{
+  "itemId": "C-569fb7a2a444",
+  "kind": "commit",
+  "ref": "569fb7a2a4443ccd337e9b78a22f429a0ff6003f",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L05",
+  "source": "codex",
+  "verdict": "결함 0건 — 처음 적은 1건은 재현되지 않아 unconfirmed 로 되돌림",
+  "note": "정확성: 처음 기록은 외자식 압축 뒤 자식 label 이 feature/x·feature/y 로 남는다고 적었으나 C-1186bef6c8a7 리뷰에서 재현에 실패했다(F-src-lib-gitbranchtree-ts-tonode-e552d7a4 참고). 보안: 이 커밋은 화면 트리·CSS·번역·시험만 바꾸며 G1~G11/C 예외의 자격증명, 공급자 저장소, 경로 쓰기, 셸 실행에 닿지 않는다. 계약: B4 의 폴더 표시와 구현이 어긋나지 않는다. 검증: 해당 시점 모듈을 꺼내 직접 돌려 label 을 확인했다. 단순화: 후속 af9507e 가 compress 경로를 제거했으나 이 커밋의 결함 때문은 아니다.",
+  "findings": [
+    "F-src-lib-gitbranchtree-ts-tonode-e552d7a4"
+  ],
+  "commits": []
+}

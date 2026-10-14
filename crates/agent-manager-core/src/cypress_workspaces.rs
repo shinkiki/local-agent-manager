@@ -499,6 +499,37 @@ pub fn set_workspace_options(
     })
 }
 
+/// 등록한 작업공간의 Cypress 모듈 루트를 바꾼다(C7-4, G10). 등록 폴더와 실행 옵션은
+/// 그대로 두며, 모듈은 이 경로 아래의 `node_modules/cypress`만 확인한다. 새 폴더를
+/// 만들지 않는 이유는 오타 하나가 빈 설치 대상으로 굳는 것을 막기 위해서다.
+pub fn set_workspace_module_dir(
+    app_data_dir: &Path,
+    id: &str,
+    module_dir: Option<&str>,
+) -> Result<CypressRegistryView, CoreError> {
+    let module_dir = match module_dir.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(raw) => Some(validate_external_dir(
+            app_data_dir,
+            raw,
+            "Cypress 모듈 위치",
+        )?),
+        None => None,
+    };
+    mutate_registry(app_data_dir, |registry| {
+        let Some(workspace) = registry
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == id)
+        else {
+            return Err(CoreError::NotFound(format!(
+                "Cypress 작업공간을 찾을 수 없습니다: {id}"
+            )));
+        };
+        workspace.module_dir = module_dir.map(|directory| directory.to_string_lossy().into_owned());
+        Ok(())
+    })
+}
+
 /// 작업공간 안의 상대 경로만 허용한다. `..`·절대경로·`.`·빈 경로는 거절.
 pub(crate) fn validate_relative_path(raw: &str) -> Result<PathBuf, CoreError> {
     let relative = Path::new(raw.trim());
@@ -547,6 +578,41 @@ pub(crate) fn relative_slash_path(path: &Path) -> String {
 
 fn is_sensitive(relative: &Path) -> bool {
     relative == Path::new(ENV_FILE)
+}
+
+/// C7-2: 이름이 아니라 실제로 닿는 파일로 env 파일인지 본다. 작업공간 안의 심볼릭 링크
+/// (`e2e/alias.json -> ../cypress.env.json`)나 하드 링크는 루트를 벗어나지 않아 경로 검사를
+/// 지나므로, 이름만 보면 마스킹 없는 원문 읽기와 전용 편집기를 거치지 않는 쓰기가 열린다.
+/// 있는 파일은 같은 파일인지(유닉스는 장치·inode)로 비교해 링크 종류와 대소문자 차이를 함께 막고,
+/// 아직 없는 대상은 정규화한 부모에 이름을 붙여 env 자리인지 본다.
+fn reaches_env_file(workspace: &CypressWorkspace, relative: &Path, target: &Path) -> bool {
+    if is_sensitive(relative) {
+        return true;
+    }
+    let env = workspace.project_dir().join(ENV_FILE);
+    if let (Ok(found), Ok(env_meta)) = (fs::metadata(target), fs::metadata(&env)) {
+        return same_file(&found, &env_meta, target, &env);
+    }
+    let Ok(root) = fs::canonicalize(workspace.project_dir()) else {
+        return false;
+    };
+    let (Some(name), Some(parent)) = (target.file_name(), target.parent()) else {
+        return false;
+    };
+    // 대소문자를 가리지 않는 파일시스템(macOS·Windows)에서는 `Cypress.env.json` 도 env 자리다.
+    fs::canonicalize(parent)
+        .is_ok_and(|parent| parent == root && name.to_string_lossy().eq_ignore_ascii_case(ENV_FILE))
+}
+
+#[cfg(unix)]
+fn same_file(a: &fs::Metadata, b: &fs::Metadata, _: &Path, _: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_: &fs::Metadata, _: &fs::Metadata, a: &Path, b: &Path) -> bool {
+    matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
 }
 
 /// 작업공간에서 삭제가 금지된 필수 파일인지 검사한다(환경 파일 또는 Cypress 설정 파일).
@@ -691,7 +757,7 @@ pub fn read_file(
     raw: &str,
 ) -> Result<CypressWorkspaceFileContent, CoreError> {
     let (relative, target) = resolve_file(workspace, raw)?;
-    let sensitive = is_sensitive(&relative);
+    let sensitive = reaches_env_file(workspace, &relative, &target);
     let content = read_text_limited(&target)?;
     Ok(CypressWorkspaceFileContent {
         path: relative_slash_path(&relative),
@@ -748,7 +814,16 @@ pub fn write_file(
     content: &str,
 ) -> Result<CypressWorkspaceFile, CoreError> {
     let (relative, target) = resolve_file(workspace, raw)?;
-    if is_sensitive(&relative) {
+    // C7-2: 끊긴 링크는 따라가지 않는다. 끊긴 링크 사슬은 쓰기 시점에야 env 파일로 풀려
+    // 0600이 아닌 env 파일을 만들 수 있다. 살아 있는 링크는 위 검사가 실제 파일로 판정한다.
+    if fs::symlink_metadata(&target).is_ok_and(|meta| meta.file_type().is_symlink())
+        && fs::metadata(&target).is_err()
+    {
+        return Err(CoreError::InvalidInput(format!(
+            "끊긴 심볼릭 링크에는 쓸 수 없습니다: {raw}"
+        )));
+    }
+    if reaches_env_file(workspace, &relative, &target) {
         return Err(CoreError::InvalidInput(
             "cypress.env.json은 설정 화면의 전용 편집기(write_cypress_env_file)로만 고칠 수 있습니다"
                 .to_owned(),
@@ -852,6 +927,73 @@ mod tests {
         (data, project, workspace)
     }
 
+    /// C7-2: 작업공간 안에서 env 파일을 가리키는 링크로도 원문을 읽거나 덮어쓸 수 없다.
+    #[cfg(unix)]
+    #[test]
+    fn env_file_reached_through_a_symlink_stays_masked_and_unwritable_c7_2() {
+        let (_data, _project, workspace) = fixture();
+        let root = workspace.project_dir();
+        fs::write(root.join(ENV_FILE), r#"{"PASSWORD":"plain-secret"}"#).expect("env");
+        std::os::unix::fs::symlink("../cypress.env.json", root.join("e2e/alias.json"))
+            .expect("symlink");
+
+        let read = read_file(&workspace, "e2e/alias.json").expect("read through link");
+        assert!(read.masked);
+        assert!(!read.content.contains("plain-secret"));
+
+        assert!(write_file(&workspace, "e2e/alias.json", "{}").is_err());
+        assert!(fs::read_to_string(root.join(ENV_FILE))
+            .expect("env read")
+            .contains("plain-secret"));
+    }
+
+    /// C7-2: 하드 링크로도 env 원문을 읽거나 덮어쓸 수 없다.
+    #[cfg(unix)]
+    #[test]
+    fn env_file_reached_through_a_hard_link_stays_masked_and_unwritable_c7_2() {
+        let (_data, _project, workspace) = fixture();
+        let root = workspace.project_dir();
+        fs::write(root.join(ENV_FILE), r#"{"PASSWORD":"plain-secret"}"#).expect("env");
+        fs::hard_link(root.join(ENV_FILE), root.join("e2e/copy.json")).expect("hard link");
+
+        let read = read_file(&workspace, "e2e/copy.json").expect("read through link");
+        assert!(read.masked);
+        assert!(!read.content.contains("plain-secret"));
+        assert!(write_file(&workspace, "e2e/copy.json", "{}").is_err());
+        assert!(fs::read_to_string(root.join(ENV_FILE))
+            .expect("env read")
+            .contains("plain-secret"));
+    }
+
+    /// C7-2: 끊긴 링크가 사슬로 이어져도 env 파일을 만들 수 없다.
+    #[cfg(unix)]
+    #[test]
+    fn chained_dangling_symlinks_cannot_create_the_env_file_c7_2() {
+        let (_data, _project, workspace) = fixture();
+        let root = workspace.project_dir();
+        fs::remove_file(root.join(ENV_FILE)).expect("remove env");
+        std::os::unix::fs::symlink("../cypress.env.json", root.join("e2e/b")).expect("b");
+        std::os::unix::fs::symlink("b", root.join("e2e/a")).expect("a");
+
+        let error = write_file(&workspace, "e2e/a", "{}").expect_err("refused");
+        assert!(error.to_string().contains("심볼릭 링크"));
+        assert!(!root.join(ENV_FILE).exists());
+    }
+
+    /// C7-2: env 파일이 없을 때 그 자리를 가리키는 끊긴 링크로 env 파일을 만들 수 없다.
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_to_a_missing_env_file_is_not_writable_c7_2() {
+        let (_data, _project, workspace) = fixture();
+        let root = workspace.project_dir();
+        fs::remove_file(root.join(ENV_FILE)).expect("remove env");
+        std::os::unix::fs::symlink("../cypress.env.json", root.join("e2e/alias.json"))
+            .expect("symlink");
+
+        assert!(write_file(&workspace, "e2e/alias.json", "{}").is_err());
+        assert!(!root.join(ENV_FILE).exists());
+    }
+
     #[test]
     fn added_empty_workspace_uses_the_template_with_a_private_env_file() {
         let (data, _project, workspace) = fixture();
@@ -941,6 +1083,69 @@ mod tests {
                 true,
                 false,
                 Some(CypressExecutionType::Standard)
+            ),
+            Err(CoreError::NotFound(_))
+        ));
+    }
+
+    /// C7-4: 모듈 경로만 바꾸며 등록 폴더와 실행 옵션은 보존한다. 경로는 G10에 따라
+    /// 정규화된 기존 외부 폴더여야 하고, 앱 데이터 안은 등록 때와 똑같이 거절한다.
+    #[test]
+    fn module_dir_update_preserves_workspace_identity_and_rejects_restricted_roots() {
+        let (data, _project, workspace) = fixture();
+        let module = TempDir::new().unwrap();
+        let package = module.path().join("node_modules/cypress");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("package.json"), r#"{"version":"15.21.1"}"#).unwrap();
+
+        set_workspace_options(
+            data.path(),
+            &workspace.id,
+            true,
+            true,
+            Some(CypressExecutionType::AgentManagerIsolated),
+        )
+        .unwrap();
+        let view = set_workspace_module_dir(
+            data.path(),
+            &workspace.id,
+            Some(module.path().to_str().unwrap()),
+        )
+        .unwrap();
+        let changed = view
+            .workspaces
+            .iter()
+            .find(|item| item.workspace.id == workspace.id)
+            .unwrap();
+        assert_eq!(changed.workspace.path, workspace.path);
+        assert!(changed.workspace.record_video && changed.workspace.headed);
+        assert_eq!(
+            changed.workspace.execution_type,
+            CypressExecutionType::AgentManagerIsolated
+        );
+        let canonical_module = fs::canonicalize(module.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            changed.workspace.module_dir.as_deref(),
+            Some(canonical_module.as_str())
+        );
+        assert!(changed.module_ready);
+
+        assert!(matches!(
+            set_workspace_module_dir(
+                data.path(),
+                &workspace.id,
+                Some(data.path().to_str().unwrap())
+            ),
+            Err(CoreError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            set_workspace_module_dir(
+                data.path(),
+                "missing",
+                Some(module.path().to_str().unwrap())
             ),
             Err(CoreError::NotFound(_))
         ));

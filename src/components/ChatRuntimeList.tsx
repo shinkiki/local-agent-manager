@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AppWindow, PanelLeftClose, Plus, Star, X } from "lucide-react";
+import { chatIdleLabel } from "../lib/chatIdle";
 import { sourceName } from "../lib/format";
 import { useI18n } from "../lib/i18n";
 import { readSecondaryPaneOpen, writeSecondaryPaneOpen } from "../lib/secondaryPane";
@@ -85,6 +86,39 @@ export function phaseLabel(phase: ChatPhase | "connecting", text: TextPicker): s
 }
 
 /**
+ * 단계에 유휴 시간을 덧붙인 한 줄("입력 대기 · 12m"). 단계만 적으면 방금 답을 끝낸
+ * 실행과 한 시간 방치된 실행이 똑같이 "입력 대기"라, 사용자가 둘을 가르지 못하고
+ * 종료된 것인지 되묻게 된다. 아직 짧은 유휴는 붙이지 않는다.
+ */
+export function phaseWithIdleLabel(chat: ChatSessionInfo, text: TextPicker, phase: ChatPhase | "connecting" = chat.state): string {
+  const label = phaseLabel(phase, text);
+  // 연결하는 중에는 아직 이 실행의 시간이 아니다. 앞선 실행의 유휴를 붙이면 막 띄운
+  // 대화가 몇 시간 방치된 것처럼 보인다. 끝난 실행(종료·실패)은 유휴가 아니라 멈춘
+  // 것이라 붙이지 않는다 — 머리줄 툴팁(chatLivenessTitle)도 같은 상태에서 뺀다.
+  const idle = phase === "connecting" || phase === "stopped" || phase === "failed" ? null : chatIdleLabel(chat);
+  return idle ? `${label} · ${idle}` : label;
+}
+
+/**
+ * 목록 항목에 걸어 둘 설명. 종료된 실행은 대화가 사라진 것이 아니라 런타임만 끊긴
+ * 것이므로 이어갈 수 있다고 적어 준다 — "종료됨" 석 자만 보고 기록까지 없어진 줄 아는
+ * 자리였다.
+ */
+export function chatLivenessTitle(chat: ChatSessionInfo, text: TextPicker, phase: ChatPhase | "connecting" = chat.state): string {
+  // 연결 중에는 라벨과 같은 이유로 유휴를 감춘다. 한쪽만 감추면 같은 요소에서 라벨은
+  // 조용한데 말풍선만 앞선 실행의 유휴를 읊는다.
+  if (phase === "connecting") return text("기존 대화에 연결하고 있습니다", "Connecting to existing conversation");
+  const idle = chatIdleLabel(chat);
+  if (chat.state === "stopped" || chat.state === "failed") {
+    return text("실행이 끝났습니다. 대화는 남아 있어 이어갈 수 있습니다", "The run has ended. The conversation remains and can be resumed");
+  }
+  if (!idle) return text("살아 있는 실행입니다", "This run is alive");
+  return chat.state === "ready"
+    ? text(`살아 있지만 ${idle} 동안 입력을 기다리고 있습니다`, `Alive but waiting for input for ${idle}`)
+    : text(`${idle} 동안 같은 상태입니다`, `Unchanged for ${idle}`);
+}
+
+/**
  * 열려 있는 채팅 목록 사이드바. 오버레이일 때 본문을 덮는 배경까지 함께 그린다 —
  * 배경은 목록이 있을 때만 있고 목록과 같은 자리에 놓이므로 둘을 떼어 놓을 이유가 없다.
  *
@@ -124,9 +158,9 @@ export function ChatRuntimeList({ pane, chats, sessions, activeChatId, busy, pop
             ? text("세션이 만들어진 뒤 즐겨찾기할 수 있습니다", "You can favorite this once its session exists")
             : favorite ? text("즐겨찾기 해제", "Remove from favorites") : text("즐겨찾기 추가", "Add to favorites");
           return <div className={`chat-runtime-list-item-shell${active ? " active" : ""}`} key={chat.chatId}>
-            <button className="chat-runtime-list-item" type="button" aria-current={active ? "page" : undefined} disabled={busy} title={`${title} · ${sourceName(chat.source)} · ${phaseLabel(chat.state, text)}`} onClick={() => { void onSwitchChat(chat.chatId).then((opened) => { if (opened) pane.closeOnOverlay(); }); }}>
+            <button className="chat-runtime-list-item" type="button" aria-current={active ? "page" : undefined} disabled={busy} title={`${title} · ${sourceName(chat.source)} · ${phaseWithIdleLabel(chat, text)}\n${chatLivenessTitle(chat, text)}`} onClick={() => { void onSwitchChat(chat.chatId).then((opened) => { if (opened) pane.closeOnOverlay(); }); }}>
               <span className={`terminal-status terminal-status-${chat.state}`} />
-              <span><strong>{title}</strong><small>{sourceName(chat.source)} · {phaseLabel(chat.state, text)}</small></span>
+              <span><strong>{title}</strong><small>{sourceName(chat.source)} · {phaseWithIdleLabel(chat, text)}</small></span>
             </button>
             <div className="chat-runtime-list-item-actions">
               <button className={`chat-runtime-list-favorite${favorite ? " active" : ""}`} type="button" disabled={busy || !catalogSession} aria-pressed={favorite} aria-label={`${title} ${favoriteLabel}`} title={favoriteLabel} onClick={() => { onToggleFavorite(chat); }}><Star size={12} fill={favorite ? "currentColor" : "none"} /></button>

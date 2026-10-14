@@ -82,3 +82,36 @@ test("backend store IDs are canonical and native identity mismatches fail closed
     /다른 백엔드 서비스/,
   );
 });
+
+test("C20: the session token rides only on WebSocket and asset URLs, as a query parameter", () => {
+  const location = { protocol: "https:", host: "manager.example.ts.net" };
+  const token = "abc.def_GHI";
+
+  // fetch 경로는 헤더로 싣는다 — URL은 그대로다.
+  assert.equal(
+    resolveBackendHttpUrl("/api/invoke/get_manager_snapshot", false, location, undefined, token),
+    "https://manager.example.ts.net/api/invoke/get_manager_snapshot",
+  );
+  assert.equal(
+    resolveBackendHttpUrl("/api/access", false, location, undefined, token),
+    "https://manager.example.ts.net/api/access",
+  );
+  // 헤더를 못 붙이는 WebSocket·<img> 자산만 쿼리로 싣고, 기존 쿼리는 보존한다.
+  assert.equal(
+    resolveBackendWebSocketUrl("/api/chat", false, location, undefined, token),
+    "wss://manager.example.ts.net/api/chat?session=abc.def_GHI",
+  );
+  assert.equal(
+    resolveBackendHttpUrl("/api/session-image/codex/s1/0/%2Fa?x=1", true, location, 4319, token),
+    "http://127.0.0.1:4319/api/session-image/codex/s1/0/%2Fa?x=1&session=abc.def_GHI",
+  );
+  assert.equal(
+    resolveBackendHttpUrl("/api/chat-attachment/c1/a1", false, location, undefined, token),
+    "https://manager.example.ts.net/api/chat-attachment/c1/a1?session=abc.def_GHI",
+  );
+  // 토큰이 없으면 아무것도 붙지 않는다.
+  assert.equal(
+    resolveBackendWebSocketUrl("/api/terminal", false, location),
+    "wss://manager.example.ts.net/api/terminal",
+  );
+});

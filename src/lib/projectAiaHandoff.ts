@@ -16,6 +16,40 @@
  */
 export const MAX_AIA_REVIEW_COMMITS = 20;
 
+/**
+ * 이 파일의 요청문이 **이름을 적어** 막는 git 명령(점검표 A7).
+ *
+ * C16-4는 이 명령들을 제품에 제공조차 하지 않는다. 그런데 화면이 넘긴 요청을 받은 AIA는
+ * 자기 셸을 갖고 있어서, 요청문이 말하지 않으면 같은 일을 `git`으로 직접 해 버린다 —
+ * 그러면 C16-4의 금지는 화면에만 있고 실제로는 비어 있는 규칙이 된다. 분석 답변이 적어 준
+ * 한 줄을 사용자가 그대로 붙여 넣는 자리도 같은 구멍이다.
+ *
+ * 그래서 "강제 푸시" 같은 뜻풀이가 아니라 **명령 형태 그대로** 적는다. 다른 말로 적힌 금지는
+ * 모델이 `push --force-with-lease`를 "강제 푸시가 아니다"로 읽을 여지를 남긴다. 다만 형태를
+ * 적는다고 변종을 빠뜨리면 반대쪽 구멍이 난다 — `clean -fd`만 적힌 금지는 `clean -xdf`를
+ * 남긴다. 그래서 대표형 옆에 "모든 형태"를 함께 적는다.
+ *
+ * 집합은 C16-4가 "never offered"로 적은 목록 전부다 — `--force*`·`reset --hard`·`clean`·
+ * worktree `restore`/`checkout`·`branch -D`·`--amend`·대화형 rebase·`--autostash`. `--force*`는
+ * 괄호 안이 아니라 독립 항목으로 적는다 — "강제 푸시(… --force*)"로 중첩하면 그 수식이 push
+ * 에만 걸려 `checkout --force` 같은 다른 명령의 force 형태가 금지 밖으로 빠진다.
+ *
+ * 금지의 뜻은 **폐기**다. 그래서 worktree `checkout`은 "경로를 지정해 HEAD 원본으로 되돌리는"
+ * 것으로 한정하고, 충돌 표시가 남은 파일의 `checkout --ours/--theirs`는 쓸 수 있다고 적는다.
+ * 통째로 막으면 쓰기 허용 충돌 해결 문단이 "충돌 표시를 제거하라"면서 그 표준 수단을 금지하는
+ * 자기모순이 되고, 모델은 지시를 손편집으로 우회하거나 제멋대로 예외를 만든다.
+ *
+ * 형제 생성기 `gitConflictAiaPrompt`도 이 상수를 그대로 쓴다. 두 곳에 따로 적으면 한쪽만 넓어진다.
+ */
+export const DESTRUCTIVE_GIT_COMMANDS_BAN =
+  "reset --hard, clean 모든 형태(clean -fd, clean -xdf 등), 강제 푸시(push --force, push -f, "
+  + "push --force-with-lease), 명령을 가리지 않고 모든 --force*/-f 형태, commit --amend, "
+  + "branch -D, 대화형 rebase(rebase -i), rebase/pull --autostash, 그리고 HEAD 원본으로 "
+  + "되돌리는 worktree 폐기(restore --source=HEAD --worktree, 경로를 지정한 worktree 파일 "
+  + "checkout)는 어느 경우에도 쓰지 마. 되돌릴 수 없고 사용자의 커밋하지 않은 변경과 로컬 "
+  + "설정이 그 자리에 있다. 다만 충돌 표시가 남은 파일에 한해 checkout --ours/--theirs로 "
+  + "한쪽을 고르는 것은 폐기가 아니니 그건 써도 돼.";
+
 export interface AiaReviewCommitInput {
   sha: string;
   subject: string;
@@ -71,6 +105,7 @@ export function buildAiaCommitReviewRequest(input: {
     readOnly
       ? "읽기만 하고 파일을 고치거나 git 상태를 바꾸지 마. 고칠 것이 있으면 무엇을 어떻게 고칠지만 적어줘."
       : "고칠 것이 있으면 무엇을 왜 고치는지 먼저 알리고 승인을 받은 뒤에만 바꿔줘.",
+    DESTRUCTIVE_GIT_COMMANDS_BAN,
   ].filter((part): part is string => part !== null).join("\n\n");
   return { projectPath: input.projectPath, commits, truncated, readOnly, prompt: body };
 }
@@ -132,7 +167,46 @@ export function buildAiaOverlayConflictRequest(
     readOnly
       ? "읽기만 하고 파일이나 git 상태를 바꾸지 마. 어떻게 맞출지만 적어줘."
       : "고칠 것이 있으면 무엇을 왜 고치는지 먼저 알리고 승인을 받은 뒤에만 바꿔줘.",
-    "reset --hard, clean, 강제 푸시, 변경 폐기, restore --source=HEAD --worktree 는 어느 경우에도 쓰지 마. 되돌릴 수 없고 사용자의 로컬 설정이 그 자리에 있다.",
+    DESTRUCTIVE_GIT_COMMANDS_BAN,
   ].filter((part): part is string => part !== null).join("\n\n");
   return { projectPath: input.projectPath, setName: input.setName, affectedPaths, reason, readOnly, prompt };
+}
+
+/** 지금 이력에 남아 있는 선택과, 사라진 선택을 갈라 놓은 결과. */
+export interface AiaReviewSelection {
+  /** 고른 순서대로, **지금 이력에 실제로 있는** 커밋만. 이것이 요청에 실린다. */
+  commits: AiaReviewCommitInput[];
+  /** 고른 뒤 이력에서 사라진 SHA(브랜치 전환·rebase·amend). 화면이 그 사실을 말해야 한다. */
+  missing: string[];
+}
+
+/**
+ * 화면이 들고 있는 선택(SHA 목록)을 지금 이력에 비추어 가른다(점검표 A1·A2).
+ *
+ * 이력은 개요가 올 때마다 첫 페이지부터 다시 읽히므로(브랜치 전환·커밋·rebase 뒤),
+ * 사용자가 고른 SHA가 다음 순간 목록에 없을 수 있다. 선택 상태는 그 재적재를 모른다.
+ *
+ * 2026-10-04 실측: 세 커밋을 고른 뒤 브랜치를 바꾸면 머리글은 여전히 "3개 선택"이라 적고,
+ * AIA 리뷰를 누르면 살아남은 것만 조용히 실려 나가거나(요청문에는 "커밋(1개)"로 적힌다)
+ * 하나도 남지 않았을 때는 버튼이 **아무 일도 하지 않는다**. 어느 쪽이든 사용자가 믿는
+ * 선택과 넘어간 선택이 다르고, 화면은 그 차이를 말하지 않는다.
+ *
+ * 그래서 세는 자리와 싣는 자리를 한 함수로 합쳤다 — 머리글이 세는 수와 요청에 실리는 수가
+ * 같은 계산에서 나오면 둘이 어긋날 수 없다. 사라진 것은 버리지 않고 `missing`으로 돌려주어
+ * 화면이 "몇 개는 지금 이력에 없다"고 적게 한다. 조용히 지우면 사용자는 자기가 고른 것이
+ * 전달됐다고 믿는다.
+ */
+export function resolveAiaReviewSelection(input: {
+  picked: readonly string[];
+  commits: readonly AiaReviewCommitInput[];
+}): AiaReviewSelection {
+  const bySha = new Map(input.commits.map((commit) => [commit.sha, commit]));
+  const commits: AiaReviewCommitInput[] = [];
+  const missing: string[] = [];
+  for (const sha of input.picked) {
+    const found = bySha.get(sha);
+    if (found === undefined) missing.push(sha);
+    else commits.push({ sha: found.sha, subject: found.subject });
+  }
+  return { commits, missing };
 }

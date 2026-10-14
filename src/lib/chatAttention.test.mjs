@@ -8,7 +8,7 @@ import {
   recountAttention,
 } from "./chatAttention.ts";
 
-const attention = (id, profile, kind, read = false) => ({ id, profile, kind, read });
+const attention = (id, profile, kind, read = false, chatId = id) => ({ id, profile, kind, read, chatId });
 const snapshot = (items) => recountAttention(items);
 
 test("counts treat approvals as unread and pending", () => {
@@ -46,6 +46,27 @@ test("marking all read without exclusions covers every profile", () => {
   assert.deepEqual(next.items.map((item) => item.read), [true, true]);
   assert.equal(next.unreadCount, 0);
   assert.equal(markAllAttentionReadLocally(next), next);
+});
+
+test("marking all read skips only the hidden AIA chat", () => {
+  const next = markAllAttentionReadLocally(snapshot([
+    attention("hidden-aia", "aia", "completed"),
+    attention("visible-aia", "aia", "completed"),
+  ]), [], ["hidden-aia"]);
+  assert.deepEqual(next.items.map((item) => item.read), [false, true]);
+  assert.equal(next.unreadCount, 1);
+});
+
+test("숨긴 대화의 알림은 id 가 새로 생겨도 함께 보존된다", () => {
+  // 마지막 폴링 뒤에 끝난 턴은 `turn:<대화>:<턴>` 꼴의 새 알림 id 를 달고 나온다. 알림
+  // id 로 거르던 동안에는 그 알림이 목록에 보이지도 않은 채 읽음 처리돼, 트리거 말풍선이
+  // 영영 뜨지 않았다. 대화 id 는 그 사이에 바뀌지 않는다.
+  const next = markAllAttentionReadLocally(snapshot([
+    attention("turn:own:latest", "aia", "completed", false, "own-chat"),
+    attention("turn:other:latest", "aia", "completed", false, "other-chat"),
+  ]), [], ["own-chat"]);
+  assert.deepEqual(next.items.map((item) => item.read), [false, true]);
+  assert.equal(next.unreadCount, 1);
 });
 
 test("marking one read leaves the rest and returns the same snapshot when nothing changes", () => {

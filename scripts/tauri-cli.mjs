@@ -15,10 +15,11 @@ const args = process.argv.slice(2);
 let executable = process.execPath;
 let childArgs = [tauriCli, ...args];
 
-// `--remote-write` belongs to the standalone backend rather than the Tauri
-// CLI. Delegate the established command to the coordinated restart script so
-// an existing listener is safely replaced and both backend and frontend are
-// started with matching code.
+// `--remote-write` is the restart script's tailnet mode, not a Tauri CLI
+// option (the backend itself no longer takes it — C20 sign-in settings decide
+// remote authority). Delegate to the coordinated restart script so an existing
+// listener is safely replaced and both backend and frontend are started with
+// matching code.
 if (args[0] === "dev") {
   const remoteWriteIndex = args.indexOf("--remote-write", 1);
   if (remoteWriteIndex !== -1) {

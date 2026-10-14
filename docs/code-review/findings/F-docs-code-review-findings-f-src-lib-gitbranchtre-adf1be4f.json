@@ -1,0 +1,17 @@
+{
+  "findingId": "F-docs-code-review-findings-f-src-lib-gitbranchtre-adf1be4f",
+  "file": "docs/code-review/findings/F-src-lib-gitbranchtree-ts-tonode-e552d7a4.json",
+  "symbol": "",
+  "symptom": "재현되지 않는 결함을 fixed 로 적었다",
+  "severity": "P2",
+  "state": "fixed",
+  "agentsRules": [],
+  "occurrences": [
+    {
+      "itemId": "C-1186bef6c8a7",
+      "at": "2026-10-06T00:00:00Z"
+    }
+  ],
+  "fixCommits": [],
+  "note": "1186bef 이 만든 장부가 재현되지 않는 결함을 state=fixed, fixCommits=[af9507e] 로 적었다. 회차 절차 4절 1번은 재현하지 못한 결함을 unconfirmed 로 남기라고 한다. fixed 로 적힌 결함은 다음 회차가 '이미 끝난 것'으로 읽어 같은 자리를 다시 보지 않으므로, 틀린 fixed 는 결함을 영영 가린다. 게다가 reviewed 항목의 commits 에 af9507e 가 들어가 있어 그 리뷰가 만들지 않은 커밋을 리뷰 산출물로 적었다(README 의 commits 는 그 회차가 만든 커밋이다). 이번 회차가 두 장부 파일을 사실에 맞게 고쳤다."
+}

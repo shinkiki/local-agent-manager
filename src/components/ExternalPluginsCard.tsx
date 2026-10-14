@@ -1,8 +1,9 @@
-import { ChevronDown, ChevronRight, KeyRound, LoaderCircle, Pencil, Plug, Plus, RefreshCw, ShieldCheck, Trash2, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, KeyRound, LoaderCircle, Pencil, Plug, Plus, RefreshCw, ShieldCheck, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { SERVICE_ICON_SRC, type ServiceIconName } from "../assets/serviceIcons";
-import { beginExternalPluginOAuth, cancelExternalPluginOAuth, getExternalPlugins, getWebAccessStatus, hasTauriRuntime, registerExternalPlugin, removeExternalPlugin, setExternalPluginEnabled, setExternalPluginToken, setExternalPluginToolPolicies, setExternalPluginToolPolicy, updateExternalPlugin, verifyExternalPlugin, type WebAccessStatus } from "../lib/ipc";
+import { beginExternalPluginOAuth, cancelExternalPluginOAuth, getExternalPlugins, getWebAccessStatus, hasTauriRuntime, registerExternalPlugin, removeExternalPlugin, setExternalPluginEnabled, setExternalPluginToken, setExternalPluginToolPolicies, setExternalPluginToolPolicy, submitExternalPluginOAuthCallback, updateExternalPlugin, verifyExternalPlugin, type WebAccessStatus } from "../lib/ipc";
 import { splitPluginNames } from "../lib/pluginNames";
+import { pluginRemoteNotice } from "../lib/pluginRemoteNotice";
 import { markBuiltinToolsChanged } from "../lib/builtinToolsSignal";
 import { openExternalUrl } from "../lib/externalUrl";
 import { CopyAction } from "./CopyAction";
@@ -321,7 +322,9 @@ function useExternalPluginsData(active: boolean) {
 
 /**
  * 외부 플러그인(MCP 서버) 카드. 등록·편집·토글·연결 확인·OAuth 인증·토큰 변경·삭제를 한 자리에서 한다.
- * 인증(OAuth 시작, 토큰 입력, 등록, 편집, 삭제)은 호스트 화면 전용이다 — 원격 UI에서는 토글과 연결 확인만 된다.
+ * 로그인한 채널은 모두 같은 권한이고(C20), 인증 방식도 채널을 가리지 않는다. 기기 코드 흐름은
+ * loopback을 쓰지 않고(H03), 콜백형 OAuth는 브라우저가 이 백엔드와 다른 기기에 있으면 승인 뒤
+ * 주소창의 콜백 주소를 승인 모달에 붙여 넣어 끝낸다(2026-10-11).
  */
 export function ExternalPluginsCard({ active }: { active: boolean }) {
   const { text } = useI18n();
@@ -355,11 +358,16 @@ export function ExternalPluginsCard({ active }: { active: boolean }) {
     }
   }, [oauthStart, snapshot]);
 
-  const canWrite = access?.writable === true;
-  // 데스크톱 셸은 호스트 UI 자체다. `/api/access` 응답을 기다리는 동안에도 호스트 전용
-  // 버튼을 잘못 잠그지 않도록 SSH 키 화면과 같은 판정 기준을 쓴다.
-  const isHost = hasTauriRuntime() || access?.remote === false;
-  const isRemote = !hasTauriRuntime() && access?.remote === true;
+  // C20: 로그인한 채널은 데스크톱과 같은 권한이라 쓰기 권한은 따로 묻지 않는다. 호스트·원격
+  // 구분이 남는 자리는 콜백형 OAuth를 어떻게 끝내는지 알리는 문구뿐이다.
+  // 데스크톱 셸은 호스트 UI 자체다. `/api/access` 응답을 기다리는 동안에도 문구가 잘못 바뀌지
+  // 않도록 SSH 키 화면과 같은 판정 기준을 쓴다.
+  const headless = access?.headless === true;
+  // 헤드리스(NAS 컨테이너) 기동에는 OAuth를 끝낼 데스크톱 앱이 없다. loopback으로 들어와
+  // `remote === false`가 되어도 호스트 화면은 존재하지 않으므로 호스트로 보지 않는다(H04).
+  const isHost = !headless && (hasTauriRuntime() || access?.remote === false);
+  // 접속 정보를 아직 못 읽은 동안에는 아무 안내도 띄우지 않는다 — 잘못된 쪽을 먼저 말하게 된다.
+  const remoteNotice = access ? pluginRemoteNotice({ hostScreen: isHost }) : "none";
 
   /**
    * 되돌리기 어려운 방향일 때만 한 번 묻고, 사용자가 거절하면 아무것도 하지 않는다. 연결 정보
@@ -478,23 +486,15 @@ export function ExternalPluginsCard({ active }: { active: boolean }) {
           "Connect services such as Notion as chat tools and set each tool to allow, ask or deny. Credentials stay only in this device's secure store.",
         )}</p>
       </header>
-      {isRemote && (
+      {remoteNotice !== "none" && (
         <div className="plugin-host-notice" role="note">
           <ShieldCheck size={16} aria-hidden="true" />
           <span>
-            <strong>{text(
-              access?.writable ? "원격 화면에서는 OAuth 인증만 제한됩니다" : "이 원격 연결은 읽기 전용입니다",
-              access?.writable ? "Only OAuth sign-in is limited on a remote screen" : "This remote connection is read-only",
-            )}</strong>
-            <small>{access?.writable
-              ? text(
-                "등록·편집·토큰 입력·삭제는 여기서 할 수 있습니다. OAuth 승인은 콜백이 호스트의 loopback으로 돌아와 호스트 앱에서만 끝낼 수 있고, 도구 권한도 호스트 전용입니다 — 원격에서 새로 붙이려면 토큰 방식을 쓰세요.",
-                "You can register, edit, enter tokens and remove here. OAuth approval only finishes in the host app because the callback returns to the host's loopback, and tool permissions stay host-only — use a token method to connect from a remote screen.",
-              )
-              : text(
-                "설정을 바꾸려면 쓰기 권한으로 다시 연결하세요. OAuth 인증과 도구 권한은 쓰기 권한과 관계없이 호스트 앱에서만 가능합니다.",
-                "Reconnect with write access to change settings. OAuth sign-in and tool permissions remain host-only regardless of remote write access.",
-              )}</small>
+            <strong>{text("OAuth 승인 뒤에는 주소를 붙여 넣어 끝냅니다", "Finish OAuth sign-in by pasting the address")}</strong>
+            <small>{text(
+              "브라우저가 이 서버가 아닌 기기에서 열리므로, 승인 뒤 브라우저가 127.0.0.1(localhost)에 연결하지 못한다는 화면에서 멈춥니다. 정상입니다 — 그 주소창의 주소를 복사해 인증 창에 붙여 넣으세요. 기기 코드·토큰 방식은 붙여넣기 없이 끝납니다.",
+              "The browser runs on a different device from this server, so after approval it stops on a page saying it cannot reach 127.0.0.1 (localhost). That is expected — copy the address from the address bar and paste it into the sign-in dialog. Device-code and token methods finish without pasting.",
+            )}</small>
           </span>
         </div>
       )}
@@ -513,7 +513,6 @@ export function ExternalPluginsCard({ active }: { active: boolean }) {
                 presets={presets}
                 proxyReady={snapshot.proxyReady}
                 busy={busy}
-                canWrite={canWrite}
                 isHost={isHost}
                 toolsExpanded={toolsOpen === plugin.id}
                 onToggleTools={() => setToolsOpen(toolsOpen === plugin.id ? null : plugin.id)}
@@ -533,11 +532,9 @@ export function ExternalPluginsCard({ active }: { active: boolean }) {
         <div className="settings-update-body">
           <span className="settings-update-status">
             <strong>{text("새 플러그인 연결", "Connect a plugin")}</strong>
-            <small>{isHost
-              ? text(`최대 ${snapshot.maxPlugins}개 · 변경 내용은 새로 시작하는 채팅부터 적용됩니다.`, `Up to ${snapshot.maxPlugins} · Changes apply to newly started chats.`)
-              : text(`최대 ${snapshot.maxPlugins}개 · 원격에서는 토큰 방식으로 붙일 수 있습니다. OAuth 승인은 호스트 화면에서 끝내야 합니다.`, `Up to ${snapshot.maxPlugins} · Token methods work from a remote screen; OAuth approval must finish on the host.`)}</small>
+            <small>{text(`최대 ${snapshot.maxPlugins}개 · 변경 내용은 새로 시작하는 채팅부터 적용됩니다.`, `Up to ${snapshot.maxPlugins} · Changes apply to newly started chats.`)}</small>
           </span>
-          <button className="button compact primary" type="button" disabled={!canWrite || snapshot.plugins.length >= snapshot.maxPlugins} onClick={() => setForm({ editing: null, draft: presetDraft(isHost ? "notionOauth" : "notionToken", snapshot) })}><Plus size={13} />{text("플러그인 추가", "Add plugin")}</button>
+          <button className="button compact primary" type="button" disabled={snapshot.plugins.length >= snapshot.maxPlugins} onClick={() => setForm({ editing: null, draft: presetDraft("notionOauth", snapshot) })}><Plus size={13} />{text("플러그인 추가", "Add plugin")}</button>
         </div>
       )}
       {snapshot && form && (
@@ -546,6 +543,7 @@ export function ExternalPluginsCard({ active }: { active: boolean }) {
           draft={form.draft}
           presets={presets}
           snapshot={snapshot}
+          headless={headless}
           busy={busy}
           onChangeDraft={changeDraft}
           onApplyPreset={applyPreset}
@@ -559,6 +557,7 @@ export function ExternalPluginsCard({ active }: { active: boolean }) {
       {oauthStart && (
         <PluginOAuthStartModal
           oauthStart={oauthStart}
+          isHost={isHost}
           onCancel={() => { void run(`cancel:${oauthStart.plugin.id}`, () => cancelExternalPluginOAuth(oauthStart.plugin.id)); setOauthStart(null); }}
           onClose={() => setOauthStart(null)}
         />
@@ -583,6 +582,8 @@ interface ExternalPluginFormProps {
   draft: DraftForm;
   presets: HostedMcpPreset[];
   snapshot: ExternalPluginsSnapshot;
+  /** 데스크톱이 없는 기동인지. OAuth 방식 각주가 달라진다(H04). */
+  headless: boolean;
   busy: string | null;
   onChangeDraft: (draft: DraftForm) => void;
   onApplyPreset: (preset: Preset) => void;
@@ -639,6 +640,7 @@ function ExternalPluginForm({
   draft,
   presets,
   snapshot,
+  headless,
   busy,
   onChangeDraft,
   onApplyPreset,
@@ -688,7 +690,7 @@ function ExternalPluginForm({
       {draft.auth !== "notionToken" && <PluginTextField id="plugin-url" label={text("MCP 주소", "MCP URL")} value={draft.url} placeholder="https://mcp.example.com/mcp" onChange={(url) => patch({ url })} />}
       {usesStaticToken(draft.auth) && <PluginTextField id="plugin-token" label={text("토큰", "Token")} secret value={draft.token} placeholder={editing && !editConnectionChanged ? text("비워 두면 기존 토큰 유지", "Leave empty to keep the current token") : draft.auth === "notionToken" ? "ntn_…" : ""} onChange={(token) => patch({ token })} />}
       {isOAuthKind(draft.auth) && <PluginOAuthFields draft={draft} editing={editing} presets={presets} onChangeDraft={onChangeDraft} />}
-      <p className="plugin-form-note">{pluginFormNote(draft, editing, presets, snapshot, text)}</p>
+      <p className="plugin-form-note">{pluginFormNote(draft, editing, presets, snapshot, headless, text)}</p>
       <div className="form-actions">
         <button className="button" type="button" onClick={onClose}>{text("취소", "Cancel")}</button>
         {editing
@@ -768,6 +770,7 @@ function pluginFormNote(
   editing: ExternalPluginView | null,
   presets: HostedMcpPreset[],
   snapshot: ExternalPluginsSnapshot,
+  headless: boolean,
   text: UiText,
 ): string {
   return editing
@@ -780,7 +783,9 @@ function pluginFormNote(
       ? text(`노션 워크스페이스 설정 → 연결에서 내부 통합을 만들고 토큰을 붙여 넣으세요. 이 백엔드가 ${snapshot.notionLocalPackage}를 loopback으로 띄워 연결하며, 통합에 공유한 페이지만 보입니다.`, `Create an internal integration in Notion settings → Connections and paste its token. The backend runs ${snapshot.notionLocalPackage} on loopback; only pages shared with the integration are visible.`)
       : text("이 방식은 Node.js(npx)가 필요합니다. 현재 호스트에서 npx를 찾지 못했습니다.", "This method needs Node.js (npx), which was not found on this host."))
     : draft.auth === "oauth"
-      ? text("등록 뒤 [인증]을 누르면 브라우저가 열립니다. 승인 콜백은 이 호스트의 loopback으로 돌아오므로 원격 화면에서는 할 수 없습니다.", "After registering, press Sign in to open the browser. The callback returns to this host's loopback, so it is not possible from a remote screen.")
+      ? (headless
+        ? text("등록 뒤 [인증]을 누르면 승인 화면이 열립니다. 이 서버에는 데스크톱이 없으므로, 승인 뒤 브라우저가 멈춘 화면의 주소창 주소를 인증 창에 붙여 넣어 끝냅니다.", "After registering, press Sign in to open the approval page. This server has no desktop, so after approving, paste the address bar of the page the browser stopped on into the sign-in dialog.")
+        : text("등록 뒤 [인증]을 누르면 브라우저가 열립니다. 브라우저가 이 호스트가 아닌 기기에 있으면 승인 뒤 멈춘 화면의 주소창 주소를 인증 창에 붙여 넣어 끝냅니다.", "After registering, press Sign in to open the browser. If the browser is on a device other than this host, paste the address bar of the page it stopped on into the sign-in dialog after approving."))
       : draft.auth === "oauthDevice"
         ? text("등록 뒤 [인증]을 누르면 사용자 코드가 뜹니다. 브라우저에서 그 코드를 입력해 승인하면 토큰이 이 기기의 보안 저장소에 저장됩니다.", "After registering, press Sign in to get a user code. Approve it in the browser and the token is stored in this device's secure store.")
         : hostedPresetFor(presets, draft.url)?.brand === "figma"
@@ -790,6 +795,8 @@ function pluginFormNote(
 
 interface PluginOAuthStartModalProps {
   oauthStart: { plugin: ExternalPluginView; start: ExternalPluginOAuthStart };
+  /** 이 화면이 백엔드와 같은 기기인지. 아니면 콜백 붙여넣기가 기본 경로라 앞세워 말한다. */
+  isHost: boolean;
   onCancel: () => void;
   onClose: () => void;
 }
@@ -798,12 +805,29 @@ interface PluginOAuthStartModalProps {
  * OAuth 승인 대기 모달. 인가 주소를 그대로 보여주고 다시 열기·복사를 제공한다 — 브라우저 열기는
  * OS 셸에 맡기는 자리라 실패해도 앱은 알 수 없고(Windows ShellExecute는 핸들러가 없어도 성공을
  * 돌려준다), 이 모달이 유일한 우회 경로다. 디바이스 인가에서는 사용자 코드도 함께 보여준다.
+ * 콜백형은 브라우저가 다른 기기에 있을 때를 위해 승인 뒤 주소를 붙여 넣는 칸도 둔다.
  */
-function PluginOAuthStartModal({ oauthStart, onCancel, onClose }: PluginOAuthStartModalProps) {
+function PluginOAuthStartModal({ oauthStart, isHost, onCancel, onClose }: PluginOAuthStartModalProps) {
   const { text } = useI18n();
   const { plugin, start } = oauthStart;
   const host = new URL(start.authorizationUrl).host;
   const device = Boolean(start.userCode);
+  const [callbackDraft, setCallbackDraft] = useState("");
+  const [pasteState, setPasteState] = useState<"idle" | "sending" | "accepted">("idle");
+  const [pasteError, setPasteError] = useState<string | null>(null);
+  const submitCallback = async () => {
+    if (!callbackDraft.trim() || pasteState !== "idle") return;
+    setPasteState("sending");
+    setPasteError(null);
+    try {
+      await submitExternalPluginOAuthCallback(plugin.id, callbackDraft);
+      // 교환은 백엔드 대기 스레드가 한다. 대기가 풀리면 카드가 이 모달을 닫는다.
+      setPasteState("accepted");
+    } catch (cause) {
+      setPasteError(errorText(cause));
+      setPasteState("idle");
+    }
+  };
   return (
     <Modal
       title={device
@@ -832,6 +856,31 @@ function PluginOAuthStartModal({ oauthStart, onCancel, onClose }: PluginOAuthSta
           <CopyAction value={start.authorizationUrl} kind="link" />
         </div>
       </div>
+      {start.acceptsCallbackPaste && (
+        <div className="plugin-oauth-url plugin-oauth-paste" data-testid="plugin-oauth-paste">
+          <label className="plugin-oauth-url-label" htmlFor="plugin-oauth-callback">{isHost
+            ? text("브라우저가 다른 기기에서 열렸다면, 승인 뒤 멈춘 화면의 주소창 주소를 붙여 넣으세요.", "If the browser opened on another device, paste the address bar from the page it stopped on after approval.")
+            : text("승인 뒤 브라우저가 127.0.0.1(localhost)에 연결하지 못한다는 화면에서 멈추면, 그 주소창의 주소를 붙여 넣으세요.", "After approval the browser stops on a page saying it cannot reach 127.0.0.1 (localhost). Paste the address from its address bar.")}</label>
+          <div className="plugin-oauth-url-row">
+            <input
+              id="plugin-oauth-callback"
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              value={callbackDraft}
+              placeholder="http://127.0.0.1:…/callback?code=…&state=…"
+              disabled={pasteState !== "idle"}
+              onChange={(event) => { setCallbackDraft(event.target.value); setPasteError(null); }}
+              onKeyDown={(event) => { if (event.key === "Enter") void submitCallback(); }}
+            />
+            <button className="button compact primary" type="button" disabled={!callbackDraft.trim() || pasteState !== "idle"} onClick={() => void submitCallback()}>
+              {pasteState === "sending" ? <LoaderCircle size={13} className="spin" /> : <Check size={13} />}{text("승인 완료", "Finish sign-in")}
+            </button>
+          </div>
+          {pasteError && <p className="plugin-oauth-paste-error" role="alert">{pasteError}</p>}
+          {pasteState === "accepted" && <p className="plugin-form-note" role="status">{text("승인 주소를 받았습니다. 토큰을 받는 중입니다…", "Got the approval address. Fetching the token…")}</p>}
+        </div>
+      )}
     </Modal>
   );
 }
@@ -875,7 +924,6 @@ interface PluginRowProps {
   proxyReady: boolean;
   /** 진행 중인 작업 키. `<작업>:<플러그인 id>` 꼴이라 이 행의 것인지 접미사로 가른다. */
   busy: string | null;
-  canWrite: boolean;
   isHost: boolean;
   toolsExpanded: boolean;
   onToggleTools: () => void;
@@ -900,7 +948,6 @@ function PluginRow({
   presets,
   proxyReady,
   busy,
-  canWrite,
   isHost,
   toolsExpanded,
   onToggleTools,
@@ -917,10 +964,11 @@ function PluginRow({
   const { text } = useI18n();
   const rowBusy = busy !== null && busy.endsWith(`:${plugin.id}`);
   // 편집·토큰 변경·삭제는 쓰기 권한만 있으면 원격에서도 눌린다(P4, 2026-09-30).
-  const manageDisabled = !canWrite || rowBusy;
-  // 인증과 도구 권한만 호스트에 남는다 — 앞은 콜백이 호스트 loopback으로 돌아와서,
-  // 뒤는 허용이 승인 카드를 없애는 권한 확대라서다.
-  const hostOnlyDisabled = !isHost || manageDisabled;
+  // C20: 편집·토큰 변경·삭제·도구 권한은 로그인한 채널이면 어디서든 눌린다 — 이 행이 바쁠 때만 잠긴다.
+  const manageDisabled = rowBusy;
+  // 도구 권한은 호스트에 남는다 — 허용이 승인 카드를 없애는 권한 확대라서다.
+  // 인증은 방식으로 갈린다(H03). 콜백형만 호스트 loopback에 묶이고 기기 코드 흐름은
+  // 원격에서도 끝난다. 집행은 백엔드가 하고 여기서는 못 누를 버튼을 열지 않을 뿐이다.
   const status = statusFor(plugin, text);
   const mark = markOf(plugin, presets);
   const brand = mark.brand;
@@ -939,15 +987,19 @@ function PluginRow({
       </div>
       <div className="plugin-row-actions">
         <div className="plugin-row-action-group plugin-row-runtime-actions">
-          <AppToggle checked={plugin.enabled} disabled={!canWrite || rowBusy} label={text("사용", "Enabled")} onChange={onSetEnabled} />
-          <button className="button compact" type="button" disabled={!canWrite || rowBusy || !proxyReady || !plugin.credentialReady} title={verifyHint(plugin, proxyReady, text)} onClick={onVerify}>
+          <AppToggle checked={plugin.enabled} disabled={rowBusy} label={text("사용", "Enabled")} onChange={onSetEnabled} />
+          <button className="button compact" type="button" disabled={rowBusy || !proxyReady || !plugin.credentialReady} title={verifyHint(plugin, proxyReady, text)} onClick={onVerify}>
             {busy === `verify:${plugin.id}` ? <LoaderCircle size={13} className="spin" /> : <RefreshCw size={13} />}{text("연결 확인", "Verify")}
           </button>
         </div>
         <div className="plugin-row-action-group plugin-row-management-actions">
           {isOAuthKind(plugin.auth) && (plugin.oauthPending
-            ? <button className="button compact" type="button" disabled={rowBusy || !canWrite} onClick={onCancelOAuth}><X size={13} />{text("취소", "Cancel")}</button>
-            : <button className="button compact primary" type="button" disabled={hostOnlyDisabled} title={isHost ? text("브라우저에서 승인하면 refresh token을 보안 저장소에 둡니다", "Approve in the browser; the refresh token is kept in the secure store") : text("승인 콜백이 호스트의 loopback으로 돌아오므로 인증은 호스트 화면에서만 끝낼 수 있습니다", "The approval callback returns to the host's loopback, so sign-in can only finish on the host")} onClick={onStartOAuth}>
+            ? <button className="button compact" type="button" disabled={rowBusy} onClick={onCancelOAuth}><X size={13} />{text("취소", "Cancel")}</button>
+            : <button className="button compact primary" type="button" disabled={manageDisabled} title={plugin.auth === "oauthDevice"
+              ? text("기기 코드 방식이라 어느 브라우저에서나 사용자 코드를 넣어 끝낼 수 있습니다", "This is a device-code flow: enter the user code in any browser to finish")
+              : isHost
+                ? text("브라우저에서 승인하면 refresh token을 보안 저장소에 둡니다", "Approve in the browser; the refresh token is kept in the secure store")
+                : text("승인 뒤 브라우저가 멈춘 화면의 주소창 주소를 붙여 넣어 끝냅니다", "After approving, paste the address bar of the page the browser stopped on to finish")} onClick={onStartOAuth}>
               <ShieldCheck size={13} />{plugin.credentialReady ? text("다시 인증", "Re-authenticate") : text("인증", "Sign in")}
             </button>)}
           {usesStaticToken(plugin.auth) && <button className="button compact" type="button" disabled={manageDisabled} onClick={onChangeToken}><KeyRound size={13} />{text("토큰 변경", "Change token")}</button>}
@@ -967,8 +1019,7 @@ function PluginRow({
         <PluginToolsPanel
           plugin={plugin}
           toolNames={toolNames}
-          disabled={hostOnlyDisabled}
-          isHost={isHost}
+          disabled={manageDisabled}
           onChangeToolPolicy={onChangeToolPolicy}
           onChangeAllToolPolicies={onChangeAllToolPolicies}
         />
@@ -982,16 +1033,16 @@ interface PluginToolsPanelProps {
   /** 발견된 도구와 권한을 정해 둔 도구의 합집합. 제한한 도구도 되돌릴 수 있어야 한다. */
   toolNames: string[];
   disabled: boolean;
-  isHost: boolean;
   onChangeToolPolicy: (tool: string, policy: PluginToolPolicy) => void;
   onChangeAllToolPolicies: (policy: PluginToolPolicy) => void;
 }
 
-/** 펼친 도구 권한 패널. 일괄 변경 머리줄과 도구별 행이 같은 버튼 묶음을 쓴다. */
-function PluginToolsPanel({ plugin, toolNames, disabled, isHost, onChangeToolPolicy, onChangeAllToolPolicies }: PluginToolsPanelProps) {
+/**
+ * 펼친 도구 권한 패널. 일괄 변경 머리줄과 도구별 행이 같은 버튼 묶음을 쓴다. 도구 권한은
+ * 로그인한 채널이면 원격에서도 바꿀 수 있어(C20) 행이 바쁠 때만 잠긴다.
+ */
+function PluginToolsPanel({ plugin, toolNames, disabled, onChangeToolPolicy, onChangeAllToolPolicies }: PluginToolsPanelProps) {
   const { text } = useI18n();
-  // 도구 권한은 쓰기 권한과 무관하게 호스트 전용이다. 일괄 버튼과 개별 행이 같은 이유를 말한다.
-  const disabledTitle = isHost ? undefined : text("도구 권한은 호스트 화면에서만 바꿀 수 있습니다", "Tool permissions are host-only");
   return (
     <div className="plugin-tools">
       <div className="plugin-tools-header">
@@ -1003,7 +1054,6 @@ function PluginToolsPanel({ plugin, toolNames, disabled, isHost, onChangeToolPol
           ariaLabel={text("현재 도구 전체 권한", "All current tool permissions")}
           currentPolicy={TOOL_POLICIES.find((policy) => toolNames.every((tool) => (plugin.toolPolicies?.[tool] ?? "ask") === policy)) ?? null}
           disabled={disabled}
-          disabledTitle={disabledTitle}
           isBulk
           onSelect={onChangeAllToolPolicies}
         />
@@ -1019,7 +1069,6 @@ function PluginToolsPanel({ plugin, toolNames, disabled, isHost, onChangeToolPol
             ariaLabel={text(`${tool} 권한`, `${tool} permission`)}
             currentPolicy={plugin.toolPolicies?.[tool] ?? "ask"}
             disabled={disabled}
-            disabledTitle={disabledTitle}
             onSelect={(policy) => onChangeToolPolicy(tool, policy)}
           />
         </div>

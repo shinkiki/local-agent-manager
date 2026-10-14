@@ -19,6 +19,9 @@ test("M4 static UI audit measures catalog gaps and declares prompt exclusions", 
     "src/lib/roundDesign.ts",
     "src/lib/projectAiaHandoff.ts",
     "src/lib/projectMenuConformance.ts",
+    "src/lib/gitConflictAiaPrompt.ts",
+    "src/lib/codeReviewQueue.ts",
+    "src/lib/flakyTestReport.ts",
   ]);
   // 2026-09-27: Windows 에서 path.relative 가 역슬래시를 돌려줘 예외가 한 건도 걸리지 않았다.
   // 예외 파일의 문구가 실제로 빠졌는지 수로 본다.

@@ -1,0 +1,18 @@
+{
+  "itemId": "C-933065d97068",
+  "kind": "commit",
+  "ref": "933065d970686e90a72a40d06b5a0bac3396db60",
+  "reviewedAt": "2026-10-05T21:20:00Z",
+  "lane": "L07",
+  "source": "claude",
+  "verdict": "결함 없음",
+  "axes": {
+    "정확성": "장부 전용 커밋이라 정확성은 '적힌 말이 코드와 맞는가'다. 세 주장 모두 맞다 — (1) readBaseline 은 ENOENT 에서만 null 을 돌려주므로 baseline.json 이 없는 첫 측정에서 hasBaseline=false 이고, (2) 기준선 파일이 {} 이거나 failureKinds/diagnosticKinds 가 없으면 flaky-isolate.mjs 328·334줄의 `baseline && baseline.failureKinds` 가 null 을 만드는데 baseline 자체는 null 이 아니라 hasBaseline=true 로 다른 문장이 나온다, (3) summary 가 없는 낡은 기준선에서도 `baseline?.summary?.measuredRuns ?? null` 이라 분모 없이 찍히고 예외가 없다. 결함 없음.",
+    "보안불변식": "docs/code-review/ 아래 JSON 두 개만 바꾼다. 자격증명·공급자 소유 저장소·셸 문자열·경로 정규화·쓰기 게이트 어디에도 닿지 않아 G1~G11 범위 밖.",
+    "계약": "파일 이름과 본문 itemId 가 같고 README 가 정한 칸(itemId·kind·ref·reviewedAt·lane·source·verdict·findings·commits)을 모두 갖춰 codeReviewQueue.test.mjs 의 전수 검사를 통과한다. queue.json 은 러너가 --write 로 다시 적은 파생값이고 reviewed 53→54 가 장부 파일 한 개 증가와 맞는다. 다만 reviewedAt 이 2026-10-06T00:00:00Z 로 커밋 시각(2026-10-05T20:51Z)보다 뒤다 — 한국 날짜를 Z 로 적은 자리다. 이 커밋만의 실수가 아니라 장부 29건이 같은 값이라 한 커밋이 고칠 자리가 아니고, README 가 UTC 표기를 못 박는 쪽이 맞아 회차 보고의 decisions 로 올린다.",
+    "검증없음": "코드가 바뀌지 않아 새 시험이 필요한 자리가 없다. 바뀐 두 파일은 codeReviewQueue.test.mjs 의 '장부 파일은 전부 JSON 으로 읽히고 이름과 본문의 id 가 같다' 전수 검사가 덮는다. npm run test:unit exit=0(dot 리포터).",
+    "단순화중복": "C-fb82dc4c8690 장부는 이 커밋이 처음이자 하나뿐이다(git log -S 로 확인). 후속 커밋 6d306160 은 C-6b44077e65c2 의 fixCommits 를 채운 다른 항목이라 중복이 아니고, 이 커밋이 같은 지적을 되풀이하지 않은 것은 맞다."
+  },
+  "findings": [],
+  "commits": []
+}

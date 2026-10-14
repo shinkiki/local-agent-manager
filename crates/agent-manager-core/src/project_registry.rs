@@ -214,6 +214,8 @@ mod tests {
             git_branch: None,
             is_subagent: false,
             aia_workspace: false,
+            aia_chat: false,
+            aia_chat_opens_as_standard: false,
             default_workspace: false,
             archived: false,
             readable: true,

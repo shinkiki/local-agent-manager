@@ -153,25 +153,65 @@ static CLI_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 /// 생기지 않는다(`G9`). 로그인 터미널은 브라우저가 열려야 하는 자리라 이 경로를 쓰지 않는다.
 #[cfg(unix)]
 fn no_browser_dir() -> Option<&'static Path> {
-    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let directory = std::env::temp_dir().join("agent-manager-agy-no-browser");
-        std::fs::create_dir_all(&directory).ok()?;
-        let link = directory.join("open");
-        match std::fs::read_link(&link) {
-            Ok(target) if target == Path::new(NO_BROWSER_TARGET) => return Some(directory),
-            Ok(_) => {
-                std::fs::remove_file(&link).ok()?;
-            }
-            Err(_) if link.exists() => {
-                std::fs::remove_file(&link).ok()?;
-            }
-            Err(_) => {}
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    let directory = DIR.get_or_init(|| std::env::temp_dir().join("agent-manager-agy-no-browser"));
+    // 한 번 확인한 결과를 기억하지 않는다. 오래 도는 헤드리스 백엔드에서는 `/tmp` 정리가
+    // 이 디렉터리를 지울 수 있고, 그 뒤 같은 이름을 다른 사용자가 만들 수 있다.
+    match prepare_unix_no_browser_dir(directory) {
+        Ok(()) => Some(directory.as_path()),
+        Err(error) => {
+            eprintln!("[antigravity] 브라우저 차단 디렉터리를 쓰지 않습니다: {error}");
+            None
         }
-        std::os::unix::fs::symlink(NO_BROWSER_TARGET, &link).ok()?;
-        Some(directory)
-    })
-    .as_deref()
+    }
+}
+
+/// 임시 디렉터리는 여러 사용자가 함께 쓰는 `/tmp`일 수 있고, 이 디렉터리는 자식의 `PATH` **맨
+/// 앞**에 놓인다. 다른 사용자가 같은 이름으로 먼저 만들어 두면 그 안에 둔 아무 실행 파일이나
+/// (`open` 확인 뒤 바꿔치기한 것까지) 공급자 CLI가 우리 권한으로 실행한다(`G9`, `G10`). 그래서
+/// 심링크가 아닌 디렉터리이고, 이 프로세스의 사용자 소유이며, 그룹·기타에 아무 권한이 없을
+/// 때만 쓴다. 조건이 안 맞으면 차단 없이 조회한다 — 창이 뜨는 쪽이 남의 실행 파일보다 낫다.
+#[cfg(unix)]
+fn prepare_unix_no_browser_dir(directory: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let metadata = std::fs::symlink_metadata(directory)?;
+    // SAFETY: getuid는 실패하지 않고 아무 상태도 바꾸지 않는다.
+    let uid = unsafe { libc::getuid() };
+    if !metadata.file_type().is_dir() || metadata.uid() != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{}가 이 사용자 소유의 디렉터리가 아닙니다",
+                directory.display()
+            ),
+        ));
+    }
+    // 이전 판은 umask 그대로(대개 0755) 만들었다. 우리 소유면 좁혀서 계속 쓴다.
+    if metadata.mode() & 0o077 != 0 {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    // 쓰기 비트가 열려 있던 동안 남이 넣은 파일은 chmod 뒤에도 남는다. `open` 말고는
+    // 아무것도 없어야 `PATH` 맨 앞에 둔다.
+    for entry in std::fs::read_dir(directory)? {
+        if entry?.file_name() != "open" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{}에 `open` 외의 항목이 있습니다", directory.display()),
+            ));
+        }
+    }
+    let link = directory.join("open");
+    match std::fs::read_link(&link) {
+        Ok(target) if target == Path::new(NO_BROWSER_TARGET) => return Ok(()),
+        _ if std::fs::symlink_metadata(&link).is_ok() => std::fs::remove_file(&link)?,
+        _ => {}
+    }
+    std::os::unix::fs::symlink(NO_BROWSER_TARGET, &link)
 }
 
 /// Windows에서 CLI는 `rundll32 url.dll,FileProtocolHandler <url>`로 브라우저를 열고, 그
@@ -1636,5 +1676,36 @@ mod tests {
         let response: UserStatusResponse =
             serde_json::from_value(json!({"userStatus": {}})).expect("응답 해석");
         assert!(windows_from_response(&response).is_empty());
+    }
+
+    /// 다른 사용자가 열어 둘 수 있는 디렉터리는 `PATH` 앞에 두지 않는다(G9, G10).
+    #[cfg(unix)]
+    #[test]
+    fn no_browser_dir_is_owner_only_and_refuses_symlink_or_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("temp");
+        let directory = temp.path().join("shim");
+        std::fs::create_dir(&directory).expect("dir");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod");
+        std::os::unix::fs::symlink("/bin/sh", directory.join("open")).expect("planted");
+        prepare_unix_no_browser_dir(&directory).expect("own directory");
+        let mode = std::fs::metadata(&directory)
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert_eq!(
+            std::fs::read_link(directory.join("open")).expect("link"),
+            Path::new(NO_BROWSER_TARGET)
+        );
+        let linked = temp.path().join("linked");
+        std::os::unix::fs::symlink(&directory, &linked).expect("symlink");
+        assert!(prepare_unix_no_browser_dir(&linked).is_err());
+        std::fs::write(directory.join("xdg-open"), b"").expect("planted");
+        assert!(prepare_unix_no_browser_dir(&directory).is_err());
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"").expect("file");
+        assert!(prepare_unix_no_browser_dir(&file).is_err());
     }
 }

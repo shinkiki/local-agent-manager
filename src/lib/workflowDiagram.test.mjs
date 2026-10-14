@@ -80,10 +80,11 @@ test("labels that would break the syntax are escaped instead of losing the whole
     steps: [{ id: "a<b>", operation: "op(1)", arguments: {}, forEach: null, condition: null, expect: null }],
   };
   const diagram = workflowDiagram(hostile);
-  assert.match(diagram, /#quot;quoted#quot;/);
-  assert.doesNotMatch(diagram, /\[name\]/);
+  assert.match(diagram, /A 'quoted' \[name\] ·/);
   assert.doesNotMatch(diagram, /a<b>/);
-  assert.match(diagram, /op#40;1#41;/);
+  assert.match(diagram, /op\(1\)/);
+  // htmlLabels: false 엔진은 엔티티를 풀지 않고 글자 그대로 찍는다.
+  assert.doesNotMatch(diagram, /#\d+;|#quot;/);
 });
 
 test("many inputs collapse instead of running off the screen", () => {

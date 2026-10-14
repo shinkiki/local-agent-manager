@@ -1,0 +1,12 @@
+{
+  "itemId": "C-d11932ad31dd",
+  "kind": "commit",
+  "ref": "d11932ad31dd5d6220b6dbbade0a9a0a229ec108",
+  "reviewedAt": "2026-10-05T18:11:06Z",
+  "lane": "L06",
+  "source": "claude",
+  "verdict": "신규 결함 0건 / 기존 open 결함 1건 재발",
+  "note": "정확성: 이 커밋이 고쳐 적은 문장('2회차에 없던 project_instructions·system_workflows 가 새로 나왔다')을 2회차 표로 실측 검증했다. 2회차가 적은 여섯 모듈은 accounts·store·usage_budget_policy·project_git·scheduler·backend_service_settings 이고, 3회차 표의 네 모듈 중 그 목록에 없는 것이 정확히 project_instructions·system_workflows 둘이다. 같은 문단의 '진단 다섯 중 셋'도 3회차 표에서 project_instructions 2건 + backend_service_settings 1건 = 3/5 로 맞는다. 고치기 전 문장('모듈은 2회차와 겹치지 않는다')은 backend_service_settings 가 양쪽에 있어 거짓이었으므로 수정 방향이 옳다. 계약: 이 커밋이 더한 findings/F-docs-flaky-tests-readme-md-2026-10-06-3-640e3a1c 의 id 를 findingId({file,symbol,symptom}) 로 재계산해 파일 이름과 일치하는 것을 확인했다(손으로 지은 id 가 아니다). reviewed 본문의 itemId 도 파일 이름과 같다. 보안 불변식: docs/ 만 건드려 G1~G11 과 C 예외 어디에도 닿지 않는다. 검증 없음: 문서 문장 교정이라 재현 시험을 둘 자리가 없고, 장부 JSON 은 러너가 읽어 큐 집계가 그대로 선다. 단순화·중복: 새 중복 서술은 없다. 유일하게 걸리는 것은 reviewed/C-d9bd0b63a4da.json 의 commits 와 새 결함의 fixCommits 가 state:\"fixed\" 인데도 빈 배열인 점인데, 이것은 이미 열려 있는 F-docs-code-review-readme-md-commits-6f902967 과 같은 자리라 새 결함을 만들지 않고 그 파일에 관측만 덧붙였다.",
+  "findings": ["F-docs-code-review-readme-md-commits-6f902967"],
+  "commits": []
+}

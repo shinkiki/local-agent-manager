@@ -328,7 +328,36 @@ fn inspect_copy_action(dir: &Path, expected_digest: &str, expected_bundle: &str)
 fn ensure_one(dir: &Path, skill: &SystemSkill) -> Result<SystemSkillOutcome, CoreError> {
     let expected = digest(skill.skill_md);
     let bundle = bundle_digest(skill);
+    // 사용자가 스킬 폴더나 그 안의 파일을 링크로 바꿔 두었으면 손대지 않는다. `fs::write`는
+    // 링크를 따라가므로 갱신이 링크 대상(다른 저장소·공급자 소유 파일)을 덮어쓴다(C3-8, G10).
+    if links_in_skill_copy(dir, skill) {
+        return Ok(SystemSkillOutcome::UserModified);
+    }
     inspect_copy_action(dir, &expected, &bundle).apply(dir, skill, &expected)
+}
+
+/// 설치·갱신이 쓸 자리(폴더, 본문, 참고 파일과 그 상위 폴더, 소유·번들 표시) 가운데 링크가
+/// 하나라도 있는지 본다. 없는 자리는 링크가 아니다.
+fn links_in_skill_copy(dir: &Path, skill: &SystemSkill) -> bool {
+    let is_link = |path: &Path| {
+        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    };
+    let mut targets = vec![
+        dir.to_path_buf(),
+        dir.join("SKILL.md"),
+        dir.join(OWNERSHIP_FILE),
+        dir.join(BUNDLE_FILE),
+    ];
+    for extra in skill.extras {
+        let mut path = dir.join(extra.path);
+        while path != dir {
+            targets.push(path.clone());
+            if !path.pop() {
+                break;
+            }
+        }
+    }
+    targets.iter().any(|path| is_link(path))
 }
 
 fn write_skill(dir: &Path, skill: &SystemSkill, expected: &str) -> Result<(), CoreError> {
@@ -560,6 +589,60 @@ mod tests {
         ] {
             assert!(body.contains(operation), "{operation} 안내가 없습니다");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_skill_copy_is_left_alone_and_link_target_is_not_written() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(&outside).expect("outside");
+        let foreign = outside.join("SKILL.md");
+        fs::write(&foreign, "링크 대상 본문").expect("write");
+
+        // 폴더 자체가 링크인 경우.
+        let linked_dir = temporary.path().join("linked");
+        std::os::unix::fs::symlink(&outside, &linked_dir).expect("symlink dir");
+        assert_eq!(
+            ensure_one(&linked_dir, skill()).expect("keep"),
+            SystemSkillOutcome::UserModified
+        );
+
+        // 폴더는 진짜이고 본문 파일만 링크인 경우. 소유 표시를 맞춰 두어 갱신 조건을 만든다.
+        let dir = temporary.path().join("session-context");
+        fs::create_dir_all(&dir).expect("dir");
+        std::os::unix::fs::symlink(&foreign, dir.join("SKILL.md")).expect("symlink file");
+        fs::write(dir.join(OWNERSHIP_FILE), digest("링크 대상 본문")).expect("write");
+        assert_eq!(
+            ensure_one(&dir, skill()).expect("keep"),
+            SystemSkillOutcome::UserModified
+        );
+
+        assert_eq!(
+            fs::read_to_string(&foreign).expect("read"),
+            "링크 대상 본문"
+        );
+        assert!(!outside.join(OWNERSHIP_FILE).exists());
+
+        // 참고 파일의 상위 폴더가 링크인 경우. 갱신 조건을 맞춰도 링크 대상에 쓰지 않는다.
+        let intake = SYSTEM_SKILLS
+            .iter()
+            .find(|skill| skill.key == "round-intake")
+            .expect("round-intake");
+        let dir = temporary.path().join("round-intake");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("SKILL.md"), "옛 본문").expect("write");
+        fs::write(dir.join(OWNERSHIP_FILE), digest("옛 본문")).expect("write");
+        std::os::unix::fs::symlink(&outside, dir.join("references")).expect("symlink extras");
+        assert_eq!(
+            ensure_one(&dir, intake).expect("keep"),
+            SystemSkillOutcome::UserModified
+        );
+        assert!(!outside.join("questions.md").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("SKILL.md")).expect("read"),
+            "옛 본문"
+        );
     }
 
     /// 문진 스킬은 질문표와 용량 해석을 `references/`에 두고 본문이 그 경로를 가리킨다.

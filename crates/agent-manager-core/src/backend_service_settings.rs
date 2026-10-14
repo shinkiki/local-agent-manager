@@ -9,17 +9,16 @@ use crate::app_data_file::write_private_json;
 use crate::store_lock;
 use crate::CoreError;
 
-const SETTINGS_SCHEMA_VERSION: u32 = 3;
+const SETTINGS_SCHEMA_VERSION: u32 = 4;
+/// `remoteWrite`를 들고 있던 스키마. C20 로그인 설정이 그 자리를 대신하므로 값은 읽지
+/// 않고 버린다 — 원격의 권한은 더 이상 스위치가 아니라 인증이 정한다(G11).
+const REMOTE_WRITE_SETTINGS_SCHEMA_VERSION: u32 = 3;
 const IDENTITY_SETTINGS_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SETTINGS_SCHEMA_VERSION: u32 = 1;
 const SETTINGS_FILE_NAME: &str = "backend-service-settings.json";
 const SETTINGS_LOCK_FILE_NAME: &str = "backend-service-settings-v1.lock";
 
 pub const DEFAULT_BACKEND_SERVICE_PORT: u16 = 54_178;
-/// 원격 UI에 데스크톱과 같은 변경 권한을 주는 것이 기본값이다. 원격 경로 자체가
-/// Tailscale 서비스를 켜야만 열리는 명시적 선택이고, 이 설정이 생기기 전의 데스크톱
-/// 동작도 그러했다. 좁히려면 설정 → 백엔드 서비스에서 끈다.
-pub const DEFAULT_BACKEND_REMOTE_WRITE: bool = true;
 pub const MIN_BACKEND_SERVICE_PORT: u16 = 1024;
 pub const MAX_BACKEND_SERVICE_PORT: u16 = u16::MAX;
 
@@ -31,9 +30,6 @@ pub struct BackendServiceSettings {
     /// Clients compare this with `/api/access` before issuing domain requests so
     /// an unrelated backend on the same loopback port cannot be reused.
     pub store_id: String,
-    /// 원격(Tailscale) UI에 데스크톱과 같은 변경 권한을 줄지. G11의 원격 write
-    /// 모드를 켜고 끄는 단일 설정 지점이며, 실행 중인 백엔드에도 즉시 반영된다.
-    pub remote_write: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,7 +38,6 @@ struct StoredBackendServiceSettings {
     schema_version: u32,
     port: u16,
     store_id: String,
-    remote_write: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,8 +46,16 @@ struct SettingsEnvelope {
     schema_version: u32,
 }
 
-/// 원격 write 설정이 들어오기 전 스키마. 그때의 데스크톱은 Tailscale을 켜면 항상
-/// 원격 write였으므로, 이관은 [`DEFAULT_BACKEND_REMOTE_WRITE`]로 그 동작을 유지한다.
+/// v3 저장본. `remoteWrite` 필드가 있지만 읽지 않는다 — serde가 모르는 필드를 버린다.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteWriteStoredBackendServiceSettings {
+    schema_version: u32,
+    port: u16,
+    store_id: String,
+}
+
+/// 원격 write 설정이 들어오기 전 스키마(v2). 식별자와 포트만 있다.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IdentityStoredBackendServiceSettings {
@@ -89,17 +92,6 @@ pub fn save_backend_service_settings(
     validate_port(port)?;
     mutate_backend_service_settings(app_data_dir, |settings| {
         settings.port = port;
-    })
-}
-
-/// 원격 UI에 변경 권한을 줄지 저장한다. 화면 토글과 헤드리스 기동 인자가 함께
-/// 쓰는 유일한 저장 지점이다.
-pub fn save_backend_service_remote_write(
-    app_data_dir: impl AsRef<Path>,
-    remote_write: bool,
-) -> Result<BackendServiceSettings, CoreError> {
-    mutate_backend_service_settings(app_data_dir, |settings| {
-        settings.remote_write = remote_write;
     })
 }
 
@@ -157,7 +149,20 @@ impl StoredSettings for StoredBackendServiceSettings {
     }
 
     fn into_settings(self) -> Result<BackendServiceSettings, CoreError> {
-        validated_settings(self.port, &self.store_id, self.remote_write)
+        validated_settings(self.port, &self.store_id)
+    }
+}
+
+impl StoredSettings for RemoteWriteStoredBackendServiceSettings {
+    const SCHEMA_VERSION: u32 = REMOTE_WRITE_SETTINGS_SCHEMA_VERSION;
+    const NEEDS_SAVE: bool = true;
+
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    fn into_settings(self) -> Result<BackendServiceSettings, CoreError> {
+        validated_settings(self.port, &self.store_id)
     }
 }
 
@@ -170,7 +175,7 @@ impl StoredSettings for IdentityStoredBackendServiceSettings {
     }
 
     fn into_settings(self) -> Result<BackendServiceSettings, CoreError> {
-        validated_settings(self.port, &self.store_id, DEFAULT_BACKEND_REMOTE_WRITE)
+        validated_settings(self.port, &self.store_id)
     }
 }
 
@@ -196,16 +201,11 @@ fn decode_settings<T: StoredSettings>(
     Ok((stored.into_settings()?, T::NEEDS_SAVE))
 }
 
-fn validated_settings(
-    port: u16,
-    store_id: &str,
-    remote_write: bool,
-) -> Result<BackendServiceSettings, CoreError> {
+fn validated_settings(port: u16, store_id: &str) -> Result<BackendServiceSettings, CoreError> {
     validate_port(port)?;
     Ok(BackendServiceSettings {
         port,
         store_id: validate_store_id(store_id)?,
-        remote_write,
     })
 }
 
@@ -215,6 +215,9 @@ fn parse_stored_settings(bytes: &[u8]) -> Result<(BackendServiceSettings, bool),
     let envelope: SettingsEnvelope = serde_json::from_slice(bytes)?;
     match envelope.schema_version {
         SETTINGS_SCHEMA_VERSION => decode_settings::<StoredBackendServiceSettings>(bytes),
+        REMOTE_WRITE_SETTINGS_SCHEMA_VERSION => {
+            decode_settings::<RemoteWriteStoredBackendServiceSettings>(bytes)
+        }
         IDENTITY_SETTINGS_SCHEMA_VERSION => {
             decode_settings::<IdentityStoredBackendServiceSettings>(bytes)
         }
@@ -229,12 +232,11 @@ fn parse_stored_settings(bytes: &[u8]) -> Result<(BackendServiceSettings, bool),
 
 fn load_settings_unlocked(app_data_dir: &Path) -> Result<BackendServiceSettings, CoreError> {
     let path = app_data_dir.join(SETTINGS_FILE_NAME);
-    if !path.exists() {
+    let Some(bytes) = read_settings_bytes(&path)? else {
         let settings = new_settings(DEFAULT_BACKEND_SERVICE_PORT);
         save_settings_unlocked(app_data_dir, &settings)?;
         return Ok(settings);
-    }
-    let bytes = fs::read(path)?;
+    };
     let (settings, needs_save) = parse_stored_settings(&bytes)?;
     if needs_save {
         save_settings_unlocked(app_data_dir, &settings)?;
@@ -242,11 +244,39 @@ fn load_settings_unlocked(app_data_dir: &Path) -> Result<BackendServiceSettings,
     Ok(settings)
 }
 
+/// 설정 파일을 읽는다. 없으면 `None`.
+///
+/// G10: 마지막 경로 성분이 심볼릭 링크면 따라가지 않고 거절한다. 링크를 따라가면 앱 데이터
+/// 밖 JSON의 `storeId`를 이 저장소의 식별자로 받아들여, 클라이언트가 `/api/access`로
+/// 확인하는 저장소 동일성이 남의 파일에 묶인다. 판정과 열기 사이의 틈은 유닉스에서
+/// `O_NOFOLLOW`로 닫는다.
+fn read_settings_bytes(path: &Path) -> Result<Option<Vec<u8>>, CoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(CoreError::InvalidInput(
+                "백엔드 서비스 설정 파일 자리에 심볼릭 링크가 있어 읽지 않습니다".to_owned(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut options.open(path)?, &mut bytes)?;
+    Ok(Some(bytes))
+}
+
 fn new_settings(port: u16) -> BackendServiceSettings {
     BackendServiceSettings {
         port,
         store_id: Uuid::new_v4().to_string(),
-        remote_write: DEFAULT_BACKEND_REMOTE_WRITE,
     }
 }
 
@@ -267,7 +297,6 @@ impl From<&BackendServiceSettings> for StoredBackendServiceSettings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             port: settings.port,
             store_id: settings.store_id.clone(),
-            remote_write: settings.remote_write,
         }
     }
 }
@@ -321,38 +350,37 @@ mod tests {
         assert_eq!(value["schemaVersion"], SETTINGS_SCHEMA_VERSION);
         assert_eq!(value["port"], 5188);
         assert_eq!(value["storeId"], saved.store_id);
-        assert_eq!(value["remoteWrite"], DEFAULT_BACKEND_REMOTE_WRITE);
+        assert!(value.get("remoteWrite").is_none());
     }
 
+    /// v3 저장본의 `remoteWrite`는 값과 상관없이 버린다. 원격 권한은 이제 C20 로그인
+    /// 설정이 정하므로, `false`로 운영하던 사용자도 이관 뒤 그 설정을 켜는 쪽으로 안내된다.
     #[test]
-    fn remote_write_is_stored_beside_the_port_and_keeps_the_identity() {
+    fn schema_v3_drops_remote_write_and_migrates_to_v4() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let initial = load_backend_service_settings(directory.path()).expect("initial settings");
-        assert_eq!(initial.remote_write, DEFAULT_BACKEND_REMOTE_WRITE);
+        let store_id = "7cb5018a-4a90-438a-a2c4-d1fd5c660cec";
+        fs::write(
+            directory.path().join(SETTINGS_FILE_NAME),
+            format!(
+                r#"{{"schemaVersion":3,"port":5217,"storeId":"{store_id}","remoteWrite":false}}"#
+            ),
+        )
+        .expect("v3 settings");
 
-        let disabled = save_backend_service_remote_write(directory.path(), false)
-            .expect("disable remote write");
+        let migrated = load_backend_service_settings(directory.path()).expect("migrated settings");
 
-        assert!(!disabled.remote_write);
-        assert_eq!(disabled.store_id, initial.store_id);
-        assert_eq!(disabled.port, initial.port);
-        // 포트 저장은 원격 write 설정을 건드리지 않는다.
-        assert!(
-            !save_backend_service_settings(directory.path(), 5188)
-                .expect("save port")
-                .remote_write
-        );
-        assert!(
-            save_backend_service_remote_write(directory.path(), true)
-                .expect("enable remote write")
-                .remote_write
-        );
+        assert_eq!(migrated.port, 5217);
+        assert_eq!(migrated.store_id, store_id);
+        let value: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.path().join(SETTINGS_FILE_NAME)).expect("migrated file"),
+        )
+        .expect("migrated JSON");
+        assert_eq!(value["schemaVersion"], SETTINGS_SCHEMA_VERSION);
+        assert!(value.get("remoteWrite").is_none());
     }
 
-    /// 원격 write 설정이 없던 저장본은 그때의 동작(Tailscale을 켜면 원격도 변경 가능)을
-    /// 그대로 유지한 채 이관돼야 한다. 갱신 뒤 폰에서 갑자기 읽기 전용이 되면 안 된다.
     #[test]
-    fn schema_v2_is_migrated_with_remote_write_left_on() {
+    fn schema_v2_is_migrated_keeping_port_and_identity() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store_id = "7cb5018a-4a90-438a-a2c4-d1fd5c660cec";
         fs::write(
@@ -365,13 +393,11 @@ mod tests {
 
         assert_eq!(migrated.port, 5217);
         assert_eq!(migrated.store_id, store_id);
-        assert!(migrated.remote_write);
         let value: serde_json::Value = serde_json::from_slice(
             &fs::read(directory.path().join(SETTINGS_FILE_NAME)).expect("migrated file"),
         )
         .expect("migrated JSON");
         assert_eq!(value["schemaVersion"], SETTINGS_SCHEMA_VERSION);
-        assert_eq!(value["remoteWrite"], true);
     }
 
     #[test]
@@ -431,7 +457,7 @@ mod tests {
         fs::write(
             directory.path().join(SETTINGS_FILE_NAME),
             format!(
-                "{{\"schemaVersion\":{SETTINGS_SCHEMA_VERSION},\"port\":{},\"storeId\":\"{}\",\"remoteWrite\":true}}",
+                "{{\"schemaVersion\":{SETTINGS_SCHEMA_VERSION},\"port\":{},\"storeId\":\"{}\"}}",
                 MIN_BACKEND_SERVICE_PORT - 1,
                 Uuid::new_v4()
             ),
@@ -448,7 +474,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         fs::write(
             directory.path().join(SETTINGS_FILE_NAME),
-            r#"{"schemaVersion":4,"port":4178,"storeId":"7cb5018a-4a90-438a-a2c4-d1fd5c660cec"}"#,
+            r#"{"schemaVersion":5,"port":4178,"storeId":"7cb5018a-4a90-438a-a2c4-d1fd5c660cec"}"#,
         )
         .expect("future settings");
 
@@ -462,9 +488,8 @@ mod tests {
     fn corrupt_or_invalid_identity_settings_fail_without_being_overwritten() {
         for contents in [
             b"not JSON".as_slice(),
-            br#"{"schemaVersion":3,"port":4178,"storeId":"not-a-uuid","remoteWrite":true}"#
-                .as_slice(),
-            br#"{"schemaVersion":3,"port":4178,"storeId":"7CB5018A-4A90-438A-A2C4-D1FD5C660CEC","remoteWrite":true}"#
+            br#"{"schemaVersion":4,"port":4178,"storeId":"not-a-uuid"}"#.as_slice(),
+            br#"{"schemaVersion":4,"port":4178,"storeId":"7CB5018A-4A90-438A-A2C4-D1FD5C660CEC"}"#
                 .as_slice(),
         ] {
             let directory = tempfile::tempdir().expect("temporary directory");
@@ -489,6 +514,36 @@ mod tests {
                 .port,
             5188
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_file_symlink_is_refused_not_followed_g10() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let foreign = outside.path().join("foreign.json");
+        fs::write(
+            &foreign,
+            br#"{"schemaVersion":4,"port":5188,"storeId":"00000000-0000-4000-8000-000000000000"}"#,
+        )
+        .expect("foreign settings");
+        let link = directory.path().join(SETTINGS_FILE_NAME);
+        std::os::unix::fs::symlink(&foreign, &link).expect("settings symlink");
+        let before = fs::read(&foreign).expect("foreign bytes");
+        assert!(matches!(
+            load_backend_service_settings(directory.path()),
+            Err(CoreError::InvalidInput(_))
+        ));
+        assert_eq!(fs::read(&foreign).expect("foreign bytes"), before);
+
+        fs::remove_file(&link).expect("remove link");
+        std::os::unix::fs::symlink(outside.path().join("missing.json"), &link)
+            .expect("dangling symlink");
+        assert!(matches!(
+            load_backend_service_settings(directory.path()),
+            Err(CoreError::InvalidInput(_))
+        ));
+        assert!(!outside.path().join("missing.json").exists());
     }
 
     #[cfg(unix)]

@@ -7,13 +7,31 @@ function isAiaAttention(item: ChatAttentionItem): boolean {
   return item.profile === "aia";
 }
 
+/**
+ * AIA 창이 가져갈 알림인지 — 프로필이 AIA이고 **이 창이 소유한 대화**의 것인지.
+ *
+ * 프로필만으로는 가를 수 없다. 세션 화면에서 AIA 작업공간 세션을 재개하면 백엔드가 프로필을
+ * Aia 로 되살리는데(`chat.rs::effective_chat_profile`), 프로필만 보고 고르면 그 대화가
+ * AIA 창으로 끌려 들어간다 — 사용자가 세션 화면에서 이어 보려고 재개한 대화를 팝업이
+ * 빼앗는 꼴이다. ↻ 로 떼어 내고 계속 돌게 둔 대화도 같다. 소유하지 않은 AIA 알림은 일반
+ * 알림 목록에 그대로 남아 세션 화면으로 열린다(`appChatAttention`의 `openAttentionItem`).
+ */
+function isOwnAiaAttention(item: ChatAttentionItem, ownedChatId: string | null): boolean {
+  return isAiaAttention(item) && ownedChatId !== null && item.chatId === ownedChatId;
+}
+
 /** 대화 턴이 완료되었거나 실패하여 종료된 상태인지 여부. */
 function isTerminalAttention(item: ChatAttentionItem): boolean {
   return item.kind === "completed" || item.kind === "failed";
 }
 
-export function withoutAiaAttention(snapshot: ChatAttentionSnapshot): ChatAttentionSnapshot {
-  return recountAttention(snapshot.items.filter((item) => !isAiaAttention(item)));
+/**
+ * 일반 알림 목록에서 AIA 창이 맡은 알림만 뺀다. 소유하지 않은 AIA 프로필 알림(세션 화면에서
+ * 재개한 세션, ↻ 로 떼어 두고 계속 도는 대화)은 남긴다 — 트리거가 가져가지 않는 알림까지
+ * 여기서 빼면 그 대화의 턴이 끝난 것을 어디에서도 알 수 없다.
+ */
+export function withoutAiaAttention(snapshot: ChatAttentionSnapshot, ownedChatId: string | null): ChatAttentionSnapshot {
+  return recountAttention(snapshot.items.filter((item) => !isOwnAiaAttention(item, ownedChatId)));
 }
 
 /**
@@ -29,10 +47,10 @@ export function aiaAttentionForChat(items: ChatAttentionItem[], chatId: string):
   return items.filter((item) => isAiaAttention(item) && item.chatId === chatId);
 }
 
-export function selectAiaAttention(items: ChatAttentionItem[]): ChatAttentionItem | null {
+export function selectAiaAttention(items: ChatAttentionItem[], ownedChatId: string | null): ChatAttentionItem | null {
   let unreadTerminal: ChatAttentionItem | null = null;
   for (const item of items) {
-    if (!isAiaAttention(item)) continue;
+    if (!isOwnAiaAttention(item, ownedChatId)) continue;
     if (item.kind === "approval") return item;
     if (unreadTerminal === null && !item.read && isTerminalAttention(item)) {
       unreadTerminal = item;

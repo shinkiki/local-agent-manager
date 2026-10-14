@@ -14,10 +14,15 @@ export interface GitDiffTarget {
   originalPath: string | null;
   staged: boolean;
   commit: string | null;
+  /** B9. 비교 요약에서 연 파일은 커밋 하나가 아니라 `<from>...<to>` 범위다. */
+  rangeFrom?: string | null;
+  rangeTo?: string | null;
 }
 
 /** 대상이 무엇과 무엇을 견주는지 한 줄. 모달 제목과 새 창 제목이 같은 말을 쓴다. */
 export function gitDiffTargetLabel(target: GitDiffTarget, text: UiText): string {
+  // 범위를 커밋 제목으로 적으면 어느 범위를 보고 있는지 사라진다 — 요약이 집은 범위를 그대로 쓴다.
+  if (target.rangeFrom && target.rangeTo) return `${target.rangeFrom}...${target.rangeTo}`;
   if (target.commit) return `${text("커밋", "Commit")} ${target.commit.slice(0, 7)}`;
   return target.staged ? text("스테이지됨", "Staged") : text("작업 트리", "Working tree");
 }

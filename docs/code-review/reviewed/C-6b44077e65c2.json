@@ -1,0 +1,18 @@
+{
+  "itemId": "C-6b44077e65c2",
+  "kind": "commit",
+  "ref": "6b44077e65c2040fcb18c1c88546664618162796",
+  "reviewedAt": "2026-10-05T20:40:00Z",
+  "lane": "L09",
+  "source": "claude",
+  "verdict": "결함 1건 / 수정 1건",
+  "axes": {
+    "정확성": "destinations 두 갈래 쓰기(--write-baseline + --out)는 옳다. logComparison 의 null 두 갈래를 한 문장으로 뭉친 것이 결함.",
+    "보안불변식": "자격증명·셸 문자열·경로 게이트에 닿지 않는다. path.resolve(ROOT, options.out) 은 회차 운영자가 주는 값이고 G1~G11 범위 밖.",
+    "계약": "글 만들기가 러너 안에 있어 '판정 규칙은 flakyTestReport.ts 에' 라는 파일 머리말 계약과 어긋났다 — 수정에서 되돌렸다.",
+    "검증없음": "바뀐 두 자리(비교 축 출력·두 갈래 쓰기) 어디에도 시험이 없었다. 출력 쪽은 comparisonLines 시험 2건으로 덮었다. 두 갈래 쓰기는 cargo 를 돌려야 해 덮지 못했다.",
+    "단순화중복": "compareFailureKinds 를 다시 만들지 않고 그대로 쓴다. 중복 없음."
+  },
+  "findings": ["F-scripts-flaky-isolate-mjs-logcomparison-dcb1839e"],
+  "commits": ["fb82dc4c"]
+}

@@ -344,12 +344,7 @@ fn ensure_ssh_root(home: &Path) -> Result<PathBuf, CoreError> {
         return Ok(root);
     }
 
-    fs::create_dir(&requested)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&requested, fs::Permissions::from_mode(0o700))?;
-    }
+    create_owner_only_dir(&requested)?;
     existing_ssh_root(&home, &requested)?.ok_or_else(|| {
         CoreError::Runtime("SSH 키 폴더를 만든 뒤 다시 확인하지 못했습니다".to_owned())
     })
@@ -730,6 +725,26 @@ fn display_algorithm(value: &str) -> String {
     }
 }
 
+/// 새 폴더를 처음부터 0700으로 만든다(C9-3). `create_dir` 뒤에 권한을 바꾸면 그
+/// 사이 폴더가 umask 기본값(대개 0755)으로 열려 있어, staging·휴지통처럼 개인키가
+/// 지나가는 폴더를 다른 사용자가 그 틈에 열어 둘 수 있다. umask 가 소유자 비트를
+/// 지울 수도 있으니 만든 뒤 0700을 한 번 더 맞추고, 그것이 실패하면 만든 폴더를
+/// 지운다.
+fn create_owner_only_dir(path: &Path) -> Result<(), CoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new().mode(0o700).create(path)?;
+        if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
+            let _ = fs::remove_dir(path);
+            return Err(error.into());
+        }
+    }
+    #[cfg(not(unix))]
+    fs::create_dir(path)?;
+    Ok(())
+}
+
 /// 지정한 상위 폴더 아래에 0700 권한의 격리 하위 폴더를 만들고, 정규화한 경로가
 /// 상위 폴더 바로 아래인지 확인해 돌려준다. 중간에 실패하거나 경계를 벗어나면
 /// 만들던 폴더를 지우고 나간다(C9-4·C9-7).
@@ -739,15 +754,7 @@ fn create_secure_subdir(
     boundary_error_message: &str,
 ) -> Result<PathBuf, CoreError> {
     let requested = parent.join(name);
-    fs::create_dir(&requested)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(error) = fs::set_permissions(&requested, fs::Permissions::from_mode(0o700)) {
-            let _ = fs::remove_dir(&requested);
-            return Err(error.into());
-        }
-    }
+    create_owner_only_dir(&requested)?;
     let subdir = match canonical_plain_path(&requested) {
         Ok(path) => path,
         Err(error) => {
@@ -1122,12 +1129,7 @@ fn ensure_trash_root(root: &Path) -> Result<PathBuf, CoreError> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(&requested)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&requested, fs::Permissions::from_mode(0o700))?;
-            }
+            create_owner_only_dir(&requested)?;
         }
         Err(error) => return Err(error.into()),
     }
@@ -1419,6 +1421,23 @@ fn cleanup_stage(private: &Path, public: &Path, directory: &Path) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_dir_is_0700_and_never_reuses_an_existing_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("root");
+        let dir = root.path().join("stage");
+        create_owner_only_dir(&dir).expect("create");
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(create_owner_only_dir(&dir).is_err());
+        assert!(create_owner_only_dir(&root.path().join("missing/child")).is_err());
+        assert!(!root.path().join("missing").exists());
+    }
 
     fn public_key_line(key_type: &str, comment: &str) -> String {
         let mut blob = Vec::new();

@@ -7,7 +7,10 @@ import {
   cliUpdateAlert,
   cliUpdateBlockedReason,
   hasCliUpdateAlert,
+  CLI_HEADLESS_IMAGE_HINT,
+  isHeadlessImageUpdateBlock,
   modelCacheBlockedReason,
+  shouldShowManualUpdateHint,
   runtimeStopConfirmationCount,
   shouldShowCliUpdatePanel,
 } from "./cliUpdate.ts";
@@ -17,8 +20,7 @@ import { cache, olderCache, status } from "./cliUpdateFixtures.mjs";
 // 판정)는 cliUpdateStatus.test.mjs가, 여러 공급자를 모아 알림과 구획을 정하는 규칙은
 // cliUpdateAlerts.test.mjs가 맡는다.
 
-const writable = { writable: true };
-const readOnly = { writable: false };
+const writable = {};
 
 test("최신 버전을 조회할 수 없는 설치도 업데이트 실행 자체는 제공한다", () => {
   const selfUpdate = status({
@@ -34,16 +36,13 @@ test("최신 버전을 조회할 수 없는 설치도 업데이트 실행 자체
   assert.equal(canCheckCliUpdate(selfUpdate, writable), false);
 });
 
-test("업데이트 버튼은 호스트·원격 구분 없이 write 권한으로 활성화된다", () => {
+test("업데이트 버튼은 호스트·원격 구분 없이 활성화된다(C20: 로그인 뒤 모든 채널이 같다)", () => {
   const updatable = status({ checked: true, latestVersion: "0.147.0", updateAvailable: true });
   assert.equal(canRunCliUpdate(updatable, writable), true);
   assert.equal(canCheckCliUpdate(updatable, writable), true);
   assert.equal(cliUpdateBlockedReason(updatable, writable), null);
 
-  // read 전용과 다른 작업 진행 중에는 여전히 막는다.
-  assert.equal(canRunCliUpdate(updatable, readOnly), false);
-  assert.match(cliUpdateBlockedReason(updatable, readOnly), /원격 변경이 비활성화/);
-  assert.equal(canCheckCliUpdate(updatable, readOnly), false);
+  // 다른 작업 진행 중에는 여전히 막는다.
   assert.equal(canRunCliUpdate(updatable, { ...writable, busy: true }), false);
 });
 
@@ -60,13 +59,42 @@ test("탐지되지 않았거나 자동 업데이트 미지원이면 사유를 �
   );
 });
 
+test("헤드리스에서는 업데이트가 막히고 이미지 재빌드를 사유로 안내한다", () => {
+  const headless = { headless: true };
+  const updatable = status({ checked: true, latestVersion: "0.147.0", updateAvailable: true });
+  assert.equal(canRunCliUpdate(updatable, headless), false);
+  assert.equal(cliUpdateBlockedReason(updatable, headless), CLI_HEADLESS_IMAGE_HINT);
+  assert.equal(isHeadlessImageUpdateBlock(updatable, headless), true);
+  assert.match(CLI_HEADLESS_IMAGE_HINT, /이미지를 다시 빌드/);
+
+  // brew·npm 미지원 사유가 있어도 헤드리스 사유가 앞선다. 재빌드와 수동 명령을 동시에
+  // 말하면 어느 쪽이 갱신 경로인지 흐려진다.
+  const unsupported = status({ updateSupported: false, unsupportedReason: "brew 실행 파일을 찾지 못했습니다" });
+  assert.equal(cliUpdateBlockedReason(unsupported, headless), CLI_HEADLESS_IMAGE_HINT);
+
+  // 수동 업데이트 안내도 같은 이유로 헤드리스에서만 사라진다.
+  const withHint = status({ manualUpdateHint: "brew upgrade --cask codex" });
+  assert.equal(shouldShowManualUpdateHint(withHint, headless), false);
+  assert.equal(shouldShowManualUpdateHint(withHint, writable), true);
+  assert.equal(shouldShowManualUpdateHint(status({ manualUpdateHint: null }), writable), false);
+
+  // 탐지되지 않은 CLI는 그대로 미탐지로 알린다 — 재빌드해도 설치되지 않은 CLI는 없다.
+  assert.match(cliUpdateBlockedReason(status({ executablePath: null }), headless), /탐지되지 않았습니다/);
+  assert.equal(isHeadlessImageUpdateBlock(status({ executablePath: null }), headless), false);
+
+  // 최신 버전 확인과 캐시 정리는 헤드리스에서도 그대로 동작한다(읽기와 앱 데이터 정리다).
+  assert.equal(canCheckCliUpdate(updatable, headless), true);
+  assert.equal(canClearModelCaches(status({ modelCaches: [cache()] }), headless), true);
+
+  // 호스트(헤드리스 아님)에서는 아무것도 달라지지 않는다.
+  assert.equal(canRunCliUpdate(updatable, { writable: true, headless: false }), true);
+  assert.equal(isHeadlessImageUpdateBlock(updatable, { writable: true, headless: false }), false);
+});
+
 test("캐시 정리는 불일치가 있을 때만 열리고, 캐시가 없는 공급자는 미지원으로 표시한다", () => {
   const mismatched = status({ modelCaches: [cache()] });
   assert.equal(canClearModelCaches(mismatched, writable), true);
   assert.equal(modelCacheBlockedReason(mismatched, writable), null);
-  // 캐시 정리도 원격 write 권한으로 실행하고, read 전용에서만 막는다.
-  assert.equal(canClearModelCaches(mismatched, readOnly), false);
-  assert.match(modelCacheBlockedReason(mismatched, readOnly), /원격 변경이 비활성화/);
   assert.equal(canClearModelCaches(mismatched, { ...writable, busy: true }), false);
 
   const matched = status({
@@ -74,9 +102,6 @@ test("캐시 정리는 불일치가 있을 때만 열리고, 캐시가 없는 �
   });
   assert.equal(canClearModelCaches(matched, writable), false);
   assert.equal(modelCacheBlockedReason(matched, writable), null);
-  // 지울 것이 없으면 원격 read 전용이어도 막힌 것이 아니다 — 권한보다 먼저 걸러야
-  // 할 일 없는 버튼에 \"원격 변경이 비활성화\" 경고가 붙지 않는다.
-  assert.equal(modelCacheBlockedReason(matched, readOnly), null);
 
   const noCache = status({
     provider: "claude",

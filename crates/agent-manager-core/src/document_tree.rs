@@ -298,6 +298,11 @@ pub fn save_doc(
     let (root, path) = resolve_root_entry(app_data_dir, root_id, relative_path, false)?;
     validate_markdown_file(&path)?;
     prepare_doc_parent(&root, &path)?;
+    // 부모만 견주면 루트 안의 `.md` 링크가 루트 밖 파일(공급자 설정 등)을 가리킬 때
+    // `fs::write`가 그 링크를 따라가 덮어쓴다(G2·G10). 목록이 링크를 숨기듯 저장도 거절한다.
+    if fs::symlink_metadata(&path).is_ok_and(|metadata| !metadata.file_type().is_file()) {
+        return Err(path_outside_root());
+    }
     if let (Some(expected), Ok(current)) = (expected_modified_at, fs::metadata(&path)) {
         if modified_ms(&current) != expected {
             return Err(CoreError::Conflict(
@@ -736,6 +741,28 @@ pub(crate) fn modified_ms(metadata: &fs::Metadata) -> i64 {
 mod tests {
     use super::*;
     use crate::store::add_doc_root;
+
+    #[cfg(unix)]
+    #[test]
+    fn save_doc_refuses_symlinked_markdown_leaf() {
+        let temp = tempfile::tempdir().expect("temp");
+        let app_data = temp.path().join("app");
+        let docs = temp.path().join("docs");
+        let outside = temp.path().join("outside.md");
+        fs::create_dir_all(&app_data).unwrap();
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(&outside, "original").unwrap();
+        std::os::unix::fs::symlink(&outside, docs.join("link.md")).unwrap();
+        let root =
+            add_doc_root(&app_data, "docs", docs.to_string_lossy().as_ref(), false).expect("root");
+        let root_id = root.root.id;
+        assert!(save_doc(&app_data, &root_id, "link.md", "overwritten", None).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "original");
+        let dangling = temp.path().join("dangling.md");
+        std::os::unix::fs::symlink(&dangling, docs.join("dangling.md")).unwrap();
+        assert!(save_doc(&app_data, &root_id, "dangling.md", "created", None).is_err());
+        assert!(!dangling.exists());
+    }
 
     #[test]
     fn document_path_rejects_parent_traversal() {

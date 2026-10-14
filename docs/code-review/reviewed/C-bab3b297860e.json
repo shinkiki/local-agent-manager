@@ -1,0 +1,19 @@
+{
+  "itemId": "C-bab3b297860e",
+  "kind": "commit",
+  "ref": "bab3b297860e851c08cf225630dcd8514ac4b7e2",
+  "reviewedAt": "2026-10-06T04:25:00Z",
+  "lane": "L02",
+  "source": "claude",
+  "verdict": "결함 0건",
+  "axes": {
+    "정확성": "장부 파일 reviewed/C-6d3061609fd5.json 한 건과 queue.json 재생성뿐이다. 적힌 ref 6d3061609fd5fe4b4282a97f53ac39640d304e3d 가 실제 커밋이고 origin/dev-history 의 조상임을 확인했다(제목 '리뷰 장부에 C-6b44077e65c2 의 수정 커밋 해시를 적는다'). 그 안의 정확성 축이 주장하는 사슬도 되짚어 참이다 — 6d3061609fd5 가 적은 fixCommits 의 fb82dc4c 는 실제 커밋 fb82dc4c8690('기준선이 없을 때도 \"축이 없다\"고 찍던 비교 줄을 가른다')이고 dev-history 에 착지해 있으며, 결함 F-scripts-flaky-isolate-mjs-logcomparison-dcb1839e 의 fix 설명(comparisonLines 를 flakyTestReport.ts 로 옮김)과 같은 커밋이다. 틀린 해시였다면 장부에서 결함과 수정이 끊기는데 그 경우가 아니다. queue.json 의 reviewed 53 도 그 커밋 시점 reviewed/ 의 .json 53건(.gitkeep 제외)과 맞고, commit 224→225 는 줄지 않고 늘었지만 그 17분 사이 작업브랜치에 새 커밋이 착지한 결과이지 셈이 틀린 것이 아니다 — 러너가 매번 다시 생성하는 파생값이다.",
+    "보안불변식": "JSON 데이터 파일 두 개만 바뀐다. 자격증명·공급자 소유 저장소·셸 문자열·경로 정규화·쓰기 게이트 어디에도 닿지 않아 AGENTS.md 2절 G1~G11 과 3절 C 예외의 범위 밖이다.",
+    "계약": "docs/code-review/README.md 의 장부 모양과 맞는다 — 파일 이름과 본문 itemId 가 일치하고(어긋나면 러너가 둘 다 리뷰된 것으로 세어 영영 다시 집히지 않는다), kind·ref·reviewedAt·lane·source·verdict·findings·commits 가 다 있고, 결함 0건이라 findings 와 commits 가 빈 배열인 것도 규약대로다. queue.json 은 센 수만 담고 items 를 담지 않는다는 규약도 지켰다. 작업트리 현재 상태에서 reviewed/ 55건·findings/ 20건 전건을 다시 파싱해 파싱 실패 0건·이름과 본문 id 불일치 0건을 확인했다.",
+    "검증없음": "코드가 아니라 장부 데이터만 바뀌어 재현할 실패가 없다. fixCommits 를 읽는 코드가 저장소에 없는 것(src·scripts·crates 전역 검색 0건)도 다시 확인했다 — 사람이 읽는 추적 기록이다. 장부를 실제로 읽는 쪽인 러너의 순수 함수에 시험이 붙어 있어 그것을 돌렸고 회귀가 없다.",
+    "단순화중복": "새 함수·새 파일 없음. 같은 사실을 두 곳에 적은 자리도 없다 — queue.json 의 수는 reviewed/ 에서 파생되지만 러너가 다시 생성하는 파생값이라 중복이 아니다."
+  },
+  "verification": "node --experimental-strip-types --test --test-reporter=dot src/lib/codeReviewQueue.test.mjs → 13 pass / 0 fail",
+  "findings": [],
+  "commits": []
+}

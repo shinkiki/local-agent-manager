@@ -80,3 +80,6 @@ local-llm-dev/finetune/__pycache__/
 
 # Windows 설치본 보관 자리. 로컬 빌드 산출물이며 공개 트리에 싣지 않는다 — 배포는 GitHub Release 첨부로 한다.
 /installers/
+
+# 간헐 실패 격리 회차가 --out 으로 떨구는 회차별 측정본. 기준선(docs/flaky-tests/baseline.json)만 추적한다.
+docs/flaky-tests/runs/

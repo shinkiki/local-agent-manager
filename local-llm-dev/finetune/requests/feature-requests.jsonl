@@ -110,7 +110,7 @@
 {"operation": "update_session_folder", "requests": ["그 세션 폴더 이름 아카이브 로 바꿔줘", "세션 폴더 색을 바꾸고 상위 폴더도 최상위로 옮겨주세요", "이 세션 폴더 숨김으로 돌려서 전체 목록에는 안 보이게 해줄 수 있어?"]}
 {"operation": "reorder_session_folder", "requests": ["이 세션 폴더 한 칸 위로 올려줘", "세션 폴더 목록에서 그게 형제들 중에 너무 위에 있으니까 한 칸 아래로 순서를 내려주세요", "폴더 순서 바꿔서 위쪽으로 올릴 수 있어?"]}
 {"operation": "delete_session_folder", "requests": ["세션 목록에서 '2분기 정리' 폴더 없애줘.", "fld_9c2a1b에 묶어둔 폴더가 이제 안 쓰이는데, 그 밑에 만들어 둔 하위 폴더까지 한꺼번에 정리해 주세요. 안에 있던 대화는 그대로 남는다고 알고 있어요.", "이 폴더 아예 지우고 싶은데, 안에 있던 세션은 안 사라지는 거 맞죠? 맞으면 지워줘"]}
-{"operation": "create_directory", "requests": ["D:\\work\\reports 폴더 하나 만들어줘.", "F:\\Project\\alpha 밑에 docs/milestones 이런 식으로 두 칸 더 파 주세요. 지금 alpha까지만 있고 그 아래는 비어 있어요.", "C:\\Users\\refre\\Documents\\초안 경로가 아직 없던데 그 자리에 디렉터리 새로 만들어 줄 수 있어?"]}
+{"operation": "create_directory", "requests": ["D:\\work\\reports 폴더 하나 만들어줘.", "F:\\Project\\alpha 밑에 docs/milestones 이런 식으로 두 칸 더 파 주세요. 지금 alpha까지만 있고 그 아래는 비어 있어요.", "C:\\Users\\me\\Documents\\초안 경로가 아직 없던데 그 자리에 디렉터리 새로 만들어 줄 수 있어?"]}
 {"operation": "create_doc_root", "requests": ["D:\\work\\manuals 파일 화면에 등록해줘.", "회사 자료 모아둔 F:\\Project\\manuals 경로를 '업무 매뉴얼'이라는 이름으로 앱 파일 목록에 추가해 주세요.", "아직 안 만든 D:\\notes\\2026 경로인데, 없으면 만들어서 같이 등록해 줄 수 있나요?"]}
 {"operation": "delete_doc_root", "requests": ["'업무 매뉴얼' 등록 빼줘.", "파일 화면에 올려둔 폴더 중에 root_7f3a2c 이건 이제 안 봐요. 목록에서 내려 주세요. 실제 폴더는 그대로 두고요.", "여기 등록해 둔 이 폴더, 목록에서만 빼는 거 되나요? 그렇게 해줘"]}
 {"operation": "put_doc", "requests": ["등록 폴더 root_7f3a2c 안의 docs/README.md에 이 내용으로 저장해줘.", "방금 정리한 회의 내용을 '업무 매뉴얼' 폴더 아래 notes/2026-09-28.md 파일로 써 주세요. 없으면 새로 만들고요.", "이 텍스트를 파일 화면 폴더의 spec/api.md에 그대로 넣어줄래?"]}

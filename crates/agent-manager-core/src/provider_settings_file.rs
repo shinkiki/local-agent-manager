@@ -137,6 +137,10 @@ impl SettingsFileGuard {
             #[cfg(unix)]
             options.mode(existing_mode);
             let mut file = options.open(&temporary)?;
+            // `mode`는 umask에 깎이므로(0o664 → 0o644) 기존 권한을 그대로 물려주려면
+            // 열린 핸들에 다시 적는다(C8-3).
+            #[cfg(unix)]
+            file.set_permissions(fs::Permissions::from_mode(existing_mode))?;
             file.write_all(bytes)?;
             file.sync_all()?;
             drop(file);
@@ -196,4 +200,61 @@ pub(crate) fn redirected_dir(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    const RULES: SettingsPathRules = SettingsPathRules {
+        symlink: "링크",
+        wrong_kind: "종류",
+        directory: false,
+    };
+    const DIRECTORY_RULES: SettingsPathRules = SettingsPathRules {
+        directory: true,
+        ..RULES
+    };
+    const GUARD: SettingsFileGuard = SettingsFileGuard {
+        read: RULES,
+        write: RULES,
+        parent: DIRECTORY_RULES,
+        grandparent: DIRECTORY_RULES,
+        missing_parent: "상위 없음",
+        missing_grandparent: "그 위 없음",
+        fallback_file_name: "settings.json",
+    };
+
+    /// umask가 지우는 비트(그룹 쓰기)까지 기존 권한을 그대로 물려받아야 한다(C8-3).
+    /// umask가 000인 환경에서는 수정 전 코드도 통과한다 — 보통의 022·002에서 회귀를 잡는다.
+    #[test]
+    fn atomic_write_preserves_mode_bits_the_umask_would_strip_c8_3() {
+        let directory = tempfile::tempdir().expect("임시 디렉터리");
+        let target = directory.path().join("settings.json");
+        fs::write(&target, b"{}").expect("기존 파일");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o666)).expect("넓은 권한");
+
+        GUARD.atomic_write(&target, b"{\"a\":1}").expect("교체");
+
+        assert_eq!(fs::read(&target).expect("내용"), b"{\"a\":1}");
+        let mode = fs::metadata(&target)
+            .expect("메타데이터")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o666);
+    }
+
+    #[test]
+    fn atomic_write_creates_a_new_file_owner_only() {
+        let directory = tempfile::tempdir().expect("임시 디렉터리");
+        let target = directory.path().join("settings.json");
+        GUARD.atomic_write(&target, b"{}").expect("생성");
+        let mode = fs::metadata(&target)
+            .expect("메타데이터")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }

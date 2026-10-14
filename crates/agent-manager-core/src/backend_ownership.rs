@@ -87,11 +87,17 @@ fn acquire_lock(lock: &File) -> Result<(), CoreError> {
 fn open_lock_file(path: &Path) -> Result<File, CoreError> {
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true).truncate(false);
+    // G10: 잠금 파일 자리에 심볼릭 링크가 놓여 있으면 따라가지 않는다. 따라가면 링크가
+    // 가리키는 앱 데이터 밖 파일을 열고, 아래 권한 변경이 그 파일을 0600으로 바꾼다.
+    // 권한도 경로가 아니라 연 파일 서술자에 건다 — 열기와 변경 사이에 경로가 바뀌어도
+    // 연 파일 말고는 건드리지 않는다.
     #[cfg(unix)]
-    options.mode(0o600);
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     let file = options.open(path)?;
     #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
     Ok(file)
 }
 
@@ -169,5 +175,29 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_lock_file_is_refused_and_its_target_keeps_its_mode() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let target = outside.path().join("foreign");
+        fs::write(&target, b"foreign").expect("foreign file");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).expect("target mode");
+        std::os::unix::fs::symlink(&target, directory.path().join(BACKEND_OWNERSHIP_LOCK_FILE))
+            .expect("planted symlink");
+
+        assert!(matches!(
+            BackendOwnershipLease::acquire(directory.path()),
+            Err(CoreError::Io(ref error)) if error.raw_os_error() == Some(libc::ELOOP)
+        ));
+        assert_eq!(fs::read(&target).expect("target contents"), b"foreign");
+        let mode = fs::metadata(&target)
+            .expect("target metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
     }
 }

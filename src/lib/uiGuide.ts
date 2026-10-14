@@ -27,12 +27,12 @@ const VIEW_IDS: readonly ViewId[] = [
 
 /** 화면별로 요청으로 열 수 있는 탭. JSON의 tab이 여기 없으면 프런트가 열 수 없는 대상이다. */
 export const UI_GUIDE_VIEW_TABS: Partial<Record<ViewId, readonly string[]>> = {
-  settings: ["connections", "aia", "service", "repository", "language", "display"],
+  settings: ["connections", "aia", "service", "language", "display"],
   chat: ["conversation", "activity", "schedules"],
-  workflows: ["catalog", "recurring"],
-  addons: ["mcp", "ssh", "db", "cypress", "mermaid", "claude", "automation"],
-  projects: ["files", "git", "settings"],
-  storage: ["data", "secrets"],
+  workflows: ["catalog", "recurring", "automation"],
+  addons: ["mcp", "ssh", "db", "cypress", "mermaid", "claude"],
+  projects: ["files", "git", "overlay", "settings"],
+  storage: ["data", "library", "secrets"],
 };
 
 export function isViewId(value: unknown): value is ViewId {

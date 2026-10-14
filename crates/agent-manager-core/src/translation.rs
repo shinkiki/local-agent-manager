@@ -2153,13 +2153,8 @@ fn run_aia_analysis_cli(
     );
     let output_file = work_dir.join(format!(".aia-analysis-{}.txt", Uuid::new_v4()));
     let schema_file = work_dir.join(format!(".aia-analysis-{}.schema.json", Uuid::new_v4()));
-    fs::write(
-        &schema_file,
-        format!(
-            r#"{{"type":"object","additionalProperties":false,"required":["summary","command"],"properties":{{"summary":{{"type":"string","maxLength":{MAX_AIA_ANALYSIS_SUMMARY_CHARS}}},"command":{{"type":"string","maxLength":{MAX_AIA_ANALYSIS_COMMAND_CHARS}}}}}}}"#
-        ),
-    )?;
-
+    // 명령을 먼저 만든다. 공급자가 분석을 못 하면 여기서 끝나고, 그때 스키마 파일을
+    // 먼저 써 두면 지울 자리(`run_headless_cli`)에 닿지 못해 작업 폴더에 남는다.
     let command = aia_analysis_command(
         executable,
         provider,
@@ -2167,6 +2162,12 @@ fn run_aia_analysis_cli(
         &prompt,
         &output_file,
         &schema_file,
+    )?;
+    fs::write(
+        &schema_file,
+        format!(
+            r#"{{"type":"object","additionalProperties":false,"required":["summary","command"],"properties":{{"summary":{{"type":"string","maxLength":{MAX_AIA_ANALYSIS_SUMMARY_CHARS}}},"command":{{"type":"string","maxLength":{MAX_AIA_ANALYSIS_COMMAND_CHARS}}}}}}}"#
+        ),
     )?;
     let (text, _stdout) = run_headless_cli(
         command,
@@ -3717,6 +3718,28 @@ fn configure_headless_command(command: &mut Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aia_analysis_refusal_leaves_no_schema_file_behind() {
+        let work = tempfile::tempdir().expect("work dir");
+        for provider in [ProviderId::Antigravity, ProviderId::Local] {
+            let error = run_aia_analysis_cli(
+                Path::new("/nonexistent/provider-cli"),
+                provider,
+                None,
+                work.path(),
+                "event",
+                None,
+            )
+            .expect_err("provider cannot run the analysis");
+            assert!(matches!(error, CoreError::InvalidInput(_)), "{error:?}");
+        }
+        let left: Vec<_> = fs::read_dir(work.path())
+            .expect("read work dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert!(left.is_empty(), "temporary files left: {left:?}");
+    }
 
     #[test]
     fn nested_cli_strings_keep_key_priority_and_value_validation() {

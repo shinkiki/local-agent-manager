@@ -1,0 +1,15 @@
+{
+  "findingId": "F-docs-code-review-findings-f-docs-code-review-rev-1812038c",
+  "file": "docs/code-review/findings/F-docs-code-review-reviewed-c-af9507eabc40-json-co-e744c33b.json",
+  "symbol": "note",
+  "symptom": "결함 note 가 고치지 않은 빈 칸 열두 건을 모두 채웠다고 적는다",
+  "severity": "P3",
+  "state": "fixed",
+  "kind": "계약불일치",
+  "detail": "288072c685d2 가 F-docs-code-review-reviewed-c-af9507eabc40-json-co-e744c33b.json 의 `note` 끝에 'C-a52e664a3563 리뷰에서 같은 드리프트가 reviewed 열 건과 findings 두 건에 더 있는 것을 확인하고 모두 채웠다' 를 덧붙였다. 같은 커밋의 본문과, 같은 커밋이 만든 F-...d9517df9 의 `fix` 는 정반대를 적는다 — '빈 commits 열 건과 빈 fixCommits 두 건 자체는 고치지 않았다'. 커밋이 바꾼 파일도 넷뿐이라 그 열두 건에 닿지 않는다. 재현: 288072c685d2 리비전에서 `node -e \"...readdirSync('docs/code-review/reviewed')...\"` 로 세면 `commits` 가 빈 배열인 reviewed 가 15 건이고, `state:'fixed'` 인데 `fixCommits` 가 빈 결함이 3 건이다(채워진 것이 없다). 깨지는 것은 다음 회차가 읽는 상태다 — `note` 만 읽으면 '이 드리프트는 닫혔다' 로 보여, 그 빈 칸을 메우는 선택지를 들고 열려 있는 결정 round-383bc1ee75694815bbb5add11d45bfc9 이 이미 해결된 것처럼 읽힌다. 러너는 `note` 를 읽지 않으므로 큐 집계는 틀리지 않아 P3 이다.",
+  "agentsRules": [],
+  "occurrences": [{ "itemId": "C-288072c685d2", "at": "2026-10-06T03:40:00Z", "lane": "L02" }],
+  "fixCommits": [],
+  "fix": "`note` 의 그 문장을 커밋이 실제로 한 일(확인했지만 채우지 않았다 · 열린 결정의 몫이다)로 고쳤다. 빈 칸 자체는 이번에도 채우지 않았다 — 같은 이유로 F-docs-code-review-readme-md-commits-6f902967 이 open 이고 그 결정이 아직 답을 기다린다.",
+  "note": "`fixCommits` 가 빈 것은 장부가 자기 커밋 해시를 적을 수 없는 구조 때문이며 그 자리는 이미 별도 결함으로 올라가 있다. 여기서 새로 적지 않는다."
+}

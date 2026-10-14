@@ -1,0 +1,12 @@
+{
+  "itemId": "C-f9894717b7b7",
+  "kind": "commit",
+  "ref": "f9894717b7b76be7d87651268152c814fe1880cf",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L04",
+  "source": "claude",
+  "verdict": "결함 0건 — 측정치 재현 확인",
+  "note": "docs/project-menu/baseline.json 의 measuredAt 한 줄만 바뀐 측정 기록 커밋. 레인 워크트리에서 scripts/project-menu-conformance.mjs 를 다시 돌려 항목 42/42 · 점검 142/142 · 실패 종류 없음(종료 코드 0)으로 커밋이 적은 수치가 그대로 재현됐다. 저장 키도 러너의 --write-baseline 출력(measuredAt·itemsPassed·checksPassed·failureKinds·checks)과 일치하고 checks 142개가 모두 true 라 checksPassed 와 어긋나지 않는다. 보안 불변식·쓰기 게이트·셸 문자열에 닿지 않는다.",
+  "findings": [],
+  "commits": []
+}

@@ -1,0 +1,12 @@
+{
+  "itemId": "C-74272c9dfc06",
+  "kind": "commit",
+  "ref": "74272c9dfc06672242500f91235a686c09ae31e9",
+  "reviewedAt": "2026-10-06T17:10:00Z",
+  "lane": "L04",
+  "source": "codex",
+  "verdict": "결함 0건 — 진단 지문 축의 집계·기준선 호환·출력 계약 확인",
+  "note": "정확성: 같은 실행에서 같은 지문으로 실패한 여러 시험을 실행 1회로 세고 시험 이름은 모두 보존한다. OS 오류는 메시지·임시 경로 대신 code/kind만 지문으로 써 로캘·경로 차이로 같은 원인이 갈라지지 않는다. 계약: 새 diagnosticKinds는 기존 failureKinds를 바꾸지 않고 별도 comparedToBaselineDiagnostics로만 추가하며, 구 기준선에는 null을 내므로 없는 축을 0으로 오인하지 않는다. 보안: 순수 출력 파싱·집계와 로컬 측정 JSON만 다루며 G1~G11/C 예외에 닿지 않는다. 검증: node --experimental-strip-types --test-reporter=dot --test src/lib/flakyTestReport.test.mjs (14 tests 통과).",
+  "findings": [],
+  "commits": []
+}

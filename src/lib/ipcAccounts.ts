@@ -17,6 +17,7 @@
  * 그대로 `lib/ipc`다.
  */
 import type {
+  AccountLoginCallbackRelay,
   AccountLoginSessionView,
   AccountSnapshot,
   AccountToolsSnapshot,
@@ -28,11 +29,23 @@ import type {
   ResumeAccountPolicy,
   SwitchActiveProviderAccountReceipt,
   UsageHistorySnapshot,
+  CredentialVaultRecoveryReceipt,
+  CredentialVaultRecoveryStatus,
 } from "../types";
 import { call } from "./ipcTransport";
 
 export function getProviderAccounts(): Promise<AccountSnapshot> {
   return call<AccountSnapshot>("get_provider_accounts");
+}
+
+/** G4/C4. 비밀값 없이 Vault 손상과 검증 가능한 프로필 사본 수만 조회한다. */
+export function getCredentialVaultRecoveryStatus(): Promise<CredentialVaultRecoveryStatus> {
+  return call<CredentialVaultRecoveryStatus>("get_credential_vault_recovery_status");
+}
+
+/** 사용자의 명시적 확인 뒤 호스트에서만 손상된 계정 Vault를 복구한다. */
+export function recoverCredentialVault(): Promise<CredentialVaultRecoveryReceipt> {
+  return call<CredentialVaultRecoveryReceipt>("recover_credential_vault");
 }
 
 /** 계정별로 쓸 수 있는 외부 MCP·커넥터·플러그인 요약. 도구를 실행하지 않는 조회다. */
@@ -61,6 +74,20 @@ export function finishProviderAccountLogin(
 
 export function cancelProviderAccountLogin(loginId: string): Promise<void> {
   return call<void>("cancel_provider_account_login", { loginId });
+}
+
+/**
+ * 브라우저 방식 Codex 로그인에서, 승인 뒤 브라우저가 멈춘 `http://127.0.0.1:1455/auth/callback?…`
+ * 주소를 백엔드 기기의 로그인 CLI에 대신 전달한다. 브라우저가 CLI와 다른 기기에 있을 때 쓴다.
+ * 성공하면 CLI가 토큰을 받아 끝나고, 저장 버튼은 `credentialsReady` 폴링이 연다.
+ */
+export function relayCodexLoginCallback(loginId: string, callbackUrl: string): Promise<AccountLoginCallbackRelay> {
+  return call<AccountLoginCallbackRelay>("relay_codex_login_callback", { loginId, callbackUrl });
+}
+
+/** 진행 중인 로그인 세션의 현재 상태. `credentialsReady`가 저장 가능 여부를 말한다. */
+export function getProviderAccountLogin(loginId: string): Promise<AccountLoginSessionView> {
+  return call<AccountLoginSessionView>("get_provider_account_login", { loginId });
 }
 
 /** 활성 계정을 바꾼다. 자격증명 교체가 없어 실행 중 세션은 종료하지 않는다. */

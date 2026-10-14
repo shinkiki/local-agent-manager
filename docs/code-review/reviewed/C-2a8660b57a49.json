@@ -1,0 +1,11 @@
+{
+  "itemId": "C-2a8660b57a49",
+  "kind": "commit",
+  "ref": "2a8660b57a49bc5e6ba0be667d202eb253b749b0",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L04",
+  "source": "claude",
+  "verdict": "결함 1건 / 수정 1건",
+  "findings": ["F-src-lib-codereviewqueue-ts-ledgerentry-b20c8696"],
+  "commits": []
+}

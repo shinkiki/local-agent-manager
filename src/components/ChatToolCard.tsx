@@ -1,4 +1,6 @@
 import { memo, useRef, useState } from "react";
+import { runtimeText } from "../lib/i18nRuntime";
+import { boundToolCardText, formatCharCount, toolCardPreviewSource } from "../lib/toolCardText";
 
 interface ChatToolCardProps {
   name: string;
@@ -9,6 +11,7 @@ interface ChatToolCardProps {
 
 const EMPTY_JSON_LITERALS = new Set(["{}", "[]", "null"]);
 const PREVIEW_KEYS = ["file_path", "path", "command", "cmd", "query"] as const;
+const RUNNING_STATUSES = new Set(["running", "inProgress"]);
 
 const TOOL_STATUS_LABELS: Record<string, string> = {
   running: "실행 중",
@@ -44,12 +47,44 @@ export const ChatToolCard = memo(function ChatToolCard({ name, status, detail: r
   const autoOpened = useRef(false);
   if (status === "running" && output) autoOpened.current = true;
   const open = userOpen ?? autoOpened.current;
+  const running = RUNNING_STATUSES.has(status);
 
   if (!detail && !output) {
     return <div className="chat-tool chat-tool-compact"><div className="chat-tool-summary">{summary}</div></div>;
   }
-  return <details className="chat-tool" open={open} onToggle={(event) => setUserOpen(event.currentTarget.open)}><summary>{summary}</summary>{detail && <pre>{detail}</pre>}{output && <pre className="chat-tool-output">{output}</pre>}</details>;
+  // 본문은 펼쳐져 있을 때만 세운다. 접힌 `<details>`의 자식은 그려지지 않지만 DOM 문자열로는
+  // 남아, 도구 94개에 650만 자가 실린 대화를 통째로 들고 있게 된다(2026-10-05 실측).
+  return <details className="chat-tool" open={open} onToggle={(event) => setUserOpen(event.currentTarget.open)}>
+    <summary>{summary}</summary>
+    {open && detail && <ChatToolText text={detail} running={running} />}
+    {open && output && <ChatToolText text={output} running={running} className="chat-tool-output" />}
+  </details>;
 });
+
+/**
+ * 카드 본문 한 칸. 상한을 넘는 글은 일부만 그리고 생략 안내와 '전체 보기'를 세운다.
+ *
+ * 실행 중인 카드는 흐르는 쪽(뒤)을, 끝난 카드는 머리(앞)를 남긴다 — 실행 중에는 지금 무엇이
+ * 나오는지가, 끝난 뒤에는 무엇을 했는지가 먼저다. 전체 보기는 사용자가 고른 한 번의 비용이라
+ * 그대로 다 그린다. 왜 묶는지는 `toolCardText.ts` 머리말에 있다.
+ */
+function ChatToolText({ text, running, className }: { text: string; running: boolean; className?: string }) {
+  const [showAll, setShowAll] = useState(false);
+  const bounded = showAll ? { text, omitted: 0, total: text.length } : boundToolCardText(text, running ? "tail" : "head");
+  const notice = bounded.omitted > 0 && (
+    <div className="chat-tool-truncated">
+      <span>{running
+        ? runtimeText(`앞 ${formatCharCount(bounded.omitted)}자 생략 · 전체 ${formatCharCount(bounded.total)}자`, `${formatCharCount(bounded.omitted)} earlier characters hidden · ${formatCharCount(bounded.total)} in total`)
+        : runtimeText(`뒤 ${formatCharCount(bounded.omitted)}자 생략 · 전체 ${formatCharCount(bounded.total)}자`, `${formatCharCount(bounded.omitted)} later characters hidden · ${formatCharCount(bounded.total)} in total`)}</span>
+      <button className="button compact" type="button" onClick={() => setShowAll(true)}>{runtimeText("전체 보기", "Full view")}</button>
+    </div>
+  );
+  return <>
+    {running && notice}
+    <pre className={className}>{bounded.text}</pre>
+    {!running && notice}
+  </>;
+}
 
 function visibleChatToolText(text: string): string {
   const trimmed = text.trim();
@@ -67,7 +102,7 @@ function chatToolPreview(text: string): string {
   } catch {
     // 일반 텍스트 요약으로 넘어간다.
   }
-  return text.replace(/\s+/g, " ").slice(0, 76);
+  return toolCardPreviewSource(text).replace(/\s+/g, " ").slice(0, 76);
 }
 
 function chatToolStatusLabel(status: string): string {

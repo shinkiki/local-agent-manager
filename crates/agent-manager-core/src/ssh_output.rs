@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn c9_19_strips_the_sudo_prompt_from_stderr() {
         assert_eq!(
-            strip_sudo_prompt("[sudo] password for manualsAdmin: done\n"),
+            strip_sudo_prompt("[sudo] password for deploy: done\n"),
             "done\n"
         );
         // 프롬프트만 있던 stderr는 비워진다 — 그래야 성공이 성공으로 읽힌다.

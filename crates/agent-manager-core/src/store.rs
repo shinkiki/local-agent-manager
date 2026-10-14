@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::app_data_file::{read_private_json_or_default, write_private_json};
-use crate::chat::{ChatApprovalMode, ChatMode, ReasoningEffort};
+use crate::chat::{ChatApprovalMode, ChatMode, ChatProfile, ReasoningEffort};
 use crate::domain::{
     ChatOrigin, DocRoot, ProviderId, SessionBookmark, SessionFolder, SessionLink, SessionMeta,
     SessionMetaPatch,
@@ -455,6 +455,23 @@ pub(crate) fn persist_session_origin(
             return false;
         }
         current.origin = Some(origin.clone());
+        true
+    })
+}
+
+/// 이 세션이 돈 프로필을 기록한다. 실행마다 갱신하므로, 프로필이 바뀌는 경로(AIA 작업공간
+/// 재개)를 지난 세션도 다음 이어가기에서는 제 프로필로 돌아온다.
+pub(crate) fn persist_session_profile(
+    app_data_dir: &Path,
+    source: ProviderId,
+    session_id: &str,
+    profile: ChatProfile,
+) -> Result<(), CoreError> {
+    update_session_entry(app_data_dir, source, session_id, |current| {
+        if current.profile == Some(profile) {
+            return false;
+        }
+        current.profile = Some(profile);
         true
     })
 }

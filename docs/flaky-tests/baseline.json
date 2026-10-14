@@ -1,0 +1,68 @@
+{
+  "mode": "suite",
+  "command": "cargo test -q -p agent-manager-core --lib",
+  "target": "usage_budget_policy::tests::the_completion_condition_switch_keeps_the_text_and_stops_applying_it",
+  "filters": [],
+  "testThreads": null,
+  "summary": {
+    "target": "usage_budget_policy::tests::the_completion_condition_switch_keeps_the_text_and_stops_applying_it",
+    "runs": 10,
+    "measuredRuns": 10,
+    "targetFailedRuns": 0,
+    "failedRuns": 1,
+    "buildErrorRuns": 0,
+    "failureCountsByTest": [
+      {
+        "name": "scheduler::tests::active_account_option_follows_the_account_active_at_run_time",
+        "runs": 1
+      }
+    ],
+    "failureCountsByDiagnostic": [
+      {
+        "signature": "Io(os error 5 · PermissionDenied)",
+        "runs": 1,
+        "tests": [
+          "scheduler::tests::active_account_option_follows_the_account_active_at_run_time"
+        ]
+      }
+    ],
+    "targetObserved": true
+  },
+  "failureKinds": [
+    {
+      "kind": "다른 시험 간헐 실패",
+      "count": 1
+    }
+  ],
+  "diagnosticKinds": [
+    {
+      "kind": "Io(os error 5 · PermissionDenied)",
+      "count": 1
+    }
+  ],
+  "verdict": "suite-flaky",
+  "diagnostics": [
+    {
+      "name": "scheduler::tests::active_account_option_follows_the_account_active_at_run_time",
+      "diagnostic": "thread 'scheduler::tests::active_account_option_follows_the_account_active_at_run_time' (66848) panicked at crates\\agent-manager-core\\src\\scheduler.rs:4467:14:\ncalled `Result::unwrap()` on an `Err` value: Io(Os { code: 5, kind: PermissionDenied, message: \"액세스가 거부되었습니다.\" })"
+    }
+  ],
+  "comparedToBaseline": [
+    {
+      "kind": "다른 시험 간헐 실패",
+      "before": 1,
+      "after": 1,
+      "direction": "same"
+    }
+  ],
+  "comparedToBaselineDiagnostics": [
+    {
+      "kind": "Io(os error 5 · PermissionDenied)",
+      "before": 1,
+      "after": 1,
+      "direction": "same"
+    }
+  ],
+  "recordedAt": "2026-10-05T21:25:12.609Z",
+  "toolVersion": 1
+}

@@ -1,0 +1,19 @@
+{
+  "findingId": "F-crates-agent-manager-core-src-resource-repositor-c60b1a21",
+  "file": "crates/agent-manager-core/src/resource_repository.rs",
+  "symbol": "load_resource_repository_settings",
+  "symptom": "기본값 상태인데 rootPath만 Windows 확장 경로 접두사(\\\\?\\)를 달고 나와 defaultRootPath와 다르다",
+  "severity": "P2",
+  "state": "unconfirmed",
+  "agentsRules": [],
+  "occurrences": [{ "itemId": "C-41b5da9e9b6c", "at": "2026-10-06T00:00:00Z" }],
+  "fixCommits": [],
+  "reproduction": {
+    "platform": "windows",
+    "command": "node scripts/e2e.mjs --spec \"cypress/e2e/{am20260906-repository-path-card,am20260913-clipboard-null-fallback}.cy.ts\"",
+    "observed": "저장소 → 라이브러리 카드가 '앱 기본값' 배지를 달고 있는데도 저장소 경로 칸(#resource-repository-path, rootPath)은 '\\\\?\\C:\\...\\app-data-XXXX\\resource-repository'이고 기본 경로 칸(#resource-repository-default-path, defaultRootPath)은 'C:\\...\\app-data-XXXX\\resource-repository'다. 두 칸이 같아야 한다고 보는 am20260906-repository-path-card.cy.ts:38과, 기본 경로 칸의 복사 버튼이 그 칸의 값을 복사한다고 보는 am20260913-clipboard-null-fallback.cy.ts:39가 함께 깨진다.",
+    "alsoFailsAt": "41b5da9e9b6c^ — 같은 두 스펙을 부모 커밋에서 다시 돌려 같은 값으로 깨지는 것을 확인했다. 이 커밋이 만든 결함이 아니라 선행 결함이다."
+  },
+  "attempted": "load_resource_repository_settings는 root(repository_root)와 default(default_repository_root)를 같은 app_data_dir에서 만들고, root_path가 저장돼 있지 않으면 둘이 같은 PathBuf다. 그 경우 custom=false와 두 문자열의 일치가 함께 성립해야 하는데 화면에서는 custom=false인 채 문자열만 갈라진다. prepare_repository_root/fs::canonicalize가 Windows에서 \\\\?\\를 붙이는 자리(set_resource_repository, initialize_resource_repository)가 후보지만, e2e 격리 백엔드가 그 경로를 언제 저장 파일에 적는지까지는 짚지 못했다. 원인을 특정하지 못해 고치지 않는다(회차 절차 4절 1번).",
+  "note": "커밋 C-41b5da9e9b6c의 diff 밖이다. 이 커밋이 두 스펙을 저장소 화면 쪽으로 옮기면서 건드려 회차 검증에 걸렸을 뿐이다."
+}

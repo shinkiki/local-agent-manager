@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { aiaAttentionBubble, aiaAttentionForChat, aiaAttentionTargetAction, selectAiaAttention, shouldShowAiaAttentionBubble, withoutAiaAttention } from "./aiaAttention.ts";
 
-const attention = (id, profile, kind, read = false) => ({ id, profile, kind, read });
+const OWN = "own-chat";
+const attention = (id, profile, kind, read = false, chatId = OWN) => ({ id, profile, kind, read, chatId });
 
 test("AIA attention is removed from the general notification snapshot", () => {
   const snapshot = withoutAiaAttention({
@@ -14,7 +15,7 @@ test("AIA attention is removed from the general notification snapshot", () => {
     ],
     unreadCount: 3,
     pendingCount: 2,
-  });
+  }, OWN);
 
   assert.deepEqual(snapshot.items.map((item) => item.id), [
     "standard-completed",
@@ -31,7 +32,7 @@ test("pending AIA approval takes priority over a completed response", () => {
     attention("failed", "aia", "failed"),
     attention("standard-approval", "standard", "approval"),
     attention("approval", "aia", "approval"),
-  ]);
+  ], OWN);
 
   assert.equal(selected?.id, "approval");
 });
@@ -41,7 +42,7 @@ test("AIA approval이 없으면 첫 미확인 완료·실패 항목을 유지한
     attention("read", "aia", "completed", true),
     attention("first-unread", "aia", "failed"),
     attention("second-unread", "aia", "completed"),
-  ]);
+  ], OWN);
 
   assert.equal(selected?.id, "first-unread");
 });
@@ -50,11 +51,11 @@ test("AIA label ignores running and already read terminal items", () => {
   assert.equal(selectAiaAttention([
     attention("running", "aia", "running"),
     attention("read", "aia", "completed", true),
-  ]), null);
+  ], OWN), null);
   assert.equal(selectAiaAttention([
     attention("standard", "standard", "approval"),
     attention("failed", "aia", "failed"),
-  ])?.id, "failed");
+  ], OWN)?.id, "failed");
 });
 
 test("AIA 메시지 미리보기는 클릭해 닫아도 다음 미확인 메시지에서 다시 열린다", () => {
@@ -127,4 +128,36 @@ test("버린 대화의 알림만 걷는다 — 다른 대화와 일반 프로필
 
   assert.deepEqual(aiaAttentionForChat(items, "old").map((item) => item.id), ["old-completed", "old-approval"]);
   assert.deepEqual(aiaAttentionForChat(items, "missing"), []);
+});
+
+test("이 창이 소유하지 않은 AIA 대화는 트리거가 가져가지 않는다", () => {
+  // 세션 화면에서 AIA 작업공간 세션을 재개하면 백엔드가 프로필을 Aia 로 되살린다
+  // (chat.rs::effective_chat_profile). 프로필만 보고 고르면 그 대화가 AIA 창으로 끌려
+  // 들어가, 사용자가 세션 화면에서 이어 보려던 대화를 팝업이 빼앗는다.
+  const items = [
+    attention("resumed-approval", "aia", "approval", false, "resumed-elsewhere"),
+    attention("resumed-done", "aia", "completed", false, "resumed-elsewhere"),
+  ];
+
+  assert.equal(selectAiaAttention(items, OWN), null);
+  assert.equal(selectAiaAttention(items, "resumed-elsewhere")?.id, "resumed-approval");
+  // 소유한 대화가 없을 때도 남의 대화를 집지 않는다.
+  assert.equal(selectAiaAttention(items, null), null);
+});
+
+test("소유하지 않은 AIA 알림은 일반 알림 목록에 남아 세션 화면으로 갈 수 있다", () => {
+  // 트리거가 맡지 않는 알림까지 일반 목록에서 빼면 그 대화의 턴이 끝난 것을 어디에서도
+  // 알 수 없다. ↻ 로 떼어 두고 계속 도는 대화가 정확히 그 자리다.
+  const snapshot = withoutAiaAttention({
+    items: [
+      attention("own", "aia", "completed"),
+      attention("detached-still-running", "aia", "completed", false, "left-running"),
+      attention("standard", "standard", "completed"),
+    ],
+    unreadCount: 3,
+    pendingCount: 0,
+  }, OWN);
+
+  assert.deepEqual(snapshot.items.map((item) => item.id), ["detached-still-running", "standard"]);
+  assert.equal(snapshot.unreadCount, 2);
 });

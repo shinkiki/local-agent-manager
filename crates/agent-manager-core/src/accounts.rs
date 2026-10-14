@@ -1,8 +1,4 @@
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
-use std::collections::HashMap;
-#[cfg(target_os = "macos")]
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -600,6 +596,38 @@ pub struct AccountSnapshot {
     pub resume_account_policy: ResumeAccountPolicy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CredentialVaultRecoveryState {
+    Ready,
+    RecoveryRequired,
+}
+
+wire_enum!(trimmed CredentialVaultRecoveryState, "알 수 없는 자격증명 Vault 상태입니다", {
+    Ready => "ready",
+    RecoveryRequired => "recoveryRequired",
+});
+
+/// G4/C4. 비밀값은 싣지 않고, 계정 Vault가 실행 가능한지와 앱 소유 격리 프로필에서
+/// 안전하게 되살릴 수 있는 계정 수만 사용자 화면에 알린다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialVaultRecoveryStatus {
+    pub state: CredentialVaultRecoveryState,
+    pub registered_account_count: usize,
+    pub stored_account_count: usize,
+    pub recoverable_account_count: usize,
+    pub needs_reauthentication_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialVaultRecoveryReceipt {
+    pub recovered_account_count: usize,
+    pub needs_reauthentication_count: usize,
+    pub snapshot: AccountSnapshot,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountLoginSessionView {
@@ -609,6 +637,10 @@ pub struct AccountLoginSessionView {
     pub environment_variable: String,
     pub profile_path: String,
     pub command: String,
+    /// 임시 프로필에 저장 가능한 자격증명이 이미 들어 있는지. 화면은 로그인 CLI의 종료
+    /// 이벤트를 놓쳐도(원격 탭의 소켓이 잠깐 끊긴 뒤 유예가 지난 경우) 이 값으로 "로그인
+    /// 완료 저장"을 열 수 있다. 판정만 하고 값은 돌려주지 않는다(G4).
+    pub credentials_ready: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -753,6 +785,8 @@ trait CredentialVault: Send + Sync {
     fn put(&self, key: &str, secret: &str) -> Result<(), CoreError>;
     fn get(&self, key: &str) -> Result<Zeroizing<String>, CoreError>;
     fn delete(&self, key: &str) -> Result<(), CoreError>;
+    fn document(&self) -> Result<CredentialVaultDocument, CoreError>;
+    fn replace_document(&self, document: &CredentialVaultDocument) -> Result<(), CoreError>;
 }
 
 trait VaultDocumentStore: Send + Sync {
@@ -829,6 +863,26 @@ impl CredentialVault for TestCredentialVault {
             .lock()
             .map_err(|_| CoreError::Runtime("test vault lock".to_owned()))?
             .remove(key);
+        Ok(())
+    }
+
+    fn document(&self) -> Result<CredentialVaultDocument, CoreError> {
+        Ok(CredentialVaultDocument {
+            schema_version: CREDENTIAL_VAULT_VERSION,
+            entries: self
+                .0
+                .lock()
+                .map_err(|_| CoreError::Runtime("test vault lock".to_owned()))?
+                .clone(),
+        })
+    }
+
+    fn replace_document(&self, document: &CredentialVaultDocument) -> Result<(), CoreError> {
+        *self
+            .0
+            .lock()
+            .map_err(|_| CoreError::Runtime("test vault lock".to_owned()))? =
+            document.entries.clone();
         Ok(())
     }
 }
@@ -969,6 +1023,29 @@ impl CredentialVault for OsCredentialVault {
             Ok(())
         })
     }
+
+    fn document(&self) -> Result<CredentialVaultDocument, CoreError> {
+        let _operation = lock(&self.operation_lock, "자격증명 Vault 점검")?;
+        with_vault_file_lock(&self.lock_path, || load_vault_document(self.store.as_ref()))
+    }
+
+    fn replace_document(&self, document: &CredentialVaultDocument) -> Result<(), CoreError> {
+        let _operation = lock(&self.operation_lock, "자격증명 Vault 복구")?;
+        with_vault_file_lock(&self.lock_path, || {
+            // G4/C4. 손상된 문서에서 읽을 수 있는 척하지 않는다. 검증된 프로필 사본과
+            // 아직 읽을 수 있던 항목으로 새 문서를 먼저 쓴 뒤 다시 읽어 같은지 확인한다.
+            // Windows 조각 writer는 새 세대 조각을 모두 쓴 뒤 머리를 바꾸므로, 실패해도
+            // 반쯤 쓴 새 문서가 정본으로 보이지 않는다.
+            save_vault_document(self.store.as_ref(), document)?;
+            let verified = load_vault_document(self.store.as_ref())?;
+            if verified != *document {
+                return Err(CoreError::Runtime(
+                    "복구한 자격증명 Vault 저장 검증에 실패했습니다".to_owned(),
+                ));
+            }
+            Ok(())
+        })
+    }
 }
 
 /// 자격증명 Vault 잠금 파일에 배타 잠금을 잡고 `action`을 돌린 뒤 해제한다. 해제
@@ -997,6 +1074,15 @@ fn load_vault_document(
         return Ok(CredentialVaultDocument::empty());
     };
     parse_vault_document(&serialized, CREDENTIAL_VAULT_VERSION)
+}
+
+/// Windows 자격증명 Vault의 머리는 남았지만 그 머리가 가리키는 조각이 사라진 경우만
+/// 자동 복구 대상으로 좁힌다. 보안 저장소 권한 오류나 일시적인 OS 장애를 손상으로 오인해
+/// 온전한 정본을 교체하면 안 된다(G4).
+fn credential_vault_has_missing_chunk(error: &CoreError) -> bool {
+    error
+        .to_string()
+        .contains("OS 보안 저장소의 자격증명 조각이 없습니다")
 }
 
 fn parse_vault_document(
@@ -1448,6 +1534,132 @@ impl AccountSupervisor {
         self.snapshot()
     }
 
+    /// G4/C4. Vault의 비밀값은 Core 밖으로 내보내지 않고, 손상 여부와 앱 소유 프로필로
+    /// 검증 복구할 수 있는 계정 수만 돌려준다. Windows 조각 하나가 사라진 현재 장애와,
+    /// 사용자가 손상된 머리 항목을 지워 빈 Vault가 된 경우를 같은 복구 흐름으로 다룬다.
+    pub fn credential_vault_recovery_status(
+        &self,
+    ) -> Result<CredentialVaultRecoveryStatus, CoreError> {
+        let registered_account_count = lock(&self.inner.state, "계정 상태")?
+            .registry
+            .accounts
+            .len();
+        let Some((_document, recovered, stored_account_count)) =
+            self.credential_vault_recovery_plan()?
+        else {
+            return Ok(CredentialVaultRecoveryStatus {
+                state: CredentialVaultRecoveryState::Ready,
+                registered_account_count,
+                stored_account_count: registered_account_count,
+                recoverable_account_count: 0,
+                needs_reauthentication_count: 0,
+            });
+        };
+        let recoverable_account_count = recovered.len();
+        Ok(CredentialVaultRecoveryStatus {
+            state: CredentialVaultRecoveryState::RecoveryRequired,
+            registered_account_count,
+            stored_account_count,
+            recoverable_account_count,
+            needs_reauthentication_count: registered_account_count
+                .saturating_sub(stored_account_count + recoverable_account_count),
+        })
+    }
+
+    /// G4/C4. 사용자가 명시적으로 승인한 경우에만 손상된 Vault 문서를 교체한다. 읽을 수
+    /// 있던 항목은 보존하고, 앱 소유 격리 프로필의 작업 사본은 유효기간과 계정 신원을 모두
+    /// 증명한 경우에만 정본으로 승격한다. 어느 쪽에도 없는 계정은 비밀을 추측하지 않고
+    /// 재인증 필요 상태로 남긴다.
+    pub fn recover_credential_vault(&self) -> Result<CredentialVaultRecoveryReceipt, CoreError> {
+        {
+            let state = lock(&self.inner.state, "계정 상태")?;
+            if state.runtime_counts.values().copied().sum::<usize>() > 0 {
+                return Err(CoreError::Conflict(
+                    "실행 중인 공급자 런타임을 모두 종료한 뒤 자격증명 Vault를 복구해 주세요"
+                        .to_owned(),
+                ));
+            }
+        }
+        let Some((document, recovered, _stored_account_count)) =
+            self.credential_vault_recovery_plan()?
+        else {
+            return Err(CoreError::Conflict(
+                "자격증명 Vault에서 복구할 손상을 찾지 못했습니다".to_owned(),
+            ));
+        };
+        self.inner.vault.replace_document(&document)?;
+
+        let (recovered_account_count, needs_reauthentication_count) = {
+            let mut state = lock(&self.inner.state, "계정 상태")?;
+            let mut registry = state.registry.clone();
+            let mut recovered_count = 0usize;
+            let mut reauthentication_count = 0usize;
+            for account in &mut registry.accounts {
+                if document.entries.contains_key(&vault_key(account)) {
+                    account.auth_status = AccountAuthStatus::Ready;
+                    recovered_count += 1;
+                } else {
+                    account.auth_status = AccountAuthStatus::Error;
+                    account.usage = AccountUsageView::default();
+                    reauthentication_count += 1;
+                }
+            }
+            save_registry(&self.inner.app_data_dir, &registry)?;
+            state.registry = registry;
+            (recovered_count, reauthentication_count)
+        };
+        lock(&self.inner.credential_profiles, "자격증명 프로필")?.clear();
+        // `recovered`는 상태 계산과 시험에서 어떤 항목이 프로필에서 왔는지 구분하는
+        // 근거다. 영수증은 비밀 키나 계정 id를 내보내지 않고 수만 돌려준다(G4).
+        debug_assert!(recovered.len() <= recovered_account_count);
+        Ok(CredentialVaultRecoveryReceipt {
+            recovered_account_count,
+            needs_reauthentication_count,
+            snapshot: self.snapshot()?,
+        })
+    }
+
+    fn credential_vault_recovery_plan(
+        &self,
+    ) -> Result<Option<(CredentialVaultDocument, HashSet<String>, usize)>, CoreError> {
+        let accounts = lock(&self.inner.state, "계정 상태")?
+            .registry
+            .accounts
+            .clone();
+        let (mut document, corrupted) = match self.inner.vault.document() {
+            Ok(document) => (document, false),
+            Err(error) if credential_vault_has_missing_chunk(&error) => {
+                (CredentialVaultDocument::empty(), true)
+            }
+            Err(error) => return Err(error),
+        };
+        let missing = accounts
+            .iter()
+            // 복구 뒤 재인증 필요로 확정한 계정에는 항목이 없는 것이 정상이다. 그 상태를
+            // 다시 Vault 손상으로 보고 같은 복구를 반복하지 않는다. 반대로 조각 문서 자체가
+            // 손상됐으면 레지스트리 상태와 무관하게 모든 항목을 잃은 것으로 다룬다.
+            .filter(|account| {
+                !document.entries.contains_key(&vault_key(account))
+                    && (corrupted || account.auth_status != AccountAuthStatus::Error)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(None);
+        }
+        let stored_account_count = accounts.len().saturating_sub(missing.len());
+        let mut recovered = HashSet::new();
+        for account in missing {
+            let Some(secret) = self.recoverable_profile_credential(&account) else {
+                continue;
+            };
+            let key = vault_key(&account);
+            document.entries.insert(key.clone(), secret.to_string());
+            recovered.insert(key);
+        }
+        Ok(Some((document, recovered, stored_account_count)))
+    }
+
     /// 공유 CLI 홈에 실제로 든 자격증명을 읽어 홈 계정 뷰를 갱신한다. 저장소는
     /// [`HOME_OBSERVE_INTERVAL_MS`]보다 자주 읽지 않고(`force`면 지금 읽는다), 신원
     /// 조회는 저장소 값이 바뀌었을 때만 한다. 실패하면 저장소가 그대로인 동안 재시도
@@ -1794,7 +2006,8 @@ impl AccountSupervisor {
             // 되므로 자식이 읽을 수 있는 모양이어야 한다.
             profile_path: crate::path_guard::canonical_child_facing(profile_path)?,
         };
-        let view = login_view(&login);
+        // 방금 만든 빈 프로필이라 자격증명은 아직 없다. 디스크를 다시 읽지 않는다.
+        let view = login_view(&login, false);
         lock(&self.inner.state, "계정 로그인 상태")?
             .logins
             .insert(id, login);
@@ -1802,12 +2015,37 @@ impl AccountSupervisor {
     }
 
     pub fn login_session(&self, id: &str) -> Result<AccountLoginSessionView, CoreError> {
-        let state = lock(&self.inner.state, "계정 로그인 상태")?;
-        state
-            .logins
-            .get(id)
-            .map(login_view)
-            .ok_or_else(|| CoreError::NotFound("계정 로그인 세션을 찾을 수 없습니다".to_owned()))
+        let login = {
+            let state = lock(&self.inner.state, "계정 로그인 상태")?;
+            state.logins.get(id).cloned().ok_or_else(|| {
+                CoreError::NotFound("계정 로그인 세션을 찾을 수 없습니다".to_owned())
+            })?
+        };
+        // 프로필 읽기는 잠금 밖에서 한다 — 볼트·파일 읽기를 잠금 안에서 하면 스냅샷 경로와
+        // 순서가 엇갈린다(`account_record`와 같은 이유).
+        let credentials_ready = self.login_credentials_ready(&login);
+        Ok(login_view(&login, credentials_ready))
+    }
+
+    /// 로그인 프로필에 `finish_login`이 받아들일 자격증명이 들어 있는지. `capture_credentials`와
+    /// 같은 자리(프로필 파일, Antigravity는 기계 전역 항목까지)를 읽고 `credential_is_complete`로
+    /// 온전성까지 본다. 신원 조회는 하지 않는다 — 공급자 서버를 부르지 않고도 "지금 저장을
+    /// 눌러도 되는가"만 답하면 된다.
+    fn login_credentials_ready(&self, login: &AccountLoginSession) -> bool {
+        let secret = match self.read_credentials(login.provider, Some(&login.profile_path)) {
+            Ok(secret) => secret,
+            Err(_) if login.provider == ProviderId::Antigravity => {
+                match credential_profiles::read_antigravity_global_login() {
+                    Ok(Some(global)) => match antigravity_envelope_from_global_login(&global) {
+                        Ok(secret) => secret,
+                        Err(_) => return false,
+                    },
+                    _ => return false,
+                }
+            }
+            Err(_) => return false,
+        };
+        credential_is_complete(login.provider, &secret)
     }
 
     pub fn finish_login(
@@ -4176,9 +4414,10 @@ fn login_capture_error(provider: ProviderId, profile_path: &Path, error: CoreErr
     ))
 }
 
-fn login_view(login: &AccountLoginSession) -> AccountLoginSessionView {
+fn login_view(login: &AccountLoginSession, credentials_ready: bool) -> AccountLoginSessionView {
     AccountLoginSessionView {
         id: login.id.clone(),
+        credentials_ready,
         provider: login.provider,
         account_id: login.account_id.clone(),
         environment_variable: match login.provider {
@@ -4477,6 +4716,10 @@ fn read_antigravity_keyring_token(home: &Path) -> Result<Option<Zeroizing<String
     if !keychain.exists() {
         return Ok(None);
     }
+    // 읽기만 하는 자리지만 준비를 먼저 거친다. 빈 암호로 열리지 않는 키체인을 그대로 조회하면
+    // 아무도 답을 모르는 잠금 해제 창이 뜨고, 계정 수만큼 쌓인다(2026-10-14 실측). 준비가
+    // 갈아끼운 뒤에는 항목이 없으므로 "자격증명 없음"으로 읽히고, 볼트에서 복원된다.
+    ensure_profile_keychain(home)?;
     let path = keychain.to_string_lossy().into_owned();
     let output = run_macos_security(
         &[
@@ -4686,16 +4929,17 @@ fn antigravity_authenticated_email_from_cli_log(home: &Path) -> Option<String> {
     antigravity_authenticated_email_from_log_text(&String::from_utf8_lossy(&bytes))
 }
 
+/// 마지막 표식 **하나만** 본다. 그 줄의 이메일이 비어 있거나 읽을 수 없으면 더 앞의 줄로
+/// 내려가지 않고 `None`(`Pending`)이다 — 앞의 줄은 이전 프로세스의 인증이라, 내려가면 이번
+/// 프로세스가 아닌 계정으로 `Matched`를 내릴 수 있다.
 fn antigravity_authenticated_email_from_log_text(text: &str) -> Option<String> {
-    text.rmatch_indices(ANTIGRAVITY_AUTH_RESULT_MARKER)
-        .find_map(|(index, _)| {
-            let rest = &text[index + ANTIGRAVITY_AUTH_RESULT_MARKER.len()..];
-            let email = rest
-                .split(|c: char| c == ',' || c.is_whitespace())
-                .next()?
-                .trim();
-            email.contains('@').then(|| email.to_owned())
-        })
+    let index = text.rfind(ANTIGRAVITY_AUTH_RESULT_MARKER)?;
+    let rest = &text[index + ANTIGRAVITY_AUTH_RESULT_MARKER.len()..];
+    let email = rest
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .next()?
+        .trim();
+    email.contains('@').then(|| email.to_owned())
 }
 
 /// 이메일 비교는 대소문자를 가리지 않는다 — 구글은 로컬 파트 대소문자를 구분하지 않고, 로그와
@@ -7763,6 +8007,7 @@ fn lock<'a, T>(mutex: &'a Mutex<T>, label: &str) -> Result<MutexGuard<'a, T>, Co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Default)]
     struct MemoryVault(Mutex<HashMap<String, String>>);
@@ -7790,6 +8035,18 @@ mod tests {
             self.0.lock().unwrap().remove(key);
             Ok(())
         }
+
+        fn document(&self) -> Result<CredentialVaultDocument, CoreError> {
+            Ok(CredentialVaultDocument {
+                schema_version: CREDENTIAL_VAULT_VERSION,
+                entries: self.0.lock().unwrap().clone(),
+            })
+        }
+
+        fn replace_document(&self, document: &CredentialVaultDocument) -> Result<(), CoreError> {
+            *self.0.lock().unwrap() = document.entries.clone();
+            Ok(())
+        }
     }
 
     struct FailingVault;
@@ -7805,6 +8062,68 @@ mod tests {
 
         fn delete(&self, _key: &str) -> Result<(), CoreError> {
             Err(CoreError::Runtime("secure store unavailable".to_owned()))
+        }
+
+        fn document(&self) -> Result<CredentialVaultDocument, CoreError> {
+            Err(CoreError::Runtime("secure store unavailable".to_owned()))
+        }
+
+        fn replace_document(&self, _document: &CredentialVaultDocument) -> Result<(), CoreError> {
+            Err(CoreError::Runtime("secure store unavailable".to_owned()))
+        }
+    }
+
+    #[derive(Default)]
+    struct MissingChunkVault {
+        entries: Mutex<HashMap<String, String>>,
+        missing_chunk: AtomicBool,
+    }
+
+    impl CredentialVault for MissingChunkVault {
+        fn put(&self, key: &str, secret: &str) -> Result<(), CoreError> {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(key.to_owned(), secret.to_owned());
+            Ok(())
+        }
+
+        fn get(&self, key: &str) -> Result<Zeroizing<String>, CoreError> {
+            if self.missing_chunk.load(Ordering::SeqCst) {
+                return Err(CoreError::Runtime(
+                    "OS 보안 저장소의 자격증명 조각이 없습니다".to_owned(),
+                ));
+            }
+            self.entries
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .map(Zeroizing::new)
+                .ok_or_else(|| CoreError::NotFound("missing credential".to_owned()))
+        }
+
+        fn delete(&self, key: &str) -> Result<(), CoreError> {
+            self.entries.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        fn document(&self) -> Result<CredentialVaultDocument, CoreError> {
+            if self.missing_chunk.load(Ordering::SeqCst) {
+                return Err(CoreError::Runtime(
+                    "OS 보안 저장소의 자격증명 조각이 없습니다".to_owned(),
+                ));
+            }
+            Ok(CredentialVaultDocument {
+                schema_version: CREDENTIAL_VAULT_VERSION,
+                entries: self.entries.lock().unwrap().clone(),
+            })
+        }
+
+        fn replace_document(&self, document: &CredentialVaultDocument) -> Result<(), CoreError> {
+            *self.entries.lock().unwrap() = document.entries.clone();
+            self.missing_chunk.store(false, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -9693,6 +10012,85 @@ mod tests {
         (data, home, vault, supervisor, a, b)
     }
 
+    /// G4/C4. Windows Vault 머리만 남고 조각이 사라져도 앱 소유 격리 프로필의 값은
+    /// 유효기간과 계정 신원을 증명한 계정에만 승격한다. 다른 계정은 Ready로 꾸미지 않고
+    /// 재인증 필요로 남기며, 영수증에는 값이나 계정 키를 싣지 않는다.
+    #[test]
+    fn missing_vault_chunks_recover_only_verified_profile_credentials() {
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir(home.path().join(".claude")).unwrap();
+        let vault = Arc::new(MissingChunkVault::default());
+        let supervisor =
+            AccountSupervisor::open_with(data.path(), home.path(), vault.clone()).unwrap();
+        supervisor
+            .upsert_captured_account(
+                ProviderId::Claude,
+                None,
+                Some("A".to_owned()),
+                captured_claude("account-a"),
+            )
+            .unwrap();
+        supervisor
+            .upsert_captured_account(
+                ProviderId::Claude,
+                None,
+                Some("B".to_owned()),
+                captured_claude("account-b"),
+            )
+            .unwrap();
+        let snapshot = supervisor.snapshot().unwrap();
+        let account_a = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.provider_account_id == "account-a")
+            .unwrap()
+            .id
+            .clone();
+        let profile =
+            credential_profiles::ensure_profile_dir(data.path(), ProviderId::Claude, &account_a)
+                .unwrap();
+        let recoverable = claude_secret_with_expiry(
+            Some("account-a"),
+            "profile-only-token",
+            now_ms() + 60 * 60_000,
+        );
+        fs::write(profile.join(".credentials.json"), &recoverable).unwrap();
+        vault.missing_chunk.store(true, Ordering::SeqCst);
+
+        let status = supervisor.credential_vault_recovery_status().unwrap();
+        assert_eq!(status.state, CredentialVaultRecoveryState::RecoveryRequired);
+        assert_eq!(status.registered_account_count, 2);
+        assert_eq!(status.stored_account_count, 0);
+        assert_eq!(status.recoverable_account_count, 1);
+        assert_eq!(status.needs_reauthentication_count, 1);
+
+        let receipt = supervisor.recover_credential_vault().unwrap();
+        assert_eq!(receipt.recovered_account_count, 1);
+        assert_eq!(receipt.needs_reauthentication_count, 1);
+        let recovered_account = receipt
+            .snapshot
+            .accounts
+            .iter()
+            .find(|account| account.provider_account_id == "account-a")
+            .unwrap();
+        let missing_account = receipt
+            .snapshot
+            .accounts
+            .iter()
+            .find(|account| account.provider_account_id == "account-b")
+            .unwrap();
+        assert_eq!(recovered_account.auth_status, AccountAuthStatus::Ready);
+        assert_eq!(missing_account.auth_status, AccountAuthStatus::Error);
+        assert!(!serde_json::to_string(&receipt)
+            .unwrap()
+            .contains("profile-only-token"));
+        assert_eq!(
+            supervisor.credential_vault_recovery_status().unwrap().state,
+            CredentialVaultRecoveryState::Ready
+        );
+    }
+
     /// 이 계정으로 런타임이 돌면 CLI가 회전 주인이라 앱은 갱신을 미루고, 런타임이 끝나면
     /// 다시 앱이 회전한다. 다른 계정의 런타임은 영향이 없다.
     #[test]
@@ -11438,6 +11836,48 @@ mod tests {
         assert!(snapshot.accounts[0].is_active);
         assert!(snapshot.accounts[0].is_active);
         assert_eq!(snapshot.accounts[0].display_name, "추가 계정");
+    }
+
+    /// 원격 탭이 CLI 종료 이벤트를 놓쳐도 저장할 수 있어야 한다(2026-10-10 NAS 실측: 승인은
+    /// 끝나 auth.json이 생겼는데 화면의 저장 버튼이 꺼진 채였다). 세션 조회가 프로필의
+    /// 자격증명 유무를 직접 답하면 화면은 그 값으로 버튼을 연다.
+    #[test]
+    fn login_session_reports_credentials_once_the_cli_has_written_them() {
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let supervisor = AccountSupervisor::open_with(
+            data.path(),
+            home.path(),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+        let login = supervisor.begin_login(ProviderId::Codex, None).unwrap();
+        assert!(!login.credentials_ready);
+        assert!(
+            !supervisor
+                .login_session(&login.id)
+                .unwrap()
+                .credentials_ready
+        );
+
+        let profile = PathBuf::from(&login.profile_path);
+        fs::write(profile.join("auth.json"), "not a credential").unwrap();
+        assert!(
+            !supervisor
+                .login_session(&login.id)
+                .unwrap()
+                .credentials_ready,
+            "검증을 통과하지 못하는 파일은 준비된 것으로 보지 않는다"
+        );
+
+        fs::write(profile.join("auth.json"), codex_secret("account-ready")).unwrap();
+        assert!(
+            supervisor
+                .login_session(&login.id)
+                .unwrap()
+                .credentials_ready
+        );
+        supervisor.cancel_login(&login.id).unwrap();
     }
 
     /// 로그인 프로필 경로는 로그인 CLI의 작업 경로이자 `CODEX_HOME` 값이 된다.
@@ -13907,6 +14347,14 @@ mod tests {
         assert_eq!(
             antigravity_authenticated_email_from_log_text(
                 "applyAuthResult: email=, authMethod=consumer"
+            ),
+            None
+        );
+        // 마지막 줄의 이메일이 비면 이전 프로세스의 계정으로 내려가지 않는다.
+        assert_eq!(
+            antigravity_authenticated_email_from_log_text(
+                "applyAuthResult: email=first@example.com, authMethod=consumer\n\
+                 applyAuthResult: email=, authMethod=consumer\n"
             ),
             None
         );

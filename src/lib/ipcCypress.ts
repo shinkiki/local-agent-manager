@@ -8,6 +8,7 @@
  * `lib/ipc`다.
  */
 import type {
+  CypressEnvironmentCheck,
   CypressExecutionType,
   CypressInstallReceipt,
   CypressRegistry,
@@ -41,12 +42,24 @@ export function setCypressWorkspaceOptions(id: string, recordVideo: boolean, hea
   return call<CypressRegistry>("set_cypress_workspace_options", { id, recordVideo, headed, executionType });
 }
 
+/** 등록 폴더와 실행 옵션을 건드리지 않고, 기존 모듈이 든 루트만 바꾼다(C7-4, G10). */
+export function setCypressWorkspaceModuleDir(id: string, moduleDir: string | null): Promise<CypressRegistry> {
+  return call<CypressRegistry>("set_cypress_workspace_module_dir", { id, moduleDir });
+}
+
 export function removeCypressWorkspace(id: string): Promise<CypressRegistry> {
   return call<CypressRegistry>("remove_cypress_workspace", { id });
 }
 
 export function installCypressModule(id: string, version: string | null = null): Promise<CypressInstallReceipt> {
   return call<CypressInstallReceipt>("install_cypress_module", { id, version }, { timeoutMs: CYPRESS_INSTALL_TIMEOUT_MS });
+}
+
+/** 첫 점검은 바이너리 캐시를 풀어 보느라 1분을 넘길 수 있다. 백엔드 상한(5분)보다 조금 길게 기다린다. */
+const CYPRESS_VERIFY_TIMEOUT_MS = 5 * 60 * 1000 + 10_000;
+
+export function verifyCypressEnvironment(id: string): Promise<CypressEnvironmentCheck> {
+  return call<CypressEnvironmentCheck>("verify_cypress_environment", { id }, { timeoutMs: CYPRESS_VERIFY_TIMEOUT_MS });
 }
 
 export function listCypressWorkspaceFiles(id: string): Promise<CypressWorkspaceFileList> {

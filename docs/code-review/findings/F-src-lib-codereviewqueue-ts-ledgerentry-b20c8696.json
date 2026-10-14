@@ -1,0 +1,13 @@
+{
+  "findingId": "F-src-lib-codereviewqueue-ts-ledgerentry-b20c8696",
+  "file": "src/lib/codeReviewQueue.ts",
+  "symbol": "LedgerEntry",
+  "symptom": "reviewedAt 타입이 number 라 장부의 ISO 문자열이 타입검사에서 떨어진다",
+  "severity": "P3",
+  "state": "fixed",
+  "kind": "계약불일치",
+  "detail": "docs/code-review/README.md 와 이 회차가 실제로 쓰는 reviewed/<항목id>.json 은 reviewedAt 을 ISO 8601 문자열(\"2026-10-05T11:20:00Z\")로 적고, scripts/code-review-queue.mjs 의 readLedger 도 그 문자열을 그대로 LedgerEntry 로 넘긴다. 그런데 LedgerEntry 는 reviewedAt 을 number 로 선언하고 있었다. 재현: README 의 장부 예시를 그대로 LedgerEntry 로 선언하면 tsc --noEmit 이 TS2322 'Type string is not assignable to type number' 로 떨어진다(실측). 지금은 reviewedAt 을 읽는 곳이 없어 동작은 틀리지 않지만, 장부를 나이로 거르려고 이 필드를 숫자로 비교하는 코드가 생기면 그때 틀린다.",
+  "agentsRules": [],
+  "occurrences": [{ "itemId": "C-2a8660b57a49", "at": "2026-10-06T00:00:00Z" }],
+  "fixCommits": []
+}

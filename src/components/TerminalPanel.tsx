@@ -2,10 +2,13 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { openExternalUrl } from "../lib/externalUrl";
+import { writeClipboardText } from "../lib/clipboard";
+import { TerminalHintCollector, hasTerminalHints, hintLinkLabel, type TerminalHints } from "../lib/terminalHints";
 import { connectAccountLoginTerminal, connectSetupTerminal, connectSshTerminal, connectTerminal, type TerminalConnection } from "../lib/terminal";
-import type { AccountLoginSessionView, ProviderId, SessionSummary, SshKeyView, TerminalEvent, TerminalPhase, TerminalSessionInfo, TerminalSshMode } from "../types";
+import type { AccountLoginSessionView, CodexLoginMethod, ProviderId, SessionSummary, SshKeyView, TerminalEvent, TerminalPhase, TerminalSessionInfo, TerminalSshMode } from "../types";
 import { ErrorBanner, NoticeBanner } from "./Shared";
 import { errorText } from "../lib/errorText";
+import { relayCodexLoginCallback } from "../lib/ipc";
 import { useI18n, type UiText } from "../lib/i18n";
 
 import { formatTimeOnly } from "../lib/format";
@@ -150,16 +153,23 @@ export function SshKeyInstallPanel({ sshKey }: { sshKey: SshKeyView }) {
   return <SshTerminalPanel sshKey={sshKey} mode="installKey" />;
 }
 
-export function AccountLoginTerminalPanel({ login, remote, onCompletionChange }: {
+export function AccountLoginTerminalPanel({ login, remote, codexMethod, onCompletionChange }: {
   login: AccountLoginSessionView;
-  /** 원격 UI 여부. 백엔드가 같은 판정으로 로그인 CLI 인자를 고르므로 안내도 여기에 맞춘다. */
+  /** 원격 UI 여부. 브라우저 방식 Codex 로그인의 안내가 콜백 붙여넣기 쪽으로 갈린다. */
   remote: boolean;
+  /** Codex 로그인 방식. 백엔드가 이 값으로 CLI 인자를 고른다. 다른 공급자는 무시한다. */
+  codexMethod: CodexLoginMethod;
   onCompletionChange: (complete: boolean) => void;
 }) {
   const { text } = useI18n();
-  const presentation = accountLoginPresentation(login.provider, remote, text);
-  return <TerminalSurface
-    connect={(cols, rows, onEvent) => connectAccountLoginTerminal({ loginId: login.id, cols, rows }, onEvent)}
+  const method = login.provider === "codex" ? codexMethod : undefined;
+  const presentation = accountLoginPresentation(login.provider, remote, method, text);
+  // 방식을 바꾸면 표면을 새로 그린다. 앞 표면은 연결을 떼고, 백엔드는 새 방식으로 열 때
+  // 앞 방식의 CLI를 끝낸다.
+  return <>
+  <TerminalSurface
+    key={method ?? "default"}
+    connect={(cols, rows, onEvent) => connectAccountLoginTerminal({ loginId: login.id, cols, rows, ...(method ? { codexMethod: method } : {}) }, onEvent)}
     connectLabel={text("공식 로그인 시작", "Start official login")}
     reconnectLabel={text("로그인 터미널 다시 열기", "Reopen login terminal")}
     identity={`${login.provider} · ${text("격리 로그인", "Isolated login")}`}
@@ -168,15 +178,68 @@ export function AccountLoginTerminalPanel({ login, remote, onCompletionChange }:
     onCompletionChange={onCompletionChange}
     composerAlwaysVisible
     composerPlaceholder={presentation.composerPlaceholder}
+    collectHints
     setup
-  />;
+  />
+  {method === "browser" && <CodexCallbackPaste loginId={login.id} remote={remote} />}
+  </>;
+}
+
+/**
+ * 브라우저 방식 Codex 로그인의 콜백 붙여넣기 칸. CLI의 로그인 서버는 백엔드 기기의
+ * `127.0.0.1:1455`에만 떠서, 브라우저가 다른 기기에 있으면 승인 뒤 "연결할 수 없음" 화면에서
+ * 멈춘다. 그 주소를 받아 백엔드가 로그인 서버에 대신 전달한다. CLI는 터미널 입력으로 코드를
+ * 받지 않으므로 위 입력란으로는 끝낼 수 없다.
+ */
+function CodexCallbackPaste({ loginId, remote }: { loginId: string; remote: boolean }) {
+  const { text } = useI18n();
+  const [draft, setDraft] = useState("");
+  const [state, setState] = useState<"idle" | "sending" | "relayed">("idle");
+  const [error, setError] = useState<string | null>(null);
+  const submit = async () => {
+    if (!draft.trim() || state === "sending") return;
+    setState("sending");
+    setError(null);
+    try {
+      await relayCodexLoginCallback(loginId, draft);
+      setState("relayed");
+    } catch (cause) {
+      setError(errorText(cause));
+      setState("idle");
+    }
+  };
+  return (
+    <div className="account-login-callback-paste" data-testid="codex-login-callback-paste">
+      <label htmlFor="codex-login-callback">{remote
+        ? text("승인 뒤 브라우저가 127.0.0.1에 연결할 수 없다는 화면에서 멈추면, 그 주소창의 주소를 붙여 넣으세요.", "After approval the browser stops on a page saying it cannot reach 127.0.0.1. Paste the address from its address bar.")
+        : text("브라우저가 다른 기기에서 열렸다면, 승인 뒤 멈춘 화면의 주소창 주소를 붙여 넣으세요.", "If the browser opened on another device, paste the address bar from the page it stopped on after approval.")}</label>
+      <div className="account-login-callback-row">
+        <input
+          id="codex-login-callback"
+          type="text"
+          autoComplete="off"
+          spellCheck={false}
+          value={draft}
+          placeholder="http://127.0.0.1:1455/auth/callback?code=…&state=…"
+          disabled={state !== "idle"}
+          onChange={(event) => { setDraft(event.target.value); setError(null); }}
+          onKeyDown={(event) => { if (event.key === "Enter") void submit(); }}
+        />
+        <button className="button compact primary" type="button" disabled={!draft.trim() || state !== "idle"} onClick={() => void submit()}>
+          {state === "sending" ? text("전달 중…", "Sending…") : text("승인 주소 전달", "Send approval address")}
+        </button>
+      </div>
+      {error && <p className="account-login-callback-error" role="alert">{error}</p>}
+      {state === "relayed" && <p className="account-login-callback-done" role="status">{text("로그인 CLI가 승인을 받았습니다. CLI가 종료되면 '로그인 완료 저장'이 켜집니다.", "The login CLI accepted the approval. 'Save login' turns on when the CLI exits.")}</p>}
+    </div>
+  );
 }
 
 /**
  * 로그인 창의 갈래. 공급자 하나가 원격 여부에 따라 다른 안내를 쓰므로, 갈래 이름은
  * 공급자가 아니라 "사용자가 무엇을 해야 하는가"로 짓는다.
  */
-type AccountLoginGuideKind = "googleConsent" | "pasteCode" | "deviceCode" | "localBrowser";
+type AccountLoginGuideKind = "googleConsent" | "pasteCode" | "deviceCode" | "localBrowser" | "pasteCallback";
 
 function accountLoginGuides(text: UiText): Record<AccountLoginGuideKind, string[]> {
   return {
@@ -196,6 +259,11 @@ function accountLoginGuides(text: UiText): Record<AccountLoginGuideKind, string[
       text("코드는 브라우저에 입력합니다. 이 터미널에 붙여넣을 필요는 없습니다.", "Enter the code in the browser. You do not need to paste it into this terminal."),
       text("브라우저 인증이 끝나면 CLI가 스스로 종료되고 '로그인 완료 저장' 버튼이 활성화됩니다.", "When browser authentication completes, the CLI will exit on its own and the 'Save completed login' button will be enabled."),
     ],
+    pasteCallback: [
+      text("터미널에 표시된 링크를 이 기기의 브라우저에서 열고 로그인을 승인하세요.", "Open the link shown in the terminal in this device's browser and approve the login."),
+      text("승인 뒤 브라우저는 127.0.0.1에 연결할 수 없다는 화면에서 멈춥니다. 정상입니다 — 그 주소창의 주소를 아래 '승인 주소 전달' 칸에 붙여 넣으세요.", "After approval the browser stops on a page saying it cannot reach 127.0.0.1. That is expected — paste the address from its address bar into the 'Send approval address' field below."),
+      text("CLI가 토큰을 받고 종료되면 '로그인 완료 저장' 버튼이 활성화됩니다.", "When the CLI receives the token and exits, the 'Save login' button will be enabled."),
+    ],
     localBrowser: [
       text("이 컴퓨터의 브라우저가 열리면 로그인만 마치세요. 터미널에 입력할 코드는 없습니다.", "When the browser on this computer opens, simply complete the login. There is no code to enter in the terminal."),
       text("브라우저가 자동으로 열리지 않으면 터미널에 표시된 주소를 직접 여세요.", "If the browser does not open automatically, open the address shown in the terminal directly."),
@@ -204,14 +272,15 @@ function accountLoginGuides(text: UiText): Record<AccountLoginGuideKind, string[
   };
 }
 
-function accountLoginGuideKind(provider: ProviderId, remote: boolean): AccountLoginGuideKind {
+function accountLoginGuideKind(provider: ProviderId, remote: boolean, codexMethod: CodexLoginMethod | undefined): AccountLoginGuideKind {
   if (provider === "antigravity") return "googleConsent";
   if (provider !== "codex") return "pasteCode";
-  // Codex만 원격에서 기기 코드 흐름으로 갈라진다. 백엔드가 같은 판정으로 CLI 인자를 고른다.
-  return remote ? "deviceCode" : "localBrowser";
+  // Codex는 고른 방식으로 갈린다. 브라우저 방식은 브라우저가 이 기기에 없을 때 붙여넣기가 필요하다.
+  if (codexMethod === "device") return "deviceCode";
+  return remote ? "pasteCallback" : "localBrowser";
 }
 
-function accountLoginPresentation(provider: ProviderId, remote: boolean, text: UiText): {
+function accountLoginPresentation(provider: ProviderId, remote: boolean, codexMethod: CodexLoginMethod | undefined, text: UiText): {
   introLines: string[];
   composerPlaceholder: string;
 } {
@@ -221,7 +290,7 @@ function accountLoginPresentation(provider: ProviderId, remote: boolean, text: U
       : text("브라우저 인증 코드 붙여넣기", "Paste browser authorization code"),
     introLines: [
       text("공급자 공식 CLI 로그인 전용 터미널", "Dedicated terminal for official provider CLI login"),
-      ...accountLoginGuides(text)[accountLoginGuideKind(provider, remote)],
+      ...accountLoginGuides(text)[accountLoginGuideKind(provider, remote, codexMethod)],
     ],
   };
 }
@@ -237,12 +306,14 @@ function accountLoginPresentation(provider: ProviderId, remote: boolean, text: U
  * 조건이 렌더 중에 ref를 직접 읽어 판단하고 있고, 그 판정을 상태로 옮기면 다시 그리는
  * 시점이 달라진다. 이 회차는 동작을 그대로 두는 것이 목적이라 읽는 문장도 그대로 둔다.
  */
-function useTerminalSurface({ openConnection, introLines, onCompletionChange, composerAlwaysVisible, exitLabel }: {
+function useTerminalSurface({ openConnection, introLines, onCompletionChange, composerAlwaysVisible, exitLabel, collectHints }: {
   openConnection: (cols: number, rows: number, onEvent: (event: TerminalEvent) => void) => Promise<TerminalConnection>;
   introLines: string[];
   onCompletionChange?: (complete: boolean) => void;
   composerAlwaysVisible: boolean;
   exitLabel: string;
+  /** 출력에서 주소·일회용 코드를 골라 버튼으로 꺼낼지. 로그인 터미널만 켠다. */
+  collectHints: boolean;
 }) {
   const { text } = useI18n();
   const hostRef = useRef<HTMLDivElement>(null);
@@ -255,6 +326,8 @@ function useTerminalSurface({ openConnection, introLines, onCompletionChange, co
   const phaseRef = useRef<TerminalSurfacePhase>("idle");
   const [error, setError] = useState<string | null>(null);
   const [sentFeedback, setSentFeedback] = useState<string | null>(null);
+  const [hints, setHints] = useState<TerminalHints | null>(null);
+  const hintCollectorRef = useRef<TerminalHintCollector | null>(collectHints ? new TerminalHintCollector() : null);
 
   const updatePhase = (next: TerminalSurfacePhase) => {
     phaseRef.current = next;
@@ -298,9 +371,10 @@ function useTerminalSurface({ openConnection, introLines, onCompletionChange, co
 
   const handleEvent = (event: TerminalEvent) => {
     if (event.type === "output") {
-      terminalRef.current?.write(
-        event.data instanceof Uint8Array ? event.data : new Uint8Array(event.data),
-      );
+      const bytes = event.data instanceof Uint8Array ? event.data : new Uint8Array(event.data);
+      terminalRef.current?.write(bytes);
+      const changed = hintCollectorRef.current?.push(bytes);
+      if (changed) setHints(changed);
       return;
     }
     if (event.type === "state") {
@@ -330,6 +404,9 @@ function useTerminalSurface({ openConnection, introLines, onCompletionChange, co
   const connect = async () => {
     const terminal = terminalRef.current;
     if (!terminal || connectionRef.current) return;
+    // 새 연결의 출력만 본다. 다시 연 로그인 CLI는 새 주소·새 코드를 찍는다.
+    hintCollectorRef.current?.reset();
+    setHints(null);
     setError(null);
     setSentFeedback(null);
     updatePhase("connecting");
@@ -380,7 +457,60 @@ function useTerminalSurface({ openConnection, introLines, onCompletionChange, co
     setSentFeedback(value || "(Enter)");
   };
 
-  return { hostRef, mobileInputElementRef, connectionRef, info, phase, error, sentFeedback, connect, stop, sendMobileLine };
+  return { hostRef, mobileInputElementRef, connectionRef, info, phase, error, sentFeedback, hints, setError, connect, stop, sendMobileLine };
+}
+
+/**
+ * 터미널 출력에서 꺼낸 주소·일회용 코드를 버튼으로 보인다. 원격 화면, 특히 모바일에서는
+ * xterm 안의 글자를 긁어 복사하기 어렵고 긴 OAuth 주소는 여러 줄로 접혀 보이므로, 여는
+ * 것과 복사하는 것을 버튼 한 번으로 끝내게 한다. 출력은 신뢰할 수 없는 데이터라 여는 쪽이
+ * http(s)만 받는다(`openExternalUrl`).
+ */
+function TerminalHintBar({ hints, onError }: { hints: TerminalHints; onError: (message: string) => void }) {
+  const { text } = useI18n();
+  const [copied, setCopied] = useState<string | null>(null);
+  const copiedTimerRef = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current);
+  }, []);
+
+  const copy = async (value: string) => {
+    try {
+      await writeClipboardText(value);
+      setCopied(value);
+      if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = window.setTimeout(() => setCopied(null), 1800);
+    } catch (cause) {
+      onError(errorText(cause));
+    }
+  };
+  const open = (url: string) => {
+    void openExternalUrl(url).catch((cause) => onError(errorText(cause)));
+  };
+
+  return (
+    <div className="terminal-hints" role="group" aria-label={text("터미널에서 꺼낸 주소와 코드", "Addresses and codes found in the terminal")}>
+      {hints.links.map((url) => (
+        <div className="terminal-hint" key={`link:${url}`}>
+          <span className="terminal-hint-kind">{text("주소", "Link")}</span>
+          <code className="terminal-hint-value" title={url}>{hintLinkLabel(url)}</code>
+          <button className="button primary" type="button" onClick={() => open(url)}>{text("브라우저에서 열기", "Open in browser")}</button>
+          <button className="button" type="button" onClick={() => void copy(url)}>
+            {copied === url ? text("복사됨", "Copied") : text("주소 복사", "Copy address")}
+          </button>
+        </div>
+      ))}
+      {hints.codes.map((code) => (
+        <div className="terminal-hint" key={`code:${code}`}>
+          <span className="terminal-hint-kind">{text("일회용 코드", "One-time code")}</span>
+          <code className="terminal-hint-value terminal-hint-code">{code}</code>
+          <button className="button" type="button" onClick={() => void copy(code)}>
+            {copied === code ? text("복사됨", "Copied") : text("코드 복사", "Copy code")}
+          </button>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function TerminalSurface({
@@ -395,6 +525,7 @@ function TerminalSurface({
   composerAlwaysVisible = false,
   composerPlaceholder,
   exitLabel,
+  collectHints = false,
   setup = false,
 }: {
   connect: (cols: number, rows: number, onEvent: (event: TerminalEvent) => void) => Promise<TerminalConnection>;
@@ -410,13 +541,15 @@ function TerminalSurface({
   composerPlaceholder?: string;
   /** 종료 줄에 남길 이름. 공급자 CLI가 아닌 터미널(SSH 셸)은 "CLI"라고 부를 수 없다. */
   exitLabel?: string;
+  /** 출력의 주소·일회용 코드를 버튼으로 꺼낸다. 로그인 터미널만 켠다. */
+  collectHints?: boolean;
   setup?: boolean;
 }) {
   const { text } = useI18n();
   const effectivePlaceholder = composerPlaceholder ?? text("모바일 터미널 입력", "Mobile terminal input");
   const effectiveExitLabel = exitLabel ?? text("CLI 종료", "Exit CLI");
-  const { hostRef, mobileInputElementRef, connectionRef, info, phase, error, sentFeedback, connect, stop, sendMobileLine } =
-    useTerminalSurface({ openConnection, introLines, onCompletionChange, composerAlwaysVisible, exitLabel: effectiveExitLabel });
+  const { hostRef, mobileInputElementRef, connectionRef, info, phase, error, sentFeedback, hints, setError, connect, stop, sendMobileLine } =
+    useTerminalSurface({ openConnection, introLines, onCompletionChange, composerAlwaysVisible, exitLabel: effectiveExitLabel, collectHints });
 
   const canConnect = (phase === "idle" || isFinished(phase)) && !connectionRef.current && !blockedReason;
 
@@ -440,6 +573,7 @@ function TerminalSurface({
       </header>
       {blockedReason && <NoticeBanner message={blockedReason} />}
       {error && <ErrorBanner message={error} />}
+      {hasTerminalHints(hints) && <TerminalHintBar hints={hints} onError={setError} />}
       <div className="terminal-host" ref={hostRef} />
       <TerminalLineComposer
         inputRef={mobileInputElementRef}

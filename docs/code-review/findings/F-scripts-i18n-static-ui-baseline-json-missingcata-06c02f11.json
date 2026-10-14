@@ -1,0 +1,12 @@
+{
+  "findingId": "F-scripts-i18n-static-ui-baseline-json-missingcata-06c02f11",
+  "file": "scripts/i18n-static-ui-baseline.json",
+  "symbol": "missingCatalog",
+  "symptom": "정적 감사 기준선을 넘겨 i18n 게이트가 붉다",
+  "detail": "`node scripts/check-i18n-static-ui.mjs`가 missingCatalog=344로 기준선 335를 넘겨 종료 코드 1이다. 기준선은 2026-10-02(0ca36072)에 쟀고 그 뒤 작업브랜치에 200건 넘게 착지했다. 지금까지는 같은 npm 스크립트의 앞 칸(generate-ui-catalog --check)이 F-scripts-generate-ui-catalog-mjs-check-4e045831로 먼저 떨어져 이 실패가 가려져 있었다.",
+  "severity": "P2",
+  "state": "unconfirmed",
+  "agentsRules": ["V4"],
+  "occurrences": [{ "itemId": "C-af9507eabc40", "at": "2026-10-06T00:00:00Z", "lane": "L07" }],
+  "triage": "이 항목의 커밋이 원인이 아님을 확인했다. git archive 로 af9507eabc40^ · af9507eabc40 · HEAD 세 트리를 떠 auditStaticUi()를 돌렸고 셋 다 missingCatalog=344였다. 어느 커밋이 335를 넘겼는지는 이 항목의 읽기 범위 밖이라 짚지 못했으므로 고치지 않는다. 기준선을 다시 재는 것은 점검표 범위 변경이라 사람이 정할 자리로 올렸다."
+}

@@ -1,0 +1,25 @@
+{
+  "itemId": "C-bd0ac165f76e",
+  "kind": "commit",
+  "ref": "bd0ac165f76e4ca743e091329ac59145bc78e717",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L06",
+  "source": "claude",
+  "verdict": "결함 1건(기존 열린 결함의 여덟 번째 관측) / 새 결함 0건 / 수정 0건",
+  "axes": {
+    "정확성": "커밋이 주장한 사실을 전부 되재어 어긋나는 것이 없었다. (1) 더한 queue.json 의 counts(커밋 219 · 모듈 234 · reviewed 34, remaining 453)가 그 트리의 실제 수와 맞는다 — git ls-tree 로 센 reviewed/*.json 이 34개이고 219+234=453 이다. reviewed 가 33→34 로 올랐는데 커밋 수가 219 로 그대로인 것은 결함이 아니다. 러너는 rebase 뒤의 작업브랜치를 세고, 같은 사이 다른 레인의 회차 커밋이 한 건 착지해 분모도 함께 늘기 때문이다. (2) 새 finding 의 findingId 가 생성기와 일치한다 — findingId({file:'docs/code-review/reviewed/C-175c75ac0bd3.json',symbol:'commitMessage',symptom:<적힌 증상>}) 가 F-docs-code-review-reviewed-c-175c75ac0bd3-json-co-fd0f34ac 를 돌려줘 파일 이름과 같다. (3) 기존 결함 note 에 적은 수(그 시점 reviewed 31 중 29, findings 14 중 fixed 이면서 fixCommits 빈 것 6)를 4ebe28fa93c1 트리에서 직접 세어 31·29 / 14·6 으로 똑같이 나왔다.",
+    "보안 불변식": "해당 없음. docs/code-review 아래 JSON 넷만 바꾸며 AGENTS.md 2절 G1~G11 이 다루는 자격증명 저장·공급자 소유 저장소·셸 문자열 조립·경로 정규화·쓰기 게이트 어느 것에도 닿지 않고, 3절 C 직접변경 예외에도 걸리지 않는다.",
+    "계약": "결함 1건. 더한 reviewed/C-4ebe28fa93c1.json 의 `commits` 가 또 빈 배열이라 README '장부 파일의 모양'이 요구하는 값을 채우지 못한다. 이미 열려 있는 F-docs-code-review-readme-md-commits-6f902967 이라 새 finding 을 만들지 않고 occurrences 에 이번 관측으로 덧붙였다(그 시점 reviewed 34 중 32, findings 15 중 6). 같은 주제의 결정이 round-383bc1ee75694815bbb5add11d45bfc9 에 열려 있어 다시 올리지 않는다. 한편 이 커밋이 지적한 D3 트레일러 파손은 되재어 사실임을 확인했다 — git log -1 --pretty='%b' 4ebe28fa93c1 의 본문이 역슬래시-n 두 글자를 담은 한 줄이고 %(trailers:key=Co-Authored-By) 가 빈 줄을 돌려준다. 반면 이 커밋 자신(bd0ac165f76e)의 트레일러는 정상으로 읽혀 같은 실수를 되풀이하지 않았다.",
+    "검증 없음": "문서 장부만 바꾼 커밋이라 제품 시험이 걸리는 자리가 없다. 대신 커밋이 적은 주장 — queue.json 의 수, findingId, 트레일러 파손, note 안의 집계 — 을 모두 러너와 git 으로 직접 되재어 확인했다.",
+    "단순화·중복": "결함 없음. 이미 열린 결함을 새 finding 으로 복제하지 않았고 findingId 는 손으로 짓지 않고 생성기에서 받았다. 다만 새 finding 의 `file` 이 결함의 실제 자리(커밋 메시지)가 아니라 그 커밋이 더한 장부 파일에 걸려 있어, 같은 종류가 다른 커밋에서 또 나오면 findingId 가 달라져 occurrences 로 모이지 않는다. 커밋 메시지는 저장소 파일이 아니라 규약상 더 나은 anchor 가 없어 결함으로 세지 않고 여기 적어 둔다."
+  },
+  "findings": ["F-docs-code-review-readme-md-commits-6f902967"],
+  "verification": [
+    "git ls-tree -r bd0ac165f76e / bd0ac165f76e^ docs/code-review/reviewed 로 queue.json 의 reviewed 33→34 대조",
+    "node --experimental-strip-types 로 findingId() 재계산 → F-docs-code-review-reviewed-c-175c75ac0bd3-json-co-fd0f34ac 일치",
+    "git log -1 --pretty='%b' | cat -A 4ebe28fa93c1 (리터럴 \\n) 및 %(trailers:key=Co-Authored-By) (빈 줄) 대 bd0ac165f76e (공동저자 반환)",
+    "4ebe28fa93c1 트리에서 reviewed/findings 를 돌며 commits·fixCommits 빈 건수를 세어 31·29 / 14·6 확인",
+    "node --experimental-strip-types scripts/code-review-queue.mjs --json (ledgerDuplicates 0, 종료 코드 0)"
+  ],
+  "commits": []
+}

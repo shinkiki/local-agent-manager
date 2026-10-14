@@ -529,7 +529,7 @@ fn read_codex_exporter(loaded: &LoadedFile, spec: &OptionSpec) -> TelemetryOptio
                 Some(other.to_owned()),
                 "OTLP 내보내기가 구성되어 있어 화면에서 바꾸지 않습니다",
             ),
-            None => unknown(spec, None, NOT_A_STRING),
+            None => unknown(spec, raw_toml_scalar(item), NOT_A_STRING),
         },
     }
 }
@@ -545,9 +545,29 @@ fn read_codex_otel_flag(
         OtelEntry::NotATable => unknown(spec, None, OTEL_NOT_A_TABLE),
         OtelEntry::Value(item) => match item.as_bool() {
             Some(value) => known_flag(spec, value),
-            None => unknown(spec, None, NOT_A_BOOL),
+            None => unknown(spec, raw_toml_scalar(item), NOT_A_BOOL),
         },
     }
+}
+
+/// 해석하지 못한 TOML 값의 원문. 화면이 그 값을 그대로 보여 주어야 사용자가 왜 잠겼는지
+/// 안다(C13-4) — JSON 쪽 갈래가 `other.to_string()`을 넘기는 것과 같은 자리다.
+/// 스칼라만 옮긴다: 문자열이 아닌 `exporter`는 대개 OTLP 표이고 그 안의 `headers`에는
+/// 수집기 API 키가 들어 있어, 표를 그대로 넘기면 비밀값이 화면에 닿는다(G4).
+fn raw_toml_scalar(item: &Item) -> Option<String> {
+    // 허용 목록으로 고른다 — 새 복합 종류가 생겨도 닫힌 쪽으로 남는다. 같은 줄의 주석은
+    // decor에 붙어 `to_string()`에 섞여 나오므로 지우고 옮긴다(주석은 값이 아니다).
+    let mut value = item.as_value()?.clone();
+    if !(value.is_str()
+        || value.is_integer()
+        || value.is_float()
+        || value.is_bool()
+        || value.is_datetime())
+    {
+        return None;
+    }
+    value.decor_mut().clear();
+    Some(value.to_string())
 }
 
 /// 항목 하나의 현재 상태. 파일이 통째로 깨졌는지만 여기서 가르고, 나머지는 자리마다
@@ -941,6 +961,56 @@ mod tests {
         assert!(!option.editable);
         assert_eq!(option.current.as_deref(), Some("maybe"));
         assert!(fixture.set("claude.telemetry", true).is_err());
+    }
+
+    #[test]
+    fn codex_reports_the_raw_value_it_cannot_interpret() {
+        // C13-4: 해석하지 못한 값은 원문과 함께 보고된다. Codex 갈래가 원문을 버려
+        // 화면에는 잠긴 토글만 남고 무엇이 적혀 있는지는 보이지 않았다.
+        let fixture = Fixture::new();
+        fixture.write(
+            ".codex/config.toml",
+            "[otel]\nexporter = 3\nlog_user_prompt = \"yes\"\n",
+        );
+        let exporter = fixture.option("codex.telemetry");
+        assert!(!exporter.editable);
+        assert_eq!(exporter.current.as_deref(), Some("3"));
+        let prompt = fixture.option("codex.promptLogging");
+        assert!(!prompt.editable);
+        assert_eq!(prompt.current.as_deref(), Some("\"yes\""));
+    }
+
+    #[test]
+    fn codex_never_echoes_an_otlp_exporter_table() {
+        // G4: OTLP 표의 headers에는 수집기 API 키가 들어 있다. 원문 보고는 스칼라에만 한다.
+        let fixture = Fixture::new();
+        fixture.write(
+            ".codex/config.toml",
+            "[otel]\nexporter = { otlp-http = { endpoint = \"https://x\", headers = { \"x-api-key\" = \"sk-secret\" } } }\n",
+        );
+        let exporter = fixture.option("codex.telemetry");
+        assert!(!exporter.editable);
+        assert_eq!(exporter.current, None);
+        fixture.write(
+            ".codex/config.toml",
+            "[otel.exporter.otlp-http]\nendpoint = \"https://x\"\nheaders = { \"x-api-key\" = \"sk-secret\" }\n",
+        );
+        assert_eq!(fixture.option("codex.telemetry").current, None);
+        fixture.write(".codex/config.toml", "[otel]\nexporter = [\"sk-secret\"]\n");
+        assert_eq!(fixture.option("codex.telemetry").current, None);
+    }
+
+    #[test]
+    fn codex_raw_value_leaves_a_trailing_comment_behind() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".codex/config.toml",
+            "[otel]\nexporter =   3   # key sk-secret\n",
+        );
+        assert_eq!(
+            fixture.option("codex.telemetry").current.as_deref(),
+            Some("3")
+        );
     }
 
     #[test]

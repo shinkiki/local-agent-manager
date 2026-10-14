@@ -1,6 +1,6 @@
 //! 선언형 온보딩 카드 팩 로더와 검증기(W6).
 //!
-//! 애드온 → 자동화 탭의 온보딩 카드는 예전에 화면 코드에 그대로 박혀 있었다. 다른
+//! 워크플로 → 자동화 탭의 온보딩 카드는 예전에 화면 코드에 그대로 박혀 있었다. 다른
 //! 시스템을 위한 온보딩을 하나 더 만들려면 React 컴포넌트를 또 쓰고 앱을 다시 배포해야
 //! 했고, 사용자가 자기 절차에 맞춰 단계를 바꾸는 길은 아예 없었다.
 //!
@@ -1299,7 +1299,7 @@ mod tests {
             .find(|field| field.key == "branch")
             .expect("브랜치 칸");
         assert_eq!(branch.kind, AiaOnboardingFieldKind::BranchPicker);
-        // 리모트를 붙인 이름(private/dev-history)은 로컬 목록에 없으므로 직접 적을 수 있어야 한다.
+        // 리모트를 붙인 이름(upstream/feature/x)은 로컬 목록에 없으므로 직접 적을 수 있어야 한다.
         assert!(branch.allow_other);
         // 비워 두는 것이 "커밋하지 않는다"는 뜻이므로 필수가 아니다.
         assert!(!branch.required);

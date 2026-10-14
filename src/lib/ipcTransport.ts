@@ -13,7 +13,15 @@
  * 예전 그대로 `lib/ipc`다.
  */
 import { invoke } from "@tauri-apps/api/core";
-import { backendError } from "./backendErrors";
+import { backendError, BackendCodedError } from "./backendErrors";
+import {
+  loginRequiredStore,
+  loginRequirementFromParams,
+  loginSessionHeaders,
+  LoginRequiredError,
+  setLoginSessionToken,
+  type LoginRequirement,
+} from "./loginSession.ts";
 import {
   assertBackendStoreIdentity,
   backendHttpUrl,
@@ -28,8 +36,12 @@ import {
 /** 이 UI가 요구하는 백엔드 계약. 백엔드 `REMOTE_API_PROTOCOL_VERSION`과 **정확히**
  *  같아야 하므로 한쪽만 올리면 모든 요청이 버전 불일치로 막힌다. 함께 올릴 것.
  *  9: SSH 공개키 본문 조회·키 삭제·키 메모를 지원한다.
- *  10: Antigravity 페이싱 자원의 사용량 행 조회를 지원한다. */
-const EXPECTED_BACKEND_PROTOCOL_VERSION = 11;
+ *  10: Antigravity 페이싱 자원의 사용량 행 조회를 지원한다.
+ *  11: 프로젝트 파일 조회와 C16 git 형상관리 명령을 지원한다.
+ *  12: C20 접근 채널 로그인 — `/api/access`가 `channel`·`authenticated`·`loginRequired`를
+ *      싣고 `writable`을 버렸다.
+ *      헤드리스 표시(`headless`)도 함께 온다. */
+const EXPECTED_BACKEND_PROTOCOL_VERSION = 12;
 
 /** 단일 백엔드까지 요청이 도달하지 못한 네트워크 수준 실패. */
 export class RemoteConnectionError extends Error {
@@ -57,7 +69,17 @@ function errorMessageFrom(payload: unknown): string | null {
  *  본문이 안정 코드를 함께 보냈으면 문구는 화면이 고른다(`backendErrors.ts`) — 백엔드
  *  문장은 한국어뿐이라 다른 언어에서는 그대로 쓸 수 없다. */
 function failedResponseError(payload: unknown, status: number, fallback: string): Error {
-  return backendError(payload, errorMessageFrom(payload) || `${fallback} (${status})`);
+  const error = backendError(payload, errorMessageFrom(payload) || `${fallback} (${status})`);
+  // C20. 채널이 로그인을 요구하는데 세션이 없거나 끝났다. 들고 있던 토큰은 더 이상 유효하지
+  // 않으니 버리고, 게이트가 로그인 화면을 띄우게 알린다. 악수도 다시 맺어야 한다.
+  if (status === 401 && error instanceof BackendCodedError && error.code === "LOGIN_REQUIRED") {
+    const requirement = loginRequirementFromParams(error.params);
+    setLoginSessionToken(null);
+    resetBackendProtocolHandshake();
+    loginRequiredStore.raise(requirement);
+    return new LoginRequiredError(requirement, error.message);
+  }
+  return error;
 }
 
 /** 실패한 응답의 본문을 읽어 던질 오류를 만든다. 성공 응답에는 쓰지 않는다 —
@@ -66,12 +88,22 @@ export async function responseError(response: Response, fallback: string): Promi
   return failedResponseError(await readJsonPayload(response), response.status, fallback);
 }
 
+/** 백엔드로 나가는 모든 `fetch`. 세션 토큰이 있으면 헤더로 싣는다(C20). */
 export async function remoteFetch(input: string, init?: RequestInit): Promise<Response> {
   try {
-    return await fetch(input, init);
+    return await fetch(input, withLoginSession(init));
   } catch (cause) {
     throw new RemoteConnectionError(cause);
   }
+}
+
+/** 요청 옵션에 세션 헤더를 얹는다. 호출부가 준 헤더는 그대로 두고 하나만 더한다. */
+export function withLoginSession(init?: RequestInit): RequestInit | undefined {
+  const session = loginSessionHeaders();
+  if (Object.keys(session).length === 0) return init;
+  const headers = new Headers(init?.headers);
+  for (const [name, value] of Object.entries(session)) headers.set(name, value);
+  return { ...init, headers };
 }
 
 /** 백엔드로 나가는 JSON 본문 POST. 요청 조립(메서드·헤더·직렬화)이 호출·다운로드
@@ -199,7 +231,25 @@ export interface WebAccessStatus {
   backendPort: number;
   mode: "local" | "tailscale";
   remote: boolean;
-  writable: boolean;
+  /** C20. 서버가 가른 접근 채널. `native`는 Origin 없는 루프백 호출자라 화면에는 오지 않는다. */
+  channel: AccessChannel;
+  /** 이 채널이 요구하는 수단을 세션으로 이미 만족했는지. 요구가 없으면 false여도 무방하다. */
+  authenticated: boolean;
+  /** 이 채널이 요구하는 로그인 수단. 둘 다 false면 로그인 없이 연다. */
+  loginRequired: LoginRequirement;
+  /**
+   * 이 백엔드에 데스크톱 호스트 화면이 아예 없는지(NAS 같은 헤드리스 기동).
+   * `remote`는 "지금 접속자가 원격인가"라 호스트 브라우저에서는 false가 되지만,
+   * 헤드리스에서는 돌아갈 호스트 앱 자체가 없으므로 따로 받는다.
+   */
+  headless: boolean;
+}
+
+export type AccessChannel = "desktop" | "localBrowser" | "remote" | "native";
+
+/** 지금 로그인 화면을 띄워야 하는 악수 결과인지. */
+export function accessNeedsLogin(access: WebAccessStatus): boolean {
+  return !access.authenticated && (access.loginRequired.password || access.loginRequired.otp);
 }
 
 let backendProtocolHandshake: Promise<WebAccessStatus> | null = null;
@@ -243,12 +293,20 @@ type WebAccessPayload = Partial<WebAccessStatus> & { error?: string };
 
 /** 필수 필드가 모두 제 모양으로 온 악수 응답. 확정 단계는 이 모양만 읽는다. */
 type CheckedWebAccessPayload =
-  WebAccessPayload & Pick<WebAccessStatus, "mode" | "remote" | "writable" | "instanceId">;
+  WebAccessPayload & Pick<WebAccessStatus, "mode" | "remote" | "channel" | "authenticated" | "loginRequired" | "headless" | "instanceId">;
+
+const ACCESS_CHANNELS: readonly AccessChannel[] = ["desktop", "localBrowser", "remote", "native"];
 
 function hasRequiredWebAccessFields(payload: WebAccessPayload): payload is CheckedWebAccessPayload {
   return (payload.mode === "local" || payload.mode === "tailscale")
     && typeof payload.remote === "boolean"
-    && typeof payload.writable === "boolean"
+    && ACCESS_CHANNELS.includes(payload.channel as AccessChannel)
+    && typeof payload.authenticated === "boolean"
+    && typeof payload.loginRequired?.password === "boolean"
+    && typeof payload.loginRequired?.otp === "boolean"
+    // 버전을 올린 이유 중 하나가 이 필드다. v12를 자처하면서 빠뜨린 응답을 관대하게 "데스크톱"으로
+    // 읽으면, 헤드리스 화면이 돌아갈 데 없는 호스트 앱을 가리키는 쪽으로 조용히 되돌아간다.
+    && typeof payload.headless === "boolean"
     && typeof payload.instanceId === "string" && payload.instanceId.length > 0;
 }
 
@@ -300,6 +358,9 @@ function validatedWebAccessStatus(payload: WebAccessPayload | null): WebAccessSt
     backendPort: resolvedBackendPort(checked.backendPort, checked.mode),
     mode: checked.mode,
     remote: checked.remote,
-    writable: checked.writable,
+    channel: checked.channel,
+    authenticated: checked.authenticated,
+    loginRequired: { password: checked.loginRequired.password, otp: checked.loginRequired.otp },
+    headless: checked.headless,
   };
 }

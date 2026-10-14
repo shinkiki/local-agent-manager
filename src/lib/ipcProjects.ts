@@ -13,6 +13,7 @@ import type {
   CheckProjectOverlayApplyRequest,
   DeleteProjectOverlaySetRequest,
   DocumentEntryPage,
+  ExcludeProjectOverlayPathsRequest,
   GitActionReceipt,
   GitBranchComparison,
   GitCommitFiles,
@@ -25,7 +26,10 @@ import type {
   ProjectFileSearchPage,
   ProjectBranchFollows,
   ProjectFileSearchRequest,
+  ProjectOverlayReapply,
   ProjectOverlayReceipt,
+  ProjectOverlayDrift,
+  ProjectOverlayPatch,
   ProjectOverlaySets,
   ProjectGitCommitFilesRequest,
   ProjectGitComparisonRequest,
@@ -40,6 +44,8 @@ import type {
   ProjectGitStashRequest,
   ProjectGitSwitchRequest,
   ReadProjectFileRequest,
+  ReadProjectOverlayPatchRequest,
+  ReapplyProjectOverlaysRequest,
   SaveProjectOverlaySetRequest,
   SnapshotProjectOverlayRequest,
   SetProjectBranchFollowRequest,
@@ -158,6 +164,51 @@ export function listProjectOverlaySets(projectPath: string): Promise<ProjectOver
 }
 
 /**
+ * 보관된 overlay 세트의 patch 본문을 읽는다(C19-5).
+ *
+ * 스냅샷이 끝나면 작업 트리는 HEAD 원본으로 돌아가므로, 사용자가 하던 변경의 **유일한
+ * 사본**은 앱 데이터 안의 patch 파일이 된다. 그래서 `checkProjectOverlayApply`가
+ * `overlayNeedsResolution`을 돌려준 자리에서 이 읽기가 필요하다 — 충돌한 경로 이름만으로는
+ * 무엇을 손으로 다시 적어야 하는지 알 수 없다.
+ *
+ * git을 띄우지 않으므로 저장소가 잠겨 있어도 답한다. `digestMatches`가 거짓이면 장부와
+ * 디스크의 patch가 어긋나 적용도 거절되는 상태이고, `reason`은 본문을 싣지 못했거나 상한에서
+ * 끊은 사유다.
+ */
+export function readProjectOverlayPatch(
+  request: ReadProjectOverlayPatchRequest,
+): Promise<ProjectOverlayPatch> {
+  return call<ProjectOverlayPatch>("read_project_overlay_patch", { request });
+}
+
+/**
+ * 터미널 같은 **외부** Git 작업이 있었는지 묻는다(C19-3). 보관된 patch의 기준 HEAD와 지금
+ * HEAD가 다른 세트가 `headMoved: true`·`trigger: "external"`로 실려 온다.
+ *
+ * 답을 받아도 화면은 **자동으로 적용하지 않는다.** C19-3이 외부 작업 뒤의 자동 적용을
+ * 금지했기 때문이다 — 사람이 터미널에서 무엇을 하던 중인지 앱은 모른다. 화면이 하는 일은
+ * `checkProjectOverlayApply` 결과와 적용 버튼을 내미는 데까지다.
+ */
+export function getProjectOverlayDrift(projectPath: string): Promise<ProjectOverlayDrift> {
+  return call<ProjectOverlayDrift>("get_project_overlay_drift", { request: { projectPath } });
+}
+
+/**
+ * 앱이 시작한 Git 작업(switch·pull·rebase) **직후에** 보관된 overlay 세트를 모두 작업
+ * 트리에 다시 넣는다(C19-3). 자동 적용이 허용되는 유일한 자리다 — 터미널에서 사람이 옮긴
+ * 경우는 `getProjectOverlayDrift`가 버튼만 내미는 것으로 끝난다.
+ *
+ * Git 작업이 **실패했을 때도** 부른다. 실패한 switch는 HEAD를 움직이지 않지만 스냅샷으로
+ * 빠져 있던 로컬 변경은 그대로 빠져 있고, 그 상태를 그냥 두면 사용자는 자기 설정이 사라진
+ * 작업 트리에서 계속 일하게 된다(C19-3의 "이전 브랜치에서 재적용").
+ */
+export function reapplyProjectOverlays(
+  request: ReapplyProjectOverlaysRequest,
+): Promise<ProjectOverlayReapply> {
+  return call<ProjectOverlayReapply>("reapply_project_overlays", { request });
+}
+
+/**
  * overlay 세트를 만들거나 고친다. `setId`를 비우면 새 세트다. 민감 경로가 하나라도 걸리면
  * 영수증의 `outcome`이 `rejected`이고 **아무것도 저장되지 않는다** — 일부만 담으면 사용자가
  * 고른 파일이 전부 들어갔다고 믿은 채 브랜치를 옮기게 된다(C19-2).
@@ -178,6 +229,20 @@ export function applyProjectOverlay(
   request: ApplyProjectOverlayRequest,
 ): Promise<ProjectOverlayReceipt> {
   return call<ProjectOverlayReceipt>("apply_project_overlay", { request });
+}
+
+/**
+ * 세트에서 경로 몇 개를 빼고 보관한 patch에서도 그 구역을 덜어낸다(C19-3).
+ *
+ * 적용이 `overlayNeedsResolution`으로 막았을 때, 막은 것이 세트 안의 한 파일뿐이면 세트를
+ * 통째로 버릴 이유가 없다 — 버리면 막지 않은 경로의 로컬 설정까지 같이 사라진다. 덜어내기
+ * 전의 patch는 지워지지 않고 앱 소유 휴지통으로 옮겨지고(C19-5), 빠진 경로는 영수증의
+ * `affected`에 실린다. 작업 트리는 한 글자도 바뀌지 않는다.
+ */
+export function excludeProjectOverlayPaths(
+  request: ExcludeProjectOverlayPathsRequest,
+): Promise<ProjectOverlayReceipt> {
+  return call<ProjectOverlayReceipt>("exclude_project_overlay_paths", { request });
 }
 
 export function deleteProjectOverlaySet(

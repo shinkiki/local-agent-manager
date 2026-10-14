@@ -1,0 +1,21 @@
+{
+  "findingId": "F-src-lib-gitbranchtree-ts-tonode-e552d7a4",
+  "file": "src/lib/gitBranchTree.ts",
+  "symbol": "toNode",
+  "symptom": "외자식 폴더 압축이 중첩 폴더의 자식 표시 깊이를 잃는다",
+  "severity": "P2",
+  "state": "unconfirmed",
+  "agentsRules": [],
+  "occurrences": [
+    {
+      "itemId": "C-569fb7a2a444",
+      "at": "2026-10-06T00:00:00Z"
+    },
+    {
+      "itemId": "C-1186bef6c8a7",
+      "at": "2026-10-06T00:00:00Z"
+    }
+  ],
+  "fixCommits": [],
+  "note": "재현되지 않았다. 569fb7a2a444 시점의 gitBranchTree.ts 를 그대로 꺼내 origin/feature/x·origin/feature/y 를 넣어 돌린 결과 폴더 label 은 origin/feature, 자식 잎 label 은 x·y 로 올바르게 나왔다(origin/feature/a/x·origin/feature/b/y 는 a/x·b/y). 원인은 buildChildren 의 prefixLength 가 잎에 쓰이지 않기 때문이다 — 잎의 label 은 buildGitBranchTree 가 segments 의 마지막 조각으로 미리 정하고, prefixLength 는 toNode 로 들어가는 폴더 자식에만 쓰인다. 압축된 폴더의 path 는 merged.path 이고 그 폴더의 buildChildren 이 쓰는 prefixLength 도 merged.path 길이라 어긋나지 않는다. 처음 기록은 af9507e 가 이 결함을 고쳤다고 적었으나, 고칠 결함 자체가 없었으므로 fixCommits 를 비우고 state 를 unconfirmed 로 되돌린다(회차 절차 4절 1번)."
+}

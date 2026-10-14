@@ -1,7 +1,7 @@
 import { ShieldCheck } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
-import { getProviderTelemetry, getWebAccessStatus, setProviderTelemetryOption, type WebAccessStatus } from "../lib/ipc";
+import { getProviderTelemetry, setProviderTelemetryOption } from "../lib/ipc";
 import { useI18n } from "../lib/i18n";
 import { displayPath } from "../lib/displayPath";
 import { errorText } from "../lib/errorText";
@@ -22,20 +22,18 @@ import { AppToggle, ErrorBanner, HelpHint, useBusyAction } from "./Shared";
 export function TelemetrySettingsCard({ active }: { active: boolean }) {
   const { text } = useI18n();
   const [snapshot, setSnapshot] = useState<ProviderTelemetrySnapshot | null>(null);
-  const [access, setAccess] = useState<WebAccessStatus | null>(null);
   const { busy, error, setError, run } = useBusyAction();
   const loadedRef = useRef(false);
-  const canWrite = access?.writable === true;
 
+  // C20: 로그인한 채널은 호스트와 같은 권한이라 접근 상태는 읽지 않는다. 토글을 잠그는 것은
+  // 항목 자체의 편집 가능 여부(C13-4)와 진행 중인 쓰기뿐이다.
   useEffect(() => {
     if (!active) { loadedRef.current = false; return; }
     if (loadedRef.current) return;
     loadedRef.current = true;
     void (async () => {
       try {
-        const [states, writable] = await Promise.all([getProviderTelemetry(), getWebAccessStatus()]);
-        setSnapshot(states);
-        setAccess(writable);
+        setSnapshot(await getProviderTelemetry());
         setError(null);
       } catch (cause) {
         setError(errorText(cause));
@@ -78,7 +76,6 @@ export function TelemetrySettingsCard({ active }: { active: boolean }) {
             key={file.provider}
             file={file}
             busy={busy}
-            canWrite={canWrite}
             onToggle={toggle}
           />
         ))}
@@ -92,10 +89,9 @@ export function TelemetrySettingsCard({ active }: { active: boolean }) {
 }
 
 /** 공급자 하나의 설정 파일과 그 안 항목들. */
-function TelemetryProviderBlock({ file, busy, canWrite, onToggle }: {
+function TelemetryProviderBlock({ file, busy, onToggle }: {
   file: ProviderTelemetryFile;
   busy: string | null;
-  canWrite: boolean;
   onToggle: (option: TelemetryOptionState, blocked: boolean) => void;
 }) {
   const { text } = useI18n();
@@ -122,7 +118,6 @@ function TelemetryProviderBlock({ file, busy, canWrite, onToggle }: {
             key={option.key}
             option={option}
             busy={busy === option.key}
-            canWrite={canWrite}
             onToggle={onToggle}
           />
         ))}
@@ -131,10 +126,9 @@ function TelemetryProviderBlock({ file, busy, canWrite, onToggle }: {
   );
 }
 
-function TelemetryOptionRow({ option, busy, canWrite, onToggle }: {
+function TelemetryOptionRow({ option, busy, onToggle }: {
   option: TelemetryOptionState;
   busy: boolean;
-  canWrite: boolean;
   onToggle: (option: TelemetryOptionState, blocked: boolean) => void;
 }) {
   const { text } = useI18n();
@@ -143,7 +137,7 @@ function TelemetryOptionRow({ option, busy, canWrite, onToggle }: {
   // 값이 없으면 공급자 기본값을 따르므로 "막지 않음"과 같은 자리에 선다. 다만 파일에 우리
   // 값이 적혀 있는지와는 다르므로 상태 문구로 구분해 알린다.
   const checked = option.blocked === true;
-  const disabled = !canWrite || !option.editable || busy;
+  const disabled = !option.editable || busy;
   return (
     <li className={`telemetry-option${option.editable ? "" : " locked"}`}>
       <span className="telemetry-option-copy">

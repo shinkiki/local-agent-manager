@@ -1,0 +1,19 @@
+{
+  "itemId": "C-2b02f3dd4b55",
+  "kind": "commit",
+  "ref": "2b02f3dd4b559fd7a9314790960836042c6e39d7",
+  "reviewedAt": "2026-10-06T05:35:00Z",
+  "lane": "L07",
+  "source": "claude",
+  "verdict": "결함 0건",
+  "axes": {
+    "정확성": "reviewed/C-770d19487b7b.json 한 건과 러너가 다시 생성한 queue.json 만 담은 데이터 커밋이다. 적힌 ref 770d19487b7ba46ea2b61a5b7bb90bf448e5a132 는 실제 커밋 '리뷰: 장부 해시 잇기 커밋 bab3b297 을 장부에 적는다' 이고 origin/dev-history 의 조상이며, 항목 id C-770d19487b7b 와 ref 앞 12자가 맞는다. 그 장부가 주장하는 사슬도 원본에서 되짚어 전부 참이다 — bab3b297860e851c08cf225630dcd8514ac4b7e2 는 '리뷰: 수정 커밋 해시를 장부에 잇는 커밋을 검토한다', 6d3061609fd5fe4b4282a97f53ac39640d304e3d 는 '리뷰 장부에 C-6b44077e65c2 의 수정 커밋 해시를 적는다', fixCommits 의 fb82dc4c 는 '기준선이 없을 때도 \"축이 없다\"고 찍던 비교 줄을 가른다' 로 셋 다 dev-history 에 착지해 있다. 수를 되잰 주장도 git ls-tree 로 세 트리에서 직접 다시 셌다 — 770d1948 시점 reviewed/ 56건 = queue.reviewed 56, bab3b297 시점 53건 = 53, 이 커밋 2b02f3dd 시점 61건 = queue.reviewed 61 로 전부 맞는다(56 → 61 로 다섯이 뛴 것은 이 커밋이 한 건만 더하면서 다른 레인의 다섯 건 위로 rebase 돼 착지했기 때문이고, 러너가 트리를 다시 세므로 수가 맞는 것이 정상이다). remaining 459 = commit 225 + module 234 로 자기 안에서도 맞는다. 세었다는 수가 틀렸다면 러너가 --write 로 다시 생성할 때 수가 튀는데 그 경우가 아니다.",
+    "보안불변식": "JSON 데이터 파일 두 개만 바뀐다. 자격증명·공급자 소유 저장소·셸 문자열·경로 정규화·쓰기 게이트 어디에도 닿지 않아 AGENTS.md 2절 G1~G11 과 3절 C 예외의 범위 밖이다.",
+    "계약": "docs/code-review/README.md 의 장부 모양과 맞는다 — 파일 이름 C-770d19487b7b.json 과 본문 itemId 가 일치하고(어긋나면 러너가 둘 다 리뷰된 것으로 세어 다시 집히지 않는다), kind·ref·reviewedAt·lane·source·verdict·findings·commits 가 다 있고, 결함 0건이라 findings·commits 가 빈 배열인 것도 규약대로다. queue.json 은 센 수만 담고 items 를 담지 않는다는 규약도 지켰다. 작업트리 현재 상태의 reviewed/ 61건 전건을 다시 파싱해 파싱 실패 0건·이름과 본문 id 불일치 0건·필수 키 누락 0건·커밋 항목의 id 와 ref 앞 12자 불일치 0건을 확인했다.",
+    "검증없음": "코드가 아니라 장부 데이터만 바뀌어 재현할 실패가 없다. 장부를 실제로 읽는 쪽인 러너의 순수 함수에 시험이 붙어 있어 그것을 돌렸고 회귀가 없다. 러너도 돌려 ledgerDuplicates 가 빈 것을 확인했다.",
+    "단순화중복": "새 함수·새 파일 없음. queue.json 의 수는 reviewed/ 에서 파생되지만 러너가 --write 로 다시 생성하는 파생값이라 같은 사실을 두 곳에 적은 자리가 아니다."
+  },
+  "verification": "node --experimental-strip-types --test src/lib/codeReviewQueue.test.mjs → # tests 13 / # pass 13 / # fail 0",
+  "findings": [],
+  "commits": []
+}

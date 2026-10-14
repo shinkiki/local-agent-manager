@@ -829,8 +829,11 @@ fn write_schema_overrides(
     let body = serde_json::to_vec_pretty(overrides).map_err(|error| {
         CoreError::Runtime(format!("실행설정 스키마를 직렬화하지 못했습니다: {error}"))
     })?;
-    fs::write(schema_overrides_path(app_data_dir), body)?;
-    Ok(())
+    // G7·G10: 앱 소유 저장 파일의 공용 원자 쓰기를 따른다. 그 자리에 바로 쓰면 도중에
+    // 끊긴 쓰기가 반쪽 JSON을 남기고, 읽기는 그것을 기본값으로 삼아 사용자가 고친
+    // 실행설정 스키마를 말없이 잃는다. 또 그 자리에 놓인 심볼릭 링크를 따라가 앱 데이터
+    // 밖 파일을 덮어쓰고, 새 파일은 0600이 아니라 umask 권한으로 생긴다.
+    crate::app_data_file::write_private_bytes(&schema_overrides_path(app_data_dir), &body)
 }
 
 /// 스키마 저장을 마친 갱신 경로의 공통 반환값.
@@ -1699,6 +1702,29 @@ mod tests {
             value.to_string(),
         )
         .expect("write schema file");
+    }
+
+    /// G10: 저장본 자리에 놓인 심볼릭 링크는 따라가지 않고 링크 자체를 새 파일로
+    /// 바꾼다. 링크 대상(앱 데이터 밖 파일)은 그대로 남고, 새 저장본은 0600이다.
+    #[cfg(unix)]
+    #[test]
+    fn schema_overrides_write_replaces_a_symlink_instead_of_following_it_g10() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = schema_dir();
+        let outside = tempfile::tempdir().expect("outside dir");
+        let victim = outside.path().join("victim.json");
+        fs::write(&victim, b"untouched").expect("victim");
+        let path = schema_overrides_path(dir.path());
+        std::os::unix::fs::symlink(&victim, &path).expect("symlink");
+
+        write_schema_overrides(dir.path(), &ChatSettingsSchemaOverrides::default())
+            .expect("write overrides");
+
+        assert_eq!(fs::read(&victim).expect("victim read"), b"untouched");
+        let meta = fs::symlink_metadata(&path).expect("schema meta");
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     }
 
     /// 해당 디렉터리를 앱 데이터로 삼는 감독자. 아홉 곳이 같은 두 줄이었다.

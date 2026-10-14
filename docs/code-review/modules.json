@@ -1,0 +1,1176 @@
+{
+  "note": "에이전트매니저 코드리뷰 회차의 모듈 전수 점검표. 항목 하나가 모듈 하나이고, 회차는 큐에서 하나를 점유해 리뷰한다. 순서는 AGENTS.md 2절 보안 불변식이 직접 걸리는 모듈부터, 그 뒤는 줄 수가 많은 것부터다 — 결함은 큰 모듈에 숨는다.",
+  "excluded": "src/lib/*.ts 는 순수 함수이고 같은 이름의 *.test.mjs 가 이미 붙어 있다. 그 자리의 변경은 커밋 리뷰가 본다. 점검표를 넓히려면 여기에 항목을 추가하면 되고, 항목 id 는 경로가 정하므로 순서를 바꿔도 이미 리뷰한 것이 다시 올라오지 않는다.",
+  "modules": [
+    {
+      "path": "crates/agent-manager-core/src/remote.rs",
+      "title": "crates/agent-manager-core/src/remote.rs (11015줄, 보안 불변식 직접 관련)",
+      "order": 1
+    },
+    {
+      "path": "crates/agent-manager-core/src/external_plugins.rs",
+      "title": "crates/agent-manager-core/src/external_plugins.rs (4900줄, 보안 불변식 직접 관련)",
+      "order": 2
+    },
+    {
+      "path": "crates/agent-manager-core/src/system_mcp.rs",
+      "title": "crates/agent-manager-core/src/system_mcp.rs (4026줄, 보안 불변식 직접 관련)",
+      "order": 3
+    },
+    {
+      "path": "crates/agent-manager-core/src/ssh_exec.rs",
+      "title": "crates/agent-manager-core/src/ssh_exec.rs (3432줄, 보안 불변식 직접 관련)",
+      "order": 4
+    },
+    {
+      "path": "crates/agent-manager-core/src/ssh_endpoints.rs",
+      "title": "crates/agent-manager-core/src/ssh_endpoints.rs (1899줄, 보안 불변식 직접 관련)",
+      "order": 5
+    },
+    {
+      "path": "crates/agent-manager-core/src/ssh_keys.rs",
+      "title": "crates/agent-manager-core/src/ssh_keys.rs (1820줄, 보안 불변식 직접 관련)",
+      "order": 6
+    },
+    {
+      "path": "crates/agent-manager-core/src/chat_secrets.rs",
+      "title": "crates/agent-manager-core/src/chat_secrets.rs (1474줄, 보안 불변식 직접 관련)",
+      "order": 7
+    },
+    {
+      "path": "crates/agent-manager-core/src/credential_profiles.rs",
+      "title": "crates/agent-manager-core/src/credential_profiles.rs (1261줄, 보안 불변식 직접 관련)",
+      "order": 8
+    },
+    {
+      "path": "crates/agent-manager-core/src/os_keychain.rs",
+      "title": "crates/agent-manager-core/src/os_keychain.rs (1255줄, 보안 불변식 직접 관련)",
+      "order": 9
+    },
+    {
+      "path": "crates/agent-manager-core/src/mcp_registry.rs",
+      "title": "crates/agent-manager-core/src/mcp_registry.rs (1222줄, 보안 불변식 직접 관련)",
+      "order": 10
+    },
+    {
+      "path": "crates/agent-manager-core/src/db_exec.rs",
+      "title": "crates/agent-manager-core/src/db_exec.rs (1031줄, 보안 불변식 직접 관련)",
+      "order": 11
+    },
+    {
+      "path": "crates/agent-manager-core/src/cli_interface.rs",
+      "title": "crates/agent-manager-core/src/cli_interface.rs (820줄, 보안 불변식 직접 관련)",
+      "order": 12
+    },
+    {
+      "path": "crates/agent-manager-core/src/ssh_command_line.rs",
+      "title": "crates/agent-manager-core/src/ssh_command_line.rs (722줄, 보안 불변식 직접 관련)",
+      "order": 13
+    },
+    {
+      "path": "crates/agent-manager-core/src/ssh_approvals.rs",
+      "title": "crates/agent-manager-core/src/ssh_approvals.rs (698줄, 보안 불변식 직접 관련)",
+      "order": 14
+    },
+    {
+      "path": "crates/agent-manager-core/src/ssh_command_policy.rs",
+      "title": "crates/agent-manager-core/src/ssh_command_policy.rs (640줄, 보안 불변식 직접 관련)",
+      "order": 15
+    },
+    {
+      "path": "crates/agent-manager-core/src/db_sql.rs",
+      "title": "crates/agent-manager-core/src/db_sql.rs (480줄, 보안 불변식 직접 관련)",
+      "order": 16
+    },
+    {
+      "path": "crates/agent-manager-core/src/db_approvals.rs",
+      "title": "crates/agent-manager-core/src/db_approvals.rs (413줄, 보안 불변식 직접 관련)",
+      "order": 17
+    },
+    {
+      "path": "crates/agent-manager-core/src/chat_secret_cli.rs",
+      "title": "crates/agent-manager-core/src/chat_secret_cli.rs (367줄, 보안 불변식 직접 관련)",
+      "order": 18
+    },
+    {
+      "path": "crates/agent-manager-core/src/approval_ledger.rs",
+      "title": "crates/agent-manager-core/src/approval_ledger.rs (334줄, 보안 불변식 직접 관련)",
+      "order": 19
+    },
+    {
+      "path": "crates/agent-manager-core/src/saved_secrets.rs",
+      "title": "crates/agent-manager-core/src/saved_secrets.rs (332줄, 보안 불변식 직접 관련)",
+      "order": 20
+    },
+    {
+      "path": "crates/agent-manager-core/src/path_guard.rs",
+      "title": "crates/agent-manager-core/src/path_guard.rs (328줄, 보안 불변식 직접 관련)",
+      "order": 21
+    },
+    {
+      "path": "crates/agent-manager-core/src/ssh_output.rs",
+      "title": "crates/agent-manager-core/src/ssh_output.rs (294줄, 보안 불변식 직접 관련)",
+      "order": 22
+    },
+    {
+      "path": "crates/agent-manager-core/src/ssh_secrets.rs",
+      "title": "crates/agent-manager-core/src/ssh_secrets.rs (288줄, 보안 불변식 직접 관련)",
+      "order": 23
+    },
+    {
+      "path": "crates/agent-manager-core/src/process_signal.rs",
+      "title": "crates/agent-manager-core/src/process_signal.rs (244줄, 보안 불변식 직접 관련)",
+      "order": 24
+    },
+    {
+      "path": "crates/agent-manager-core/src/db_credential_files.rs",
+      "title": "crates/agent-manager-core/src/db_credential_files.rs (191줄, 보안 불변식 직접 관련)",
+      "order": 25
+    },
+    {
+      "path": "crates/agent-manager-core/src/storage_reset.rs",
+      "title": "crates/agent-manager-core/src/storage_reset.rs (107줄, 보안 불변식 직접 관련)",
+      "order": 26
+    },
+    {
+      "path": "crates/agent-manager-core/src/chat.rs",
+      "title": "crates/agent-manager-core/src/chat.rs (20271줄)",
+      "order": 27
+    },
+    {
+      "path": "crates/agent-manager-core/src/accounts.rs",
+      "title": "crates/agent-manager-core/src/accounts.rs (14117줄)",
+      "order": 28
+    },
+    {
+      "path": "crates/agent-manager-core/src/usage_pacing.rs",
+      "title": "crates/agent-manager-core/src/usage_pacing.rs (12087줄)",
+      "order": 29
+    },
+    {
+      "path": "crates/agent-manager-core/src/catalog.rs",
+      "title": "crates/agent-manager-core/src/catalog.rs (9333줄)",
+      "order": 30
+    },
+    {
+      "path": "crates/agent-manager-core/src/project_instructions.rs",
+      "title": "crates/agent-manager-core/src/project_instructions.rs (6404줄)",
+      "order": 31
+    },
+    {
+      "path": "crates/agent-manager-core/src/system_workflows.rs",
+      "title": "crates/agent-manager-core/src/system_workflows.rs (6288줄)",
+      "order": 32
+    },
+    {
+      "path": "crates/agent-manager-core/src/project_git.rs",
+      "title": "crates/agent-manager-core/src/project_git.rs (6210줄)",
+      "order": 33
+    },
+    {
+      "path": "crates/agent-manager-core/src/translation.rs",
+      "title": "crates/agent-manager-core/src/translation.rs (5912줄)",
+      "order": 34
+    },
+    {
+      "path": "crates/agent-manager-core/src/skill_library.rs",
+      "title": "crates/agent-manager-core/src/skill_library.rs (5801줄)",
+      "order": 35
+    },
+    {
+      "path": "crates/agent-manager-core/src/scheduler.rs",
+      "title": "crates/agent-manager-core/src/scheduler.rs (5641줄)",
+      "order": 36
+    },
+    {
+      "path": "src/types.ts",
+      "title": "src/types.ts (4632줄)",
+      "order": 37
+    },
+    {
+      "path": "crates/agent-manager-core/src/project_overlays.rs",
+      "title": "crates/agent-manager-core/src/project_overlays.rs (4248줄)",
+      "order": 38
+    },
+    {
+      "path": "crates/agent-manager-core/src/plan.rs",
+      "title": "crates/agent-manager-core/src/plan.rs (4029줄)",
+      "order": 39
+    },
+    {
+      "path": "src/components/SettingsView.tsx",
+      "title": "src/components/SettingsView.tsx (3815줄)",
+      "order": 40
+    },
+    {
+      "path": "src/components/SessionsView.tsx",
+      "title": "src/components/SessionsView.tsx (3672줄)",
+      "order": 41
+    },
+    {
+      "path": "src/components/InstructionsView.tsx",
+      "title": "src/components/InstructionsView.tsx (3342줄)",
+      "order": 42
+    },
+    {
+      "path": "crates/agent-manager-core/src/session_management.rs",
+      "title": "crates/agent-manager-core/src/session_management.rs (3162줄)",
+      "order": 43
+    },
+    {
+      "path": "src/components/UsageBudgetPanel.tsx",
+      "title": "src/components/UsageBudgetPanel.tsx (3135줄)",
+      "order": 44
+    },
+    {
+      "path": "src/components/SkillLibraryPanel.tsx",
+      "title": "src/components/SkillLibraryPanel.tsx (3106줄)",
+      "order": 45
+    },
+    {
+      "path": "crates/agent-manager-core/src/chat_settings.rs",
+      "title": "crates/agent-manager-core/src/chat_settings.rs (2764줄)",
+      "order": 46
+    },
+    {
+      "path": "crates/agent-manager-core/src/session_context.rs",
+      "title": "crates/agent-manager-core/src/session_context.rs (2599줄)",
+      "order": 47
+    },
+    {
+      "path": "crates/agent-manager-core/src/document_automation.rs",
+      "title": "crates/agent-manager-core/src/document_automation.rs (2592줄)",
+      "order": 48
+    },
+    {
+      "path": "crates/agent-manager-core/src/cli_updates.rs",
+      "title": "crates/agent-manager-core/src/cli_updates.rs (2319줄)",
+      "order": 49
+    },
+    {
+      "path": "crates/agent-manager-core/src/usage_budget_policy.rs",
+      "title": "crates/agent-manager-core/src/usage_budget_policy.rs (2304줄)",
+      "order": 50
+    },
+    {
+      "path": "crates/agent-manager-core/src/session_cleanup.rs",
+      "title": "crates/agent-manager-core/src/session_cleanup.rs (2249줄)",
+      "order": 51
+    },
+    {
+      "path": "crates/agent-manager-core/src/cypress_runs.rs",
+      "title": "crates/agent-manager-core/src/cypress_runs.rs (2244줄)",
+      "order": 52
+    },
+    {
+      "path": "crates/agent-manager-core/src/opencode_config.rs",
+      "title": "crates/agent-manager-core/src/opencode_config.rs (2222줄)",
+      "order": 53
+    },
+    {
+      "path": "crates/agent-manager-core/src/domain.rs",
+      "title": "crates/agent-manager-core/src/domain.rs (2151줄)",
+      "order": 54
+    },
+    {
+      "path": "crates/agent-manager-core/src/terminal.rs",
+      "title": "crates/agent-manager-core/src/terminal.rs (1879줄)",
+      "order": 55
+    },
+    {
+      "path": "crates/agent-manager-core/src/store.rs",
+      "title": "crates/agent-manager-core/src/store.rs (1870줄)",
+      "order": 56
+    },
+    {
+      "path": "src/components/ChatView.tsx",
+      "title": "src/components/ChatView.tsx (1770줄)",
+      "order": 57
+    },
+    {
+      "path": "crates/agent-manager-core/src/aia_onboarding.rs",
+      "title": "crates/agent-manager-core/src/aia_onboarding.rs (1714줄)",
+      "order": 58
+    },
+    {
+      "path": "src/components/CypressWorkspacePanel.tsx",
+      "title": "src/components/CypressWorkspacePanel.tsx (1701줄)",
+      "order": 59
+    },
+    {
+      "path": "crates/agent-manager-core/src/antigravity_usage.rs",
+      "title": "crates/agent-manager-core/src/antigravity_usage.rs (1641줄)",
+      "order": 60
+    },
+    {
+      "path": "src/components/ProjectGitPanel.tsx",
+      "title": "src/components/ProjectGitPanel.tsx (1542줄)",
+      "order": 61
+    },
+    {
+      "path": "src/components/WorkflowsView.tsx",
+      "title": "src/components/WorkflowsView.tsx (1442줄)",
+      "order": 62
+    },
+    {
+      "path": "src/App.tsx",
+      "title": "src/App.tsx (1399줄)",
+      "order": 63
+    },
+    {
+      "path": "crates/agent-manager-core/src/claude_settings.rs",
+      "title": "crates/agent-manager-core/src/claude_settings.rs (1385줄)",
+      "order": 64
+    },
+    {
+      "path": "crates/agent-manager-core/src/account_tools.rs",
+      "title": "crates/agent-manager-core/src/account_tools.rs (1373줄)",
+      "order": 65
+    },
+    {
+      "path": "crates/agent-manager-core/src/cypress_workspaces.rs",
+      "title": "crates/agent-manager-core/src/cypress_workspaces.rs (1355줄)",
+      "order": 66
+    },
+    {
+      "path": "crates/agent-manager-core/src/aia_suggestions.rs",
+      "title": "crates/agent-manager-core/src/aia_suggestions.rs (1323줄)",
+      "order": 67
+    },
+    {
+      "path": "crates/agent-manager-core/src/local_llm.rs",
+      "title": "crates/agent-manager-core/src/local_llm.rs (1298줄)",
+      "order": 68
+    },
+    {
+      "path": "src/components/DocsView.tsx",
+      "title": "src/components/DocsView.tsx (1273줄)",
+      "order": 69
+    },
+    {
+      "path": "src/components/AiaOnboardingCards.tsx",
+      "title": "src/components/AiaOnboardingCards.tsx (1182줄)",
+      "order": 70
+    },
+    {
+      "path": "crates/agent-manager-core/src/project_files.rs",
+      "title": "crates/agent-manager-core/src/project_files.rs (1119줄)",
+      "order": 71
+    },
+    {
+      "path": "crates/agent-manager-core/src/db_connections.rs",
+      "title": "crates/agent-manager-core/src/db_connections.rs (1110줄)",
+      "order": 72
+    },
+    {
+      "path": "src/components/SshKeysCard.tsx",
+      "title": "src/components/SshKeysCard.tsx (1101줄)",
+      "order": 73
+    },
+    {
+      "path": "src/components/DocumentAutomationPanel.tsx",
+      "title": "src/components/DocumentAutomationPanel.tsx (1100줄)",
+      "order": 74
+    },
+    {
+      "path": "crates/agent-manager-core/src/external_processes.rs",
+      "title": "crates/agent-manager-core/src/external_processes.rs (1081줄)",
+      "order": 75
+    },
+    {
+      "path": "src/components/ExternalPluginsCard.tsx",
+      "title": "src/components/ExternalPluginsCard.tsx (1071줄)",
+      "order": 76
+    },
+    {
+      "path": "crates/agent-manager-core/src/providers.rs",
+      "title": "crates/agent-manager-core/src/providers.rs (1063줄)",
+      "order": 77
+    },
+    {
+      "path": "src/components/AiaChatPopup.tsx",
+      "title": "src/components/AiaChatPopup.tsx (1055줄)",
+      "order": 78
+    },
+    {
+      "path": "crates/agent-manager-core/src/document_tree.rs",
+      "title": "crates/agent-manager-core/src/document_tree.rs (1016줄)",
+      "order": 79
+    },
+    {
+      "path": "crates/agent-manager-core/src/provider_telemetry.rs",
+      "title": "crates/agent-manager-core/src/provider_telemetry.rs (1011줄)",
+      "order": 80
+    },
+    {
+      "path": "src/components/DashboardView.tsx",
+      "title": "src/components/DashboardView.tsx (972줄)",
+      "order": 81
+    },
+    {
+      "path": "src/components/SessionTranscript.tsx",
+      "title": "src/components/SessionTranscript.tsx (912줄)",
+      "order": 82
+    },
+    {
+      "path": "crates/agent-manager-core/src/acp.rs",
+      "title": "crates/agent-manager-core/src/acp.rs (904줄)",
+      "order": 83
+    },
+    {
+      "path": "crates/agent-manager-core/src/rounds.rs",
+      "title": "crates/agent-manager-core/src/rounds.rs (860줄)",
+      "order": 84
+    },
+    {
+      "path": "crates/agent-manager-core/src/resource_repository.rs",
+      "title": "crates/agent-manager-core/src/resource_repository.rs (813줄)",
+      "order": 85
+    },
+    {
+      "path": "crates/agent-manager-core/src/system_skills.rs",
+      "title": "crates/agent-manager-core/src/system_skills.rs (801줄)",
+      "order": 86
+    },
+    {
+      "path": "src/components/Shared.tsx",
+      "title": "src/components/Shared.tsx (797줄)",
+      "order": 87
+    },
+    {
+      "path": "crates/agent-manager-core/src/usage_budget.rs",
+      "title": "crates/agent-manager-core/src/usage_budget.rs (759줄)",
+      "order": 88
+    },
+    {
+      "path": "crates/agent-manager-core/src/agent_builtin_tools.rs",
+      "title": "crates/agent-manager-core/src/agent_builtin_tools.rs (738줄)",
+      "order": 89
+    },
+    {
+      "path": "crates/agent-manager-core/src/linked_file.rs",
+      "title": "crates/agent-manager-core/src/linked_file.rs (675줄)",
+      "order": 90
+    },
+    {
+      "path": "src/components/ClaudePluginsCard.tsx",
+      "title": "src/components/ClaudePluginsCard.tsx (672줄)",
+      "order": 91
+    },
+    {
+      "path": "src/components/SessionFolderSidebar.tsx",
+      "title": "src/components/SessionFolderSidebar.tsx (660줄)",
+      "order": 92
+    },
+    {
+      "path": "src/components/TerminalPanel.tsx",
+      "title": "src/components/TerminalPanel.tsx (643줄)",
+      "order": 93
+    },
+    {
+      "path": "src/components/SessionCleanupCard.tsx",
+      "title": "src/components/SessionCleanupCard.tsx (627줄)",
+      "order": 94
+    },
+    {
+      "path": "src/components/SessionReadPolicyFields.tsx",
+      "title": "src/components/SessionReadPolicyFields.tsx (626줄)",
+      "order": 95
+    },
+    {
+      "path": "src/components/MarkdownPreview.tsx",
+      "title": "src/components/MarkdownPreview.tsx (624줄)",
+      "order": 96
+    },
+    {
+      "path": "src/components/ChatConversation.tsx",
+      "title": "src/components/ChatConversation.tsx (598줄)",
+      "order": 97
+    },
+    {
+      "path": "src/components/ChatScheduleEditor.tsx",
+      "title": "src/components/ChatScheduleEditor.tsx (597줄)",
+      "order": 98
+    },
+    {
+      "path": "crates/agent-manager-core/src/session_folders.rs",
+      "title": "crates/agent-manager-core/src/session_folders.rs (596줄)",
+      "order": 99
+    },
+    {
+      "path": "crates/agent-manager-core/src/claude_branch_plugins.rs",
+      "title": "crates/agent-manager-core/src/claude_branch_plugins.rs (590줄)",
+      "order": 100
+    },
+    {
+      "path": "src/components/ChatRuntimeSettingsMenu.tsx",
+      "title": "src/components/ChatRuntimeSettingsMenu.tsx (590줄)",
+      "order": 101
+    },
+    {
+      "path": "src/components/DocumentTreePane.tsx",
+      "title": "src/components/DocumentTreePane.tsx (577줄)",
+      "order": 102
+    },
+    {
+      "path": "src/components/SkillsView.tsx",
+      "title": "src/components/SkillsView.tsx (564줄)",
+      "order": 103
+    },
+    {
+      "path": "src/components/ProjectOverlayPanel.tsx",
+      "title": "src/components/ProjectOverlayPanel.tsx (554줄)",
+      "order": 104
+    },
+    {
+      "path": "src/components/PacedTriggerEditor.tsx",
+      "title": "src/components/PacedTriggerEditor.tsx (545줄)",
+      "order": 105
+    },
+    {
+      "path": "crates/agent-manager-core/src/backend_service_settings.rs",
+      "title": "crates/agent-manager-core/src/backend_service_settings.rs (512줄)",
+      "order": 106
+    },
+    {
+      "path": "crates/agent-manager-core/src/user_path.rs",
+      "title": "crates/agent-manager-core/src/user_path.rs (510줄)",
+      "order": 107
+    },
+    {
+      "path": "crates/agent-manager-core/src/quiet_hours.rs",
+      "title": "crates/agent-manager-core/src/quiet_hours.rs (508줄)",
+      "order": 108
+    },
+    {
+      "path": "crates/agent-manager-core/src/instruction_trash.rs",
+      "title": "crates/agent-manager-core/src/instruction_trash.rs (507줄)",
+      "order": 109
+    },
+    {
+      "path": "crates/agent-manager-core/src/lib.rs",
+      "title": "crates/agent-manager-core/src/lib.rs (505줄)",
+      "order": 110
+    },
+    {
+      "path": "src-tauri/src/lib.rs",
+      "title": "src-tauri/src/lib.rs (504줄)",
+      "order": 111
+    },
+    {
+      "path": "crates/agent-manager-core/src/trash_store.rs",
+      "title": "crates/agent-manager-core/src/trash_store.rs (498줄)",
+      "order": 112
+    },
+    {
+      "path": "src/components/LocalLlmConnectionCard.tsx",
+      "title": "src/components/LocalLlmConnectionCard.tsx (494줄)",
+      "order": 113
+    },
+    {
+      "path": "src/components/DbConnectionsCard.tsx",
+      "title": "src/components/DbConnectionsCard.tsx (491줄)",
+      "order": 114
+    },
+    {
+      "path": "src/components/ApprovalPrompts.tsx",
+      "title": "src/components/ApprovalPrompts.tsx (473줄)",
+      "order": 115
+    },
+    {
+      "path": "crates/agent-manager-core/src/usage_history.rs",
+      "title": "crates/agent-manager-core/src/usage_history.rs (469줄)",
+      "order": 116
+    },
+    {
+      "path": "src/components/ChatFindBar.tsx",
+      "title": "src/components/ChatFindBar.tsx (468줄)",
+      "order": 117
+    },
+    {
+      "path": "crates/agent-manager-core/src/skill_trash.rs",
+      "title": "crates/agent-manager-core/src/skill_trash.rs (467줄)",
+      "order": 118
+    },
+    {
+      "path": "src/components/ChatAttentionCenter.tsx",
+      "title": "src/components/ChatAttentionCenter.tsx (464줄)",
+      "order": 119
+    },
+    {
+      "path": "src/components/RuntimeSettings.tsx",
+      "title": "src/components/RuntimeSettings.tsx (454줄)",
+      "order": 120
+    },
+    {
+      "path": "src/components/ChatSchedules.tsx",
+      "title": "src/components/ChatSchedules.tsx (444줄)",
+      "order": 121
+    },
+    {
+      "path": "crates/agent-manager-core/src/project_registry.rs",
+      "title": "crates/agent-manager-core/src/project_registry.rs (428줄)",
+      "order": 122
+    },
+    {
+      "path": "crates/agent-manager-core/src/power.rs",
+      "title": "crates/agent-manager-core/src/power.rs (417줄)",
+      "order": 123
+    },
+    {
+      "path": "src/components/ReadingBookmarks.tsx",
+      "title": "src/components/ReadingBookmarks.tsx (415줄)",
+      "order": 124
+    },
+    {
+      "path": "crates/agent-manager-core/src/supplement_store.rs",
+      "title": "crates/agent-manager-core/src/supplement_store.rs (411줄)",
+      "order": 125
+    },
+    {
+      "path": "src/components/StorageSecretsTab.tsx",
+      "title": "src/components/StorageSecretsTab.tsx (407줄)",
+      "order": 126
+    },
+    {
+      "path": "crates/agent-manager-core/src/cli_quarantine.rs",
+      "title": "crates/agent-manager-core/src/cli_quarantine.rs (401줄)",
+      "order": 127
+    },
+    {
+      "path": "src/appChatAttention.ts",
+      "title": "src/appChatAttention.ts (397줄)",
+      "order": 128
+    },
+    {
+      "path": "crates/agent-manager-core/src/markdown_plain.rs",
+      "title": "crates/agent-manager-core/src/markdown_plain.rs (376줄)",
+      "order": 129
+    },
+    {
+      "path": "src/components/SavedSecretsCard.tsx",
+      "title": "src/components/SavedSecretsCard.tsx (376줄)",
+      "order": 130
+    },
+    {
+      "path": "src/components/DiagramViewer.tsx",
+      "title": "src/components/DiagramViewer.tsx (368줄)",
+      "order": 131
+    },
+    {
+      "path": "src/appAiaScreenControl.ts",
+      "title": "src/appAiaScreenControl.ts (353줄)",
+      "order": 132
+    },
+    {
+      "path": "crates/agent-manager-core/src/chat_runtime_store.rs",
+      "title": "crates/agent-manager-core/src/chat_runtime_store.rs (352줄)",
+      "order": 133
+    },
+    {
+      "path": "crates/agent-manager-core/src/catalog_health.rs",
+      "title": "crates/agent-manager-core/src/catalog_health.rs (348줄)",
+      "order": 134
+    },
+    {
+      "path": "src/components/LinkedFilePreview.tsx",
+      "title": "src/components/LinkedFilePreview.tsx (345줄)",
+      "order": 135
+    },
+    {
+      "path": "src/components/ChatAttachments.tsx",
+      "title": "src/components/ChatAttachments.tsx (344줄)",
+      "order": 136
+    },
+    {
+      "path": "src/components/ProjectRegistryCard.tsx",
+      "title": "src/components/ProjectRegistryCard.tsx (324줄)",
+      "order": 137
+    },
+    {
+      "path": "src/components/VoiceControls.tsx",
+      "title": "src/components/VoiceControls.tsx (312줄)",
+      "order": 138
+    },
+    {
+      "path": "crates/agent-manager-core/src/git_refs.rs",
+      "title": "crates/agent-manager-core/src/git_refs.rs (303줄)",
+      "order": 139
+    },
+    {
+      "path": "crates/agent-manager-core/src/tailscale_cli.rs",
+      "title": "crates/agent-manager-core/src/tailscale_cli.rs (295줄)",
+      "order": 140
+    },
+    {
+      "path": "crates/agent-manager-core/src/app_data_file.rs",
+      "title": "crates/agent-manager-core/src/app_data_file.rs (293줄)",
+      "order": 141
+    },
+    {
+      "path": "crates/agent-manager-core/src/json_store.rs",
+      "title": "crates/agent-manager-core/src/json_store.rs (288줄)",
+      "order": 142
+    },
+    {
+      "path": "crates/agent-manager-core/src/instruction_links.rs",
+      "title": "crates/agent-manager-core/src/instruction_links.rs (278줄)",
+      "order": 143
+    },
+    {
+      "path": "src/components/TelemetrySettingsCard.tsx",
+      "title": "src/components/TelemetrySettingsCard.tsx (276줄)",
+      "order": 144
+    },
+    {
+      "path": "src/appAiaSuggestions.ts",
+      "title": "src/appAiaSuggestions.ts (275줄)",
+      "order": 145
+    },
+    {
+      "path": "src/components/ChatSecretsPanel.tsx",
+      "title": "src/components/ChatSecretsPanel.tsx (275줄)",
+      "order": 146
+    },
+    {
+      "path": "src/components/BrandMarks.tsx",
+      "title": "src/components/BrandMarks.tsx (265줄)",
+      "order": 147
+    },
+    {
+      "path": "src/components/RoundGoalsPanel.tsx",
+      "title": "src/components/RoundGoalsPanel.tsx (261줄)",
+      "order": 148
+    },
+    {
+      "path": "src-tauri/src/commands.rs",
+      "title": "src-tauri/src/commands.rs (258줄)",
+      "order": 149
+    },
+    {
+      "path": "src/components/CliConnectionDrawer.tsx",
+      "title": "src/components/CliConnectionDrawer.tsx (257줄)",
+      "order": 150
+    },
+    {
+      "path": "crates/agent-manager-core/src/doc_roots.rs",
+      "title": "crates/agent-manager-core/src/doc_roots.rs (241줄)",
+      "order": 151
+    },
+    {
+      "path": "src/components/StorageView.tsx",
+      "title": "src/components/StorageView.tsx (241줄)",
+      "order": 152
+    },
+    {
+      "path": "src/components/ArtifactsView.tsx",
+      "title": "src/components/ArtifactsView.tsx (236줄)",
+      "order": 153
+    },
+    {
+      "path": "src/components/AiaSuggestionPackPanel.tsx",
+      "title": "src/components/AiaSuggestionPackPanel.tsx (228줄)",
+      "order": 154
+    },
+    {
+      "path": "crates/agent-manager-core/src/db_cli.rs",
+      "title": "crates/agent-manager-core/src/db_cli.rs (223줄)",
+      "order": 155
+    },
+    {
+      "path": "src/components/AiaTopbarTrigger.tsx",
+      "title": "src/components/AiaTopbarTrigger.tsx (221줄)",
+      "order": 156
+    },
+    {
+      "path": "src/components/DocumentFilePane.tsx",
+      "title": "src/components/DocumentFilePane.tsx (213줄)",
+      "order": 157
+    },
+    {
+      "path": "src/components/ChatLaunchPanel.tsx",
+      "title": "src/components/ChatLaunchPanel.tsx (209줄)",
+      "order": 158
+    },
+    {
+      "path": "crates/agent-manager-core/src/turn_continuation.rs",
+      "title": "crates/agent-manager-core/src/turn_continuation.rs (205줄)",
+      "order": 159
+    },
+    {
+      "path": "src/components/ChatSkillUsage.tsx",
+      "title": "src/components/ChatSkillUsage.tsx (204줄)",
+      "order": 160
+    },
+    {
+      "path": "crates/agent-manager-core/src/provider_settings_file.rs",
+      "title": "crates/agent-manager-core/src/provider_settings_file.rs (200줄)",
+      "order": 161
+    },
+    {
+      "path": "src/components/ChatEventStream.tsx",
+      "title": "src/components/ChatEventStream.tsx (200줄)",
+      "order": 162
+    },
+    {
+      "path": "src/components/ProjectFilesPanel.tsx",
+      "title": "src/components/ProjectFilesPanel.tsx (194줄)",
+      "order": 163
+    },
+    {
+      "path": "src-tauri/src/file_download.rs",
+      "title": "src-tauri/src/file_download.rs (188줄)",
+      "order": 164
+    },
+    {
+      "path": "src/components/ChatAttachmentPreview.tsx",
+      "title": "src/components/ChatAttachmentPreview.tsx (187줄)",
+      "order": 165
+    },
+    {
+      "path": "src/components/RoundReportsModal.tsx",
+      "title": "src/components/RoundReportsModal.tsx (187줄)",
+      "order": 166
+    },
+    {
+      "path": "src/appStoredState.ts",
+      "title": "src/appStoredState.ts (185줄)",
+      "order": 167
+    },
+    {
+      "path": "src/components/SkillInstallDiff.tsx",
+      "title": "src/components/SkillInstallDiff.tsx (178줄)",
+      "order": 168
+    },
+    {
+      "path": "src/components/ChatRuntimeList.tsx",
+      "title": "src/components/ChatRuntimeList.tsx (176줄)",
+      "order": 169
+    },
+    {
+      "path": "crates/agent-manager-core/src/backend_ownership.rs",
+      "title": "crates/agent-manager-core/src/backend_ownership.rs (174줄)",
+      "order": 170
+    },
+    {
+      "path": "src/components/AppStatusbar.tsx",
+      "title": "src/components/AppStatusbar.tsx (173줄)",
+      "order": 171
+    },
+    {
+      "path": "crates/agent-manager-core/src/app_error.rs",
+      "title": "crates/agent-manager-core/src/app_error.rs (164줄)",
+      "order": 172
+    },
+    {
+      "path": "crates/agent-manager-core/src/staged_replace.rs",
+      "title": "crates/agent-manager-core/src/staged_replace.rs (163줄)",
+      "order": 173
+    },
+    {
+      "path": "crates/agent-manager-core/src/text_limit.rs",
+      "title": "crates/agent-manager-core/src/text_limit.rs (163줄)",
+      "order": 174
+    },
+    {
+      "path": "src/components/ProjectsView.tsx",
+      "title": "src/components/ProjectsView.tsx (163줄)",
+      "order": 175
+    },
+    {
+      "path": "src/components/BuiltinToolAccess.tsx",
+      "title": "src/components/BuiltinToolAccess.tsx (159줄)",
+      "order": 176
+    },
+    {
+      "path": "crates/agent-manager-core/src/skill_meta.rs",
+      "title": "crates/agent-manager-core/src/skill_meta.rs (156줄)",
+      "order": 177
+    },
+    {
+      "path": "src/components/AddonsView.tsx",
+      "title": "src/components/AddonsView.tsx (155줄)",
+      "order": 178
+    },
+    {
+      "path": "src/components/WorkflowProcedurePanel.tsx",
+      "title": "src/components/WorkflowProcedurePanel.tsx (153줄)",
+      "order": 179
+    },
+    {
+      "path": "src/components/WorkflowRuntimeEditor.tsx",
+      "title": "src/components/WorkflowRuntimeEditor.tsx (153줄)",
+      "order": 180
+    },
+    {
+      "path": "src/components/TranslationProgress.tsx",
+      "title": "src/components/TranslationProgress.tsx (149줄)",
+      "order": 181
+    },
+    {
+      "path": "crates/agent-manager-core/src/process_output.rs",
+      "title": "crates/agent-manager-core/src/process_output.rs (147줄)",
+      "order": 182
+    },
+    {
+      "path": "src/components/ChatConnectionGeneration.tsx",
+      "title": "src/components/ChatConnectionGeneration.tsx (145줄)",
+      "order": 183
+    },
+    {
+      "path": "src/components/FilterAxisBar.tsx",
+      "title": "src/components/FilterAxisBar.tsx (141줄)",
+      "order": 184
+    },
+    {
+      "path": "src/components/ChatComposer.tsx",
+      "title": "src/components/ChatComposer.tsx (136줄)",
+      "order": 185
+    },
+    {
+      "path": "src/components/AgentsView.tsx",
+      "title": "src/components/AgentsView.tsx (127줄)",
+      "order": 186
+    },
+    {
+      "path": "src/components/AppToasts.tsx",
+      "title": "src/components/AppToasts.tsx (123줄)",
+      "order": 187
+    },
+    {
+      "path": "src/components/ErrorBoundary.tsx",
+      "title": "src/components/ErrorBoundary.tsx (122줄)",
+      "order": 188
+    },
+    {
+      "path": "src/components/MermaidPluginPanel.tsx",
+      "title": "src/components/MermaidPluginPanel.tsx (122줄)",
+      "order": 189
+    },
+    {
+      "path": "src/components/ChatActivityLog.tsx",
+      "title": "src/components/ChatActivityLog.tsx (117줄)",
+      "order": 190
+    },
+    {
+      "path": "src/components/HelpHint.tsx",
+      "title": "src/components/HelpHint.tsx (115줄)",
+      "order": 191
+    },
+    {
+      "path": "src/components/DetailDrawer.tsx",
+      "title": "src/components/DetailDrawer.tsx (114줄)",
+      "order": 192
+    },
+    {
+      "path": "src/appNewProjects.ts",
+      "title": "src/appNewProjects.ts (113줄)",
+      "order": 193
+    },
+    {
+      "path": "crates/agent-manager-core/src/file_kind.rs",
+      "title": "crates/agent-manager-core/src/file_kind.rs (111줄)",
+      "order": 194
+    },
+    {
+      "path": "crates/agent-manager-core/src/loopback_host.rs",
+      "title": "crates/agent-manager-core/src/loopback_host.rs (111줄)",
+      "order": 195
+    },
+    {
+      "path": "src/components/ChatToolCard.tsx",
+      "title": "src/components/ChatToolCard.tsx (111줄)",
+      "order": 196
+    },
+    {
+      "path": "src/components/TranslationSettingsRows.tsx",
+      "title": "src/components/TranslationSettingsRows.tsx (109줄)",
+      "order": 197
+    },
+    {
+      "path": "src/components/WorkflowVersionDiff.tsx",
+      "title": "src/components/WorkflowVersionDiff.tsx (109줄)",
+      "order": 198
+    },
+    {
+      "path": "src/components/readingAnchorDom.ts",
+      "title": "src/components/readingAnchorDom.ts (107줄)",
+      "order": 199
+    },
+    {
+      "path": "src/components/ChatRuntimeDraft.tsx",
+      "title": "src/components/ChatRuntimeDraft.tsx (106줄)",
+      "order": 200
+    },
+    {
+      "path": "src/appAiaPopup.ts",
+      "title": "src/appAiaPopup.ts (104줄)",
+      "order": 201
+    },
+    {
+      "path": "src/components/ChatTranscriptHistory.tsx",
+      "title": "src/components/ChatTranscriptHistory.tsx (103줄)",
+      "order": 202
+    },
+    {
+      "path": "crates/agent-manager-core/src/identifier.rs",
+      "title": "crates/agent-manager-core/src/identifier.rs (98줄)",
+      "order": 203
+    },
+    {
+      "path": "src/components/MermaidBlock.tsx",
+      "title": "src/components/MermaidBlock.tsx (97줄)",
+      "order": 204
+    },
+    {
+      "path": "src/components/GitDiffModal.tsx",
+      "title": "src/components/GitDiffModal.tsx (95줄)",
+      "order": 205
+    },
+    {
+      "path": "src/components/SettingsSubTabs.tsx",
+      "title": "src/components/SettingsSubTabs.tsx (93줄)",
+      "order": 206
+    },
+    {
+      "path": "src/components/AppSidebar.tsx",
+      "title": "src/components/AppSidebar.tsx (88줄)",
+      "order": 207
+    },
+    {
+      "path": "src/main.tsx",
+      "title": "src/main.tsx (88줄)",
+      "order": 208
+    },
+    {
+      "path": "src/components/UiGuidePointer.tsx",
+      "title": "src/components/UiGuidePointer.tsx (87줄)",
+      "order": 209
+    },
+    {
+      "path": "src/components/CopyAction.tsx",
+      "title": "src/components/CopyAction.tsx (83줄)",
+      "order": 210
+    },
+    {
+      "path": "crates/agent-manager-core/src/store_lock.rs",
+      "title": "crates/agent-manager-core/src/store_lock.rs (78줄)",
+      "order": 211
+    },
+    {
+      "path": "src/components/ChatLocalSettings.tsx",
+      "title": "src/components/ChatLocalSettings.tsx (78줄)",
+      "order": 212
+    },
+    {
+      "path": "src/components/FileDownloadProgress.tsx",
+      "title": "src/components/FileDownloadProgress.tsx (72줄)",
+      "order": 213
+    },
+    {
+      "path": "src/components/ProjectFilePane.tsx",
+      "title": "src/components/ProjectFilePane.tsx (69줄)",
+      "order": 214
+    },
+    {
+      "path": "crates/agent-manager-core/src/user_home.rs",
+      "title": "crates/agent-manager-core/src/user_home.rs (66줄)",
+      "order": 215
+    },
+    {
+      "path": "src/components/ChatLocalMemory.tsx",
+      "title": "src/components/ChatLocalMemory.tsx (64줄)",
+      "order": 216
+    },
+    {
+      "path": "src/components/NewProjectsModal.tsx",
+      "title": "src/components/NewProjectsModal.tsx (62줄)",
+      "order": 217
+    },
+    {
+      "path": "src/components/ChatScheduleAccounts.tsx",
+      "title": "src/components/ChatScheduleAccounts.tsx (61줄)",
+      "order": 218
+    },
+    {
+      "path": "src/components/ChatConnectionAction.tsx",
+      "title": "src/components/ChatConnectionAction.tsx (59줄)",
+      "order": 219
+    },
+    {
+      "path": "src/components/GitDiffWindow.tsx",
+      "title": "src/components/GitDiffWindow.tsx (58줄)",
+      "order": 220
+    },
+    {
+      "path": "src/components/ChatActivityGroup.tsx",
+      "title": "src/components/ChatActivityGroup.tsx (48줄)",
+      "order": 221
+    },
+    {
+      "path": "src/components/DiagramCanvas.tsx",
+      "title": "src/components/DiagramCanvas.tsx (48줄)",
+      "order": 222
+    },
+    {
+      "path": "crates/agent-manager-core/src/clock.rs",
+      "title": "crates/agent-manager-core/src/clock.rs (44줄)",
+      "order": 223
+    },
+    {
+      "path": "src/components/UnifiedDiffView.tsx",
+      "title": "src/components/UnifiedDiffView.tsx (40줄)",
+      "order": 224
+    },
+    {
+      "path": "src/components/DiagramWindow.tsx",
+      "title": "src/components/DiagramWindow.tsx (37줄)",
+      "order": 225
+    },
+    {
+      "path": "src/components/CatalogHealthBanner.tsx",
+      "title": "src/components/CatalogHealthBanner.tsx (30줄)",
+      "order": 226
+    },
+    {
+      "path": "src/components/ChatLinkedFiles.tsx",
+      "title": "src/components/ChatLinkedFiles.tsx (30줄)",
+      "order": 227
+    },
+    {
+      "path": "src/components/ChatMirroredState.tsx",
+      "title": "src/components/ChatMirroredState.tsx (29줄)",
+      "order": 228
+    },
+    {
+      "path": "src/components/ChatPopover.tsx",
+      "title": "src/components/ChatPopover.tsx (29줄)",
+      "order": 229
+    },
+    {
+      "path": "src/components/UiCursor.tsx",
+      "title": "src/components/UiCursor.tsx (29줄)",
+      "order": 230
+    },
+    {
+      "path": "src/appStateIdentity.ts",
+      "title": "src/appStateIdentity.ts (21줄)",
+      "order": 231
+    },
+    {
+      "path": "src-tauri/src/main.rs",
+      "title": "src-tauri/src/main.rs (18줄)",
+      "order": 232
+    },
+    {
+      "path": "src/components/AgentMessageMeta.tsx",
+      "title": "src/components/AgentMessageMeta.tsx (14줄)",
+      "order": 233
+    },
+    {
+      "path": "crates/agent-manager-server/src/main.rs",
+      "title": "crates/agent-manager-server/src/main.rs (7줄)",
+      "order": 234
+    }
+  ]
+}

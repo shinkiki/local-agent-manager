@@ -1,0 +1,22 @@
+{
+  "itemId": "C-7d2aa77a3ecf",
+  "kind": "commit",
+  "ref": "7d2aa77a3ecfd1fc1a0cdf4a947a3599a4b3df9c",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L04",
+  "source": "codex",
+  "verdict": "결함 0건. 장부의 commits 빈 배열은 이미 보류 중인 자기참조 저장 형식 결정과 같은 주제라 중복 결함·결정을 만들지 않음",
+  "axes": {
+    "정확성": "C-41b5da9e9b6c의 diff와 원본을 대조했다. resource_repository::load_resource_repository_settings는 저장값이 없으면 root와 default를 같은 PathBuf에서 만들며, 관측의 원인은 아직 특정하지 못했다는 unconfirmed 기록이 코드와 맞는다. 선행 커밋의 검증 실패를 이 커밋의 회귀로 기록하지 않은 것도 부모에서 동일했다는 근거와 맞는다.",
+    "보안 불변식": "이번 diff는 코드리뷰 장부와 파생 큐다. 새 권한·비밀·공급자 소유 저장소 접근, 셸 실행, 경로 쓰기 게이트를 추가하지 않아 G1~G11 및 C 예외에 닿는 변경이 없다.",
+    "계약": "findingId·file·symbol·occurrence의 itemId는 서로 일치하고, finding의 state=unconfirmed와 fixCommits 빈 배열도 README 규약에 맞는다. reviewed의 commits 빈 배열은 장부 자신을 담은 커밋 해시를 한 커밋 안에 쓸 수 없는 기존 pending 결정과 동일하므로 같은 결정을 재상정하지 않았다.",
+    "검증 없음": "관측은 두 Cypress 스펙과 부모 커밋 재실행 결과를 재현 절차에 남겼다. 이번 장부 전용 diff에 별도 제품 시험은 필요하지 않으며 resource_repository 범위 Rust 시험을 다시 실행했다.",
+    "단순화·중복": "큐는 손으로 세지 않고 러너 산출값으로 갱신했다. 기존 finding 파일을 재사용하고 새 지문 파일을 만들지 않은 것이 결함 중복 방지 규약에 맞다."
+  },
+  "findings": [],
+  "verification": [
+    "cargo test -q -p agent-manager-core resource_repository — test result: ok",
+    "node --experimental-strip-types scripts/code-review-queue.mjs --write — 종료 코드 0 · ledgerDuplicates 없음"
+  ],
+  "commits": []
+}

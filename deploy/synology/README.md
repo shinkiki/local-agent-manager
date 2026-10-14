@@ -54,6 +54,11 @@ docker compose -f deploy/synology/docker-compose.yml exec tailscale tailscale st
 | `init: true` | 에이전트 CLI의 고아 자식을 PID 1이 회수해야 한다. 없으면 좀비가 쌓이고 프로세스 그룹 종료 확인이 끝나지 않아 채팅 강제 종료가 멈춘다. |
 | `procps` 설치 | 관리 프로세스 신원 확인과 외부 프로세스 목록 조회가 `ps`를 부른다. |
 | dbus + gnome-keyring | 리눅스 자격증명 볼트는 secret-service를 쓴다. 없으면 서버는 뜨지만 공급자 계정이 전부 실패한다. |
+| 전용 사용자(`PUID`/`PGID`) | 서버·키링·CLI는 root로 돌지 않는다. Claude CLI가 uid 0에서 `--dangerously-skip-permissions`를 거부해 전체 접근 채팅이 exit 1로 끝난다. 엔트리포인트가 root로 `/data`·HOME 소유권만 맞춘 뒤 `setpriv`로 내려간다. |
+
+`./data/home`은 이제 컨테이너의 `/root`가 아니라 `/home/agent`에 붙는다. 호스트 폴더는
+그대로이므로 기존 계정·세션은 유지되고, 엔트리포인트가 첫 기동에 소유권을 `PUID:PGID`로
+맞춘다. 공유 폴더 파일이 1000이 아닌 uid 소유라면 `.env`에 그 값을 `PUID`/`PGID`로 적는다.
 
 ## 보안상 감안할 점
 
@@ -72,11 +77,32 @@ docker compose -f deploy/synology/docker-compose.yml exec tailscale tailscale st
 - 서버 기동, `/api/access`·계정 조회 정상 응답
 - dbus + gnome-keyring 조합으로 시크릿 서비스 읽기/쓰기 성공
 - `init` 없이는 프로세스 그룹 종료가 멈추고, 있으면 통과
+- 전용 사용자(uid 1000)로 내려간 뒤에도 dbus + gnome-keyring 잠금 해제와 secret-service
+  읽기/쓰기가 동작(`~/.local/share/keyrings`가 그 사용자 소유로 생성됨)
+- 엔트리포인트의 권한 내리기: `deploy/synology/test-privdrop.sh`(docker 필요)가 실제
+  컨테이너에서 서버가 받은 uid/gid·HOME·argv로 판정한다. `PUID=0` 거부와 소유권 실패 시
+  중단도 같은 시험이 본다.
+
+2026-10-10~11 시놀로지 NAS(DSM 7.3.2, x86_64, 커널 4.4)에서 실제로 확인한 것:
+
+- compose 스택 전체 기동. Tailscale 사이드카의 tailnet 가입, `serve.json` 적용, TLS 인증서 발급,
+  `Tailscale-User-Login` 신원 헤더로 서버 인증, tailnet 안 다른 기기의 브라우저 접속.
+- 에이전트 CLI 헤드리스 로그인. Claude(브라우저 인증 뒤 코드 붙여넣기), Codex(기기 코드),
+  Antigravity(구글 동의 뒤 코드를 60초 안에 전송) 세 계정 등록. 원격 탭이 CLI 종료 이벤트를 놓쳐도
+  백엔드의 자격증명 판정으로 저장할 수 있다.
+- 전용 사용자 기동(L13). `PUID`/`PGID`로 내려간 뒤 `IS_SANDBOX` 없이 전체 접근 채팅 1턴이 정상 종료.
+- Cypress 작업공간 등록·모듈 설치·`cypress verify`·헤드리스 스펙 실행(xvfb 포함 이미지).
+- 데이터 볼륨 이동. `data/`·`workspace/`를 다른 볼륨의 절대 경로로 옮기고 재생성해도 계정·세션 유지.
+- **`TS_USERSPACE=true` 전환(L10, 2026-10-11)**. 사용자 공간 모드에서 tailnet 가입·`serve` 프록시·
+  `Tailscale-User-Login` 신원 헤더·`/api/access`가 모두 정상이고, 커널 4.4에서 나던 iptables
+  connmark Health 경고가 사라진다. 그래서 기본값을 이쪽으로 옮겼다(L21). 커널 모드로 쓰려면
+  `.env`에 `TS_USERSPACE=false`를 적는다. `devices: /dev/net/tun`과 `cap_add`는 그대로 두므로
+  전제조건은 바뀌지 않는다.
 
 아직 확인하지 못한 것:
 
-- **이 compose 스택 전체의 기동**. Tailscale 사이드카와 실제 tailnet 연결, `serve.json`
-  적용, 신원 헤더 주입까지는 검증하지 않았다.
-- **에이전트 CLI 헤드리스 로그인**. 컨테이너에 `claude`를 설치하지만, OAuth 로그인은
-  브라우저가 필요해 토큰 주입 경로를 따로 마련해야 한다.
-- **실제 채팅 세션 실행**. 서버가 뜨는 것과 에이전트가 도는 것은 별개다.
+- **외부 플러그인 OAuth를 원격에서 끝내기**. 기기 코드(H03)와 콜백 주소 붙여넣기(H13) 모두 코드는
+  들어갔고 NAS 실측이 남았다. 콜백형은 승인 뒤 멈춘 `127.0.0.1:<포트>/callback?…` 주소를 인증 창에 붙여 넣는다.
+- **Codex 브라우저 방식 로그인(L22)**. 계정 추가에서 "브라우저"를 고르면, 승인 뒤 멈춘
+  `127.0.0.1:1455/auth/callback?…` 주소를 붙여 넣어 백엔드가 컨테이너 안 로그인 CLI에 전달한다.
+  기기 코드 방식은 그대로 기본값이다.

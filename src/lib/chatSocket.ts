@@ -182,6 +182,24 @@ function stopReconnecting(runtime: ChatSocketRuntime, message: string): void {
   closeChatSocket(runtime);
 }
 
+/**
+ * 재연결 한 번의 실패를 다음 행동으로 옮긴다. 재연결 시도 함수가 인스턴스 확인과 attach
+ * 성공 흐름 사이에 실패 정책까지 함께 들고 있으면, 종료 실패와 일시 실패에 필요한 정리
+ * 순서를 바꿀 때 성공 흐름도 함께 읽어야 한다. 실패 분류 뒤의 기존 순서(종료 또는 안내,
+ * 그다음 재예약)는 이 자리에서만 유지한다.
+ */
+function handleChatReconnectFailure(runtime: ChatSocketRuntime, cause: unknown): void {
+  if (runtime.detached) return;
+  const decision = chatReconnectDecision(cause);
+  if (decision.terminal) {
+    stopReconnecting(runtime, decision.message);
+    return;
+  }
+  const notice = runtime.reconnectWatch.noteFailure(decision.message);
+  if (notice) runtime.eventBatch.push({ type: "error", message: notice });
+  runtime.reconnectWatch.schedule();
+}
+
 async function reconnectChatSocket(runtime: ChatSocketRuntime, chatId: string): Promise<void> {
   try {
     // attach를 보내기 전에 프로세스가 그대로인지 확인한다. 교체된 뒤에는 attach가
@@ -194,14 +212,6 @@ async function reconnectChatSocket(runtime: ChatSocketRuntime, chatId: string): 
     await openChatSocket(runtime, { type: "attach", chatId }, true);
     runtime.reconnectWatch.reset();
   } catch (cause) {
-    if (runtime.detached) return;
-    const decision = chatReconnectDecision(cause);
-    if (decision.terminal) {
-      stopReconnecting(runtime, decision.message);
-      return;
-    }
-    const notice = runtime.reconnectWatch.noteFailure(decision.message);
-    if (notice) runtime.eventBatch.push({ type: "error", message: notice });
-    runtime.reconnectWatch.schedule();
+    handleChatReconnectFailure(runtime, cause);
   }
 }

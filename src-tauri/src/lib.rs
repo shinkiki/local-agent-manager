@@ -372,6 +372,9 @@ fn backend_child_args(
         ]);
     }
     args.extend([
+        // 이 백엔드에 데스크톱 화면 소유자가 있다는 표시. 헤드리스 판정은 수명 플래그가
+        // 아니라 이것만 본다(L20, `remote.rs::is_headless_host`).
+        agent_manager_core::DESKTOP_SHELL_ARG.into(),
         "--shutdown-on-stdin-eof".into(),
         // A restart spawns this child while the predecessor backend is still
         // shutting down, so let it wait for the app-data store handover.
@@ -499,5 +502,18 @@ mod tests {
             .any(|pair| pair == ["--tailscale-user", "user@example.com"]));
         // 원격 write는 백엔드가 저장된 설정에서 직접 읽는다(설정 지점 단일화).
         assert!(!args.iter().any(|arg| arg == "--remote-write"));
+        // L20. Tailscale을 연 데스크톱 자식도 소유자 표시를 달고 떠야 헤드리스로 읽히지 않는다.
+        assert!(args
+            .iter()
+            .any(|arg| arg == agent_manager_core::DESKTOP_SHELL_ARG));
+    }
+
+    /// L20. 헤드리스 판정의 근거는 수명 플래그가 아니라 이 표시다. 셸이 이것을 빠뜨리면
+    /// 데스크톱이 연 Tailscale 서비스가 헤드리스로 읽히므로 argv 단위로 고정한다.
+    #[test]
+    fn every_desktop_child_backend_declares_the_shell_owner_flag() {
+        assert!(args_as_strings(None)
+            .iter()
+            .any(|arg| arg == agent_manager_core::DESKTOP_SHELL_ARG));
     }
 }

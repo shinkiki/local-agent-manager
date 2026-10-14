@@ -1,10 +1,15 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { listProjectEntries, readProjectFile, searchProjectFiles } from "../lib/ipc";
 import { useI18n } from "../lib/i18n";
 import type { DocumentEntry, ProjectFileSearchHit, ProjectFileSearchPage, ProjectFileView } from "../types";
+import { buildProjectFileSearchRequest, unreadContentCount } from "../lib/projectFileSearch";
+import { readSecondaryPaneOpen, SECONDARY_PANE_COLLAPSE_MEDIA_QUERY, writeSecondaryPaneOpen } from "../lib/secondaryPane";
 import { DocumentTreePane, useRequestGeneration, type DocumentTreeSource } from "./DocumentTreePane";
 import { ProjectFilePane } from "./ProjectFilePane";
-import { EmptyState, ErrorBanner, LoadingState } from "./Shared";
+import { EmptyState, ErrorBanner, LoadingState, useEscapeToClose } from "./Shared";
+
+const PROJECT_FILES_SIDEBAR_OPEN_KEY = "agent-manager.project-files-sidebar";
 
 /**
  * 프로젝트 화면의 파일 탭. 문서 화면의 트리 창(`DocumentTreePane`)을 그대로 쓰되 원천만
@@ -23,6 +28,33 @@ export function ProjectFilesPanel({ projectPath, active }: { projectPath: string
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const generation = useRequestGeneration();
+  const [sidebarOpen, setSidebarOpen] = useState(() => readSecondaryPaneOpen(PROJECT_FILES_SIDEBAR_OPEN_KEY));
+  const [sidebarIsOverlay, setSidebarIsOverlay] = useState(() => window.matchMedia(SECONDARY_PANE_COLLAPSE_MEDIA_QUERY).matches);
+  const sidebarCloseRef = useRef<HTMLButtonElement>(null);
+  const sidebarRestoreRef = useRef<HTMLButtonElement>(null);
+  const sidebarFocusTarget = useRef<"close" | "restore" | null>(null);
+
+  const setSidebarVisibility = (open: boolean) => {
+    sidebarFocusTarget.current = open ? "close" : "restore";
+    setSidebarOpen(open);
+  };
+
+  useEffect(() => writeSecondaryPaneOpen(PROJECT_FILES_SIDEBAR_OPEN_KEY, sidebarOpen), [sidebarOpen]);
+  useEffect(() => {
+    const query = window.matchMedia(SECONDARY_PANE_COLLAPSE_MEDIA_QUERY);
+    const sync = () => setSidebarIsOverlay(query.matches);
+    sync();
+    query.addEventListener("change", sync);
+    return () => query.removeEventListener("change", sync);
+  }, []);
+  useLayoutEffect(() => {
+    const target = sidebarFocusTarget.current;
+    if (target === null) return;
+    sidebarFocusTarget.current = null;
+    if (target === "close") sidebarCloseRef.current?.focus();
+    else sidebarRestoreRef.current?.focus();
+  }, [sidebarOpen]);
+  useEscapeToClose(() => setSidebarVisibility(false), sidebarOpen && sidebarIsOverlay);
 
   const searchLabel = text("파일명 또는 경로 검색", "Search by file name or path");
   const source = useMemo<DocumentTreeSource>(() => ({
@@ -32,12 +64,16 @@ export function ProjectFilesPanel({ projectPath, active }: { projectPath: string
   }), [projectPath, text]);
 
   const [query, setQuery] = useState("");
+  // 본문까지 훑을지(F3). 기본이 꺼짐인 것은 Core 와 같은 선택이다 — 본문 검색은 트리를
+  // 걸으며 파일을 여는 일이라 파일명 검색과 비용이 다르고, 사람이 명시로 켜야 한다.
+  const [searchContents, setSearchContents] = useState(false);
   const [results, setResults] = useState<ProjectFileSearchPage | null>(null);
   const [searching, setSearching] = useState(false);
 
   const trimmed = query.trim();
   useEffect(() => {
-    if (trimmed.length === 0) {
+    const request = buildProjectFileSearchRequest({ projectPath, query: trimmed, searchContents });
+    if (request === null) {
       setResults(null);
       return;
     }
@@ -48,7 +84,7 @@ export function ProjectFilesPanel({ projectPath, active }: { projectPath: string
       setSearching(true);
       void generation.latest(
         requestId,
-        () => searchProjectFiles({ projectPath, query: trimmed }),
+        () => searchProjectFiles(request),
         {
           onResult: setResults,
           onError: setError,
@@ -57,7 +93,9 @@ export function ProjectFilesPanel({ projectPath, active }: { projectPath: string
       );
     }, 250);
     return () => clearTimeout(timer);
-  }, [generation, projectPath, trimmed]);
+    // 요청은 효과 안에서 만든다 — 렌더마다 새 객체인 값을 의존성에 걸면 효과가 매번 돈다.
+    // `searchContents` 가 의존성에 있어야 스위치를 켠 순간 같은 질의로 다시 검색한다.
+  }, [generation, projectPath, trimmed, searchContents]);
 
   const selectedPath = selected?.relativePath ?? null;
   useEffect(() => {
@@ -86,9 +124,37 @@ export function ProjectFilesPanel({ projectPath, active }: { projectPath: string
     setError(null);
   };
 
+  const restoreSidebar = sidebarOpen ? null : (
+    <button
+      ref={sidebarRestoreRef}
+      className="secondary-pane-restore"
+      type="button"
+      onClick={() => setSidebarVisibility(true)}
+      aria-label={text("파일 탐색기 보기", "Show file explorer")}
+      title={text("파일 탐색기 보기", "Show file explorer")}
+      aria-expanded={false}
+    >
+      <PanelLeftOpen size={15} aria-hidden="true" />
+      <span>{text("파일", "Files")}</span>
+    </button>
+  );
+
   return (
     <div className="docs-layout project-files-layout">
-      <aside className="docs-sidebar">
+      {sidebarOpen && <aside className="docs-sidebar" id="project-files-sidebar">
+        <div className="docs-sidebar-head">
+          <div><strong>{text("파일 탐색기", "File explorer")}</strong></div>
+          <button
+            ref={sidebarCloseRef}
+            className="secondary-pane-toggle"
+            type="button"
+            onClick={() => setSidebarVisibility(false)}
+            aria-label={text("파일 탐색기 숨기기", "Hide file explorer")}
+            title={text("파일 탐색기 숨기기", "Hide file explorer")}
+          >
+            <PanelLeftClose size={15} aria-hidden="true" />
+          </button>
+        </div>
         <div className="doc-tree-panel">
           <label className="document-tree-search">
             <input
@@ -99,6 +165,14 @@ export function ProjectFilesPanel({ projectPath, active }: { projectPath: string
               aria-label={searchLabel}
             />
           </label>
+          <label className="project-search-contents">
+            <input
+              type="checkbox"
+              checked={searchContents}
+              onChange={(event) => setSearchContents(event.target.checked)}
+            />
+            <span>{text("파일 본문도 검색", "Search file contents too")}</span>
+          </label>
           {trimmed.length > 0
             ? <ProjectFileSearchResults
                 page={results}
@@ -108,15 +182,24 @@ export function ProjectFilesPanel({ projectPath, active }: { projectPath: string
               />
             : <DocumentTreePane source={source} selectedPath={selectedPath} onSelect={onSelect} />}
         </div>
-      </aside>
+      </aside>}
+      {sidebarOpen && sidebarIsOverlay && (
+        <button
+          className="docs-sidebar-backdrop"
+          type="button"
+          onClick={() => setSidebarVisibility(false)}
+          aria-label={text("파일 탐색기 닫기", "Close file explorer")}
+        />
+      )}
       <main className="doc-workspace">
+        {restoreSidebar && file === null && <header className="doc-header doc-header-empty">{restoreSidebar}</header>}
         {error && <ErrorBanner message={error} />}
         {selected === null
           ? <EmptyState title={text("파일을 선택하세요", "Select a file")} detail={text("왼쪽 트리에서 파일을 고르면 읽기 전용으로 보여 줍니다.", "Pick a file in the tree to view it read-only.")} />
           : loading || (file === null && !error)
             ? <LoadingState label={text("파일을 읽고 있습니다", "Reading file")} />
             : file
-              ? <ProjectFilePane file={file} />
+              ? <ProjectFilePane file={file} headerLeading={restoreSidebar} />
               : null}
       </main>
     </div>
@@ -140,6 +223,7 @@ function ProjectFileSearchResults({
   onSelect: (entry: ProjectFileSearchHit) => void;
 }) {
   const { text } = useI18n();
+  const unread = unreadContentCount(page);
   if (searching && !page) return <LoadingState label={text("파일을 검색하고 있습니다", "Searching files")} />;
   if (!page) return null;
   if (page.entries.length === 0) {
@@ -166,6 +250,9 @@ function ProjectFileSearchResults({
           </span>
         </button>
       ))}
+      {unread > 0
+        ? <p className="tree-empty">{text(`${unread}개 파일은 본문을 열지 않았습니다 — 제외 폴더·1MB 초과·바이너리입니다.`, `${unread} file(s) were not opened — excluded folders, over 1MB, or binary.`)}</p>
+        : null}
       {page.truncated
         ? <p className="tree-empty">{text("결과가 상한에서 잘렸습니다. 검색어를 좁혀 주세요.", "Results were capped. Narrow the query.")}</p>
         : null}

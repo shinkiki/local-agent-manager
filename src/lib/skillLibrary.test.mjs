@@ -3,7 +3,6 @@ import test from "node:test";
 import {
   adapterSummary,
   isSkillProviderDeployed,
-  latestSkillVersion,
   matchesSkillQuery,
   publishHadFailure,
   publishSummary,
@@ -218,35 +217,6 @@ test("방향을 모르면 어느 쪽이 새 내용인지 단정하지 않는다"
 });
 
 test("방향별 다음 조치를 문구로 알려 준다", () => {
-  assert.match(skillDivergenceHint("behind", translate), /다시 배포/);
-  assert.match(skillDivergenceHint("edited", translate), /채택/);
-});
-
-// "가장 앞선 것으로 전부 맞춘다"가 어느 방향으로 갈지는 수정 시각 하나가 정한다.
-const divergent = (provider, modifiedAtMs) => ({
-  provider,
-  install: { skillId: `${provider}-install`, modifiedAtMs, divergent: true, divergence: null },
-});
-
-test("원본이 가장 새로우면 최신본은 원본이다", () => {
-  const latest = latestSkillVersion(2_000, [divergent("codex", 1_000), divergent("claude", 1_500)]);
-  assert.deepEqual(latest, { kind: "source" });
-});
-
-test("사용본이 원본보다 새로우면 그중 가장 나중 것을 고른다", () => {
-  const latest = latestSkillVersion(2_000, [divergent("codex", 3_000), divergent("claude", 4_000)]);
-  assert.equal(latest.kind, "install");
-  assert.equal(latest.provider, "claude");
-});
-
-test("같은 시각이면 원본이 이긴다", () => {
-  // 배포는 원본의 수정 시각을 사본에 넘기지 않는다. 동시각은 사람이 고친 흔적이 아니다.
-  assert.deepEqual(latestSkillVersion(2_000, [divergent("codex", 2_000)]), { kind: "source" });
-});
-
-test("시각을 모르는 자리가 하나라도 있으면 고르지 않는다", () => {
-  // 모르는 값을 0으로 깔면 그 자리가 늘 지고, 실제로 가장 새로운 사본이 조용히 덮인다.
-  assert.deepEqual(latestSkillVersion(2_000, [divergent("codex", null)]), { kind: "unknown" });
-  assert.deepEqual(latestSkillVersion(null, [divergent("codex", 3_000)]), { kind: "unknown" });
-  assert.deepEqual(latestSkillVersion(null, []), { kind: "source" });
+  assert.match(skillDivergenceHint("behind", translate), /변경사항 취소/);
+  assert.match(skillDivergenceHint("edited", translate), /이 버전으로 통일/);
 });

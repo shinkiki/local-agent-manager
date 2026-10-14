@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Folder, RotateCcw } from "lucide-react";
-import { getClaudeSettingsStates, getProjectRegistry, getSkillDetail, getWebAccessStatus, setClaudeSkillOverride, type WebAccessStatus } from "../lib/ipc";
+import { getClaudeSettingsStates, getProjectRegistry, getSkillDetail, setClaudeSkillOverride } from "../lib/ipc";
 import { useI18n, type UiText } from "../lib/i18n";
 import { CatalogHealthBanner } from "./CatalogHealthBanner";
 import { skillBulkMigrationPrompt } from "../lib/skillTransfer";
@@ -248,26 +248,26 @@ function useClaudeSkillOverride(
   const [projects, setProjects] = useState<ProjectRegistryEntry[]>([]);
   const [selectedProject, setSelectedProject] = useState<string | null>(skill.scope === "project" ? intrinsicProject : null);
   const [settings, setSettings] = useState<ClaudeSettingsSnapshot | null>(claudeSettings);
-  const [access, setAccess] = useState<WebAccessStatus | null>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (skill.source !== "claude" || skill.scope === "plugin") return;
     let active = true;
     const contextProject = selectedProject ?? intrinsicProject;
-    Promise.all([getClaudeSettingsStates(contextProject), getProjectRegistry(), getWebAccessStatus()])
-      .then(([snapshot, entries, webAccess]) => {
+    Promise.all([getClaudeSettingsStates(contextProject), getProjectRegistry()])
+      .then(([snapshot, entries]) => {
         if (!active) return;
         setSettings(snapshot);
         setProjects(entries.filter((entry) => entry.active && entry.exists));
-        setAccess(webAccess);
       })
       .catch((cause: unknown) => { if (active) setError(errorText(cause)); });
     return () => { active = false; };
   }, [skill.source, skill.scope, intrinsicProject, selectedProject]);
 
   const override = settings?.skills.find((entry) => entry.directory === skill.directory) ?? null;
-  const canWrite = access?.writable === true && !override?.locked && !override?.disableModelInvocation;
+  // C20. 로그인한 채널은 모두 데스크톱과 같은 권한이라 접속 경로는 묻지 않는다 — 잠그는 것은
+  // 설정 자체(정책 잠금·모델 호출 비활성)뿐이다.
+  const canWrite = !override?.locked && !override?.disableModelInvocation;
   const writeScope = selectedProject ? "project" : "user";
   const explicit = override ? (writeScope === "user" ? override.values.user : override.values.local) : undefined;
 

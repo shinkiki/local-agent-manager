@@ -55,6 +55,24 @@ test("조기 확정은 의미상 누락으로 남기고 완료되지 않은 계�
     assert.equal(score(task, result).ok, false);
     assert.equal(score(task, { steps: [{ tools: ["webfetch"] }, { tools: ["notion-create-pages"] }], ended: "되묻기 한도" }).ok, false);
 });
+// 2026-10-05: 11·12회차가 두 번 올린 물음 — bash 만으로 끝난 리팩토링 계획을 실패로 셀 것인가. 제품이 bash 를
+// 쓰기 도구로 분류하므로 채점도 인정하되, 그 사실을 표식으로 남겨 따로 셀 수 있어야 한다.
+test("리팩토링 과제의 고치는 자리는 bash 로도 채워지고 그때만 표식이 남는다", () => {
+    const refactor = TASKS.find(t => t.id === "local-refactor");
+    const byBash = score(refactor, { steps: [{ tools: ["read"] }, { tools: ["bash"] }], ended: "확정" });
+    assert.equal(byBash.ok, true);
+    assert.deepEqual(byBash.marks, ["bash 만으로 고침"]);
+    const byEdit = score(refactor, { steps: [{ tools: ["read"] }, { tools: ["edit"] }], ended: "확정" });
+    assert.equal(byEdit.ok, true);
+    assert.deepEqual(byEdit.marks, []);
+    // 읽는 자리를 bash 로 채운 것은 고친 것이 아니므로 표식이 아니다.
+    const readByBash = score(refactor, { steps: [{ tools: ["bash"] }, { tools: ["write"] }], ended: "확정" });
+    assert.deepEqual(readByBash.marks, []);
+    // 읽기만 한 계획은 여전히 실패다 — 고치는 자리가 비어 있다.
+    const readOnly = score(refactor, { steps: [{ tools: ["read"] }], ended: "확정" });
+    assert.equal(readOnly.ok, false);
+    assert.deepEqual(readOnly.issues, ["edit 자리 없음"]);
+});
 test("제품의 두 번 되묻기를 제공한 뒤에만 미확정으로 끝낸다", async () => {
     const { result } = await scripted(Array.from({ length: 3 }, () => ({ role: "assistant", content: "알겠습니다" })), "baseline");
     assert.equal(result.nudges, 2);

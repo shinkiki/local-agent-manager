@@ -47,19 +47,30 @@ Apply to every change. The only permitted deviations are the numbered exceptions
 - **G9** Never execute an arbitrary shell string. Resolve an approved executable and pass
   arguments as a structured vector.
 - **G10** Validate and canonicalize filesystem paths in Rust before reading or writing.
-- **G11** Mutating operations are write-gated. A mutation is additionally reachable from the
-  remote UI in write mode only when it stays inside validated app-owned or app-managed targets
-  and is recoverable. Anything touching provider-owned state outside that boundary is not
-  remote-eligible. Write mode has exactly one stored decision point — `remoteWrite` in
-  `backend-service-settings.json`, owned by the host-only Settings → 백엔드 서비스 toggle
-  (`set_remote_write_enabled`), applied to the running backend without a restart. Headless
-  launches may state the operator's choice with `--remote-write` / `--no-remote-write`, which
-  writes that same setting instead of deciding separately.
+- **G11** Every UI reaches the backend through one of four **access channels** — `desktop`
+  (the Tauri window), `localBrowser` (a browser on the same machine), `remote` (Tailscale Serve,
+  headless NAS) and `native` (an Origin-less loopback caller: CLI relays, the self-check). A
+  channel either requires a sign-in or it does not, per the **C20 login settings** (ID/password
+  and OTP, each switched per channel in Settings → 시스템 → 로그인 설정); `native` never does, being
+  the host's own processes. **Once a channel's requirement is satisfied, every channel carries the
+  same authority as the desktop** (user decision, 2026-10-11): there is no read-only remote mode,
+  no stored `remoteWrite` switch and no host-only command list. The single remaining remote
+  refusal is `begin_external_plugin_oauth` (`is_remote_refused_command`), a physical limit — its
+  callback lands on the host's loopback — not a permission. `is_write_command` survives only as
+  the classification table that the AIA catalog grade test and `projectMenuConformance` read; the
+  request boundary no longer consults it. `--remote-write` / `--no-remote-write` are accepted and
+  ignored with a warning for one release so existing NAS images keep starting.
 
 ## 3. Direct-mutation exceptions
 
 The adapters below are the only direct-mutation exceptions. Nothing else may write outside the
 default app-data boundary or hold credential material there.
+
+The **"Remote in write mode"** column and every per-clause "host-only" / "remote-eligible in write
+mode" statement below are the history of how each exception was opened to remote; since `C20`
+(2026-10-11) they no longer gate anything — a signed-in channel has the whole table. They stay
+because they record *why* each target was judged recoverable, which is still the condition for a
+row being here at all.
 
 | # | Adapter | Write target | Recovery | Remote in write mode |
 | --- | --- | --- | --- | --- |
@@ -78,8 +89,9 @@ default app-data boundary or hold credential material there.
 | C15 | chat secret broker (`chat_secrets.rs`, `chat_secret_cli.rs`) | nothing on disk — named secret values the user hands to one chat live only in backend memory, and the only place a value leaves that memory is the environment of a child process the backend spawns on the agent's behalf | values expire, are dropped with the chat, and are scrubbed from the child's captured output; the agent never receives a value, only its name | yes — the whole feature follows the one `remoteWrite` switch (`C15-7`) |
 | C17 | saved secret vault (`saved_secrets.rs`) | the OS Keychain item derived from a secret name, plus its name, purpose, agent-use flag and timestamps in the app data directory | the user saved it deliberately and deletes it the same way; no provider state is touched | yes — the whole feature follows the one `remoteWrite` switch (`C17-7`) |
 | C14 | local provider execution harness (`acp.rs`, `opencode_config.rs`, `local_llm.rs`) | exactly two keys in the user-owned `~/.config/opencode/opencode.json` — `provider.agent-manager-local` and the `agent.agent-manager-local*` entries — plus the connection record in the app data directory and the OS Keychain item holding its API key | every other key is read and written back untouched and the file is replaced atomically; turning the connection off removes the two keys rather than leaving a stale address behind | yes — registering the connection and probing a server address are both write-gated, the probe deliberately so (`C14-7`) |
-| C16 | project git adapter (`project_git.rs`) | the git repository whose worktree contains an **active registered project** — index, refs, stash and worktree files — only through the user's own `git` binary; a repository whose top-level is the user's home or a restricted root is refused | every offered operation leaves a reflog / `ORIG_HEAD` / stash anchor on its receipt (`headBefore`, `headAfter`, `droppedStashSha`); irrecoverable commands (`reset --hard`, `clean`, discarding worktree changes, `branch -D`, `--force*`, `--amend`, interactive rebase) are not offered at all | yes, except `push_project_git` (host-only: it publishes outward with the host user's credentials) |
+| C16 | project git adapter (`project_git.rs`) | the git repository whose worktree contains an **active registered project** — index, refs, stash and worktree files — only through the user's own `git` binary; a repository whose top-level is the user's home or a restricted root is refused | every offered operation leaves a reflog / `ORIG_HEAD` / stash anchor on its receipt (`headBefore`, `headAfter`, `droppedStashSha`); irrecoverable commands (`reset --hard`, `clean`, discarding worktree changes, `branch -D`, `--force*`, `--amend`, interactive rebase) are not offered at all | yes, `push_project_git` included since 2026-10-10 |
 | C18 | cask quarantine release (`cli_quarantine.rs`) | the `com.apple.quarantine` extended attribute — nothing else — on regular files directly inside the resolved provider CLI's `Caskroom/<token>/<version>/…` folder, for a cask token registered in `TRUSTED_CASK_SIGNERS` and a file whose signature satisfies that vendor's Developer ID team | the attribute only makes Gatekeeper re-evaluate a notarized binary on every exec; file contents, permissions and every other attribute stay as installed, and the next cask upgrade stamps a fresh folder anyway | yes — it runs as part of resolving an executable, never as its own operation |
+| C20 | access-channel login adapter (`login_auth.rs`, `login_sessions.rs`, `login_totp.rs`) | `login-settings-v1.json` (user ID, argon2id hash, per-channel requirements, last OTP step), `login-sessions-v1.json` (session SHA-256 only) and the OTP secret — OS Keychain item `Agent Manager Login`/`totp`, falling back to the `0600` file `login-otp-secret` only where no secure store exists | nothing provider-owned is touched; `--reset-login` (or deleting the three files) returns to "no login required". Sessions expire (30 days idle, 90 days absolute) and can be revoked from the settings card | the whole card is reachable from any signed-in channel; changing a method needs the current password (or OTP) again (`C20-4`) |
 | C19 | local overlay adapter (`project_overlays.rs`) | 앱 데이터의 `<app data>/git-overlays/`, 그리고 스냅샷·적용 시점에만 **등록된 활성 프로젝트** 작업 트리의 선택된 추적 파일 | patch를 먼저 쓰고 digest까지 확인한 뒤에만 되돌리고, 재적용은 `git apply --check`가 통과할 때만 한다. 세트 삭제는 앱 소유 휴지통으로 옮긴다 | 읽기는 열려 있고, 세트 저장·삭제와 작업 트리를 바꾸는 스냅샷·적용 모두 write mode에서 원격 가능(2026-10-02 사용자 결정) |
 
 ### C1 — credential adapter
@@ -383,7 +395,7 @@ folder may use its own or another module directory (`node_modules/cypress`).
   code (`cy.exec`, `setupNodeEvents`) on the host. That is the accepted risk of the opt-in; the
   Execute approval on `run_cypress_spec` and the host-only gate are the controls, not sandboxing.
 
-- **C7-7** Cypress is available to all agents through a dedicated loopback MCP endpoint. Claude/Codex attach it at standard-chat start; other shell-capable agents receive the bundled cypress-automation skill and app-owned endpoint pointer. Each tools/list and tools/call rechecks the enabled flag. Only the explicit Cypress allowlist is callable; enabling, removal and env plaintext remain UI-only. The existing opt-in permits host execution (C7-6); the agent runtime applies its tool/shell approval policy. No general aia_system capability is attached.
+- **C7-7** Cypress is available to all agents through a dedicated loopback MCP endpoint. Claude/Codex attach it at standard-chat start; Antigravity receives it through the global-config sync of `P12`; other shell-capable agents receive the bundled cypress-automation skill and app-owned endpoint pointer. Each tools/list and tools/call rechecks the enabled flag. Only the explicit Cypress allowlist is callable; enabling, removal and env plaintext remain UI-only. The existing opt-in permits host execution (C7-6); the agent runtime applies its tool/shell approval policy. No general aia_system capability is attached.
 
 - **C7-8** `open_cypress_runner` launches the same runner in `cypress.open()` mode so a person can
   pick a spec in the Cypress launcher and step through it (`cy.pause()` is ignored by `cypress.run`,
@@ -696,9 +708,10 @@ exception is deliberately the narrowest shape that answers the question a user a
   passphrase, password, and host-key prompts must reach the person typing, so a host missing from
   `known_hosts` is answered here once instead of being refused. And it enforces **no command list** —
   a prefix comparison on a stream of keystrokes is not enforcement, and the lists bind agents, not
-  the user. Consequently it is host-only (`authorize_terminal_open_request`), like remote execution
-  and transfers: a shell reaching a third-party server with the host's key does not belong in a
-  remote browser. `SessionKey::source` becomes `Option<ProviderId>` so this terminal carries no
+  the user. User decision, 2026-10-01: the authenticated remote UI may also open this terminal
+  when `remoteWrite` is enabled (G11); `authorize_terminal_open_request` rejects read-only remote
+  access. This remains a user-driven terminal, never an agent operation.
+  `SessionKey::source` becomes `Option<ProviderId>` so this terminal carries no
   provider — it takes no account lease, is excluded from per-provider bulk stops, and its lock file
   is named from the sanitized fingerprint so one server maps to one reattachable terminal. Private
   keys are still passed by path only (G4).
@@ -718,8 +731,12 @@ exception is deliberately the narrowest shape that answers the question a user a
   keeps only `[A-Za-z0-9@._+-]` before being wrapped in single quotes, so nothing in a key file can
   close that quote and become a command on the remote shell. The session id is
   `ssh-install-<fingerprint>`, distinct from the shell's, because a shared id would reattach to an
-  open shell and silently skip the install. Host-only for the same reason as C9-19, and more
-  pointedly: this is a window a password gets typed into.
+  open shell and silently skip the install. User decision, 2026-10-01: this installation
+  mode is also available to the authenticated remote UI when `remoteWrite` is enabled (G11).
+  Passwords are typed directly into the existing PTY/WebSocket surface and are never stored;
+  no new credential field or agent operation is introduced. Read-only remote access is refused
+  by both the frontend connector and `authorize_terminal_open_request`, just like the general
+  SSH shell under C9-19, including requests with an omitted mode.
 
 ### C10 — database connections, statements, and approvals (`db_connections.rs`, `db_sql.rs`, `db_exec.rs`, `db_approvals.rs`, `db_cli.rs`)
 
@@ -781,10 +798,9 @@ client is installed on the host and nothing is downloaded at runtime.
 - **C10-13** Shell-capable agents use the bundled `db-connections` system skill: `<CLI> db list`
   and `<CLI> db query` run in that process against the same policy code, and `<CLI> db exec`
   relays to the running backend because only the backend can raise the approval card.
-- **C10-14** Registration, credential entry, and statement execution (including the CLI relay) are
-  host-only; listing, the agent-use toggle, the connection check and reads are write-gated and
-  remote-eligible in write mode. No new permission switch is introduced — the two existing
-  decision points (`remoteWrite` and the host-only command list) carry this.
+- **C10-14** Registration, credential entry, and statement execution (including the CLI relay) were
+  host-only until `C20` (2026-10-11); now every operation here is open to any signed-in channel. No
+  permission switch of its own is introduced — the channel login (G11) carries this.
 
 ### C11 — session cleanup (`session_cleanup.rs`)
 
@@ -986,6 +1002,10 @@ set is closed and every offered command is recoverable.
   and push (`push <remote> HEAD`, optionally `--set-upstream`). Never offered: any `--force*`,
   `reset --hard`, `clean`, `restore` or `checkout` of worktree files, `branch -D`, `--amend`,
   interactive rebase, `--autostash`. Adding a command to this list is a change to this exception.
+  Every flag named here as offered or forbidden, and every global option in C16-2/C16-3, must be
+  exercised against a real `git` by at least one test that inspects the argv the child actually
+  received — a literal that only appears in source can be deleted without failing anything
+  (2026-10-04: the push refspec and `rev-parse` echo defects both hid behind literals no test ran).
 - **C16-5** Every ref, branch, remote, stash index and message is bounded, refused when it starts
   with `-` or contains control characters, and verified against the repository before it reaches
   argv (`check-ref-format --branch`, `rev-parse --verify --end-of-options <ref>^{commit}`, exact
@@ -997,17 +1017,47 @@ set is closed and every offered command is recoverable.
   identity, or locked index is a structured receipt (`outcome`, `conflictedFiles`, `blockedFiles`,
   `message`), not a bare error. Every receipt carries `headBefore` and `headAfter`; a stash drop
   additionally carries the dropped SHA, so the recovery command is always derivable from the
-  receipt.
+  receipt. The wording that classifies each outcome is bound to real `git` output by a test that
+  provokes that outcome — a test that feeds the classifier its own hand-written string only proves
+  the two agree with each other, not that `git` says it (2026-10-04).
 - **C16-7** Reads (overview, status, diff, commit file list, log) are ungated and open to the read-only remote UI.
   All mutations are write-gated and remote-eligible in write mode (user decision, 2026-09-28, on
   the same grounds as C6-6 / C9-5 / C9-10: everything offered is recoverable and remote write
-  already lets a chat change the host) **except push**, which is host-only and additionally
-  confirmed in the UI. Every operation is registered for AIA — reads as `Read`, mutations as
+  already lets a chat change the host). **Push is no longer the exception** (user decision,
+  2026-10-10, headless backlog H07): a headless Linux deployment has no desktop app, so "do it on
+  the host" is not a seat the user can ever reach and host-only removes the operation entirely
+  rather than relocating it. Opening it widens no credential — execution stays non-interactive
+  under C16-3 (`GIT_TERMINAL_PROMPT=0`, empty `GIT_ASKPASS`), so it can only use a credential the
+  host already holds and otherwise ends as an `authFailed` receipt without prompting, and C16-4
+  still offers no `--force*`, so remote history cannot be overwritten. The UI confirmation stays.
+  Every operation is registered for AIA — reads as `Read`, mutations as
   `Execute` — and switch, stash, rebase, pull and push carry `HARD_TO_RECOVER_OPERATIONS` entries
   (W3).
 - **C16-8** Remote URLs and captured output have `scheme://user:token@` userinfo redacted before
   they leave Core, and nothing else is masked — the SSH output redaction would erase commit SHAs.
   No other secret enters a receipt (G4).
+- **C16-10** A headless container has no credential helper and no key, so both HTTPS and SSH
+  remotes fail `authFailed` and nothing can be pushed from a NAS. The answer is deliberately the
+  narrowest one: an SSH add-on key (`C9-9`) carries a **git-remote** flag, and when it is on the
+  three network operations — and only those three (`fetch`, `pull`, `push`, through
+  `network_mutate`) — receive `GIT_SSH_COMMAND` naming that key. Reads and local mutations do not,
+  and **no agent child process ever does**: this is the user's own git, not a capability handed to
+  an agent, so `C9`'s agent surface and `C16-2`'s environment contract are unchanged. The flag is a
+  user path like the `C9-19` terminal, so it requires a private key but **not** `agentEnabled`, and
+  turning it on opens nothing in `list_agent_ssh_endpoints`. At most one key per device may carry
+  it — two would make the identity a receipt could not name — and a second is refused rather than
+  silently clearing the first. The flag rides the endpoint record, so saving it needs a host entry
+  the git path never reads. The key is never copied: `ssh` receives the path only (`G4`).
+  `GIT_SSH_COMMAND` — unlike `GIT_SSH` — **is interpreted by a shell**, which is why extra options
+  can be written into it; the path is therefore single-quoted, and a path containing the one
+  character a single quote cannot neutralize (`'`) or a control character is refused **where the
+  user turns the flag on**, not where it is used, so the refusal is something they can read (`G9`).
+  An inherited `GIT_SSH_COMMAND`, `GIT_SSH` or `GIT_SSH_VARIANT` is in `REMOVED_ENV`, so only the
+  key the user chose can reach git, and `run_capped_with` removing before it sets is what makes
+  that hold — pinned by a test that spawns a real child with the same name on both lists. The identity path
+  is redacted from both captured streams before the receipt leaves Core, because `ssh` prints it in
+  its own warnings and that receipt reaches a remote screen. Resolution failure is not a refusal:
+  git falls back to its own defaults and ends in `authFailed` as before.
 - **C16-9** The file tab (`project_files.rs`) needs no exception: it is a G1-style read of the
   registered project folder. It lists and reads regular files only — dot-entries are shown, `.git`
   is hidden at every depth, symbolic links are hidden in listings and refused on read at every
@@ -1105,6 +1155,21 @@ identity, SSH, caches and the browser profile with it. This exception exists to 
   runs in it. Linking the shared home's keychain instead is forbidden: the modal would stop but
   every account would contend for the same item, which is the isolation this exception exists to
   provide. Account login runs inside that profile like any other run — never in the shared home.
+  That keychain is **rebuilt once per boot**, and existence is never taken for usability. It is
+  open only in the session that created it: a reboot brings it back locked, nobody unlocks it
+  (loginwindow does that for the user's own keychain with the account password, and a profile has
+  no such party), and a keychain whose file name is `login.keychain-db` is one that
+  `security unlock-keychain -p <password>` cannot open with **any** password — measured
+  2026-10-14, where `t.keychain-db` in the same directory opened and `login.keychain-db` returned
+  `errSecAuthFailed`. The name is not ours to change: a redirected `HOME` resolves its default
+  keychain only at `$HOME/Library/Keychains/login.keychain-db`, and `default-keychain -d user -s`
+  does not persist into that home (same day). So a stale keychain can only raise the unanswerable
+  unlock panel, once per account — the state three Antigravity profiles were found in after the
+  09:23 reboot that day. `ensure_profile_keychain` therefore compares the file's creation time
+  with `kern.boottime`, moves anything older aside as `login.keychain-db.unusable-<ms>` (never
+  deletes it — the token inside is unreachable, not gone) and creates a fresh one, which
+  `sync_profile_credential` refills from the Vault. Asking `security` whether a keychain is
+  locked is not an option: the question itself raises the panel.
 - **C12-5** Every registered account runs in its own profile, the active one included. Letting the
   active account use the shared home instead looks like it preserves the user's existing
   conversations, but `set_active` only rewrites the registry — it never replaces the shared home's
@@ -1280,15 +1345,26 @@ happen in a terminal outside the app, so the release runs where an executable is
   atomic replace이고 디렉터리는 `0700`, patch 파일은 `0600`이다. 메타데이터는 repository
   identity, canonical root, 대상 경로, snapshot id, 생성 시점, 기준 HEAD, patch digest, 적용
   상태만 담는다. 파일 내용과 patch 본문은 메타데이터에 들어가지 않는다.
-- **C19-2** patch 본문에는 파일 **내용**이 그대로 들어가므로, `.env`, `*.pem`, `*.key`, `id_*`,
-  `credential`/`credentials`, `secrets`, `.npmrc`, `.netrc`에 걸리는 경로는 기본 제외하고 **사유와
-  함께 거절**한다. G4가 금지하는 것은 Agent Manager 파일에 비밀값을 남기는 것이고, 앱 데이터
-  안의 patch가 바로 그 파일이다. 거절은 조용하지 않다 — 어느 경로가 어느 규칙에 걸렸는지
-  영수증에 싣는다.
-  - v1은 예외 등록을 제공하지 않는다. 거절 사유만 보여 주고, 민감 경로를
-    overlay에 넣는 길은 열지 않는다.
+  - `<저장소 식별자>`는 등록 프로젝트 루트가 아니라 **저장소 최상위**(`.git`이 있는 곳)에서
+    나온다 — 한 저장소의 하위 폴더를 둘 등록해도 장부는 하나다. 세트의 대상 경로는 **저장소
+    루트 기준**이다(C16-1과 같다): `git status`가 주는 경로를 스냅샷·적용이 저장소 최상위의
+    git에 그대로 넘긴다. 이 둘이 코드 여러 자리에 암묵적으로만 적혀 있어 2026-10-04에 결함이
+    넷 나왔다(하위 폴더 프로젝트에서 overlay 표시·장부·재적용이 조용히 꺼져 있었다).
+- **C19-2** overlay가 존재하는 이유가 바로 **민감·로컬 전용 설정을 로컬에만 두는 것**이다.
+  `.env`, `*.pem`, `*.key`, `id_*`, `credential`/`credentials`, `secrets`, `.npmrc`, `.netrc`
+  같은 경로야말로 브랜치를 옮길 때마다 잃어서는 안 되는 것이고, 그것을 막으면 이 기능이 서 있을
+  이유가 사라진다. 그래서 이 경로들을 **거절하지 않는다** — v1의 기본 제외는 걷어낸다
+  (2026-10-05 사용자 결정).
+  - G4(Agent Manager 파일에 비밀값을 남기지 않는다)는 금지가 아니라 보관 **자리**로 받는다:
+    C19-1 대로 세트는 저장소 밖 `<app data>/git-overlays/`에만 쓰고 디렉터리는 `0700`,
+    본문 파일은 `0600`이다. 막아 두어도 그 값은 어차피 사용자의 작업 트리에 그대로 있었고,
+    overlay는 그것을 더 느슨한 자리로 옮기지 않는다.
+  - 영수증에는 여전히 patch 본문도 파일 내용도 싣지 않는다(C19-5).
 - **C19-3** 이 예외가 더하는 git 명령은 정확히 둘이다 — `git restore --source=HEAD --worktree`
-  (patch 저장이 성공한 **뒤에만**)와 `git apply`(재적용). C16-4가 금지한 나머지는 여전히
+  (patch 저장이 성공한 **뒤에만**)와 `git apply`(재적용). 그 인자의 유일한 출처는
+  `project_overlays.rs`의 `OVERLAY_DIFF_ARGS`·`OVERLAY_RESTORE_ARGS` 상수이고 가드 시험은 본문이
+  아니라 그 상수 값을 본다 — 문자열이 파일 어딘가에 있는지 보는 시험은 미끼 상수 하나로
+  통과시킬 수 있었다(2026-10-04 실측). C16-4가 금지한 나머지는 여전히
   금지다: 어떤 `--force*`도, `reset --hard`도, `clean`도, `--amend`도, 대화형 rebase도 이 예외가
   열지 않는다. `git checkout`은 worktree 복원에 쓰지 않는다(`restore`가 범위가 좁다). 순서가
   안전의 전부다 — patch를 쓰고 fsync하고 digest를 확인한 뒤에 되돌리므로, 저장이 실패하면 작업
@@ -1299,17 +1375,26 @@ happen in a terminal outside the app, so the release runs where an executable is
   외부 Git 작업을 감지한 경우에는 자동 적용하지 않고 검사 결과와 적용 버튼만 내민다. Git 작업
   자체가 실패하면 이전 브랜치에서 재적용을 시도하고, 그 재적용까지 실패해도 **patch는
   보존하고** 복구 영수증을 남긴다 — patch를 잃는 경로는 어디에도 없다. v1이 지원하는 것은
-  HEAD에 있는 추적된 일반 파일의 unstaged 변경뿐이고, `untracked`, `staged`, `deleted`,
-  `rename`, `modeChange`, `submodule`, `conflicted`, `symlink`, `unbornHead`는 등록 또는 스냅샷
-  생성을 사유와 함께 거절한다. 저장소 하나에 변경 하나다 — C16-3의 저장소 단위 잠금을 git
+  HEAD에 있는 추적된 일반 파일의 unstaged 변경과 **untracked 일반 파일**이고, `staged`,
+  `deleted`, `rename`, `modeChange`, `submodule`, `conflicted`, `symlink`, `unbornHead`는 등록
+  또는 스냅샷 생성을 사유와 함께 거절한다.
+  - untracked는 patch가 아니라 **파일 사본**으로 보관한다(2026-10-05 사용자 결정). HEAD에
+    원본이 없어 `git diff`도 `git restore`도 기준점을 갖지 못하지만, 그 자리에서 되돌림은
+    `restore`가 아니라 **파일 삭제**이고 재적용은 사본을 그 경로에 다시 쓰는 것이라 기준점이
+    필요 없다 — v1이 거절한 근거('절반 적용을 되돌릴 수 없다')가 성립하지 않는다. 순서는
+    같다: 사본을 쓰고 fsync하고 digest를 확인한 뒤에만 작업 트리에서 지운다. 재적용은 그
+    경로가 비어 있을 때만 하고, 이미 파일이 있으면 덮지 않고 `overlayNeedsResolution`으로
+    돌려준다. 사본도 patch와 같은 자리·같은 권한에 둔다(C19-1).
+  저장소 하나에 변경 하나다 — C16-3의 저장소 단위 잠금을 git
   어댑터와 **공유**해 overlay 적용과 `git` 변경이 서로를 가로지르지 않게 하고, 겹치면 `busy`를
   돌려준다.
 - **C19-4** 읽기(`list_project_overlay_sets`, `check_project_overlay_apply`)는 원격 UI에 열린다.
   세트 저장·삭제(`save_project_overlay_set`, `delete_project_overlay_set`)와 작업 트리를 바꾸는
   둘(`snapshot_project_overlay`, `apply_project_overlay`)은 모두 쓰기 게이트를 지나고 **write
   mode에서 원격 가능**하다(2026-10-02 사용자 결정). 초안은 뒤의 둘을 C16-7의 push와 같은 부류로
-  보아 호스트 전용으로 제안했으나, push가 호스트 전용인 이유는 호스트 사용자의 자격증명으로
-  **바깥으로** 내보내기 때문이고 overlay는 바깥으로 나가지 않는다. 남는 위험은 "화면 앞에 없는
+  보아 호스트 전용으로 제안했으나, 그때 push를 호스트 전용으로 둔 이유는 호스트 사용자의
+  자격증명으로 **바깥으로** 내보내기 때문이었고 overlay는 바깥으로 나가지 않는다(그 push도
+  2026-10-10 C16-7 개정으로 열렸으나, overlay가 그와 다른 부류라는 판단은 그대로다). 남는 위험은 "화면 앞에 없는
   사이 작업 트리가 바뀐다"인데, 그 답은 권한 경계가 아니라 복구성이다 — patch를 먼저 쓰고
   digest까지 확인한 뒤에만 되돌리고, 재적용은 `--check`가 통과할 때만 하고, 모든 변경이 C19-5의
   영수증을 남기므로 무엇이 왜 바뀌었는지 영수증만으로 되짚을 수 있다. G11의 하나뿐인 결정
@@ -1320,8 +1405,73 @@ happen in a terminal outside the app, so the release runs where an executable is
   SHA-256, 적용 시점에 같은 patch인지 확인한다), `outcome`(`applied`/`overlayNeedsResolution`/
   `rejected`/`busy`), `affected`(검사 실패 시 충돌한 경로), `rejected`(거절한 경로와 사유),
   `trigger`(`app`/`external` — 자동 적용했는지 버튼을 내밀었는지)다. 영수증에는 patch 본문도
-  파일 내용도 싣지 않는다(G4). 세트 삭제는 지우지 않고 앱 소유 휴지통으로 옮긴다(C3-11) —
+  파일 내용도 싣지 않는다(G4). 이 금지는 **영수증**에 대한 것이다 — 모든 변경에 자동으로 남는
+  기록이라 본문이 들어가면 쌓인다. 사용자가 세트 하나를 지목해 본문을 묻는 읽기
+  (`read_project_overlay_patch`, O16·O17)는 그 대상이 아니다. 세트 삭제는 지우지 않고 앱 소유
+  휴지통으로 옮긴다(C3-11) —
   patch는 사용자 로컬 데이터이고, 지우면 그 변경의 유일한 사본이 사라진다.
+
+### C20 — access-channel login (`login_auth.rs`, `login_sessions.rs`, `login_totp.rs`)
+
+Until 2026-10-11 remote identity was the Tailscale header alone and remote *authority* was the
+`remoteWrite` switch plus a host-only command list. The user replaced that with authentication:
+each access channel (G11) may require an ID/password, an OTP, both or neither, and a signed-in
+channel is the desktop. The adapter owns three app-data stores and nothing else.
+
+- **C20-1** Writes go to `<app data>/login-settings-v1.json` (`0600`, atomic replace), `<app
+  data>/login-sessions-v1.json` (`0600`) and the OTP secret. The settings file holds the user ID, the
+  argon2id PHC string, the last accepted OTP step and `{desktop, localBrowser, remote} × {password,
+  otp}`; a password plaintext never reaches any file, log, receipt or response.
+- **C20-2** Password: argon2id (RustCrypto `argon2`, default parameters, fresh salt), 8–256
+  characters. OTP: RFC 6238 TOTP, HMAC-SHA1, 6 digits, 30 s, ±1 step, the accepted step recorded so a
+  code is never accepted twice (`login_totp.rs`, pinned to the RFC appendix vectors). Comparisons are
+  constant-time and the user ID is checked together with the hash so timing does not reveal whether
+  the ID exists. Enrollment is two steps — `begin_login_otp_setup` returns the otpauth URL, base32 key
+  and an SVG QR; nothing is stored until `confirm_login_otp_setup` verifies a live code.
+- **C20-3** A session is a 32-byte random token the client keeps in `localStorage`; the store keeps
+  only its SHA-256 with the issuing channel, timestamps and a bounded label. The token travels as
+  `X-Agent-Manager-Session` on `fetch` and, because browsers cannot set headers there, as the
+  `session` query parameter on WebSocket upgrades and the two `<img>` asset routes
+  (`/api/session-image/`, `/api/chat-attachment/`); the server reads header first, then query, and
+  never echoes it. A session issued on `remote` is valid only on `remote`; a loopback session is
+  valid on `desktop` and `localBrowser`. Idle expiry 30 days, absolute 90 days, at most 64 sessions.
+- **C20-4** Changing the user ID, setting or clearing the password, and enrolling or removing OTP
+  require the **current** password (or, with no password, a current OTP code) in the same call — a
+  stolen session alone cannot rewrite the credentials. A method still required on any channel
+  cannot be removed (`LOGIN_METHOD_IN_USE`); a method not yet configured cannot be required
+  (`LOGIN_METHOD_NOT_CONFIGURED`). Failed sign-ins and failed re-authentications are rate-limited per
+  channel (5 failures → 30 s, doubling to 15 min, memory only).
+- **C20-5** `native` — a loopback request with no `Origin` and no browser `Sec-Fetch-*` marker — is
+  the host's own process (`db_cli`, `chat_secret_cli`, the start-up self-check) and is never asked to
+  sign in, exactly the trust loopback had before. A local process could forge a browser Origin; that
+  is the same trust level and is accepted.
+- **C20-6** Browsers omit `Origin` on same-origin GETs and `<img>` loads, so an Origin-less loopback
+  request *with* `Sec-Fetch-*` is a loopback browser: `Sec-Fetch-Site: same-origin` is
+  `localBrowser`, anything else is treated as `desktop`. Where the two loopback channels disagree an
+  asset GET follows the weaker requirement (`loopback_asset_requirement`). In practice the Tauri window
+  fetches attachments with a header (its CSP forbids direct loopback `<img>`), so this only matters
+  for a browser whose channel requires nothing while the desktop's does.
+- **C20-7** Recovery is the operator's: `agent-manager-server --reset-login` (parsed after
+  `--app-data-dir`) removes the three stores and the Keychain item; on the desktop the user deletes
+  the same files. The sign-in screen says so. No backdoor exists in the UI or the API.
+- **C20-8** The OTP secret prefers the OS Keychain (`os_keychain.rs`). Where the keyring reports the
+  store itself unavailable (`KEYCHAIN_UNAVAILABLE`, headless Linux without Secret Service) it is kept
+  as a `0600` file in app data — the same accepted risk as `C4-9`, surfaced to the user as
+  `otpSecretStorage: file` on the settings card. Any other keyring error fails the enrollment.
+- **C20-9** The login is a UI gate at the HTTP boundary (`enforce_login`), not a process boundary:
+  the Tauri shell's own IPC (`nativeCall`) and anything already running on the host are untouched.
+  Static files, `GET /api/access`, `POST /api/login`, `POST /api/logout` and CORS preflight stay
+  public so the sign-in screen can load. A revoked session ends new requests; WebSocket streams
+  already open keep running, as before.
+- **C20-10** Login settings and session commands are absent from the AIA catalog — the agent may be
+  told where the card is (`show_ui_guide settings.login`) and nothing more. The `/api/access`
+  contract (`protocolVersion` 12) reports `channel`, `authenticated` and `loginRequired`; `writable`
+  is gone. Reads of the settings card are plain reads; every setter is in `is_write_command` for the
+  classification test only.
+- **C20-11** Accepted and stated: `tauri dev` serves the window from `localhost:1420`, so during
+  development the desktop window is classified as `localBrowser`. Users who ran with `remoteWrite:
+  false` become writable-from-remote on upgrade; the settings card shows a warning while the
+  Tailscale service is on and the remote channel requires nothing.
 
 
 ## 4. External MCP interfaces (`mcp_registry.rs`)
@@ -1351,7 +1501,8 @@ An external plugin is an MCP server (Notion and the like) attached directly to *
 per run and exposed to AIA only through typed proxy operations. It is the second outbound network
 dependency after 4, and the only one a standard chat acquires.
 User decisions (2026-08-30): credentials are **device-scoped**, the remote UI **cannot
-authenticate**, and Notion works both through OAuth (hosted `mcp.notion.com`) and through an
+authenticate** (superseded for every flow by H03 and the 2026-10-11 callback paste in P4), and
+Notion works both through OAuth (hosted `mcp.notion.com`) and through an
 internal integration token (`ntn_…`) served by the official open-source server.
 User decision (2026-09-01): Google's official Workspace remote MCP servers (Gmail, Drive,
 Calendar, Docs) are offered as OAuth presets backed by a user-created GCP OAuth client.
@@ -1389,12 +1540,25 @@ through the **device flow** because its authorization server has no dynamic regi
   phone without closing any disclosure path. Removal follows registration — what is registered
   remotely must be removable remotely, and what it deletes is an app-owned record plus a token the
   user can reissue at the provider.
-  **`begin_external_plugin_oauth` stays host-only**, and that is a physical limit rather than a
-  permission: the callback `redirect_uri` is the host's loopback, so approving in a remote browser
-  redirects nowhere and only leaves a pending flow the remote screen cannot finish. Connecting
-  from a remote screen therefore means a token method. `set_external_plugin_tool_policy` /
-  `set_external_plugin_tool_policies` also stay host-only — `allow` removes an approval card, and
-  a decision that widens authority is taken at the host (same rule as `set_remote_write_enabled`).
+  **`begin_external_plugin_oauth` is open on every channel** (user decision, 2026-10-11). The
+  device flow (`PluginAuthKind::OAuthDevice`, RFC 8628) never had a channel limit — it opens no
+  loopback and the backend polls the token endpoint while the user types the code in any browser
+  (headless backlog H03). The callback flow's limit was physical, not a permission: its
+  `redirect_uri` is the backend's loopback, so a browser on another device (a remote screen, or
+  any screen of a headless deployment) stops on a "cannot connect to 127.0.0.1" page. That page's
+  address is the finish line: `submit_external_plugin_oauth_callback` hands the pasted
+  `http://127.0.0.1:<port>/callback?code=…&state=…` to the pending flow, which accepts it only
+  when scheme, port and path equal the flow's registered redirect, the host is loopback
+  (`localhost` included) and `state` matches; a mismatch leaves the flow untouched so the user
+  can paste again, and a flow takes one code. The same wait thread that serves the loopback
+  request exchanges that code, so PKCE, `resource`, token storage and the failure record are
+  shared with the host path, and the registered redirect (and with it the client registration and
+  refresh token) stays the same whichever screen finishes the flow. What crosses the channel is a
+  single-use code bound to a verifier that never leaves the backend. The command is a write
+  command under the channel login (`C20`); there is no remote refusal left in this module.
+  `set_external_plugin_tool_policy` /
+  `set_external_plugin_tool_policies` were host-only until 2026-10-11 and now follow the channel
+  login like everything else.
   AIA can inspect and toggle plugins, list the current tools of an enabled, credential-ready
   plugin, and call them only through the typed read/execute proxy operations; it never receives a
   credential.
@@ -1412,7 +1576,8 @@ through the **device flow** because its authorization server has no dynamic regi
   never gets a plugin MCP server directly: it uses `get_external_plugin_tools`,
   `read_external_plugin_tool`, and `execute_external_plugin_tool` through `aia_system`, with the
   enabled/credential-ready state and current `readOnlyHint` revalidated for every call.
-  Antigravity never gets plugins.
+  Antigravity has no per-run MCP config and receives the same set through its global config
+  instead (`P12`).
 - **P8** Limits: 16 plugins, 1 MB request body, 8 MB proxied response, 10-minute callback wait,
   90-second managed-server start.
 - **P9** Hosted presets are defined once in the backend `HOSTED_MCPS` table (id, URL, auth kind,
@@ -1438,6 +1603,44 @@ through the **device flow** because its authorization server has no dynamic regi
   standard chat carries the policies it started with (P7) and auto-approves those Claude
   `can_use_tool` requests. Setting a policy is a **host-only** command like token entry, because
   `allow` removes an approval the user would otherwise see.
+- **P12** Every proxy address handed to a CLI names its caller:
+  `<base>/<agent>/<id>` with `<agent>` one of `claude`, `codex`, `local`, `antigravity`
+  (`plugin_proxy_url`, the one builder both paths below use). The segment-less `<base>/<id>` is the
+  app's own path (AIA proxy operations, the local plugin shell, connection checks) and accepts
+  older registrations; an unknown segment is not routed. The segment is **not authentication** —
+  the route key stays the boundary, and a local process that knows it can write any segment (the
+  `C20-5` native trust level) — so it only ever narrows: what a caller sees is decided by whether
+  that provider can put an `ask` tool in front of the user (`ProviderId::confirms_plugin_tools`).
+  Claude (`can_use_tool`), Codex (MCP approval requests) and the local harness (ACP permission
+  requests) can; Antigravity's print mode cannot — it soft-denies a confirmation and fails the
+  turn, or with `--dangerously-skip-permissions` runs it unasked. For a caller that cannot, `deny`
+  stays hidden, `allow` is shown, and `ask` (the default) is shown only when the upstream's
+  current `readOnlyHint` says read-only. The same verdict is re-taken at `tools/call`: the proxy
+  sends one `tools/list` on the CLI's own session and refuses the call as a tool error naming the
+  `allow` switch when the hint is not read-only (a hint that cannot be read refuses with its own
+  reason). Each of those `tools/list` requests carries a fresh JSON-RPC id, every tool name in a
+  batch is checked, not just the first, and a body the proxy cannot parse is refused for such a
+  caller rather than passed through unjudged. The builtin Cypress endpoint keeps its
+  segment-less `/builtin/cypress` path: it has no tool policies, and Antigravity already reached
+  the same allowlist through the skill route (`C7-7`).
+  Antigravity gets the plugins through its global `~/.gemini/config/mcp_config.json`, which every
+  `C12` profile shares through the linked `.gemini/config` (`antigravity_mcp_sync.rs`). The desired
+  set is exactly what a run-scoped provider would attach — enabled, credential-ready plugins at
+  their `antigravity` address plus the builtin Cypress endpoint while Cypress is on. Writes go only
+  through the provider's own `agy mcp add|remove|disable` with a structured argv (`G3`, `G9`); the
+  file is read for comparison only (`G1`). Ownership comes from the ledger
+  `antigravity-mcp-registrations.json` (`G7`) and from the address — the route key is a persisted
+  random value, so an entry pointing exactly at the current proxy is the app's. Anything else is
+  the user's: a same-name entry with another address is left alone and reported as a conflict,
+  never overwritten or removed, and an entry the user disabled with `agy mcp disable` stays
+  disabled across an address update and across being withdrawn and re-registered (the ledger
+  remembers the observed flag). Sync runs right before every Antigravity chat starts (the CLI
+  fixes its tool list there), after backend start (the port may have moved), after a plugin or
+  Cypress change, and when an OAuth flow completes, against the live proxy address of this process
+  (the stored one only where none is at hand). It is serialized, a no-op when nothing differs, and
+  never blocks a start: a start waits at most two seconds for another sync, then proceeds with
+  whatever is registered. Accepted and stated: the registration is machine-global, so
+  the user's own bare `agy` sees the same plugins under the same strict exposure.
 
 ## 4b. Session context reads (`session_context.rs`)
 
@@ -1509,7 +1712,7 @@ runtime, and a **grant** is the scope that runtime may read. No grant, no tools.
 - **W5** Suggestion packs (`aia_suggestions.rs`) read only the bundled default packs and the
   configured common skill repository. A pack expresses wording and limited parameters, never
   code, tool, or network execution.
-- **W6** Onboarding packs (`aia_onboarding.rs`) render the Add-ons → Automation cards from data
+- **W6** Onboarding packs (`aia_onboarding.rs`) render the Workflows → Automation cards from data
   so a new onboarding is a pack, not a React component. Same source boundary as `W5`: the
   bundled pack plus `references/aia-onboarding.json` inside a common-repository skill. A pack
   expresses wording, a field schema, and outcome **arguments** — never code, shell, URLs, or

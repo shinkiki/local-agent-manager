@@ -1,0 +1,25 @@
+{
+  "itemId": "C-41b5da9e9b6c",
+  "kind": "commit",
+  "ref": "41b5da9e9b6c0cc00d0c3ae8decff588bab84df7",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L08",
+  "source": "claude",
+  "verdict": "diff 결함 0건. 검증 중 관측한 선행 결함 1건은 unconfirmed로 남김",
+  "axes": {
+    "정확성": "자동화 패널은 hidden으로 남기고(입력 보존) 조회는 active로 가르며, 라이브러리 카드는 탭을 떠날 때 내려놓는다 — 옮기기 전 수명 그대로다. useCardTask→useBusyAction 교체도 notice 비우는 시점이 action 첫 줄이라 동작이 같다.",
+    "보안 불변식": "자격증명·셸·경로 정규화·쓰기 게이트에 닿지 않는다. crates 변경은 주석·프롬프트 문구뿐이고 W6 설명의 화면 이름만 바뀐다.",
+    "계약": "addons.automation→workflows.automation, settings.repository-path→storage.repository-path, settings.tab.repository 제거가 uiGuideTargets.json·UI_GUIDE_VIEW_TABS·system_mcp.rs 프롬프트에서 모두 맞물린다. 저장소 전체에 옛 id 잔존 없음(남은 것은 uiElements.test.mjs 고정 픽스처와 '없어졌다'를 보는 settings.cy.ts뿐).",
+    "검증 없음": "옮긴 자리마다 시험이 따라왔다 — 애드온 탭 저장값에 'automation'이 남은 장치 갈래, 워크플로 자동화 탭 접근성 이름, 저장소 라이브러리 탭 경로 카드. 설정 탭 줄 자동 스크롤 시험은 사전조건(줄이 실제로 넘친다)을 명시해 탭이 하나 줄어도 헛돌지 않는다.",
+    "단순화·중복": "useCardTask 세 번째 복사본을 만들지 않고 useBusyAction을 쓴 쪽이 맞다. AddonsPanelProps가 active 하나로 줄어 패널 여섯이 쓰지도 않는 값 넷을 받던 것이 없어졌다."
+  },
+  "findings": ["F-crates-agent-manager-core-src-resource-repositor-c60b1a21"],
+  "verification": [
+    "npx tsc --noEmit — 출력 없음",
+    "npm run test:unit — 실패 없음",
+    "npm run conformance:project-menu — 항목 42/42 · 점검 142/142, 실패 종류: 없음",
+    "npm run test:e2e --spec (애드온·설정·화면안내 7개 스펙) — passed=22 failed=0",
+    "npm run test:e2e --spec (온보딩·회차목표·저장소 15개 스펙) — passed=31 failed=2 (아래 결함, 부모 커밋에서도 동일)"
+  ],
+  "commits": []
+}

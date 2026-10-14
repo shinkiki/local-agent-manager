@@ -1,0 +1,15 @@
+{
+  "findingId": "F-docs-code-review-findings-f-docs-code-review-fin-ecd6c2ef",
+  "file": "docs/code-review/findings/F-docs-code-review-findings-f-docs-code-review-rev-1812038c.json",
+  "symbol": "detail",
+  "symptom": "리뷰 대상 커밋이 바꾼 파일 수를 넷이 아니라 다섯으로 적는다",
+  "severity": "P3",
+  "state": "fixed",
+  "kind": "정확성",
+  "detail": "6542f512f4ac 가 만든 결함 기록의 `detail` 이 '커밋이 바꾼 파일도 다섯 개뿐이라 그 열두 건에 닿지 않는다' 고 적는다. 대상 커밋 288072c685d2 가 바꾼 파일은 넷이다 — `git show --name-only --pretty= 288072c685d2` 가 findings 둘(F-...d9517df9 신규·F-...e744c33b 수정), queue.json, reviewed/C-a52e664a3563.json 네 줄만 돌려준다. 결론('그 열두 건에 닿지 않는다')은 넷이든 다섯이든 참이라 판단은 바뀌지 않지만, 이 결함 기록 자체가 '장부에 적힌 수치가 실측과 다르다' 를 지적하는 자리라 같은 자리에서 수치가 또 틀렸다. 깨지는 것은 다음 회차가 읽는 근거다 — detail 의 수치를 믿고 되재지 않으면 어느 파일이 빠졌는지 찾느라 헛돈다. 러너는 detail 을 읽지 않아 큐 집계는 틀리지 않으므로 P3 이다.",
+  "agentsRules": [],
+  "occurrences": [{ "itemId": "C-6542f512f4ac", "at": "2026-10-06T04:10:00Z", "lane": "L04" }],
+  "fixCommits": [],
+  "fix": "`detail` 의 '다섯 개뿐' 을 실측값 '넷뿐' 으로 고쳤다. findingId 는 file·symbol·symptom 으로만 만들어지므로 detail 을 고쳐도 id 는 바뀌지 않는다 — 파일 이름을 그대로 두는 것이 맞다.",
+  "note": "`fixCommits` 가 빈 것은 장부가 자기 커밋 해시를 적을 수 없는 구조 때문이며 F-docs-code-review-readme-md-commits-6f902967 에 open 으로 올라가 있다. 여기서 새로 적지 않는다."
+}

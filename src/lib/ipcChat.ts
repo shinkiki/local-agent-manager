@@ -64,8 +64,11 @@ export function markChatAttentionRead(id: string): Promise<ChatAttentionSnapshot
  * HTTP 왕복이 쌓여, 원격으로 붙었을 때 버튼이 굳은 것처럼 보인다.
  * `excludeProfiles`는 화면 목록에서 감춘 프로필을 대상에서 빼는 데 쓴다.
  */
-export function markAllChatAttentionRead(excludeProfiles: ChatProfile[] = []): Promise<ChatAttentionSnapshot> {
-  return call<ChatAttentionSnapshot>("mark_all_chat_attention_read", { excludeProfiles });
+export function markAllChatAttentionRead(
+  excludeProfiles: ChatProfile[] = [],
+  excludeChatIds: string[] = [],
+): Promise<ChatAttentionSnapshot> {
+  return call<ChatAttentionSnapshot>("mark_all_chat_attention_read", { excludeProfiles, excludeChatIds });
 }
 
 export function clearReadChatAttention(): Promise<ChatAttentionSnapshot> {

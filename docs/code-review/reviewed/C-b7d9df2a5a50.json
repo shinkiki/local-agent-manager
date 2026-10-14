@@ -1,0 +1,23 @@
+{
+  "itemId": "C-b7d9df2a5a50",
+  "kind": "commit",
+  "ref": "b7d9df2a5a50938ad4620fc610691eed51731dc0",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L07",
+  "source": "claude",
+  "verdict": "결함 1건 / 수정 1건 (정확성·보안 불변식 결함 없음, 계약 드리프트 1건 수정)",
+  "axes": {
+    "정확성": "결함 없음. 진입점 가드와 줄끝 정규화를 실측으로 확인했다. (1) `node ./scripts/generate-ui-catalog.mjs --check` 가 CRLF 작업 트리에서 종료 코드 0 과 'up to date' 를 낸다. (2) 생성 파일에 쌍 하나를 CRLF 로 끼워 넣으면 같은 명령이 '소스와 다릅니다' 와 종료 코드 1 을 낸다 — 가드가 검사를 조용한 통과로 바꾸지 않는다. (3) `npm run i18n:catalog` 가 가드를 통과해 쌍 2979 개를 거둔다. (4) 가드가 깨질 만한 경로 표기 차이를 찔러 봤다 — 소문자 드라이브(`node f:/.../generate-ui-catalog.mjs --check`)로 불러도 path.resolve 가 양쪽을 `F:\\` 로 맞춰 가드가 선다. generatedCatalogMatches 는 `\\r\\n` 만 지우는데, 생성 본문의 줄바꿈은 JSON.stringify 가 `\\\\n` 두 글자로 이스케이프하므로 문구 안의 줄바꿈이 비교에서 지워지지 않는다.",
+    "보안 불변식": "해당 없음. 저장소 소스를 읽어 저장소가 추적하는 생성 파일 하나를 쓰는 빌드 스크립트다. G8 — process.argv 만 읽고 환경변수를 읽지 않는다. G9 — 셸 문자열을 만들지 않는다(자식 프로세스가 없다). G10 — 경로는 import.meta.dirname 기준 상수 두 개뿐이고 외부 입력이 경로에 들어오지 않는다. G1·G2·G4 가 말하는 공급자 소유 저장소·자격증명에 닿지 않는다.",
+    "계약": "어긋났다. docs/code-review/README.md 가 정한 reviewed 의 `commits` 와 결함의 `fixCommits` 를 이 커밋이 더한 두 장부 파일만 비워 두었다 — F-docs-code-review-reviewed-c-af9507eabc40-json-co-e744c33b. 이번 회차가 채웠다. 그 밖의 계약은 일치한다: queue.json 의 reviewed 5→6 이 reviewed/ 의 파일 수와 맞고, 파일 이름과 본문 itemId·findingId 가 모두 같고, reviewed 의 findings 세 id 가 실제 findings/ 파일과 일대일로 붙는다.",
+    "검증 없음": "고친 자리에 시험이 있다. src/lib/i18nGeneratedUiCatalog.test.mjs 가 generatedCatalogMatches 의 CRLF 동일·내용 상이·빈 입력 세 경우를 재고, test:unit 글롭(src/lib/*.test.mjs)에 걸린다. 진입점 가드 자체는 단위 시험이 없지만, 가드가 헛돌면 --check 가 아무 말 없이 종료 코드 0 이 되므로 위 정확성 (2)를 명령으로 직접 재서 메웠다. 새 자동화를 들이지 않는다는 회차 규칙에 따라 통합 시험 칸을 새로 만들지 않았다.",
+    "단순화·중복": "진입점 가드는 check-i18n-static-ui.mjs 의 같은 식을 되풀이하지만, 저장소가 이미 쓰는 관용구를 맞춘 것이라 합치지 않았다. 다만 시험 파일 이름 src/lib/i18nGeneratedUiCatalog.test.mjs 는 생성 파일이 아니라 scripts/generate-ui-catalog.mjs 를 재므로 가리키는 곳이 어긋난다. 고치는 쪽(이름 변경)은 결함이 아니라 읽기 편의라 지적까지만 남긴다 — modules.json 은 모듈과 시험 파일을 짝지어 두지 않아 기계가 틀리는 자리가 없다."
+  },
+  "findings": ["F-docs-code-review-reviewed-c-af9507eabc40-json-co-e744c33b"],
+  "verification": [
+    "node --experimental-strip-types --test --test-reporter=dot src/lib/*.test.mjs",
+    "npx tsc --noEmit",
+    "node ./scripts/generate-ui-catalog.mjs --check (정상 / 내용 변조 두 경우)"
+  ],
+  "commits": ["a52e664a"]
+}

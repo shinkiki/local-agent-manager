@@ -1,0 +1,11 @@
+{
+  "itemId": "C-4ccc192750e0",
+  "kind": "commit",
+  "ref": "4ccc192750e0a5b34269f765ea9c64cd4fd9cf4d",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L07",
+  "source": "claude",
+  "verdict": "결함 1건 / 수정 1건",
+  "findings": ["F-src-lib-flakytestreport-ts-diagnosticsignature-ba645c72"],
+  "commits": []
+}

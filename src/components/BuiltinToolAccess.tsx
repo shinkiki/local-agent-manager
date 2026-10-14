@@ -111,8 +111,8 @@ function noteLabel(note: AgentBuiltinToolNote, text: (ko: string, en: string) =>
           );
       const missing = note.missing.length
         ? text(
-            `. 앱에서는 쓸 수 있지만 아직 등록되지 않음: ${note.missing.join(", ")}`,
-            `. Usable in the app but not registered yet: ${note.missing.join(", ")}`,
+            `. 아직 등록되지 않음(새 채팅을 시작할 때 앱이 등록): ${note.missing.join(", ")}`,
+            `. Not registered yet (the app registers it when a new chat starts): ${note.missing.join(", ")}`,
           )
         : "";
       return `${registered}${missing}${pendingLabel(note.pending, text)}`;
@@ -148,7 +148,7 @@ function accessLabel(method: string, text: (ko: string, en: string) => string): 
     case "aiaSystem": return text("AIA 시스템 도구", "AIA system tools");
     case "directMcp": return text("채팅에 직접 붙는 MCP", "MCP attached to the chat");
     case "externalMcpConfig":
-      return text("CLI 전역 설정에 등록한 MCP", "MCP registered in the CLI's global config");
+      return text("앱이 CLI 전역 설정에 등록한 MCP", "MCP the app registers in the CLI's global config");
     case "systemSkillCli": return text("시스템 스킬 · CLI", "System skill · CLI");
     case "systemSkillHttp": return text("시스템 스킬 · HTTP", "System skill · HTTP");
     case "appRender": return text("앱 화면이 그림", "Rendered by the app");

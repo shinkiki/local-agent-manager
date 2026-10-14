@@ -27,7 +27,6 @@ use std::time::{Duration, Instant};
 
 #[cfg(not(target_os = "macos"))]
 use keyring::Entry;
-#[cfg(target_os = "macos")]
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
@@ -48,7 +47,26 @@ const MAX_KEYCHAIN_COMMAND_OUTPUT_BYTES: u64 = 1024 * 1024;
 
 #[cfg(not(target_os = "macos"))]
 fn vault_error(prefix: &'static str) -> impl FnOnce(keyring::Error) -> CoreError {
-    move |error| CoreError::Runtime(format!("{prefix}: {error}"))
+    move |error| match error {
+        // 저장소 자체가 없거나 닿을 수 없다(헤드리스 리눅스의 Secret Service 부재 등).
+        // 호출자 대부분은 Runtime과 같게 보이지만, C20 OTP 비밀처럼 파일 폴백을 가진
+        // 호출자는 이 코드로 "다른 자리에 두어도 된다"를 가른다.
+        keyring::Error::PlatformFailure(_) | keyring::Error::NoStorageAccess(_) => {
+            CoreError::Coded(crate::app_error::AppError::conflict(
+                KEYCHAIN_UNAVAILABLE_CODE,
+                format!("{prefix}: {error}"),
+            ))
+        }
+        error => CoreError::Runtime(format!("{prefix}: {error}")),
+    }
+}
+
+/// OS 보안 저장소에 닿을 수 없을 때의 코드. 값이 없는 것(`NoEntry`)과는 다르다.
+pub(crate) const KEYCHAIN_UNAVAILABLE_CODE: &str = "KEYCHAIN_UNAVAILABLE";
+
+/// 저장소 부재로 실패했는지. 파일 폴백을 가진 호출자만 이 판정을 쓴다.
+pub(crate) fn is_keychain_unavailable(error: &CoreError) -> bool {
+    matches!(error, CoreError::Coded(coded) if coded.code() == KEYCHAIN_UNAVAILABLE_CODE)
 }
 
 #[cfg(target_os = "macos")]
@@ -100,11 +118,29 @@ fn macos_security_executable() -> Result<PathBuf, CoreError> {
 /// 공유 홈의 키체인을 링크하면 모달은 사라지지만 계정들이 같은 항목 하나를 두고 다투므로
 /// 격리가 되레 깨진다. 그래서 프로필마다 자기 키체인을 만든다. 사용자의 로그인 키체인에는
 /// 아무것도 들어가지 않는다.
+///
+/// 그 키체인은 **부팅마다 다시 만든다**. 빈 암호로 만든 키체인은 만든 그 세션에서만 열려
+/// 있고, 재부팅하면 잠긴 채로 올라온다. 사용자의 로그인 키체인은 loginwindow가 계정 암호로
+/// 열어 주지만 프로필 키체인에는 그런 주체가 없고, 파일 이름이 `login.keychain-db`인 키체인은
+/// `security unlock-keychain -p <암호>`가 **어떤 암호로도** 열지 못한다(2026-10-14 실측:
+/// 같은 디렉터리에서 `t.keychain-db`는 열리고 `login.keychain-db`는 `errSecAuthFailed`).
+/// 그 이름이 필수인 이유는 홈을 가른 프로세스가 기본 키체인을 `$HOME/Library/Keychains/
+/// login.keychain-db`로만 찾기 때문이다 — `default-keychain -d user -s`는 리다이렉트된 홈에
+/// 남지 않는다(같은 날 실측).
+///
+/// 그래서 잠긴 키체인은 열 길이 없고, 닿을 때마다 **아무도 답을 모르는** 잠금 해제 창이 계정
+/// 수만큼 뜬다(2026-10-14: 09:23 재부팅 뒤 Antigravity 프로필 3개가 모두 그 상태였다). 유일한
+/// 복구는 새로 만드는 것이고, 토큰은 볼트가 권위이므로(`C4-2`) 복원된다. 판정 기준은 파일의
+/// 생성 시각이다: 이번 부팅보다 먼저 만들어진 키체인은 잠겨 있다고 보고 치운 뒤 새로 만든다.
+/// 잠겼는지 `security`에 물어보는 방법은 없다 — 묻는 행위 자체가 그 창을 띄운다.
 #[cfg(target_os = "macos")]
 pub(crate) fn ensure_profile_keychain(profile_home: &Path) -> Result<(), CoreError> {
     let keychain = profile_home.join("Library/Keychains/login.keychain-db");
     if keychain.exists() {
-        return Ok(());
+        if profile_keychain_survived_this_boot(&keychain) {
+            return Ok(());
+        }
+        retire_unusable_profile_keychain(&keychain)?;
     }
     let directory = keychain
         .parent()
@@ -125,6 +161,78 @@ pub(crate) fn ensure_profile_keychain(profile_home: &Path) -> Result<(), CoreErr
     )?;
     // 자동 잠금을 끈다. 기본값(5분·절전 시 잠금)으로 두면 잠긴 뒤 접근할 때 암호 창이 뜬다.
     run_profile_security(&security, profile_home, &["set-keychain-settings", &path])?;
+    Ok(())
+}
+
+/// 이 키체인이 이번 부팅에서 만들어졌는가. 만들어진 직후의 키체인은 열려 있고
+/// `set-keychain-settings`로 자동 잠금도 꺼 두므로, 같은 부팅 안에서는 계속 열려 있다.
+#[cfg(target_os = "macos")]
+fn profile_keychain_survived_this_boot(keychain: &Path) -> bool {
+    let Ok(created) = fs::metadata(keychain).and_then(|metadata| metadata.created()) else {
+        // 생성 시각을 못 읽으면 "이번 부팅 것"이라고 우길 근거가 없다. 다시 만드는 쪽이
+        // 손해가 작다 — 잃는 것은 볼트가 가진 토큰의 사본뿐이고, 반대는 답할 수 없는 창이다.
+        return false;
+    };
+    match (
+        created.duration_since(std::time::UNIX_EPOCH),
+        boot_time_since_epoch(),
+    ) {
+        (Ok(created), Some(boot)) => created > boot,
+        _ => false,
+    }
+}
+
+/// 마지막 부팅 시각. 프로세스가 사는 동안 바뀌지 않으므로 한 번만 읽는다.
+#[cfg(target_os = "macos")]
+fn boot_time_since_epoch() -> Option<Duration> {
+    static BOOT_TIME: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *BOOT_TIME.get_or_init(|| {
+        let mut boot = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut size = std::mem::size_of::<libc::timeval>();
+        // kern.boottime은 읽기 전용 커널 값이다(`G8`의 환경변수와 무관하다).
+        let read = unsafe {
+            libc::sysctlbyname(
+                c"kern.boottime".as_ptr(),
+                (&raw mut boot).cast(),
+                &raw mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if read != 0 || boot.tv_sec <= 0 {
+            return None;
+        }
+        Some(Duration::new(
+            boot.tv_sec as u64,
+            boot.tv_usec as u32 * 1000,
+        ))
+    })
+}
+
+/// 열 수 없게 된 프로필 키체인을 옆으로 치운다. 지우지 않는 것은 `C3-11`·`C19-5`와 같은
+/// 이유다 — 안에 든 토큰은 지금 닿을 수 없을 뿐 사라지지는 않았고, 지우면 그 사본까지
+/// 사라진다. 파일 이름만 바꾸므로 사용자 홈에는 아무것도 하지 않는다.
+#[cfg(target_os = "macos")]
+fn retire_unusable_profile_keychain(keychain: &Path) -> Result<(), CoreError> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    let mut retired = keychain.as_os_str().to_owned();
+    retired.push(format!(".unusable-{stamp}"));
+    let retired = PathBuf::from(retired);
+    fs::rename(keychain, &retired).map_err(|error| {
+        CoreError::Runtime(format!(
+            "열 수 없는 프로필 키체인을 치우지 못했습니다: {error}"
+        ))
+    })?;
+    eprintln!(
+        "[keychain] 이번 부팅 전에 만들어진(=잠긴) 프로필 키체인을 치우고 새로 만듭니다: {}",
+        retired.display()
+    );
     Ok(())
 }
 
@@ -407,9 +515,21 @@ fn read_keyring_entry(
     match entry.get_password() {
         Ok(value) => Ok(Some(Zeroizing::new(value))),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(CoreError::Runtime(format!(
-            "OS 보안 저장소를 읽지 못했습니다: {error}"
-        ))),
+        Err(mut error) => {
+            scrub_keyring_error(&mut error);
+            Err(vault_error("OS 보안 저장소를 읽지 못했습니다")(
+                error,
+            ))
+        }
+    }
+}
+
+/// `BadEncoding`은 UTF-8로 풀지 못한 저장 값 **그 자체**를 들고 온다. 오류 문구에는
+/// 실리지 않지만, 그대로 버리면 비밀 바이트가 지워지지 않은 채 해제된다(`G4`).
+#[cfg(not(target_os = "macos"))]
+fn scrub_keyring_error(error: &mut keyring::Error) {
+    if let keyring::Error::BadEncoding(bytes) = error {
+        bytes.zeroize();
     }
 }
 
@@ -496,9 +616,9 @@ fn delete_keyring_entry(service: &str, account: &str) -> Result<(), CoreError> {
         .delete_credential()
     {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(CoreError::Runtime(format!(
-            "OS 보안 저장소에서 삭제하지 못했습니다: {error}"
-        ))),
+        Err(error) => Err(vault_error("OS 보안 저장소에서 삭제하지 못했습니다")(
+            error,
+        )),
     }
 }
 
@@ -901,6 +1021,20 @@ pub(crate) fn delete_os_keychain_password(service: &str, account: &str) -> Resul
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn g4_bad_encoding_secret_bytes_are_wiped_before_the_error_leaves() {
+        let mut error = keyring::Error::BadEncoding(vec![0xff, b's', b'e', b'c']);
+        super::scrub_keyring_error(&mut error);
+        match &error {
+            // `Vec::zeroize`는 0을 쓴 뒤 비운다. 지워진 메모리 자체는 안전한 Rust에서 볼 수
+            // 없으므로, 값이 오류 안에 남지 않는다는 것까지만 고정한다.
+            keyring::Error::BadEncoding(bytes) => assert!(bytes.is_empty()),
+            other => panic!("unexpected {other}"),
+        }
+        assert_eq!(error.to_string(), "Data is not UTF-8 encoded");
+    }
+
     #[cfg(target_os = "macos")]
     use super::*;
     #[cfg(target_os = "macos")]
@@ -1003,6 +1137,61 @@ mod tests {
             fs::metadata(&keychain).expect("metadata").len(),
             before,
             "이미 있는 키체인을 다시 만들지 않는다"
+        );
+    }
+
+    /// 재부팅하면 프로필 키체인은 잠긴 채로 올라오고, 이름이 `login.keychain-db`인 키체인은
+    /// 어떤 암호로도 `unlock-keychain`이 열지 못한다. 그래서 "이번 부팅에 만든 것인가"가
+    /// 쓸 수 있는지의 기준이다(2026-10-14 실측).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_a_keychain_made_after_the_last_boot_counts_as_usable() {
+        let profile = tempfile::tempdir().expect("profile");
+        ensure_profile_keychain(profile.path()).expect("키체인 준비");
+        let keychain = profile.path().join("Library/Keychains/login.keychain-db");
+        assert!(
+            profile_keychain_survived_this_boot(&keychain),
+            "방금 만든 키체인은 이번 부팅 것이다"
+        );
+        // 부팅보다 오래된 파일은 잠긴 것으로 본다. 설치 시점이 이번 부팅보다 앞선 시스템
+        // 파일을 기준점으로 쓴다 — 생성 시각을 뒤로 돌리는 이식 가능한 방법이 없다.
+        assert!(
+            !profile_keychain_survived_this_boot(Path::new(MACOS_SECURITY_BIN)),
+            "부팅 전에 만들어진 파일은 이번 부팅 것이 아니다"
+        );
+        assert!(
+            !profile_keychain_survived_this_boot(&profile.path().join("없는-파일")),
+            "읽을 수 없으면 쓸 수 있다고 보지 않는다"
+        );
+    }
+
+    /// 잠긴 키체인은 지우지 않고 치운다. 안에 든 토큰은 닿을 수 없을 뿐 사라지지 않았다.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stale_profile_keychain_is_retired_beside_the_new_one() {
+        let profile = tempfile::tempdir().expect("profile");
+        let keychain = profile.path().join("Library/Keychains/login.keychain-db");
+        fs::create_dir_all(keychain.parent().expect("parent")).expect("directory");
+        fs::write(&keychain, b"stale").expect("낡은 키체인");
+
+        retire_unusable_profile_keychain(&keychain).expect("치우기");
+
+        assert!(!keychain.exists(), "낡은 파일은 그 자리에서 비켜야 한다");
+        let retired = fs::read_dir(keychain.parent().expect("parent"))
+            .expect("읽기")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("login.keychain-db.unusable-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retired.len(), 1, "지우지 않고 옆에 남긴다");
+        assert_eq!(
+            fs::read(retired[0].path()).expect("내용"),
+            b"stale",
+            "내용은 그대로다"
         );
     }
 

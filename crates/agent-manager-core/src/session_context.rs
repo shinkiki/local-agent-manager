@@ -1362,10 +1362,7 @@ impl SessionReadCliFlags {
         })?;
         Ok(SessionReadCliOptions {
             op,
-            app_data_dir: match self.app_data_dir {
-                Some(path) => path,
-                None => crate::remote::default_app_data_dir().map_err(CoreError::InvalidInput)?,
-            },
+            app_data_dir: crate::remote::cli_app_data_dir(self.app_data_dir)?,
             policy: normalize_policy(policy)?,
             own_cwd: self.own_cwd.unwrap_or_default(),
             timezone: self.timezone.unwrap_or_else(|| "UTC".to_owned()),

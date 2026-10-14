@@ -97,7 +97,7 @@ PID=$!
 echo "$PID" > "$PID_FILE"
 
 for _ in $(seq 1 80); do
-  if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/api/access" 2>/dev/null | grep -q '"writable":true'; then
+  if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/api/access" 2>/dev/null | grep -q '"protocolVersion"'; then
     echo "개발 백엔드 준비됨: http://127.0.0.1:$PORT (pid=$PID)"
     echo "  앱 데이터: $DEV_DATA"
     echo "  로그: $LOG_OUT / $LOG_ERR"

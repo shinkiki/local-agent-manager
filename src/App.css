@@ -1428,6 +1428,8 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .plugin-oauth-url-row { display: flex; align-items: flex-start; gap: 8px; }
 .plugin-oauth-url-row code { flex: 1; min-width: 0; font-size: var(--ui-font-11); line-height: 1.45; word-break: break-all; user-select: all; }
 .plugin-device-code code { padding: 8px 16px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--x0b1219); color: var(--xd8e1ea); font-size: var(--ui-font-12); letter-spacing: .18em; }
+.plugin-oauth-paste .plugin-oauth-url-row input { flex: 1; min-width: 0; font-size: var(--ui-font-11); }
+.plugin-oauth-paste-error { margin: 0; color: var(--danger); font-size: var(--ui-font-7); line-height: 1.5; }
 @media (max-width: 760px) { .plugin-row { grid-template-columns: 40px minmax(0, 1fr); } .plugin-row-actions { grid-column: 1 / -1; justify-content: space-between; padding-top: 10px; border-top: 1px solid var(--border-soft); } .plugin-tools-toggle, .plugin-tools { grid-column: 1 / -1; } .plugin-presets { grid-template-columns: 1fr; } .plugin-form .form-row { grid-template-columns: 1fr; gap: 4px; }  .plugin-field-note { margin-left: 0; } .plugin-scope-chips { margin-left: 0; } .plugin-tool-row { flex-wrap: wrap; } .claude-plugin-scopebar { align-items: stretch; flex-direction: column; } .claude-plugin-projects { grid-column: 1 / -1; } .claude-plugin-project-item { grid-template-columns: 18px minmax(0, 1fr); } .claude-plugin-project-item code { grid-column: 2; } .claude-branch-rule, .claude-branch-add { flex-wrap: wrap; padding-left: 7px; } .claude-branch-search, .claude-branch-extra > small { padding-left: 7px; } .claude-branch-rule > .claude-branch-state { margin-left: 0; } }
 @media (max-width: 520px) { .plugin-row-actions { align-items: stretch; flex-direction: column; } .plugin-row-action-group { width: 100%; } .plugin-row-management-actions { padding: 8px 0 0; border-top: 1px solid var(--border-soft); border-left: 0; } .plugin-tools-header { align-items: stretch; flex-direction: column; } .plugin-tool-bulk { align-self: flex-start; } .claude-skill-options { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .settings-update-toggle.check-filter { display: flex; align-items: flex-start; gap: 8px; padding: 0 18px 16px; color: var(--x94a5b8); font-size: var(--ui-font-8); line-height: 1.5; white-space: normal; overflow-wrap: anywhere; }.settings-update-toggle input { flex: none; margin-top: 2px; }.settings-update-toggle > span { min-width: 0; }
@@ -1497,7 +1499,7 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .account-usage-axis span:nth-child(1) { transform: translateY(-50%); }.account-usage-axis span:nth-child(2) { transform: translateY(-25%); }.account-usage-axis span:nth-child(4) { transform: translateY(25%); }.account-usage-axis span:nth-child(5) { transform: translateY(50%); }
 .account-usage-column > .week-bar { width: 100%; max-width: 30px; min-width: 0; flex: 1; }
 .account-usage-bar.empty { background: repeating-linear-gradient(135deg, var(--x1b2633) 0 3px, transparent 3px 6px); }
-.storage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }.storage-panel { display: flex; min-height: 220px; flex-direction: column; }.storage-list { display: flex; flex: 1; flex-direction: column; padding: 5px 15px; }.storage-row { display: flex; min-height: 72px; align-items: center; justify-content: space-between; gap: 15px; border-bottom: 1px solid var(--border-soft); }.storage-row:last-child { border-bottom: 0; }.storage-row > div { display: flex; min-width: 0; flex-direction: column; gap: 4px; }.storage-row > div:last-child { flex: none; align-items: flex-end; text-align: right; }.storage-row strong { font-size: var(--ui-font-10); }.storage-row span, .storage-panel > footer { color: var(--faint); font-size: var(--ui-font-8); line-height: 1.45; }.storage-panel > footer { padding: 11px 15px; border-top: 1px solid var(--border-soft); background: var(--t-storage-foot); }
+.storage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }.storage-panel { display: flex; min-height: 220px; flex-direction: column; }.storage-list { display: flex; flex: 1; flex-direction: column; padding: 5px 15px; }.storage-row { display: flex; min-height: 72px; align-items: center; justify-content: space-between; gap: 15px; border-bottom: 1px solid var(--border-soft); }.storage-row:last-child { border-bottom: 0; }.storage-row > div { display: flex; min-width: 0; flex-direction: column; gap: 4px; }.storage-row > div:last-child { flex: none; align-items: flex-end; text-align: right; }.storage-row strong { font-size: var(--ui-font-10); }.storage-row-path { overflow: hidden; color: var(--faint); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }.storage-row span, .storage-panel > footer { color: var(--faint); font-size: var(--ui-font-8); line-height: 1.45; }.storage-panel > footer { padding: 11px 15px; border-top: 1px solid var(--border-soft); background: var(--t-storage-foot); }
 /* 저장소 화면 껍데기(탭 + 패널). .view-stack과 같은 너비·가운데 정렬이라 탭 줄이 본문과 나란히 선다. */
 .storage-screen { width: min(1500px, 100%); margin: 0 auto; }
 /* 비밀정보 탭. 값은 절대 그리지 않으므로 표에는 이름·용도·출처·남은 시간·동작만 있다. */
@@ -1853,6 +1855,18 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .mobile-terminal-composer .button { min-width: 58px; min-height: 40px; flex: none; }
 /* 계정 로그인처럼 CLI가 입력을 에코하지 않는 터미널은 데스크톱에서도 입력란을 보여준다. */
 .terminal-composer-always { display: flex; }
+/* 출력에서 꺼낸 주소·일회용 코드. 터미널 위에 고정해 긁어 복사하지 않아도 되게 한다. */
+.terminal-hints { display: flex; min-width: 0; flex: none; flex-direction: column; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border-soft); background: #0e1620; }
+.terminal-hint { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.terminal-hint-kind { flex: none; color: var(--faint); font-size: var(--ui-font-9); font-weight: 700; }
+.terminal-hint-value { overflow: hidden; min-width: 0; flex: 1 1 120px; color: var(--muted); font-size: var(--ui-font-8); text-overflow: ellipsis; white-space: nowrap; }
+.terminal-hint-code { color: var(--text); font-size: var(--ui-font-6); font-weight: 700; letter-spacing: 0.06em; }
+.terminal-hint .button { min-height: 32px; flex: none; }
+@media (max-width: 760px) {
+  .terminal-hints { position: sticky; top: 0; z-index: 2; }
+  .terminal-hint-value { flex-basis: 100%; }
+  .terminal-hint .button { min-height: 40px; flex: 1 1 auto; }
+}
 .terminal-composer-feedback { display: flex; min-width: 0; flex: none; align-items: baseline; gap: 6px; margin: 0; padding: 5px 10px 7px; background: #0e1620; color: var(--faint); font-size: var(--ui-font-7); }
 .terminal-composer-feedback code { overflow: hidden; min-width: 0; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
 .session-drawer-header-content { padding-top: 10px; padding-bottom: 0; }
@@ -1900,8 +1914,11 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .projects-selector > span { color: var(--muted); font-size: var(--ui-font-8); font-weight: 700; white-space: nowrap; }
 .projects-selector > select { min-width: 0; max-width: 100%; flex: 1; }
 .projects-empty { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 24px 0; }
-.project-files-layout { height: auto; min-height: 0; flex: 1; overflow: hidden; border: 1px solid var(--border); border-radius: 9px; }
-.project-files-layout > .docs-sidebar { z-index: auto; }
+.project-files-layout { height: auto; min-height: 0; flex: 1; overflow: hidden; isolation: isolate; border: 1px solid var(--border); border-radius: 9px; }
+/* 좁은 화면에서는 파일 탐색기가 본문 위에 선다. 코드 줄 번호(z-index: 3)가 탐색기 위로
+   튀어나오지 않도록 문서 화면과 같은 레이어를 유지한다. */
+.project-files-layout > .docs-sidebar { z-index: 51; }
+.project-files-layout > .docs-sidebar-backdrop { border-radius: inherit; }
 .project-file-readonly { color: var(--faint); font-size: var(--ui-font-7); white-space: nowrap; }
 .docs-layout { position: relative; display: flex; width: 100%; height: 100%; }.docs-sidebar { z-index: 51; display: flex; width: 310px; flex: none; flex-direction: column; border-right: 1px solid var(--border); background: var(--x0d141d); }.docs-sidebar-backdrop { display: none; }.docs-sidebar-head { display: flex; min-height: var(--secondary-pane-header-height); align-items: center; justify-content: space-between; padding: 0 12px; border-bottom: 1px solid var(--border-soft); }.docs-sidebar-head > div:first-child { display: flex; align-items: baseline; gap: 7px; }.docs-sidebar-head strong { font-size: var(--ui-font-11); }.docs-sidebar-head span { color: var(--faint); font-size: var(--ui-font-8); }.secondary-pane-header-actions { display: flex; flex: none; align-items: center; gap: 5px; }.secondary-pane-toggle { display: grid; width: 31px; height: 31px; flex: none; padding: 0; place-items: center; border: 1px solid var(--border); border-radius: 8px; background: var(--x111a24); color: var(--muted); cursor: pointer; }.secondary-pane-toggle:hover { border-color: var(--x40536a); color: var(--text); }.secondary-pane-restore { display: inline-flex; min-width: 0; min-height: 30px; flex: none; align-items: center; gap: 6px; padding: 0 8px; border: 1px solid rgba(var(--accent-rgb), .22); border-radius: 7px; background: rgba(var(--accent-rgb), .06); color: var(--muted); font: inherit; font-size: var(--ui-font-8); font-weight: 700; cursor: pointer; }.secondary-pane-restore > span { overflow: hidden; max-width: 120px; text-overflow: ellipsis; white-space: nowrap; }.secondary-pane-restore:hover { border-color: rgba(var(--accent-rgb), .42); color: var(--text); }.root-form { display: flex; flex-direction: column; gap: 6px; padding: 9px; border-bottom: 1px solid var(--border); background: var(--x101924); }.root-form input { min-height: 29px; padding: 0 8px; font-size: var(--ui-font-8); }.root-form .button { align-self: flex-end; }.root-list { max-height: 190px; overflow: auto; padding: 6px; border-bottom: 1px solid var(--border-soft); }.root-row { display: flex; align-items: center; border-radius: 7px; }.root-row.active { background: var(--x182432); }.root-row > button:first-child { display: flex; min-width: 0; flex: 1; align-items: center; gap: 8px; padding: 7px; border: 0; background: transparent; text-align: left; cursor: pointer; }.root-row > button:first-child > span { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }.root-row strong { font-size: var(--ui-font-9); }.root-row code { overflow: hidden; color: var(--faint); font-size: var(--ui-font-6-5); text-overflow: ellipsis; white-space: nowrap; }.remove-root { width: 23px; border: 0; background: transparent; color: var(--faint); cursor: pointer; }.remove-root:hover { color: var(--danger); }
 .doc-tree-panel { display: flex; min-height: 0; flex: 1; flex-direction: column; padding: 7px; }.doc-tree-panel > input { min-height: 29px; padding: 0 8px; font-size: var(--ui-font-8); }.new-doc-row { display: flex; gap: 4px; margin-top: 5px; }.new-doc-row input { min-width: 0; min-height: 27px; flex: 1; padding: 0 7px; font-size: var(--ui-font-8); }.new-doc-row button { width: 28px; border: 1px solid var(--border); border-radius: 7px; background: var(--x14202b); cursor: pointer; }.new-doc-row button:disabled { opacity: 0.4; }.doc-tree { min-height: 0; overflow: auto; margin-top: 7px; }.tree-row { display: flex; width: 100%; align-items: center; gap: 5px; min-height: 25px; border: 0; border-radius: 5px; background: transparent; color: var(--x93a2b4); text-align: left; cursor: pointer; }.tree-row:hover, .tree-row.active { background: var(--x182431); color: var(--text); }.tree-row strong { overflow: hidden; font-size: var(--ui-font-8); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }.tree-row > span { color: var(--faint); font-size: var(--ui-font-8); }.tree-row.file.active { box-shadow: inset 2px 0 var(--green); }.tree-empty { color: var(--faint); font-size: var(--ui-font-8); text-align: center; }
@@ -1923,6 +1940,7 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .document-tree-pane { display: flex; min-height: 0; flex: 1; flex-direction: column; margin-top: 7px; }
 .document-tree-search { display: flex; min-height: 29px; flex: none; align-items: center; gap: 6px; padding: 0 8px; border: 1px solid var(--border); border-radius: 7px; color: var(--faint); background: var(--x0b1219); }
 .document-tree-search input { min-width: 0; flex: 1; border: 0; background: transparent; font-size: var(--ui-font-8); outline: 0; }
+.project-search-contents { display: flex; flex: none; align-items: center; gap: 6px; padding: 4px 2px 0; color: var(--faint); font-size: var(--ui-font-8); cursor: pointer; }
 .document-tree-scroll, .document-search-results { min-height: 0; overflow: auto; margin-top: 7px; }
 .document-tree-level { display: flex; flex-direction: column; }.document-tree-item { min-width: 0; }.document-tree-file-indent { width: 12px; flex: none; }.tree-row > svg { flex: none; color: var(--faint); }
 .document-tree-more { min-height: 27px; margin: 5px 8px; padding: 0 8px; font-size: var(--ui-font-7); }
@@ -1940,6 +1958,11 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 
 .workflows-view { min-height: 100%; }
 .workflows-hub-tabs { margin-bottom: -4px; }
+/* 자동화 탭의 카드는 애드온 화면에서 쓰던 좁은 설정 기둥(920px)을 그대로 유지한다 — 워크플로
+   화면의 1500px 기둥에 그대로 두면 같은 카드가 화면마다 다른 너비로 선다. 탭이 바뀌어도
+   패널은 DOM에 남으므로(입력 보존) hidden일 때 display를 명시해 접는다. */
+.workflows-automation { display: flex; width: min(920px, 100%); margin: 0 auto; flex-direction: column; gap: 12px; }
+.workflows-automation[hidden] { display: none; }
 .recurring-overview .workflow-overview-icon { color: var(--accent); }
 .workflow-overview { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 18px; overflow: hidden; padding: 19px 20px 0; background: radial-gradient(circle at 0 0, rgba(var(--accent-rgb), .09), transparent 30rem), var(--t-panel-glass); }
 .workflow-overview-copy { display: flex; min-width: 0; align-items: flex-start; gap: 13px; }.workflow-overview-icon, .workflow-detail-symbol { display: grid; flex: none; place-items: center; border: 1px solid rgba(var(--accent-rgb), .24); background: rgba(var(--accent-rgb), .09); color: var(--green); }.workflow-overview-icon { width: 42px; height: 42px; border-radius: 11px; }.workflow-overview-copy > div { min-width: 0; }.workflow-eyebrow { display: block; margin: 0 0 3px; color: var(--green); font-size: var(--ui-font-6-5); font-weight: 850; letter-spacing: .1em; }.workflow-overview h2 { margin: 0; color: var(--xedf3f8); font-size: var(--ui-font-15); letter-spacing: -.02em; }.workflow-overview p { max-width: 760px; margin: 6px 0 0; color: var(--muted); font-size: var(--ui-font-9); line-height: 1.55; }
@@ -2323,6 +2346,8 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .cli-update-alert > span { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
 .cli-update-alert strong { color: var(--xe9c978); font-size: var(--ui-font-8); }
 .cli-update-alert small { color: var(--xd0ac64); font-size: var(--ui-font-7); line-height: 1.5; }
+.credential-vault-recovery > span { flex: 1; }
+.credential-vault-recovery > .button { flex: none; align-self: center; }
 .cli-update-panel { display: flex; flex-direction: column; gap: 7px; margin-top: 11px; padding: 11px 12px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--x0b1219); }
 .cli-update-versions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
 .cli-update-versions > span { display: flex; align-items: baseline; gap: 6px; }
@@ -2338,6 +2363,13 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .account-login-label { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; color: var(--muted); font-size: var(--ui-font-8); }
 .account-login-label input { min-height: 36px; padding: 0 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--x0b1219); color: var(--text); }
 .account-login-completion-hint { margin: 10px 0 0; color: var(--xe9be5d); font-size: var(--ui-font-8); line-height: 1.5; text-align: right; }
+.account-login-method { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; color: var(--muted); font-size: var(--ui-font-8); }
+.account-login-method span { margin-right: 4px; }
+.account-login-callback-paste { display: grid; gap: 6px; margin-top: 10px; padding: 10px 12px; border: 1px dashed var(--border-soft); border-radius: 9px; color: var(--muted); font-size: var(--ui-font-8); line-height: 1.5; }
+.account-login-callback-row { display: flex; gap: 8px; }
+.account-login-callback-row input { flex: 1; min-width: 0; min-height: 32px; padding: 0 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--x0b1219); color: var(--text); font-size: var(--ui-font-11); }
+.account-login-callback-error { margin: 0; color: var(--danger); }
+.account-login-callback-done { margin: 0; color: var(--xe9be5d); }
 .chat-cli-connections { display: flex; flex-direction: column; gap: 7px; margin-top: 16px; }
 .chat-cli-connection-card { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) auto; overflow: hidden; border: 1px solid rgba(233, 190, 93, .24); border-radius: 9px; background: rgba(94, 72, 21, .1); }
 .chat-cli-connection-card:focus-within, .chat-cli-connection-card:hover { border-color: rgba(233, 190, 93, .48); background: rgba(94, 72, 21, .18); }
@@ -2458,8 +2490,8 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .chat-message { max-width: 88%; padding: 11px 13px; border: 1px solid var(--border-soft); border-radius: 12px; background: var(--x111a24); }.chat-message > strong { display: block; margin-bottom: 6px; color: var(--muted); font-size: var(--ui-font-7); text-transform: uppercase; }.chat-message > div { color: var(--xcbd6e1); font-size: var(--ui-font-10); line-height: 1.7; white-space: pre-wrap; word-break: break-word; }.chat-message > .chat-message-markdown { white-space: normal; }.chat-message-user { align-self: flex-end; border-color: rgba(139, 184, 255, .24); border-bottom-right-radius: 4px; background: var(--t-user-bubble); }.chat-message-assistant { align-self: flex-start; border-color: rgba(var(--accent-rgb), .16); border-bottom-left-radius: 4px; }.chat-message-system { align-self: stretch; max-width: 100%; border-style: dashed; border-color: var(--border-soft); background: transparent; }.chat-message-system > div { color: var(--x91a0b1); font-size: var(--ui-font-9); }.chat-message-reasoning { max-width: 100%; align-self: stretch; border-style: dashed; background: var(--x0d141c); }.chat-message-reasoning > div { color: var(--x91a0b1); font-size: var(--ui-font-9); }
 .agent-message-meta { margin-top: 8px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--x0c131b); }.agent-message-meta summary { padding: 5px 9px; color: var(--faint); font-size: var(--ui-font-7); cursor: pointer; }.agent-message-meta pre { max-height: 220px; overflow: auto; margin: 0; padding: 8px 9px; border-top: 1px solid var(--border-soft); color: var(--x95a6b8); font: var(--ui-font-8)/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; }
 .chat-message { position: relative; }.chat-message:has(> .message-copy-action) > strong { padding-right: 84px; }.chat-message:has(> .voice-playback-action) > strong { padding-right: 156px; }.chat-message:hover > .message-copy-action, .chat-message:focus-within > .message-copy-action { opacity: 1; }
-.chat-tool { border: 1px solid var(--border); border-radius: 9px; background: var(--x0c131b); }.chat-tool summary { display: flex; min-height: 37px; align-items: center; justify-content: space-between; gap: 10px; padding: 0 11px; color: var(--xb6c2cf); font-size: var(--ui-font-9); cursor: pointer; }.chat-tool summary em { color: var(--faint); font-size: var(--ui-font-7); font-style: normal; }.chat-tool pre, .chat-approval pre { max-height: 250px; overflow: auto; margin: 0; padding: 10px 11px; border-top: 1px solid var(--border-soft); color: var(--x95a6b8); font: var(--ui-font-8)/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; }.chat-tool .chat-tool-output { background: var(--x080e14); color: var(--xaebccc); }
-.chat-approval { padding: 13px; border: 1px solid rgba(239, 196, 95, .3); border-radius: 10px; background: var(--t-approval-bg); }.chat-approval-head { display: flex; align-items: baseline; justify-content: space-between; gap: 9px; margin-bottom: 8px; }.chat-approval-head > strong { min-width: 0; color: var(--xefd183); font-size: var(--ui-font-10); }.chat-approval-expand { display: inline-flex; flex: none; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid rgba(239, 196, 95, .3); border-radius: 999px; background: rgba(239, 196, 95, .08); color: var(--xefd183); font: inherit; font-size: var(--ui-font-7); font-weight: 700; cursor: pointer; }.chat-approval-expand:hover, .chat-approval-expand:focus-visible { border-color: rgba(239, 196, 95, .58); background: rgba(239, 196, 95, .16); }.chat-approval-expand > svg { flex: none; }.chat-approval > div { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }.chat-approval > p { margin: 8px 0 0; color: var(--xc1ad77); font-size: var(--ui-font-8); line-height: 1.55; }.chat-approval-result { color: var(--xb8c5d2); font-size: var(--ui-font-8); }.chat-approval-questions { display: flex; flex-direction: column; gap: 8px; margin-top: 9px; }.chat-approval-question { display: flex; flex-direction: column; gap: 6px; padding: 10px 11px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--x0c131b); }.chat-approval-question > p { display: flex; align-items: baseline; gap: 7px; margin: 0 0 2px; color: var(--xb6c2cf); font-size: var(--ui-font-9); line-height: 1.5; }.chat-approval-question > p em { flex: none; padding: 1px 7px; border-radius: 999px; background: rgba(239, 196, 95, .14); color: var(--xefd183); font-size: var(--ui-font-7); font-style: normal; }.chat-approval-question > label { display: flex; align-items: flex-start; gap: 8px; padding: 6px 8px; border: 1px solid transparent; border-radius: 8px; cursor: pointer; }.chat-approval-question > label:hover { background: rgba(239, 196, 95, .06); }.chat-approval-question > label:focus-within { border-color: rgba(239, 196, 95, .34); }.chat-approval-question > label:has(> input:checked) { border-color: rgba(239, 196, 95, .5); background: rgba(239, 196, 95, .12); }.chat-approval-question > label:has(> input:checked) b { color: var(--xefd183); }.chat-approval-question > label > input { flex: none; margin: 3px 0 0; accent-color: var(--xefd183); }.chat-approval-question > label > span { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }.chat-approval-question > label b { color: var(--xb8c5d2); font-size: var(--ui-font-8); font-weight: 600; }.chat-approval-question > label small { color: var(--faint); font-size: var(--ui-font-7); line-height: 1.45; }.chat-approval-question-custom input[type="text"] { min-width: 0; padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--x080e14); color: var(--xb6c2cf); font-size: var(--ui-font-8); }.chat-approval-secret { display: flex; flex-direction: column; gap: 5px; margin-top: 9px; padding: 10px 11px; border: 1px solid rgba(239, 196, 95, .3); border-radius: 8px; background: var(--x0c131b); }.chat-approval-secret > span { color: var(--xefd183); font-size: var(--ui-font-8); font-weight: 600; }.chat-approval-secret > input { min-width: 0; padding: 5px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--x080e14); color: var(--xb6c2cf); font-size: var(--ui-font-8); font-family: inherit; }.chat-approval-secret > input:focus-visible { border-color: rgba(239, 196, 95, .5); outline: none; }.chat-approval-secret > em { color: var(--faint); font-size: var(--ui-font-7); font-style: normal; line-height: 1.45; }.chat-approval-secret-save { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 3px 8px; margin-top: 6px; padding: 7px 9px; border: 1px solid var(--border-soft); border-radius: 7px; background: var(--x080e14); cursor: pointer; }.chat-approval-secret-save:hover { border-color: rgba(239, 196, 95, .34); }.chat-approval-secret-save > input { flex: none; margin: 0; accent-color: var(--xefd183); }.chat-approval-secret-save > span { color: var(--xb8c5d2); font-size: var(--ui-font-8); font-weight: 600; }.chat-approval-secret-save > em { grid-column: 2; color: var(--faint); font-size: var(--ui-font-7); font-style: normal; line-height: 1.45; }.chat-approval-answers { display: flex; flex-direction: column; gap: 7px; margin-top: 9px; }.chat-approval-answers > div { display: flex; flex-direction: column; gap: 4px; padding: 9px 11px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--x0c131b); }.chat-approval-answers > div > p { display: flex; align-items: baseline; gap: 7px; margin: 0; color: var(--x95a6b8); font-size: var(--ui-font-8); line-height: 1.5; }.chat-approval-answers > div > p em { flex: none; padding: 1px 7px; border-radius: 999px; background: rgba(239, 196, 95, .14); color: var(--xefd183); font-size: var(--ui-font-7); font-style: normal; }.chat-approval-answers > div > strong { color: var(--xefd183); font-size: var(--ui-font-9); line-height: 1.5; overflow-wrap: anywhere; }.chat-approval-answers > div > small { color: var(--faint); font-size: var(--ui-font-8); }.chat-approval-document { max-height: 340px; overflow: auto; margin-top: 9px; padding: 2px 11px 4px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--x0c131b); }.chat-approval-document .markdown-preview { color: var(--xb6c2cf); font-size: var(--ui-font-8); }.chat-event-error { padding: 9px 11px; border: 1px solid rgba(255, 129, 120, .25); border-radius: 8px; background: rgba(255, 129, 120, .06); color: var(--xf3a09a); font-size: var(--ui-font-9); }
+.chat-tool { border: 1px solid var(--border); border-radius: 9px; background: var(--x0c131b); }.chat-tool summary { display: flex; min-height: 37px; align-items: center; justify-content: space-between; gap: 10px; padding: 0 11px; color: var(--xb6c2cf); font-size: var(--ui-font-9); cursor: pointer; }.chat-tool summary em { color: var(--faint); font-size: var(--ui-font-7); font-style: normal; }.chat-tool pre, .chat-approval pre { max-height: 250px; overflow: auto; margin: 0; padding: 10px 11px; border-top: 1px solid var(--border-soft); color: var(--x95a6b8); font: var(--ui-font-8)/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; }.chat-tool .chat-tool-output { background: var(--x080e14); color: var(--xaebccc); }.chat-tool .chat-tool-truncated { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 11px; border-top: 1px solid var(--border-soft); color: var(--faint); font-size: var(--ui-font-7); }
+.chat-approval { padding: 13px; border: 1px solid rgba(239, 196, 95, .3); border-radius: 10px; background: var(--t-approval-bg); }.chat-approval-head { display: flex; align-items: baseline; justify-content: space-between; gap: 9px; margin-bottom: 8px; }.chat-approval-head > strong { min-width: 0; color: var(--xefd183); font-size: var(--ui-font-10); }.chat-approval-expand { display: inline-flex; flex: none; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid rgba(239, 196, 95, .3); border-radius: 999px; background: rgba(239, 196, 95, .08); color: var(--xefd183); font: inherit; font-size: var(--ui-font-7); font-weight: 700; cursor: pointer; }.chat-approval-expand:hover, .chat-approval-expand:focus-visible { border-color: rgba(239, 196, 95, .58); background: rgba(239, 196, 95, .16); }.chat-approval-expand > svg { flex: none; }.chat-approval > div { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }.chat-approval > p { margin: 8px 0 0; color: var(--xc1ad77); font-size: var(--ui-font-8); line-height: 1.55; }.chat-approval-result { color: var(--xb8c5d2); font-size: var(--ui-font-8); }.chat-approval-questions { display: flex; flex-direction: column; gap: 8px; margin-top: 9px; }.chat-approval-question { display: flex; flex-direction: column; gap: 6px; padding: 10px 11px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--x0c131b); }.chat-approval-question > p { display: flex; align-items: baseline; gap: 7px; margin: 0 0 2px; color: var(--xb6c2cf); font-size: var(--ui-font-9); line-height: 1.5; }.chat-approval-question > p em { flex: none; padding: 1px 7px; border-radius: 999px; background: rgba(239, 196, 95, .14); color: var(--xefd183); font-size: var(--ui-font-7); font-style: normal; }.chat-approval-question > label { display: flex; align-items: flex-start; gap: 8px; padding: 6px 8px; border: 1px solid transparent; border-radius: 8px; cursor: pointer; }.chat-approval-question > label:hover { background: rgba(239, 196, 95, .06); }.chat-approval-question > label:focus-within { border-color: rgba(239, 196, 95, .34); }.chat-approval-question > label:has(> input:checked) { border-color: rgba(239, 196, 95, .5); background: rgba(239, 196, 95, .12); }.chat-approval-question > label:has(> input:checked) b { color: var(--xefd183); }.chat-approval-question > label > input { flex: none; margin: 3px 0 0; accent-color: var(--xefd183); }.chat-approval-question > label > span { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }.chat-approval-question > label b { color: var(--xb8c5d2); font-size: var(--ui-font-8); font-weight: 600; }.chat-approval-question > label small { color: var(--faint); font-size: var(--ui-font-7); line-height: 1.45; }.chat-approval-recommended { display: inline-block; margin-left: 7px; padding: 0 6px; border: 1px solid rgba(239, 196, 95, .45); border-radius: 999px; background: rgba(239, 196, 95, .14); color: var(--xefd183); font-size: var(--ui-font-7); font-style: normal; font-weight: 700; line-height: 1.5; vertical-align: 1px; }.chat-approval-question-custom input[type="text"] { min-width: 0; padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--x080e14); color: var(--xb6c2cf); font-size: var(--ui-font-8); }.chat-approval-secret { display: flex; flex-direction: column; gap: 5px; margin-top: 9px; padding: 10px 11px; border: 1px solid rgba(239, 196, 95, .3); border-radius: 8px; background: var(--x0c131b); }.chat-approval-secret > span { color: var(--xefd183); font-size: var(--ui-font-8); font-weight: 600; }.chat-approval-secret > input { min-width: 0; padding: 5px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--x080e14); color: var(--xb6c2cf); font-size: var(--ui-font-8); font-family: inherit; }.chat-approval-secret > input:focus-visible { border-color: rgba(239, 196, 95, .5); outline: none; }.chat-approval-secret > em { color: var(--faint); font-size: var(--ui-font-7); font-style: normal; line-height: 1.45; }.chat-approval-secret-save { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 3px 8px; margin-top: 6px; padding: 7px 9px; border: 1px solid var(--border-soft); border-radius: 7px; background: var(--x080e14); cursor: pointer; }.chat-approval-secret-save:hover { border-color: rgba(239, 196, 95, .34); }.chat-approval-secret-save > input { flex: none; margin: 0; accent-color: var(--xefd183); }.chat-approval-secret-save > span { color: var(--xb8c5d2); font-size: var(--ui-font-8); font-weight: 600; }.chat-approval-secret-save > em { grid-column: 2; color: var(--faint); font-size: var(--ui-font-7); font-style: normal; line-height: 1.45; }.chat-approval-answers { display: flex; flex-direction: column; gap: 7px; margin-top: 9px; }.chat-approval-answers > div { display: flex; flex-direction: column; gap: 4px; padding: 9px 11px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--x0c131b); }.chat-approval-answers > div > p { display: flex; align-items: baseline; gap: 7px; margin: 0; color: var(--x95a6b8); font-size: var(--ui-font-8); line-height: 1.5; }.chat-approval-answers > div > p em { flex: none; padding: 1px 7px; border-radius: 999px; background: rgba(239, 196, 95, .14); color: var(--xefd183); font-size: var(--ui-font-7); font-style: normal; }.chat-approval-answers > div > strong { color: var(--xefd183); font-size: var(--ui-font-9); line-height: 1.5; overflow-wrap: anywhere; }.chat-approval-answers > div > small { color: var(--faint); font-size: var(--ui-font-8); }.chat-approval-document { max-height: 340px; overflow: auto; margin-top: 9px; padding: 2px 11px 4px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--x0c131b); }.chat-approval-document .markdown-preview { color: var(--xb6c2cf); font-size: var(--ui-font-8); }.chat-event-error { padding: 9px 11px; border: 1px solid rgba(255, 129, 120, .25); border-radius: 8px; background: rgba(255, 129, 120, .06); color: var(--xf3a09a); font-size: var(--ui-font-9); }
 .chat-approval-pending { border-color: rgba(239, 196, 95, .55); box-shadow: 0 0 0 1px rgba(239, 196, 95, .08), 0 8px 24px rgba(0, 0, 0, .2); }.chat-approval-dock { display: flex; max-height: min(46vh, 390px); flex: none; overflow-y: auto; flex-direction: column; gap: 8px; padding: 10px 13px; border-top: 1px solid rgba(239, 196, 95, .32); border-bottom: 1px solid rgba(239, 196, 95, .18); background: rgba(38, 31, 16, .96); box-shadow: 0 -12px 28px rgba(0, 0, 0, .22); }.chat-approval-dock > header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }.chat-approval-dock > header strong { color: var(--xefd183); font-size: var(--ui-font-9); }.chat-approval-dock > header span { color: var(--xc1ad77); font-size: var(--ui-font-7); }.approval-dock-heading { display: flex; min-width: 0; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; }.approval-dock-toggle { display: inline-flex; flex: none; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid rgba(239, 196, 95, .3); border-radius: 999px; background: rgba(239, 196, 95, .08); color: var(--xefd183); font: inherit; font-size: var(--ui-font-7); font-weight: 700; cursor: pointer; }.approval-dock-toggle:hover, .approval-dock-toggle:focus-visible { border-color: rgba(239, 196, 95, .58); background: rgba(239, 196, 95, .16); }.approval-dock-toggle > em { flex: none; color: var(--xc1ad77); font-style: normal; font-variant-numeric: tabular-nums; }.approval-dock-toggle > svg { flex: none; transition: transform 140ms ease; }.approval-dock-toggle[aria-expanded="true"] > svg { transform: rotate(180deg); }.approval-dock-summary { overflow: hidden; margin: 0; color: var(--xc1ad77); font-size: var(--ui-font-8); text-overflow: ellipsis; white-space: nowrap; }.chat-approval-dock.approval-dock-collapsed, .aia-approval-dock.approval-dock-collapsed { max-height: none; overflow: visible; }.chat-approval-dock .chat-approval { background: rgba(15, 20, 25, .82); }.chat-approval-dock .chat-approval pre { max-height: 140px; }.chat-approval-dock .chat-approval-document { max-height: min(34vh, 260px); }.chat-approval-dock .chat-approval-questions { max-height: min(34vh, 280px); overflow-y: auto; }
 .chat-composer { display: flex; flex: none; align-items: flex-end; gap: 9px; padding: 11px 13px; border-top: 1px solid var(--border); background: var(--x0e161f); }.chat-composer textarea { min-height: 40px; max-height: 180px; flex: 1; padding: 10px 11px; color: var(--xd7e0ea); font-size: var(--ui-font-10); line-height: 1.55; resize: none; field-sizing: content; }.chat-composer .button { min-width: 64px; min-height: 36px; }
 .chat-composer-actions { display: flex; flex-direction: column; gap: 5px; }.chat-composer-actions .button { min-height: 30px; white-space: nowrap; }
@@ -3011,7 +3043,6 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .ui-cursor-badge .aia-mark-needle { animation: aia-needle-wander 13s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) { .ui-cursor, .ui-cursor-icon, .ui-cursor-badge .aia-mark-needle { transition: none !important; animation: none !important; } }
 /* 설정 → 자동화: Cypress 작업공간 패널. 목록·편집기는 project-registry·skill-editor를 재사용하고 여기서는 보탬만 둔다. */
-.cypress-host-note { color: var(--xe9be5d) !important; }
 .cypress-banner { padding: 0 18px 14px; }.cypress-banner .error-banner { margin: 0; }
 .cypress-notice { margin: 0; padding: 0 18px 14px; color: var(--green); font-size: var(--ui-font-8); }
 .cypress-muted { margin: 0; color: var(--faint); font-size: var(--ui-font-8); line-height: 1.5; }
@@ -3036,6 +3067,15 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .cypress-workspace-detail > header .project-registry-path { white-space: normal; overflow-wrap: anywhere; }
 .cypress-workspace-actions { display: flex; flex: none; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; }
 .cypress-workspace-actions .button { display: inline-flex; align-items: center; gap: 4px; }
+.cypress-module-status { display: inline-flex; width: fit-content; align-items: center; padding: 2px 7px; border: 1px solid rgba(255, 129, 120, .38); border-radius: 999px; background: rgba(255, 129, 120, .08); color: var(--danger); font-size: var(--ui-font-7); font-weight: 700; }
+.cypress-module-status.ready { border-color: rgba(var(--accent-rgb), .35); background: rgba(var(--accent-rgb), .08); color: var(--green); }
+.cypress-module-dir-editor { margin: 0 18px 18px; padding: 12px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--x0f1720); }
+.cypress-module-dir-editor > div { display: flex; min-width: 0; flex-direction: column; gap: 7px; }
+.cypress-module-dir-heading { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; }
+.cypress-module-dir-heading label { color: var(--xe4ebf3); font-size: var(--ui-font-8); font-weight: 700; }
+.cypress-module-dir-heading code { min-width: 0; max-width: 100%; color: var(--faint); font-size: var(--ui-font-7); overflow-wrap: anywhere; }
+.cypress-module-dir-editor small { color: var(--faint); font-size: var(--ui-font-7); line-height: 1.5; }
+.cypress-module-dir-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .cypress-selected-name { color: var(--muted); font-weight: 500; }
 .cypress-sensitive-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
 .cypress-sensitive-bar small { flex: 1; min-width: 160px; color: var(--faint); font-size: var(--ui-font-7); }
@@ -3106,12 +3146,15 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 @media (max-width: 900px) { .mermaid-preview { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 760px) {
   .cypress-form .form-row { grid-template-columns: 1fr; gap: 4px; }
-  /* 좁은 폭에서는 중메뉴가 위로 올라가 가로로 넘기는 칩 줄이 된다. */
+  /* 모바일에서는 이름·경로를 읽기 위해 가로 칩 대신 전체 폭의 세로 목록으로 둔다.
+     가로 스크롤은 항목이 잘린 채 남아 현재 선택·모듈 상태를 확인하기 어려웠다. */
   .cypress-layout { grid-template-columns: 1fr; }
   .cypress-workspace-nav, .cypress-workspace-nav > .settings-subsection { position: static; }
   .cypress-workspace-nav { border-right: 0; border-bottom: 1px solid var(--border-soft); }
-  .cypress-workspace-list { flex-direction: row; overflow-x: auto; padding-bottom: 12px; }
-  .cypress-workspace-row { flex: none; width: min(240px, 80vw); }
+  .cypress-workspace-list { flex-direction: column; overflow: visible; padding-bottom: 12px; }
+  .cypress-workspace-row { width: 100%; }
+  .cypress-workspace-select { padding: 10px; }
+  .cypress-workspace-select .project-registry-path { overflow-wrap: anywhere; white-space: normal; }
   .cypress-workspace-detail > header { flex-direction: column; align-items: stretch; }
   .cypress-workspace-actions { justify-content: flex-start; }
 }
@@ -4034,6 +4077,13 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
    손잡이다. 미결 결정이 있는 카드와 모달 제목은 같은 배지(round-goal-pending)로 알린다. */
 .round-goal-pending { border-color: rgba(233, 190, 93, .35); background: rgba(233, 190, 93, .1); color: var(--xe9be5d); }
 .round-report-modal-body { display: flex; flex-direction: column; gap: 8px; }
+.round-auto-decision-toggle { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 13px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--x0b1219); cursor: pointer; }
+.round-auto-decision-toggle.enabled { border-color: rgba(var(--accent-rgb), .34); background: rgba(var(--accent-rgb), .06); }
+.round-auto-decision-toggle > span { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.round-auto-decision-toggle strong { color: var(--xd8e1ea); font-size: var(--ui-font-9); }
+.round-auto-decision-toggle small, .round-auto-decision-notice { color: var(--faint); font-size: var(--ui-font-7); line-height: 1.5; }
+.round-auto-decision-toggle input { flex: none; width: 16px; height: 16px; accent-color: rgb(var(--accent-rgb)); cursor: pointer; }
+.round-auto-decision-notice { padding: 0 3px 4px; color: var(--green); }
 .round-report-details { border: 1px solid var(--border-soft); border-radius: 9px; padding: 8px 10px; }
 .round-report-details > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; cursor: pointer; list-style: none; }
 .round-report-details > summary::-webkit-details-marker { display: none; }
@@ -4041,6 +4091,13 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .round-report-details[open] > summary::before { content: "▾"; }
 .round-report-body { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 .round-report-body > p { margin: 0; }
+/* 회차 글은 줄바꿈 없는 한 문단으로 오는 일이 많아 roundText 가 문단으로 나눈다. 목록은 글머리표로 세운다. */
+.round-text { display: flex; flex-direction: column; gap: 6px; }
+.round-text > p { margin: 0; line-height: 1.6; overflow-wrap: anywhere; }
+.round-report-list { display: flex; flex-direction: column; gap: 2px; font-size: var(--ui-font-7); color: var(--muted); }
+.round-report-list > span { font-weight: 600; }
+.round-report-list > ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 2px; }
+.round-report-list li { overflow-wrap: anywhere; }
 .round-decision { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border: 1px dashed rgba(233, 190, 93, .45); border-radius: 8px; }
 .round-decision > p { margin: 0; font-weight: 600; }
 .round-decision-form.path-field-group { flex-direction: row; flex-wrap: wrap; align-items: center; }
@@ -4050,10 +4107,13 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
    차이와 이력. 두 열 모두 자기 안에서 스크롤하도록 min-height 0을 준다. */
 .git-panel-shell { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: 10px; }
 .git-panel { display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); gap: 12px; min-height: 0; flex: 1; }
-.git-panel-aside, .git-panel-main { display: flex; min-width: 0; min-height: 0; flex-direction: column; gap: 10px; overflow: auto; }
+/* 두 열은 자기 안에서 스크롤한다. scrollbar-gutter가 없으면 겹치는 스크롤바가 카드 테두리
+   위에 그려져 오른쪽 끝 글자와 전환 단추가 가린다. padding-right는 그 자리와 카드 사이 숨통. */
+.git-panel-aside, .git-panel-main { display: flex; min-width: 0; min-height: 0; flex-direction: column; gap: 10px; overflow-y: auto; overflow-x: hidden; padding-right: 4px; padding-bottom: 2px; scrollbar-gutter: stable; }
 .git-panel-aside > .settings-subsection, .git-panel-main > .settings-subsection { border: 1px solid var(--border); border-radius: 10px; background: var(--t-panel-glass); }
 .git-panel-aside > .settings-subsection + .settings-subsection, .git-panel-main > .settings-subsection + .settings-subsection { border-top: 1px solid var(--border); }
 .git-panel .settings-subsection > header { padding: 10px 12px 6px; }
+.git-changes > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .git-overview { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--t-panel-glass); }
 .git-overview-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
 .git-overview-head .git-branch-name { color: var(--xe4ebf3); font-size: var(--ui-font-12); }
@@ -4063,7 +4123,6 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .git-overview-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .git-action-group { display: inline-flex; align-items: center; gap: 4px; }
 .git-action-group select, .git-inline-form select, .git-inline-form input[type="text"] { min-height: 28px; padding: 3px 7px; font-size: var(--ui-font-7); }
-.git-write-reason { color: var(--faint); font-size: var(--ui-font-7); }
 .git-inline-form { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 0 12px 10px; }
 .git-inline-form > label { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: var(--ui-font-8); }
 .git-rebase-form { padding: 0; }
@@ -4083,18 +4142,24 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .git-change-group-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 4px 4px; }
 .git-change-group-head strong { color: var(--muted); font-size: var(--ui-font-8); }
 .git-change-group-head strong span { color: var(--faint); font-weight: 600; }
-.git-change-list, .git-branch-list, .git-branch-follow-list, .git-worktree-list, .git-stash-list, .git-log-list { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
-.git-branch-follow-card { padding: 8px; border: 1px solid var(--border-soft); border-radius: 6px; }
-.git-branch-follow-card dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 12px; margin: 6px 0 0; font-size: 12px; }
-.git-branch-follow-card dl div { display: flex; gap: 4px; min-width: 0; }
-.git-branch-follow-card dt { color: var(--muted); }
-.git-branch-follow-card dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* B5: 수신·송신 수 옆에 기준(마지막 fetch)을 붙여 실시간 값으로 읽히지 않게 한다. */
-.git-branch-follow-card .git-follow-basis { margin-left: 4px; color: var(--muted); font-size: 11px; }
+.git-change-view-toggle { display: inline-flex; flex: none; gap: 2px; padding: 2px; border: 1px solid var(--border-soft); border-radius: 7px; background: var(--x080e14); }
+.git-change-view-toggle .button { min-height: 24px; border-color: transparent; background: transparent; }
+.git-change-view-toggle .button[aria-pressed="true"] { border-color: rgba(var(--accent-rgb), .28); background: rgba(var(--accent-rgb), .12); color: var(--green); }
+.git-change-select-all { display: inline-flex; flex: none; align-items: center; gap: 5px; color: var(--faint); font-size: var(--ui-font-7); cursor: pointer; }
+.git-change-select-all input { width: 14px; height: 14px; margin: 0; accent-color: rgb(var(--accent-rgb)); cursor: pointer; }
+.git-change-select-all:has(input:disabled) { cursor: not-allowed; opacity: .55; }
+.git-change-list, .git-branch-list, .git-worktree-list, .git-stash-list, .git-log-list { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
 .git-log-list { gap: 0; }
 .git-change-row { display: flex; min-width: 0; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 6px; }
 .git-change-row:hover { background: rgba(var(--accent-rgb), .05); }
 .git-change-row.selected { background: rgba(var(--accent-rgb), .1); }
+.git-change-tree .git-change-tree { gap: 1px; }
+.git-change-folder { min-width: 0; }
+.git-change-folder-toggle { display: flex; width: 100%; min-width: 0; align-items: center; gap: 5px; padding-top: 3px; padding-right: 4px; padding-bottom: 3px; border: 0; border-radius: 6px; background: none; color: var(--muted); font: inherit; text-align: left; cursor: pointer; }
+.git-change-folder-toggle:hover { background: rgba(var(--accent-rgb), .05); }
+.git-change-folder-toggle > svg { flex: none; color: var(--faint); }
+.git-change-folder-toggle > strong { overflow: hidden; min-width: 0; font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
+.git-change-folder-toggle > small { flex: none; color: var(--faint); font-size: var(--ui-font-7); font-variant-numeric: tabular-nums; }
 .git-change-check { display: inline-flex; flex: none; align-items: center; }
 .git-change-check input { width: 14px; height: 14px; margin: 0; accent-color: rgb(var(--accent-rgb)); cursor: pointer; }
 .git-change-code { flex: none; width: 1.4em; color: var(--faint); font-size: var(--ui-font-7); font-weight: 750; text-align: center; }
@@ -4112,9 +4177,47 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .git-branch-main { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 1px; }
 .git-branch-main strong { overflow: hidden; color: var(--xe4ebf3); font-size: var(--ui-font-8); text-overflow: ellipsis; white-space: nowrap; }
 .git-branch-main small { overflow: hidden; color: var(--faint); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
+/* 브랜치 트리(B4). 이름의 `/`를 폴더로 읽어 접고 펴는 줄과, upstream을 따르는 브랜치의
+   팔로우 표식·방향 화살표. 들여쓰기는 깊이에 따라 인라인 padding-left로 들어온다. */
+.git-branch-header-actions { display: inline-flex; flex: none; align-items: center; gap: 6px; }
+.git-branch-list-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 12px 8px; }
+.git-branch-list-toolbar > small { color: var(--faint); font-size: var(--ui-font-7); }
+.git-branch-fold-all { display: inline-flex; align-items: center; justify-content: center; gap: 5px; }
+.git-branch-fold-all > svg { flex: none; color: currentColor; }
+.git-branch-scope { margin: 0 8px 8px; overflow: hidden; border: 1px solid var(--border-soft); border-radius: 9px; background: rgba(8, 14, 20, .28); }
+.git-branch-scope.remote { border-color: rgba(118, 149, 184, .22); background: rgba(32, 49, 68, .16); }
+.git-branch-scope-head { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 42px; padding: 7px 10px; border-bottom: 1px solid var(--border-soft); background: rgba(255, 255, 255, .018); }
+.git-branch-scope.remote .git-branch-scope-head { background: rgba(93, 132, 174, .055); }
+.git-branch-scope-icon { display: inline-flex; width: 24px; height: 24px; align-items: center; justify-content: center; border: 1px solid rgba(var(--accent-rgb), .24); border-radius: 7px; background: rgba(var(--accent-rgb), .08); color: var(--green); }
+.git-branch-scope.remote .git-branch-scope-icon { border-color: rgba(118, 166, 218, .28); background: rgba(80, 130, 184, .1); color: var(--x8fb6ef, #8fb6ef); }
+.git-branch-scope-head > div { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
+.git-branch-scope-head strong { color: var(--xd3dde7); font-size: var(--ui-font-8); }
+.git-branch-scope-head small { overflow: hidden; color: var(--faint); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
+.git-branch-scope-count { min-width: 22px; padding: 1px 6px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: var(--ui-font-7); font-weight: 700; text-align: center; font-variant-numeric: tabular-nums; }
+.git-branch-scope > .git-branch-list { padding: 4px 0; }
+.git-branch-folder-toggle { display: flex; width: 100%; min-width: 0; align-items: center; gap: 6px; padding: 4px 12px; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.git-branch-folder-toggle:hover { background: rgba(var(--accent-rgb), .05); }
+.git-branch-folder-toggle:focus-visible { outline: 1px solid rgba(var(--accent-rgb), .5); outline-offset: -1px; }
+.git-branch-folder-toggle > svg { flex: none; color: var(--faint); }
+.git-branch-folder-toggle > strong { overflow: hidden; min-width: 0; color: var(--xc6d1dc); font-size: var(--ui-font-8); text-overflow: ellipsis; white-space: nowrap; }
+.git-branch-folder-toggle > small { flex: none; color: var(--faint); font-size: var(--ui-font-7); font-variant-numeric: tabular-nums; }
+/* 접힌 폴더 안에 현재 브랜치가 있다는 점. 펼치지 않고도 어디를 열면 되는지 보이게 한다. */
+.git-branch-folder-head { width: 5px; height: 5px; flex: none; border-radius: 50%; background: var(--green); }
+.git-branch-followed { margin-right: 4px; color: var(--faint); vertical-align: -1px; }
+.git-branch-followed.gone { color: var(--danger); }
+.git-branch-row.current .git-branch-followed { color: var(--green); }
+/* 수신·송신을 수 대신 방향으로 읽게 한다. 0인 쪽은 아예 그리지 않아 줄이 조용하다. */
+.git-branch-track { display: inline-flex; flex: none; align-items: center; gap: 6px; font-size: var(--ui-font-7); font-variant-numeric: tabular-nums; }
+.git-branch-track > span { display: inline-flex; align-items: center; gap: 1px; }
+.git-branch-track svg { flex: none; }
+.git-track-in { color: var(--x8fb6ef, #8fb6ef); }
+.git-track-out { color: var(--green); }
+/* 양쪽에 커밋이 있으면 fast-forward로 정리되지 않는다. 두 방향을 같은 경고색으로 묶는다. */
+.git-branch-track.diverged .git-track-in, .git-branch-track.diverged .git-track-out { color: var(--xefd183); }
 .git-branch-context-menu { position: fixed; z-index: 120; display: flex; width: 230px; flex-direction: column; gap: 1px; padding: 6px; border: 1px solid var(--x35485e); border-radius: 11px; background: var(--x101923); box-shadow: 0 20px 48px var(--t-shadow-popover); }
 .git-branch-context-menu > header { min-width: 0; padding: 6px 8px 8px; border-bottom: 1px solid var(--border-soft); }
 .git-branch-context-menu > header strong { display: block; overflow: hidden; color: var(--xd3dde7); font-size: var(--ui-font-8); text-overflow: ellipsis; white-space: nowrap; }
+.git-branch-context-menu > header small { display: block; margin-top: 2px; color: var(--faint); font-size: var(--ui-font-7); }
 .git-branch-context-menu > button { display: flex; width: 100%; min-height: 32px; align-items: center; gap: 8px; padding: 0 8px; border: 0; border-radius: 7px; background: transparent; color: var(--xc6d1dc); font: inherit; font-size: var(--ui-font-8); font-weight: 650; text-align: left; cursor: pointer; }
 .git-branch-context-menu > button:hover:not(:disabled), .git-branch-context-menu > button:focus-visible { outline: 0; background: var(--x192634); color: var(--text); }
 .git-branch-context-menu > button:disabled { cursor: not-allowed; opacity: .45; }
@@ -4123,13 +4226,25 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .git-worktree-row code { overflow: hidden; max-width: 100%; color: var(--xe4ebf3); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
 .git-worktree-row small { color: var(--faint); font-size: var(--ui-font-7); }
 .git-row-actions { display: inline-flex; flex: none; gap: 4px; }
+.git-log { container-type: inline-size; }
+.git-log-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 12px 10px; }
+.git-log-toolbar > small { flex: none; color: var(--faint); font-size: var(--ui-font-7); font-variant-numeric: tabular-nums; }
+.git-log-search { display: flex; min-width: 180px; max-width: 440px; flex: 1; align-items: center; gap: 6px; padding: 0 7px; border: 1px solid var(--border); border-radius: 7px; background: var(--x080e14); color: var(--faint); }
+.git-log-search:focus-within { border-color: rgba(var(--accent-rgb), .5); }
+.git-log-search > svg { flex: none; }
+.git-log-search > input { width: 100%; min-width: 0; height: 29px; padding: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; font-size: var(--ui-font-8); }
+.git-log-search > input::-webkit-search-cancel-button { display: none; }
+.git-log-search > button { display: inline-flex; width: 22px; height: 22px; flex: none; align-items: center; justify-content: center; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--faint); cursor: pointer; }
+.git-log-search > button:hover { background: rgba(255, 255, 255, .06); color: var(--text); }
+.git-log-columns { display: grid; min-width: 0; grid-template-columns: 52px minmax(120px, 1fr) minmax(90px, 170px) minmax(105px, 145px) 42px; column-gap: 10px; align-items: center; padding-bottom: 5px; color: var(--faint); font-size: var(--ui-font-7); font-weight: 650; }
+.git-log-column-pick { text-align: center; }
 .git-log-row { display: flex; min-width: 0; flex-direction: column; background: linear-gradient(90deg, var(--git-lane-bg) 0, transparent 56%); box-shadow: inset 0 1px var(--border-soft); }
 .git-log-toggle { display: flex; width: 100%; min-width: 0; align-items: stretch; gap: 10px; padding: 0 12px; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
 .git-log-toggle:hover { background: rgba(255, 255, 255, .025); }
 .git-log-row:first-child { box-shadow: none; }
-.git-log-head { display: flex; min-width: 0; align-items: stretch; }
+.git-log-head { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) 42px; align-items: stretch; }
 .git-log-head .git-log-toggle { min-width: 0; flex: 1; }
-.git-log-pick { flex: none; align-items: center; padding-left: 10px; }
+.git-log-pick { width: 42px; min-width: 42px; align-items: center; justify-content: center; padding: 0; }
 .git-log-row.picked { background: linear-gradient(90deg, var(--git-lane-bg) 0, rgba(255, 255, 255, .05) 56%); }
 .git-log-graph { position: relative; align-self: stretch; min-height: 38px; flex: none; }
 .git-log-graph svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
@@ -4146,19 +4261,42 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .lane-color-5 { --git-lane-color: #4fd1c5; --git-lane-bg: rgba(79, 209, 197, .09); }
 .lane-color-6 { --git-lane-color: #fc8181; --git-lane-bg: rgba(252, 129, 129, .09); }
 .lane-color-7 { --git-lane-color: #90cdf4; --git-lane-bg: rgba(144, 205, 244, .09); }
-.git-log-sha { flex: none; padding-top: 8px; color: var(--faint); font-size: var(--ui-font-7); }
+.git-log-sha { width: 52px; flex: none; padding-top: 8px; color: var(--faint); font-size: var(--ui-font-7); }
+.git-log-cells { display: grid; min-width: 0; flex: 1; grid-template-columns: minmax(120px, 1fr) minmax(90px, 170px) minmax(105px, 145px); column-gap: 10px; align-items: center; }
 .git-log-main { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; padding: 6px 0; }
 .git-log-main strong { overflow: hidden; color: var(--xe4ebf3); font-size: var(--ui-font-8); text-overflow: ellipsis; white-space: nowrap; }
 .git-log-main small { color: var(--faint); font-size: var(--ui-font-7); }
+.git-log-author, .git-log-time { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.git-log-author strong, .git-log-time strong { overflow: hidden; color: var(--xc6d1dc); font-size: var(--ui-font-7); font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.git-log-author small, .git-log-time small { overflow: hidden; color: var(--faint); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
+.git-log-time { font-style: normal; font-variant-numeric: tabular-nums; }
 .git-log-refs { display: flex; flex-wrap: wrap; gap: 4px; }
 .git-log-refs .skill-extra-pill { border: 1px solid var(--git-lane-color); background: var(--git-lane-bg); color: var(--git-lane-color); }
 .git-commit-box textarea { width: calc(100% - 24px); margin: 0 12px; padding: 8px 9px; font-size: var(--ui-font-8); line-height: 1.5; resize: vertical; }
 .git-commit-box .form-actions, .git-log .form-actions { margin: 8px 12px 10px; }
+/* 바깥 viewport가 넓어도 왼쪽 프로젝트 열 때문에 이력 카드 자체는 좁을 수 있다. 이때 고정
+   계정·시간 열을 억지로 유지하면 머리글만 카드 밖으로 나가 선택 칸과 날짜가 겹친다. */
+@container (max-width: 620px) {
+  .git-log-columns { grid-template-columns: 52px minmax(0, 1fr) 42px; }
+  .git-log-columns > :nth-child(3), .git-log-columns > :nth-child(4) { display: none; }
+  .git-log-cells { grid-template-columns: minmax(0, 1fr); }
+  .git-log-author, .git-log-time { display: none; }
+}
 @media (max-width: 900px) {
   /* 한 열에서는 바깥 탭이 전체를 스크롤한다. 남은 높이에 맞춘 grid를 유지하면 왼쪽 묶음이
      내용보다 짧게 수축하고, visible인 브랜치 목록 위에서 다음 행(이력)이 시작해 겹친다. */
   .git-panel { display: flex; flex: none; flex-direction: column; }
   .git-panel-aside, .git-panel-main { overflow: visible; }
+  .git-log-columns { grid-template-columns: 52px minmax(120px, 1fr) minmax(90px, 130px) minmax(105px, 128px) 42px; }
+  .git-log-cells { grid-template-columns: minmax(120px, 1fr) minmax(90px, 130px) minmax(105px, 128px); }
+}
+@media (max-width: 680px) {
+  .git-log-toolbar { align-items: stretch; flex-direction: column; }
+  .git-log-search { max-width: none; }
+  .git-log-toolbar > small { align-self: flex-end; }
+  .git-log-columns { display: none; }
+  .git-log-cells { grid-template-columns: minmax(0, 1fr); }
+  .git-log-author, .git-log-time { display: none; }
 }
 /* 채팅 비밀값 패널. 승인 카드의 비밀번호 칸(.chat-approval-secret)과 같은 노란 톤이지만 실행 설정 메뉴 자리에 얹히는 별도 상자다. 값은 어디에도 그리지 않는다. */
 .chat-secrets-menu { position: relative; flex: none; border-top: 1px solid var(--border); background: var(--x0e161f); }.chat-secrets-bar { display: flex; min-height: 32px; align-items: center; gap: 7px; padding: 3px 13px; }.chat-secrets-trigger { display: inline-flex; min-height: 26px; align-items: center; gap: 5px; padding-inline: 7px; border-color: transparent; background: transparent; color: var(--faint); }.chat-secrets-trigger:hover:not(:disabled), .chat-secrets-trigger.active { border-color: rgba(239, 196, 95, .3); background: rgba(239, 196, 95, .08); color: var(--xefd183); }.chat-secrets-trigger > svg { flex: none; }.chat-secrets-trigger > svg:last-child { transition: transform 160ms ease; }.chat-secrets-trigger.active > svg:last-child { transform: rotate(180deg); }.chat-secrets-panel { display: flex; flex-direction: column; gap: 9px; margin: 0 13px 9px; padding: 10px 11px; border: 1px solid rgba(239, 196, 95, .3); border-radius: 8px; background: var(--x0c131b); }.chat-secrets-hint, .chat-secrets-empty { margin: 0; color: var(--faint); font-size: var(--ui-font-7); line-height: 1.45; }.chat-secrets-list { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }.chat-secrets-item { display: flex; flex-direction: column; gap: 3px; padding: 7px 9px; border: 1px solid var(--border-soft); border-radius: 6px; background: var(--x080e14); }.chat-secrets-item-head { display: flex; min-width: 0; align-items: center; gap: 7px; }.chat-secrets-item-head > code { min-width: 0; overflow: hidden; color: var(--xefd183); font-size: var(--ui-font-8); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }.chat-secrets-item-head > small { flex: none; margin-left: auto; color: var(--faint); font-size: var(--ui-font-7); font-variant-numeric: tabular-nums; }.chat-secrets-source { flex: none; padding: 1px 7px; border-radius: 999px; background: rgba(239, 196, 95, .14); color: var(--xefd183); font-size: var(--ui-font-7); font-style: normal; }.chat-secrets-source-agent { background: rgba(var(--accent-rgb), .14); color: var(--green); }.chat-secrets-remove { min-height: 22px; flex: none; padding-inline: 5px; }.chat-secrets-remember { min-height: 22px; flex: none; padding-inline: 5px; }.chat-secrets-source-saved { background: rgba(124, 164, 224, .16); color: var(--x8fb6ef, #8fb6ef); }.chat-secrets-purpose { color: var(--xb6c2cf); font-size: var(--ui-font-8); line-height: 1.45; overflow-wrap: anywhere; }.chat-secrets-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }.chat-secrets-form > label { display: flex; min-width: 0; flex-direction: column; gap: 4px; }.chat-secrets-form > label > span { color: var(--xefd183); font-size: var(--ui-font-7); font-weight: 600; }.chat-secrets-form > label > input { min-width: 0; padding: 5px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--x080e14); color: var(--xb6c2cf); font-size: var(--ui-font-8); font-family: inherit; }.chat-secrets-form > label > input:focus-visible { border-color: rgba(239, 196, 95, .5); outline: none; }.chat-secrets-form-actions { display: flex; grid-column: 1 / -1; align-items: center; justify-content: flex-end; gap: 9px; }.chat-secrets-error { min-width: 0; flex: 1; overflow: hidden; color: var(--xf3a09a); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
@@ -4180,7 +4318,168 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .git-diff-window-body { min-height: 0; flex: 1; overflow: auto; padding: 12px 18px 24px; }
 /* 이력 행을 누르면 그 커밋이 바꾼 파일이 아래로 펼쳐진다. */
 .git-log-row.expanded { background: linear-gradient(90deg, var(--git-lane-bg) 0, var(--x0b1219) 65%); }
+.git-commit-detail { display: flex; min-width: 0; flex-direction: column; gap: 7px; margin: 6px 12px 9px 32px; padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: 8px; background: rgba(0, 0, 0, .12); }
+.git-commit-detail > strong { color: var(--xe4ebf3); font-size: var(--ui-font-9); line-height: 1.45; overflow-wrap: anywhere; }
+.git-commit-detail > pre { margin: 0; color: var(--xb6c2cf); font: inherit; font-size: var(--ui-font-8); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.git-commit-detail > dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 16px; margin: 2px 0 0; padding-top: 8px; border-top: 1px solid var(--border-soft); }
+.git-commit-detail > dl > div { display: grid; min-width: 0; grid-template-columns: max-content minmax(0, 1fr); gap: 6px; }
+.git-commit-detail dt { color: var(--faint); font-size: var(--ui-font-7); }
+.git-commit-detail dd { overflow: hidden; margin: 0; color: var(--muted); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
 .git-commit-files { display: flex; flex-direction: column; gap: 2px; margin: 0 0 6px 32px; padding: 0 12px 6px; list-style: none; }
 .git-commit-file { display: flex; min-width: 0; align-items: center; gap: 8px; }
 .git-commit-file .git-change-path { min-width: 0; flex: 1; }
 .git-commit-files-note { margin: 0 0 6px 44px; color: var(--faint); font-size: var(--ui-font-7); }
+
+/* 프로젝트 화면 Overlay 탭(C19, O11). 생성과 보관을 한 작업대의 두 단계로 묶는다.
+   넓은 화면에서는 나란히 비교하고, 좁은 화면에서는 작업 순서대로 한 열이 된다. */
+.overlay-panel-shell { --overlay-card-bg: color-mix(in srgb, var(--t-panel-glass) 82%, var(--x080d13)); }
+.overlay-hero { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 4px 2px 2px; }
+.overlay-hero-copy { display: flex; min-width: 0; align-items: center; gap: 11px; }
+.overlay-hero-icon { display: inline-flex; width: 34px; height: 34px; flex: none; align-items: center; justify-content: center; border: 1px solid rgba(var(--accent-rgb), .28); border-radius: 10px; background: rgba(var(--accent-rgb), .08); color: var(--accent); }
+.overlay-hero h3 { margin: 0; color: var(--xedf3f8); font-size: var(--ui-font-12); }
+.overlay-hero p { margin: 3px 0 0; color: var(--faint); font-size: var(--ui-font-8); line-height: 1.45; }
+.overlay-refresh { flex: none; }
+.overlay-refresh .spinning { animation: spin 900ms linear infinite; }
+.overlay-summary { display: grid; grid-template-columns: max-content max-content minmax(220px, 1fr); align-items: center; gap: 10px; padding: 9px 12px; border: 1px solid var(--border-soft); border-radius: 9px; background: rgba(255, 255, 255, .018); }
+.overlay-summary > div { display: flex; align-items: baseline; gap: 6px; padding-right: 12px; border-right: 1px solid var(--border-soft); }
+.overlay-summary strong { color: var(--xe4ebf3); font-size: var(--ui-font-11); font-variant-numeric: tabular-nums; }
+.overlay-summary span, .overlay-summary p { color: var(--faint); font-size: var(--ui-font-7); }
+.overlay-summary p { margin: 0; text-align: right; }
+.overlay-workspace { display: grid; min-height: 0; grid-template-columns: minmax(300px, .9fr) minmax(360px, 1.1fr); align-items: start; gap: 12px; }
+.overlay-card { display: flex; min-width: 0; flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: 11px; background: var(--overlay-card-bg); box-shadow: 0 8px 24px rgba(0, 0, 0, .08); }
+.overlay-card-head { display: flex; min-height: 56px; align-items: center; gap: 10px; padding: 10px 13px; border-bottom: 1px solid var(--border-soft); background: rgba(255, 255, 255, .018); }
+.overlay-step { display: inline-flex; width: 25px; height: 25px; flex: none; align-items: center; justify-content: center; border: 1px solid rgba(var(--accent-rgb), .25); border-radius: 7px; background: rgba(var(--accent-rgb), .07); color: var(--accent); font-size: var(--ui-font-7); font-weight: 700; font-variant-numeric: tabular-nums; }
+.overlay-card-head h4 { margin: 0; color: var(--xe4ebf3); font-size: var(--ui-font-10); }
+.overlay-card-head p { margin: 2px 0 0; color: var(--faint); font-size: var(--ui-font-7); line-height: 1.4; }
+.overlay-card-body { display: flex; min-width: 0; flex-direction: column; gap: 11px; padding: 13px; }
+.overlay-name-field { display: flex; flex-direction: column; gap: 5px; }
+.overlay-name-field > span { color: var(--muted); font-size: var(--ui-font-8); font-weight: 650; }
+.overlay-name-field > input { width: 100%; min-width: 0; box-sizing: border-box; }
+.overlay-picker { overflow: hidden; border: 1px solid var(--border-soft); border-radius: 8px; background: rgba(0, 0, 0, .08); }
+.overlay-picker-head { display: flex; min-height: 34px; align-items: center; justify-content: space-between; gap: 10px; padding: 0 10px; border-bottom: 1px solid var(--border-soft); color: var(--muted); font-size: var(--ui-font-8); }
+.overlay-picker-head strong { margin-left: 3px; color: var(--xe4ebf3); font-variant-numeric: tabular-nums; }
+.overlay-picker-actions { display: inline-flex; align-items: center; gap: 8px; }
+.overlay-picker-actions button { padding: 0; border: 0; background: none; color: var(--accent); font: inherit; font-size: var(--ui-font-7); cursor: pointer; }
+.overlay-picker-actions button:hover:not(:disabled) { text-decoration: underline; text-underline-offset: 2px; }
+.overlay-picker-actions button:disabled { color: var(--x405165); cursor: default; }
+.overlay-picker .empty-state { min-height: 128px; padding: 18px 14px; }
+.overlay-candidates,
+.overlay-set-paths,
+.overlay-receipt-paths,
+.overlay-receipt-rejected { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.overlay-candidates { max-height: 280px; overflow: auto; gap: 0; }
+.overlay-candidates li + li { border-top: 1px solid var(--border-soft); }
+.overlay-candidates label { display: flex; min-width: 0; align-items: center; gap: 8px; padding: 8px 10px; cursor: pointer; }
+.overlay-candidates label:hover { background: rgba(var(--accent-rgb), .035); }
+.overlay-candidates input { flex: none; accent-color: var(--accent); }
+.overlay-candidates code { overflow: hidden; color: var(--xc6d1dc); font-size: var(--ui-font-8); text-overflow: ellipsis; white-space: nowrap; }
+.overlay-create-actions { display: flex; min-height: 31px; align-items: center; justify-content: space-between; gap: 10px; }
+.overlay-create-actions > span { color: var(--faint); font-size: var(--ui-font-7); font-variant-numeric: tabular-nums; }
+.overlay-create-actions .button { align-self: auto; min-width: 96px; }
+.overlay-set-list { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.overlay-sets .empty-state { min-height: 214px; padding: 22px 16px; }
+.overlay-set-row { display: flex; flex-direction: column; gap: 8px; padding: 11px; border: 1px solid var(--border-soft); border-radius: 8px; background: rgba(0, 0, 0, .08); }
+.overlay-set-head { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 7px; }
+.overlay-set-head strong { min-width: 0; overflow: hidden; color: var(--xe4ebf3); font-size: var(--ui-font-9); text-overflow: ellipsis; white-space: nowrap; }
+.overlay-set-head .muted { margin-left: auto; font-size: var(--ui-font-7); }
+.overlay-set-head [data-overlay-state="registered"] { color: var(--xdcb958); }
+.overlay-set-head [data-overlay-state="stored"] { color: var(--x8ebcff); }
+.overlay-set-head [data-overlay-state="applied"] { color: var(--green); }
+.overlay-set-paths { max-height: 96px; overflow: auto; padding: 7px 9px; border-radius: 6px; background: rgba(0, 0, 0, .12); }
+.overlay-set-paths code { color: var(--muted); font-size: var(--ui-font-7); }
+.overlay-set-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.overlay-set-actions .button.danger { margin-left: auto; }
+/* 적용 검사 실패는 오류가 아니라 영수증이다(C19-3). 색으로 경고하되 오류 배너로 만들지 않는다. */
+.overlay-receipt { display: flex; flex-direction: column; gap: 6px; }
+.overlay-receipt-conflict { border-color: var(--warning, #c9881f); }
+/* C19-3. 외부 Git 작업을 보고 내미는 자리. 충돌 영수증과 같은 테두리를 쓰는 것은 둘 다
+   "아직 작업 트리에 들어가지 않았다"는 같은 사실을 말하기 때문이다. */
+.overlay-drift { border-color: var(--warning, #c9881f); display: flex; flex-direction: column; gap: 6px; }
+.overlay-drift > span { display: flex; align-items: center; gap: 6px; }
+.overlay-drift-sets { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.overlay-drift-sets li { display: flex; align-items: center; gap: 8px; }
+.overlay-set-row[data-overlay-drift="external"] { border-left: 2px solid var(--warning, #c9881f); padding-left: 8px; }
+@media (max-width: 1050px) {
+  .overlay-workspace { grid-template-columns: 1fr; }
+  .overlay-sets .empty-state { min-height: 150px; }
+}
+@media (max-width: 700px) {
+  .overlay-hero { align-items: flex-start; }
+  .overlay-hero-copy { align-items: flex-start; }
+  .overlay-refresh { width: 32px; min-width: 32px; padding-inline: 0; font-size: 0; }
+  .overlay-summary { grid-template-columns: 1fr 1fr; }
+  .overlay-summary > div { padding-right: 0; border-right: 0; }
+  .overlay-summary p { grid-column: 1 / -1; padding-top: 7px; border-top: 1px solid var(--border-soft); text-align: left; }
+  .overlay-set-actions .button.danger { margin-left: 0; }
+}
+/* C19-3. 앱이 브랜치를 옮긴 직후의 자동 재적용 결과. 외부 이동 배너와 같은 틀을 쓴다 —
+   사용자가 보는 것은 같은 종류의 사실(보관한 overlay가 지금 어디 있는가)이다. */
+.overlay-reapply { display: flex; flex-direction: column; gap: 6px; }
+.overlay-reapply > span { display: flex; align-items: center; gap: 6px; }
+/* C19-5. 보관된 patch 본문. 스냅샷 뒤 작업 트리는 HEAD 원본이라 이 본문이 그 변경의 유일한
+   사본이고, 사용자가 충돌을 손으로 풀 때 그대로 옮겨 적는 자리다 — 그래서 줄바꿈과 공백을
+   보존하고(`pre`), 가로로 접지 않는다. 접으면 diff의 선행 공백이 바뀌어 보인다. */
+.overlay-patch-view { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--border); padding-top: 10px; }
+.overlay-patch-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.overlay-patch-body { margin: 0; max-height: 420px; overflow: auto; background: var(--surface-2, rgba(127,127,127,0.08)); padding: 10px; border-radius: 6px; font-size: var(--ui-font-7); white-space: pre; }
+
+/* B8. upstream 비교 — 수신과 송신을 좌우로 갈라 둔다. 한 칸에 겹쳐 두면 "3건"이 어느
+   방향인지 다시 읽어야 하고, 그 모호함을 없애려고 이 화면을 만들었다. */
+.git-branch-comparison .git-comparison-sides { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.git-branch-comparison .git-comparison-side { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; min-width: 0; }
+.git-branch-comparison .git-comparison-side > header { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
+.git-branch-comparison .git-comparison-commits { display: flex; flex-direction: column; gap: 2px; margin: 0 0 6px; padding: 0; list-style: none; font-size: 12px; }
+.git-branch-comparison .git-comparison-commits li { display: flex; gap: 6px; min-width: 0; }
+.git-branch-comparison .git-comparison-commits span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.git-branch-comparison .git-commit-files { margin-left: 0; padding-left: 0; }
+.git-branch-comparison .git-change-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* B9. 비교 요약의 파일은 같은 세 점 범위의 diff 를 연다 — 작업 트리 목록과 같은 눌림 표시를 쓴다. */
+.git-change-path-button:hover { text-decoration: underline; }
+.git-change-path-button.selected { color: var(--accent); font-weight: 600; }
+.overlay-patch-index { display: flex; flex-wrap: wrap; gap: 6px; list-style: none; margin: 0; padding: 0; }
+.overlay-patch-index button { padding: 2px 8px; }
+.overlay-patch-index button[aria-current="true"] { border-color: var(--accent, #4a90d9); }
+
+/* C20. 접근 채널 로그인 게이트와 설정 → 시스템의 로그인 설정 카드. */
+.login-gate { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center; padding: 24px; background: var(--bg); }
+.login-gate.overlay { background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(6px); }
+.login-gate-card { display: flex; width: min(360px, 100%); flex-direction: column; gap: 12px; padding: 24px; border: 1px solid var(--border); border-radius: 14px; background: var(--x0b1219); }
+.login-gate-card h1 { margin: 0; font-size: var(--ui-font-12); }
+.login-gate-lead { margin: 0; color: var(--faint); font-size: var(--ui-font-8); line-height: 1.5; }
+.login-gate-card label { display: flex; flex-direction: column; gap: 4px; font-size: var(--ui-font-8); }
+.login-gate-card input { font-size: 16px; }
+.login-gate-help { color: var(--faint); font-size: var(--ui-font-6); line-height: 1.45; }
+.login-settings-body { gap: 14px; }
+.login-settings-warning { padding: 12px; border: 1px solid rgba(233, 190, 93, .45); border-radius: 9px; background: rgba(233, 190, 93, .08); }
+.login-settings-warning p { margin: 0; color: var(--xe9be5d); font-size: var(--ui-font-7); line-height: 1.5; }
+.login-settings-section { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--x0b1219); }
+.login-settings-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.login-settings-row > span:first-child, .login-session-list li > span { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.login-settings-row strong, .login-settings-heading { display: inline-flex; align-items: center; gap: 6px; font-size: var(--ui-font-9); }
+.login-settings-row small, .login-session-list small { color: var(--faint); font-size: var(--ui-font-7); line-height: 1.45; }
+.login-settings-actions { display: flex; flex: none; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.login-settings-form { grid-template-columns: minmax(0, 1fr); }
+.login-settings-form-title { grid-column: 1 / -1; font-size: var(--ui-font-8); }
+.login-channel-table { width: 100%; border-collapse: collapse; font-size: var(--ui-font-8); }
+.login-channel-table th, .login-channel-table td { padding: 8px 6px; border-top: 1px solid var(--border-soft); text-align: left; vertical-align: middle; }
+.login-channel-table thead th { border-top: 0; color: var(--faint); font-weight: 500; font-size: var(--ui-font-7); }
+.login-channel-table tbody th { font-weight: 500; }
+.login-channel-table tbody th > span { display: flex; align-items: center; gap: 6px; }
+.login-channel-table tbody th small { display: block; color: var(--faint); font-size: var(--ui-font-6); font-weight: 400; }
+.login-channel-table tr.current tbody th, .login-channel-table tr.current th { color: var(--text); }
+.login-channel-current { padding: 1px 6px; border-radius: 999px; background: rgba(var(--accent-rgb), .14); color: var(--green); font-size: var(--ui-font-5); font-style: normal; }
+.login-session-list { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.login-session-list li { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--border-soft); border-radius: 8px; }
+.login-session-list strong { display: inline-flex; align-items: center; gap: 6px; font-size: var(--ui-font-8); }
+.login-otp-enroll { grid-template-columns: auto minmax(0, 1fr); }
+.login-otp-qr { grid-row: span 2; display: flex; align-items: flex-start; }
+.login-otp-qr img { border-radius: 8px; background: #fff; }
+.login-otp-manual { display: flex; flex-direction: column; gap: 6px; font-size: var(--ui-font-7); color: var(--faint); }
+.login-otp-manual code { user-select: all; color: var(--text); font-size: var(--ui-font-8); letter-spacing: .06em; word-break: break-all; }
+.login-otp-manual .button { align-self: flex-start; }
+@media (max-width: 640px) {
+  .login-otp-enroll { grid-template-columns: minmax(0, 1fr); }
+  .login-otp-qr { grid-row: auto; justify-content: center; }
+  .login-settings-row { flex-direction: column; }
+  .login-settings-actions { justify-content: flex-start; }
+}

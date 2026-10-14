@@ -1,0 +1,25 @@
+{
+  "itemId": "C-b25bd2aeea7f",
+  "kind": "commit",
+  "ref": "b25bd2aeea7f1dd94190fe2b5f1b0bc4c5b17eaf",
+  "reviewedAt": "2026-10-05T20:05:00Z",
+  "lane": "L02",
+  "source": "claude",
+  "verdict": "결함 1건(기존 열린 결함의 관측 추가) / 새 결함 0건 / 수정 0건",
+  "axes": {
+    "정확성": "커밋이 적은 수를 하나도 믿지 않고 전부 다시 셌고 어긋나는 것이 없었다. (1) 되잰 대상 ee868f04 트리: reviewed/*.json 36 · 그 중 commits 가 빈 것 34 · findings 15 · state=fixed 인데 fixCommits 가 빈 것 6 — 그 커밋이 적은 값과 같다. (2) 그 커밋이 되잰 bd0ac165f76e 트리: 34 · 32 · 15 · 6 — 역시 같다. (3) 이 커밋 자신의 트리에서 reviewed/*.json 39 (ls-tree 전체 40 중 .gitkeep 1 을 뺀 값)이고 그것이 더한 queue.json 의 counts.reviewed 39 와 맞는다. 부모의 38 에서 장부 한 개를 더해 39 다. (4) counts.commit 이 219 로 그대로이고 remaining 219+234=453 도 산술이 맞다 — 러너의 readCommits 가 작업트리 HEAD 가 아니라 `git log <branch>`(origin/dev-history)를 읽으므로 ee868f04 가 리뷰로 빠진 한 건과 그 사이 다른 레인이 착지시킨 한 건이 상쇄된 값이다. 자기 커밋을 세지 못하는 것은 러너의 설계대로이지 이 커밋의 오산이 아니다. (5) 트레일러는 `%(trailers:key=Co-Authored-By)` 로 한 줄 정상 반환돼(AGENTS.md D3) 대상이 지적한 리터럴 \\n 파손을 되풀이하지 않았다.",
+    "보안 불변식": "해당 없음. docs/code-review 아래 JSON 셋(finding 1 · queue 1 · reviewed 1)만 바꿔 AGENTS.md 2절 G1~G11 이 다루는 자격증명 저장·공급자 소유 저장소·셸 문자열 조립·경로 정규화·쓰기 게이트 어디에도 닿지 않고, 3절 C 직접변경 예외에도 걸리지 않는다.",
+    "계약": "결함 1건. 이 커밋이 더한 reviewed/C-ee868f04ef8a.json 의 `commits` 가 또 빈 배열이라 README '장부 파일의 모양'이 요구하는 값을 채우지 못한다. 열린 F-docs-code-review-readme-md-commits-6f902967 이라 새 finding 을 만들지 않고 occurrences 에 덧붙였다(17 번째). 그 밖의 모양은 규약과 맞는다 — 파일 이름과 본문 itemId 가 일치하고, `findings` 가 가리키는 결함 파일이 같은 커밋 안에 실재하며, queue.json 은 손으로 고치지 않고 러너로 다시 생성한 자취(generatedAt 갱신)가 남아 있다. 커밋 본문이 관측을 \"여덟 번째\"로 센 것과 실제 순번이 어긋나는 점은 대상 커밋이 이미 장부에 적어 두었고 서수는 규약이 요구하는 값이 아니라 결함으로 세지 않는다.",
+    "검증 없음": "문서 장부만 바꾼 커밋이라 제품 시험이 걸리는 자리가 없다. 대신 커밋이 적은 주장 전부(세 트리의 집계 네 쌍, queue.json 의 counts 와 산술, 트레일러 파손 여부)를 git 과 러너로 직접 되재어 확인했다.",
+    "단순화·중복": "결함 없음. 열린 결함을 새 finding 으로 복제하지 않고 occurrences 로 모았고, 러너를 손 집계로 대신하지 않았다. 다만 `note` 가 관측마다 같은 문형의 긴 문장을 덧붙여 자라고 있어 occurrences 와 사실이 겹친다 — 지적만 남긴다. 수치는 occurrences 쪽으로 옮기는 편이 맞지만 그것은 저장 형식 변경이라 이 회차가 고칠 자리가 아니고, 같은 주제의 결정이 이미 열려 있다."
+  },
+  "findings": ["F-docs-code-review-readme-md-commits-6f902967"],
+  "verification": [
+    "git ls-tree -r b25bd2aeea7f docs/code-review/reviewed → .json 39 (=queue.json counts.reviewed), .gitkeep 1",
+    "ee868f04ef8a / bd0ac165f76e / b25bd2aeea7f 세 트리에서 reviewed·findings 를 돌며 commits·fixCommits 빈 건수 집계 (36·34 / 15·6, 34·32 / 15·6, 39·37 / 15·6)",
+    "git show b25bd2aeea7f^:docs/code-review/queue.json → counts.reviewed 38 (부모 +1 = 39 확인)",
+    "git log -1 --pretty='%(trailers:key=Co-Authored-By)' b25bd2aeea7f → 공동저자 한 줄 반환",
+    "node --experimental-strip-types scripts/code-review-queue.mjs --write (ledgerDuplicates 0, 종료 코드 0)"
+  ],
+  "commits": []
+}

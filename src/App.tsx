@@ -43,6 +43,7 @@ import {
 import { providerLabel } from "./lib/skillLibrary";
 import { SESSION_SYNC_DELAYS_MS, sessionSyncKey, unindexedRunTargets } from "./lib/sessionSyncBudget";
 import { aiaAttentionForChat, selectAiaAttention, withoutAiaAttention } from "./lib/aiaAttention";
+import { ownedAiaWindowChatId } from "./lib/aiaWindowSession";
 import { aiaRuntimeProvider } from "./lib/aiaRuntime";
 import { navigationHelpEmphasis, navigationHelpParagraphs } from "./lib/navigationHelp";
 import { loadNavigationPreferences, saveNavigationPreferences, type NavigationPreferences } from "./lib/navigationPreferences";
@@ -567,9 +568,28 @@ function App() {
     void refreshSuggestionCatalog();
   }, [invalidateResourceViews, refreshSuggestionCatalog]);
 
+  // 이 창이 쓰는 AIA 대화 자리. 메인 창과 팝아웃이 각자 제 대화를 기억한다.
+  const aiaWindowId = popoutRequest?.kind === "aia" ? popoutRequest.windowId : null;
+  // 트리거가 맡는 것은 **이 창이 소유한** AIA 대화의 알림뿐이다. 세션 화면에서 재개한 AIA
+  // 세션이나 ↻ 로 떼어 두고 계속 도는 대화는 일반 알림 목록에 남아 세션 화면으로 열린다.
+  //
+  // 저장소를 렌더에서 읽지 않고 팝업이 바꿀 때 받아 둔다. 저장소 쓰기는 렌더를 부르지
+  // 않으므로, 읽어 쓰면 ↻ 직후에도 떼어 낸 대화가 "내 것"으로 남아 그 말풍선이 트리거에
+  // 그대로 떠 있다. 첫 값만 저장소에서 가져온다 — 앱을 다시 켜도 제 대화를 이어 맡는다.
+  const [aiaOwnChatId, setAiaOwnChatId] = useState<string | null>(() => ownedAiaWindowChatId(aiaWindowId));
   // AIA가 꺼져 있으면 열 수 있는 대화가 없으므로 남은 알림도 트리거에 표시하지 않는다.
-  const aiaAttention = aiaProviderId ? selectAiaAttention(chatAttention.items) : null;
-  const visibleChatAttention = withoutAiaAttention(chatAttention);
+  const aiaAttention = aiaProviderId ? selectAiaAttention(chatAttention.items, aiaOwnChatId) : null;
+  const visibleChatAttention = withoutAiaAttention(chatAttention, aiaOwnChatId);
+  // 모두 읽음은 목록에 실제로 보이는 항목을 처리한다. AIA 패널이 가져간 이 창의 대화만
+  // 보존하고, 같은 AIA 프로필이라도 여기 남아 보이는 다른 대화는 함께 읽음 처리한다.
+  //
+  // 거르는 기준은 알림 id 가 아니라 **대화 id** 다. 알림 id 로 거르면 마지막 폴링과 클릭
+  // 사이에 끝난 턴이 새 id(`turn:<대화>:<턴>`)를 달고 나와 이 목록에 없고, 목록에서도
+  // 숨겨진 채 읽음 처리돼 트리거 말풍선이 영영 뜨지 않는다. 대화 id 는 그 사이에 바뀌지
+  // 않으므로 스냅숏이 몇 초 낡아도 같은 답을 낸다.
+  const markVisibleAttentionRead = useCallback(() => {
+    markAllAttentionRead(aiaOwnChatId ? [aiaOwnChatId] : []);
+  }, [aiaOwnChatId, markAllAttentionRead]);
   // 페이싱 제안은 알림창과 페이싱 탭 두 곳에 같은 목록으로 뜬다. 알림에서 탭으로 넘어온
   // 사용자가 무엇을 보고 조정해야 하는지 그 화면에서 바로 읽게 하려는 것이다.
   const pacingSuggestions = chatAttention.items.filter((item) => item.kind === "pacingSuggestion");
@@ -771,7 +791,7 @@ function App() {
               onToggle={toggleAia}
               onOpenSettings={openSystemAgentSettings}
             />
-            <ChatAttentionCenter snapshot={visibleChatAttention} sessions={snapshot.sessions} onOpen={openAttentionItem} onMarkAllRead={markAllAttentionRead} onClearRead={clearReadAttention} onDismiss={dismissAttention} />
+            <ChatAttentionCenter snapshot={visibleChatAttention} sessions={snapshot.sessions} onOpen={openAttentionItem} onMarkAllRead={markVisibleAttentionRead} onClearRead={clearReadAttention} onDismiss={dismissAttention} />
           </div>
         </header>
         {reconnecting && <div className="content-error">
@@ -795,10 +815,10 @@ function App() {
           {panel("skills", () => <MemoSkillsView active={view === "skills"} skills={snapshot.skills} automation={automation} onAutomationChange={applyAutomationChange} onSkillsChanged={reloadChangedResources} onRequestAiaPrompt={requestAiaPrompt} aiaTransferAvailable={skillTransferAiaAvailable} catalogHealth={catalogHealth} repositoryRevision={resourceRepositoryRevision} />)}
           {panel("agents", () => <MemoAgentsView agents={snapshot.agents} automation={automation} onAutomationChange={applyAutomationChange} catalogHealth={catalogHealth} />)}
           {panel("artifacts", () => <MemoArtifactsView groups={snapshot.artifacts} automation={automation} onAutomationChange={applyAutomationChange} catalogHealth={catalogHealth} />)}
-          {panel("workflows", () => <MemoWorkflowsView active={view === "workflows"} onRequestAiaPrompt={requestAiaPrompt} tabRequest={workflowsTabRequest} pacingSuggestions={pacingSuggestions} />)}
-          {panel("addons", () => <MemoAddonsView active={view === "addons"} tabRequest={addonsTabRequest} automation={automation} onAutomationChange={applyAutomationChange} onSkillsChanged={reloadChangedResources} onRequestAiaPrompt={requestAiaPrompt} refreshNonce={refreshNonce} />)}
-          {panel("storage",() => <MemoStorageView active={view === "storage"} tabRequest={storageTabRequest} />)}
-          {panel("settings", () => <MemoSettingsView active={view === "settings"} providers={snapshot.status.providers} accounts={accounts} models={modelOptions} onAccountsChange={setAccounts} onConnectCli={connectCli} themeMode={themeMode} onThemeModeChange={setThemeMode} accentColor={accentColor} onAccentColorChange={setAccentColor} navigationPreferences={navigationPreferences} onNavigationPreferencesChange={setNavigationPreferences} messageDisplayMode={messageDisplayMode} onMessageDisplayModeChange={setMessageDisplayMode} automation={automation} onAutomationChange={applyAutomationChange} onRequestAiaPrompt={requestAiaPrompt} tabRequest={settingsTabRequest} systemAgentNoticeRequest={systemAgentNoticeRequest} appVersionManifest={appVersionManifest} onRepositoryChanged={invalidateResourceViews} onSkillsChanged={reloadChangedResources} />)}
+          {panel("workflows", () => <MemoWorkflowsView active={view === "workflows"} onRequestAiaPrompt={requestAiaPrompt} tabRequest={workflowsTabRequest} pacingSuggestions={pacingSuggestions} automation={automation} onAutomationChange={applyAutomationChange} onSkillsChanged={reloadChangedResources} refreshNonce={refreshNonce} />)}
+          {panel("addons", () => <MemoAddonsView active={view === "addons"} tabRequest={addonsTabRequest} />)}
+          {panel("storage",() => <MemoStorageView active={view === "storage"} tabRequest={storageTabRequest} automation={automation} onRequestAiaPrompt={requestAiaPrompt} onRepositoryChanged={invalidateResourceViews} />)}
+          {panel("settings", () => <MemoSettingsView active={view === "settings"} providers={snapshot.status.providers} accounts={accounts} models={modelOptions} onAccountsChange={setAccounts} onConnectCli={connectCli} themeMode={themeMode} onThemeModeChange={setThemeMode} accentColor={accentColor} onAccentColorChange={setAccentColor} navigationPreferences={navigationPreferences} onNavigationPreferencesChange={setNavigationPreferences} messageDisplayMode={messageDisplayMode} onMessageDisplayModeChange={setMessageDisplayMode} automation={automation} onAutomationChange={applyAutomationChange} onRequestAiaPrompt={requestAiaPrompt} tabRequest={settingsTabRequest} systemAgentNoticeRequest={systemAgentNoticeRequest} appVersionManifest={appVersionManifest} onSkillsChanged={reloadChangedResources} />)}
           </Suspense>
         </main>
       </section>
@@ -836,7 +856,7 @@ function App() {
       /></Suspense></ErrorBoundary>}
       {aiaMounted && aiaProviderId && <ErrorBoundary label="AIA 대화" scope="view"><Suspense fallback={null}><AiaChatPopup
         open={aiaVisible}
-        windowId={popoutRequest?.kind === "aia" ? popoutRequest.windowId : null}
+        windowId={aiaWindowId}
         provider={aiaProviderId}
         runtime={aiaRuntime}
         providerName={aiaProvider?.displayName ?? aiaProviderId}
@@ -849,6 +869,7 @@ function App() {
         onAutoPromptHandled={handleAiaAutoPrompt}
         onDismissSuggestion={dismissSuggestion}
         onDiscardChat={discardAiaChat}
+        onOwnChatChange={setAiaOwnChatId}
         onBusyChange={setAiaBusy}
         onUiGuide={showUiGuide}
         onUiQuery={answerAiaUiQuery}
@@ -864,6 +885,12 @@ function App() {
       <FileDownloadProgress />
       <AppToastStack toasts={toasts} onDismiss={dismissToast} />
       {quitConfirmDialog}
+      {/*
+        기동 화면에서만 그리면 인덱싱이 끝나는 순간 이 창이 통째로 사라진다 — 사용자가
+        읽기도 전에 스쳐 지나가고, 확인을 못 받았으니 백엔드의 안내도 지워지지 않는다.
+        본 화면에서도 같은 창을 그려 닫을 때까지 남긴다.
+      */}
+      {systemSkillNoticeDialog}
     </div>
   );
 }

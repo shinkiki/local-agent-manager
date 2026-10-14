@@ -15,6 +15,7 @@ import { parseDiagramPopoutId } from "./lib/diagramPopout";
 import { DiagramWindow } from "./components/DiagramWindow";
 import { parsePopoutRequest } from "./lib/popout";
 import { GitDiffWindow } from "./components/GitDiffWindow";
+import { LoginGate } from "./components/LoginGate";
 
 function StartupError({ cause }: { cause: unknown }) {
   const { text } = useI18n();
@@ -71,7 +72,9 @@ if (diagramWindowId) {
         <React.StrictMode>
           <I18nProvider>
             <ErrorBoundary label="Agent Manager">
-              {gitDiffRequest?.kind === "gitDiff" ? <GitDiffWindow request={gitDiffRequest} /> : <App />}
+              <LoginGate>
+                {gitDiffRequest?.kind === "gitDiff" ? <GitDiffWindow request={gitDiffRequest} /> : <App />}
+              </LoginGate>
             </ErrorBoundary>
           </I18nProvider>
         </React.StrictMode>,

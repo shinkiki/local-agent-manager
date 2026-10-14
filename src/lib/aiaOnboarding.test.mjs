@@ -233,7 +233,7 @@ test("병렬을 켜면 지시문 앞에 레인 서문이 서고 레인 스킬 �
     projectPath: "/repo",
     [PARALLEL_FIELD_KEYS.enabled]: "true",
     [PARALLEL_FIELD_KEYS.runs]: "4",
-    [PARALLEL_FIELD_KEYS.devLine]: "private/dev-history",
+    [PARALLEL_FIELD_KEYS.devLine]: "upstream/feature/x",
     [PARALLEL_FIELD_KEYS.landing]: "push",
   };
   const contract = buildWorkflowContract(parallelCard.actions[0].workflow, values, { paced: true });
@@ -242,7 +242,7 @@ test("병렬을 켜면 지시문 앞에 레인 서문이 서고 레인 스킬 �
   assert.ok(message.startsWith("## 병렬 실행"), message.slice(0, 40));
   assert.ok(message.includes("최대 4건"), message.slice(0, 200));
   assert.ok(message.includes("/repo/.rounds"), message.slice(0, 300));
-  assert.ok(message.includes("private/dev-history"), message.slice(0, 300));
+  assert.ok(message.includes("upstream/feature/x"), message.slice(0, 300));
   // 절차 자체는 스킬에 있다. 서문은 값만 전한다.
   assert.ok(message.includes(LANE_SKILL_KEY));
   assert.ok(!message.includes("mkdir"), "절차를 서문에 베끼지 않는다");

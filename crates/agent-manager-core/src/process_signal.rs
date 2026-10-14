@@ -124,12 +124,28 @@ fn signal_target(
     target: SignalTarget,
     signal: libc::c_int,
 ) -> Result<SignalDelivery, std::io::Error> {
+    let pid = match target {
+        SignalTarget::Process(pid) | SignalTarget::ProcessGroup(pid) => pid,
+    };
+    // `kill`·`killpg`는 0을 "호출자 자신의 그룹"으로, 음수를 "그 그룹" 또는 (-1이면)
+    // "신호를 보낼 수 있는 모든 프로세스"로 읽는다. u32 PID가 0이거나 pid_t로 옮길 때
+    // 음수가 되는 값이면, 대상 하나를 겨눈 호출이 앱 자신이나 사용자의 프로세스 전체를
+    // 끝내게 된다. 잠금 파일에서 읽어 온 PID도 여기를 지나므로 커널에 넘기기 전에 막는다.
+    let raw = match libc::pid_t::try_from(pid) {
+        Ok(raw) if raw > 0 => raw,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("신호를 보낼 수 없는 PID입니다: {pid}"),
+            ))
+        }
+    };
     // SAFETY: kill과 killpg는 신호만 보낼 뿐 메모리를 건드리지 않는다. 자식을
     // process_group(0)으로 띄우면 그 PID가 곧 그룹 ID다.
     let result = unsafe {
         match target {
-            SignalTarget::Process(pid) => libc::kill(pid as libc::pid_t, signal),
-            SignalTarget::ProcessGroup(pid) => libc::killpg(pid as libc::pid_t, signal),
+            SignalTarget::Process(_) => libc::kill(raw, signal),
+            SignalTarget::ProcessGroup(_) => libc::killpg(raw, signal),
         }
     };
     delivery(result)
@@ -179,6 +195,20 @@ mod tests {
             Ok(SignalDelivery::Gone)
         ));
         assert!(!pid_exists(pid).expect("종료된 PID 조회"));
+    }
+
+    /// 0과 pid_t로 옮기면 음수가 되는 값은 단일 대상이 아니라 그룹·전체 신호가 된다.
+    /// 신호 0(존재 확인)으로만 시험하므로 막지 못해도 아무 프로세스도 끝나지 않는다.
+    #[test]
+    fn refuses_pids_the_kernel_reads_as_groups_or_everyone() {
+        for pid in [0, u32::MAX, i32::MAX as u32 + 1] {
+            for probe in [signal_pid(pid, 0), signal_process_group(pid, 0)] {
+                let error = probe.expect_err("단일 대상이 아닌 PID는 거부해야 한다");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{pid}");
+            }
+            assert!(pid_exists(pid).is_err(), "{pid}");
+            assert!(process_group_exists(pid).is_err(), "{pid}");
+        }
     }
 
     #[test]

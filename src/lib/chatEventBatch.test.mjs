@@ -67,3 +67,40 @@ test("dispose delivers pending text and ignores late socket events", () => {
   assert.deepEqual(events.map((event) => event.type), ["messageDelta"]);
   assert.equal(frame.callbacks.size, 0);
 });
+
+test("adjacent tool output appends are merged into one event per frame", () => {
+  const frame = fixture();
+  const events = [];
+  const batch = createChatEventBatch((event) => events.push(event), frame.scheduler);
+
+  const chunk = (output) => ({ type: "tool", id: "exec-1", name: "명령 실행", status: "running", detail: null, output, append: true });
+  batch.push(chunk("line one\n"));
+  batch.push(chunk("line two\n"));
+
+  assert.equal(events.length, 0);
+  assert.equal(frame.callbacks.size, 1);
+  frame.runFrame();
+  assert.deepEqual(events, [
+    { type: "tool", id: "exec-1", name: "명령 실행", status: "running", detail: null, output: "line one\nline two\n", append: true },
+  ]);
+});
+
+test("appends of different tool cards and a final snapshot keep their order", () => {
+  const frame = fixture();
+  const events = [];
+  const batch = createChatEventBatch((event) => events.push(event), frame.scheduler);
+
+  batch.push({ type: "tool", id: "exec-1", name: "명령 실행", status: "running", detail: null, output: "a", append: true });
+  batch.push({ type: "tool", id: "exec-2", name: "명령 실행", status: "running", detail: null, output: "b", append: true });
+  batch.push({ type: "tool", id: "exec-1", name: "명령 실행", status: "running", detail: null, output: "c", append: true });
+  // 완료 스냅숏은 이어 붙는 조각이 아니다. 앞선 조각을 비운 뒤 그 자리에서 전달된다.
+  batch.push({ type: "tool", id: "exec-1", name: "명령 실행", status: "completed", detail: "ls", output: "abc", append: false });
+
+  assert.deepEqual(events.map((event) => [event.id, event.output, event.append]), [
+    ["exec-1", "a", true],
+    ["exec-2", "b", true],
+    ["exec-1", "c", true],
+    ["exec-1", "abc", false],
+  ]);
+  assert.equal(frame.callbacks.size, 0);
+});

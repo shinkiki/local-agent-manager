@@ -704,6 +704,13 @@ pub struct UsagePacedRunsRequest {
     /// 가드 창이 자른다.
     #[serde(default)]
     pub max_runs: Option<usize>,
+    /// 이번 회차에 실제로 남아 있는 일감의 수. 있으면 상한을 이 수로 한 번 더 자른다 —
+    /// `max_runs`는 장비가 감당하는 최대치지 매 회차 채워야 할 목표가 아니다. 할 일이 하나인데
+    /// 아홉을 띄우면 여덟은 레인만 잡았다가 "남은 항목 없음"으로 끝난다(2026-10-04 실측:
+    /// 회차마다 5~9건이 떠서 85초 만에 끝났고, 그 사이 같은 자리를 두 레인이 동시에 고쳐
+    /// 한쪽을 버린 회차도 있다). 비우면 종전대로 계정 여력과 상한만으로 건수를 정한다.
+    #[serde(default)]
+    pub remaining_work: Option<usize>,
     /// 표본으로 회당 비용을 실측하지 못했을 때 쓸 값(%p).
     #[serde(default)]
     pub fallback_cost_percent_per_run: Option<f64>,
@@ -3990,6 +3997,31 @@ fn concurrent_launch_limit(
     limit
 }
 
+/// 남은 일감이 자르는 이번 회차 상한. 수요를 선언하지 않은 회차는 종전대로 여력과 상한만
+/// 본다 — 수요를 세는 법은 회차마다 다르므로 모르는 것을 0으로 가정하지 않는다.
+///
+/// 바닥이 1건인 이유는 수요를 세는 자리가 "선언된 일감"이기 때문이다. 수용 점검표가 전건
+/// 통과한 뒤에도 그 뒤에서 제품 결함이 계속 나왔으므로(2026-10-04: 점검표 42/42 상태에서
+/// push가 업스트림이 아니라 로컬 브랜치 이름으로 나가던 결함을 회차가 찾아냈다), 0으로
+/// 막으면 그 길이 닫힌다. 아홉을 띄울 이유가 없을 뿐이지 한 건도 띄우지 말라는 뜻이 아니다.
+fn remaining_work_limit(
+    limit: usize,
+    remaining: Option<usize>,
+    reasoning: &mut Vec<String>,
+) -> usize {
+    let Some(remaining) = remaining else {
+        return limit;
+    };
+    let wanted = remaining.max(1);
+    if wanted >= limit {
+        return limit;
+    }
+    reasoning.push(format!(
+        "남은 일감이 {remaining}건이라 이번 회차 상한을 {limit}건에서 {wanted}건으로 줄였습니다"
+    ));
+    wanted
+}
+
 /// 응답 최상단에 싣는, 모든 계정에 공통인 목표·가드 캡.
 struct EffectivePlanCaps {
     target_percent: f64,
@@ -4262,6 +4294,7 @@ fn compute_plan(
         &live_chat_ids,
         &mut reasoning,
     );
+    let limit = remaining_work_limit(limit, request.remaining_work, &mut reasoning);
     let guard_label = request.guard_window_label.as_deref();
     let EffectivePlanCaps {
         target_percent: effective_target_percent,
@@ -5983,6 +6016,57 @@ mod tests {
     use crate::accounts::{AccountAuthStatus, AccountUsageWindow};
 
     #[test]
+    fn remaining_work_cuts_the_round_below_the_parallel_ceiling() {
+        // maxRuns는 장비가 감당하는 최대치지 매 회차 채워야 할 목표가 아니다. 남은 일감이
+        // 둘인데 아홉을 띄우면 일곱은 레인만 잡았다 끝난다.
+        let mut reasoning = Vec::new();
+        assert_eq!(remaining_work_limit(9, Some(2), &mut reasoning), 2);
+        assert_eq!(reasoning.len(), 1);
+        assert!(
+            reasoning[0].contains("남은 일감이 2건"),
+            "줄인 이유를 판단 문장으로 남긴다: {:?}",
+            reasoning
+        );
+    }
+
+    #[test]
+    fn remaining_work_never_closes_the_round_entirely() {
+        // 수요 0은 "선언한 자리에 일이 없다"는 뜻이지 "할 일이 없다"는 뜻이 아니다. 점검표가
+        // 전건 통과한 뒤에도 그 뒤에서 제품 결함이 계속 나왔으므로 한 건은 남긴다.
+        let mut reasoning = Vec::new();
+        assert_eq!(remaining_work_limit(9, Some(0), &mut reasoning), 1);
+    }
+
+    #[test]
+    fn remaining_work_does_not_raise_the_ceiling() {
+        // 일감이 상한보다 많아도 상한이 이긴다 — 수요는 자르기만 한다.
+        let mut reasoning = Vec::new();
+        assert_eq!(remaining_work_limit(3, Some(20), &mut reasoning), 3);
+        assert!(reasoning.is_empty(), "자르지 않았으면 문장도 없다");
+    }
+
+    #[test]
+    fn unmeasured_remaining_work_leaves_the_ceiling_alone() {
+        // 수요를 세는 법은 회차마다 다르다. 모르는 것을 0으로 가정하면 선언하지 않은 회차가
+        // 전부 한 건으로 줄어든다.
+        let mut reasoning = Vec::new();
+        assert_eq!(remaining_work_limit(9, None, &mut reasoning), 9);
+        assert!(reasoning.is_empty());
+    }
+
+    #[test]
+    fn remaining_work_is_read_from_the_request_body() {
+        let request: UsagePacedRunsRequest = serde_json::from_value(
+            serde_json::json!({ "projectPath": "F:/tmp", "remainingWork": 2 }),
+        )
+        .expect("parse");
+        assert_eq!(request.remaining_work, Some(2));
+        let without: UsagePacedRunsRequest =
+            serde_json::from_value(serde_json::json!({ "projectPath": "F:/tmp" })).expect("parse");
+        assert_eq!(without.remaining_work, None);
+    }
+
+    #[test]
     fn local_runs_are_one_per_model() {
         let planned = local_planned_runs(&["qwen3.5-gpu".to_owned(), "gpt-oss-cpu-low".to_owned()]);
         assert_eq!(planned.len(), 2);
@@ -6245,6 +6329,8 @@ mod tests {
         ChatSessionInfo {
             chat_id: chat_id.to_owned(),
             started_at: NOW - HOUR,
+            last_activity_at: NOW - HOUR,
+            idle_ms: HOUR,
             source: ProviderId::Claude,
             account_id: Some("claude-a".to_owned()),
             resuming: false,
@@ -6268,6 +6354,7 @@ mod tests {
             system_tools: false,
             settings: BTreeMap::new(),
             aia_runtime: None,
+            record_session: false,
             context_used_tokens: None,
             context_window_tokens: None,
         }
@@ -6285,6 +6372,7 @@ mod tests {
             guard_window_label: Some("5시간".to_owned()),
             guard_percent: Some(85.0),
             max_runs: Some(6),
+            remaining_work: None,
             fallback_cost_percent_per_run: Some(2.0),
             cost_windows: None,
             min_cost_percent_per_run: None,

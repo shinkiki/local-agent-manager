@@ -234,8 +234,19 @@ pub fn save_linked_file_download(
     file: &LinkedFileDownload,
     destination: &Path,
 ) -> Result<(), CoreError> {
+    // 이어 복사 경로와 같은 순서를 지킨다: 같은 폴더의 `.part`에 새로 쓰고 옮긴다.
+    // 목적지에 바로 쓰면 검사 뒤 끼어든 심볼릭 링크를 따라가고, 쓰다 실패하면 기존
+    // 파일이 반쪽으로 남고, 하드 링크된 목적지는 연결된 다른 파일까지 바뀐다(G10).
     let destination = validated_destination(destination)?;
-    fs::write(destination, &file.bytes)?;
+    let staged = staging_path(&destination)?;
+    let written = File::create_new(&staged).and_then(|mut writer| {
+        writer.write_all(&file.bytes)?;
+        writer.flush()
+    });
+    if let Err(error) = written.and_then(|()| fs::rename(&staged, &destination)) {
+        let _ = fs::remove_file(&staged);
+        return Err(CoreError::Io(error));
+    }
     Ok(())
 }
 
@@ -563,6 +574,26 @@ mod tests {
             Err(CoreError::InvalidInput(_))
         ));
         assert_eq!(fs::read(target).expect("target bytes"), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_over_a_hard_linked_destination_leaves_the_other_link_untouched() {
+        let temp = tempdir().expect("temp directory");
+        let other = temp.path().join("other.xlsx");
+        fs::write(&other, b"original").expect("other file");
+        let destination = temp.path().join("saved.xlsx");
+        fs::hard_link(&other, &destination).expect("destination hard link");
+        let download = LinkedFileDownload {
+            relative_path: "source.xlsx".to_owned(),
+            bytes: b"replacement".to_vec(),
+            size_bytes: 11,
+        };
+
+        save_linked_file_download(&download, &destination).expect("save download");
+        assert_eq!(fs::read(&destination).expect("saved bytes"), b"replacement");
+        assert_eq!(fs::read(&other).expect("other bytes"), b"original");
+        assert_eq!(staging_leftovers(temp.path()), 0);
     }
 
     #[test]

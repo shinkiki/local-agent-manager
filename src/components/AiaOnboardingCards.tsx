@@ -1,5 +1,5 @@
 /**
- * 애드온 → 자동화 탭의 온보딩 카드(W6).
+ * 워크플로 → 자동화 탭의 온보딩 카드(W6).
  *
  * 카드 한 장마다 컴포넌트를 쓰던 자리다. 지금은 팩 데이터가 카드를 정하고 이 파일은
  * 그리는 규칙 한 벌만 들고 있다 — 카드를 더하는 일은 공통 스킬에
@@ -270,7 +270,7 @@ export function AiaOnboardingCards({ active, automation = null, onAutomationChan
   };
 
   return (
-    <section className="settings-card aia-addon-card" data-ui-anchor="addons.automation-content">
+    <section className="settings-card aia-addon-card" data-ui-anchor="workflows.automation-content">
       <header className="plugin-page-header">
         <div className="plugin-page-title">
           <i><AiaMark size={18} /></i>
@@ -596,7 +596,7 @@ function OnboardingStartCard({ card, onHide, onDelete, onStart }: {
   const { text } = useI18n();
   const Icon = cardIcons[card.icon];
   return (
-    <article className="aia-onboarding-start" data-ui-anchor="addons.automation-start">
+    <article className="aia-onboarding-start" data-ui-anchor="workflows.automation-start">
       <i className="aia-onboarding-mark"><Icon size={16} aria-hidden="true" /></i>
       <div>
         <strong>
@@ -866,7 +866,7 @@ function OnboardingDonePanel({ outcomes, onStartOver }: {
 }) {
   const { text } = useI18n();
   return (
-    <div className="aia-onboarding-panel aia-onboarding-done-panel" data-ui-anchor="addons.automation-done">
+    <div className="aia-onboarding-panel aia-onboarding-done-panel" data-ui-anchor="workflows.automation-done">
       <p className="aia-onboarding-done">
         <CheckCircle2 size={15} aria-hidden="true" />
         <strong>{text("만들기가 끝났습니다.", "Everything was created.")}</strong>
@@ -1171,7 +1171,7 @@ function OnboardingFieldInput({ field, value, onChange, sources, onDraft }: {
       {/* 읽을 것이 아직 없는 프로젝트를 위한 갈래. 앱은 만들지 않는다 — 적어 둔 값을
           실은 요청문으로 AIA 대화를 열고, 만드는 일과 승인은 거기서 이뤄진다. */}
       {onDraft ? (
-        <button className="button compact" type="button" onClick={onDraft} data-ui-anchor="addons.automation-draft">
+        <button className="button compact" type="button" onClick={onDraft} data-ui-anchor="workflows.automation-draft">
           <AiaMark size={13} />
           {text("AIA에게 만들어 달라고 하기", "Ask AIA to create them")}
         </button>

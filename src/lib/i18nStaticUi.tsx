@@ -17,6 +17,7 @@ import {
   UI_CATALOG_VERSION,
 } from "./i18nStaticDictionary";
 import { canonicalSourceText, sendableUiCatalogSource } from "./staticUiText";
+import { runtimeLocale } from "./i18nRuntime";
 import { untranslatableUiProperNoun } from "./uiProperNouns";
 
 /**
@@ -239,6 +240,13 @@ export function StaticUiLocalization({ locale, messages }: { locale: AppLocale; 
     apply(root);
     const observer = new MutationObserver((mutations) => {
       if (applying) return;
+      // 언어가 막 바뀌면 React가 새 언어로 다시 그린 뒤에야 이 effect의 정리(관찰 해제)가
+      // 돈다. 그 사이 옛 언어의 관찰자가 새 글자를 받아 옛 언어로 되돌려 썼고, 개수가 끼는
+      // 문장은 되짚을 표가 없어 영어로 남았다(qa51 — 한국어로 돌아와도 "Active 0 / 0 total").
+      // setLocale은 setActive보다 먼저 런타임 언어를 바꾸므로, 어긋나면 이 관찰자는 물러나고
+      // 새 effect의 apply(root)가 그 자리를 맡는다. messages는 객체 동일성으로 견주지
+      // 않는다 — 내용이 같으면 이전 객체를 그대로 두므로 관찰자가 영영 꺼질 수 있다.
+      if (runtimeLocale().locale !== locale) return;
       for (const mutation of mutations) {
         if (mutation.type === "characterData") apply(mutation.target);
         mutation.addedNodes.forEach(apply);

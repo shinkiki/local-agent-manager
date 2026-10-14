@@ -6,7 +6,6 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -38,14 +37,15 @@ use crate::{
     ChatSupervisor, CoreError, DocumentActionContext, DocumentActionError, DocumentActionExecutor,
     DocumentActionOption, DocumentActionReceipt, DocumentAutomationOptions,
     DocumentAutomationSupervisor, DocumentChatAction, DocumentTriggerAction, FolderMoveDirection,
-    LinkedFileDownload, ProviderId, ScheduleRunListRequest, ScheduleWorkflowAction,
-    ScheduleWorkflowExecutor, ScheduledRequestInput, ScheduledRequestListRequest, SchedulerHandle,
-    SchedulerSupervisor, SendChatMessageRequest, SessionCatalog, SessionListRequest,
-    SessionMetaPatch, SessionStatisticsRequest, SessionTranscriptLimit,
-    SessionTranscriptPageRequest, SkillPublishRequest, StartChatRequest, SystemAuditListRequest,
-    SystemAutomationSettingsInput, SystemLanguageRequest, TerminalAccountLoginRequest,
-    TerminalEvent, TerminalOpenRequest, TerminalSetupRequest, TerminalSshRequest,
-    TerminalSupervisor, TranscriptImage, TranslationMenu, TranslationSupervisor,
+    LinkedFileDownload, LoginAuth, LoginChannel, LoginMethod, LoginRequirement, ProviderId, Reauth,
+    ScheduleRunListRequest, ScheduleWorkflowAction, ScheduleWorkflowExecutor,
+    ScheduledRequestInput, ScheduledRequestListRequest, SchedulerHandle, SchedulerSupervisor,
+    SendChatMessageRequest, SessionCatalog, SessionListRequest, SessionMetaPatch,
+    SessionStatisticsRequest, SessionTranscriptLimit, SessionTranscriptPageRequest,
+    SkillPublishRequest, StartChatRequest, SystemAuditListRequest, SystemAutomationSettingsInput,
+    SystemLanguageRequest, TerminalAccountLoginRequest, TerminalEvent, TerminalOpenRequest,
+    TerminalSetupRequest, TerminalSshRequest, TerminalSupervisor, TranscriptImage, TranslationMenu,
+    TranslationSupervisor,
 };
 use bytes::Bytes;
 use flate2::write::GzEncoder;
@@ -58,7 +58,7 @@ use hyper::header::{
     ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS,
     ACCESS_CONTROL_MAX_AGE, ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD,
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_SECURITY_POLICY,
-    CONTENT_TYPE, HOST, ORIGIN, REFERRER_POLICY, VARY, X_CONTENT_TYPE_OPTIONS,
+    CONTENT_TYPE, HOST, ORIGIN, REFERRER_POLICY, RETRY_AFTER, VARY, X_CONTENT_TYPE_OPTIONS,
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -70,6 +70,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 const MAX_REQUEST_BODY: usize = 20 * 1024 * 1024;
 pub const DEFAULT_REMOTE_ACCESS_PORT: u16 = crate::DEFAULT_BACKEND_SERVICE_PORT;
@@ -80,7 +81,10 @@ pub const DEFAULT_REMOTE_ACCESS_PORT: u16 = crate::DEFAULT_BACKEND_SERVICE_PORT;
 /// 9: C9 SSH 공개키 본문 조회·키 삭제·키 메모 명령이 추가됐다.
 /// 10: Antigravity 페이싱 자원의 사용량 행 조회 명령이 추가됐다.
 /// 11: 프로젝트 파일 조회와 C16 git 형상관리 명령이 추가됐다.
-pub const REMOTE_API_PROTOCOL_VERSION: u32 = 11;
+/// 12: C20 접근 채널 로그인 — `/api/access`가 `channel`·`authenticated`·`loginRequired`를
+///     싣고 `writable`을 버렸다. `/api/login`·`/api/logout`과 로그인 설정 명령이 추가됐다.
+/// 12: `/api/access`에 헤드리스 표시(`headless`)가 함께 실린다.
+pub const REMOTE_API_PROTOCOL_VERSION: u32 = 12;
 const MIN_REMOTE_ACCESS_PORT: u16 = crate::MIN_BACKEND_SERVICE_PORT;
 /// 재시작 시 이전 백엔드가 저장소 잠금을 놓을 때까지 기다리는 최대 시간.
 const BACKEND_OWNERSHIP_HANDOVER_WAIT: Duration = Duration::from_secs(15);
@@ -100,7 +104,11 @@ const LOCAL_UI_CORS_ORIGINS: &[&str] = &[
 /// 요청 검사가 이 한 줄을 함께 쓴다 — 목록이 둘로 나뉘어 있으면 한쪽에만 헤더를 더했을 때
 /// 검사와 광고가 조용히 어긋난다(헤더 이름은 대소문자를 가리지 않고 비교한다).
 const LOCAL_UI_CORS_REQUEST_HEADERS: &str =
-    "Accept, Cache-Control, Content-Type, Pragma, X-Chat-Id, X-File-Name, X-File-Type";
+    "Accept, Cache-Control, Content-Type, Pragma, X-Agent-Manager-Session, X-Chat-Id, X-File-Name, X-File-Type";
+/// C20. 로그인 세션 토큰을 싣는 요청 헤더. WebSocket과 `<img>`는 헤더를 못 붙이므로 같은
+/// 값을 `session` 쿼리로 받는다([`session_token_from_request`]).
+const LOGIN_SESSION_HEADER: &str = "x-agent-manager-session";
+const LOGIN_SESSION_QUERY_KEY: &str = "session";
 /// 종료 사유는 진행 중이던 턴에 그대로 실려 사용자가 읽는 문장이 된다. 그래서 어느
 /// 경로로 내려가는지에 따라 나눈다 — 한 문장으로 합쳐 두면 앱을 끈 사람에게는 오지도
 /// 않을 재시작을 기다리게 하고, 백엔드만 교체한 사람에게는 앱이 꺼진 줄로 읽힌다.
@@ -123,7 +131,12 @@ struct Config {
     /// 443이라 `None`이고, 그때 기대 Origin에 포트가 붙지 않는다. 개발 중 두 번째
     /// 인스턴스를 다른 포트로 물릴 때만 값이 있다.
     tailscale_serve_port: Option<u16>,
-    remote_write: RemoteWriteFlag,
+    /// C20. 채널별 로그인 요구와 세션 판정. 한 프로세스에 하나이며 `ServiceEndpoint`와
+    /// 같은 핸들을 복제해 쓴다.
+    login: LoginAuth,
+    /// 데스크톱 셸이 없는 서버 단독 기동인지(`is_headless_host`). 화면은 이 값으로
+    /// "호스트 앱에서 하세요"류의 안내를 접는다 — 헤드리스에는 그 앱이 아예 없다.
+    headless: bool,
     session_catalog: SessionCatalog,
     terminals: TerminalSupervisor,
     chats: ChatSupervisor,
@@ -810,10 +823,51 @@ fn document_event_prompt(context: &DocumentActionContext) -> String {
     )
 }
 
+/// 요청이 들어온 접근 채널(C20). 서버가 Origin과 Tailscale 헤더로 가른다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AccessChannel {
+    /// Tauri 창. Origin이 `tauri://localhost`·`http://tauri.localhost`다.
+    Desktop,
+    /// 같은 PC의 브라우저. 이 백엔드가 제공한 페이지(루프백 Origin 또는 same-origin).
+    LocalBrowser,
+    /// Tailscale Serve를 지나온 원격 브라우저·PWA, 헤드리스 NAS의 모든 방문자.
+    Remote,
+    /// Origin도 브라우저 표식도 없는 루프백 호출 — CLI 릴레이와 자가 점검. 호스트 프로세스로
+    /// 보고 로그인을 묻지 않는다(C20-5).
+    Native,
+}
+
+impl AccessChannel {
+    fn login_channel(self) -> Option<LoginChannel> {
+        match self {
+            AccessChannel::Desktop => Some(LoginChannel::Desktop),
+            AccessChannel::LocalBrowser => Some(LoginChannel::LocalBrowser),
+            AccessChannel::Remote => Some(LoginChannel::Remote),
+            AccessChannel::Native => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RequestAccess {
-    remote: bool,
-    writable: bool,
+    channel: AccessChannel,
+    /// 이 요청이 만족해야 하는 로그인 요구. Origin 없는 루프백 자산 GET은 두 루프백 채널 중
+    /// 약한 쪽을 받는다(C20-6).
+    login_required: LoginRequirement,
+    /// 살아 있는 세션을 들고 왔고 그 세션이 이 채널에 맞는지.
+    authenticated: bool,
+    session_id: Option<Uuid>,
+}
+
+impl RequestAccess {
+    fn remote(self) -> bool {
+        self.channel == AccessChannel::Remote
+    }
+
+    fn login_satisfied(self) -> bool {
+        !self.login_required.any() || self.authenticated
+    }
 }
 
 #[derive(Debug)]
@@ -861,7 +915,35 @@ struct AccessStatus<'a> {
     backend_port: u16,
     mode: &'a str,
     remote: bool,
-    writable: bool,
+    channel: AccessChannel,
+    authenticated: bool,
+    login_required: LoginRequirement,
+    /// 이 백엔드에 데스크톱 호스트 화면이 아예 없는지. `remote`는 "이 접속자가
+    /// 원격인가"라 호스트 브라우저(127.0.0.1)에서는 false가 되지만, 헤드리스에는
+    /// 그 호스트 자체가 없으므로 접속 경로와 따로 알려야 한다.
+    headless: bool,
+}
+
+/// 헤드리스 판정 — 데스크톱 소유자가 없는 서버 단독 기동.
+///
+/// 두 조건을 함께 본다. `--tailscale-host`로 떴다는 것은 이 프로세스가 원격을 받도록
+/// 구성됐다는 뜻이고, `--desktop-shell`은 데스크톱 셸이 자기 자식으로 띄울 때만
+/// 붙인다(`src-tauri/src/lib.rs`). 한쪽만 보면 개발 중 손으로 띄운 로컬 서버가
+/// 헤드리스로 읽히거나, 데스크톱이 연 Tailscale 서비스가 헤드리스로 읽힌다.
+///
+/// L20. 전에는 두 번째 조건이 수명 플래그 `--shutdown-on-stdin-eof`였다. 그 플래그의 뜻은
+/// "부모의 stdin이 닫히면 같이 내려간다"이지 "데스크톱 화면이 있다"가 아니어서,
+/// 컨테이너 엔트리포인트나 감독자가 수명을 그렇게 묶는 순간 헤드리스 판정이 조용히
+/// 뒤집혔다. 소유자 유무는 그것만 뜻하는 전용 플래그로 명시한다.
+/// 데스크톱 셸이 자기 자식 백엔드에 다는 소유자 표시.
+///
+/// 셸(`src-tauri`)과 파서가 서로 다른 크레이트라, 철자를 양쪽에 따로 적으면 한쪽만
+/// 바뀌어도 두 크레이트의 시험이 모두 통과한다(AGENTS.md C16-4의 "소스에만 있는 리터럴").
+/// 두 자리와 사용법 문자열이 이 상수 하나를 쓴다.
+pub const DESKTOP_SHELL_ARG: &str = "--desktop-shell";
+
+fn is_headless_host(tailscale_host: Option<&str>, desktop_shell: bool) -> bool {
+    tailscale_host.is_some() && !desktop_shell
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1232,22 +1314,22 @@ impl RemoteAccessSupervisor {
     /// 이 포트로 인프로세스 서버를 띄운다. 워크플로 실행기와 문서 자동화까지 같은 종단점
     /// 위에 세우는 한 벌이라 셋을 갈라 두면 절반만 선 상태가 생긴다.
     ///
-    /// 이 구형 인프로세스 경로는 원격을 켜는 순간 데스크톱과 같은 권한으로 열리던
-    /// 시절의 것이다. 한 프로세스 안에서는 판정이 갈라지면 안 되므로 종단점마다
-    /// 새로 만들지 않고 하나의 핸들을 복제해 쓴다.
+    /// 한 프로세스 안에서는 로그인 판정이 갈라지면 안 되므로 종단점마다 새로 만들지
+    /// 않고 하나의 핸들을 복제해 쓴다.
     fn spawn_managed_server(
         &self,
         port: u16,
         identity: &TailscaleIdentity,
         static_dir: PathBuf,
     ) -> Result<RunningServer, EnableFailure> {
-        let remote_write = RemoteWriteFlag::new(true);
+        let login = LoginAuth::open(&self.inner.app_data_dir)
+            .map_err(|error| (RemoteAccessPhase::Error, error.to_string()))?;
         let layers = RuntimeLayers {
             app_data_dir: self.inner.app_data_dir.clone(),
             service: ServiceEndpoint {
                 port,
                 tailscale_host: Some(identity.host.clone()),
-                remote_write: remote_write.clone(),
+                login: login.clone(),
             },
             session_catalog: self.inner.session_catalog.clone(),
             chats: self.inner.chats.clone(),
@@ -1274,7 +1356,9 @@ impl RemoteAccessSupervisor {
             tailscale_user: Some(identity.login.clone()),
             // 앱이 여는 Serve는 언제나 443이라 Origin에 포트가 붙지 않는다.
             tailscale_serve_port: None,
-            remote_write,
+            login,
+            // 이 경로는 데스크톱 앱이 자기 안에서 여는 서버다 — 호스트 화면이 있다.
+            headless: false,
             session_catalog: self.inner.session_catalog.clone(),
             terminals: self.inner.terminals.clone(),
             chats: self.inner.chats.clone(),
@@ -1489,46 +1573,17 @@ pub struct TailscaleServiceStatus {
     /// 이 백엔드가 Tailscale 프록시 요청을 수락하도록 실행됐는지. 꺼져 있으면
     /// Serve를 켜도 원격 요청은 403으로 거부된다.
     pub remote_accepted: bool,
-    pub remote_write: bool,
     pub error: Option<String>,
 }
 
-/// 원격 UI에 데스크톱과 같은 변경 권한을 줄지의 실행 중 값. 저장 지점은 백엔드
-/// 서비스 설정 하나뿐이고(`remoteWrite`), 이 핸들은 그 값을 프로세스 안에서
-/// 공유해 설정 화면의 토글이 재기동 없이 바로 반영되게 한다. 이미 열린
-/// WebSocket 스트림은 접속 시점의 판정으로 이어지므로, 껐을 때 즉시 끊기는 것은
-/// 새 요청뿐이다.
-#[derive(Debug, Clone)]
-pub struct RemoteWriteFlag(Arc<AtomicBool>);
-
-impl RemoteWriteFlag {
-    pub fn new(enabled: bool) -> Self {
-        Self(Arc::new(AtomicBool::new(enabled)))
-    }
-
-    pub fn get(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
-    }
-
-    pub fn set(&self, enabled: bool) {
-        self.0.store(enabled, Ordering::SeqCst);
-    }
-}
-
-impl From<bool> for RemoteWriteFlag {
-    fn from(enabled: bool) -> Self {
-        Self::new(enabled)
-    }
-}
-
 /// 실행 중인 백엔드가 노출하는 서비스 종단점. Tailscale Serve 대상과 원격 수락
-/// 여부는 저장된 설정이 아니라 현재 프로세스가 받은 기동 인자에서 오고, 원격
-/// 변경 권한만 프로세스가 공유하는 실행 중 값으로 따라온다.
+/// 여부는 저장된 설정이 아니라 현재 프로세스가 받은 기동 인자에서 오고, 채널별
+/// 로그인 판정(C20)은 프로세스가 공유하는 하나의 핸들로 따라온다.
 #[derive(Debug, Clone)]
 pub struct ServiceEndpoint {
     pub port: u16,
     pub tailscale_host: Option<String>,
-    pub remote_write: RemoteWriteFlag,
+    pub login: LoginAuth,
 }
 
 /// Verified non-secret Tailscale identity used by the desktop shell when it
@@ -1628,7 +1683,6 @@ fn unavailable_tailscale_service(
         serve_target: None,
         conflict_target: None,
         remote_accepted: service.tailscale_host.is_some(),
-        remote_write: service.remote_write.get(),
         error: Some(error),
     }
 }
@@ -1660,25 +1714,8 @@ pub(crate) fn tailscale_service_status(service: &ServiceEndpoint) -> TailscaleSe
         serve_target: existing.clone(),
         conflict_target: if enabled { None } else { existing },
         remote_accepted: service.tailscale_host.is_some(),
-        remote_write: service.remote_write.get(),
         error: None,
     }
-}
-
-/// 원격 UI에 데스크톱과 같은 변경 권한(G11의 원격 write)을 줄지 바꾼다.
-///
-/// 저장 지점은 백엔드 서비스 설정의 `remoteWrite` 하나뿐이고, 같은 값을 실행 중인
-/// 백엔드에도 즉시 반영한다. 재기동을 요구하면 권한 하나를 좁히자고 진행 중인
-/// 채팅과 터미널을 모두 죽여야 해서, 좁히는 쪽이 오히려 미뤄진다. 이미 열린
-/// 스트림은 접속 시점 판정으로 이어지므로 끄기는 새 요청부터 걸린다.
-pub(crate) fn set_remote_write(
-    app_data_dir: &Path,
-    service: &ServiceEndpoint,
-    enabled: bool,
-) -> Result<TailscaleServiceStatus, CoreError> {
-    crate::save_backend_service_remote_write(app_data_dir, enabled)?;
-    service.remote_write.set(enabled);
-    Ok(tailscale_service_status(service))
 }
 
 pub(crate) fn set_tailscale_service(
@@ -1810,7 +1847,7 @@ fn verify_local_access(port: u16, expected_store_id: &str) -> Result<(), CoreErr
                 if text.starts_with("HTTP/1.1 200")
                     && text.contains(&protocol_marker)
                     && text.contains(&store_marker)
-                    && text.contains("\"writable\":true")
+                    && text.contains("\"channel\":\"native\"")
                 {
                     return Ok(());
                 }
@@ -1948,11 +1985,10 @@ pub fn run_remote_server_from_args(
         let listener = TcpListener::from_std(listener)?;
 
         println!(
-            "Agent Manager remote adapter: http://{} (static={}, remote={}, writable={})",
+            "Agent Manager remote adapter: http://{} (static={}, remote={})",
             address,
             config.static_dir.display(),
             config.tailscale_host.as_deref().unwrap_or("disabled"),
-            config.remote_write.get(),
         );
 
         // 호스트가 잠들면 원격 UI에서는 백엔드 장애와 구분되지 않는다. 저장된 설정에
@@ -2110,6 +2146,15 @@ fn migration_app_data_dir(mut args: impl Iterator<Item = String>) -> Result<Path
     Ok(app_data_dir)
 }
 
+/// C20-7. 떠 있는 백엔드는 로그인 설정을 메모리에 들고 있다가 다음 로그인·세션 갱신에서
+/// 파일을 다시 쓰므로, 그 아래에서 지우면 초기화가 조용히 되돌려진다. 그래서
+/// `migrate-keychain-v2`처럼 백엔드 소유권을 잡은 동안에만 지우고, 못 잡으면 거절한다.
+fn reset_login_with_ownership(app_data_dir: &Path) -> Result<Vec<String>, String> {
+    let failed = |error: CoreError| format!("로그인 설정을 초기화하지 못했습니다: {error}");
+    let ownership = crate::BackendOwnershipLease::acquire(app_data_dir).map_err(failed)?;
+    crate::reset_login_files(ownership.app_data_dir()).map_err(failed)
+}
+
 struct StandaloneServerOptions {
     port: u16,
     static_dir: PathBuf,
@@ -2117,11 +2162,10 @@ struct StandaloneServerOptions {
     tailscale_host: Option<String>,
     tailscale_user: Option<String>,
     tailscale_serve_port: Option<u16>,
-    /// 기동 인자로 원격 write를 명시했는지. 명시하면 저장된 설정에 그대로 기록해
-    /// 판정 지점이 하나로 남는다. 없으면 저장된 설정을 그대로 쓴다.
-    remote_write: Option<bool>,
     shutdown_on_stdin_eof: bool,
     await_store_handover: bool,
+    /// 데스크톱 셸이 자기 자식으로 띄웠는지. 헤드리스 판정은 이 값만 본다(L20).
+    desktop_shell: bool,
 }
 
 impl StandaloneServerOptions {
@@ -2132,9 +2176,10 @@ impl StandaloneServerOptions {
         let mut tailscale_host = None;
         let mut tailscale_user = None;
         let mut tailscale_serve_port = None;
-        let mut remote_write = None;
+        let mut reset_login = false;
         let mut shutdown_on_stdin_eof = false;
         let mut await_store_handover = false;
+        let mut desktop_shell = false;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--port" => {
@@ -2180,21 +2225,45 @@ impl StandaloneServerOptions {
                             })?,
                     );
                 }
-                "--remote-write" => remote_write = Some(true),
-                "--no-remote-write" => remote_write = Some(false),
+                // C20 전환기. 원격 권한은 이제 로그인 설정이 정하므로 받기만 하고 버린다 —
+                // 기존 NAS 이미지의 entrypoint가 아직 이 플래그를 넘긴다. 다음 릴리스에서 뺀다.
+                "--remote-write" | "--no-remote-write" => {
+                    eprintln!(
+                        "[agent-manager] {arg}는 더 이상 쓰이지 않습니다. 원격 권한은 설정 → 시스템 → 로그인 설정이 정합니다"
+                    );
+                }
+                // C20-7. 비밀번호·OTP를 잃었을 때의 복구. 로그인 설정·세션·OTP 비밀만 지운다.
+                // `--app-data-dir`가 뒤에 와도 그 경로를 쓰도록 파싱이 끝난 뒤 실행한다.
+                "--reset-login" => reset_login = true,
                 "--shutdown-on-stdin-eof" => shutdown_on_stdin_eof = true,
                 "--await-store-handover" => await_store_handover = true,
+                // L20. 이 백엔드에 데스크톱 화면 소유자가 있다는 뜻만 가진다. 수명 플래그에
+                // 얹지 않는 이유는 `is_headless_host`의 설명에 있다.
+                _ if arg == DESKTOP_SHELL_ARG => desktop_shell = true,
                 "-h" | "--help" => {
                     println!(
                         "Usage: agent-manager-server [--port {DEFAULT_REMOTE_ACCESS_PORT}] [--static-dir dist] \
                          [--app-data-dir PATH] [--tailscale-host HOST --tailscale-user LOGIN \
                          [--tailscale-serve-port PORT]] \
-                         [--remote-write | --no-remote-write] [--shutdown-on-stdin-eof]"
+                         [--reset-login] [--shutdown-on-stdin-eof] [{DESKTOP_SHELL_ARG}]"
                     );
                     std::process::exit(0);
                 }
                 _ => return Err(format!("알 수 없는 인자입니다: {arg}")),
             }
+        }
+
+        if reset_login {
+            let removed = reset_login_with_ownership(&app_data_dir)?;
+            if removed.is_empty() {
+                println!(
+                    "초기화할 로그인 설정이 없습니다 ({})",
+                    app_data_dir.display()
+                );
+            } else {
+                println!("로그인 설정을 초기화했습니다: {}", removed.join(", "));
+            }
+            std::process::exit(0);
         }
 
         static_dir = fs::canonicalize(&static_dir)
@@ -2223,9 +2292,9 @@ impl StandaloneServerOptions {
             tailscale_host,
             tailscale_user,
             tailscale_serve_port,
-            remote_write,
             shutdown_on_stdin_eof,
             await_store_handover,
+            desktop_shell,
         })
     }
 }
@@ -2241,26 +2310,23 @@ impl Config {
             tailscale_host,
             tailscale_user,
             tailscale_serve_port,
-            remote_write,
+            desktop_shell,
             ..
         } = options;
+        let headless = is_headless_host(tailscale_host.as_deref(), desktop_shell);
         // 저장 위치는 기동 인자가 아니라 소유권 리스가 정한다. 인자로 받은 경로는 리스를
         // 잡을 때 이미 쓰였고, 여기서 다시 읽으면 두 경로가 갈라질 수 있다.
         let app_data_dir = ownership.app_data_dir().to_path_buf();
         let settings = crate::load_backend_service_settings(&app_data_dir)
             .map_err(|error| error.to_string())?;
         let store_id = settings.store_id;
-        let remote_write = RemoteWriteFlag::new(resolve_standalone_remote_write(
-            &app_data_dir,
-            settings.remote_write,
-            remote_write,
-        )?);
+        let login = LoginAuth::open(&app_data_dir).map_err(|error| error.to_string())?;
 
         prepare_standalone_storage(&app_data_dir)?;
         let service = ServiceEndpoint {
             port,
             tailscale_host: tailscale_host.clone(),
-            remote_write: remote_write.clone(),
+            login: login.clone(),
         };
         let StandaloneRuntime {
             session_catalog,
@@ -2280,7 +2346,8 @@ impl Config {
             tailscale_host,
             tailscale_user,
             tailscale_serve_port,
-            remote_write,
+            login,
+            headless,
             session_catalog,
             terminals,
             chats,
@@ -2291,21 +2358,6 @@ impl Config {
             _system_mcp: Some(system_mcp),
         })
     }
-}
-
-/// 원격 write의 저장 지점은 백엔드 서비스 설정 하나다. 기동 인자로 명시한 헤드리스
-/// 운영자의 선택도 그 설정에 기록해, 화면 토글과 같은 값을 본다.
-fn resolve_standalone_remote_write(
-    app_data_dir: &Path,
-    stored: bool,
-    explicit: Option<bool>,
-) -> Result<bool, String> {
-    let Some(explicit) = explicit else {
-        return Ok(stored);
-    };
-    crate::save_backend_service_remote_write(app_data_dir, explicit)
-        .map_err(|error| error.to_string())?;
-    Ok(explicit)
 }
 
 /// 감독자를 세우기 전에 끝나 있어야 하는 저장소 준비. 계정 관리 저장소와 공통 저장소가
@@ -2443,6 +2495,11 @@ impl StandaloneRuntime {
         chats
             .set_plugin_mcp_base(system_mcp.plugin_proxy_base().to_owned())
             .map_err(|error| error.to_string())?;
+        // P12. 프록시 포트가 바뀌었을 수 있으니 Antigravity 전역 등록을 지금 주소로 맞춘다.
+        crate::antigravity_mcp_sync::sync_in_background(
+            app_data_dir.clone(),
+            Some(system_mcp.plugin_proxy_base().to_owned()),
+        );
 
         Ok(Self {
             session_catalog,
@@ -2477,6 +2534,54 @@ pub(crate) fn default_app_data_dir() -> Result<PathBuf, String> {
     linux_app_data_dir(env::var_os("XDG_DATA_HOME"), env::var_os("HOME"))
 }
 
+/// 백엔드가 관리 채팅 자식에게 심어 두는 자기 앱 데이터 폴더. 스킬이 부르는 CLI
+/// (`sessions`·`ssh`·`db`·`secret`)는 `--app-data-dir`가 없으면 이 값을 따른다.
+///
+/// 플랫폼 기본 폴더만 보던 때는 `--app-data-dir /data`로 뜬 NAS 백엔드나 접미가 붙은 개발
+/// 백엔드 아래에서 스킬이 백엔드 위치 파일을 못 찾았고, 더 나쁘게는 `ssh list`·`db list`가
+/// 비어 있는 기본 폴더를 읽어 "열어 둔 서버가 없다"는 빈 목록을 오류 없이 돌려줬다.
+/// 대화를 띄운 백엔드가 어느 폴더를 쓰는지는 그 백엔드만 정확히 안다.
+pub const APP_DATA_DIR_ENV: &str = "AGENT_MANAGER_APP_DATA_DIR";
+
+/// 스킬 CLI가 읽을 앱 데이터 폴더: `--app-data-dir` → [`APP_DATA_DIR_ENV`] → 플랫폼 기본값.
+pub(crate) fn cli_app_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf, CoreError> {
+    resolve_cli_app_data_dir(
+        explicit,
+        env::var_os(APP_DATA_DIR_ENV),
+        default_app_data_dir,
+    )
+}
+
+/// [`cli_app_data_dir`]의 판단부. 환경 조회를 밖에 두어 순서를 파일 시스템 없이 시험한다.
+///
+/// 상대 경로인 환경값은 버린다 — 이 프로세스의 작업 폴더는 대화의 작업 폴더라, 상대 경로를
+/// 받으면 프로젝트 안의 엉뚱한 폴더를 앱 데이터로 읽는다. 기본값으로 떨어졌을 때는 그 폴더에
+/// 백엔드 위치 파일이 있어야 한다: 없으면 그 폴더는 어떤 백엔드도 쓰지 않은 곳이고, 거기서
+/// 읽은 빈 목록은 "없다"가 아니라 "엉뚱한 곳을 봤다"이므로 빈 결과 대신 그 사실을 알린다.
+fn resolve_cli_app_data_dir(
+    explicit: Option<PathBuf>,
+    from_env: Option<std::ffi::OsString>,
+    platform_default: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<PathBuf, CoreError> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    if let Some(path) = from_env
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return Ok(path);
+    }
+    let path = platform_default().map_err(CoreError::InvalidInput)?;
+    if !crate::system_skills::session_read_cli_pointer_path(&path).is_file() {
+        return Err(CoreError::Conflict(format!(
+            "Agent Manager 백엔드 위치 파일이 기본 앱 데이터 폴더({})에 없습니다. 백엔드가 다른 폴더로 떠 있으면 --app-data-dir <폴더>로 지정하고, 아니면 앱을 먼저 실행하세요",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
 fn linux_app_data_dir(
     xdg_data_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
@@ -2508,7 +2613,10 @@ async fn handle_request(
                 Ok(()) => {
                     let cors_origin = local_ui_cors_origin(request.headers(), access, config.port)
                         .map(str::to_owned);
-                    let response = route(request, config, access, compress).await;
+                    let response = match enforce_login(&request, access) {
+                        Ok(()) => route(request, config, access, compress).await,
+                        Err(error) => error_response(error),
+                    };
                     apply_local_ui_cors(response, cors_origin.as_deref())
                 }
                 Err(error) => error_response(error),
@@ -2517,6 +2625,24 @@ async fn handle_request(
         Err(error) => error_response(error),
     };
     Ok(maybe_gzip_response(response, compress).await)
+}
+
+/// C20. 채널이 로그인을 요구하는데 세션이 없으면 `/api/*`를 막는다. 정적 파일과 로그인
+/// 화면이 쓰는 세 경로(`/api/access`, `/api/login`, `/api/logout`)와 CORS preflight는 연다.
+fn enforce_login(request: &Request<Incoming>, access: RequestAccess) -> Result<(), ApiError> {
+    enforce_login_for(request.method(), request.uri().path(), access)
+}
+
+fn enforce_login_for(method: &Method, path: &str, access: RequestAccess) -> Result<(), ApiError> {
+    if access.login_satisfied() || !path.starts_with("/api/") || method == Method::OPTIONS {
+        return Ok(());
+    }
+    if path == "/api/access" || path == "/api/login" || path == "/api/logout" {
+        return Ok(());
+    }
+    Err(ApiError::from(crate::login_auth::login_required(
+        access.login_required,
+    )))
 }
 
 fn accepts_gzip(headers: &HeaderMap) -> bool {
@@ -2642,7 +2768,7 @@ fn cached_manager_snapshot_response(
 }
 
 fn local_ui_cors_origin(headers: &HeaderMap, access: RequestAccess, port: u16) -> Option<&str> {
-    if access.remote {
+    if access.remote() {
         return None;
     }
     header_text(headers, ORIGIN.as_str()).filter(|origin| is_allowed_loopback_origin(origin, port))
@@ -2670,7 +2796,7 @@ fn authorize_local_api_origin(
     port: u16,
     access: RequestAccess,
 ) -> Result<(), ApiError> {
-    if access.remote || !path.starts_with("/api/") {
+    if access.remote() || !path.starts_with("/api/") {
         return Ok(());
     }
     let Some(origin) = headers.get(ORIGIN) else {
@@ -2720,6 +2846,17 @@ const HTTPS_DEFAULT_PORT: u16 = 443;
 
 fn authorize(request: &Request<Incoming>, config: &Config) -> Result<RequestAccess, ApiError> {
     let headers = request.headers();
+    let channel = classify_channel(headers, config)?;
+    let token = session_token_from_request(headers, request.uri().query());
+    Ok(resolve_access(
+        &config.login,
+        channel,
+        token.as_ref().map(|token| token.as_str()),
+    ))
+}
+
+/// 요청이 어느 접근 채널에서 왔는지(C20). 전송 계층의 사실만 본다 — 세션은 뒤에서 판정한다.
+fn classify_channel(headers: &HeaderMap, config: &Config) -> Result<AccessChannel, ApiError> {
     if let Some(login) = header_text(headers, "tailscale-user-login") {
         let expected = config
             .tailscale_user
@@ -2733,23 +2870,83 @@ fn authorize(request: &Request<Incoming>, config: &Config) -> Result<RequestAcce
                 return Err(ApiError::forbidden("허용되지 않은 원격 Origin입니다"));
             }
         }
-        return Ok(RequestAccess {
-            remote: true,
-            writable: config.remote_write.get(),
-        });
+        return Ok(AccessChannel::Remote);
     }
 
     let host = header_text(headers, HOST.as_str()).unwrap_or_default();
-    if crate::loopback_host::is_loopback_host(host) {
-        return Ok(RequestAccess {
-            remote: false,
-            writable: true,
-        });
+    if !crate::loopback_host::is_loopback_host(host) {
+        return Err(ApiError::forbidden(
+            "검증된 로컬 또는 Tailscale 요청만 허용됩니다",
+        ));
     }
+    Ok(classify_loopback_channel(headers))
+}
 
-    Err(ApiError::forbidden(
-        "검증된 로컬 또는 Tailscale 요청만 허용됩니다",
-    ))
+/// 루프백 요청의 채널. Origin이 있으면 그것이 답이고(Tauri 창인지 브라우저인지), 없으면
+/// 브라우저만 붙이는 `Sec-Fetch-*` 표식으로 브라우저와 네이티브 호출자를 가른다 —
+/// same-origin GET과 `<img>`에는 브라우저가 Origin을 붙이지 않는다.
+fn classify_loopback_channel(headers: &HeaderMap) -> AccessChannel {
+    match header_text(headers, ORIGIN.as_str()) {
+        Some(origin) if is_tauri_origin(origin) => AccessChannel::Desktop,
+        Some(_) => AccessChannel::LocalBrowser,
+        None if header_text(headers, "sec-fetch-site") == Some("same-origin") => {
+            AccessChannel::LocalBrowser
+        }
+        None if headers.contains_key("sec-fetch-mode") => AccessChannel::Desktop,
+        None => AccessChannel::Native,
+    }
+}
+
+fn is_tauri_origin(origin: &str) -> bool {
+    matches!(origin, "tauri://localhost" | "http://tauri.localhost")
+}
+
+/// 채널과 (있다면) 세션으로 접근 판정을 만든다. Origin 없는 루프백 브라우저 요청(`<img>`,
+/// same-origin GET)은 어느 루프백 채널인지 확정할 수 없으므로 두 채널 중 약한 요구를
+/// 받고, 두 채널의 세션을 모두 받는다(C20-6).
+fn resolve_access(login: &LoginAuth, channel: AccessChannel, token: Option<&str>) -> RequestAccess {
+    let login_required = match channel.login_channel() {
+        Some(login_channel) => login.requirement(login_channel),
+        None => LoginRequirement::default(),
+    };
+    let session = token.and_then(|token| login.resolve_session(token));
+    let compatible = session
+        .as_ref()
+        .is_some_and(|session| match (channel, session.channel) {
+            (AccessChannel::Remote, LoginChannel::Remote) => true,
+            (AccessChannel::Remote, _) | (_, LoginChannel::Remote) => false,
+            (AccessChannel::Native, _) => true,
+            _ => true,
+        });
+    RequestAccess {
+        channel,
+        login_required,
+        authenticated: compatible,
+        session_id: session
+            .filter(|_| compatible)
+            .and_then(|session| Uuid::parse_str(&session.id).ok()),
+    }
+}
+
+/// 세션 토큰은 헤더가 우선이고, 헤더를 못 붙이는 WebSocket·`<img>`만 쿼리로 보낸다.
+/// 어느 쪽이든 값은 오류 문구나 로그에 다시 적지 않는다.
+fn session_token_from_request(
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Option<Zeroizing<String>> {
+    if let Some(token) = header_text(headers, LOGIN_SESSION_HEADER) {
+        let token = token.trim();
+        if !token.is_empty() {
+            return Some(Zeroizing::new(token.to_owned()));
+        }
+    }
+    query?
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == LOGIN_SESSION_QUERY_KEY)
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| Zeroizing::new(value.to_owned()))
 }
 
 fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -2887,11 +3084,31 @@ async fn route(
             store_id: &config.store_id,
             instance_id: backend_instance_id(),
             backend_port: config.port,
-            mode: if access.remote { "tailscale" } else { "local" },
-            remote: access.remote,
-            writable: access.writable,
+            mode: if access.remote() {
+                "tailscale"
+            } else {
+                "local"
+            },
+            remote: access.remote(),
+            channel: access.channel,
+            authenticated: access.authenticated,
+            login_required: access.login_required,
+            headless: config.headless,
         };
         return json_response(StatusCode::OK, &status);
+    }
+
+    if method == Method::POST && path == "/api/login" {
+        return login_response(request, &config, access).await;
+    }
+
+    if method == Method::POST && path == "/api/logout" {
+        let token = session_token_from_request(request.headers(), request.uri().query());
+        let revoked = match token {
+            Some(token) => config.login.logout(&token).unwrap_or(false),
+            None => false,
+        };
+        return json_response(StatusCode::OK, &json!({ "revoked": revoked }));
     }
 
     if method == Method::GET && path == "/api/terminal" && is_upgrade_request(&request) {
@@ -2925,7 +3142,7 @@ async fn route(
 
     if method == Method::POST {
         if path == "/api/chat-attachment" {
-            return chat_attachment_upload_response(request, &config, access).await;
+            return chat_attachment_upload_response(request, &config).await;
         }
         if let Some(kind) = path.strip_prefix("/api/download/linked-file/") {
             return linked_file_download_route(request, &config, kind).await;
@@ -2959,11 +3176,7 @@ fn chat_attachment_download_response(config: &Config, ids: &str) -> HttpResponse
 async fn chat_attachment_upload_response(
     request: Request<Incoming>,
     config: &Config,
-    access: RequestAccess,
 ) -> HttpResponse {
-    if !access.writable {
-        return error_response(ApiError::forbidden("원격 변경이 비활성화되어 있습니다"));
-    }
     let headers = request.headers();
     let (chat_id, name, media_type) = match (
         required_encoded_header(headers, "x-chat-id"),
@@ -3018,8 +3231,10 @@ async fn linked_file_download_route(
     }
 }
 
-/// `POST /api/invoke/{명령}` — 쓰기·호스트 전용 게이트를 지난 뒤 명령 디스패처로 넘긴다.
-/// 관리 스냅숏만 캐시 응답을 그대로 돌려주므로 디스패처 앞에서 갈라진다.
+/// `POST /api/invoke/{명령}` — 로그인 게이트(`enforce_login`)를 지난 요청을 명령 디스패처로
+/// 넘긴다. 인증 뒤에는 모든 채널이 같은 권한이다(G11); 콜백형 OAuth 시작만 실행 지점
+/// (`ExternalPluginRegistry::begin_oauth`)이 호출 채널을 보고 거절한다. 관리 스냅숏은 캐시 응답을 그대로
+/// 돌려주고, 로그인 세션 명령은 현재 세션을 알아야 해서 디스패처 앞에서 갈라진다.
 async fn invoke_command_response(
     request: Request<Incoming>,
     config: &Config,
@@ -3027,19 +3242,23 @@ async fn invoke_command_response(
     command: &str,
     compress: bool,
 ) -> HttpResponse {
+    // G4/C4. Vault diagnosis and repair remain host-only even though authenticated
+    // channels otherwise share command permissions (C20).
+    if access.remote() && is_credential_vault_host_only(command) {
+        return error_response(ApiError::forbidden(
+            "자격증명 저장소 복구는 Agent Manager 호스트의 로컬 UI에서만 실행할 수 있습니다",
+        ));
+    }
     if !has_json_content_type(request.headers()) {
         return unsupported_json_content_type_response();
-    }
-    if is_write_command(command) && !access.writable {
-        return error_response(ApiError::forbidden("원격 변경이 비활성화되어 있습니다"));
-    }
-    if is_host_only_command(command) && access.remote {
-        return error_response(ApiError::forbidden(HOST_ONLY_COMMAND_MESSAGE));
     }
     let params = match read_json_body(request.into_body()).await {
         Ok(params) => params,
         Err(error) => return error_response(error),
     };
+    if let Some(response) = login_session_command_response(config, access, command, &params) {
+        return response;
+    }
     if command == "get_manager_snapshot" {
         let session_catalog = config.session_catalog.clone();
         let cache = config.manager_snapshot_cache.clone();
@@ -3057,7 +3276,7 @@ async fn invoke_command_response(
     let service = ServiceEndpoint {
         port: config.port,
         tailscale_host: config.tailscale_host.clone(),
-        remote_write: config.remote_write.clone(),
+        login: config.login.clone(),
     };
     let scheduler = config.scheduler.clone();
     let session_catalog = config.session_catalog.clone();
@@ -3080,13 +3299,207 @@ async fn invoke_command_response(
             aia_chat_id: None,
             origin: None,
         };
-        dispatch_command(&context, &command, params)
+        dispatch_command_from_channel(&context, access.channel, &command, params)
     })
     .await
     {
         Ok(value) => json_value_response(StatusCode::OK, value),
         Err(error) => error_response(error),
     }
+}
+
+/// `POST /api/login` — 채널이 요구하는 수단을 확인하고 세션 토큰을 발급한다(C20).
+async fn login_response(
+    request: Request<Incoming>,
+    config: &Config,
+    access: RequestAccess,
+) -> HttpResponse {
+    if !has_json_content_type(request.headers()) {
+        return unsupported_json_content_type_response();
+    }
+    let Some(channel) = access.channel.login_channel() else {
+        return error_response(ApiError::bad_request(
+            "이 호출 경로는 로그인을 요구하지 않습니다",
+        ));
+    };
+    let label = header_text(request.headers(), "user-agent")
+        .unwrap_or_default()
+        .chars()
+        .take(120)
+        .collect::<String>();
+    let body = match read_json_body(request.into_body()).await {
+        Ok(body) => body,
+        Err(error) => return error_response(error),
+    };
+    let args: LoginArg = match parse_params(body) {
+        Ok(args) => args,
+        Err(error) => return error_response(error),
+    };
+    let login = config.login.clone();
+    match run_blocking(
+        "로그인 처리 작업이 중단되었습니다",
+        move || {
+            login
+                .authenticate(
+                    channel,
+                    args.user_id.as_deref(),
+                    args.password.as_deref(),
+                    args.otp.as_deref(),
+                    &label,
+                )
+                .map_err(ApiError::from)
+        },
+    )
+    .await
+    {
+        Ok(issued) => json_response(
+            StatusCode::OK,
+            &json!({
+                "token": issued.token.as_str(),
+                "sessionId": issued.id,
+                "expiresAt": issued.expires_at,
+            }),
+        ),
+        Err(error) => error_response(error),
+    }
+}
+
+/// 로그인 폼이 보내는 본문. 요구하지 않는 칸은 비워 둔다.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginArg {
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    otp: Option<String>,
+}
+
+/// 현재 세션을 알아야 답할 수 있는 세 명령. 디스패처는 요청을 모르므로 여기서 갈라진다.
+fn login_session_command_response(
+    config: &Config,
+    access: RequestAccess,
+    command: &str,
+    params: &Value,
+) -> Option<HttpResponse> {
+    let current = access.session_id.map(|id| id.to_string());
+    let result = match command {
+        "list_login_sessions" => to_value(config.login.list_sessions(current.as_deref())),
+        "revoke_login_session" => parse_params::<LoginSessionIdArg>(params.clone())
+            .and_then(|args| Ok(json!({ "revoked": config.login.revoke_session(&args.id)? }))),
+        "revoke_all_login_sessions" => {
+            parse_optional_params::<RevokeAllLoginSessionsArg>(params.clone()).and_then(|args| {
+                let keep = if args.keep_current {
+                    current.as_deref()
+                } else {
+                    None
+                };
+                Ok(json!({ "revokedCount": config.login.revoke_all_sessions(keep)? }))
+            })
+        }
+        _ => return None,
+    };
+    Some(match result {
+        Ok(value) => json_value_response(StatusCode::OK, value),
+        Err(error) => error_response(error),
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginSessionIdArg {
+    id: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RevokeAllLoginSessionsArg {
+    #[serde(default)]
+    keep_current: bool,
+}
+
+/// 로그인 설정 명령은 재인증의 시도 제한을 채널별로 세므로 호출 채널을 알아야 한다. 그 밖의
+/// 명령은 [`dispatch_command`]로 그대로 간다. 이 명령들은 AIA 카탈로그에 없다 — 인증 수단을
+/// 바꾸는 일은 사람이 화면에서 한다.
+fn dispatch_command_from_channel(
+    context: &SystemCommandContext<'_>,
+    channel: AccessChannel,
+    command: &str,
+    params: Value,
+) -> Result<Value, ApiError> {
+    let login = &context.service.login;
+    // Origin 없는 루프백 호출자는 호스트 프로세스라 데스크톱 채널로 센다.
+    let reauth_channel = channel.login_channel().unwrap_or(LoginChannel::Desktop);
+    match command {
+        "get_login_settings" => to_value(login.settings_view()?),
+        "set_login_user_id" => {
+            let args: LoginUserIdArg = parse_params(params)?;
+            to_value(login.set_user_id(reauth_channel, &args.user_id, &args.reauth)?)
+        }
+        "set_login_password" => {
+            let args: LoginPasswordArg = parse_params(params)?;
+            to_value(login.set_password(
+                reauth_channel,
+                args.user_id.as_deref(),
+                &args.next,
+                &args.reauth,
+            )?)
+        }
+        "clear_login_password" => {
+            let args: Reauth = parse_optional_params(params)?;
+            to_value(login.clear_password(reauth_channel, &args)?)
+        }
+        "begin_login_otp_setup" => {
+            let args: Reauth = parse_optional_params(params)?;
+            to_value(login.begin_otp_setup(reauth_channel, &args)?)
+        }
+        "confirm_login_otp_setup" => {
+            let args: LoginOtpCodeArg = parse_params(params)?;
+            to_value(login.confirm_otp_setup(&args.code)?)
+        }
+        "disable_login_otp" => {
+            let args: Reauth = parse_optional_params(params)?;
+            to_value(login.disable_otp(reauth_channel, &args)?)
+        }
+        "set_login_channel_requirement" => {
+            let args: LoginChannelRequirementArg = parse_params(params)?;
+            to_value(login.set_channel_requirement(args.channel, args.method, args.enabled)?)
+        }
+        _ => dispatch_command(context, command, params),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginUserIdArg {
+    user_id: String,
+    #[serde(flatten)]
+    reauth: Reauth,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginPasswordArg {
+    #[serde(default)]
+    user_id: Option<String>,
+    next: String,
+    #[serde(flatten)]
+    reauth: Reauth,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginOtpCodeArg {
+    code: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginChannelRequirementArg {
+    channel: LoginChannel,
+    method: LoginMethod,
+    enabled: bool,
 }
 
 /// 터미널·채팅 소켓은 인가 → 업그레이드 → 처리 작업 spawn이라는 같은 절차를 탄다.
@@ -3243,7 +3656,7 @@ fn authorize_terminal(
     config: &Config,
     access: RequestAccess,
 ) -> Result<(), ApiError> {
-    if !access.remote {
+    if !access.remote() {
         let Some(origin) = header_text(headers, ORIGIN.as_str()) else {
             return Ok(());
         };
@@ -3253,9 +3666,6 @@ fn authorize_terminal(
         return Err(ApiError::forbidden(
             "허용되지 않은 로컬 WebSocket Origin입니다",
         ));
-    }
-    if !access.writable {
-        return Err(ApiError::forbidden("원격 터미널이 비활성화되어 있습니다"));
     }
     let expected_origin = expected_remote_origin(config);
     if header_text(headers, "origin") != Some(expected_origin.as_str()) {
@@ -3296,15 +3706,10 @@ async fn handle_terminal_socket(
         TerminalClientMessage::Open { request } => request,
         _ => return Err("첫 터미널 메시지는 open이어야 합니다".to_owned()),
     };
-    if let Err(error) = authorize_terminal_open_request(&request, access) {
-        let _ = send_terminal_event(&mut socket, TerminalEvent::Error { message: error }).await;
-        let _ = socket.close(None).await;
-        return Ok(());
-    }
     let attachment = match request {
         RemoteTerminalOpenRequest::Session(request) => terminals.open_or_attach(request),
         RemoteTerminalOpenRequest::AccountLogin(request) => {
-            terminals.open_account_login(request, access.remote)
+            terminals.open_account_login(request, access.remote())
         }
         RemoteTerminalOpenRequest::Setup(request) => terminals.open_setup(request),
         RemoteTerminalOpenRequest::Ssh(request) => terminals.open_ssh(request),
@@ -3374,23 +3779,6 @@ async fn handle_terminal_socket(
         }
     }
     let _ = terminals.detach(&terminal_id);
-    Ok(())
-}
-
-fn authorize_terminal_open_request(
-    request: &RemoteTerminalOpenRequest,
-    access: RequestAccess,
-) -> Result<(), String> {
-    if matches!(request, RemoteTerminalOpenRequest::Setup(_)) && access.remote {
-        return Err(
-            "CLI 설정 터미널은 Agent Manager 호스트의 로컬 UI에서만 열 수 있습니다".to_owned(),
-        );
-    }
-    // C9-19. 원격 UI에서 열면 호스트의 키로 제3의 서버에 붙는 셸이 원격 브라우저에 놓인다.
-    // 명령 실행·전송과 같은 이유로 호스트 화면에서만 연다.
-    if matches!(request, RemoteTerminalOpenRequest::Ssh(_)) && access.remote {
-        return Err("SSH 터미널은 Agent Manager 호스트의 로컬 UI에서만 열 수 있습니다".to_owned());
-    }
     Ok(())
 }
 
@@ -3684,6 +4072,18 @@ async fn read_body(mut body: Incoming) -> Result<Vec<u8>, ApiError> {
     Ok(result)
 }
 
+/// 변경 명령 분류표. **게이트가 아니다** — 인증 뒤에는 모든 채널이 같은 권한이라(G11) 요청
+/// 경계는 이 표를 보지 않는다. 남은 독자는 system_mcp의 등급(`Read`/`Execute`) 일치 시험과
+/// `src/lib/projectMenuConformance.ts`뿐이며, 새 변경 명령은 여전히 여기 적어 두 독자가 어긋나지
+/// 않게 한다.
+fn is_credential_vault_host_only(command: &str) -> bool {
+    matches!(
+        command,
+        "get_credential_vault_recovery_status" | "recover_credential_vault"
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_write_command(command: &str) -> bool {
     matches!(
         command,
@@ -3733,7 +4133,9 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "remove_chat_input_file"
             | "begin_provider_account_login"
             | "finish_provider_account_login"
+            | "recover_credential_vault"
             | "cancel_provider_account_login"
+            | "relay_codex_login_callback"
             | "revalidate_provider_account_credential"
             | "consume_account_reset_credit"
             | "set_default_provider_account"
@@ -3748,7 +4150,15 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "set_auto_switch_usage_gap"
             | "set_resume_account_policy"
             | "set_tailscale_service_enabled"
-            | "set_remote_write_enabled"
+            | "set_login_user_id"
+            | "set_login_password"
+            | "clear_login_password"
+            | "begin_login_otp_setup"
+            | "confirm_login_otp_setup"
+            | "disable_login_otp"
+            | "set_login_channel_requirement"
+            | "revoke_login_session"
+            | "revoke_all_login_sessions"
             | "set_sleep_prevention"
             | "delete_provider_account"
             | "propose_chat_settings_schema"
@@ -3765,6 +4175,7 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "set_external_plugin_tool_policies"
             | "set_external_plugin_token"
             | "begin_external_plugin_oauth"
+            | "submit_external_plugin_oauth_callback"
             | "cancel_external_plugin_oauth"
             | "verify_external_plugin"
             | "generate_ssh_key"
@@ -3803,9 +4214,11 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "click_ui_element"
             | "set_cypress_enabled"
             | "set_cypress_workspace_options"
+            | "set_cypress_workspace_module_dir"
             | "add_cypress_workspace"
             | "remove_cypress_workspace"
             | "install_cypress_module"
+            | "verify_cypress_environment"
             | "write_cypress_workspace_file"
             | "write_cypress_env_file"
             | "read_cypress_env_file"
@@ -3883,6 +4296,9 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             // 휴지통으로 옮기므로 되돌릴 자리가 남는다. 호스트 전용 목록에는 overlay 명령이
             // 하나도 들어가지 않는다.
             | "save_project_overlay_set"
+            // C19-4. 세트 장부와 보관한 patch를 고친다. 작업 트리는 건드리지 않고 이전
+            // patch는 휴지통에 남으므로 세트 저장과 같은 칸이다.
+            | "exclude_project_overlay_paths"
             | "delete_project_overlay_set"
             // C19-4. 작업 트리를 바꾸지만 바깥으로 나가지 않는다. push가 호스트 전용인
             // 이유는 호스트 자격증명으로 내보내기 때문이고 overlay에는 그 축이 없다.
@@ -3891,104 +4307,11 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             // 적용하고, patch는 앱 데이터에 그대로 남아 같은 세트를 다시 뜰 수 있다.
             // 2026-10-02 사용자 결정으로 write mode에서 원격 가능하다.
             | "apply_project_overlay"
-    )
-}
-
-pub(crate) const HOST_ONLY_COMMAND_MESSAGE: &str =
-    "이 작업은 Agent Manager 호스트의 로컬 UI에서만 실행할 수 있습니다";
-
-/// 원격 write 권한으로도 실행을 막는 호스트 전용 작업 목록.
-///
-/// 스킬 원본 생성·가져오기·게시·삭제·휴지통 작업은 2026-08 정책 변경으로 원격
-/// write에 허용했다. 모든 쓰기가 검증된 스킬 루트와 Agent Manager 소유 휴지통
-/// 안에서만 일어나고 삭제는 휴지통 경유라 복구 가능하기 때문이다.
-///
-/// `create_directory`도 2026-09-20 사용자 결정으로 원격 write에 허용했다. 만드는
-/// 폴더가 앱 소유가 아닌 것은 그대로지만, 원격 편집 권한은 설정의 스위치 하나로
-/// 통일돼 있고 "편집을 허용했으면 폴더 만들기도 허용"이 사용자가 그 스위치에
-/// 기대하는 뜻이다. 남는 것은 빈 폴더 하나뿐이라 되돌리기가 쉽고, 공급자 홈·앱
-/// 데이터는 여전히 거절되며 확인 대화가 만들 칸을 모두 보여 준다(C6-4b).
-///
-/// Cypress 자동화(C7)는 처음엔 호스트 전용이었으나 2026-08-29 사용자 결정으로 원격 write에
-/// 허용했다. 원격은 Tailscale 인증 사용자만 오는 경로이고, 사용자가 폰에서도 작업공간을
-/// 설정·실행하길 원했기 때문이다. 대신 `cypress.env.json` 원문 읽기(`read_cypress_env_file`)는
-/// 조회지만 쓰기 목록에 넣어 원격 읽기 전용 모드에서는 막는다 — 비밀 원문은 변경 권한과 같은
-/// 급으로 다룬다.
-///
-/// 외부 플러그인의 등록·편집·토큰 입력·삭제는 2026-09-30 사용자 결정으로 원격 write에
-/// 허용한다. 처음 경계(2026-08-30)는 "토큰은 원격 경로로 받지 않는다"였는데, 2026-09-29에
-/// 비밀값(C15-7/C17-7)을 `remoteWrite` 하나로 모으면서 그 전제가 이미 깨졌다 — 원격 화면은
-/// 승인 카드로 비밀값을 백엔드 메모리에 넣고 보안 저장소에 저장까지 한다. 플러그인 토큰만
-/// 남겨 두면 막는 것은 유출 경로가 아니라 "폰에서 노션을 붙이는 일"뿐이었다. 삭제도 같이
-/// 연다: 등록할 수 있는데 지우지 못하면 원격에서 잘못 넣은 항목을 되돌릴 방법이 없고,
-/// 지워지는 것은 앱이 소유한 기록과 사용자가 발급처에서 다시 받을 수 있는 토큰뿐이다.
-///
-/// **OAuth 시작(`begin_external_plugin_oauth`)만 호스트 전용으로 남는다.** 이것은 권한이
-/// 아니라 물리적 제약이다 — 콜백 `redirect_uri`가 호스트 loopback이라(`external_plugins.rs`의
-/// `begin_callback_oauth`) 원격 브라우저에서 승인하면 리디렉트가 닿을 곳이 없다. 원격에서
-/// 눌리게 하면 끝낼 수 없는 대기 상태만 만든다. 그래서 등록은 열되 인증은 호스트에서 하고,
-/// 원격에서 새로 붙일 때는 토큰 방식을 쓴다. 시작이 호스트 전용이면 취소도 거기서 되지만,
-/// 취소는 대기 상태를 거두는 정리 동작이라 원격에도 연다 — 삭제를 열어 둔 채 취소만 막으면
-/// 원격에서 대기 중인 플러그인을 지우는 것 말고는 손쓸 수가 없다.
-///
-/// 도구 정책은 계속 호스트 전용이다 — 허용으로 바꾸면 그 도구는 승인 카드를 거치지 않으므로,
-/// 권한을 넓히는 결정은 호스트 화면에서만 내린다. 외부 플러그인의 변경 도구 호출도 앱 밖의
-/// 데이터를 바꾸며 복구를 보장할 수 없어 호스트 전용이다. 사용 토글과 연결 확인은 앱 소유
-/// 저장소 안의 변경이라 전부터 원격 write에 허용한다.
-///
-/// SSH(C9)는 처음엔 연결 서버와 키 관리가 모두 호스트 전용이었으나 2026-09-03 사용자
-/// 결정으로 원격 write에 전부 허용했다. 엔드포인트는 비밀값 없는 앱 데이터(호스트·포트·
-/// 사용자·에이전트 사용 플래그)이고 해제하면 그대로 돌아간다. 키 생성은 C9-2/C9-4의
-/// 검증된 새 경로에만 no-clobber로 만들고, 삭제는 C9-7대로 지우지 않고 `~/.ssh` 안
-/// 휴지통으로 옮기는 것이라 사용자가 되돌릴 수 있다 — 둘 다 앱이 만든 대상 안에서만
-/// 움직이고 복구 가능하다는 G11 조건을 만족한다. 원격 write가 켜진 시점에 이미 원격은
-/// 채팅으로 호스트에서 임의 작업을 시킬 수 있어, 이 경계만 남겨 두는 것이 실질적인
-/// 보호가 되지 않는다는 점도 근거다. 개인키 본문은 어느 경로로도 나가지 않는다(G4).
-///
-/// 원격 write 허용 토글(`set_remote_write_enabled`)은 앱 소유 설정 파일 한 줄을 바꾸는
-/// 되돌릴 수 있는 작업이지만 호스트 전용이다. 원격이 스스로의 권한 범위를 정하면 권한
-/// 결정과 권한 행사가 같은 자리에서 일어난다 — 외부 플러그인 도구 정책과 같은 이유로,
-/// 권한을 넓히는 결정은 호스트 화면에서만 내린다. 끄는 방향도 막는 것은, 폰에서 끈 뒤
-/// 다시 켜려면 호스트 앞으로 가야 하는 한쪽 문을 만들지 않기 위해서다.
-///
-/// Claude 설정 C8 쓰기는 두 키의 검증된 엔트리 하나만 바꾸고 앱 데이터 백업으로
-/// 복구할 수 있다. 사용자 전역 또는 활성 등록 프로젝트라는 관리 경계도 다시 검증하므로
-/// 원격 write에 허용한다.
-///
-/// 반대로 SSH 원격 명령 실행과 파일 전송(C9-14/C9-15)은 호스트 전용이다. 엔드포인트
-/// 저장·연결 확인과 달리 이들은 **다른 시스템의 상태를 바꾼다** — 되돌리는 방법이 앱
-/// 안에 없고, 외부 플러그인의 변경 도구 호출과 같은 급이다. 허용 목록 영구 추가(C9-17)도
-/// 같은 자리에 둔다: 그 한 줄이 앞으로의 실행을 승인 없이 열기 때문에, 목록을 편집하는
-/// 화면 자체가 호스트 전용인 것과 판단이 같다. AIA는 시스템 인터페이스 경로로 오므로 이
-/// 경계가 AIA를 막지는 않는다. 여기서 막는 것은 원격 브라우저 UI가 사용자 화면을 거치지
-/// 않고 서버를 바꾸는 경로다.
-///
-/// 프로젝트 git(C16)의 변경은 2026-09-28 사용자 결정으로 원격 write에 허용했다. 스테이지·
-/// 커밋·브랜치 전환·스태시·리베이스·fetch·pull은 모두 reflog·`ORIG_HEAD`·stash 앵커로
-/// 되돌릴 수 있고 되돌릴 수 없는 명령은 아예 제공하지 않으며, SSH·C6과 같이 원격 write가
-/// 켜진 시점엔 이미 채팅으로 호스트를 바꿀 수 있다. **push만 호스트 전용**이다 — 커밋을
-/// 바깥 저장소에 호스트 사용자의 자격증명으로 게시하는 일이라 되돌리는 방법이 앱 안에
-/// 없고, SSH 원격 명령 실행과 같은 급이다.
-pub(crate) fn is_host_only_command(command: &str) -> bool {
-    matches!(
-        command,
-        "analyze_aia_event"
-            | "set_resource_repository"
-            | "set_external_plugin_tool_policy"
-            | "set_external_plugin_tool_policies"
-            | "begin_external_plugin_oauth"
-            | "execute_external_plugin_tool"
-            | "execute_ssh_command"
-            | "relay_ssh_command"
-            | "allow_ssh_command_permanently"
-            | "upload_ssh_file"
-            | "download_ssh_file"
-            | "set_db_connection"
-            | "remove_db_connection"
-            | "run_db_statement"
-            | "relay_db_statement"
-            | "set_remote_write_enabled"
-            | "push_project_git"
+            // C19-3. 앱이 시작한 Git 작업 뒤의 일괄 재적용. 세트마다 apply_project_overlay를
+            // 그대로 부르므로 권한도 복구도 그것과 같다 — 쓰기 게이트를 지나고 호스트 전용은
+            // 아니다. 게이트에서 빠지면 읽기 전용 원격 UI의 브랜치 전환이 작업 트리에
+            // patch를 집어넣게 된다.
+            | "reapply_project_overlays"
     )
 }
 
@@ -4967,8 +5290,8 @@ fn paced_runs_inputs(
 /// 한때 이 함수 하나가 명령 이름 이백여 개를 1,700줄짜리 match로 받아, 어느 갈래를 고치든
 /// 같은 본문을 훑어야 했다. 이제는 갈래별 `dispatch_*_command`로 나누고 아는 이름이 없으면
 /// 다음 갈래로 넘긴다 — 이미 있던 `dispatch_external_plugin_command` 넘김과 같은 모양이라
-/// 갈래 사슬의 끝도 그대로다. 나눈 기준은 부르는 계층이지 인가가 아니다: 호스트 전용·원격
-/// write 판정은 여전히 명령 이름만 보고 `is_host_only_command` 쪽에서 하므로 경계는 그대로다.
+/// 갈래 사슬의 끝도 그대로다. 나눈 기준은 부르는 계층이지 인가가 아니다: 인가는 요청 경계의
+/// 로그인 게이트(C20)가 끝냈고 명령 이름은 보지 않는다.
 ///
 /// 이 갈래는 실행 환경·CLI 업데이트·서비스 토글·SSH·DB 명령을 받는다.
 fn dispatch_command(
@@ -5051,16 +5374,6 @@ fn dispatch_command(
             let args: EnabledArg = parse_params(params)?;
             to_value(crate::set_sleep_prevention(app_data_dir, args.enabled)?)
         }
-        // 원격에 변경 권한을 줄지는 앱이 소유한 설정 파일 한 줄이고 언제든 되돌릴 수
-        // 있지만, 권한을 넓히는 결정은 호스트 화면에서만 내린다(is_host_only_command).
-        "set_remote_write_enabled" => {
-            let args: EnabledArg = parse_params(params)?;
-            to_value(set_remote_write(
-                context.app_data_dir,
-                service,
-                args.enabled,
-            )?)
-        }
         "set_tailscale_service_enabled" => {
             let args: TailscaleServiceArg = parse_params(params)?;
             to_value(set_tailscale_service(
@@ -5071,6 +5384,16 @@ fn dispatch_command(
             )?)
         }
         "get_provider_accounts" => to_value(require_accounts(chats)?.reconciled_snapshot()?),
+        "get_credential_vault_recovery_status" => {
+            to_value(require_accounts(chats)?.credential_vault_recovery_status()?)
+        }
+        // 진행 중인 로그인 세션의 현재 상태. 프로필에 자격증명이 들어왔는지(`credentialsReady`)를
+        // 함께 주어, 원격 탭이 CLI 종료 이벤트를 놓쳐도 저장 버튼을 열 수 있게 한다. 값은
+        // 돌려주지 않고 판정만 한다.
+        "get_provider_account_login" => {
+            let args: LoginIdArg = parse_params(params)?;
+            to_value(require_accounts(chats)?.login_session(&args.login_id)?)
+        }
         // 앱 데이터의 파생 이력만 읽는다. 자격증명도 공급자 API도 건드리지 않아
         // 원격에서도 허용한다.
         "get_account_usage_history" => to_value(require_accounts(chats)?.usage_history()?),
@@ -5385,7 +5708,7 @@ fn dispatch_command(
 /// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
 /// 하나다. Claude 설정·공급자 텔레메트리·플러그인 분기 규칙과 계정 등록·전환 명령.
 /// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
-/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로만 하므로 그대로다.
+/// 는 요청 경계의 로그인 게이트(C20)가 끝냈으므로 그대로다.
 fn dispatch_claude_and_account_command(
     context: &SystemCommandContext<'_>,
     command: &str,
@@ -5396,6 +5719,7 @@ fn dispatch_claude_and_account_command(
         session_catalog,
         chats,
         scheduler,
+        terminals,
         ..
     } = context;
     match command {
@@ -5505,10 +5829,19 @@ fn dispatch_claude_and_account_command(
             let args: FinishProviderAccountLoginArg = parse_params(params)?;
             to_value(require_accounts(chats)?.finish_login(&args.login_id, args.display_name)?)
         }
+        "recover_credential_vault" => {
+            to_value(require_accounts(chats)?.recover_credential_vault()?)
+        }
         "cancel_provider_account_login" => {
             let args: LoginIdArg = parse_params(params)?;
             require_accounts(chats)?.cancel_login(&args.login_id)?;
             Ok(Value::Null)
+        }
+        // 브라우저 방식 Codex 로그인을 브라우저가 다른 기기에 있을 때 끝내는 길이다. 전달할 수
+        // 있는 자리(이 기기 로그인 서버의 콜백)와 대조는 터미널 감독자가 정한다.
+        "relay_codex_login_callback" => {
+            let args: RelayCodexLoginCallbackArg = parse_params(params)?;
+            to_value(terminals.relay_codex_login_callback(&args.login_id, &args.callback_url)?)
         }
         "set_default_provider_account" => {
             let args: AccountIdArg = parse_params(params)?;
@@ -5585,7 +5918,7 @@ fn dispatch_claude_and_account_command(
 /// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
 /// 하나다. 화면 안내 조회·조작과 Cypress 작업공간·실행 명령.
 /// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
-/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로만 하므로 그대로다.
+/// 는 요청 경계의 로그인 게이트(C20)가 끝냈으므로 그대로다.
 fn dispatch_ui_and_cypress_command(
     context: &SystemCommandContext<'_>,
     command: &str,
@@ -5686,10 +6019,13 @@ fn dispatch_ui_and_cypress_command(
         }
         "set_cypress_enabled" => {
             let args: EnabledArg = parse_params(params)?;
-            to_value(crate::cypress_workspaces::set_enabled(
-                app_data_dir,
-                args.enabled,
-            )?)
+            let view = crate::cypress_workspaces::set_enabled(app_data_dir, args.enabled)?;
+            // P12. Antigravity는 Cypress도 전역 설정으로 받는다.
+            crate::antigravity_mcp_sync::sync_in_background(
+                app_data_dir.to_path_buf(),
+                chats.plugin_mcp_base(),
+            );
+            to_value(view)
         }
         "add_cypress_workspace" => {
             require_cypress_enabled_for_aia(actor, app_data_dir, "작업공간 등록")?;
@@ -5711,6 +6047,14 @@ fn dispatch_ui_and_cypress_command(
                 args.execution_type,
             )?)
         }
+        "set_cypress_workspace_module_dir" => {
+            let args: CypressWorkspaceModuleDirRequest = parse_params(params)?;
+            to_value(crate::cypress_workspaces::set_workspace_module_dir(
+                app_data_dir,
+                &args.id,
+                args.module_dir.as_deref(),
+            )?)
+        }
         "remove_cypress_workspace" => {
             let args: IdArg = parse_params(params)?;
             to_value(crate::cypress_workspaces::remove_workspace(
@@ -5726,6 +6070,14 @@ fn dispatch_ui_and_cypress_command(
                 &workspace,
                 args.version.as_deref(),
             )?)
+        }
+        // 설치와 같은 급의 자식 프로세스 실행이라 같은 토글 전제를 둔다. 결과는 판정과 출력
+        // 꼬리뿐이고 작업공간은 바꾸지 않는다.
+        "verify_cypress_environment" => {
+            require_cypress_enabled_for_aia(actor, app_data_dir, "Cypress 환경 점검")?;
+            let args: IdArg = parse_params(params)?;
+            let workspace = crate::cypress_workspaces::workspace(app_data_dir, &args.id)?;
+            to_value(crate::cypress_runs::verify_environment(&workspace)?)
         }
         "list_cypress_workspace_files" => {
             let args: IdArg = parse_params(params)?;
@@ -5815,7 +6167,7 @@ fn require_aia_chat_id<'a>(chat_id: Option<&'a str>, command: &str) -> Result<&'
 /// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
 /// 하나다. 대화 알림·세션 카탈로그·번역·세션 상세와 정리·폴더 명령.
 /// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
-/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로만 하므로 그대로다.
+/// 는 요청 경계의 로그인 게이트(C20)가 끝냈으므로 그대로다.
 fn dispatch_session_command(
     context: &SystemCommandContext<'_>,
     command: &str,
@@ -5843,7 +6195,7 @@ fn dispatch_session_command(
         }
         "mark_all_chat_attention_read" => {
             let args: MarkAllAttentionReadArgs = parse_optional_params(params)?;
-            to_value(chats.mark_all_attention_read(&args.exclude_profiles)?)
+            to_value(chats.mark_all_attention_read(&args.exclude_profiles, &args.exclude_chat_ids)?)
         }
         "clear_read_chat_attention" => to_value(chats.clear_read_attention()?),
         "dismiss_chat_attention" => {
@@ -6160,7 +6512,7 @@ fn dispatch_session_command(
 /// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
 /// 하나다. 스킬 라이브러리·자원 저장소·프로젝트 등록과 에이전트·아티팩트 조회 명령.
 /// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
-/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로만 하므로 그대로다.
+/// 는 요청 경계의 로그인 게이트(C20)가 끝냈으므로 그대로다.
 fn dispatch_skill_command(
     context: &SystemCommandContext<'_>,
     command: &str,
@@ -6385,7 +6737,7 @@ fn dispatch_skill_command(
 /// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
 /// 하나다. 프로젝트 지침의 목록·읽기·발행·연결과 지침 휴지통 명령.
 /// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
-/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로만 하므로 그대로다.
+/// 는 요청 경계의 로그인 게이트(C20)가 끝냈으므로 그대로다.
 fn dispatch_project_instruction_command(
     context: &SystemCommandContext<'_>,
     command: &str,
@@ -6701,6 +7053,28 @@ fn dispatch_project_command(
             let root = project(&args.request.project_path)?;
             to_value(crate::list_project_overlay_sets(app_data_dir, &root)?)
         }
+        // C19-5. 보관된 patch 본문을 사람이 읽는다. 스냅샷 뒤 작업 트리는 HEAD 원본으로
+        // 돌아가므로, 그 변경의 유일한 사본은 앱 데이터의 patch다 — 열 길이 없으면 검사가
+        // 실패했을 때 무엇을 손으로 다시 적어야 하는지 알 수 없다. git을 띄우지 않으므로
+        // 저장소가 잠겨 있어도 답한다.
+        "read_project_overlay_patch" => {
+            let args: RequestEnvelope<crate::ReadProjectOverlayPatchRequest> =
+                parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::read_project_overlay_patch(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        // C19-3. 외부 Git 작업 뒤 재적용을 **내밀 자리가 있는지**만 묻는다. 작업 트리를
+        // 건드리지 않으므로 게이트가 없고 원격 읽기에도 열린다 — 적용 자체는 여전히
+        // 쓰기인 `apply_project_overlay`가 한다.
+        "get_project_overlay_drift" => {
+            let args: RequestEnvelope<crate::ProjectOverlayTarget> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::get_project_overlay_drift(app_data_dir, &root)?)
+        }
         "save_project_overlay_set" => {
             let args: RequestEnvelope<crate::SaveProjectOverlaySetRequest> = parse_params(params)?;
             let root = project(&args.request.project_path)?;
@@ -6729,12 +7103,36 @@ fn dispatch_project_command(
                 &args.request,
             )?)
         }
+        // C19-3/C19-5. 막은 경로 하나 때문에 세트를 통째로 버리지 않도록, 그 경로만 세트와
+        // 보관한 patch에서 덜어낸다. 작업 트리는 바뀌지 않고 이전 patch는 휴지통에 남는다.
+        "exclude_project_overlay_paths" => {
+            let args: RequestEnvelope<crate::ExcludeProjectOverlayPathsRequest> =
+                parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::exclude_project_overlay_paths(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
         // C19-3. 저장해 둔 patch를 작업 트리에 되돌려 넣는다. 검사가 통과하지 못하면
         // 아무것도 적용하지 않고 overlayNeedsResolution 영수증만 돌려준다.
         "apply_project_overlay" => {
             let args: RequestEnvelope<crate::ApplyProjectOverlayRequest> = parse_params(params)?;
             let root = project(&args.request.project_path)?;
             to_value(crate::apply_project_overlay(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        // C19-3. 앱이 시작한 Git 작업(switch·pull·rebase) 뒤에 보관된 overlay를 다시
+        // 넣는다. 외부 Git 작업 뒤의 자동 적용은 여전히 금지이고, 그 자리는 게이트 없는
+        // get_project_overlay_drift가 버튼만 내미는 것으로 끝난다.
+        "reapply_project_overlays" => {
+            let args: RequestEnvelope<crate::ReapplyProjectOverlaysRequest> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::reapply_project_overlays(
                 app_data_dir,
                 &root,
                 &args.request,
@@ -6839,7 +7237,7 @@ fn dispatch_project_command(
 /// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
 /// 하나다. 문서 루트·트리·파일 조회와 문서 자동화 트리거 명령.
 /// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
-/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로만 하므로 그대로다.
+/// 는 요청 경계의 로그인 게이트(C20)가 끝냈으므로 그대로다.
 fn dispatch_document_command(
     context: &SystemCommandContext<'_>,
     command: &str,
@@ -6990,7 +7388,7 @@ fn dispatch_document_command(
 /// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
 /// 하나다. 스케줄러 조회·채팅 실행·사용량 예산과 시스템 워크플로·예약 요청 명령.
 /// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
-/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로만 하므로 그대로다.
+/// 는 요청 경계의 로그인 게이트(C20)가 끝냈으므로 그대로다.
 fn dispatch_scheduler_and_run_command(
     context: &SystemCommandContext<'_>,
     command: &str,
@@ -7302,7 +7700,7 @@ fn dispatch_scheduler_and_run_command(
 /// 외부 플러그인 명령 열넷은 모두 앱 데이터의 레지스트리 하나를 그 자리에서 열어 한 번
 /// 부르는 모양이라, `dispatch_command` 본문에서는 같은 생성 표현이 열네 줄 그대로
 /// 되풀이됐다. 이름 붙은 진입점으로 떼어내 레지스트리를 한 번만 열고, 인가 판정
-/// (`is_host_only_command`·원격 write 목록)은 명령 이름으로 따로 하므로 그대로 둔다.
+/// 는 요청 경계의 로그인 게이트(C20)가 끝냈으므로 그대로 둔다.
 /// 갈래 사슬의 마지막 자리이므로 아는 명령이 아니면 여기서 "지원하지 않는 명령"으로 끝낸다.
 fn dispatch_external_plugin_command(
     context: &SystemCommandContext<'_>,
@@ -7315,7 +7713,7 @@ fn dispatch_external_plugin_command(
         ..
     } = context;
     let registry = crate::ExternalPluginRegistry::new(app_data_dir.to_path_buf());
-    match command {
+    let result = match command {
         // 외부 플러그인 목록은 앱 소유 저장 파일만 읽고 비밀값은 싣지 않는다.
         "get_external_plugins" => to_value(registry.snapshot(chats.plugin_mcp_base().is_some())?),
         "get_external_plugin_tools" => {
@@ -7367,6 +7765,12 @@ fn dispatch_external_plugin_command(
             let args: crate::ExternalPluginIdRequest = parse_params(params)?;
             to_value(registry.begin_oauth(&args.id)?)
         }
+        // 콜백형 OAuth를 브라우저가 이 백엔드와 다른 기기에 있을 때 끝내는 길이다. 대조는
+        // 레지스트리가 하고, 교환·저장은 진행 중인 흐름의 대기 스레드가 한다.
+        "submit_external_plugin_oauth_callback" => {
+            let args: crate::SubmitExternalPluginOAuthCallbackRequest = parse_params(params)?;
+            to_value(registry.submit_oauth_callback(&args.id, &args.callback_url)?)
+        }
         "cancel_external_plugin_oauth" => {
             let args: crate::ExternalPluginIdRequest = parse_params(params)?;
             to_value(registry.cancel_oauth(&args.id)?)
@@ -7378,7 +7782,28 @@ fn dispatch_external_plugin_command(
             to_value(registry.verify(&args.id, &base)?)
         }
         _ => Err(ApiError::not_found("지원하지 않는 명령입니다")),
+    };
+    // P12. 붙을 플러그인이 바뀔 수 있는 명령 뒤에는 Antigravity 전역 등록을 맞춘다. 바뀐 것이
+    // 없으면 설정 두 개를 읽고 끝난다. 도구 정책은 등록이 아니라 프록시의 노출을 바꾸므로
+    // 여기 없다 — 프록시가 요청마다 정책을 다시 읽는다.
+    if result.is_ok()
+        && matches!(
+            command,
+            "register_external_plugin"
+                | "update_external_plugin"
+                | "remove_external_plugin"
+                | "set_external_plugin_enabled"
+                | "set_external_plugin_token"
+                | "cancel_external_plugin_oauth"
+                | "verify_external_plugin"
+        )
+    {
+        crate::antigravity_mcp_sync::sync_in_background(
+            app_data_dir.to_path_buf(),
+            chats.plugin_mcp_base(),
+        );
     }
+    result
 }
 
 fn audited_recovery_command(
@@ -7487,6 +7912,8 @@ impl From<CoreError> for ApiError {
                 AppErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
                 AppErrorKind::NotFound => StatusCode::NOT_FOUND,
                 AppErrorKind::Conflict => StatusCode::CONFLICT,
+                AppErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
+                AppErrorKind::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             };
             return Self {
                 status,
@@ -7726,7 +8153,18 @@ fn error_response(error: ApiError) -> HttpResponse {
         object.insert("code".to_owned(), json!(coded.code()));
         object.insert("params".to_owned(), json!(coded.params()));
     }
-    json_response(error.status, &body)
+    let mut response = json_response(error.status, &body);
+    // 시도 제한(429)은 표준 헤더로도 남은 시간을 알린다.
+    if let Some(retry_after) = error
+        .coded
+        .as_ref()
+        .filter(|coded| coded.kind() == AppErrorKind::RateLimited)
+        .and_then(|coded| coded.params().get("retryAfterSeconds"))
+        .and_then(|value| HeaderValue::from_str(value).ok())
+    {
+        response.headers_mut().insert(RETRY_AFTER, retry_after);
+    }
+    response
 }
 
 fn response(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> HttpResponse {
@@ -8174,6 +8612,13 @@ struct LoginIdArg {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RelayCodexLoginCallbackArg {
+    login_id: String,
+    callback_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SetProviderAccountDisabledArg {
     account_id: String,
     disabled: bool,
@@ -8439,6 +8884,14 @@ struct CypressWorkspaceOptionsRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct CypressWorkspaceModuleDirRequest {
+    id: String,
+    #[serde(default)]
+    module_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CypressAddWorkspaceRequest {
     name: String,
     path: String,
@@ -8553,6 +9006,11 @@ struct ProfileArg {
 struct MarkAllAttentionReadArgs {
     #[serde(default)]
     exclude_profiles: Vec<ChatProfile>,
+    /// 화면에서 숨긴 **대화**만 보존한다. 프로필 전체를 빼면 세션 화면에 보이는 다른 AIA
+    /// 대화도 "모두 읽음"에서 빠지고, 알림 id 로 빼면 마지막 폴링 뒤에 끝난 턴이 새 id 를
+    /// 달고 나와 목록에 보이지도 않은 채 읽음 처리된다. 대화 id 는 그 사이에 바뀌지 않는다.
+    #[serde(default)]
+    exclude_chat_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8668,6 +9126,27 @@ mod tests {
     use super::*;
     use crate::terminal::TerminalSshMode;
     use tempfile::tempdir;
+
+    fn test_login(app_data_dir: &Path) -> LoginAuth {
+        LoginAuth::open(app_data_dir).expect("login auth")
+    }
+
+    fn access_for(channel: AccessChannel) -> RequestAccess {
+        RequestAccess {
+            channel,
+            login_required: LoginRequirement::default(),
+            authenticated: false,
+            session_id: None,
+        }
+    }
+
+    fn local_access() -> RequestAccess {
+        access_for(AccessChannel::LocalBrowser)
+    }
+
+    fn remote_access() -> RequestAccess {
+        access_for(AccessChannel::Remote)
+    }
 
     /// 코드화된 실패는 범주에 맞는 상태로 나가고, 코드와 파라미터가 본문에 함께 실린다.
     #[test]
@@ -9231,7 +9710,10 @@ mod tests {
             backend_port: 4178,
             mode: "local",
             remote: false,
-            writable: true,
+            channel: AccessChannel::LocalBrowser,
+            authenticated: false,
+            login_required: LoginRequirement::default(),
+            headless: false,
         })
         .expect("access status");
         assert_eq!(
@@ -9240,6 +9722,9 @@ mod tests {
         );
         assert_eq!(value.get("storeId").and_then(Value::as_str), Some(store_id));
         assert_eq!(value.get("backendPort").and_then(Value::as_u64), Some(4178));
+        // H10. 데스크톱 셸이 있는 기동은 헤드리스가 아니라고 명시해 내보낸다 — 프런트는
+        // 이 필드 하나로 데스크톱 전용 안내를 접는다.
+        assert_eq!(value.get("headless").and_then(Value::as_bool), Some(false));
         assert_eq!(
             value.get("instanceId").and_then(Value::as_str),
             Some(backend_instance_id())
@@ -9370,10 +9855,7 @@ mod tests {
 
     #[test]
     fn local_ui_cors_preflight_uses_an_exact_origin_and_header_allowlist() {
-        let access = RequestAccess {
-            remote: false,
-            writable: true,
-        };
+        let access = local_access();
         let mut headers = HeaderMap::new();
         headers.insert(ORIGIN, HeaderValue::from_static("http://localhost:1420"));
         headers.insert(
@@ -9429,15 +9911,7 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            local_ui_cors_preflight(
-                &headers,
-                RequestAccess {
-                    remote: true,
-                    writable: true,
-                },
-                4178,
-            )
-            .status(),
+            local_ui_cors_preflight(&headers, remote_access(), 4178,).status(),
             StatusCode::FORBIDDEN
         );
 
@@ -9487,6 +9961,12 @@ mod tests {
     #[test]
     fn classifies_write_commands() {
         assert!(is_write_command("put_doc"));
+        assert!(!is_write_command("get_credential_vault_recovery_status"));
+        assert!(is_write_command("recover_credential_vault"));
+        assert!(is_credential_vault_host_only(
+            "get_credential_vault_recovery_status"
+        ));
+        assert!(is_credential_vault_host_only("recover_credential_vault"));
         // 회차 계획은 예약을 기록하므로 변경 작업이고, 미리보기는 기록이 없어 조회다.
         assert!(is_write_command("plan_usage_paced_runs"));
         assert!(!is_write_command("preview_usage_paced_runs"));
@@ -9495,14 +9975,11 @@ mod tests {
         assert!(is_write_command("patch_session_meta"));
         // 프로젝트 활성 여부는 앱 소유 메타이고 토글로 되돌릴 수 있어 원격 write에 허용한다.
         assert!(is_write_command("set_project_active"));
-        assert!(!is_host_only_command("set_project_active"));
         // C6-6: 폴더 만들기는 변경이지만 호스트 전용이 아니다. 원격 편집 권한은 설정의
         // 스위치 하나로 통일돼 있고, 편집을 허용했으면 폴더 만들기도 그 권한 안이다.
         assert!(is_write_command("create_directory"));
-        assert!(!is_host_only_command("create_directory"));
         // 만들 목록을 미리 보는 조회는 변경이 아니다.
         assert!(!is_write_command("preview_directory_creation"));
-        assert!(!is_host_only_command("preview_directory_creation"));
         assert!(!is_write_command("get_project_registry"));
         assert!(is_write_command("create_session_folder"));
         assert!(is_write_command("record_round_report"));
@@ -9515,8 +9992,6 @@ mod tests {
         assert!(is_write_command("delete_shared_skill"));
         assert!(is_write_command("restore_skill_trash"));
         assert!(is_write_command("purge_skill_trash"));
-        assert!(!is_host_only_command("delete_skill"));
-        assert!(!is_host_only_command("restore_skill_trash"));
         assert!(!is_write_command("check_skill_delete"));
         assert!(!is_write_command("list_skill_trash"));
         assert!(is_write_command("delete_project_instruction_deployment"));
@@ -9527,8 +10002,6 @@ mod tests {
         assert!(is_write_command("purge_instruction_trash"));
         assert!(!is_write_command("check_project_instruction_delete"));
         assert!(!is_write_command("list_instruction_trash"));
-        assert!(!is_host_only_command("delete_shared_project_instruction"));
-        assert!(!is_host_only_command("restore_instruction_trash"));
         assert!(is_write_command("set_system_automation_settings"));
         assert!(is_write_command("request_system_language"));
         assert!(is_write_command("retry_ui_translation"));
@@ -9537,7 +10010,6 @@ mod tests {
         assert!(is_write_command("reset_menu_translation"));
         assert!(is_write_command("translate_resource"));
         assert!(is_write_command("analyze_aia_event"));
-        assert!(is_host_only_command("analyze_aia_event"));
         assert!(is_write_command("cancel_scheduled_run"));
         assert!(is_write_command("mark_chat_attention_read"));
         assert!(is_write_command("mark_all_chat_attention_read"));
@@ -9548,6 +10020,7 @@ mod tests {
         assert!(is_write_command("begin_provider_account_login"));
         assert!(is_write_command("finish_provider_account_login"));
         assert!(is_write_command("cancel_provider_account_login"));
+        assert!(is_write_command("relay_codex_login_callback"));
         assert!(is_write_command("revalidate_provider_account_credential"));
         // 크레딧을 실제로 소비하므로 읽기 전용 원격에서는 막혀야 한다.
         assert!(is_write_command("consume_account_reset_credit"));
@@ -9564,7 +10037,6 @@ mod tests {
         // 아래에서 원격도 쓸 수 있어야 한다(G11). 호스트 전용으로 잠그지 않는다.
         assert!(is_write_command("set_sleep_prevention"));
         assert!(!is_write_command("get_sleep_prevention"));
-        assert!(!is_host_only_command("set_sleep_prevention"));
         assert!(is_write_command("delete_provider_account"));
         assert!(!is_write_command("get_manager_snapshot"));
         assert!(!is_write_command("get_live_chats"));
@@ -9666,7 +10138,6 @@ mod tests {
             "purge_instruction_trash",
         ] {
             assert!(is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
         // 조회와 호환성 검사는 파일을 쓰지 않으므로 원격에서도 허용한다.
         for command in [
@@ -9689,27 +10160,24 @@ mod tests {
             "compare_skill_install",
         ] {
             assert!(!is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
         assert!(is_write_command("set_resource_repository"));
-        assert!(is_host_only_command("set_resource_repository"));
         // Cypress 자동화는 원격 write에 허용된다(C7, 2026-08-29 결정). env 원문 읽기만 쓰기 급.
         for command in [
             "set_cypress_enabled",
             "add_cypress_workspace",
             "install_cypress_module",
+            "verify_cypress_environment",
             "read_cypress_env_file",
             "write_cypress_env_file",
             "run_cypress_spec",
         ] {
             assert!(is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
         // 런처 열기와 중지도 실행과 같은 취급이다. 창이 호스트 화면에만 뜨는 것은 사용성
         // 문제이지 권한 경계가 아니어서, 원격 write에서도 열고 끊을 수 있어야 한다.
         for command in ["open_cypress_runner", "stop_cypress_run"] {
             assert!(is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
         assert!(!is_write_command("read_cypress_workspace_file"));
     }
@@ -9743,11 +10211,9 @@ mod tests {
             "clear_session_cleanup_tombstones",
         ] {
             assert!(is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
         // 상태 조회는 읽기라 원격에서도 조건과 미리보기를 볼 수 있다.
         assert!(!is_write_command("get_session_cleanup_status"));
-        assert!(!is_host_only_command("get_session_cleanup_status"));
     }
 
     #[test]
@@ -9759,21 +10225,16 @@ mod tests {
             "clear_provider_model_caches",
         ] {
             assert!(is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
         // 상태 조회는 읽기 작업이라 원격에서도 CLI 버전과 캐시 불일치를 볼 수 있다.
         assert!(!is_write_command("get_cli_update_status"));
-        assert!(!is_host_only_command("get_cli_update_status"));
         assert!(!is_write_command("get_provider_runtime_counts"));
-        assert!(!is_host_only_command("get_provider_runtime_counts"));
-        assert!(!is_host_only_command("set_active_provider_account"));
     }
 
     #[test]
     fn account_usage_history_is_a_plain_read_command() {
         // 앱 데이터의 파생 이력만 읽으므로 write·host 게이트가 없다.
         assert!(!is_write_command("get_account_usage_history"));
-        assert!(!is_host_only_command("get_account_usage_history"));
     }
 
     #[test]
@@ -9813,17 +10274,19 @@ mod tests {
     }
 
     /// P4(2026-09-30 결정). 등록·편집·토큰 입력·삭제는 원격 write까지 열고, 승인 카드를
-    /// 없애는 도구 정책과 호스트 loopback으로 콜백이 돌아오는 OAuth 시작만 호스트에 남긴다.
+    /// 없애는 도구 정책만 호스트에 남긴다. OAuth 시작은 H03 이후 이름이 아니라 본문의
+    /// 인증 방식으로 갈리므로 이름 목록에서는 빠진다.
     #[test]
     fn external_plugin_oauth_start_and_tool_policy_stay_on_the_host() {
         for command in [
             "set_external_plugin_tool_policy",
             "set_external_plugin_tool_policies",
-            "begin_external_plugin_oauth",
         ] {
             assert!(is_write_command(command), "{command}");
-            assert!(is_host_only_command(command), "{command}");
         }
+        // OAuth 시작과 콜백 붙여넣기는 어느 채널에서나 쓰기 명령이다(H03, 2026-10-11).
+        assert!(is_write_command("begin_external_plugin_oauth"));
+        assert!(is_write_command("submit_external_plugin_oauth_callback"));
         for command in [
             "register_external_plugin",
             "update_external_plugin",
@@ -9834,16 +10297,11 @@ mod tests {
             "verify_external_plugin",
         ] {
             assert!(is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
         assert!(is_write_command("execute_external_plugin_tool"));
-        assert!(is_host_only_command("execute_external_plugin_tool"));
         assert!(!is_write_command("get_external_plugins"));
-        assert!(!is_host_only_command("get_external_plugins"));
         assert!(!is_write_command("get_external_plugin_tools"));
-        assert!(!is_host_only_command("get_external_plugin_tools"));
         assert!(!is_write_command("read_external_plugin_tool"));
-        assert!(!is_host_only_command("read_external_plugin_tool"));
     }
 
     /// C8-6. 두 setter는 쓰기 게이트를 거치되 검증된 설정 파일과 앱 데이터 백업만
@@ -9852,10 +10310,8 @@ mod tests {
     fn claude_settings_c8_commands_are_remote_write_eligible() {
         for command in ["set_claude_plugin_enabled", "set_claude_skill_override"] {
             assert!(is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
         assert!(!is_write_command("get_claude_settings_states"));
-        assert!(!is_host_only_command("get_claude_settings_states"));
     }
 
     /// C13-6. 수집 설정 쓰기는 검증된 설정 파일 한 항목과 앱 데이터 백업만 다루므로 C8과
@@ -9863,9 +10319,7 @@ mod tests {
     #[test]
     fn provider_telemetry_c13_command_is_remote_write_eligible() {
         assert!(is_write_command("set_provider_telemetry_option"));
-        assert!(!is_host_only_command("set_provider_telemetry_option"));
         assert!(!is_write_command("get_provider_telemetry"));
-        assert!(!is_host_only_command("get_provider_telemetry"));
     }
 
     /// 브랜치 규칙은 앱 소유 저장소 한 줄만 바꾸고 공급자 파일에는 닿지 않으므로, 쓰기
@@ -9877,10 +10331,8 @@ mod tests {
             "remove_claude_plugin_branch_rule",
         ] {
             assert!(is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
         assert!(!is_write_command("get_claude_plugin_branch_rules"));
-        assert!(!is_host_only_command("get_claude_plugin_branch_rules"));
     }
 
     /// C10. 데이터베이스 작업이 기존 두 결정점(원격 write 플래그와 호스트 전용 목록)
@@ -9894,35 +10346,25 @@ mod tests {
         // 저장소에 닿지 않아도 호스트가 임의 주소로 나가는 일이라 write 로 묶는다.
         assert!(is_write_command("probe_local_llm_connection"));
         assert!(is_write_command("set_local_llm_connection"));
-        assert!(!is_host_only_command("set_local_llm_connection"));
         assert!(!is_write_command("get_local_llm_connections"));
         assert!(is_write_command("upsert_local_llm_connection"));
         assert!(is_write_command("remove_local_llm_connection"));
         assert!(is_write_command("set_default_local_llm_connection"));
 
         assert!(!is_write_command("get_db_connections"));
-        assert!(!is_host_only_command("get_db_connections"));
         assert!(!is_write_command("list_agent_db_connections"));
-        assert!(!is_host_only_command("list_agent_db_connections"));
         // 등록·삭제는 비밀번호를 받고 보안 저장소를 지우므로 호스트 화면 전용이다.
         assert!(is_write_command("set_db_connection"));
-        assert!(is_host_only_command("set_db_connection"));
         assert!(is_write_command("remove_db_connection"));
-        assert!(is_host_only_command("remove_db_connection"));
         // 토글과 연결 확인은 앱 데이터 안의 변경이라 원격 write에 허용한다.
         assert!(is_write_command("set_db_connection_enabled"));
-        assert!(!is_host_only_command("set_db_connection_enabled"));
         assert!(is_write_command("check_db_connection"));
-        assert!(!is_host_only_command("check_db_connection"));
         // 조회는 원격 읽기 전용에서는 막고(결과에 원문 데이터가 실린다) write 모드에서는
         // 연다. `read_cypress_env_file`과 같은 판단이다.
         assert!(is_write_command("run_db_query"));
-        assert!(!is_host_only_command("run_db_query"));
         // 변경 실행은 다른 시스템의 상태를 바꾸고 되돌리는 방법이 앱 안에 없다.
         assert!(is_write_command("run_db_statement"));
-        assert!(is_host_only_command("run_db_statement"));
         assert!(is_write_command("relay_db_statement"));
-        assert!(is_host_only_command("relay_db_statement"));
     }
 
     /// C17-7. 저장된 비밀값도 결정점이 하나다 — 설정의 원격 편집 스위치(사용자 결정,
@@ -9932,7 +10374,6 @@ mod tests {
     #[test]
     fn saved_secrets_c17_follow_the_single_remote_write_switch() {
         assert!(!is_write_command("list_saved_secrets"));
-        assert!(!is_host_only_command("list_saved_secrets"));
         assert!(crate::system_mcp::system_operation_kind("list_saved_secrets").is_some());
 
         for command in [
@@ -9943,11 +10384,9 @@ mod tests {
             "read_saved_secret_value",
         ] {
             assert!(is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
 
         assert!(is_write_command("read_saved_secret_value"));
-        assert!(!is_host_only_command("read_saved_secret_value"));
 
         for command in [
             "save_secret",
@@ -9963,8 +10402,10 @@ mod tests {
         }
     }
 
-    /// C16. 프로젝트 파일 조회와 git 읽기는 게이트 없는 조회, git 변경은 원격 write에
-    /// 허용하되 push만 호스트 전용이다(2026-09-28 사용자 결정).
+    /// C16. 프로젝트 파일 조회와 git 읽기는 게이트 없는 조회, git 변경은 모두 쓰기 게이트를
+    /// 지나고 원격 write에서 열린다(2026-09-28 사용자 결정). 마지막까지 호스트 전용이던
+    /// push도 2026-10-10 C16-7 개정(헤드리스 백로그 H07)으로 열렸다 — 그래서 이 표면에
+    /// 호스트 전용은 하나도 남지 않았고, 시험은 그것을 **이름으로** 고정한다.
     #[test]
     fn project_git_c16_split_writes_between_remote_and_host_only() {
         for command in [
@@ -9981,7 +10422,6 @@ mod tests {
             "list_project_branch_follows",
         ] {
             assert!(!is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
         for command in [
             "stage_project_git_paths",
@@ -9994,19 +10434,22 @@ mod tests {
             "pull_project_git",
             // 팔로우 저장은 앱 데이터 한 줄이라 원격 write로 열되 게이트는 지난다(B3).
             "set_project_branch_follow",
+            // H07(2026-10-10). push도 원격 write에서 열린다 — 헤드리스 배포에는 "호스트
+            // 화면"이 영원히 없어 호스트 전용이 기능을 통째로 막는 말이 된다. 자격증명은
+            // C16-3 비대화형 규칙이 그대로 막는다.
+            "push_project_git",
         ] {
             assert!(is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
         // 바깥으로 게시하는 push는 되돌릴 방법이 앱 안에 없다.
         assert!(is_write_command("push_project_git"));
-        assert!(is_host_only_command("push_project_git"));
     }
 
     /// C19-4. overlay는 읽기 하나와 쓰기 셋으로 갈리고, **호스트 전용은 하나도 없다**
     /// (2026-10-02 사용자 결정). 초안은 작업 트리를 바꾸는 둘을 C16-7의 push와 같은 부류로
-    /// 보아 호스트 전용으로 제안했으나, push가 호스트 전용인 이유는 호스트 사용자의
-    /// 자격증명으로 **바깥으로** 내보내기 때문이고 overlay는 바깥으로 나가지 않는다.
+    /// 보아 호스트 전용으로 제안했으나, 그때 push를 호스트 전용으로 둔 이유는 호스트
+    /// 사용자의 자격증명으로 **바깥으로** 내보내기 때문이었고 overlay는 바깥으로 나가지
+    /// 않는다(그 push도 2026-10-10 C16-7 개정으로 열렸다).
     ///
     /// 문구가 아니라 일치를 고정한다: 게이트 목록과 호스트 전용 목록을 한쪽만 고치면
     /// 읽기 전용 원격 UI에서 작업 트리가 조용히 되돌아가거나(게이트 누락), 사용자가
@@ -10016,18 +10459,45 @@ mod tests {
         // 세트 장부 조회는 앱 데이터만 읽는다. 재적용 전 검사는 git을 띄우지만 `apply --check`
         // 뿐이라 작업 트리를 바꾸지 않는다 — 게이트에 올리면 읽기 전용 원격 UI가 "적용할 수
         // 있는지"조차 묻지 못한다.
-        for command in ["list_project_overlay_sets", "check_project_overlay_apply"] {
+        // 2026-10-04. 외부 Git 작업 감지(C19-3)를 더하면서 같이 고정한다. 이 조회는
+        // `rev-parse` 한 번으로 기준 HEAD와 지금 HEAD를 견줄 뿐 작업 트리를 바꾸지 않는다.
+        // 게이트에 올리면 읽기 전용 원격 UI가 "지금 overlay가 떠 있는지"조차 모른 채
+        // 브랜치를 옮기게 된다 — overlay가 없애려던 바로 그 상황이다.
+        for command in [
+            "list_project_overlay_sets",
+            "check_project_overlay_apply",
+            "get_project_overlay_drift",
+            // 2026-10-04 신설. 읽기 쪽에 둔다 — patch 파일을 열어 보기만 하고 작업 트리도
+            // 장부도 건드리지 않는다. 쓰기 게이트에 올리면 읽기 전용 원격 UI가 보관된
+            // 변경이 무엇인지 확인조차 못 한 채 적용 여부만 판단하게 된다.
+            "read_project_overlay_patch",
+        ] {
             assert!(!is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
         for command in [
             "save_project_overlay_set",
             "delete_project_overlay_set",
+            // 2026-10-04. 충돌 해결의 "대상 파일 제외"(C19-3). 앱 데이터의 장부와 patch만
+            // 고치고 작업 트리는 건드리지 않으며 이전 patch는 휴지통에 남으므로, 세트
+            // 저장·삭제와 같은 칸이다. 게이트에서 빠지면 읽기 전용 원격 UI가 보관한 patch의
+            // 일부를 조용히 덜어낼 수 있다.
+            "exclude_project_overlay_paths",
             // 작업 트리를 바꾸지만 복구는 권한 경계가 아니라 저장 순서와 영수증이 진다.
             "snapshot_project_overlay",
+            // 2026-10-04. `apply_project_overlay`가 이 파수꾼에서 빠져 있었다. 세 회차 동안
+            // 점검표는 V2.remote 를 통과로 셌지만, `testNamed` 점검은 이 함수의 **이름이
+            // 있는지**만 보지 본문이 무엇을 고정하는지는 보지 않는다. 그래서 overlay 명령
+            // 가운데 **실제로 작업 트리를 바꾸는 유일한 하나**를 아무 시험도 집고 있지
+            // 않았다 — `is_write_command`에서 이 줄을 지워도 전건이 녹색으로 남고, 읽기
+            // 전용 원격 UI가 사용자의 작업 트리를 조용히 되돌릴 수 있게 된다(C19-4, G11).
+            // 저장·삭제·스냅샷만 고정하는 것은 가장 위험한 자리를 비워 둔 것이었다.
+            "apply_project_overlay",
+            // 2026-10-04. 앱이 시작한 Git 작업 뒤의 일괄 재적용(C19-3). 세트마다
+            // apply_project_overlay를 그대로 부르므로 같은 칸에 선다 — 한쪽만 고치면 읽기
+            // 전용 원격 UI의 브랜치 전환이 작업 트리를 바꾸게 된다.
+            "reapply_project_overlays",
         ] {
             assert!(is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
     }
 
@@ -10040,7 +10510,6 @@ mod tests {
         // 목록은 이름·용도·만료만 실리므로 원격 읽기에도 연다.
         for command in ["list_chat_secrets", "list_all_chat_secrets"] {
             assert!(!is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
         // 나머지는 모두 write 게이트 아래 원격에서 쓴다. 호스트 전용은 하나도 남지 않는다.
         for command in [
@@ -10052,74 +10521,50 @@ mod tests {
             "request_chat_secret",
         ] {
             assert!(is_write_command(command), "{command}");
-            assert!(!is_host_only_command(command), "{command}");
         }
         // 값을 그대로 돌려주는 명령은 원격에서 쓸 수 있어도 AIA 카탈로그에는 없다.
         assert!(crate::system_mcp::system_operation_kind("read_chat_secret_value").is_none());
     }
 
-    /// 원격 편집 스위치 자체는 예외다. 원격에서 켤 수 있으면 그 스위치는 아무것도 가르지
-    /// 않는다 — 꺼 둔 상태에서 원격이 먼저 하는 일이 스위치를 켜는 일이 된다(G11).
-    #[test]
-    fn the_remote_write_switch_itself_stays_on_the_host() {
-        assert!(is_write_command("set_remote_write_enabled"));
-        assert!(is_host_only_command("set_remote_write_enabled"));
-    }
-
     #[test]
     fn ssh_keys_c9_writes_are_gated_and_remote_eligible() {
         assert!(!is_write_command("get_ssh_keys"));
-        assert!(!is_host_only_command("get_ssh_keys"));
         assert!(is_write_command("generate_ssh_key"));
-        assert!(!is_host_only_command("generate_ssh_key"));
         // C9-7. 키 삭제는 지우는 게 아니라 ~/.ssh 안 휴지통으로 옮기는 것이라 되돌릴 수
         // 있고, 2026-09-03 결정으로 원격 write에서도 허용한다.
         assert!(is_write_command("delete_ssh_key"));
-        assert!(!is_host_only_command("delete_ssh_key"));
         // C9-6/C9-8. 공개키 본문 조회는 비밀 없는 읽기고, 메모는 앱 데이터만 바꾸므로
         // 원격 write에서도 허용한다.
         assert!(!is_write_command("read_ssh_public_key"));
-        assert!(!is_host_only_command("read_ssh_public_key"));
         assert!(is_write_command("set_ssh_key_note"));
-        assert!(!is_host_only_command("set_ssh_key_note"));
         // C9-10. 엔드포인트 저장과 연결 확인은 write이지만, 2026-09-03 결정으로 원격
         // write에서도 허용한다 — 비밀값 없는 앱 데이터이고 지우면 그대로 돌아간다.
         assert!(is_write_command("set_ssh_key_endpoint"));
-        assert!(!is_host_only_command("set_ssh_key_endpoint"));
         assert!(is_write_command("check_ssh_endpoint"));
-        assert!(!is_host_only_command("check_ssh_endpoint"));
         // C9-14/C9-15. 원격 명령 실행과 파일 업로드는 다른 시스템의 상태를 바꾸고 되돌리는
         // 방법이 앱 안에 없다. 원격 브라우저 UI에는 열지 않고 호스트 화면과 AIA 시스템
         // 인터페이스에서만 닿는다.
         assert!(is_write_command("execute_ssh_command"));
-        assert!(is_host_only_command("execute_ssh_command"));
         // C9-18. 경유 실행도 같은 원격 명령 실행이라 같은 분류다.
         assert!(is_write_command("relay_ssh_command"));
-        assert!(is_host_only_command("relay_ssh_command"));
         assert!(is_write_command("upload_ssh_file"));
-        assert!(is_host_only_command("upload_ssh_file"));
         assert!(is_write_command("download_ssh_file"));
-        assert!(is_host_only_command("download_ssh_file"));
         // C9-17. 허용 목록 영구 추가는 앞으로의 실행을 승인 없이 여는 한 줄이라, 목록을
         // 편집하는 화면과 같은 급으로 호스트 전용이다. 워크플로 단계로도 부를 수 없다 —
         // 그 자리에는 승인 카드를 볼 대화가 없다.
         assert!(is_write_command("allow_ssh_command_permanently"));
-        assert!(is_host_only_command("allow_ssh_command_permanently"));
         assert!(crate::system_workflows::step_operation_is_forbidden(
             "allow_ssh_command_permanently"
         ));
         // C9-12. 열린 엔드포인트 목록은 개인키 경로와 `ssh` 인자만 담은 조회다.
         assert!(!is_write_command("list_agent_ssh_endpoints"));
-        assert!(!is_host_only_command("list_agent_ssh_endpoints"));
     }
 
     #[test]
     fn account_tool_summary_is_a_plain_read_command() {
         // 공급자 홈 설정만 읽고 도구를 실행하지 않으므로 write·host 게이트가 없다.
         assert!(!is_write_command("get_account_tools"));
-        assert!(!is_host_only_command("get_account_tools"));
         assert!(!is_write_command("get_agent_builtin_tools"));
-        assert!(!is_host_only_command("get_agent_builtin_tools"));
     }
 
     #[test]
@@ -10179,13 +10624,14 @@ mod tests {
                     login_id,
                     cols: 120,
                     rows: 30,
+                    codex_method: None,
                 })
             } if login_id == "login-123"
         ));
     }
 
     #[test]
-    fn setup_terminal_open_is_parsed_and_restricted_to_loopback_access() {
+    fn setup_terminal_open_is_parsed() {
         let message =
             Message::text(r#"{"type":"open","request":{"source":"codex","cols":120,"rows":30}}"#);
         let parsed = parse_terminal_message(message).expect("setup terminal open");
@@ -10200,27 +10646,38 @@ mod tests {
                 rows: 30,
             })
         ));
-        assert!(authorize_terminal_open_request(
-            &request,
-            RequestAccess {
-                remote: false,
-                writable: true,
-            },
-        )
-        .is_ok());
-        assert!(authorize_terminal_open_request(
-            &request,
-            RequestAccess {
-                remote: true,
-                writable: true,
-            },
-        )
-        .is_err());
     }
 
-    /// C9-19. SSH 터미널 open은 지문만으로 구분되고, 원격 접근에서는 열리지 않는다.
+    /// L12. 계정 로그인 터미널은 설정 터미널과 달리 원격에서도 열린다. 데스크톱 앱이
+    /// 없는 헤드리스 서버에서 계정을 추가할 수 있는 유일한 경로라, AIA 카탈로그의
+    /// 한계 문구(`system_mcp.rs` INTERFACE_LIMITS)가 이 사실을 그대로 적는다. 여기서
+    /// 호스트 전용으로 바뀌면 그 문구가 거짓이 되므로 같은 변경에서 둘을 함께 고친다.
+    /// C20 뒤로는 원격 쓰기 모드라는 조건 자체가 없다 — 로그인한 채널이면 열린다.
+    /// `RemoteTerminalOpenRequest`는 `untagged`라 본문만으로 변형이 갈리므로, 여기서
+    /// 실제 파싱을 거쳐 `AccountLogin`이 나오는 것까지 확인해 변형 순서 회귀도 잡는다.
     #[test]
-    fn ssh_terminal_open_is_parsed_and_restricted_to_loopback_access() {
+    fn account_login_terminal_open_is_allowed_from_remote_screens() {
+        let message = Message::text(
+            r#"{"type":"open","request":{"loginId":"login-1","cols":100,"rows":30}}"#,
+        );
+        let parsed = parse_terminal_message(message).expect("account login terminal open");
+        let TerminalClientMessage::Open { request } = parsed else {
+            panic!("expected terminal open request");
+        };
+        assert!(matches!(
+            &request,
+            RemoteTerminalOpenRequest::AccountLogin(TerminalAccountLoginRequest {
+                login_id,
+                cols: 100,
+                rows: 30,
+                codex_method: None,
+            }) if login_id == "login-1"
+        ));
+    }
+
+    /// C9-19. 모드를 생략한 SSH 셸. 채널별 제한은 없다 — 로그인 뒤 모든 채널이 같다(G11).
+    #[test]
+    fn ssh_terminal_open_c9_19_parses_the_default_shell_mode() {
         let message = Message::text(
             r#"{"type":"open","request":{"fingerprint":"SHA256:abc","cols":100,"rows":30}}"#,
         );
@@ -10238,28 +10695,11 @@ mod tests {
                 mode: TerminalSshMode::Shell,
             }) if fingerprint == "SHA256:abc"
         ));
-        assert!(authorize_terminal_open_request(
-            &request,
-            RequestAccess {
-                remote: false,
-                writable: true,
-            },
-        )
-        .is_ok());
-        assert!(authorize_terminal_open_request(
-            &request,
-            RequestAccess {
-                remote: true,
-                writable: true,
-            },
-        )
-        .is_err());
     }
 
-    /// C9-20. 공개키 등록 창도 같은 open 메시지로 열리고, 원격 접근 제한을 똑같이 받는다.
-    /// 비밀번호를 칠 수 있는 창이므로 호스트 화면에서만 열려야 한다.
+    /// C9-20. 공개키 등록 모드. 채널별 제한은 없다.
     #[test]
-    fn ssh_key_install_terminal_open_is_parsed_and_restricted_to_loopback_access() {
+    fn ssh_key_install_terminal_open_c9_20_parses_the_install_mode() {
         let message = Message::text(
             r#"{"type":"open","request":{"fingerprint":"SHA256:abc","cols":100,"rows":30,"mode":"installKey"}}"#,
         );
@@ -10274,14 +10714,6 @@ mod tests {
                 ..
             })
         ));
-        assert!(authorize_terminal_open_request(
-            &request,
-            RequestAccess {
-                remote: true,
-                writable: true,
-            },
-        )
-        .is_err());
     }
 
     /// Serve를 443이 아닌 포트에 물리면 브라우저 Origin에 그 포트가 실려 온다. 포트를
@@ -10302,7 +10734,8 @@ mod tests {
             tailscale_host: Some("device.example.ts.net".to_owned()),
             tailscale_user: Some("user@example.com".to_owned()),
             tailscale_serve_port: None,
-            remote_write: true.into(),
+            login: test_login(&data),
+            headless: false,
             session_catalog: test_session_catalog(&data, &directory.path().join("home")),
             terminals: TerminalSupervisor::new(&data).expect("terminal supervisor"),
             chats,
@@ -10335,7 +10768,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_terminal_requires_write_mode_and_exact_origin() {
+    fn remote_terminal_requires_the_exact_origin() {
         let directory = tempdir().expect("temporary directory");
         fs::write(directory.path().join("index.html"), "ok").expect("index file");
         let chats = ChatSupervisor::new();
@@ -10350,7 +10783,8 @@ mod tests {
             tailscale_host: Some("device.example.ts.net".to_owned()),
             tailscale_user: Some("user@example.com".to_owned()),
             tailscale_serve_port: None,
-            remote_write: true.into(),
+            login: test_login(&data),
+            headless: false,
             session_catalog: test_session_catalog(&data, &directory.path().join("home")),
             terminals: TerminalSupervisor::new(&data).expect("terminal supervisor"),
             chats,
@@ -10362,64 +10796,24 @@ mod tests {
         };
         let mut headers = HeaderMap::new();
         headers.insert(ORIGIN, HeaderValue::from_static("http://localhost:1420"));
-        assert!(authorize_terminal(
-            &headers,
-            &config,
-            RequestAccess {
-                remote: false,
-                writable: true,
-            },
-        )
-        .is_ok());
+        assert!(authorize_terminal(&headers, &config, local_access(),).is_ok());
         headers.insert(
             ORIGIN,
             HeaderValue::from_static("https://untrusted.example.com"),
         );
-        assert!(authorize_terminal(
-            &headers,
-            &config,
-            RequestAccess {
-                remote: false,
-                writable: true,
-            },
-        )
-        .is_err());
+        assert!(authorize_terminal(&headers, &config, local_access(),).is_err());
         headers.insert(
             ORIGIN,
             HeaderValue::from_static("https://device.example.ts.net"),
         );
-        assert!(authorize_terminal(
-            &headers,
-            &config,
-            RequestAccess {
-                remote: true,
-                writable: true,
-            },
-        )
-        .is_ok());
+        assert!(authorize_terminal(&headers, &config, remote_access(),).is_ok());
 
         headers.insert(
             ORIGIN,
             HeaderValue::from_static("https://other.example.ts.net"),
         );
-        assert!(authorize_terminal(
-            &headers,
-            &config,
-            RequestAccess {
-                remote: true,
-                writable: true,
-            },
-        )
-        .is_err());
-        assert!(authorize_terminal(
-            &HeaderMap::new(),
-            &config,
-            RequestAccess {
-                remote: true,
-                writable: false,
-            },
-        )
-        .is_err());
+        assert!(authorize_terminal(&headers, &config, remote_access(),).is_err());
+        assert!(authorize_terminal(&HeaderMap::new(), &config, remote_access(),).is_err());
     }
 
     #[test]
@@ -10431,6 +10825,57 @@ mod tests {
             StoredRemoteAccessSettings::default().port,
             DEFAULT_REMOTE_ACCESS_PORT
         );
+    }
+
+    /// H10. 헤드리스 판정은 실제로 파싱된 기동 인자로 고정한다 — 조건 두 개를 상수로
+    /// 복사해 비교하는 시험은 인자 이름이 바뀌어도 통과한다.
+    #[test]
+    fn headless_host_requires_tailscale_host_without_desktop_parent() {
+        let directory = tempdir().expect("temporary directory");
+        fs::write(directory.path().join("index.html"), "ok").expect("index file");
+        let base = [
+            "--static-dir".to_owned(),
+            directory.path().to_string_lossy().into_owned(),
+            "--app-data-dir".to_owned(),
+            directory.path().join("data").to_string_lossy().into_owned(),
+        ];
+        let parsed = |extra: &[&str]| {
+            let args = base
+                .iter()
+                .cloned()
+                .chain(extra.iter().map(|value| (*value).to_owned()));
+            let options = StandaloneServerOptions::from_args(args).expect("standalone options");
+            is_headless_host(options.tailscale_host.as_deref(), options.desktop_shell)
+        };
+        let remote = [
+            "--tailscale-host",
+            "device.example.ts.net",
+            "--tailscale-user",
+            "operator@example.com",
+        ];
+        // NAS 컨테이너: 원격을 받도록 떴고 자기를 띄운 데스크톱 셸이 없다.
+        assert!(parsed(&remote));
+        // L20. 수명 플래그는 판정에 쓰이지 않는다 — 엔트리포인트나 감독자가 컨테이너의
+        // 수명을 stdin에 묶어도 NAS는 여전히 헤드리스다.
+        let supervised: Vec<&str> = remote
+            .iter()
+            .copied()
+            .chain(["--shutdown-on-stdin-eof"])
+            .collect();
+        assert!(parsed(&supervised));
+        // 데스크톱이 띄운 자식 백엔드는 같은 원격 인자를 받아도 호스트 화면이 있다.
+        let desktop_child: Vec<&str> = remote.iter().copied().chain([DESKTOP_SHELL_ARG]).collect();
+        assert!(!parsed(&desktop_child));
+        // 데스크톱 셸이 실제로 주는 조합(소유자 + 수명)도 헤드리스가 아니다.
+        let desktop_child_full: Vec<&str> = remote
+            .iter()
+            .copied()
+            .chain([DESKTOP_SHELL_ARG, "--shutdown-on-stdin-eof"])
+            .collect();
+        assert!(!parsed(&desktop_child_full));
+        // 원격 인자 없이 손으로 띄운 로컬 서버는 헤드리스가 아니다.
+        assert!(!parsed(&[]));
+        assert!(!parsed(&[DESKTOP_SHELL_ARG]));
     }
 
     #[test]
@@ -10553,34 +10998,6 @@ mod tests {
         );
     }
 
-    /// 기동 인자는 명시했을 때만 저장된 설정을 덮어쓴다. 아무것도 주지 않으면
-    /// 설정 화면의 값이 그대로 산다.
-    #[test]
-    fn remote_write_arguments_are_an_explicit_override_of_the_stored_setting() {
-        let directory = tempdir().expect("temporary directory");
-        fs::write(directory.path().join("index.html"), "ok").expect("index file");
-        let base_args = [
-            "--static-dir".to_owned(),
-            directory.path().to_string_lossy().into_owned(),
-            "--app-data-dir".to_owned(),
-            directory.path().join("data").to_string_lossy().into_owned(),
-        ];
-        let parse = |extra: &[&str]| {
-            StandaloneServerOptions::from_args(
-                base_args
-                    .iter()
-                    .cloned()
-                    .chain(extra.iter().map(|value| (*value).to_owned())),
-            )
-            .expect("standalone options")
-            .remote_write
-        };
-
-        assert_eq!(parse(&[]), None);
-        assert_eq!(parse(&["--remote-write"]), Some(true));
-        assert_eq!(parse(&["--no-remote-write"]), Some(false));
-    }
-
     #[cfg(unix)]
     #[test]
     fn linux_app_data_prefers_an_absolute_xdg_data_home() {
@@ -10593,6 +11010,39 @@ mod tests {
             linux_app_data_dir(Some("relative/path".into()), Some("/home/user".into()))
                 .expect("HOME fallback"),
             PathBuf::from("/home/user/.local/share/com.shinc.agentmanager")
+        );
+    }
+
+    #[test]
+    fn cli_app_data_dir_prefers_flag_then_backend_env_then_platform_default() {
+        let unused = || -> Result<PathBuf, String> { panic!("기본값을 보면 안 된다") };
+        assert_eq!(
+            resolve_cli_app_data_dir(Some(PathBuf::from("/flag")), Some("/env".into()), unused)
+                .expect("flag"),
+            PathBuf::from("/flag")
+        );
+        assert_eq!(
+            resolve_cli_app_data_dir(None, Some("/data".into()), unused).expect("env"),
+            PathBuf::from("/data")
+        );
+
+        let directory = tempdir().expect("temporary directory");
+        let default_dir = directory.path().to_path_buf();
+        // 상대 경로 환경값은 대화의 작업 폴더를 가리키므로 버리고 기본값으로 간다.
+        let error =
+            resolve_cli_app_data_dir(None, Some("relative".into()), || Ok(default_dir.clone()))
+                .expect_err("백엔드가 쓰지 않은 기본 폴더");
+        assert!(error.to_string().contains("--app-data-dir"));
+
+        fs::write(
+            crate::system_skills::session_read_cli_pointer_path(&default_dir),
+            "{}",
+        )
+        .expect("pointer");
+        assert_eq!(
+            resolve_cli_app_data_dir(None, None, || Ok(default_dir.clone()))
+                .expect("pointer present"),
+            default_dir
         );
     }
 
@@ -10610,67 +11060,6 @@ mod tests {
         assert!(loaded.enabled);
         assert_eq!(loaded.port, 5217);
         assert!(loaded.managed_serve);
-    }
-
-    /// 원격에 데스크톱과 같은 변경 권한을 줄지는 변경 작업이면서 호스트 전용이다.
-    /// 원격이 자기 권한 범위를 정하는 자리를 만들지 않는다.
-    #[test]
-    fn remote_write_toggle_is_write_gated_and_host_only() {
-        assert!(is_write_command("set_remote_write_enabled"));
-        assert!(is_host_only_command("set_remote_write_enabled"));
-    }
-
-    /// 토글은 저장된 설정과 실행 중인 백엔드를 함께 바꿔야 한다. 하나만 바뀌면
-    /// 화면이 보여 주는 값과 실제 권한이 갈라진다.
-    #[test]
-    fn remote_write_toggle_changes_the_stored_setting_and_the_running_backend() {
-        let directory = tempdir().expect("temporary directory");
-        let service = ServiceEndpoint {
-            port: 5217,
-            tailscale_host: Some("device.example.ts.net".to_owned()),
-            remote_write: true.into(),
-        };
-
-        let status =
-            set_remote_write(directory.path(), &service, false).expect("disable remote write");
-
-        assert!(!status.remote_write);
-        assert!(!service.remote_write.get());
-        assert!(
-            !crate::load_backend_service_settings(directory.path())
-                .expect("stored settings")
-                .remote_write
-        );
-        set_remote_write(directory.path(), &service, true).expect("enable remote write");
-        assert!(service.remote_write.get());
-        assert!(
-            crate::load_backend_service_settings(directory.path())
-                .expect("stored settings")
-                .remote_write
-        );
-    }
-
-    /// 한 프로세스가 여러 종단점(요청 처리, 워크플로 실행기, 시스템 MCP)을 들고 있어도
-    /// 원격 write 판정은 하나여야 한다. 기동 때 복제한 핸들이 갈라지면 토글이 일부
-    /// 경로에만 걸린다.
-    #[test]
-    fn remote_write_flag_is_shared_by_every_service_endpoint() {
-        let flag = RemoteWriteFlag::new(true);
-        let request_endpoint = ServiceEndpoint {
-            port: 5217,
-            tailscale_host: None,
-            remote_write: flag.clone(),
-        };
-        let executor_endpoint = ServiceEndpoint {
-            port: 5217,
-            tailscale_host: None,
-            remote_write: flag.clone(),
-        };
-
-        request_endpoint.remote_write.set(false);
-
-        assert!(!executor_endpoint.remote_write.get());
-        assert!(!flag.get());
     }
 
     #[test]
@@ -10735,7 +11124,8 @@ mod tests {
             tailscale_host: Some("device.example.ts.net".to_owned()),
             tailscale_user: Some("user@example.com".to_owned()),
             tailscale_serve_port: None,
-            remote_write: true.into(),
+            login: test_login(&data),
+            headless: false,
             session_catalog: test_session_catalog(&data, &directory.path().join("home")),
             terminals,
             chats,
@@ -10772,7 +11162,8 @@ mod tests {
             tailscale_host: Some("device.example.ts.net".to_owned()),
             tailscale_user: Some("user@example.com".to_owned()),
             tailscale_serve_port: None,
-            remote_write: true.into(),
+            login: test_login(&data),
+            headless: false,
             session_catalog: test_session_catalog(&data, &directory.path().join("home")),
             terminals,
             chats,
@@ -10905,5 +11296,240 @@ mod tests {
         assert!(RemoteAccessPhase::Error.is_error());
 
         assert!(RemoteAccessPhase::from_str("unknown").is_err());
+    }
+
+    /// C20. 루프백 요청의 채널은 Origin이 정하고, Origin이 없으면 브라우저만 붙이는
+    /// `Sec-Fetch-*`로 브라우저와 네이티브 호출자를 가른다.
+    #[test]
+    fn loopback_channel_is_classified_by_origin_then_browser_markers() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(classify_loopback_channel(&headers), AccessChannel::Native);
+        headers.insert(ORIGIN, HeaderValue::from_static("tauri://localhost"));
+        assert_eq!(classify_loopback_channel(&headers), AccessChannel::Desktop);
+        headers.insert(ORIGIN, HeaderValue::from_static("http://tauri.localhost"));
+        assert_eq!(classify_loopback_channel(&headers), AccessChannel::Desktop);
+        headers.insert(ORIGIN, HeaderValue::from_static("http://127.0.0.1:4178"));
+        assert_eq!(
+            classify_loopback_channel(&headers),
+            AccessChannel::LocalBrowser
+        );
+        headers.insert(ORIGIN, HeaderValue::from_static("http://localhost:1420"));
+        assert_eq!(
+            classify_loopback_channel(&headers),
+            AccessChannel::LocalBrowser
+        );
+        headers.remove(ORIGIN);
+        headers.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert_eq!(
+            classify_loopback_channel(&headers),
+            AccessChannel::LocalBrowser
+        );
+        headers.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        assert_eq!(classify_loopback_channel(&headers), AccessChannel::Desktop);
+    }
+
+    /// C20. 세션 토큰은 헤더가 우선이고, 없을 때만 쿼리의 `session`을 본다.
+    #[test]
+    fn session_token_comes_from_the_header_then_the_query() {
+        let mut headers = HeaderMap::new();
+        assert!(session_token_from_request(&headers, None).is_none());
+        assert_eq!(
+            session_token_from_request(&headers, Some("a=1&session=abc&b=2"))
+                .map(|t| t.to_string()),
+            Some("abc".to_owned())
+        );
+        assert!(session_token_from_request(&headers, Some("session=")).is_none());
+        headers.insert(LOGIN_SESSION_HEADER, HeaderValue::from_static(" hdr "));
+        assert_eq!(
+            session_token_from_request(&headers, Some("session=abc")).map(|t| t.to_string()),
+            Some("hdr".to_owned())
+        );
+    }
+
+    /// C20. 로그인 게이트는 요구가 있는 채널의 `/api/*`만 막고, 정적 파일·접근 상태·로그인·
+    /// 로그아웃·preflight는 연다.
+    #[test]
+    fn login_gate_opens_only_the_login_screen_paths() {
+        let required = RequestAccess {
+            channel: AccessChannel::Remote,
+            login_required: LoginRequirement {
+                password: true,
+                otp: false,
+            },
+            authenticated: false,
+            session_id: None,
+        };
+        for (method, path) in [
+            (Method::GET, "/"),
+            (Method::GET, "/assets/app.js"),
+            (Method::GET, "/sw.js"),
+            (Method::GET, "/api/access"),
+            (Method::POST, "/api/login"),
+            (Method::POST, "/api/logout"),
+            (Method::OPTIONS, "/api/invoke/put_doc"),
+        ] {
+            assert!(enforce_login_for(&method, path, required).is_ok(), "{path}");
+        }
+        for (method, path) in [
+            (Method::POST, "/api/invoke/put_doc"),
+            (Method::POST, "/api/invoke/get_manager_snapshot"),
+            (Method::GET, "/api/chat"),
+            (Method::GET, "/api/session-image/x/y"),
+        ] {
+            let error = enforce_login_for(&method, path, required).expect_err(path);
+            assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+            let coded = error.coded.expect("coded");
+            assert_eq!(coded.code(), "LOGIN_REQUIRED");
+            assert_eq!(
+                coded.params().get("password").map(String::as_str),
+                Some("true")
+            );
+            assert_eq!(coded.params().get("otp").map(String::as_str), Some("false"));
+        }
+        let authenticated = RequestAccess {
+            authenticated: true,
+            ..required
+        };
+        assert!(enforce_login_for(&Method::POST, "/api/invoke/put_doc", authenticated).is_ok());
+        let nothing_required = RequestAccess {
+            login_required: LoginRequirement::default(),
+            ..required
+        };
+        assert!(enforce_login_for(&Method::POST, "/api/invoke/put_doc", nothing_required).is_ok());
+    }
+
+    /// C20. 세션은 발급한 채널에 묶인다 — 원격 세션은 원격에서만, 루프백 세션은 두 루프백
+    /// 채널에서 쓴다. 네이티브 호출자는 세션 없이도 요구가 없다.
+    #[test]
+    fn sessions_resolve_per_channel_and_natives_need_no_login() {
+        let directory = tempdir().expect("temporary directory");
+        let login = test_login(directory.path());
+        login
+            .set_password(
+                LoginChannel::Desktop,
+                Some("shin"),
+                "password-123",
+                &Reauth::default(),
+            )
+            .expect("password");
+        login
+            .set_channel_requirement(LoginChannel::Remote, LoginMethod::Password, true)
+            .expect("remote requires password");
+        login
+            .set_channel_requirement(LoginChannel::LocalBrowser, LoginMethod::Password, true)
+            .expect("local browser requires password");
+        let remote = login
+            .authenticate(
+                LoginChannel::Remote,
+                Some("shin"),
+                Some("password-123"),
+                None,
+                "",
+            )
+            .expect("remote session");
+        let local = login
+            .authenticate(
+                LoginChannel::LocalBrowser,
+                Some("shin"),
+                Some("password-123"),
+                None,
+                "",
+            )
+            .expect("local session");
+
+        let access = resolve_access(&login, AccessChannel::Remote, Some(&remote.token));
+        assert!(access.authenticated && access.login_required.password);
+        assert_eq!(
+            access.session_id.map(|id| id.to_string()),
+            Some(remote.id.clone())
+        );
+        assert!(!resolve_access(&login, AccessChannel::Remote, Some(&local.token)).authenticated);
+        assert!(!resolve_access(&login, AccessChannel::Desktop, Some(&remote.token)).authenticated);
+        assert!(resolve_access(&login, AccessChannel::Desktop, Some(&local.token)).authenticated);
+        assert!(
+            resolve_access(&login, AccessChannel::LocalBrowser, Some(&local.token)).authenticated
+        );
+        assert!(!resolve_access(&login, AccessChannel::Remote, Some("not-a-token")).authenticated);
+        assert!(!resolve_access(&login, AccessChannel::Remote, None).authenticated);
+
+        let native = resolve_access(&login, AccessChannel::Native, None);
+        assert!(!native.login_required.any());
+        assert!(native.login_satisfied());
+        // 데스크톱 채널은 요구가 없으므로 세션 없이도 만족한다.
+        assert!(resolve_access(&login, AccessChannel::Desktop, None).login_satisfied());
+    }
+
+    /// C20 전환기. 예전 원격 편집 플래그는 받되 아무것도 바꾸지 않고, `--reset-login`은
+    /// 파싱 뒤의 앱 데이터 경로에서 로그인 파일만 지운다.
+    #[test]
+    fn remote_write_flags_are_accepted_and_ignored() {
+        let directory = tempdir().expect("temporary directory");
+        fs::write(directory.path().join("index.html"), "ok").expect("index file");
+        let data = directory.path().join("data");
+        for flag in ["--remote-write", "--no-remote-write"] {
+            let options = StandaloneServerOptions::from_args(
+                [
+                    "--static-dir",
+                    &directory.path().to_string_lossy(),
+                    "--app-data-dir",
+                    &data.to_string_lossy(),
+                    flag,
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .expect(flag);
+            assert_eq!(options.port, DEFAULT_REMOTE_ACCESS_PORT);
+        }
+        assert!(!data
+            .join(crate::login_auth::LOGIN_SETTINGS_FILE_NAME)
+            .exists());
+    }
+
+    /// 인증 뒤에는 모든 채널이 같은 권한이다. 로그인 설정 명령은 분류표에만 오르고 AIA
+    /// 카탈로그에는 없다.
+    #[test]
+    fn login_commands_are_classified_but_not_cataloged() {
+        for command in [
+            "set_login_user_id",
+            "set_login_password",
+            "clear_login_password",
+            "begin_login_otp_setup",
+            "confirm_login_otp_setup",
+            "disable_login_otp",
+            "set_login_channel_requirement",
+            "revoke_login_session",
+            "revoke_all_login_sessions",
+        ] {
+            assert!(is_write_command(command), "{command}");
+            assert!(
+                crate::system_mcp::system_operation_kind(command).is_none(),
+                "{command}는 AIA 카탈로그에 없어야 한다"
+            );
+        }
+        assert!(!is_write_command("get_login_settings"));
+        assert!(!is_write_command("list_login_sessions"));
+    }
+
+    /// C20-7. 떠 있는 백엔드 아래에서 지우면 그 백엔드가 메모리의 설정으로 파일을 다시
+    /// 쓴다. 소유권을 잡지 못하면 아무것도 지우지 않고 거절해야 한다.
+    #[test]
+    fn c20_7_reset_login_refuses_while_a_backend_owns_the_store() {
+        let directory = tempdir().expect("tempdir");
+        let settings = directory
+            .path()
+            .join(crate::login_auth::LOGIN_SETTINGS_FILE_NAME);
+        fs::write(&settings, "{}").expect("settings");
+
+        let held = crate::BackendOwnershipLease::acquire(directory.path()).expect("owner");
+        let error = reset_login_with_ownership(directory.path()).expect_err("refused");
+        assert!(error.contains("이미 실행 중"), "{error}");
+        assert!(
+            settings.is_file(),
+            "a refused reset must not delete anything"
+        );
+        // 성공 경로는 실제 OS 키체인의 OTP 항목을 지우므로 시험하지 않는다.
+        drop(held);
     }
 }

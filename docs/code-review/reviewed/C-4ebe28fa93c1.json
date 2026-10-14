@@ -1,0 +1,26 @@
+{
+  "itemId": "C-4ebe28fa93c1",
+  "kind": "commit",
+  "ref": "4ebe28fa93c10d50223ca2c608c5ec2d5895f28c",
+  "reviewedAt": "2026-10-06T00:00:00Z",
+  "lane": "L06",
+  "source": "claude",
+  "verdict": "결함 1건 / 수정 0건 (이력이라 고칠 수 없음)",
+  "axes": {
+    "정확성": "장부 내용은 맞다. 커밋이 적은 queue.json 의 counts 가 그 트리의 실제 수와 일치한다 — reviewed/ 의 .json 은 31개(.gitkeep 제외)로 reviewed:31 과 같고, 커밋 219 · 모듈 234 의 합이 remaining 453 과 같다. 바꾼 reviewed/C-175c75ac0bd3.json 의 ref 는 실제 커밋 해시이고 itemId 는 파일 이름과 같아 러너가 이중으로 세지 않는다.",
+    "보안 불변식": "해당 없음. docs/code-review 아래 JSON 두 개만 바꾸며 2절 G1~G11 이 다루는 자격증명·공급자 소유 저장소·셸 문자열·경로 정규화·쓰기 게이트에도, 3절 C 직접변경 예외에도 닿지 않는다.",
+    "계약": "결함 1건(F-docs-code-review-readme-md-commits-6f902967 의 여섯 번째 관측). 더한 reviewed/C-175c75ac0bd3.json 의 `commits` 가 빈 배열이라 README '장부 파일의 모양'이 요구하는 값을 채우지 못한다. 이미 열려 있는 결함이라 새로 만들지 않고 occurrences 에 덧붙였다. 같은 주제의 결정이 round-383bc1ee75694815bbb5add11d45bfc9 에 열려 있어 다시 올리지 않았다.",
+    "검증 없음": "문서 장부 변경이라 제품 시험이 걸리지 않는다. 커밋이 주장하는 사실(해시·장부 수·ledgerDuplicates 0)은 러너와 git ls-tree 로 직접 대조해 확인했다.",
+    "단순화·중복": "결함 없음. 기존 열린 결함을 새 finding 으로 복제하지 않았고 findingId 는 규약대로 생성기에서 받았다."
+  },
+  "findings": [
+    "F-docs-code-review-reviewed-c-175c75ac0bd3-json-co-fd0f34ac",
+    "F-docs-code-review-readme-md-commits-6f902967"
+  ],
+  "verification": [
+    "git show 4ebe28fa93c1 / git ls-tree -r 4ebe28fa93c1 docs/code-review 로 queue.json counts 대조",
+    "git log -1 --pretty='%(trailers:key=Co-Authored-By)' 4ebe28fa93c1 (빈 줄) 대 7602d309·0fc5b0eb·2b6743ed·3ecad96b (공동저자 반환)",
+    "node --experimental-strip-types scripts/code-review-queue.mjs --json (ledgerDuplicates 0)"
+  ],
+  "commits": []
+}

@@ -56,7 +56,13 @@ const CHECK_CONNECT_TIMEOUT_SECONDS: u32 = 10;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 /// 확인은 원격에서 아무것도 바꾸지 않는 고정 명령 하나만 돌린다. 사용자·에이전트가 준
 /// 문자열을 원격에서 실행하는 경로는 이 어댑터에 없다(G9).
-const CHECK_REMOTE_COMMAND: &str = "true";
+///
+/// `true` 는 POSIX 셸 전제라 **원격이 Windows면 인증에 성공하고도 확인이 실패한다** —
+/// `cmd.exe` 에 `true` 가 없어 종료 코드 1과 "내부 또는 외부 명령이 아닙니다"가 돌아오고,
+/// 그 문구는 CP949 라 깨져 보이기까지 한다. `exit` 는 `cmd.exe`·PowerShell·POSIX 셸 모두의
+/// 내장 명령이라 어느 쪽에서도 출력 없이 0으로 끝난다. 이 확인이 보려는 것은 셸의 종류가
+/// 아니라 접속·인증이 되는지뿐이다.
+const CHECK_REMOTE_COMMAND: &str = "exit";
 const MAX_CHECK_MESSAGE_CHARS: usize = 400;
 const MAX_COMMAND_RULES: usize = 64;
 const MAX_COMMAND_RULE_CHARS: usize = 120;
@@ -159,6 +165,14 @@ pub struct SshEndpointView {
     /// 화면이 한 번 더 확인하며, 기본은 꺼짐이라 예전 저장본은 그대로 꺼진 상태로 읽힌다.
     #[serde(default)]
     pub unrestricted_commands: bool,
+    /// 프로젝트 git의 **네트워크 작업에만** 이 키를 신원으로 넘길지(C16-10). 앞의 네 토글과
+    /// 달리 이것은 에이전트 권한이 아니라 사용자 자신의 git이 쓰는 키라, C9-19의 대화형
+    /// 터미널과 같은 이유로 `agent_enabled`에 묶지 않는다 — 에이전트에게 서버를 열어 주지
+    /// 않은 사람도 자기 저장소에는 push할 수 있어야 한다. 개인키가 있어야 한다는 조건만
+    /// 공유한다. 기기 전체에서 한 키만 켤 수 있다(여러 키가 켜져 있으면 어느 신원이 쓰였는지
+    /// 영수증만으로 되짚을 수 없다). 기본은 꺼짐이라 예전 저장본은 그대로 꺼진 상태로 읽힌다.
+    #[serde(default)]
+    pub project_git_enabled: bool,
     pub updated_at: i64,
 }
 
@@ -282,6 +296,8 @@ pub struct SetSshKeyEndpointRequest {
     pub terminal_enabled: bool,
     #[serde(default)]
     pub unrestricted_commands: bool,
+    #[serde(default)]
+    pub project_git_enabled: bool,
 }
 
 /// 연결 확인 결과. 원격에서 무엇도 바꾸지 않았고, 개인키 내용은 어느 필드에도 없다.
@@ -417,6 +433,13 @@ fn set_ssh_key_endpoint_with(
         None
     } else {
         let transfer_root = validate_endpoint_options(request, key.has_private_key)?;
+        // C16-10. 감쌀 수 없는 경로는 **켜는 자리에서** 거절한다. 쓰는 자리에서만 거절하면
+        // 토글은 저장된 채로 켜져 보이고 git은 말없이 신원 없이 붙는다 — 사용자가 읽을 수
+        // 있는 실패가 어디에도 남지 않는다.
+        if request.project_git_enabled {
+            let identity = PathBuf::from(&key.path).with_extension("");
+            ssh_command_line("ssh", &identity.to_string_lossy())?;
+        }
         Some(SshEndpointView {
             host: validate_host(host)?.to_owned(),
             port: validate_port(request.port)?,
@@ -428,6 +451,7 @@ fn set_ssh_key_endpoint_with(
             transfer_root,
             terminal_enabled: request.terminal_enabled,
             unrestricted_commands: request.unrestricted_commands,
+            project_git_enabled: request.project_git_enabled,
             updated_at: now_ms(),
         })
     };
@@ -440,6 +464,19 @@ fn set_ssh_key_endpoint_with(
             Some(endpoint) => {
                 if !endpoints.contains_key(&fingerprint) && endpoints.len() >= MAX_ENDPOINTS {
                     return Err(CoreError::TooLarge(MAX_ENDPOINTS as u64));
+                }
+                // C16-10. git 원격용은 기기 전체에서 한 키다. 조용히 다른 키를 꺼 버리면
+                // 사용자가 끈 적 없는 설정이 사라지므로, 켜져 있는 키를 알려 주고 거절한다.
+                if endpoint.project_git_enabled {
+                    let other = endpoints
+                        .iter()
+                        .find(|(other, saved)| **other != fingerprint && saved.project_git_enabled)
+                        .map(|(other, _)| other.clone());
+                    if let Some(other) = other {
+                        return Err(CoreError::Conflict(format!(
+                            "git 원격용으로 이미 다른 키({other})가 켜져 있습니다. 그 키를 먼저 끄세요"
+                        )));
+                    }
                 }
                 endpoints.insert(fingerprint.clone(), endpoint);
             }
@@ -462,6 +499,13 @@ fn validate_endpoint_options(
     if request.agent_enabled && !has_private_key {
         return Err(CoreError::Conflict(
             "개인키가 없는 공개키는 에이전트 사용을 켤 수 없습니다".to_owned(),
+        ));
+    }
+    // C16-10. git 원격용은 에이전트 권한이 아니라 사용자의 git이 쓸 신원이므로
+    // `require_agent_use`를 거치지 않는다. 개인키 조건만 같다.
+    if request.project_git_enabled && !has_private_key {
+        return Err(CoreError::Conflict(
+            "개인키가 없는 공개키는 git 원격용으로 켤 수 없습니다".to_owned(),
         ));
     }
     // 세 기능 모두 에이전트가 실행할 때만 의미가 있다. 꺼진 서버에 종속 기능만 켜 두면
@@ -850,6 +894,81 @@ fn load_endpoints(app_data_dir: &Path) -> Result<BTreeMap<String, SshEndpointVie
     load_sidecar::<SshEndpointStore>(app_data_dir)
 }
 
+/// C16-10. 프로젝트 git의 네트워크 작업이 쓸 신원 하나.
+#[derive(Clone)]
+pub(crate) struct ProjectGitIdentity {
+    /// `ssh`에 `-i`로 넘길 개인키 경로. 영수증에서 가릴 때도 이 문자열을 그대로 쓴다.
+    pub(crate) identity_path: String,
+    /// `GIT_SSH_COMMAND`에 넣을 값. git이 셸 없이 자기 분해기로 나누므로 경로를 따옴표로 감싼다.
+    pub(crate) ssh_command: String,
+}
+
+/// C16-10. "git 원격용"을 켜 둔 키가 있으면 그 신원을 만들어 준다.
+///
+/// 켜 둔 키가 없거나 개인키가 사라졌으면 `None`이고, 그때 git은 지금까지처럼 자기 기본값으로
+/// 붙는다 — 이 자리는 인증을 **더해 줄** 뿐 빼앗지 않는다. 개인키는 열지 않고 존재만 본다(G4).
+pub(crate) fn project_git_identity(
+    app_data_dir: &Path,
+) -> Result<Option<ProjectGitIdentity>, CoreError> {
+    project_git_identity_with(&home_dir()?, app_data_dir)
+}
+
+fn project_git_identity_with(
+    home: &Path,
+    app_data_dir: &Path,
+) -> Result<Option<ProjectGitIdentity>, CoreError> {
+    // 켜 둔 키가 없는 것이 보통이므로 앱 데이터 한 번만 읽고 끝낸다. `~/.ssh` 훑기는
+    // 실제로 켜 둔 키가 있을 때만 치른다.
+    let endpoints = load_endpoints(app_data_dir)?;
+    if !endpoints
+        .values()
+        .any(|endpoint| endpoint.project_git_enabled)
+    {
+        return Ok(None);
+    }
+    let snapshot = crate::ssh_keys::snapshot_with_metadata(home, app_data_dir)?;
+    let Some(key) = snapshot.keys.iter().find(|key| {
+        key.endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.project_git_enabled)
+    }) else {
+        return Ok(None);
+    };
+    if !key.has_private_key {
+        return Ok(None);
+    }
+    let identity = PathBuf::from(&key.path).with_extension("");
+    if !private_key_present(&identity)? {
+        return Ok(None);
+    }
+    let identity_path = identity.to_string_lossy().into_owned();
+    let executable = crate::providers::resolve_named_executable(&["ssh"])?;
+    let ssh_command = ssh_command_line(&executable.to_string_lossy(), &identity_path)?;
+    Ok(Some(ProjectGitIdentity {
+        identity_path,
+        ssh_command,
+    }))
+}
+
+/// `GIT_SSH_COMMAND` 한 줄. git은 이 값을 **셸에 넘긴다** — `GIT_SSH`와 달리 추가 인자를
+/// 적을 수 있는 것이 그 때문이다. 그래서 공백·`$`·`;` 같은 글자가 든 경로가 그대로 명령이
+/// 되지 않도록 작은따옴표로 감싼다. 그 안에서 무력해지지 않는 것은 작은따옴표 자신뿐이라
+/// 그것과 제어문자만 거절하면 된다 — 조용히 잘린 인자를 넘기는 것보다 켜는 자리에서
+/// 실패하는 편이 낫다(G9).
+fn ssh_command_line(executable: &str, identity_path: &str) -> Result<String, CoreError> {
+    for value in [executable, identity_path] {
+        if value.contains('\'') || value.chars().any(char::is_control) {
+            return Err(CoreError::InvalidInput(
+                "SSH 실행 파일이나 개인키 경로에 따옴표·제어문자가 있어 git 신원으로 쓸 수 없습니다"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(format!(
+        "'{executable}' -i '{identity_path}' -o IdentitiesOnly=yes -o BatchMode=yes"
+    ))
+}
+
 /// 모든 접속에 공통으로 붙는 인자. 저장한 키만 쓰게 하고(`IdentitiesOnly`), 어떤 경로에서도
 /// 암호 프롬프트로 멈추지 않게 한다(`BatchMode`).
 pub(crate) fn connect_args(identity: &str, port: &str) -> Vec<String> {
@@ -1115,16 +1234,7 @@ fn parse_list_args(args: impl Iterator<Item = String>) -> Result<std::path::Path
             other => return Err(unknown_argument(other, "")),
         }
     }
-    resolve_cli_app_data_dir(app_data_dir)
-}
-
-fn resolve_cli_app_data_dir(
-    app_data_dir: Option<std::path::PathBuf>,
-) -> Result<std::path::PathBuf, CoreError> {
-    match app_data_dir {
-        Some(path) => Ok(path),
-        None => crate::remote::default_app_data_dir().map_err(CoreError::InvalidInput),
-    }
+    crate::remote::cli_app_data_dir(app_data_dir)
 }
 
 /// C9-18. 에이전트가 자기 셸에서 `AGENT_MANAGER_CHAT_ID`를 물려받아 부르는 환경 변수.
@@ -1194,7 +1304,7 @@ impl SshExecCliOptions {
             fingerprint,
             command,
             timeout_seconds,
-            app_data_dir: resolve_cli_app_data_dir(app_data_dir)?,
+            app_data_dir: crate::remote::cli_app_data_dir(app_data_dir)?,
             chat_id: chat_id.filter(|value| !value.trim().is_empty()),
         })
     }
@@ -1260,12 +1370,18 @@ mod tests {
     use base64::Engine as _;
 
     fn public_key_line(comment: &str) -> String {
+        public_key_line_with_body(comment, 7)
+    }
+
+    /// 지문은 키 본문에서 나오고 주석에서 나오지 않는다. 키 둘이 필요한 시험은 본문을
+    /// 달리 해야 서로 다른 지문을 얻는다.
+    fn public_key_line_with_body(comment: &str, body: u8) -> String {
         let key_type = "ssh-ed25519";
         let mut blob = Vec::new();
         blob.extend_from_slice(&(key_type.len() as u32).to_be_bytes());
         blob.extend_from_slice(key_type.as_bytes());
         blob.extend_from_slice(&32u32.to_be_bytes());
-        blob.extend_from_slice(&[7; 32]);
+        blob.extend_from_slice(&[body; 32]);
         format!("{key_type} {} {comment}\n", STANDARD.encode(blob))
     }
 
@@ -1297,6 +1413,7 @@ mod tests {
             transfer_root: String::new(),
             terminal_enabled: false,
             unrestricted_commands: false,
+            project_git_enabled: false,
         }
     }
 
@@ -1338,6 +1455,7 @@ mod tests {
                 transfer_root: String::new(),
                 terminal_enabled: false,
                 unrestricted_commands: false,
+                project_git_enabled: false,
             },
         )
         .expect("clear");
@@ -1508,6 +1626,109 @@ mod tests {
         )
         .expect("legacy");
         assert!(!legacy.unrestricted_commands);
+    }
+
+    /// C16-10. "git 원격용"은 에이전트 권한이 아니다 — 에이전트 사용이 꺼져 있어도 켤 수
+    /// 있어야 하고(개인키만 요구한다), 기기 전체에서 한 키만 켤 수 있으며, 켜도 에이전트
+    /// 목록에는 나오지 않는다. 예전 저장본은 꺼진 상태로 읽힌다.
+    #[test]
+    fn c16_10_project_git_flag_is_a_user_path_bounded_to_one_key() {
+        let home = tempfile::tempdir().expect("home");
+        let app_data = tempfile::tempdir().expect("app data");
+        let first = fixture(home.path(), true);
+
+        // 개인키 없는 공개키는 거절한다 — 신원으로 넘길 파일이 없다.
+        let bare_home = tempfile::tempdir().expect("home");
+        let bare_app = tempfile::tempdir().expect("app data");
+        let bare = fixture(bare_home.path(), false);
+        let mut bare_request = request(&bare, false);
+        bare_request.project_git_enabled = true;
+        assert!(
+            set_ssh_key_endpoint_with(bare_home.path(), bare_app.path(), &bare_request).is_err()
+        );
+
+        // 에이전트 사용이 꺼진 채로 켜진다. 다른 세 토글과 갈리는 지점이다.
+        let mut on = request(&first, false);
+        on.project_git_enabled = true;
+        let snapshot = set_ssh_key_endpoint_with(home.path(), app_data.path(), &on).expect("save");
+        let endpoint = snapshot.keys[0].endpoint.as_ref().expect("endpoint");
+        assert!(endpoint.project_git_enabled && !endpoint.agent_enabled);
+        // 에이전트 목록에는 그대로 나오지 않는다 — 이 토글은 에이전트에게 아무것도 열지 않는다.
+        assert!(list_agent_ssh_endpoints_with(home.path(), app_data.path())
+            .expect("list")
+            .endpoints
+            .is_empty());
+
+        // 켜 둔 키가 git 신원으로 뽑히고, 경로는 공개키 이름에서 `.pub`을 뗀 개인키다.
+        let identity = project_git_identity_with(home.path(), app_data.path())
+            .expect("identity")
+            .expect("some");
+        assert_eq!(
+            identity.identity_path,
+            std::fs::canonicalize(home.path())
+                .expect("home")
+                .join(".ssh/id_example")
+                .to_string_lossy()
+        );
+        assert!(identity.ssh_command.contains(&format!(
+            "-i '{}' -o IdentitiesOnly=yes",
+            identity.identity_path
+        )));
+
+        // 두 번째 키를 같은 용도로 켜면 거절한다. 먼저 켜 둔 키를 조용히 끄지 않는다.
+        fs::write(
+            home.path().join(".ssh/id_second.pub"),
+            public_key_line_with_body("second@example", 9),
+        )
+        .expect("public");
+        fs::write(home.path().join(".ssh/id_second"), b"private material").expect("private");
+        let second = crate::ssh_keys::get_ssh_keys_with_home(home.path())
+            .expect("inventory")
+            .keys
+            .iter()
+            .find(|key| key.file_name == "id_second.pub")
+            .expect("second key")
+            .fingerprint
+            .clone();
+        let mut both = request(&second, false);
+        both.project_git_enabled = true;
+        let error = set_ssh_key_endpoint_with(home.path(), app_data.path(), &both)
+            .expect_err("두 번째 키는 거절한다");
+        assert!(matches!(error, CoreError::Conflict(_)));
+        assert!(
+            load_endpoints(app_data.path())
+                .expect("store")
+                .get(&first)
+                .expect("first")
+                .project_git_enabled
+        );
+
+        // 끄면 신원이 사라지고, 그때 git은 자기 기본값으로 붙는다.
+        let off = request(&first, false);
+        set_ssh_key_endpoint_with(home.path(), app_data.path(), &off).expect("save");
+        assert!(project_git_identity_with(home.path(), app_data.path())
+            .expect("identity")
+            .is_none());
+
+        let legacy: SshEndpointView = serde_json::from_str(
+            r#"{"host":"h","port":22,"user":"u","agentEnabled":true,"updatedAt":0}"#,
+        )
+        .expect("legacy");
+        assert!(!legacy.project_git_enabled);
+    }
+
+    /// C16-10. git은 `GIT_SSH_COMMAND`를 **셸에 넘긴다**(`GIT_SSH`와 다른 점이고, 그래서
+    /// 추가 인자를 적을 수 있다). 그러므로 경로는 작은따옴표로 감싸고, 그 안에서 무력해지지
+    /// 않는 작은따옴표 자체와 제어문자가 들어 있으면 거절한다(G9).
+    #[test]
+    fn c16_10_ssh_command_line_quotes_paths_and_refuses_unquotable_ones() {
+        let line = ssh_command_line("/usr/bin/ssh", "/Users/a b/.ssh/id_ed25519").expect("line");
+        assert_eq!(
+            line,
+            "'/usr/bin/ssh' -i '/Users/a b/.ssh/id_ed25519' -o IdentitiesOnly=yes -o BatchMode=yes"
+        );
+        assert!(ssh_command_line("/usr/bin/ssh", "/home/it's/id").is_err());
+        assert!(ssh_command_line("/usr/bin/ssh", "/home/a\nb/id").is_err());
     }
 
     /// C9-18. `ssh exec`는 지문과 `--` 뒤의 명령을 요구하고, 명령 단어는 한 칸씩 띄워
@@ -1848,6 +2069,7 @@ mod tests {
             terminal_enabled: false,
             unrestricted_commands: false,
             updated_at: 0,
+            project_git_enabled: false,
         };
         assert_eq!(target(&endpoint), "deploy@[fd7a:1234::5]");
         assert_eq!(

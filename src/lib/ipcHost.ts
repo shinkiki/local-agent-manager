@@ -58,7 +58,6 @@ export interface TailscaleServiceStatus {
   serveTarget: string | null;
   conflictTarget: string | null;
   remoteAccepted: boolean;
-  remoteWrite: boolean;
   error: string | null;
 }
 
@@ -71,14 +70,6 @@ export function setTailscaleServiceEnabled(
   replaceExisting = false,
 ): Promise<TailscaleServiceStatus> {
   return call<TailscaleServiceStatus>("set_tailscale_service_enabled", { enabled, replaceExisting });
-}
-
-/**
- * 원격 UI에 데스크톱과 같은 변경 권한을 줄지 바꿉니다. 저장 지점은 백엔드 서비스
- * 설정 하나이고 실행 중인 백엔드에 바로 반영되며, 호스트 화면에서만 호출할 수 있습니다.
- */
-export function setRemoteWriteEnabled(enabled: boolean): Promise<TailscaleServiceStatus> {
-  return call<TailscaleServiceStatus>("set_remote_write_enabled", { enabled });
 }
 
 /** 호스트 자동 절전 억제 상태. 억제 수단은 OS마다 다르므로 어떤 수단인지 함께 알린다. */

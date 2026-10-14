@@ -1,6 +1,7 @@
 import type { ChatInputFile } from "../types";
 import { backendHttpUrl, hasNativeShell } from "./backend.ts";
 import { assertRemoteChatAccess } from "./chatAccess.ts";
+import { withLoginSession } from "./ipcTransport.ts";
 
 export async function uploadChatInputFile(chatId: string, file: File): Promise<ChatInputFile> {
   await assertRemoteChatAccess();
@@ -65,7 +66,7 @@ async function chatAttachmentRequest(
   fallback: string,
   init?: RequestInit,
 ): Promise<Response> {
-  const response = await fetch(backendHttpUrl(path), init);
+  const response = await fetch(backendHttpUrl(path), withLoginSession(init));
   if (response.ok) return response;
   const body = await responseJsonOrNull<{ error?: string }>(response);
   throw new Error(body?.error || `${fallback} (${response.status})`);

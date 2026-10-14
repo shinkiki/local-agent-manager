@@ -94,6 +94,34 @@ mod tests {
         assert!(regular_file_metadata(&link, "거부").is_err());
     }
 
+    /// C3-8 / C5-4: 디렉터리를 가리키거나 끊어진 링크도 원본 루트로 받지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn c3_8_c5_4_rejects_directory_and_dangling_symlinks() {
+        let dir = tempfile::tempdir().expect("임시 디렉터리");
+        let root = dir.path().join("root");
+        let target = dir.path().join("outside");
+        fs::create_dir(&root).expect("원본 루트 생성");
+        fs::create_dir(&target).expect("루트 밖 디렉터리 생성");
+        let rejection = "원본은 심볼릭 링크가 아닌 디렉터리여야 합니다";
+
+        for (name, target) in [
+            ("directory-link", target),
+            ("dangling-link", dir.path().join("missing")),
+        ] {
+            let link = root.join(name);
+            std::os::unix::fs::symlink(&target, &link).expect("링크 생성");
+            if name == "directory-link" {
+                assert!(fs::metadata(&link).expect("링크 대상 메타데이터").is_dir());
+            }
+            let metadata = fs::symlink_metadata(&link).expect("링크 자체 메타데이터");
+            match ensure_directory(&metadata, rejection) {
+                Err(CoreError::InvalidInput(message)) => assert_eq!(message, rejection),
+                other => panic!("{name}을 InvalidInput으로 거부해야 합니다: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn reports_limit_value_when_exceeded() {
         let dir = tempfile::tempdir().expect("임시 디렉터리");

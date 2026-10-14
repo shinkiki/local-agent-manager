@@ -1123,18 +1123,40 @@ const DEFAULT_WORKSPACE_PROJECT: &str = "작업 경로 없음";
 
 /// AIA 작업공간 세션도 목록에 남기되 어느 대화가 AIA와 나눈 것인지 표시한다.
 /// 화면은 이 표시로 목록에서 빼거나 배지를 붙이고, 새 채팅 프로젝트 후보에서는 제외한다.
-fn mark_aia_workspace_session(session: &mut SessionSummary, aia_workspace: &Path) {
-    if !is_workspace_session(session, aia_workspace) {
-        return;
+/// 두 질문에 따로 답한다. `aia_workspace`는 "앱 소유 경로인가"로 작업 경로만 보고 —
+/// 프로젝트 등록·스킬·지침 스캔·새 채팅 후보에서 앱 내부 폴더를 빼는 소비처들이 읽는 값이라
+/// 대화의 성격과 섞이면 `<app data>/aia-workspace`가 프로젝트로 등록된다. `aia_chat`은
+/// "AIA 와 나눈 대화인가"로 세션이 적어 둔 프로필을 먼저 보고 기록이 없는 옛 세션만 경로로
+/// 판정한다. 재개가 프로필을 가리는 자리(`effective_chat_profile`)와 같은 순서다 — 적힌 값이
+/// `Standard`인데 경로로 넘어가면 AIA 작업공간을 골라 연 일반 채팅이 목록에서만 AIA 가 되어
+/// "AIA 대화 포함"을 끈 목록에서 사라진다. 추측으로 얻은 `Standard`는 적히지 않으므로
+/// (`persist_session_profile` 호출부) 적힌 값은 믿어도 된다.
+///
+/// 경로 판정은 형제 app-data 까지 보지만 재개 자리는 자기 app-data 만 본다(권한 경계).
+/// 그래서 기록 없이 형제 경로로만 AIA 가 된 대화는 이 실행본에서 열면 일반 채팅이고, 그
+/// 사실을 `aia_chat_opens_as_standard`로 실어 화면이 설명한다.
+fn mark_aia_workspace_session(session: &mut SessionSummary, workspaces: &AppWorkspaces) {
+    let in_workspace = is_workspace_session(session, &workspaces.aia);
+    if in_workspace {
+        session.aia_workspace = true;
+        session.project = Some(AIA_WORKSPACE_PROJECT.to_owned());
     }
-    session.aia_workspace = true;
-    session.project = Some(AIA_WORKSPACE_PROJECT.to_owned());
+    let recorded = session.meta.profile;
+    session.aia_chat = match recorded {
+        Some(profile) => profile == crate::chat::ChatProfile::Aia,
+        None => in_workspace,
+    };
+    // 기록 없이 경로로만 AIA 가 된 대화에서만 자기 경로인지 다시 묻는다. 정규화가 한 번 더
+    // 돌지만 그 갈래는 형제 실행본의 옛 세션뿐이라 드물다.
+    session.aia_chat_opens_as_standard = session.aia_chat
+        && recorded.is_none()
+        && !is_workspace_session(session, std::slice::from_ref(&workspaces.own_aia));
 }
 
 /// 작업 경로를 비우고 시작한 세션도 같은 방식으로 표시한다. 화면은 이 표시로 새 채팅의
 /// 프로젝트 후보에서 빼고, 목록에는 고정 이름으로 남긴다.
-fn mark_default_workspace_session(session: &mut SessionSummary, default_workspace: &Path) {
-    if !is_workspace_session(session, default_workspace) {
+fn mark_default_workspace_session(session: &mut SessionSummary, default_workspaces: &[PathBuf]) {
+    if !is_workspace_session(session, default_workspaces) {
         return;
     }
     session.default_workspace = true;
@@ -1150,35 +1172,103 @@ fn apply_device_metadata(
 ) {
     apply_session_metadata(session, &metadata.sessions);
     apply_session_working_directory(session, &metadata.session_working_directories);
-    mark_aia_workspace_session(session, &workspaces.aia);
+    mark_aia_workspace_session(session, workspaces);
     mark_default_workspace_session(session, &workspaces.default);
 }
 
 /// 앱 데이터 아래 앱 소유 작업공간들의 정규 경로. 채팅은 정규화한 경로를 세션 cwd로 남기므로
 /// (macOS `/var` → `/private/var`처럼) 양쪽을 같은 기준으로 맞춰야 비교가 어긋나지 않는다.
 struct AppWorkspaces {
-    aia: PathBuf,
-    default: PathBuf,
+    /// 자기 app-data 의 AIA 작업공간. 재개가 프로필을 가리는 자리(`effective_chat_profile`)가
+    /// 보는 유일한 경로라, 어떤 AIA 대화가 이 실행본에서는 일반 채팅으로 열릴지 알려면 형제
+    /// 전체(`aia`)와 따로 들고 있어야 한다.
+    own_aia: PathBuf,
+    aia: Vec<PathBuf>,
+    default: Vec<PathBuf>,
 }
 
 fn app_workspaces(app_data_dir: &Path) -> AppWorkspaces {
+    let roots = sibling_app_data_dirs(app_data_dir);
+    let own = [app_data_dir.to_path_buf()];
     AppWorkspaces {
-        aia: canonical_workspace(app_data_dir, crate::chat::AIA_WORKSPACE_DIR),
-        default: canonical_workspace(app_data_dir, crate::chat::DEFAULT_WORKSPACE_DIR),
+        own_aia: canonical_workspaces(&own, crate::chat::AIA_WORKSPACE_DIR)
+            .pop()
+            .unwrap_or_else(|| app_data_dir.join(crate::chat::AIA_WORKSPACE_DIR)),
+        aia: canonical_workspaces(&roots, crate::chat::AIA_WORKSPACE_DIR),
+        default: canonical_workspaces(&roots, crate::chat::DEFAULT_WORKSPACE_DIR),
     }
 }
 
-fn canonical_workspace(app_data_dir: &Path, name: &str) -> PathBuf {
-    let workspace = app_data_dir.join(name);
-    fs::canonicalize(&workspace).unwrap_or(workspace)
+/// 같은 앱이 쓰는 앱 데이터 폴더들. 개발 실행은 `--app-data-dir`로 접미가 붙은 폴더를
+/// 따로 쓰는데(`com.shinc.agentmanager-dev`), 세션 목록은 공급자 홈에서 읽어 양쪽이 같은
+/// 것을 보므로 작업공간 판정만 한쪽을 모르면 같은 대화가 빌드마다 다르게 보인다. 설치본이
+/// 만든 AIA 세션이 개발본 목록에서 일반 대화로 뜨던 자리다.
+///
+/// 접미는 저장소가 정한 값이 아니라 실행하는 사람이 붙이는 것이라 특정 이름을 박지 않고,
+/// 한쪽 이름이 다른 쪽 이름 뒤에 `-`를 더해 이어지는 관계만 본다. 읽기에 실패하면 자기
+/// 폴더만 쓴다 — 판정이 좁아져 예전처럼 동작할 뿐이라 목록이 막히지 않는다.
+fn sibling_app_data_dirs(app_data_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![app_data_dir.to_path_buf()];
+    let (Some(parent), Some(name)) = (
+        app_data_dir.parent(),
+        app_data_dir.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return roots;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return roots;
+    };
+    for entry in entries.flatten() {
+        let Ok(candidate) = entry.file_name().into_string() else {
+            continue;
+        };
+        if candidate == name || !is_sibling_app_data_name(name, &candidate) {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            roots.push(entry.path());
+        }
+    }
+    roots
 }
 
-fn is_workspace_session(session: &SessionSummary, workspace: &Path) -> bool {
+/// 두 앱 데이터 폴더 이름이 같은 앱의 것인지. 한쪽이 다른 쪽에 `-접미`를 더한 모양이면
+/// 같은 앱으로 본다. 설치본과 접미를 붙인 실행본은 이 관계로 서로를 알아본다.
+///
+/// 접미끼리는 이어 주지 않는다. `…-dev`와 `…-dev2`는 둘 다 설치본의 파생이지만 서로를
+/// 모르므로, 개발용 app-data 를 **둘 이상 동시에** 쓰면 설치본에서는 양쪽이 AIA 로 보이고
+/// 개발본끼리는 서로를 일반 대화로 본다. 공통 기준 이름을 `-` 로 끊어 구하면 그 자리는
+/// 메워지지만, 식별자 자체에 `-` 가 든 앱에서 무관한 폴더를 같은 앱으로 묶는다 — 못 찾는
+/// 쪽으로 틀리는 편이 조용히 잘못된 표시를 만드는 쪽보다 낫다고 보고 좁은 규칙을 둔다.
+fn is_sibling_app_data_name(name: &str, candidate: &str) -> bool {
+    let extends = |base: &str, derived: &str| {
+        derived
+            .strip_prefix(base)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+    };
+    name == candidate || extends(name, candidate) || extends(candidate, name)
+}
+
+fn canonical_workspaces(app_data_dirs: &[PathBuf], name: &str) -> Vec<PathBuf> {
+    app_data_dirs
+        .iter()
+        .map(|app_data_dir| {
+            let workspace = app_data_dir.join(name);
+            fs::canonicalize(&workspace).unwrap_or(workspace)
+        })
+        .collect()
+}
+
+fn is_workspace_session(session: &SessionSummary, workspaces: &[PathBuf]) -> bool {
     let Some(cwd) = session.cwd.as_deref() else {
         return false;
     };
     let cwd = Path::new(cwd);
-    cwd == workspace || fs::canonicalize(cwd).is_ok_and(|cwd| cwd == workspace)
+    if workspaces.iter().any(|workspace| cwd == workspace) {
+        return true;
+    }
+    // 정규화는 파일시스템을 두드리므로 후보마다 다시 하지 않고 한 번만 푼다.
+    fs::canonicalize(cwd).is_ok_and(|cwd| workspaces.contains(&cwd))
 }
 
 fn raw_catalog_sessions(persisted: &PersistedSessionCatalog) -> Vec<SessionSummary> {
@@ -1694,9 +1784,40 @@ fn storage_usage_item(
         id: id.to_owned(),
         label: label.to_owned(),
         description: description.to_owned(),
+        root_path: storage_paths_root(paths),
         size_bytes,
         file_count,
     }
+}
+
+/// 잰 경로들을 한 줄로 대표하는 자리를 고른다 — 전부의 공통 조상이다.
+///
+/// 호출부에서 대표 경로를 따로 받지 않는 것은 그러면 잰 자리와 적은 자리가 갈라질 수 있어서다
+/// (Codex는 세 경로, Antigravity는 대화 디렉터리 수가 홈 상태에 따라 달라진다). 공통 조상으로
+/// 뽑으면 적힌 경로는 실제로 잰 자리를 **덮는다** — 정확히 그 자리라는 뜻은 아니다. 형제
+/// 경로를 함께 재면 부모로 올라가므로(`~/.codex/sessions` + `~/.codex/state_5.sqlite` →
+/// `~/.codex`) 적힌 자리가 잰 자리보다 넓을 수 있다.
+///
+/// 공통 조상이 파일시스템 루트까지 올라가면 아무것도 적지 않는다. `/`는 "파일시스템 전체를
+/// 쟀다"로 읽히는데, 그 오해를 없애자는 것이 이 필드를 더한 이유(L09)라 적지 않는 편이 낫다.
+fn storage_paths_root(paths: &[PathBuf]) -> String {
+    let mut iter = paths.iter();
+    let Some(first) = iter.next() else {
+        return String::new();
+    };
+    let mut root: PathBuf = first.clone();
+    for path in iter {
+        while !path.starts_with(&root) {
+            // 더 올라갈 데가 없다 — 절대 경로와 상대 경로를 함께 받은 경우다.
+            if !root.pop() {
+                return String::new();
+            }
+        }
+    }
+    if root.parent().is_none() {
+        return String::new();
+    }
+    root.to_string_lossy().into_owned()
 }
 
 fn measure_storage_paths(paths: &[PathBuf]) -> (u64, u64) {
@@ -2629,6 +2750,8 @@ fn claude_summary_from_entry(entry: &ClaudeCatalogEntry) -> SessionSummary {
         git_branch: entry.scan.git_branch.clone(),
         is_subagent: false,
         aia_workspace: false,
+        aia_chat: false,
+        aia_chat_opens_as_standard: false,
         default_workspace: false,
         archived: false,
         readable: true,
@@ -2885,6 +3008,8 @@ fn list_opencode_sessions(home: &Path) -> Vec<SessionSummary> {
                 git_branch: None,
                 is_subagent: false,
                 aia_workspace: false,
+                aia_chat: false,
+                aia_chat_opens_as_standard: false,
                 default_workspace: false,
                 archived: archived.is_some_and(|value| value > 0),
                 readable: true,
@@ -3096,6 +3221,8 @@ fn codex_session_from_row(
             Some("subagent" | "guardian_review")
         ),
         aia_workspace: false,
+        aia_chat: false,
+        aia_chat_opens_as_standard: false,
         default_workspace: false,
         archived,
         readable: resolved_path.is_file(),
@@ -3261,6 +3388,8 @@ fn antigravity_session_from_path(
         git_branch: None,
         is_subagent: false,
         aia_workspace: false,
+        aia_chat: false,
+        aia_chat_opens_as_standard: false,
         default_workspace: false,
         archived: false,
         readable,
@@ -6000,6 +6129,8 @@ mod tests {
             git_branch: None,
             is_subagent: false,
             aia_workspace: false,
+            aia_chat: false,
+            aia_chat_opens_as_standard: false,
             default_workspace: false,
             archived: false,
             readable: true,
@@ -6755,6 +6886,9 @@ mod tests {
             .find(|session| session.id == "aia-session")
             .expect("AIA 작업공간 세션도 목록에 남는다");
         assert!(aia.aia_workspace);
+        assert!(aia.aia_chat);
+        // 자기 app-data 의 작업공간이라 이 실행본이 AIA 로 연다.
+        assert!(!aia.aia_chat_opens_as_standard);
         assert!(!aia.default_workspace);
         assert_eq!(aia.project.as_deref(), Some(AIA_WORKSPACE_PROJECT));
         let default = snapshot
@@ -6773,6 +6907,139 @@ mod tests {
         assert!(!project.aia_workspace);
         assert!(!project.default_workspace);
         assert_eq!(project.project.as_deref(), Some("project"));
+    }
+
+    /// 설치본이 만든 AIA 대화를 app-data가 다른 개발본이 읽는 상황. AIA 작업공간 경로는
+    /// app-data 아래라 빌드마다 다르지만 세션 목록은 공급자 홈에서 읽어 함께 보므로, 자기
+    /// app-data 만 보면 같은 대화가 한쪽에서만 AIA 로 보였다. 세션에 적힌 프로필과 형제
+    /// app-data 의 작업공간, 두 길이 그 어긋남을 메운다.
+    #[test]
+    fn an_aia_conversation_keeps_its_chip_across_app_data_dirs() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let data = root.path().join("data");
+        let aia_workspace = data.join("aia-workspace");
+        let default_workspace = data.join("default-workspace");
+        // 같은 앱의 개발 실행이 쓰는 app-data. 이름이 `data` 뒤에 `-dev` 를 더한 모양이라
+        // 형제로 본다.
+        let sibling_workspace = root.path().join("data-dev").join("aia-workspace");
+        // 앱과 무관한 폴더. 이름이 이어지지 않으므로 경로 판정에 걸리지 않는다.
+        let unrelated_workspace = root.path().join("elsewhere").join("aia-workspace");
+        for directory in [
+            &home,
+            &aia_workspace,
+            &default_workspace,
+            &sibling_workspace,
+            &unrelated_workspace,
+        ] {
+            fs::create_dir_all(directory).expect("directory");
+        }
+
+        let persisted = PersistedSessionCatalog {
+            codex_sessions: vec![
+                session_with_cwd("recorded-aia-session-1", unrelated_workspace.clone()),
+                session_with_cwd("sibling-aia-session-01", sibling_workspace),
+                session_with_cwd("unrelated-session-001", unrelated_workspace),
+            ],
+            ..PersistedSessionCatalog::default()
+        };
+        crate::store::persist_session_profile(
+            &data,
+            ProviderId::Codex,
+            "recorded-aia-session-1",
+            crate::chat::ChatProfile::Aia,
+        )
+        .expect("AIA 실행이 자기 프로필을 적는다");
+
+        let projects = registered_project_paths(&data, &persisted).expect("registered projects");
+        let resources = SnapshotResources::scan(&home, &data, &projects, 1).expect("resource scan");
+        let snapshot = compose_manager_snapshot(&home, &data, &persisted, resources)
+            .expect("manager snapshot");
+        let session = |id: &str| {
+            snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == id)
+                .unwrap_or_else(|| panic!("세션 {id}"))
+                .clone()
+        };
+
+        // 세션이 프로필을 적어 두었으면 경로가 어디든 AIA 대화다. 경로는 앱 소유가 아니라
+        // 작업공간 표시와 프로젝트 이름은 그대로다 — 두 질문은 따로 답한다.
+        let recorded = session("recorded-aia-session-1");
+        assert!(recorded.aia_chat);
+        assert!(!recorded.aia_chat_opens_as_standard);
+        assert!(!recorded.aia_workspace);
+        assert_ne!(recorded.project.as_deref(), Some(AIA_WORKSPACE_PROJECT));
+
+        // 기록이 생기기 전에 쌓인 세션은 형제 app-data 의 작업공간으로 알아본다. 다만 재개
+        // 자리는 자기 app-data 만 보므로 이 실행본에서 열면 일반 채팅이고, 그 사실을 함께 싣는다.
+        let sibling = session("sibling-aia-session-01");
+        assert!(sibling.aia_workspace);
+        assert!(sibling.aia_chat);
+        assert!(sibling.aia_chat_opens_as_standard);
+        assert_eq!(sibling.project.as_deref(), Some(AIA_WORKSPACE_PROJECT));
+
+        // 둘 다 아니면 그대로 일반 대화다. 같은 자리에서 돌았어도 번지지 않는다.
+        let unrelated = session("unrelated-session-001");
+        assert!(!unrelated.aia_workspace);
+        assert!(!unrelated.aia_chat);
+        assert_ne!(unrelated.project.as_deref(), Some(AIA_WORKSPACE_PROJECT));
+    }
+
+    /// AIA 작업공간을 작업 경로로 골라 연 일반 채팅. 적힌 프로필이 `Standard`면 경로가
+    /// 거기여도 일반 대화로 남는다 — 재개가 프로필을 가리는 자리와 같은 답을 내야, 목록에서
+    /// AIA 인데 열면 일반 채팅인 대화가 생기지 않는다. 그런 대화는 "AIA 대화 포함"을 끈
+    /// 목록에서 함께 사라진다. 경로 표시(`aia_workspace`)는 그대로 남는다 — 앱 소유 폴더를
+    /// 프로젝트·스캔에서 빼는 판단은 대화의 성격과 무관하다.
+    #[test]
+    fn a_recorded_standard_profile_removes_the_chip_but_keeps_the_workspace_flag() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let data = root.path().join("data");
+        let aia_workspace = data.join("aia-workspace");
+        for directory in [&home, &aia_workspace, &data.join("default-workspace")] {
+            fs::create_dir_all(directory).expect("directory");
+        }
+
+        let persisted = PersistedSessionCatalog {
+            codex_sessions: vec![
+                session_with_cwd("standard-in-aia-dir-1", aia_workspace.clone()),
+                session_with_cwd("unrecorded-in-aia-01", aia_workspace),
+            ],
+            ..PersistedSessionCatalog::default()
+        };
+        crate::store::persist_session_profile(
+            &data,
+            ProviderId::Codex,
+            "standard-in-aia-dir-1",
+            crate::chat::ChatProfile::Standard,
+        )
+        .expect("일반 실행이 자기 프로필을 적는다");
+
+        let projects = registered_project_paths(&data, &persisted).expect("registered projects");
+        let resources = SnapshotResources::scan(&home, &data, &projects, 1).expect("resource scan");
+        let snapshot = compose_manager_snapshot(&home, &data, &persisted, resources)
+            .expect("manager snapshot");
+        let session = |id: &str| {
+            snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == id)
+                .unwrap_or_else(|| panic!("세션 {id}"))
+                .clone()
+        };
+
+        let standard = session("standard-in-aia-dir-1");
+        assert!(!standard.aia_chat);
+        assert!(standard.aia_workspace);
+        assert_eq!(standard.project.as_deref(), Some(AIA_WORKSPACE_PROJECT));
+
+        // 기록이 없는 세션은 종전대로 경로가 답한다. 자기 경로라 이 실행본이 AIA 로 연다.
+        let unrecorded = session("unrecorded-in-aia-01");
+        assert!(unrecorded.aia_chat);
+        assert!(unrecorded.aia_workspace);
+        assert!(!unrecorded.aia_chat_opens_as_standard);
     }
 
     fn persist_test_catalog(data: &Path, persisted: &PersistedSessionCatalog) {
@@ -9092,5 +9359,90 @@ mod tests {
         fs::write(owned.join("44444444-4444-4444-8444-444444444444.db"), b"x").expect("profile db");
         let after = antigravity_provider_fingerprint(&homes).expect("fingerprint");
         assert_ne!(before, after);
+    }
+}
+
+#[cfg(test)]
+mod storage_root_tests {
+    use super::storage_usage_item;
+    use std::path::PathBuf;
+
+    #[test]
+    fn single_path_is_its_own_root() {
+        let item = storage_usage_item(
+            "claude",
+            "라벨",
+            "설명",
+            &[PathBuf::from("/root/.claude/projects")],
+        );
+        assert_eq!(item.root_path, "/root/.claude/projects");
+    }
+
+    #[test]
+    fn sibling_paths_collapse_to_their_common_parent() {
+        let item = storage_usage_item(
+            "codex",
+            "라벨",
+            "설명",
+            &[
+                PathBuf::from("/root/.codex/sessions"),
+                PathBuf::from("/root/.codex/archived_sessions"),
+                PathBuf::from("/root/.codex/state_5.sqlite"),
+            ],
+        );
+        assert_eq!(item.root_path, "/root/.codex");
+    }
+
+    #[test]
+    fn nested_paths_keep_the_outermost_one() {
+        let item = storage_usage_item(
+            "antigravity",
+            "라벨",
+            "설명",
+            &[
+                PathBuf::from("/root/.gemini/antigravity/brain"),
+                PathBuf::from("/root/.gemini"),
+            ],
+        );
+        assert_eq!(item.root_path, "/root/.gemini");
+    }
+
+    // 이름이 같은 접두사로 시작할 뿐인 형제는 하나가 다른 하나를 덮지 못한다. 성분 단위로
+    // 보는 `Path::starts_with` 가 그것을 막는데, 문자열 비교로 "단순화" 하면 `/root/.codex` 가
+    // 그대로 남아 `.codexbak` 을 재고도 적지 않은 자리가 된다.
+    #[test]
+    fn same_prefix_but_different_component_climbs_to_the_parent() {
+        let item = storage_usage_item(
+            "codex",
+            "라벨",
+            "설명",
+            &[
+                PathBuf::from("/root/.codex"),
+                PathBuf::from("/root/.codexbak"),
+            ],
+        );
+        assert_eq!(item.root_path, "/root");
+    }
+
+    #[test]
+    fn no_paths_and_disjoint_roots_report_nothing_rather_than_guessing() {
+        let empty = storage_usage_item("none", "라벨", "설명", &[]);
+        assert_eq!(empty.root_path, "");
+        // 절대 경로와 상대 경로를 함께 받으면 공통 조상이 없다.
+        let mixed = storage_usage_item(
+            "mixed",
+            "라벨",
+            "설명",
+            &[PathBuf::from("/root/.claude"), PathBuf::from("relative")],
+        );
+        assert_eq!(mixed.root_path, "");
+        // 공통 조상이 파일시스템 루트뿐이면 `/` 가 아니라 아무것도 적지 않는다.
+        let disjoint = storage_usage_item(
+            "disjoint",
+            "라벨",
+            "설명",
+            &[PathBuf::from("/root/.claude"), PathBuf::from("/home/x")],
+        );
+        assert_eq!(disjoint.root_path, "");
     }
 }

@@ -1,7 +1,7 @@
-import { ArrowDownFromLine, CornerDownLeft, Keyboard, Send, ArrowDownToLine, ArrowUpToLine, Blocks, Cable, Calendar, ChartPie, ChevronDown, ChevronRight, CircleCheck, Cloud, Code, CreditCard, Database, Download, Eraser, Eye, EyeOff, FileText, FolderClosed, GitBranch, Globe, KeyRound, Languages, LayoutTemplate, Library, LoaderCircle, Mail, Monitor, MonitorCog, Moon, NotebookText,PenLine, PenTool, Plug, Plus, Power, PowerOff, Presentation, RefreshCw, Repeat, Search, Server, Settings, ShieldAlert, SquareTerminal, Sun, Table2, Ticket, Trash2, Upload, Users, Waypoints, X, type LucideIcon } from "lucide-react";
+import { ArrowDownFromLine, CornerDownLeft, Keyboard, Send, ArrowDownToLine, ArrowUpToLine, Blocks, Cable, Calendar, ChartPie, ChevronDown, ChevronRight, CircleCheck, Cloud, Code, CreditCard, Database, Download, Eraser, Eye, EyeOff, FileText, FolderClosed, GitBranch, Globe, KeyRound, Languages, LayoutTemplate, LoaderCircle, Mail, Monitor, MonitorCog, Moon, NotebookText,PenLine, PenTool, Plug, Plus, Power, PowerOff, Presentation, RefreshCw, Repeat, Search, Server, Settings, ShieldAlert, SquareTerminal, Sun, Table2, Ticket, Trash2, Users, Waypoints, X, type LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import type { TabRequest } from "../lib/uiGuide";
-import { beginProviderAccountLogin, cancelProviderAccountLogin, cancelUiTranslation, checkProviderCliUpdate, clearProviderModelCaches, consumeAccountResetCredit, deleteProviderAccount, finishProviderAccountLogin, getAccountTools, getAntigravityUsage, getBackendServiceSettings, getBackgroundSettings, getCliUpdateStatus, getProviderRuntimeCounts, getResourceRepository, getSleepPrevention, getTailscaleServiceStatus, getWebAccessStatus, hasTauriRuntime, refreshProviderAccountUsage, requestSystemLanguage, resetMenuTranslation, restartApp, revalidateProviderAccountCredential, retryMenuTranslation, retryUiTranslation, setAutoSwitchPolicy, setAutoSwitchResume, setAutoSwitchUsageGap, setResumeAccountPolicy, setBackendServiceSettings, setBackgroundSettings, setSleepPrevention, setProviderAccountAutoSwitch, setProviderAccountAutoSwitchPriority, setProviderAccountDisabled, setProviderAccountNote, setProviderAccountLabel, setRemoteWriteEnabled, setResourceRepository, setSystemAutomationSettings, setTailscaleServiceEnabled, switchActiveProviderAccount, updateProviderCli, type BackendServiceSettings, type SleepPreventionStatus, type TailscaleServiceStatus, type WebAccessStatus } from "../lib/ipc";
+import { beginProviderAccountLogin, cancelProviderAccountLogin, cancelUiTranslation, checkProviderCliUpdate, clearProviderModelCaches, consumeAccountResetCredit, deleteProviderAccount, getProviderAccountLogin, finishProviderAccountLogin, getAccountTools, getAntigravityUsage, getBackendServiceSettings, getBackgroundSettings, getCliUpdateStatus, getCredentialVaultRecoveryStatus, getProviderRuntimeCounts, getSleepPrevention, getTailscaleServiceStatus, getWebAccessStatus, hasTauriRuntime, recoverCredentialVault, refreshProviderAccountUsage, requestSystemLanguage, resetMenuTranslation, restartApp, revalidateProviderAccountCredential, retryMenuTranslation, retryUiTranslation, setAutoSwitchPolicy, setAutoSwitchResume, setAutoSwitchUsageGap, setResumeAccountPolicy, setBackendServiceSettings, setBackgroundSettings, setSleepPrevention, setProviderAccountAutoSwitch, setProviderAccountAutoSwitchPriority, setProviderAccountDisabled, setProviderAccountNote, setProviderAccountLabel, setSystemAutomationSettings, setTailscaleServiceEnabled, switchActiveProviderAccount, updateProviderCli, type BackendServiceSettings, type SleepPreventionStatus, type TailscaleServiceStatus, type WebAccessStatus } from "../lib/ipc";
 import { getUiTranslationCatalog, useI18n, type UiText } from "../lib/i18n";
 import { runtimeText } from "../lib/i18nRuntime";
 import { sourceName, formatDateOnly, formatDateTime } from "../lib/format";
@@ -10,20 +10,22 @@ import { autoSwitchEventSummary } from "../lib/autoSwitchEvent";
 import { homeAccountSummary, homeUsageNote } from "../lib/homeAccount";
 import { credentialExpiryImminent, daysUntilExpiry } from "../lib/accountCredentialExpiry";
 import type { AccountUsageView, ProviderHomeToolsView, ProviderHomeView } from "../types";
+import { LoginSettingsCard } from "./LoginSettingsCard";
 import { accountNoteDraftState, submitAccountNote, ACCOUNT_NOTE_MAX_CHARS } from "../lib/accountNote";
 import { accountLabelDraftState, submitAccountLabel, ACCOUNT_LABEL_MAX_CHARS } from "../lib/accountLabel";
 import { accountToolBadges, accountToolsFor, homeToolsFor, DEFAULT_ACCOUNT_TOOL_BADGE_LIMIT, type AccountToolBadgeSource, type AccountToolIconName } from "../lib/accountTools";
-import { cacheAwaitsNewerCliRelease, canCheckCliUpdate, canClearModelCaches, canRunCliUpdate, cliUpdateAlert, cliUpdateBadge, cliUpdateBlockedReason, hasCliUpdateAlert, modelCacheBlockedReason, runtimeStopConfirmationCount, shouldShowCliUpdatePanel, type CliActionAccess, type CliUpdateAlert } from "../lib/cliUpdate";
-import type { AccountLoginSessionView, AccountSnapshot, AccountToolsSnapshot, AccountToolsView, AccentColor, AppLocale, HostPlatform, AutoSwitchEventView, AutoSwitchPolicy, ChatApprovalMode, ChatMode, ChatProviderOptions, CliUpdateReceipt, MessageDisplayMode, ModelCacheCleanupReceipt, ModelOption, ProviderAccountView, ProviderCliUpdateStatus, ProviderId, ProviderRuntimeCounts, ProviderStatus, ProviderRuntimeStopSummary, ResourceRepositorySettings, ResumeAccountPolicy, SystemAutomationSettings, SystemAutomationSnapshot, ThemeMode, TranslationLanguage, TranslationMenu } from "../types";
+import { cacheAwaitsNewerCliRelease, canCheckCliUpdate, canClearModelCaches, canRunCliUpdate, cliUpdateAlert, cliUpdateBadge, cliUpdateBlockedReason, hasCliUpdateAlert, isHeadlessImageUpdateBlock, modelCacheBlockedReason, shouldShowManualUpdateHint, runtimeStopConfirmationCount, shouldShowCliUpdatePanel, type CliActionAccess, type CliUpdateAlert } from "../lib/cliUpdate";
+import type { AccountLoginSessionView, CodexLoginMethod, AccountSnapshot, AccountToolsSnapshot, AccountToolsView, AccentColor, AppLocale, AutoSwitchEventView, AutoSwitchPolicy, ChatApprovalMode, ChatMode, ChatProviderOptions, CliUpdateReceipt, CredentialVaultRecoveryStatus, MessageDisplayMode, ModelCacheCleanupReceipt, ModelOption, ProviderAccountView, ProviderCliUpdateStatus, ProviderId, ProviderRuntimeCounts, ProviderStatus, ProviderRuntimeStopSummary, ResumeAccountPolicy, SystemAutomationSettings, SystemAutomationSnapshot, ThemeMode, TranslationLanguage, TranslationMenu } from "../types";
 import { aiaRuntimeProvider, aiaRuntimeSettings, canRunSystemAgent, sameAiaRuntimeSettings, systemAgentRuntimePatch, type AiaRuntimeSettings } from "../lib/aiaRuntime";
 import { cachedProviderOptions, reasoningOptionsFor, refreshProviderOptions, subscribeProviderOptions, useProviderOptions } from "../lib/providerOptions";
 import { normalizeExtraSettings, normalizeSettingValue, settingFieldsFor } from "../lib/chatSettings";
 import { catalogResetPrompt, schemaDiscoveryPrompt, staleCatalogSources } from "../lib/schemaDiscovery";
+import { loginStartAvailability } from "../lib/loginStartAvailability";
+import { sleepToggleDisabled } from "../lib/sleepPrevention";
 import { defaultEffortFor, RuntimeSettings } from "./RuntimeSettings";
 import { currentBackendServicePort, DEFAULT_BACKEND_SERVICE_PORT, MAX_BACKEND_SERVICE_PORT, MIN_BACKEND_SERVICE_PORT } from "../lib/backend";
-import { repositoryTransferPrompt } from "../lib/skillTransfer";
 import { moveNavigationItem, previewView, setNavigationVisibility, type ConfigurableViewId, type NavigationPreferences } from "../lib/navigationPreferences";
-import { AiaMark, AppToggle, BrandMark, Drawer, ErrorBanner, HelpHint, Modal, NoticeBanner, PathField, SourceBadge, useConfirm, useEscapeToClose, useOutsidePointerToClose } from "./Shared";
+import { AiaMark, AppToggle, BrandMark, Drawer, ErrorBanner, HelpHint, Modal, NoticeBanner, SourceBadge, useConfirm, useEscapeToClose, useOutsidePointerToClose } from "./Shared";
 import { AiaSuggestionPackPanel } from "./AiaSuggestionPackPanel";
 import { TelemetrySettingsCard } from "./TelemetrySettingsCard";
 import { AccountLoginTerminalPanel } from "./TerminalPanel";
@@ -59,9 +61,6 @@ interface SettingsViewProps {
   /** AIA 버튼에서 기본 에이전트 설정이 필요해 이동한 요청. 값이 바뀔 때 안내를 다시 연다. */
   systemAgentNoticeRequest?: number | null;
   appVersionManifest: AppVersionManifest | null;
-  /// 공통 저장소 경로나 프로젝트 활성여부가 바뀌면 알린다. 스킬·지침 화면이 다시 읽고
-  /// 스냅샷도 다시 받아야 한다.
-  onRepositoryChanged?: () => void;
   /// AIA 설정 탭의 선제 제안 팩을 공통 스킬로 복사·복구하면 스킬 목록과 제안 카탈로그가
   /// 함께 바뀐다.
   onSkillsChanged?: () => void;
@@ -311,7 +310,7 @@ function useLoadOnActiveEntry(
 }
 
 type SystemSectionId = "cli" | "agent" | "service" | "language";
-export type SettingsTabId = "connections" | "aia" | "service" | "repository" | "language" | "display";
+export type SettingsTabId = "connections" | "aia" | "service" | "language" | "display";
 
 // 채팅·세션 화면과 같은 중메뉴. 한 화면에 모든 카드를 쌓지 않고 탭으로 나눈다.
 // 채팅 실행설정 스키마는 CLI 정보가 갱신될 때 백엔드가 직접 조사해 맞추므로 독립된
@@ -322,7 +321,6 @@ const settingsTabs: { id: SettingsTabId; icon: ComponentType<{ size?: number; "a
   { id: "connections", icon: KeyRound, label: (text) => text("CLI 설정", "CLI settings") },
   { id: "aia", icon: AiaMark, label: (text) => text("AIA 설정", "AIA settings") },
   { id: "service", icon: Server, label: (text) => text("시스템", "System") },
-  { id: "repository", icon: Library, label: (text) => text("라이브러리", "Library") },
   { id: "language", icon: Languages, label: (text) => text("언어·번역", "Language") },
   { id: "display", icon: Monitor, label: (text) => text("화면·채팅", "Display and chat") },
 ];
@@ -390,7 +388,7 @@ const navigationLabels = (text: UiText): Record<ConfigurableViewId, { label: str
   },
 });
 
-export function SettingsView({ active, providers, accounts, onAccountsChange, onConnectCli, models, themeMode, onThemeModeChange, accentColor, onAccentColorChange, navigationPreferences, onNavigationPreferencesChange, messageDisplayMode, onMessageDisplayModeChange, automation, onAutomationChange, onRequestAiaPrompt, tabRequest, systemAgentNoticeRequest = null, appVersionManifest, onRepositoryChanged, onSkillsChanged }: SettingsViewProps) {
+export function SettingsView({ active, providers, accounts, onAccountsChange, onConnectCli, models, themeMode, onThemeModeChange, accentColor, onAccentColorChange, navigationPreferences, onNavigationPreferencesChange, messageDisplayMode, onMessageDisplayModeChange, automation, onAutomationChange, onRequestAiaPrompt, tabRequest, systemAgentNoticeRequest = null, appVersionManifest, onSkillsChanged }: SettingsViewProps) {
   const { text } = useI18n();
   const [tab, setTab] = useState<SettingsTabId>("connections");
   const [showSystemAgentNotice, setShowSystemAgentNotice] = useState(false);
@@ -444,15 +442,12 @@ export function SettingsView({ active, providers, accounts, onAccountsChange, on
       {tab === "aia" && <>
         {systemCard(["agent"])}
         {/* 선제 제안은 AIA가 스스로 하는 일이라 시스템 에이전트 선택 바로 아래가 제자리다.
-            애드온 → 자동화에 있을 때는 AIA를 켜고 끄는 자리와 AIA가 먼저 말을 거는 자리가
+            자동화 탭에 있을 때는 AIA를 켜고 끄는 자리와 AIA가 먼저 말을 거는 자리가
             갈려 있어, 제안이 뜨지 않을 때 두 화면을 오가야 했다. */}
         <AiaSuggestionPackPanel active={active} automation={automation} onAutomationChange={onAutomationChange} onSkillsChanged={onSkillsChanged} />
       </>}
       {tab === "service" && systemCard(["service"])}
       {tab === "language" && systemCard(["language"])}
-      {/* 프로젝트 활성여부 카드는 프로젝트 화면의 설정 탭으로 옮겨 갔다. `onRepositoryChanged`는
-          공통 저장소 경로 변경이 스킬·지침 화면을 다시 읽게 하는 데 그대로 쓰인다. */}
-      {tab === "repository" && <ResourceRepositoryCard onChanged={onRepositoryChanged} automation={automation} onRequestAiaPrompt={onRequestAiaPrompt} />}
       {tab === "display" && (
         <DisplaySettingsSection
           navigationPreferences={navigationPreferences}
@@ -586,7 +581,7 @@ function DisplaySettingsSection({
               </div>
             </div>
           </section>
-          <section className="settings-subsection">
+          <section className="settings-subsection" data-ui-anchor="settings.theme">
             <header><div><strong>{text("테마", "Theme")}</strong><small>{text("앱 전체의 밝기 테마를 선택합니다. 자동은 운영체제 설정을 따릅니다.", "Choose the app appearance. Auto follows the operating system.")}</small></div></header>
             <SettingsChoiceList
               ariaLabel={text("화면 테마", "Display theme")}
@@ -637,182 +632,6 @@ const DISCOVERY_WATCH_MAX_ATTEMPTS = 20;
 // 이 카드는 그 결과와 AIA가 제안한 모델·추론 카탈로그 상태를 보여주고, 자동 조사로
 // 판단할 수 없는 부분(도움말 산문의 모델 alias 등)을 AIA가 살펴보게 하는 경로다.
 // AIA가 꺼져 있으면 재조사 경로 전체를 쓸 수 없다.
-/**
- * 스킬·지침 공통 저장소 위치 설정. 지침관리 화면에 있던 카드를 설정 저장소 탭으로
- * 옮겼다. 경로를 바꾸면 스킬·지침 목록이 새 경로를 다시 읽어야 하므로 `onChanged`로
- * 알린다.
- */
-function ResourceRepositoryCard({ onChanged, automation, onRequestAiaPrompt }: {
-  onChanged?: () => void;
-  automation: SystemAutomationSnapshot | null;
-  /** 저장소 백업·복구를 AIA 입력창에 위임한다. */
-  onRequestAiaPrompt?: (prompt: string) => void;
-}) {
-  const { text } = useI18n();
-  const aiaAvailable = Boolean(aiaRuntimeProvider(automation));
-  const [repository, setRepository] = useState<ResourceRepositorySettings | null>(null);
-  const [rootPath, setRootPath] = useState("");
-  const [migrateExisting, setMigrateExisting] = useState(true);
-  const [notice, setNotice] = useState<string | null>(null);
-  const { busy: busyKey, error, setError, run } = useCardTask<"apply">(() => setNotice(null));
-  const busy = busyKey !== null;
-
-  useEffect(() => {
-    let active = true;
-    getResourceRepository()
-      .then((settings) => {
-        if (!active) return;
-        setRepository(settings);
-        setRootPath(settings.rootPath);
-      })
-      .catch((cause: unknown) => {
-        if (active) setError(errorText(cause));
-      });
-    return () => { active = false; };
-  }, []);
-
-  const apply = (useDefault: boolean) => run("apply", async () => {
-    const settings = await setResourceRepository({
-      rootPath: useDefault ? null : rootPath.trim(),
-      migrateExisting,
-    });
-    setRepository(settings);
-    setRootPath(settings.rootPath);
-    setNotice(useDefault
-      ? text("기본 저장소 경로로 되돌렸습니다.", "Restored the default repository path.")
-      : text("라이브러리 경로를 적용했습니다.", "Applied the library path."));
-    onChanged?.();
-  });
-
-  return (
-    <section className="settings-card">
-      <header>
-        <div>
-          <span>{text("라이브러리", "Library")}</span>
-          <h2>{text("스킬·프로젝트 지침 저장 위치", "Skill and project instruction storage")}</h2>
-        </div>
-        <p>{text(
-          "스킬 원본과 프로젝트 지침 원본을 보관할 위치입니다. 클라우드 드라이브 폴더로 바꾸면 여러 기기에서 같은 원본을 씁니다.",
-          "Where skill and project instruction sources are archived. Point it at a cloud-drive folder to share the same sources across devices.",
-        )}</p>
-      </header>
-      <div className="settings-card-sections">
-        <section className="settings-subsection">
-          <header>
-            <div>
-              <strong>{text("현재 장치", "Current device")}</strong>
-              <small>{repository ? platformLabel(repository.currentPlatform, text) : "-"}</small>
-            </div>
-            {repository && (
-              <span className={`skill-sync-pill ${repository.custom ? "conflict" : "current"}`}>
-                {repository.custom ? text("사용자 지정", "Custom") : text("앱 기본값", "App default")}
-              </span>
-            )}
-          </header>
-          {error && <ErrorBanner message={error} />}
-          {!repository ? (
-            <p className="settings-storage-note">{text("저장소 설정을 불러오는 중…", "Loading repository settings…")}</p>
-          ) : (
-            <div className="detail-card">
-              <div className="form-row">
-                <label htmlFor="resource-repository-path">{text("저장소 경로", "Repository path")}</label>
-                <div data-ui-anchor="settings.repository-path">
-                  <PathField
-                    id="resource-repository-path"
-                    value={rootPath}
-                    onChange={setRootPath}
-                    placeholder={repository.defaultRootPath}
-                    disabled={busy}
-                  />
-                </div>
-              </div>
-              <div className="form-row">
-                <label htmlFor="resource-repository-default-path">{text("기본 경로", "Default path")}</label>
-                <div>
-                  <PathField id="resource-repository-default-path" value={repository.defaultRootPath} />
-                </div>
-              </div>
-              <div className="form-row">
-                <label>{text("하위 경로", "Managed folders")}</label>
-                <div className="path-field-group">
-                  <PathField value={repository.skillsPath} />
-                  <PathField value={repository.instructionsPath} />
-                </div>
-              </div>
-              <div className="form-row">
-                <label>{text("이전", "Migration")}</label>
-                <label className="check-filter">
-                  <input
-                    type="checkbox"
-                    checked={migrateExisting}
-                    onChange={(event) => setMigrateExisting(event.target.checked)}
-                    disabled={busy}
-                  />
-                  {text("기존 스킬·지침 원본을 새 경로로 복사", "Copy existing skill and instruction sources to the new path")}
-                </label>
-              </div>
-              <div className="form-actions">
-                <button
-                  className="button"
-                  type="button"
-                  disabled={busy || !repository.custom}
-                  onClick={() => { void apply(true); }}
-                >{text("기본 경로로 복귀", "Restore default")}</button>
-                <button
-                  className="button primary"
-                  type="button"
-                  disabled={busy || !rootPath.trim()}
-                  onClick={() => { void apply(false); }}
-                >{busy ? text("적용 중…", "Applying…") : text("적용", "Apply")}</button>
-              </div>
-              {notice && <p className="settings-storage-note" role="status">{notice}</p>}
-            </div>
-          )}
-        </section>
-        {onRequestAiaPrompt && (
-          <section className="settings-subsection">
-            <header>
-              <div>
-                <strong>{text("백업 및 복구", "Backup and restore")}</strong>
-                <small>{text(
-                  "스킬·지침 원본을 AIA로 백업하거나 복원합니다. 채팅·세션·계정 정보는 포함되지 않습니다.",
-                  "Back up or restore skill and instruction sources with AIA. Chats, sessions, and account data are not included.",
-                )}</small>
-              </div>
-              <div className="repository-transfer-buttons">
-                <button
-                  className="button"
-                  type="button"
-                  disabled={!aiaAvailable}
-                  title={aiaAvailable
-                    ? text("AIA에게 라이브러리 백업을 요청합니다", "Ask AIA to back up the library")
-                    : text("연결된 시스템 에이전트를 설정하세요", "Configure a connected system agent")}
-                  onClick={() => onRequestAiaPrompt(repositoryTransferPrompt("backup"))}
-                ><Download size={15} aria-hidden="true" /><AiaMark size={14} />{text("백업", "Back up")}</button>
-                <button
-                  className="button"
-                  type="button"
-                  disabled={!aiaAvailable}
-                  title={aiaAvailable
-                    ? text("AIA에게 라이브러리 복구를 요청합니다", "Ask AIA to restore the library")
-                    : text("연결된 시스템 에이전트를 설정하세요", "Configure a connected system agent")}
-                  onClick={() => onRequestAiaPrompt(repositoryTransferPrompt("restore"))}
-                ><Upload size={15} aria-hidden="true" /><AiaMark size={14} />{text("복구", "Restore")}</button>
-              </div>
-            </header>
-          </section>
-        )}
-      </div>
-    </section>
-  );
-}
-
-function platformLabel(platform: HostPlatform, text: UiText): string {
-  if (platform === "macos") return "macOS";
-  if (platform === "windows") return "Windows";
-  if (platform === "linux") return "Linux";
-  return text("알 수 없음", "Unknown");
-}
 
 /**
  * 실행설정 갱신 카드가 화면에 그리는 값은 조사 원본(CLI가 감지된 공급자)들의 스냅샷을 겹쳐
@@ -1162,10 +981,39 @@ function useAccountLogin({ run, onAccountsChange, onError, onNotice }: {
   const { text } = useI18n();
   const [session, setSession] = useState<AccountLoginSessionView | null>(null);
   const [label, setLabel] = useState("");
-  const [complete, setComplete] = useState(false);
+  // 저장 가능 판정은 두 갈래다. 터미널이 CLI 종료(코드 0)를 본 것과, 백엔드가 임시 프로필에서
+  // 자격증명을 확인한 것. 원격 탭은 소켓이 잠깐 끊기면 종료 이벤트를 놓치고 2분 유예 뒤에는
+  // 터미널이 사라져 다시 받을 수도 없다(2026-10-10 NAS 실측). 그때는 두 번째 갈래가 연다.
+  const [terminalComplete, setTerminalComplete] = useState(false);
+  const [credentialsReady, setCredentialsReady] = useState(false);
+  const complete = terminalComplete || credentialsReady;
+  // 터미널 쪽 갈래만 받는다. 다시 연 터미널이 "아직 안 끝남"을 알려도 백엔드가 이미 확인한
+  // 자격증명은 그대로다.
+  const setComplete = setTerminalComplete;
+  const sessionId = session?.id ?? null;
+
+  useEffect(() => {
+    if (!sessionId || complete) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const view = await getProviderAccountLogin(sessionId);
+        if (!cancelled && view.credentialsReady) setCredentialsReady(true);
+      } catch {
+        // 세션이 이미 정리됐거나 백엔드에 닿지 못한 것이다. 다음 주기에 다시 묻고, 닫히면 멈춘다.
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [sessionId, complete]);
 
   const begin = async (provider: ProviderId, account?: ProviderAccountView) => {
-    setComplete(false);
+    setTerminalComplete(false);
+    setCredentialsReady(false);
     await run(account?.id ?? provider, async () => {
       setSession(await beginProviderAccountLogin(provider, account?.id));
       setLabel(account?.displayName ?? "");
@@ -1176,7 +1024,8 @@ function useAccountLogin({ run, onAccountsChange, onError, onNotice }: {
     if (!session) return;
     const id = session.id;
     setSession(null);
-    setComplete(false);
+    setTerminalComplete(false);
+    setCredentialsReady(false);
     try { await cancelProviderAccountLogin(id); }
     catch (cause) { onError(errorText(cause)); }
   };
@@ -1195,7 +1044,8 @@ function useAccountLogin({ run, onAccountsChange, onError, onNotice }: {
       const snapshot = await finishProviderAccountLogin(id, label.trim() || null);
       onAccountsChange(snapshot);
       setSession(null);
-      setComplete(false);
+      setTerminalComplete(false);
+      setCredentialsReady(false);
       onNotice(reauthentication
         ? text("로그인 정보를 저장했습니다. 이 계정의 다음 실행부터 새 자격증명을 씁니다.", "Login credentials saved. New credentials will be used from the next run of this account.")
         : text("로그인 정보를 저장하고 계정 등록을 완료했습니다.", "Saved login credentials and completed account registration."));
@@ -1209,15 +1059,18 @@ function useAccountLogin({ run, onAccountsChange, onError, onNotice }: {
  * 로그인을 끝내려면 무엇을 해야 하는지 한 줄. 공급자마다 브라우저와 터미널이 나눠 맡는
  * 몫이 달라 갈린다.
  */
-function loginCompletionHint(provider: ProviderId, remote: boolean): string {
+function loginCompletionHint(provider: ProviderId, remote: boolean, codexMethod: CodexLoginMethod): string {
   if (provider === "antigravity") {
     return runtimeText("브라우저 인증 후 표시된 코드를 60초 안에 터미널로 전송하세요. 시간을 넘기면 CLI가 끝나므로 취소하고 다시 시작해야 합니다.", "Send the code shown after browser authorization to the terminal within 60 seconds. If time expires, the CLI terminates and you must cancel and start again.");
   }
   if (provider !== "codex") {
     return runtimeText("브라우저 인증 후 표시된 코드를 터미널에 전송하세요. CLI가 정상 종료되어야 저장할 수 있습니다.", "Send the code shown after browser authorization to the terminal. You can save once the CLI exits cleanly.");
   }
+  if (codexMethod === "device") {
+    return runtimeText("터미널의 링크를 브라우저에서 열고 표시된 일회용 코드를 입력하세요. CLI가 정상 종료되어야 저장할 수 있습니다.", "Open the link from the terminal in your browser and enter the one-time code. You can save once the CLI exits cleanly.");
+  }
   return remote
-    ? runtimeText("터미널의 링크를 브라우저에서 열고 표시된 일회용 코드를 입력하세요. CLI가 정상 종료되어야 저장할 수 있습니다.", "Open the link from the terminal in your browser and enter the one-time code. You can save once the CLI exits cleanly.")
+    ? runtimeText("승인 뒤 멈춘 브라우저의 주소를 '승인 주소 전달' 칸에 붙여 넣으세요. CLI가 정상 종료되어야 저장할 수 있습니다.", "Paste the address of the browser page that stopped after approval into 'Send approval address'. You can save once the CLI exits cleanly.")
     : runtimeText("이 컴퓨터의 브라우저에서 로그인만 마치세요. CLI가 정상 종료되어야 저장할 수 있습니다.", "Complete the login in your browser on this computer. You can save once the CLI exits cleanly.");
 }
 
@@ -1236,10 +1089,30 @@ function AccountLoginDrawer({ login, label, complete, remote, saving, error, onL
   onFinish: () => void;
 }) {
   const { text } = useI18n();
+  // Codex는 두 방식을 모두 지원한다. 원격은 붙여넣기 없이 끝나는 기기 코드가 기본이고,
+  // 브라우저 방식은 승인 뒤 멈춘 주소를 붙여 넣어 끝낸다. 백엔드 기본값과 같다.
+  const [codexMethod, setCodexMethod] = useState<CodexLoginMethod>(remote ? "device" : "browser");
   return <Drawer title={<><SourceBadge source={login.provider} /><span>{login.accountId ? text("계정 재인증", "Re-authenticate account") : text("계정 추가", "Add account")}</span></>} onClose={onClose}>
     <label className="account-login-label"><span>{text("표시명", "Display name")}</span><input value={label} onChange={(event) => onLabelChange(event.target.value)} placeholder={text("비워두면 공급자 계정 이름 사용", "Leave blank to use provider account name")} /></label>
-    <AccountLoginTerminalPanel login={login} remote={remote} onCompletionChange={onCompletionChange} />
-    {!complete && <p className="account-login-completion-hint">{loginCompletionHint(login.provider, remote)}</p>}
+    {login.provider === "codex" && (
+      <div className="account-login-method" role="radiogroup" aria-label={text("로그인 방식", "Login method")}>
+        <span>{text("로그인 방식", "Login method")}</span>
+        {(["device", "browser"] as const).map((method) => (
+          <button
+            key={method}
+            type="button"
+            role="radio"
+            aria-checked={codexMethod === method}
+            className={`button compact${codexMethod === method ? " primary" : ""}`}
+            onClick={() => setCodexMethod(method)}
+          >
+            {method === "device" ? text("기기 코드", "Device code") : text("브라우저", "Browser")}
+          </button>
+        ))}
+      </div>
+    )}
+    <AccountLoginTerminalPanel login={login} remote={remote} codexMethod={codexMethod} onCompletionChange={onCompletionChange} />
+    {!complete && <p className="account-login-completion-hint">{loginCompletionHint(login.provider, remote, codexMethod)}</p>}
     {error && <ErrorBanner message={error} />}
     <div className="cli-connect-actions"><button className="button" type="button" disabled={saving} onClick={onClose}>{text("취소", "Cancel")}</button><button className="button primary" type="button" disabled={saving || !complete} onClick={onFinish}>{saving ? text("저장 중…", "Saving…") : text("로그인 완료 저장", "Save login")}</button></div>
   </Drawer>;
@@ -1479,10 +1352,20 @@ function CliConnectionSettingsSection({ active, providers, accounts, onAccountsC
   const [notice, setNotice] = useState<string | null>(null);
   const { busy, error, setError, run: runAccountTask } = useCardTask<string>(() => setNotice(null));
   const [accountTools, setAccountTools] = useState<AccountToolsSnapshot | null>(null);
-  const canManage = access?.writable === true;
+  const [vaultRecovery, setVaultRecovery] = useState<CredentialVaultRecoveryStatus | null>(null);
+  // C20. 로그인 뒤에는 모든 채널이 같은 권한이다. 악수가 끝나면 관리할 수 있다.
+  const canManage = access !== null;
   const cli = useProviderCliUpdates(active, access, canManage);
 
   useEffect(() => loadWhileMounted(getWebAccessStatus, setAccess, setError), []);
+
+  useEffect(() => {
+    if (!active || access === null || access.remote) return undefined;
+    return loadWhileMounted(getCredentialVaultRecoveryStatus, setVaultRecovery, (cause) => {
+      setVaultRecovery(null);
+      setError(errorText(cause));
+    });
+  }, [active, access?.remote]);
 
   // 계정별 도구 요약은 공급자 홈 설정만 읽는 부수효과 없는 조회다. 계정 목록이
   // 바뀔 때(추가·삭제·활성 계정 전환)마다 다시 읽어 귀속을 최신 상태로 맞춘다.
@@ -1534,6 +1417,30 @@ function CliConnectionSettingsSection({ active, providers, accounts, onAccountsC
   const login = accountLogin.session;
   const accountActions = useAccountActions({ accounts, busy, onAccountsChange, run: runAccountTask, setError, setNotice, confirm });
 
+  const recoverVault = async () => {
+    if (!vaultRecovery || vaultRecovery.state !== "recoveryRequired" || busy) return;
+    const accepted = await confirm({
+      title: text("자격증명 저장소 복구", "Recover credential vault"),
+      message: `${text(
+        "손상된 자격증명 Vault를 새 문서로 교체합니다. 격리 프로필의 계정과 유효기간을 검증한 뒤 복구합니다.",
+        "Replace the damaged credential vault with a new document after verifying account identity and expiry from isolated profiles.",
+      )}\n${text("검증 복구 가능", "Verified recovery available")}: ${vaultRecovery.recoverableAccountCount} · ${text("재인증 필요", "Sign-in required")}: ${vaultRecovery.needsReauthenticationCount}`,
+      warning: text(
+        "누락된 Vault 조각 자체는 복원할 수 없습니다. 실행 중인 공급자 작업이 있으면 복구가 거절됩니다.",
+        "Missing vault chunks cannot be restored. Recovery is refused while provider runtimes are active.",
+      ),
+      confirmLabel: text("검증 후 복구", "Verify and recover"),
+      tone: "danger",
+    });
+    if (!accepted) return;
+    await runAccountTask("recover-vault", async () => {
+      const receipt = await recoverCredentialVault();
+      onAccountsChange(receipt.snapshot);
+      setVaultRecovery(await getCredentialVaultRecoveryStatus());
+      setNotice(`${text("자격증명 저장소 복구를 마쳤습니다.", "Credential vault recovery completed.")} ${text("복구된 계정", "Recovered accounts")}: ${receipt.recoveredAccountCount} · ${text("재인증 필요", "Sign-in required")}: ${receipt.needsReauthenticationCount}`);
+    });
+  };
+
   return <>
     <section className="settings-subsection cli-status-settings-section" id="cli-connections" data-ui-anchor="settings.connections">
       <header>
@@ -1543,11 +1450,9 @@ function CliConnectionSettingsSection({ active, providers, accounts, onAccountsC
             label={text("활성 계정 변경 동작 설명", "How active account changes are applied")}
             title={text("활성 계정 변경 동작", "How active account changes are applied")}
           >{access === null
-            ? text("원격 계정 관리 권한을 확인하고 있습니다.", "Checking remote account management access.")
-            : !canManage
-              ? text("원격 편집이 꺼져 있어 계정과 사용량만 조회할 수 있습니다.", "Remote editing is off; accounts and usage are read-only.")
-              : access.remote
-              ? text("원격 편집이 켜져 있어 계정 추가와 활성 인증 변경을 사용할 수 있습니다.", "Remote editing is on, so account login and active authentication changes are available.")
+            ? text("백엔드 연결을 확인하고 있습니다.", "Checking the backend connection.")
+            : access.remote
+              ? text("원격에서도 데스크톱과 같은 권한으로 계정 추가와 활성 인증 변경을 사용할 수 있습니다.", "Remote has the same permissions as the desktop, so account login and active authentication changes are available.")
               : text("활성 계정 변경은 중앙 백엔드에서 실행 중인 관리 세션과 외부 실행 CLI 프로세스(터미널·IDE)를 모두 종료한 뒤 적용됩니다(정상 종료 실패 시 강제 종료). 새 세션은 변경된 활성 계정을 사용합니다.", "The central backend changes the active account only after stopping managed sessions and externally launched CLI processes (terminal/IDE), force-killing any that fail to stop; new sessions use the activated account.")}</HelpHint></strong>
           <small>{text(
             "공급자별 CLI와 공유 히스토리를 유지하면서 활성 인증 계정과 사용량을 관리합니다.",
@@ -1556,6 +1461,17 @@ function CliConnectionSettingsSection({ active, providers, accounts, onAccountsC
         </div>
       </header>
       <div className="cli-status-settings-body">
+        {vaultRecovery?.state === "recoveryRequired" && <div className="cli-update-alert credential-vault-recovery" role="alert">
+          <ShieldAlert size={16} aria-hidden="true" />
+          <span>
+            <strong>{text("자격증명 저장소 복구 필요", "Credential vault recovery required")}</strong>
+            <small>{text(
+              "등록 계정의 Vault 조각이 누락됐습니다. 격리 프로필에서 검증 가능한 자격증명만 복구합니다.",
+              "Credential vault chunks are missing. Only credentials verified from isolated profiles will be recovered.",
+            )} {text("등록", "Registered")}: {vaultRecovery.registeredAccountCount} · {text("검증 복구 가능", "Verified recovery available")}: {vaultRecovery.recoverableAccountCount} · {text("재인증 필요", "Sign-in required")}: {vaultRecovery.needsReauthenticationCount}</small>
+          </span>
+          <button className="button compact" type="button" disabled={Boolean(busy)} onClick={() => void recoverVault()}>{busy === "recover-vault" ? text("복구 중…", "Recovering…") : text("복구", "Recover")}</button>
+        </div>}
         <CliUpdateNotice alert={cli.alert} />
         {cli.errors.status && <ErrorBanner message={cli.errors.status} />}
         <div className="cli-settings-list account-settings-list">
@@ -1564,6 +1480,7 @@ function CliConnectionSettingsSection({ active, providers, accounts, onAccountsC
             provider={provider}
             accounts={accounts}
             canManage={canManage}
+            headless={Boolean(access?.headless)}
             busy={busy}
             cli={cli}
             accountTools={accountTools}
@@ -1887,6 +1804,11 @@ function ProviderCliUpdatePanel({ status, access, busyKey, pending, notices, err
     unchecked: text("확인 전", "Not checked"),
   }[badge];
   const updateBlocked = cliUpdateBlockedReason(status, access);
+  // 헤드리스 사유만 이 화면이 직접 쓰는 문장이라 영어 짝을 가진다. 나머지는 백엔드가 준
+  // 문장을 그대로 싣는다. 본문과 버튼 툴팁이 같은 변수를 보게 해 한쪽만 영어가 되지 않게 한다.
+  const updateBlockedLabel = isHeadlessImageUpdateBlock(status, access)
+    ? text("컨테이너 이미지에 포함된 CLI입니다. 이미지를 다시 빌드해 갱신하세요.", "This CLI ships inside the container image. Rebuild the image to update it.")
+    : updateBlocked;
   const cacheBlocked = modelCacheBlockedReason(status, access);
   const checking = busyKey === cliTaskKey("check", status.provider);
   const updating = busyKey === cliTaskKey("update", status.provider);
@@ -1914,13 +1836,13 @@ function ProviderCliUpdatePanel({ status, access, busyKey, pending, notices, err
     {status.checkError && <small className="cli-update-note error">{text("최신 버전 확인 실패", "Version check failed")}: {status.checkError}</small>}
     {!status.checkSupported && status.checkUnsupportedReason && !status.checkError
       && <small className="cli-update-note">{status.checkUnsupportedReason}</small>}
-    {updateBlocked && <small className="cli-update-note">{updateBlocked}
-      {status.manualUpdateHint ? ` · ${text("수동 업데이트", "Manual update")}: ${status.manualUpdateHint}` : ""}</small>}
+    {updateBlockedLabel && <small className="cli-update-note">{updateBlockedLabel}
+      {shouldShowManualUpdateHint(status, access) ? ` · ${text("수동 업데이트", "Manual update")}: ${status.manualUpdateHint}` : ""}</small>}
     <div className="cli-update-actions">
       <button className="button compact" type="button" disabled={!canCheckCliUpdate(status, access)} title={status.checkSupported ? undefined : status.checkUnsupportedReason ?? undefined} onClick={onCheck}>
         <RefreshCw size={13} />{checking ? text("확인 중…", "Checking…") : text("업데이트 확인", "Check for updates")}
       </button>
-      <button className={`button compact${status.updateAvailable ? " primary" : ""}`} type="button" disabled={!canRunCliUpdate(status, access)} title={updateBlocked ?? status.updateCommandLabel ?? undefined} onClick={onUpdate}>
+      <button className={`button compact${status.updateAvailable ? " primary" : ""}`} type="button" disabled={!canRunCliUpdate(status, access)} title={updateBlockedLabel ?? status.updateCommandLabel ?? undefined} onClick={onUpdate}>
         <Download size={13} />{updating ? text("업데이트 중…", "Updating…") : text("업데이트", "Update")}
       </button>
       {status.modelCaches.length > 0 && <button className="button compact" type="button" disabled={!canClearModelCaches(status, access)} title={cacheBlocked ?? text("실행 버전보다 높은 기록 버전의 모델 캐시만 삭제합니다", "Deletes only model caches written by a newer client version")} onClick={onClearCache}>
@@ -2534,6 +2456,7 @@ function CliProviderCard({
   provider,
   accounts,
   canManage,
+  headless,
   busy,
   cli,
   accountTools,
@@ -2547,6 +2470,7 @@ function CliProviderCard({
   provider: ProviderStatus;
   accounts: AccountSnapshot | null;
   canManage: boolean;
+  headless: boolean;
   busy: string | null;
   cli: ReturnType<typeof useProviderCliUpdates>;
   accountTools: AccountToolsSnapshot | null;
@@ -2565,7 +2489,7 @@ function CliProviderCard({
   // 화면만 뒤처져, 등록된 계정이 있는데도 계정 구획이 통째로 숨는다.
   const managed = Boolean(providerState);
   const cliStatus = cli.statuses?.find((status) => status.provider === provider.provider) ?? null;
-  const cliAccess: CliActionAccess = { writable: canManage, busy: Boolean(cli.busy) };
+  const cliAccess: CliActionAccess = { headless, busy: Boolean(cli.busy) };
   // 업데이트 구획은 상단 알림 근거가 있을 때만 알림과 함께 연다. 진행 중인 작업과
   // 남아 있는 결과 안내는 근거가 사라진 뒤에도 읽을 수 있게 함께 조건에 넣는다.
   const cliActionKeys = [cliTaskKey("check", provider.provider), cliTaskKey("update", provider.provider), cliTaskKey("cache", provider.provider)];
@@ -2674,6 +2598,7 @@ function SystemAutomationSettingsCard({ active, sections, providers, accounts, o
         {sections.includes("service") && <>
           <AppVersionSettings manifest={appVersionManifest} />
           <RemoteAccessSettings />
+          <LoginSettingsCard />
         </>}
         {sections.includes("language") && <LanguageAutomationSection automation={automation} onChange={onChange} onError={setError} />}
       </div>
@@ -3077,7 +3002,7 @@ function SystemAgentRuntimeSettings({ provider, providerName, recentModels, runt
 /// 다만 "아직 안 온 값"과 "오지 못한 값"은 다르다. 조회가 실패로 끝났는데도 확인 중을
 /// 두면 화면에 다시 부르는 길이 없어 영원히 기다리는 표식이 되고, 같은 줄의 요약이
 /// 실패를 말하는 것과 정면으로 어긋난다(QA #80). `loadError`가 있으면 그 사실을 적는다.
-function BackendServiceToggleRow({ title, help, summary, checked, highlighted, disabled, loadError, desktopOnly, onChange }: {
+function BackendServiceToggleRow({ title, help, summary, checked, highlighted, disabled, loadError, desktopOnly, notApplicable, onChange }: {
   title: string;
   help?: ReactNode;
   summary: string;
@@ -3088,6 +3013,8 @@ function BackendServiceToggleRow({ title, help, summary, checked, highlighted, d
   loadError?: string | null;
   /** 데스크톱 앱에서만 읽고 바꿀 수 있는 값. 브라우저·원격 화면에서는 조회 자체를 하지 않는다. */
   desktopOnly?: boolean;
+  /** 이 기동에서는 토글 자체가 성립하지 않을 때 스위치 대신 보일 표식(H10 헤드리스). */
+  notApplicable?: string | null;
   onChange: (next: boolean) => void;
 }) {
   const { text } = useI18n();
@@ -3101,7 +3028,11 @@ function BackendServiceToggleRow({ title, help, summary, checked, highlighted, d
         <strong>{title}{help}</strong>
         <small>{summary}</small>
       </span>
-      {unknown && desktopOnly
+      {unknown && notApplicable
+        // 조회된 값이 아니라 이 기동에 해당 없는 행이다. "확인 중"으로 두면 오지 않을
+        // 응답을 기다리는 표식이 되고, 꺼짐으로 두면 살아 있는 접속을 꺼진 것으로 읽힌다.
+        ? <em className="health muted backend-service-toggle-not-applicable">{notApplicable}</em>
+        : unknown && desktopOnly
         // 조회하지 않는 값에 "확인 중"을 두면 영원히 기다리는 표식이 된다(qa34).
         ? <em className="health muted backend-service-toggle-desktop-only">{text("데스크톱 앱 전용", "Desktop app only")}</em>
         : unknown
@@ -3133,40 +3064,29 @@ function BackendServiceAlert({ message, actions }: { message: string; actions?: 
 function tailscaleSummaryText(
   taskError: string | null,
   tailscale: TailscaleServiceStatus | null,
+  headless: boolean,
   text: UiText,
 ): string {
   if (taskError) return taskError;
+  // 헤드리스(NAS 컨테이너)에서는 Serve를 앱이 아니라 사이드카가 물고 있다. 이 화면에서
+  // 켜고 끄는 것은 앱이 관리하는 Serve뿐이라, 같은 토글을 내밀면 끄지도 못하면서
+  // 실패만 하거나 사이드카가 연 경로와 어긋난 상태를 보여 준다.
+  if (headless) {
+    const managed = text("Tailscale 사이드카가 담당합니다", "The Tailscale sidecar owns this");
+    // 주소가 있으면 어디로 들어오는지, 조회가 실패했으면 그 사유를 덧붙인다 — 담당이
+    // 사이드카라는 사실이 컨테이너의 Tailscale 조회 실패를 가려서는 안 된다.
+    const detail = tailscale?.url
+      ?? (tailscale?.host ? `https://${tailscale.host}` : null)
+      ?? tailscale?.error
+      ?? null;
+    return detail ? `${managed} · ${detail}` : managed;
+  }
   if (!tailscale) return text("Tailscale 상태 확인 중…", "Checking Tailscale status…");
   if (!tailscale.available) return tailscale.error ?? text("Tailscale을 사용할 수 없습니다.", "Tailscale is unavailable.");
-  // 읽기 전용 여부는 아래 원격 편집 허용 행이 단독으로 알린다.
   if (tailscale.enabled) return `${text("서비스주소", "Service address")} ${tailscale.url ?? `https://${tailscale.host ?? ""}`}`;
   if (tailscale.conflictTarget) return `${text("다른 서비스가 Serve 루트를 사용 중", "Another service owns the Serve root")}: ${tailscale.conflictTarget}`;
   if (tailscale.host) return `${text("꺼짐 · 켜면", "Off · turns on at")} https://${tailscale.host}`;
   return text("꺼짐", "Off");
-}
-
-/**
- * 원격 편집 허용 행의 요약 문구. 현재 권한 상태 뒤에, 이 화면에서 못 바꾸는 경우만 그 사정을 덧붙인다.
- *
- * 이 행의 값은 Tailscale 상태 조회가 함께 실어 온다. 그 조회가 실패하면 여기에도 값이
- * 영영 오지 않으므로, 자기 작업 오류가 없더라도 조회 실패를 그대로 옮겨 적는다 —
- * 그러지 않으면 이 줄만 아무 일도 없다는 듯 "설정 확인 중…"에 머문다(QA #80).
- */
-function remoteWriteSummaryText(
-  taskError: string | null,
-  loadError: string | null,
-  tailscale: TailscaleServiceStatus | null,
-  access: WebAccessStatus | null,
-  canManage: boolean,
-  text: UiText,
-): string {
-  if (taskError) return taskError;
-  if (!tailscale) return loadError ?? text("설정 확인 중…", "Checking setting…");
-  const state = tailscale.remoteWrite
-    ? text("원격에서도 데스크톱과 같이 변경할 수 있습니다", "Remote can change things just like the desktop")
-    : text("원격은 읽기 전용입니다 · 조회만 됩니다", "Remote is read only · viewing only");
-  if (!access || canManage) return state;
-  return `${state} · ${text("호스트 화면에서만 바꿀 수 있습니다", "Changeable from the host screen only")}`;
 }
 
 /** 절전 억제 행의 요약 문구. 호스트가 알려 준 실패 사유가 있으면 켜짐·꺼짐보다 그것을 먼저 보여 준다. */
@@ -3408,7 +3328,7 @@ function BackendServicePortRow({ state, nativeRuntime, tailscalePort, runningPor
 
 /**
  * 백엔드 서비스 카드의 토글 행 하나가 `BackendServiceToggleRow`에 넘기는 값 한 벌.
- * 세 행(Tailscale 서비스·원격 편집 허용·절전 억제)이 모두 이 모양으로 그려지므로,
+ * 세 행(Tailscale 서비스·절전 억제·자동 시작)이 모두 이 모양으로 그려지므로,
  * 행마다의 훅이 이 타입 하나를 돌려주고 컴포넌트는 그대로 펴 넘기기만 한다.
  */
 type BackendToggleState = {
@@ -3417,6 +3337,7 @@ type BackendToggleState = {
   loadError: string | null;
   disabled: boolean;
   desktopOnly?: boolean;
+  notApplicable?: string | null;
   highlighted?: boolean;
   onChange: (next: boolean) => void;
 };
@@ -3505,69 +3426,22 @@ function useTailscaleServiceToggle({ nativeRuntime, access, restarting, setResta
     });
   };
 
-  const canManage = Boolean(access?.writable) && Boolean(status?.available);
+  // 헤드리스에서는 이 행이 읽기 전용 안내다 — 앱이 관리하는 Serve가 없고, 켜기가
+  // 동반하는 "앱 재시작"도 돌아갈 데스크톱 앱이 없어 성립하지 않는다.
+  const headless = Boolean(access?.headless);
+  const canManage = !headless && Boolean(access) && Boolean(status?.available);
   const row: BackendToggleState = {
-    summary: tailscaleSummaryText(task.error, status, text),
-    checked: status ? status.enabled : null,
+    summary: tailscaleSummaryText(task.error, status, headless, text),
+    // 헤드리스에서 `status.enabled`는 "**앱이** 관리하는 Serve가 걸려 있는가"라 사이드카가
+    // 무는 컨테이너에서는 늘 꺼짐이다. 살아 있는 원격 접속을 꺼진 스위치로 보이지 않도록
+    // 값을 내주지 않고 해당 없음 표식으로 그린다.
+    checked: headless ? null : status ? status.enabled : null,
+    notApplicable: headless ? text("사이드카 담당", "Sidecar-managed") : null,
     loadError: task.error,
     disabled: !canManage || task.busy || restarting,
     onChange: (next) => void toggle(next),
   };
   return { task, status, setStatus, conflict, setConflict, toggle, row };
-}
-
-/**
- * 원격 편집 허용 행. 값은 Tailscale 상태 조회가 함께 실어 오므로 그 상태와 조회 실패
- * 사유를 넘겨받아 쓰고, 자기가 바꾼 결과는 같은 자리에 되돌려 놓는다.
- */
-function useRemoteWriteToggle({ status, setStatus, loadError, access, restarting, clearNotice, setNotice, confirm }: {
-  status: TailscaleServiceStatus | null;
-  setStatus: (value: TailscaleServiceStatus) => void;
-  loadError: string | null;
-  access: WebAccessStatus | null;
-  restarting: boolean;
-  clearNotice: () => void;
-  setNotice: (value: string | null) => void;
-  confirm: ReturnType<typeof useConfirm>["confirm"];
-}): BackendToggleState {
-  const { text } = useI18n();
-  const task = useBackendTask(clearNotice);
-
-  const toggle = async (next: boolean) => {
-    await task.run(async () => {
-      setStatus(await setRemoteWriteEnabled(next));
-      setNotice(next
-        ? text("원격 편집을 허용했습니다", "Remote editing is allowed")
-        : text("원격을 읽기 전용으로 바꿨습니다", "Remote is now read only"));
-    }, {
-      // 켜는 쪽만 확인받는다. 원격에 데스크톱과 같은 변경 권한을 주는 결정이고,
-      // 끄는 쪽은 좁히는 방향이라 되돌리기 쉽다.
-      confirm: next ? () => confirm({
-        title: text("원격 편집 허용", "Allow remote editing"),
-        message: text(
-          "원격 접속에서도 데스크톱과 같은 변경 권한을 줍니다.\n계속할까요?",
-          "Remote access will get the same change permissions as the desktop.\nContinue?",
-        ),
-        warning: text(
-          "채팅 실행, 계정 전환, 스킬·지침 편집 같은 변경 작업이 원격에서도 가능해집니다.",
-          "Starting chats, switching accounts, and editing skills or instructions become possible from remote.",
-        ),
-        confirmLabel: text("허용", "Allow"),
-      }) : null,
-    });
-  };
-
-  // 원격 편집 허용은 원격이 자기 권한을 정하지 못하도록 호스트 화면 전용이다.
-  // 데스크톱 앱이 아니어도 호스트의 브라우저(127.0.0.1)면 같은 자리다.
-  const canManage = Boolean(access && !access.remote && access.writable);
-  return {
-    summary: remoteWriteSummaryText(task.error, loadError, status, access, canManage, text),
-    // 조회 전에는 null — 알려진 값처럼 꺼짐으로 그리지 않는다(QA #34).
-    checked: status ? status.remoteWrite : null,
-    loadError: task.error ?? loadError,
-    disabled: !canManage || task.busy || restarting,
-    onChange: (next) => void toggle(next),
-  };
 }
 
 /** 절전 억제 행. 조회도 토글도 이 행 안에서 끝나 다른 행과 나눠 쓰는 값이 없다. */
@@ -3609,7 +3483,7 @@ function useSleepPreventionToggle({ access, clearNotice, setNotice }: {
     checked: status ? status.enabled : null,
     loadError: task.error,
     highlighted: Boolean(status?.active),
-    disabled: !access?.writable || task.busy,
+    disabled: sleepToggleDisabled(status, { loaded: access !== null, busy: task.busy }),
     onChange: (next) => void toggle(next),
   };
 }
@@ -3620,24 +3494,30 @@ function useSleepPreventionToggle({ access, clearNotice, setNotice }: {
  * 못한다. 반복 요청 편집기에 요청별 칸처럼 놓여 있던 것을 여기로 옮겼다(2026-09-27):
  * 예약은 앱이 떠 있는 동안에는 이 값과 무관하게 돌고, 이 값이 정하는 것은 재부팅 뒤 앱을
  * 사람이 열기 전에도 예약이 돌게 할지뿐이다.
+ *
+ * 헤드리스(NAS 컨테이너) 기동에는 그 데스크톱 셸이 아예 없다. "호스트 앱에서 바꾸세요"는
+ * 존재하지 않는 화면을 가리키므로, 그때는 해당 없음으로 그리고 재시작을 실제로 정하는
+ * 자리(컨테이너 재시작 정책)를 말한다(docs/headless-linux-gaps.md L08).
  */
-function useLoginStartToggle({ nativeRuntime, clearNotice, setNotice }: {
+function useLoginStartToggle({ nativeRuntime, headless, clearNotice, setNotice }: {
   nativeRuntime: boolean;
+  headless: boolean;
   clearNotice: () => void;
   setNotice: (value: string | null) => void;
 }): BackendToggleState {
   const { text } = useI18n();
   const task = useBackendTask(clearNotice);
   const [enabled, setEnabled] = useState<boolean | null>(null);
+  const availability = loginStartAvailability({ nativeRuntime, headless });
 
   useEffect(() => {
-    if (!nativeRuntime) return;
+    if (!nativeRuntime || headless) return;
     return loadWhileMounted(
       getBackgroundSettings,
       (next) => { setEnabled(next.loginStart); task.setError(null); },
       task.setError,
     );
-  }, [nativeRuntime]);
+  }, [nativeRuntime, headless]);
 
   const toggle = async (next: boolean) => {
     await task.run(async () => {
@@ -3650,7 +3530,12 @@ function useLoginStartToggle({ nativeRuntime, clearNotice, setNotice }: {
   };
 
   const summary = task.error
-    ?? (!nativeRuntime
+    ?? (availability === "notApplicable"
+      ? text(
+        "이 서버에는 데스크톱 셸이 없습니다. 재시작 뒤 자동 기동은 컨테이너 재시작 정책이 정합니다",
+        "This server has no desktop shell. The container restart policy decides whether it comes back up",
+      )
+      : availability === "desktopOnly"
       ? text("호스트의 Agent Manager 데스크톱 앱에서만 바꿀 수 있습니다", "Only the Agent Manager desktop app on the host can change this")
       : enabled === null
         ? text("자동 시작 설정 확인 중…", "Checking automatic start…")
@@ -3660,10 +3545,13 @@ function useLoginStartToggle({ nativeRuntime, clearNotice, setNotice }: {
 
   return {
     summary,
-    checked: enabled,
+    // 바꿀 수 없는 기동에서는 값을 내주지 않는다. 한 번 실린 `enabled`를 그대로 두면
+    // 비활성 스위치와 "해당 없음" 요약이 같은 줄에서 어긋난다(Tailscale 행과 같은 모양).
+    checked: availability === "manageable" ? enabled : null,
     loadError: task.error,
-    disabled: !nativeRuntime || task.busy,
-    desktopOnly: !nativeRuntime,
+    disabled: availability !== "manageable" || task.busy,
+    desktopOnly: availability === "desktopOnly",
+    notApplicable: availability === "notApplicable" ? text("해당 없음", "Not applicable") : null,
     onChange: (next) => void toggle(next),
   };
 }
@@ -3682,14 +3570,8 @@ function RemoteAccessSettings() {
     nativeRuntime, access, restarting, setRestarting, clearNotice, setNotice, confirm,
   });
   const tailscale = tailscaleToggle.status;
-  const remoteWriteRow = useRemoteWriteToggle({
-    status: tailscale,
-    setStatus: tailscaleToggle.setStatus,
-    loadError: tailscaleToggle.task.error,
-    access, restarting, clearNotice, setNotice, confirm,
-  });
   const sleepRow = useSleepPreventionToggle({ access, clearNotice, setNotice });
-  const loginStartRow = useLoginStartToggle({ nativeRuntime, clearNotice, setNotice });
+  const loginStartRow = useLoginStartToggle({ nativeRuntime, headless: Boolean(access?.headless), clearNotice, setNotice });
   // Tailscale Serve가 이미 루프백 대상을 잡고 있으면 그 포트가 서비스 포트의
   // 원본이 된다. 사용자는 두 값을 따로 바꿀 수 없고 Serve 쪽을 따라간다.
   const tailscalePort = loopbackTargetPort(tailscale?.serveTarget ?? null);
@@ -3738,16 +3620,6 @@ function RemoteAccessSettings() {
           {...tailscaleToggle.row}
         />
         <BackendServiceToggleRow
-          title={text("원격 편집 허용", "Allow remote editing")}
-          help={<HelpHint label={text("원격 편집 허용 설명", "How remote editing works")} title={text("원격 편집 허용", "Allow remote editing")}>
-            {text(
-              "원격(Tailscale) 접속에 데스크톱과 같은 변경 권한을 줄지 정합니다. 끄면 원격 화면은 조회만 되고 채팅 실행·계정 전환·편집이 모두 거절됩니다. 재시작 없이 바로 반영되지만 이미 열려 있는 채팅 스트림은 접속할 때의 권한으로 이어집니다. 켜도 계정 로그인처럼 호스트에서만 되는 작업은 원격에 열리지 않으며, 이 설정은 호스트 화면에서만 바꿀 수 있습니다.",
-              "Decides whether remote (Tailscale) access gets the same change permissions as the desktop. While off, the remote UI can only view: starting chats, switching accounts, and editing are refused. It applies without a restart, but streams that are already open keep the permission they connected with. Host-only actions such as account login stay closed to remote either way, and only the host can change this setting.",
-            )}
-          </HelpHint>}
-          {...remoteWriteRow}
-        />
-        <BackendServiceToggleRow
           title={text("절전 억제", "Prevent sleep")}
           help={<HelpHint label={text("절전 억제 동작 설명", "How preventing sleep works")} title={text("절전 억제", "Prevent sleep")}>
             {text(
@@ -3760,10 +3632,21 @@ function RemoteAccessSettings() {
         <BackendServiceToggleRow
           title={text("시스템 시작 시 Agent Manager 자동 시작", "Start Agent Manager at system startup")}
           help={<HelpHint label={text("자동 시작 동작 설명", "How automatic start works")} title={text("시스템 시작 시 Agent Manager 자동 시작", "Start Agent Manager at system startup")}>
+            {/* 꼬리 한 문장만 가른다 — 헤드리스에는 가리킬 데스크톱 앱이 없으므로 요약줄만
+                고치고 도움말에 같은 문장을 남기면 L08이 없애려던 안내가 그대로 읽힌다. */}
             {text(
-              "OS 로그인 항목에 Agent Manager를 등록합니다. 켜면 로그인 직후 트레이에서 조용히 시작되어, 앱을 직접 열지 않아도 반복 요청이 예정된 시각에 실행됩니다. 끄면 앱을 실행하기 전까지 예약이 건너뛰어집니다. 앱이 떠 있는 동안의 실행에는 영향이 없으며, 이 설정은 호스트의 데스크톱 앱에서만 바꿀 수 있습니다.",
-              "Registers Agent Manager as an OS login item. While on, it starts quietly in the tray right after login, so scheduled requests run on time even if you never open the app. While off, schedules are skipped until you launch the app. It does not affect runs while the app is already open, and only the desktop app on the host can change it.",
-            )}
+              "OS 로그인 항목에 Agent Manager를 등록합니다. 켜면 로그인 직후 트레이에서 조용히 시작되어, 앱을 직접 열지 않아도 반복 요청이 예정된 시각에 실행됩니다. 끄면 앱을 실행하기 전까지 예약이 건너뛰어집니다. 앱이 떠 있는 동안의 실행에는 영향이 없습니다.",
+              "Registers Agent Manager as an OS login item. While on, it starts quietly in the tray right after login, so scheduled requests run on time even if you never open the app. While off, schedules are skipped until you launch the app. It does not affect runs while the app is already open.",
+            )}{" "}
+            {loginStartRow.notApplicable
+              ? text(
+                "이 서버에는 데스크톱 셸이 없어 이 항목은 해당 없습니다. 재시작 뒤 자동 기동은 컨테이너 재시작 정책이 정합니다.",
+                "This server has no desktop shell, so this item does not apply. The container restart policy decides whether it comes back up.",
+              )
+              : text(
+                "이 설정은 호스트의 데스크톱 앱에서만 바꿀 수 있습니다.",
+                "Only the desktop app on the host can change this setting.",
+              )}
           </HelpHint>}
           {...loginStartRow}
         />

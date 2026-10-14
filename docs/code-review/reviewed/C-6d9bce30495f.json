@@ -1,0 +1,11 @@
+{
+  "itemId": "C-6d9bce30495f",
+  "kind": "commit",
+  "ref": "6d9bce30495f4264bbe0f39adbc90976a848e361",
+  "reviewedAt": "2026-10-05T17:09:43Z",
+  "lane": "L10",
+  "source": "codex",
+  "verdict": "결함 없음",
+  "findings": [],
+  "commits": []
+}

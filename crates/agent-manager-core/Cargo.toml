@@ -1,6 +1,6 @@
 [package]
 name = "agent-manager-core"
-version = "0.3.1"
+version = "0.3.2"
 description = "Platform-independent domain and application core for Agent Manager"
 edition = "2021"
 publish = false
@@ -48,6 +48,14 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "rustls"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 zeroize = "1"
+# C20. 접근 채널 로그인. 비밀번호는 argon2id PHC 문자열로, OTP는 RFC 6238(HMAC-SHA1)로
+# 검증한다. QR은 서버가 SVG로 그려 화면은 `<img>`에 넣기만 한다.
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+hmac = "0.12"
+sha1 = "0.10"
+subtle = "2"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 # libc는 macOS 전용 Keychain 호출만이 아니라 process_signal/terminal/external_processes의
 # cfg(unix) 경로에서도 쓴다. 리눅스에서도 링크되도록 unix 전체를 대상으로 선언한다.
@@ -65,7 +73,7 @@ keyring = { version = "3", features = ["windows-native"] }
 # 생성 API가 없어(nightly 전용) 리파스 포인트 버퍼를 직접 쌓는 unsafe 대신 이 크레이트를
 # 쓴다. 의존하는 windows-sys 범위가 위와 같아 중복 링크되지 않는다.
 junction = { version = "2", default-features = false }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Power", "Win32_System_RemoteDesktop", "Win32_System_Threading", "Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Power", "Win32_System_JobObjects", "Win32_System_RemoteDesktop", "Win32_System_Threading", "Win32_UI_Shell"] }
 
 [dev-dependencies]
 tempfile = "3"

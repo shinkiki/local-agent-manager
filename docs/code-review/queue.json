@@ -1,0 +1,13 @@
+{
+  "generatedAt": "2026-10-05T21:31:36.121Z",
+  "branch": "origin/dev-history",
+  "commitWindowDays": 7,
+  "remaining": 459,
+  "counts": {
+    "commit": 225,
+    "module": 234,
+    "expired": 36,
+    "reviewed": 65
+  },
+  "ledgerDuplicates": []
+}

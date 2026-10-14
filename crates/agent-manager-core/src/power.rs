@@ -27,6 +27,10 @@ use crate::CoreError;
 const SETTINGS_SCHEMA_VERSION: u32 = 1;
 const SETTINGS_FILE_NAME: &str = "power-settings.json";
 
+/// 수단이 없는 호스트에서 켜려 했을 때의 사유. OS가 내는 "No such file or directory"를 그대로
+/// 흘리지 않고 한 문장으로 고정해, 화면과 AIA가 같은 설명을 본다.
+const UNSUPPORTED_HOST_ERROR: &str = "이 호스트에는 자동 절전을 막을 수단이 없습니다.";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SleepPreventionStatus {
@@ -74,7 +78,23 @@ impl Held {
     }
 
     fn engage(&mut self) {
+        self.reap();
+        self.engage_where(platform::supported());
+    }
+
+    /// `supported`를 인자로 받는 것은 시험 때문이다. 수단이 없는 갈래는 맥에서는 절대 돌지
+    /// 않으므로, 판정을 안에서 읽으면 그 갈래를 고정하는 시험을 리눅스에서만 쓸 수 있다.
+    fn engage_where(&mut self, supported: bool) {
         if self.guard.is_none() {
+            // 수단이 없는 호스트(systemd가 없는 리눅스 컨테이너에는 `systemd-inhibit`이 없다)에서는
+            // 자식을 띄워 보지도 않는다. 띄워 봐야 OS의 ENOENT 문구가 그대로 사유 자리에 실려
+            // 나가고, 상태 조회는 이미 `supported: false`로 같은 사실을 말하고 있었다
+            // (docs/headless-linux-gaps.md L03).
+            if !supported {
+                self.mechanism = None;
+                self.error = Some(UNSUPPORTED_HOST_ERROR.to_owned());
+                return;
+            }
             match platform::engage() {
                 Ok(guard) => {
                     self.guard = Some(guard);
@@ -89,12 +109,32 @@ impl Held {
         }
     }
 
+    /// 손잡이가 있어도 수단이 이미 끝났을 수 있다. 리눅스 컨테이너에는 `systemd-inhibit`
+    /// 실행 파일만 있고 logind·시스템 D-Bus가 없는 경우가 흔한데, 그때 자식은 기동 직후
+    /// 실패로 끝나고 억제는 걸린 적이 없다. 끝난 손잡이를 `active`로 보고하면 화면이 걸리지
+    /// 않은 억제를 걸렸다고 말하므로, 상태를 내기 전에 거둬 사유로 바꾼다.
+    /// 켠 직후 응답에서는 자식이 아직 실패하기 전일 수 있다 — 그때는 다음 상태 조회가 바로잡는다.
+    fn reap(&mut self) {
+        let Some(guard) = self.guard.as_mut() else {
+            return;
+        };
+        if let Some(reason) = platform::exited(guard) {
+            // 상태 확인 자체가 실패했다면 자식이 살아 있을 수도 있으니 버리지 않고 끝낸다.
+            if let Some(guard) = self.guard.take() {
+                platform::release(guard);
+            }
+            self.mechanism = None;
+            self.error = Some(reason);
+        }
+    }
+
     fn apply(&mut self, enabled: bool) -> SleepPreventionStatus {
         if enabled {
             self.engage();
         } else {
             self.release();
         }
+        self.reap();
         self.snapshot(enabled)
     }
 
@@ -119,7 +159,10 @@ static HELD: Mutex<Held> = Mutex::new(Held::empty());
 /// 저장된 설정과 지금 걸려 있는 상태를 함께 읽는다.
 pub fn sleep_prevention_status(app_data_dir: &Path) -> Result<SleepPreventionStatus, CoreError> {
     let enabled = load_prevent_sleep(app_data_dir)?;
-    Ok(with_held(|held| held.snapshot(enabled)))
+    Ok(with_held(|held| {
+        held.reap();
+        held.snapshot(enabled)
+    }))
 }
 
 /// 설정을 저장하고 즉시 적용한다. 저장이 실패하면 억제 상태는 건드리지 않는다 —
@@ -206,6 +249,26 @@ mod platform {
             .stderr(Stdio::null())
             .spawn()?;
         Ok(Guard(child))
+    }
+
+    /// 자식이 이미 끝났으면 그 사유를 돌려준다. `try_wait`가 거둬 가므로 좀비도 남지 않는다.
+    pub(super) fn exited(guard: &mut Guard) -> Option<String> {
+        match guard.0.try_wait() {
+            Ok(None) => None,
+            Ok(Some(status)) => Some(format!(
+                "{} 가 곧바로 끝나 자동 절전을 막지 못했습니다 ({status})",
+                spec::EXECUTABLE
+            )),
+            Err(error) => Some(format!(
+                "{} 상태를 확인하지 못했습니다: {error}",
+                spec::EXECUTABLE
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn guard_for_test(child: Child) -> Guard {
+        Guard(child)
     }
 
     /// stdin을 잡고 있었다면 먼저 닫아 정상 종료를 시키고, 그래도 남으면 강제로 끝낸다.
@@ -338,6 +401,11 @@ mod platform {
         }
     }
 
+    /// 스레드는 해제 신호를 받을 때까지 끝나지 않으므로, 손잡이가 있는 동안 억제는 살아 있다.
+    pub(super) fn exited(_guard: &mut Guard) -> Option<String> {
+        None
+    }
+
     pub(super) fn release(guard: Guard) {
         let Guard { _release, thread } = guard;
         drop(_release);
@@ -412,5 +480,55 @@ mod tests {
         assert!(!released.active);
         assert!(released.error.is_none());
         assert!(released.mechanism.is_none());
+    }
+
+    /// 수단이 없는 호스트에서 켜려 하면 자식을 띄워 보지 않고 고정된 사유로 끝난다.
+    /// NAS 컨테이너 실측(2026-10-10)에서 `systemd-inhibit`이 없어 `supported`가 거짓이었고,
+    /// 그때 OS의 ENOENT 문구가 그대로 사유로 나가던 자리를 이 시험이 막는다.
+    #[test]
+    fn engaging_without_a_mechanism_reports_one_fixed_reason() {
+        let mut held = Held::empty();
+        held.engage_where(false);
+
+        assert!(held.guard.is_none());
+        assert_eq!(held.error.as_deref(), Some(UNSUPPORTED_HOST_ERROR));
+        assert!(held.mechanism.is_none());
+        assert!(!held.snapshot(true).active);
+    }
+
+    /// 기동 직후 끝난 수단(logind가 없는 컨테이너의 `systemd-inhibit`)을 `active`로
+    /// 보고하지 않고, 사유를 남긴 채 손잡이를 거둔다.
+    #[cfg(unix)]
+    #[test]
+    fn a_mechanism_that_exited_is_reported_inactive_with_a_reason() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .spawn()
+            .expect("short-lived child");
+        child.wait().expect("child finished");
+        let mut held = Held::empty();
+        held.guard = Some(platform::guard_for_test(child));
+        held.mechanism = Some(platform::MECHANISM);
+
+        held.reap();
+
+        assert!(held.guard.is_none());
+        assert!(held.mechanism.is_none());
+        assert!(held.error.is_some());
+        assert!(!held.snapshot(true).active);
+    }
+
+    /// 꺼 둔 설정으로 기동하면 수단이 없어도 사유 자리가 비어 있다 — 수용 기준의
+    /// "조용한 무동작"이 회귀하지 않게 고정한다.
+    #[test]
+    fn starting_with_the_setting_off_reports_no_error() {
+        let _guard = HELD_TEST_LOCK.lock().expect("test lock");
+        let directory = tempfile::tempdir().expect("temporary directory");
+
+        let status = apply_saved_sleep_prevention(directory.path());
+        assert!(!status.enabled);
+        assert!(!status.active);
+        assert!(status.error.is_none());
+        assert!(status.mechanism.is_none());
     }
 }

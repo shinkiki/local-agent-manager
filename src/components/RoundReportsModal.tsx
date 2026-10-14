@@ -1,5 +1,5 @@
 /**
- * 목표 하나의 회차 보고를 읽고 결정을 답하는 모달(M10).
+ * 목표 하나의 회차 보고를 읽고 선택 요청을 직접 답하거나 자동 처리로 넘기는 모달(M10).
  *
  * 보고와 미결 결정은 목표 카드 아래에 펼쳐 쌓지 않고 여기 한 곳에서 본다. 목표가 여럿이면
  * 어느 목표의 보고인지, 무엇을 정하는지가 한 화면에 섞여 흐름이 끊겼다(사용자 결정 2026-09-30).
@@ -10,7 +10,8 @@ import { type PropsWithChildren, useCallback, useEffect, useMemo, useState } fro
 
 import { formatDateTime } from "../lib/format";
 import { useI18n } from "../lib/i18n";
-import { listRoundReports, resolveRoundDecision } from "../lib/ipc";
+import { listRoundReports, resolveRoundDecision, updateRoundGoal } from "../lib/ipc";
+import { roundTextParagraphs } from "../lib/roundText";
 import type { RoundDecision, RoundGoal, RoundReport } from "../types";
 import { ErrorBanner, Modal } from "./Shared";
 
@@ -54,12 +55,30 @@ export function RoundDecisionForm({ decision, busy, value, onChange, onAnswer }:
   );
 }
 
+/** 줄바꿈 없는 긴 글도 문단으로 나눠 보인다(roundText). 목표 카드와 보고 본문이 같이 쓴다. */
+export function RoundText({ text, className }: { text: string; className?: string }) {
+  const paragraphs = roundTextParagraphs(text);
+  if (paragraphs.length === 0) return null;
+  return <div className={`round-text${className ? ` ${className}` : ""}`}>{paragraphs.map((paragraph, index) => <p key={index}>{paragraph}</p>)}</div>;
+}
+
+/** `고친 것`·`다음` 같은 항목 목록. 한 줄에 ` · ` 로 잇던 것을 글머리표로 세운다. */
+function RoundReportList({ label, items }: { label: string; items: string[] }) {
+  if (items.length === 0) return null;
+  return (
+    <div className="round-report-list">
+      <span>{label}</span>
+      <ul>{items.map((item, index) => <li key={index}>{item}</li>)}</ul>
+    </div>
+  );
+}
+
 /** 보고 한 건의 본문. `children` 자리에 미결 결정 폼이 선다. */
 export function RoundReportBlock({ report, children }: PropsWithChildren<{ report: RoundReport }>) {
   const { text } = useI18n();
   return (
     <div className="round-report-body">
-      {report.summary && <p>{report.summary}</p>}
+      <RoundText text={report.summary} />
       {report.measures.length > 0 && (
         <table className="round-report-table">
           <thead><tr><th>{text("측정", "Measure")}</th><th>{text("전", "Before")}</th><th>{text("후", "After")}</th></tr></thead>
@@ -71,10 +90,10 @@ export function RoundReportBlock({ report, children }: PropsWithChildren<{ repor
           {text("실패 종류", "Failure kinds")}: {report.failureKinds.map((kind) => `${kind.kind} ${kind.before}→${kind.after}`).join(" · ")}
         </small>
       )}
-      {report.fixes.length > 0 && <small className="db-connection-meta">{text("고친 것", "Fixes")}: {report.fixes.join(" · ")}</small>}
+      <RoundReportList label={text("고친 것", "Fixes")} items={report.fixes} />
       {report.commits.length > 0 && <small className="db-connection-meta">{text("커밋", "Commits")}: {report.commits.join(", ")}</small>}
-      {report.reverted.length > 0 && <small className="db-connection-meta">{text("되돌린 것", "Reverted")}: {report.reverted.join(" · ")}</small>}
-      {report.next.length > 0 && <small className="db-connection-meta">{text("다음", "Next")}: {report.next.join(" · ")}</small>}
+      <RoundReportList label={text("되돌린 것", "Reverted")} items={report.reverted} />
+      <RoundReportList label={text("다음", "Next")} items={report.next} />
       {report.decisions.map((decision, index) => decision.resolved
         ? <small className="db-connection-meta" key={index}>{text("결정", "Decision")}: {decision.question} → {decision.resolved}</small>
         : null)}
@@ -83,11 +102,12 @@ export function RoundReportBlock({ report, children }: PropsWithChildren<{ repor
   );
 }
 
-export function RoundReportsModal({ goal, onClose, onResolved }: {
+export function RoundReportsModal({ goal, onClose, onResolved, onGoalUpdated }: {
   goal: RoundGoal;
   onClose: () => void;
   /** 결정을 답한 뒤 패널이 배지를 다시 세도록 알린다. */
   onResolved: () => void;
+  onGoalUpdated: (goal: RoundGoal) => void;
 }) {
   const { text } = useI18n();
   const [reports, setReports] = useState<RoundReport[] | null>(null);
@@ -120,6 +140,15 @@ export function RoundReportsModal({ goal, onClose, onResolved }: {
       .finally(() => setBusy(false));
   }, [load, onResolved]);
 
+  const setAutomatic = useCallback((automatic: boolean) => {
+    setBusy(true);
+    setError(null);
+    updateRoundGoal(goal.id, { decisionMode: automatic ? "automatic" : "manual" })
+      .then((updated) => onGoalUpdated(updated))
+      .catch((cause) => setError(errorMessage(cause)))
+      .finally(() => setBusy(false));
+  }, [goal.id, onGoalUpdated]);
+
   const pendingTotal = useMemo(() => (reports ?? []).reduce((sum, report) => sum + pendingDecisionCount(report), 0), [reports]);
   // 저장 중에는 배경 클릭·Esc 로 닫히지 않게 한다(Modal 계약).
   const close = useCallback(() => { if (!busy) onClose(); }, [busy, onClose]);
@@ -140,6 +169,28 @@ export function RoundReportsModal({ goal, onClose, onResolved }: {
     >
       <div className="round-report-modal-body" data-goal-id={goal.id}>
         {error && <ErrorBanner message={error} />}
+        <label className={`round-auto-decision-toggle${goal.decisionMode === "automatic" ? " enabled" : ""}`}>
+          <span>
+            <strong>{text("완전자동 결정", "Fully automatic decisions")}</strong>
+            <small>{text(
+              "다음 회차부터 미결 질문을 보고서 맥락과 함께 분석해 선택지를 고르거나 구체적인 추가 요청을 작성하고, 그 작업까지 이어서 진행합니다. 새 권한을 부여하지는 않습니다.",
+              "Starting with the next round, analyze pending questions in report context, choose an option or write a concrete follow-up request, and continue that work. This does not grant new permissions.",
+            )}</small>
+          </span>
+          <input
+            type="checkbox"
+            checked={goal.decisionMode === "automatic"}
+            disabled={busy}
+            aria-label={text("완전자동 결정", "Fully automatic decisions")}
+            onChange={(event) => setAutomatic(event.target.checked)}
+          />
+        </label>
+        {goal.decisionMode === "automatic" && pendingTotal > 0 && (
+          <small className="round-auto-decision-notice">{text(
+            `대기 중인 ${pendingTotal}건은 다음 회차가 시작할 때 먼저 처리합니다.`,
+            `${pendingTotal} pending request(s) will be handled first when the next round starts.`,
+          )}</small>
+        )}
         {reports !== null && reports.length === 0 && <p className="round-report-empty">{text("아직 보고가 없습니다.", "No reports yet.")}</p>}
         {(reports ?? []).map((report, position) => {
           const pending = pendingDecisionCount(report);

@@ -864,7 +864,30 @@ fn compare_versions(left: &str, right: &str) -> Ordering {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
-        (false, false) => left_pre.cmp(&right_pre),
+        (false, false) => compare_prerelease(&left_pre, &right_pre),
+    }
+}
+
+/// SemVer 11.4 의 프리릴리스 우선순위. 점으로 나눈 식별자를 왼쪽부터 비교하되 숫자 식별자는
+/// 수치로, 숫자는 영숫자보다 낮게, 앞부분이 같으면 식별자가 적은 쪽을 낮게 본다.
+fn compare_prerelease(left: &str, right: &str) -> Ordering {
+    let mut left_ids = left.split('.');
+    let mut right_ids = right.split('.');
+    loop {
+        let order = match (left_ids.next(), right_ids.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(l), Some(r)) => match (l.parse::<u64>(), r.parse::<u64>()) {
+                (Ok(l), Ok(r)) => l.cmp(&r),
+                (Ok(_), Err(_)) => Ordering::Less,
+                (Err(_), Ok(_)) => Ordering::Greater,
+                (Err(_), Err(_)) => l.cmp(r),
+            },
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
     }
 }
 
@@ -1767,6 +1790,42 @@ mod tests {
             compare_versions("1.2.0-beta.1", "1.2.0-beta.2"),
             Ordering::Less
         );
+    }
+
+    #[test]
+    fn compares_prerelease_identifiers_by_semver_precedence() {
+        // 숫자 식별자는 수치로 비교한다. 문자열로 비교하면 alpha.10 이 alpha.9 보다 낮아져
+        // 더 새 CLI 가 남긴 캐시를 옛 기록(Outdated)으로 잘못 보고 정리 대상에서 뺀다.
+        assert_eq!(
+            compare_versions("0.47.0-alpha.10", "0.47.0-alpha.9"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("1.0.0-alpha", "1.0.0-alpha.1"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("1.0.0-alpha.1", "1.0.0-alpha.beta"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("1.0.0-beta.11", "1.0.0-rc.1"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("1.0.0-rc.1", "1.0.0-rc.1"),
+            Ordering::Equal
+        );
+        let root = temporary_directory();
+        write_cache(&root, "0.47.0-alpha.10");
+        let status = inspect_model_cache(codex_cache_spec(), &root, Some("0.47.0-alpha.9"));
+        assert_eq!(status.state, ModelCacheState::Mismatched);
+        assert!(status.cleanup_available);
+        // 반대 방향(C2-3): 옛 프리릴리스가 남긴 캐시는 보고만 하고 지우지 않는다.
+        let status = inspect_model_cache(codex_cache_spec(), &root, Some("0.47.0-alpha.11"));
+        assert_eq!(status.state, ModelCacheState::Outdated);
+        assert!(!status.cleanup_available);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
