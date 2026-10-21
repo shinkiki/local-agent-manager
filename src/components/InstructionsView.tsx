@@ -752,19 +752,27 @@ function useDeployedFileViewer(
   const [viewerTarget, setViewerTarget] = useState("");
   const [viewerContent, setViewerContent] = useState<DeployedInstructionFileContent | null>(null);
 
+  // 읽기 도중 왼쪽 목록에서 다른 지침을 고르면(목록은 busy에도 눌린다) 앞 지침의 응답이
+  // 늦게 도착해 새 지침 화면에 앞 지침 원문을 채웠다. 요청마다 세대를 올리고, 응답이
+  // 도착했을 때 세대가 그대로인 것만 반영한다.
+  const generation = useRef(0);
+
   useEffect(() => {
+    generation.current += 1;
     setViewerTarget("");
     setViewerContent(null);
   }, [entryKey]);
 
   const openViewer = async (selection: string) => {
+    const requested = ++generation.current;
     setViewerTarget(selection);
     setViewerContent(null);
     const deployment = presentDeployments.find((candidate) => deploymentKey(candidate) === selection);
     if (!deployment) return;
     await runBusy("viewer", async () => {
       const target = deploymentTarget(deployment);
-      setViewerContent(await readDeployedInstructionFile(target.scope, target.projectPath, deployment.provider));
+      const content = await readDeployedInstructionFile(target.scope, target.projectPath, deployment.provider);
+      if (requested === generation.current) setViewerContent(content);
     });
   };
 

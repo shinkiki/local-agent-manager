@@ -464,11 +464,104 @@ pub(crate) fn pacing_resource_id_for_model(model: &str) -> Result<&'static str, 
     Ok(resource_for_model(model)?.id())
 }
 
+/// 창 라벨 `{모델군} · {창}`의 모델군 이름. 모델군 창이 아니면 라벨 그대로다. 라벨은
+/// [`combined_usage`]가 이 모양으로 만들므로 계정 쪽 판정(`accounts`)도 이 함수로 자른다.
+pub(crate) fn group_of_label(label: &str) -> &str {
+    label.split_once(" · ").map_or(label, |(group, _)| group)
+}
+
+/// 모델군 이름·모델 id를 같은 모양으로 접는다(`Gemini 4 Argon` → `gemini-4-argon`). 버전의
+/// 점과 하이픈은 공급자마다 달라(`gemini-3.8-flash`·`claude-opus-4-6`) 모두 하이픈으로 본다.
+fn line_slug(name: &str) -> String {
+    let mut slug = String::new();
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
+}
+
+/// 특정 모델 한 줄에만 걸린 모델군인지(`Gemini 4 Argon`). 버전 숫자가 이름에 들어 있고
+/// 계열 전체를 말하는 `models`가 없으면 그렇게 본다 — 계열 전체 모델군(`Gemini Models`·
+/// `Claude and GPT models`)은 2026-10-19 기준 숫자가 없고, 숫자가 붙더라도 `models`로 끝난다.
+/// 그날 Antigravity가 `Gemini 4 Argon`을 따로 떼어 내기 전까지는 모델군이 계열마다 하나라
+/// 계열 키워드만으로 충분했다.
+fn group_is_model_line(name: &str) -> bool {
+    name.chars().any(|ch| ch.is_ascii_digit()) && !name.to_ascii_lowercase().contains("models")
+}
+
+/// 모델 id가 이 모델군 이름이 가리키는 모델 줄에 속하는지(`gemini-4-argon-high` ↔
+/// `Gemini 4 Argon`). 접은 이름이 접두로 같고 그 뒤가 끝이거나 구분자여야 한다 —
+/// `gemini-4-argonite`를 `Gemini 4 Argon`으로 읽지 않는다.
+fn model_in_line(model: &str, group: &str) -> bool {
+    let slug = line_slug(group);
+    !slug.is_empty()
+        && line_slug(model)
+            .strip_prefix(&slug)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+}
+
+/// 이 모델이 소비하는 모델군을 계정이 보고한 모델군 이름 중에서 고른다.
+///
+/// 같은 계열에 모델군이 여럿일 수 있다 — 계열 전체 모델군(`Gemini Models`) 옆에 특정 모델
+/// 줄만 쓰는 모델군(`Gemini 4 Argon`)이 따로 쿼터를 든다. 그 줄의 모델은 자기 모델군을, 나머지
+/// 모델은 계열 전체 모델군을 쓴다. 계열 키워드만으로 고르면 Argon 쿼터가 찼을 때 같은 계열의
+/// 다른 Gemini 모델까지 막히고(실행 게이트), 계획은 Argon 모델을 `Gemini Models` 창으로 세운다
+/// (2026-10-19 실측: 계획은 9.7% 창으로 세웠는데 게이트가 100% Argon 창으로 거부).
+///
+/// 계열은 모델군 **이름**으로 가린다([`resource_for_group_name`]) — 고르는 대상이 창 라벨이라
+/// 버킷 id가 남아 있지 않다. 맞는 모델군이 없으면 `None`이고, 모델 계열을 모르면 오류다.
+fn model_group<'a>(
+    model: &str,
+    groups: impl IntoIterator<Item = &'a str>,
+) -> Result<Option<&'a str>, CoreError> {
+    let resource = resource_for_model(model)?;
+    let family: Vec<&str> = groups
+        .into_iter()
+        .filter(|group| resource_for_group_name(group) == Some(resource))
+        .collect();
+    let line = family
+        .iter()
+        .copied()
+        .filter(|group| group_is_model_line(group) && model_in_line(model, group))
+        .max_by_key(|group| line_slug(group).len());
+    Ok(line.or_else(|| {
+        family
+            .iter()
+            .copied()
+            .find(|group| !group_is_model_line(group))
+    }))
+}
+
+/// 이번 실행의 모델이 소비하는 모델군 창들. 모델 계열을 모르거나 그 모델의 모델군을 계정이
+/// 보고하지 않으면 비어 있다 — 부르는 쪽이 계정 전체 판정으로 되돌아간다.
+pub(crate) fn model_group_windows<'a>(
+    model: &str,
+    windows: &'a [AccountUsageWindow],
+) -> Vec<&'a AccountUsageWindow> {
+    let scoped = || windows.iter().filter(|window| window.model_scoped);
+    let Ok(Some(group)) = model_group(model, scoped().map(|window| group_of_label(&window.label)))
+    else {
+        return Vec::new();
+    };
+    scoped()
+        .filter(|window| group_of_label(&window.label) == group)
+        .collect()
+}
+
 /// 이번 회차의 모델이 소비하는 **모델군 창**의 라벨(`Claude and GPT models · 7일` 꼴).
 ///
-/// 계정 하나가 모델군 두 개의 쿼터를 따로 들고 있고, 계정 대표 창은 그중 **빡빡한 쪽**이다
+/// 계정 하나가 모델군 여럿의 쿼터를 따로 들고 있고, 계정 대표 창은 그중 **빡빡한 쪽**이다
 /// ([`combined_usage`]). 대표 창을 계획 창으로 쓰면 한 모델군이 소진된 계정에서 다른
-/// 모델군의 여유를 영영 쓰지 못하므로, 페이싱은 이 라벨로 계획한다.
+/// 모델군의 여유를 영영 쓰지 못하므로, 페이싱은 이 라벨로 계획한다. 어느 모델군인지는
+/// [`model_group`]이 고른다 — 실행 게이트([`model_group_windows`])와 같은 판정이어야 계획한
+/// 창과 거부하는 창이 갈리지 않는다.
 ///
 /// 계정이 그 모델군 창을 보고하지 않으면 모델군 이름으로 만든 라벨을 돌려준다 — 계정
 /// 대표 창으로 되돌아가면 다른 모델군의 소진을 이 모델군의 것으로 읽으므로, 찾지 못했다는
@@ -484,30 +577,45 @@ pub(crate) fn model_window_label(
     base_label: &str,
 ) -> Result<String, CoreError> {
     let resource = resource_for_model(model)?;
-    let suffix = format!(" · {base_label}");
-    Ok(usage
-        .windows
-        .iter()
-        .filter(|window| window.model_scoped && window.label.ends_with(&suffix))
-        .find(|window| resource_for_group_name(&window.label) == Some(resource))
-        .map(|window| window.label.clone())
-        .unwrap_or_else(|| format!("{} · {base_label}", resource.group_name())))
+    let group = model_group(
+        model,
+        usage
+            .windows
+            .iter()
+            .filter(|window| window.model_scoped)
+            .map(|window| group_of_label(&window.label)),
+    )?;
+    Ok(format!(
+        "{} · {base_label}",
+        group.unwrap_or_else(|| resource.group_name())
+    ))
 }
 
 /// 이 모델의 실행이 그 창의 쿼터를 소비하는지.
 ///
-/// 계정 하나가 모델군 두 개의 쿼터를 따로 들고 있으므로, 모델군 창(`Claude and GPT models ·
+/// 계정 하나가 모델군 여럿의 쿼터를 따로 들고 있으므로, 모델군 창(`Claude and GPT models ·
 /// 7일`)을 채우는 것은 같은 모델군의 실행뿐이다. Gemini 회차가 도는 동안 Claude/GPT 창은
-/// 손대지 않은 채로 있고, 그 반대도 같다.
+/// 손대지 않은 채로 있고, 그 반대도 같다. 특정 모델 줄의 모델군(`Gemini 4 Argon`)은 그 줄의
+/// 모델만 채운다.
+///
+/// 라벨 하나만 보고 답하므로 계열 전체 모델군 창은 같은 계열의 모든 모델이 채우는 것으로
+/// 본다 — 그 계열에 이 모델 줄만의 모델군이 따로 있는지는 라벨로 알 수 없고, 점유를 덜 세면
+/// 같은 쿼터에 겹쳐 띄운다. 실행을 막을지는 계정의 창 전부를 보는 [`model_group_windows`]가
+/// 정한다.
 ///
 /// 모델군 창이 아닌 라벨(계정 대표 창)은 어느 모델군이 돌든 그 소진을 싣고 있으므로 참이다.
 /// 모델을 알 수 없으면(모델군을 가릴 수 없는 이름) 참 — 소비 여부를 모르는 실행을 "이 창과
 /// 무관"으로 읽으면 같은 쿼터에 겹쳐 띄운다.
 pub(crate) fn model_consumes_window(model: &str, window_label: &str) -> bool {
-    let Some(group) = resource_for_group_name(window_label) else {
+    let group = group_of_label(window_label);
+    let Some(resource) = resource_for_group_name(group) else {
         return true;
     };
-    resource_for_model(model).map_or(true, |resource| resource == group)
+    match resource_for_model(model) {
+        Err(_) => true,
+        Ok(model_resource) if model_resource != resource => false,
+        Ok(_) => !group_is_model_line(group) || model_in_line(model, group),
+    }
 }
 
 pub(crate) fn is_pacing_resource_id(value: &str) -> bool {
@@ -589,13 +697,22 @@ fn usage_for_resource(
     resource: PacingResource,
 ) -> AccountUsageView {
     match groups {
-        Ok(groups) => groups
-            .iter()
-            .find(|group| resource_for_group(group) == Some(resource))
-            .map(usage_from_group)
-            .unwrap_or_else(|| {
-                error_usage("Antigravity /usage 응답에서 모델 그룹을 찾지 못했습니다")
-            }),
+        // 같은 계열에 특정 모델 줄의 모델군(`Gemini 4 Argon`)이 함께 오면 계열 전체 모델군을
+        // 자원 행으로 쓴다 — 응답 순서에 따라 한 모델 줄의 쿼터가 계열 전체를 대표하지 않게 한다.
+        Ok(groups) => {
+            let family = || {
+                groups
+                    .iter()
+                    .filter(|group| resource_for_group(group) == Some(resource))
+            };
+            family()
+                .find(|group| !group_is_model_line(&group.name))
+                .or_else(|| family().next())
+                .map(usage_from_group)
+                .unwrap_or_else(|| {
+                    error_usage("Antigravity /usage 응답에서 모델 그룹을 찾지 못했습니다")
+                })
+        }
         Err(error) => error_usage(&error.to_string()),
     }
 }
@@ -1549,6 +1666,94 @@ mod tests {
         assert!(model_consumes_window("gemini-3.8-flash-high", "7일"));
         // 모델군을 가릴 수 없는 이름은 창과 무관하다고 읽지 않는다.
         assert!(model_consumes_window("auto", "Claude and GPT models · 7일"));
+    }
+
+    fn argon_split_usage() -> AccountUsageView {
+        combined_usage(
+            &parse_cli_usage_groups(
+                r#"{
+                    "status":"SUCCESS",
+                    "command":{"name":"usage","data":{"groups":[
+                        {"name":"Gemini 4 Argon","buckets":[
+                            {"id":"gemini-4-argon-weekly","window":"weekly","remaining_fraction":0,"reset_time":"2026-10-25T23:15:30Z"}
+                        ]},
+                        {"name":"Gemini Models","buckets":[
+                            {"id":"gemini-weekly","window":"weekly","remaining_fraction":0.9,"reset_time":"2026-10-24T01:15:58Z"},
+                            {"id":"gemini-5h","window":"5h","remaining_fraction":1,"reset_time":"2026-10-19T06:00:00Z"}
+                        ]},
+                        {"name":"Claude and GPT models","buckets":[
+                            {"id":"3p-weekly","window":"weekly","remaining_fraction":1,"reset_time":"2026-10-26T00:00:00Z"}
+                        ]}
+                    ]}}
+                }"#,
+            )
+            .expect("CLI fixture"),
+        )
+    }
+
+    /// 2026-10-19 Antigravity가 `Gemini 4 Argon`을 따로 떼어 냈다. 계열 키워드로만 고르면 응답
+    /// 순서에 따라 Argon 창이 Gemini 전체의 계획 창이 되거나, Argon 모델이 Gemini Models 창으로
+    /// 계획된다. 모델 줄의 모델군은 그 줄의 모델만, 나머지는 계열 전체 모델군이 받는다.
+    #[test]
+    fn a_model_line_group_is_chosen_only_for_its_own_models() {
+        let usage = argon_split_usage();
+        let label = |model| model_window_label(&usage, model, "7일").expect("label");
+        assert_eq!(label("gemini-3.8-flash-high"), "Gemini Models · 7일");
+        assert_eq!(label("gemini-4-argon-high"), "Gemini 4 Argon · 7일");
+        assert_eq!(label("claude-sonnet-4.6"), "Claude and GPT models · 7일");
+        // 그 줄에 없는 창은 계열 전체 창으로 되돌아가지 않는다 — 다른 쿼터를 이 모델의 것으로
+        // 읽느니 "창을 찾을 수 없음"으로 쉬는 편이 낫다.
+        assert_eq!(
+            model_window_label(&usage, "gemini-4-argon-high", "5시간").expect("label"),
+            "Gemini 4 Argon · 5시간"
+        );
+
+        assert!(!model_consumes_window(
+            "gemini-3.8-flash-high",
+            "Gemini 4 Argon · 7일"
+        ));
+        assert!(model_consumes_window(
+            "gemini-4-argon-high",
+            "Gemini 4 Argon · 7일"
+        ));
+        // 이름 접두만 같은 다른 모델은 그 줄이 아니다.
+        assert!(!model_consumes_window(
+            "gemini-4-argonite",
+            "Gemini 4 Argon · 7일"
+        ));
+        // 계열 전체 창은 라벨만으로는 이 모델 줄의 모델군이 따로 있는지 모르므로 점유를 센다.
+        assert!(model_consumes_window(
+            "gemini-4-argon-high",
+            "Gemini Models · 7일"
+        ));
+
+        let windows: Vec<&str> = model_group_windows("gemini-3.8-flash-high", &usage.windows)
+            .iter()
+            .map(|window| window.label.as_str())
+            .collect();
+        assert_eq!(windows, ["Gemini Models · 5시간", "Gemini Models · 7일"]);
+        assert!(model_group_windows("auto", &usage.windows).is_empty());
+    }
+
+    /// 모델군 자원 행(`antigravity:gemini`)은 응답에 Argon이 먼저 와도 계열 전체 모델군을 쓴다.
+    #[test]
+    fn the_gemini_pacing_resource_tracks_the_family_wide_group() {
+        let groups = Ok(parse_cli_usage_groups(
+            r#"{
+                "status":"SUCCESS",
+                "command":{"name":"usage","data":{"groups":[
+                    {"name":"Gemini 4 Argon","buckets":[
+                        {"id":"gemini-4-argon-weekly","window":"weekly","remaining_fraction":0,"reset_time":"2026-10-25T23:15:30Z"}
+                    ]},
+                    {"name":"Gemini Models","buckets":[
+                        {"id":"gemini-weekly","window":"weekly","remaining_fraction":0.75,"reset_time":"2026-10-24T01:15:58Z"}
+                    ]}
+                ]}}
+            }"#,
+        )
+        .expect("CLI fixture"));
+        let usage = usage_for_resource(&groups, PacingResource::Gemini);
+        assert!((usage.windows[0].used_percent - 25.0).abs() < 1e-9);
     }
 
     #[test]

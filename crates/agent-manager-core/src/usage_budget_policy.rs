@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::app_data_file::write_private_json;
 use crate::chat::ReasoningEffort;
 use crate::domain::ProviderId;
-use crate::quiet_hours::QuietSchedule;
+use crate::quiet_hours::{canonical_clock, QuietSchedule};
 use crate::scheduler::ScheduledRequest;
 use crate::store_lock;
 use crate::CoreError;
@@ -719,21 +719,19 @@ fn validate_range<T: PartialOrd + Display>(
 }
 
 /// 창 라벨은 "없음"과 "빈 문자열"을 구분한다 — 생략은 기본 창을 쓰라는 뜻이고, 공백만 남은
-/// 라벨은 어떤 창도 가리키지 못한다.
+/// 라벨은 어떤 창도 가리키지 못한다. 길이 상한([`MAX_LABEL_CHARS`])은 소비자 라벨과 같다 —
+/// 사용량 조회가 범위 라벨을 그 한도 안으로 자르는 것도 이 검사가 있다는 전제다.
 fn validate_window_label(label: Option<&str>) -> Result<(), CoreError> {
     if label.is_some_and(|label| label.trim().is_empty()) {
         return Err(CoreError::InvalidInput(
             "창 라벨은 비울 수 없습니다(없으면 생략)".to_owned(),
         ));
     }
-    Ok(())
+    validate_label(label)
 }
 
-fn validate_label(label: &Option<String>) -> Result<(), CoreError> {
-    if label
-        .as_deref()
-        .is_some_and(|label| label.chars().count() > MAX_LABEL_CHARS)
-    {
+fn validate_label(label: Option<&str>) -> Result<(), CoreError> {
+    if label.is_some_and(|label| label.chars().count() > MAX_LABEL_CHARS) {
         return Err(CoreError::InvalidInput(format!(
             "라벨은 {MAX_LABEL_CHARS}자를 넘을 수 없습니다"
         )));
@@ -752,8 +750,12 @@ pub(crate) fn set_defaults(
     validate_window_label(defaults.window_label.as_deref())?;
     validate_window_label(defaults.guard_window_label.as_deref())?;
     // 스케줄은 꺼져 있어도 형식·시간대·요일을 검증한다 — 깨진 값을 저장하면 켤 때 조용히 무시된다.
-    if let Some(hours) = defaults.quiet_hours.as_ref() {
+    // 같은 뜻의 다른 표기(`9:5`)는 정본 `HH:MM`으로 저장한다 — 화면의 시각 입력은 정본만 그린다.
+    let mut defaults = defaults;
+    if let Some(hours) = defaults.quiet_hours.as_mut() {
         QuietSchedule::parse(hours)?;
+        hours.start = canonical_clock(&hours.start)?;
+        hours.end = canonical_clock(&hours.end)?;
     }
     modify(app_data_dir, seed, |policy| {
         policy.defaults = defaults;
@@ -931,7 +933,7 @@ pub(crate) fn set_consumer(
     if let Some(priority) = request.priority {
         validate_range(priority, 0..=MAX_CONSUMER_PRIORITY, "우선순위")?;
     }
-    validate_label(&request.label)?;
+    validate_label(request.label.as_deref())?;
     validate_percent(request.max_cost_percent_per_run, "회당 소비 상한")?;
     if let Some(lanes) = &request.reasoning_efforts {
         validate_reasoning_efforts(lanes)?;
@@ -1084,7 +1086,7 @@ pub(crate) fn sync_consumer_metadata(
 ) -> Result<(), CoreError> {
     require_ids("반복 요청 또는 워크플로", &[schedule_id, workflow_id])?;
     let label = Some(label.to_owned());
-    validate_label(&label)?;
+    validate_label(label.as_deref())?;
     modify_existing(app_data_dir, |policy| {
         if !policy.consumers_configured() {
             return Ok(false);
@@ -1612,6 +1614,57 @@ mod tests {
         )
         .expect("valid quiet hours");
         assert!(saved.quiet_schedule().is_some());
+        // 같은 분을 뜻하는 다른 표기는 화면이 그릴 수 있는 `HH:MM` 정본으로 저장된다.
+        // 꺼진 스케줄도 같다 — 나중에 켤 때 화면이 같은 시각을 보여야 한다.
+        for enabled in [true, false] {
+            let mut hours = quiet(enabled, " +9:5", "Asia/Seoul", &[1]);
+            hours.end = "18:0".to_owned();
+            let loose = set_defaults(
+                saved_dir.path(),
+                no_seed,
+                UsageBudgetDefaults {
+                    quiet_hours: Some(hours),
+                    ..UsageBudgetDefaults::default()
+                },
+            )
+            .expect("loose clock is still valid");
+            let stored = loose.defaults.quiet_hours.expect("quiet hours");
+            assert_eq!(
+                (stored.start.as_str(), stored.end.as_str()),
+                ("09:05", "18:00")
+            );
+        }
+        // 창 라벨도 소비자 라벨과 같은 길이 상한을 지킨다 — 사용량 조회가 범위 라벨을 이
+        // 한도 안으로 자르는 근거다(`accounts::scoped_window_label`).
+        let at_limit = format!("{} 7일", "a".repeat(MAX_LABEL_CHARS - 3));
+        let over_limit = format!("{} 7일", "a".repeat(MAX_LABEL_CHARS - 2));
+        for (window_label, guard_window_label) in [
+            (Some(over_limit.clone()), None),
+            (None, Some(over_limit.clone())),
+        ] {
+            assert!(matches!(
+                set_defaults(
+                    saved_dir.path(),
+                    no_seed,
+                    UsageBudgetDefaults {
+                        window_label,
+                        guard_window_label,
+                        ..UsageBudgetDefaults::default()
+                    }
+                ),
+                Err(CoreError::InvalidInput(_))
+            ));
+        }
+        set_defaults(
+            saved_dir.path(),
+            no_seed,
+            UsageBudgetDefaults {
+                window_label: Some(at_limit.clone()),
+                guard_window_label: Some(at_limit),
+                ..UsageBudgetDefaults::default()
+            },
+        )
+        .expect("label at the limit");
         // 꺼진 스케줄은 값을 보존하되 해석되지 않는다.
         let off = set_defaults(
             saved_dir.path(),

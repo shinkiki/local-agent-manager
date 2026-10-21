@@ -1,5 +1,5 @@
-//! C9: bounded SSH public-key inventory, create-only Ed25519 generation, public-key
-//! disclosure, trash-backed removal, and device-local key memos.
+//! C9: bounded SSH public-key inventory, create-only generation (Ed25519, RSA, ECDSA),
+//! public-key disclosure, trash-backed removal, and device-local key memos.
 //!
 //! The adapter never opens a private-key file. Generation delegates to the official
 //! `ssh-keygen` executable in a private staging directory and publishes with no-clobber
@@ -26,6 +26,15 @@ use uuid::Uuid;
 use crate::clock::now_ms;
 use crate::json_store::{JsonStore, SchemaVersioned};
 use crate::ssh_endpoints::{command_policy_defaults, SshCommandPolicyDefaults, SshEndpointView};
+
+/// C9-21. 암호 저장 표시를 키 목록에 붙인다. 값은 읽지 않는다.
+fn attach_passphrase_markers(snapshot: &mut SshKeysSnapshot, app_data_dir: &Path) {
+    attach_sidecar::<crate::ssh_askpass::PassphraseMarkerStore>(
+        snapshot,
+        app_data_dir,
+        |key, marker| key.passphrase_saved = marker.is_some(),
+    );
+}
 use crate::user_home::home_dir;
 use crate::CoreError;
 
@@ -66,8 +75,8 @@ pub struct SshKeyView {
     pub has_private_key: bool,
     /// 사용자가 이 기기에 적어 둔 메모. 공개키 파일이 아니라 앱 데이터에서 온다(G7).
     pub note: Option<String>,
-    /// 이 키로 붙는 접속 지점과 에이전트 사용 여부. 메모와 같은 기기 단위 설정이다(C9-9).
-    pub endpoint: Option<SshEndpointView>,
+    /// C9-21. 이 키의 암호가 OS 보안 저장소에 저장돼 있는지. 값은 어디에도 실리지 않는다.
+    pub passphrase_saved: bool,
 }
 
 /// 공개키 본문까지 함께 보여 주는 조회 결과. 개인키는 여전히 열지 않는다.
@@ -92,7 +101,11 @@ pub struct SshKeyDeletionReceipt {
     pub trash_path: String,
     pub private_key_moved: bool,
     pub note_removed: bool,
-    pub endpoint_removed: bool,
+    /// 저장해 둔 키 암호도 함께 지웠는지(C9-21).
+    pub passphrase_removed: bool,
+    /// 이 키를 쓰던 연결 서버. 서버는 지우지 않으며, 키를 되돌리거나 다른 키로 바꿀 때까지
+    /// 에이전트 목록에 사유와 함께 남는다(C9-9).
+    pub servers_using_key: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -113,14 +126,156 @@ pub struct SshKeysSnapshot {
     /// 새 연결 서버에 채워 넣을 기본 명령 정책(C9-13). 화면과 스킬이 같은 목록을 보도록
     /// 백엔드가 소유한다.
     pub command_policy_defaults: SshCommandPolicyDefaults,
+    /// 저장된 연결 서버 전체(C9-9). 서버마다 키 지문을 하나 가리키며, 키 하나를 여러 서버가
+    /// 함께 쓸 수 있다.
+    pub servers: Vec<SshEndpointView>,
+    /// 만들 수 있는 키 종류(C9-2). 화면과 백엔드가 같은 목록을 보도록 백엔드가 소유한다.
+    pub key_types: Vec<SshKeyTypeOption>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+/// 암호를 실을 수 있어 `Debug`를 두지 않는다 — 로그·오류에 값이 찍힐 길을 만들지 않는다.
+#[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateSshKeyRequest {
     pub file_name: String,
     #[serde(default)]
     pub comment: String,
+    /// [`SshKeyKind::id`] 값. 비면 Ed25519다.
+    #[serde(default)]
+    pub key_type: String,
+    /// C9-21. 비어 있지 않으면 이 암호로 개인키를 잠그고 OS 보안 저장소에 저장한다.
+    #[serde(default)]
+    pub passphrase: Option<String>,
+}
+
+/// C9-21. 이미 있는 키의 암호를 저장하거나(값이 있으면) 지운다(비어 있으면).
+/// 암호를 싣는 요청이라 `Debug`를 두지 않는다.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSshKeyPassphraseRequest {
+    pub file_name: String,
+    pub fingerprint: String,
+    #[serde(default)]
+    pub passphrase: String,
+}
+
+/// C9-2. 만들 수 있는 키 종류. DSA는 OpenSSH가 걷어 낸 방식이라, FIDO(`-sk`)는 보안키를
+/// 손으로 눌러야 해서 원격 화면·제한 시간과 맞지 않아 넣지 않는다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshKeyKind {
+    Ed25519,
+    Rsa2048,
+    Rsa3072,
+    Rsa4096,
+    EcdsaP256,
+    EcdsaP384,
+    EcdsaP521,
+}
+
+impl SshKeyKind {
+    pub const ALL: [Self; 7] = [
+        Self::Ed25519,
+        Self::Rsa4096,
+        Self::Rsa3072,
+        Self::Rsa2048,
+        Self::EcdsaP256,
+        Self::EcdsaP384,
+        Self::EcdsaP521,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Ed25519 => "ed25519",
+            Self::Rsa2048 => "rsa-2048",
+            Self::Rsa3072 => "rsa-3072",
+            Self::Rsa4096 => "rsa-4096",
+            Self::EcdsaP256 => "ecdsa-256",
+            Self::EcdsaP384 => "ecdsa-384",
+            Self::EcdsaP521 => "ecdsa-521",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ed25519 => "Ed25519 (권장)",
+            Self::Rsa2048 => "RSA 2048",
+            Self::Rsa3072 => "RSA 3072",
+            Self::Rsa4096 => "RSA 4096 (AWS CodeCommit 등 RSA만 받는 곳)",
+            Self::EcdsaP256 => "ECDSA P-256",
+            Self::EcdsaP384 => "ECDSA P-384",
+            Self::EcdsaP521 => "ECDSA P-521",
+        }
+    }
+
+    /// `ssh-keygen`의 종류·크기 인자.
+    fn keygen_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Ed25519 => &["-t", "ed25519"],
+            Self::Rsa2048 => &["-t", "rsa", "-b", "2048"],
+            Self::Rsa3072 => &["-t", "rsa", "-b", "3072"],
+            Self::Rsa4096 => &["-t", "rsa", "-b", "4096"],
+            Self::EcdsaP256 => &["-t", "ecdsa", "-b", "256"],
+            Self::EcdsaP384 => &["-t", "ecdsa", "-b", "384"],
+            Self::EcdsaP521 => &["-t", "ecdsa", "-b", "521"],
+        }
+    }
+
+    /// 만들어진 키가 가져야 할 비트 수. RSA는 modulus 길이, ECDSA는 곡선, Ed25519는 고정이다.
+    fn bits(self) -> usize {
+        match self {
+            Self::Ed25519 | Self::EcdsaP256 => 256,
+            Self::Rsa2048 => 2048,
+            Self::Rsa3072 => 3072,
+            Self::Rsa4096 => 4096,
+            Self::EcdsaP384 => 384,
+            Self::EcdsaP521 => 521,
+        }
+    }
+
+    /// 만들어진 공개키가 가져야 할 알고리즘 이름. 다른 것이 나오면 게시하지 않는다.
+    fn public_algorithm(self) -> &'static str {
+        match self {
+            Self::Ed25519 => "ssh-ed25519",
+            Self::Rsa2048 | Self::Rsa3072 | Self::Rsa4096 => "ssh-rsa",
+            Self::EcdsaP256 => "ecdsa-sha2-nistp256",
+            Self::EcdsaP384 => "ecdsa-sha2-nistp384",
+            Self::EcdsaP521 => "ecdsa-sha2-nistp521",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, CoreError> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Ok(Self::Ed25519);
+        }
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.id() == value)
+            .ok_or_else(|| {
+                CoreError::InvalidInput(format!(
+                    "알 수 없는 키 종류입니다: {value}. {} 중 하나를 쓰세요",
+                    Self::ALL.map(Self::id).join(" | ")
+                ))
+            })
+    }
+}
+
+/// 화면이 그리는 키 종류 선택지 하나.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SshKeyTypeOption {
+    pub id: String,
+    pub label: String,
+}
+
+fn key_type_options() -> Vec<SshKeyTypeOption> {
+    SshKeyKind::ALL
+        .into_iter()
+        .map(|kind| SshKeyTypeOption {
+            id: kind.id().to_owned(),
+            label: kind.label().to_owned(),
+        })
+        .collect()
 }
 
 /// 목록에서 고른 공개키 하나를 가리키는 요청. 지문을 함께 받아, 목록을 그린 뒤 파일이
@@ -167,9 +322,123 @@ pub fn get_ssh_keys(app_data_dir: &Path) -> Result<SshKeysSnapshot, CoreError> {
     get_ssh_keys_with(&home_dir()?, app_data_dir)
 }
 
-pub fn generate_ssh_key(request: GenerateSshKeyRequest) -> Result<SshKeyView, CoreError> {
+pub fn generate_ssh_key(
+    app_data_dir: &Path,
+    request: GenerateSshKeyRequest,
+) -> Result<SshKeyView, CoreError> {
     let executable = crate::providers::resolve_named_executable(&["ssh-keygen"])?;
-    generate_ssh_key_with(&home_dir()?, &executable, request)
+    generate_ssh_key_with(
+        &home_dir()?,
+        app_data_dir,
+        &executable,
+        &crate::ssh_askpass::OsPassphraseVault,
+        request,
+    )
+}
+
+/// C9-21. 이미 있는 키의 암호를 저장하거나 지운다. 저장 전에 `ssh-keygen -y`로 그 암호가
+/// 실제로 개인키를 여는지 확인한다 — 틀린 값을 저장해 두면 에이전트 실행이 엉뚱한
+/// "권한 거부"로만 실패한다. 개인키는 공식 `ssh-keygen`이 열고 앱은 열지 않는다(C9-1).
+pub fn set_ssh_key_passphrase(
+    app_data_dir: &Path,
+    request: SetSshKeyPassphraseRequest,
+) -> Result<SshKeysSnapshot, CoreError> {
+    let executable = crate::providers::resolve_named_executable(&["ssh-keygen"])?;
+    set_ssh_key_passphrase_with(
+        &home_dir()?,
+        app_data_dir,
+        &executable,
+        &crate::ssh_askpass::OsPassphraseVault,
+        &request,
+    )
+}
+
+fn set_ssh_key_passphrase_with(
+    home: &Path,
+    app_data_dir: &Path,
+    executable: &Path,
+    vault: &dyn crate::ssh_askpass::PassphraseVault,
+    request: &SetSshKeyPassphraseRequest,
+) -> Result<SshKeysSnapshot, CoreError> {
+    let (_, public_path, view) = resolve_public_key(
+        home,
+        &SshKeyRef {
+            file_name: request.file_name.clone(),
+            fingerprint: request.fingerprint.clone(),
+        },
+    )?;
+    if request.passphrase.is_empty() {
+        crate::ssh_askpass::forget_passphrase(vault, app_data_dir, &view.fingerprint)?;
+        return snapshot_with_metadata(home, app_data_dir);
+    }
+    let passphrase = crate::ssh_askpass::validate_passphrase(&request.passphrase)?;
+    let identity = public_path.with_extension("");
+    if !private_key_present(&identity)? {
+        return Err(CoreError::Conflict(
+            "같은 이름의 개인키가 없어 암호를 확인할 수 없습니다".to_owned(),
+        ));
+    }
+    verify_passphrase(executable, &identity, passphrase, &view.fingerprint)?;
+    crate::ssh_askpass::store_passphrase(vault, app_data_dir, &view.fingerprint, passphrase)?;
+    snapshot_with_metadata(home, app_data_dir)
+}
+
+/// `ssh-keygen -y`가 암호로 개인키를 열어 공개키를 다시 만들게 하고, 그 지문이 목록의
+/// 지문과 같은지 본다. 암호가 없는 키는 묻지 않고 바로 답하므로 그 경우는 거절한다 —
+/// 저장할 암호가 없는 키다.
+fn verify_passphrase(
+    executable: &Path,
+    identity: &Path,
+    passphrase: &str,
+    fingerprint: &str,
+) -> Result<(), CoreError> {
+    let session = crate::ssh_askpass::AskpassSession::start(
+        zeroize::Zeroizing::new(passphrase.to_owned()),
+        crate::ssh_askpass::CONNECT_ANSWERS,
+    )?;
+    if opens_without_passphrase(executable, identity)? {
+        return Err(CoreError::Conflict(
+            "이 키에는 암호가 걸려 있지 않습니다. 저장할 암호가 없습니다".to_owned(),
+        ));
+    }
+    let mut command = Command::new(executable);
+    command
+        .args(["-y", "-f"])
+        .arg(identity)
+        .env_remove("DISPLAY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    session.apply(&mut command);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| CoreError::Runtime("ssh-keygen을 시작하지 못했습니다".to_owned()))?;
+    let mut stdout = child.stdout.take();
+    let reader = thread::spawn(move || {
+        let mut raw = Vec::new();
+        if let Some(stdout) = stdout.as_mut() {
+            let _ = stdout.take(MAX_PUBLIC_KEY_BYTES).read_to_end(&mut raw);
+        }
+        raw
+    });
+    let status = wait_for_child(&mut child, KEYGEN_TIMEOUT)?;
+    let raw = reader.join().unwrap_or_default();
+    drop(session);
+    let line = String::from_utf8_lossy(&raw);
+    let derived = parse_public_key(line.trim()).ok();
+    if !status.success()
+        || derived.as_ref().map(|key| key.fingerprint.as_str()) != Some(fingerprint)
+    {
+        return Err(CoreError::InvalidInput(
+            "암호가 맞지 않습니다. 이 키를 만들 때 쓴 암호를 입력하세요".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// C9-6. 고른 공개키의 본문 한 줄을 그대로 보여 준다. 공개키만 열고 개인키는 존재
@@ -206,7 +475,8 @@ pub(crate) fn snapshot_with_metadata(
 ) -> Result<SshKeysSnapshot, CoreError> {
     let mut snapshot = get_ssh_keys_with_home(home)?;
     attach_notes(&mut snapshot, app_data_dir);
-    crate::ssh_endpoints::attach_endpoints(&mut snapshot, app_data_dir);
+    attach_passphrase_markers(&mut snapshot, app_data_dir);
+    crate::ssh_endpoints::attach_servers(&mut snapshot, app_data_dir);
     Ok(snapshot)
 }
 
@@ -255,6 +525,8 @@ pub(crate) fn get_ssh_keys_with_home(home: &Path) -> Result<SshKeysSnapshot, Cor
             keys: Vec::new(),
             issues: Vec::new(),
             command_policy_defaults: command_policy_defaults(),
+            servers: Vec::new(),
+            key_types: key_type_options(),
         });
     };
 
@@ -289,6 +561,8 @@ pub(crate) fn get_ssh_keys_with_home(home: &Path) -> Result<SshKeysSnapshot, Cor
         keys,
         issues,
         command_policy_defaults: command_policy_defaults(),
+        servers: Vec::new(),
+        key_types: key_type_options(),
     })
 }
 
@@ -440,7 +714,7 @@ fn inspect_public_key(root: &Path, path: &Path) -> Result<SshKeyView, CoreError>
         comment: parsed.comment,
         has_private_key,
         note: None,
-        endpoint: None,
+        passphrase_saved: false,
     })
 }
 
@@ -780,22 +1054,51 @@ fn open_stage_dir(root: &Path) -> Result<PathBuf, CoreError> {
     )
 }
 
-/// staging 경로에 암호 없는 Ed25519 키 한 쌍을 만든다.
+/// staging 경로에 고른 종류의 키 한 쌍을 만든다.
 ///
 /// 환경을 통째로 비우지 않는다. Windows에 딸려 오는 `System32\OpenSSH`의 `ssh-keygen.exe`는
 /// 빈 환경으로 띄우면 `SystemRoot`를 잃어 기동 자체가 실패하고, 아무 진단도 내지 않은 채
-/// 255로 끝난다. 대신 이 실행에서 실제로 위험한 것만 떼어 낸다 — 패스프레이즈는 `-N ""`로
-/// 비우므로 물어볼 일이 없고, 그래도 묻는다면 그것은 우리가 부르지 않은 외부 프롬프트다.
-fn run_keygen(executable: &Path, comment: &str, stage_private: &Path) -> Result<(), CoreError> {
+/// 255로 끝난다. 대신 이 실행에서 실제로 위험한 것만 떼어 낸다.
+///
+/// 암호가 없으면 `-N ""`로 비워 물어볼 일이 없게 한다. 암호가 있으면 `-N`을 쓰지 않는다 —
+/// argv는 같은 기기의 다른 프로세스가 `ps`로 읽는다. 대신 C9-21 askpass 세션이 "입력"과
+/// "확인" 두 질문에 답한다. 그 밖의 askpass 설정은 떼어 내, 우리가 부르지 않은 외부
+/// 프롬프트가 끼어들 자리를 남기지 않는다.
+fn run_keygen(
+    executable: &Path,
+    kind: SshKeyKind,
+    comment: &str,
+    passphrase: Option<&str>,
+    stage_private: &Path,
+) -> Result<(), CoreError> {
+    let session = passphrase
+        .map(|value| {
+            crate::ssh_askpass::AskpassSession::start(
+                zeroize::Zeroizing::new(value.to_owned()),
+                crate::ssh_askpass::KEYGEN_ANSWERS,
+            )
+        })
+        .transpose()?;
     let mut command = Command::new(executable);
     command
-        .args(["-q", "-t", "ed25519", "-a", "64", "-N", "", "-C"])
+        .arg("-q")
+        .args(kind.keygen_args())
+        .args(["-a", "64"]);
+    if session.is_none() {
+        command.args(["-N", ""]);
+    }
+    command
+        .arg("-C")
         .arg(comment)
         .arg("-f")
         .arg(stage_private)
         .env_remove("SSH_ASKPASS")
         .env_remove("SSH_ASKPASS_REQUIRE")
-        .env_remove("DISPLAY")
+        .env_remove("DISPLAY");
+    if let Some(session) = &session {
+        session.apply(&mut command);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         // 실패 사유를 사용자에게 그대로 전하려고 받는다. 버리면 어느 단계에서 막혔는지
@@ -822,7 +1125,40 @@ fn run_keygen(executable: &Path, comment: &str, stage_private: &Path) -> Result<
             &detail,
         )));
     }
+    // C9-21. askpass가 답하지 못하면 `ssh-keygen`은 빈 암호로 받아들이고 **성공으로** 끝난다.
+    // 그대로 게시하면 사용자는 잠긴 키라고 믿는데 실제로는 열린 키가 남는다. 빈 암호로
+    // 열리면 게시하지 않는다.
+    if session.is_some() && opens_without_passphrase(executable, stage_private)? {
+        return Err(CoreError::Runtime(
+            "암호를 키에 걸지 못해 키를 만들지 않았습니다. 다시 시도하거나 암호 없이 만드세요"
+                .to_owned(),
+        ));
+    }
     Ok(())
+}
+
+/// 빈 암호로 개인키가 열리는지. 공식 `ssh-keygen -y`가 열고 앱은 열지 않는다(C9-1). askpass를
+/// 떼어 내 묻지 않고 빈 암호만 시도하게 한다.
+fn opens_without_passphrase(executable: &Path, identity: &Path) -> Result<bool, CoreError> {
+    let mut command = Command::new(executable);
+    command
+        .args(["-y", "-P", "", "-f"])
+        .arg(identity)
+        .env_remove("DISPLAY")
+        .env_remove("SSH_ASKPASS")
+        .env_remove("SSH_ASKPASS_REQUIRE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| CoreError::Runtime("ssh-keygen을 시작하지 못했습니다".to_owned()))?;
+    Ok(wait_for_child(&mut child, KEYGEN_TIMEOUT)?.success())
 }
 
 /// 자식의 표준 오류를 한도까지만 읽어 한 줄로 만든다. 진단용이라 읽지 못하면 비운다.
@@ -847,7 +1183,7 @@ fn read_capped_stderr(stderr: Option<std::process::ChildStderr>) -> String {
 /// 키 생성 실패 메시지. `ssh-keygen`이 아무 말도 없이 끝나는 경우가 있어 종료 코드를 항상
 /// 함께 적는다.
 fn keygen_failure_message(code: Option<i32>, detail: &str) -> String {
-    let base = "ssh-keygen이 새 Ed25519 키를 만들지 못했습니다";
+    let base = "ssh-keygen이 새 키를 만들지 못했습니다";
     let code = code.map_or_else(
         || "종료 코드 없음".to_owned(),
         |code| format!("종료 코드 {code}"),
@@ -857,6 +1193,52 @@ fn keygen_failure_message(code: Option<i32>, detail: &str) -> String {
     } else {
         format!("{base} ({code}): {detail}")
     }
+}
+
+/// C9-2. staging에 만들어진 공개키가 요청한 종류·크기인지 **게시 전에** 본다. ECDSA는
+/// 알고리즘 이름에 곡선이 들어 있어 이름 대조로 충분하고, RSA는 이름이 하나라 modulus 길이를
+/// 직접 센다. 어긋나면 `~/.ssh`에는 아무것도 남기지 않는다.
+fn verify_generated_kind(kind: SshKeyKind, stage_public: &Path) -> Result<(), CoreError> {
+    let mut text = String::new();
+    File::open(stage_public)?
+        .take(MAX_PUBLIC_KEY_BYTES)
+        .read_to_string(&mut text)?;
+    let parsed = parse_public_key(&text)?;
+    let mismatch = |found: String| {
+        CoreError::Runtime(format!(
+            "ssh-keygen이 요청({})과 다른 키({found})를 만들어 게시하지 않았습니다",
+            kind.label()
+        ))
+    };
+    if parsed.key_type != kind.public_algorithm() {
+        return Err(mismatch(parsed.key_type));
+    }
+    if parsed.key_type == "ssh-rsa" {
+        let bits = rsa_modulus_bits(&text).ok_or_else(|| mismatch("RSA ?".to_owned()))?;
+        if bits != kind.bits() {
+            return Err(mismatch(format!("RSA {bits}")));
+        }
+    }
+    Ok(())
+}
+
+/// `ssh-rsa` 공개키 한 줄에서 modulus 비트 수를 센다. blob은 문자열 셋(이름·지수·modulus)이고,
+/// mpint는 부호 때문에 앞에 0 바이트가 붙을 수 있다.
+fn rsa_modulus_bits(line: &str) -> Option<usize> {
+    let blob = STANDARD.decode(line.split_whitespace().nth(1)?).ok()?;
+    let mut rest = blob.as_slice();
+    let mut field = || -> Option<&[u8]> {
+        let length = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+        let value = rest.get(4..4 + length)?;
+        rest = &rest[4 + length..];
+        Some(value)
+    };
+    let _name = field()?;
+    let _exponent = field()?;
+    let modulus = field()?;
+    let start = modulus.iter().position(|byte| *byte != 0)?;
+    let significant = &modulus[start..];
+    Some(significant.len() * 8 - significant[0].leading_zeros() as usize)
 }
 
 /// staging의 키 쌍을 검사한 뒤 `~/.ssh`의 최종 이름으로 하드링크하고, 읽어낸 공개키
@@ -900,11 +1282,22 @@ fn publish_key_pair(
 
 fn generate_ssh_key_with(
     home: &Path,
+    app_data_dir: &Path,
     executable: &Path,
+    vault: &dyn crate::ssh_askpass::PassphraseVault,
     request: GenerateSshKeyRequest,
 ) -> Result<SshKeyView, CoreError> {
     let file_name = validate_file_name(&request.file_name)?;
     let comment = validate_comment(&request.comment)?;
+    let kind = SshKeyKind::parse(&request.key_type)?;
+    let passphrase = match request
+        .passphrase
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => Some(crate::ssh_askpass::validate_passphrase(value)?),
+        None => None,
+    };
     let root = ensure_ssh_root(home)?;
     let private_target = root.join(file_name);
     let public_target = root.join(format!("{file_name}.pub"));
@@ -915,7 +1308,8 @@ fn generate_ssh_key_with(
     let stage_private = stage_dir.join("key");
     let stage_public = stage_dir.join("key.pub");
 
-    let result = run_keygen(executable, comment, &stage_private)
+    let result = run_keygen(executable, kind, comment, passphrase, &stage_private)
+        .and_then(|()| verify_generated_kind(kind, &stage_public))
         .and_then(|()| {
             publish_key_pair(
                 &stage_dir,
@@ -933,10 +1327,24 @@ fn generate_ssh_key_with(
             comment: parsed.comment,
             has_private_key: true,
             note: None,
-            endpoint: None,
+            passphrase_saved: false,
         });
 
     let cleanup = cleanup_stage(&stage_private, &stage_public, &stage_dir);
+    // C9-21. 키는 이미 게시됐다. 암호를 저장하지 못하면 그 사실을 그대로 알린다 — 키를
+    // 되돌려 지우면 사용자가 방금 만든 것을 앱이 말없이 없애는 셈이 된다.
+    let result = result.and_then(|mut view| {
+        if let Some(passphrase) = passphrase {
+            crate::ssh_askpass::store_passphrase(vault, app_data_dir, &view.fingerprint, passphrase)
+                .map_err(|error| {
+                    CoreError::Runtime(format!(
+                        "암호를 건 키는 만들었지만 암호를 보안 저장소에 저장하지 못했습니다. 애드온 → SSH에서 이 키의 암호를 다시 저장하세요: {error}"
+                    ))
+                })?;
+            view.passphrase_saved = true;
+        }
+        Ok(view)
+    });
     match (result, cleanup) {
         (Ok(view), Ok(())) => Ok(view),
         (Err(error), Ok(())) => Err(error),
@@ -1070,8 +1478,16 @@ fn delete_ssh_key_with_home(
     // 키가 사라진 뒤의 메모는 가리킬 대상이 없다. 이미 파일은 옮겨졌으므로 메모를
     // 지우지 못한 것으로 삭제 자체를 실패로 만들지는 않는다.
     let note_removed = remove_note(app_data_dir, &view.fingerprint).unwrap_or(false);
-    let endpoint_removed =
-        crate::ssh_endpoints::remove_endpoint(app_data_dir, &view.fingerprint).unwrap_or(false);
+    // C9-21. 암호는 키 파일과 달리 휴지통으로 옮길 수 없는 비밀값이라 남겨 두지 않는다.
+    // 키를 되돌린 사용자는 암호를 다시 저장하면 된다.
+    let passphrase_removed = crate::ssh_askpass::forget_passphrase(
+        &crate::ssh_askpass::OsPassphraseVault,
+        app_data_dir,
+        &view.fingerprint,
+    )
+    .unwrap_or(false);
+    let servers_using_key =
+        crate::ssh_endpoints::servers_using_key(app_data_dir, &view.fingerprint);
 
     Ok(SshKeyDeletionReceipt {
         file_name: public_name,
@@ -1079,7 +1495,8 @@ fn delete_ssh_key_with_home(
         trash_path: entry.to_string_lossy().into_owned(),
         private_key_moved: private_state == PrivateKeyState::Present,
         note_removed,
-        endpoint_removed,
+        passphrase_removed,
+        servers_using_key,
     })
 }
 
@@ -1597,13 +2014,19 @@ mod tests {
         let request = GenerateSshKeyRequest {
             file_name: "id_created".to_owned(),
             comment: "created@example".to_owned(),
+            ..GenerateSshKeyRequest::default()
         };
-        let created = generate_ssh_key_with(home.path(), &fake, request.clone()).expect("create");
+        let app_data = tempfile::tempdir().expect("app data");
+        let vault = crate::ssh_askpass::tests::MemoryVault::default();
+        let generate = |request: GenerateSshKeyRequest| {
+            generate_ssh_key_with(home.path(), app_data.path(), &fake, &vault, request)
+        };
+        let created = generate(request.clone()).expect("create");
         assert_eq!(created.file_name, "id_created.pub");
         assert!(created.has_private_key);
         assert!(home.path().join(".ssh/id_created").is_file());
         assert!(home.path().join(".ssh/id_created.pub").is_file());
-        assert!(generate_ssh_key_with(home.path(), &fake, request).is_err());
+        assert!(generate(request).is_err());
         assert_eq!(
             fs::read(home.path().join(".ssh/id_created")).unwrap(),
             b"PRIVATE\n"
@@ -1669,12 +2092,16 @@ mod tests {
         };
         let home = tempfile::tempdir().expect("home");
 
+        let app_data = tempfile::tempdir().expect("app data");
         let view = generate_ssh_key_with(
             home.path(),
+            app_data.path(),
             &executable,
+            &crate::ssh_askpass::tests::MemoryVault::default(),
             GenerateSshKeyRequest {
                 file_name: "id_example".to_owned(),
                 comment: "agent-manager".to_owned(),
+                ..GenerateSshKeyRequest::default()
             },
         )
         .expect("real ssh-keygen must produce a key pair");
@@ -1692,6 +2119,200 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".agent-manager-key-")));
+    }
+
+    /// C9-2·C9-21. 진짜 `ssh-keygen`으로 RSA 키를 암호와 함께 만들고, 그 암호가 argv에
+    /// 실리지 않고 askpass로만 건너가 개인키를 실제로 잠갔는지 본다. 이어서 이미 있는 키의
+    /// 암호 저장이 맞는 값만 받는지도 같은 키로 확인한다.
+    #[cfg(unix)]
+    #[test]
+    fn c9_21_real_keygen_locks_an_rsa_key_with_a_passphrase_through_askpass() {
+        let Ok(executable) = crate::providers::resolve_named_executable(&["ssh-keygen"]) else {
+            return;
+        };
+        if !Path::new("/bin/bash").is_file() {
+            return;
+        }
+        let home = tempfile::tempdir().expect("home");
+        let app_data = tempfile::tempdir().expect("app data");
+        let tools = tempfile::tempdir().expect("tools");
+        crate::ssh_askpass::tests::install_script_helper(tools.path());
+        let vault = crate::ssh_askpass::tests::MemoryVault::default();
+
+        let view = generate_ssh_key_with(
+            home.path(),
+            app_data.path(),
+            &executable,
+            &vault,
+            GenerateSshKeyRequest {
+                file_name: "id_codecommit".to_owned(),
+                comment: "codecommit".to_owned(),
+                key_type: "rsa-2048".to_owned(),
+                passphrase: Some("pass phrase 1".to_owned()),
+            },
+        )
+        .expect("real ssh-keygen must produce a locked RSA pair");
+        assert_eq!(view.algorithm, "RSA");
+        assert!(view.passphrase_saved);
+        assert_eq!(
+            vault
+                .values
+                .lock()
+                .expect("vault")
+                .get(&view.fingerprint)
+                .map(String::as_str),
+            Some("pass phrase 1")
+        );
+        let identity = home.path().join(".ssh/id_codecommit");
+        // 빈 암호로는 열리지 않는다 — 실제로 잠겼다.
+        let open_without = Command::new(&executable)
+            .args(["-y", "-P", "", "-f"])
+            .arg(&identity)
+            .stdin(Stdio::null())
+            .output()
+            .expect("probe");
+        assert!(!open_without.status.success());
+
+        // 이미 있는 키의 암호 저장: 틀린 값은 거절하고 맞는 값만 남긴다.
+        let fingerprint = view.fingerprint.clone();
+        crate::ssh_askpass::forget_passphrase(&vault, app_data.path(), &fingerprint)
+            .expect("forget");
+        let request = |passphrase: &str| SetSshKeyPassphraseRequest {
+            file_name: "id_codecommit.pub".to_owned(),
+            fingerprint: fingerprint.clone(),
+            passphrase: passphrase.to_owned(),
+        };
+        assert!(set_ssh_key_passphrase_with(
+            home.path(),
+            app_data.path(),
+            &executable,
+            &vault,
+            &request("wrong"),
+        )
+        .is_err());
+        assert!(!crate::ssh_askpass::passphrase_saved(
+            app_data.path(),
+            &fingerprint
+        ));
+        let snapshot = set_ssh_key_passphrase_with(
+            home.path(),
+            app_data.path(),
+            &executable,
+            &vault,
+            &request("pass phrase 1"),
+        )
+        .expect("correct passphrase is stored");
+        assert!(snapshot.keys[0].passphrase_saved);
+    }
+
+    /// C9-21. askpass가 답하지 못하면 `ssh-keygen`은 빈 암호로 성공해 버린다. 그 열린 키를
+    /// 잠긴 키로 게시하지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn c9_21_generation_refuses_to_publish_a_key_the_passphrase_did_not_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(executable) = crate::providers::resolve_named_executable(&["ssh-keygen"]) else {
+            return;
+        };
+        let home = tempfile::tempdir().expect("home");
+        let app_data = tempfile::tempdir().expect("app data");
+        let tools = tempfile::tempdir().expect("tools");
+        let silent = tools.path().join("askpass-silent.sh");
+        fs::write(&silent, "#!/bin/sh\nexit 1\n").expect("script");
+        fs::set_permissions(&silent, fs::Permissions::from_mode(0o700)).expect("executable");
+        crate::ssh_askpass::tests::EXECUTABLE_OVERRIDE
+            .with(|cell| *cell.borrow_mut() = Some(silent));
+        let vault = crate::ssh_askpass::tests::MemoryVault::default();
+
+        let error = generate_ssh_key_with(
+            home.path(),
+            app_data.path(),
+            &executable,
+            &vault,
+            GenerateSshKeyRequest {
+                file_name: "id_unlocked".to_owned(),
+                key_type: "ed25519".to_owned(),
+                passphrase: Some("never delivered".to_owned()),
+                ..GenerateSshKeyRequest::default()
+            },
+        )
+        .expect_err("열린 키는 게시하지 않는다");
+        assert!(
+            error.to_string().contains("암호를 키에 걸지 못해"),
+            "{error}"
+        );
+        assert!(!home.path().join(".ssh/id_unlocked").exists());
+        assert!(!home.path().join(".ssh/id_unlocked.pub").exists());
+        assert!(vault.values.lock().expect("vault").is_empty());
+    }
+
+    /// C9-2. `ssh-keygen`이 요청과 다른 종류를 내놓으면 `~/.ssh`에 아무것도 게시하지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn c9_2_a_mismatched_key_kind_is_never_published() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().expect("home");
+        let app_data = tempfile::tempdir().expect("app data");
+        let fake = home.path().join("ssh-keygen");
+        let encoded = public_key_line("ssh-ed25519", "fixture")
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_owned();
+        fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\ntarget=''\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -f) shift; target=$1 ;;\n  esac\n  shift\ndone\nprintf 'PRIVATE\\n' > \"$target\"\nprintf 'ssh-ed25519 {encoded} x\\n' > \"$target.pub\"\n"
+            ),
+        )
+        .expect("fake executable");
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).expect("executable");
+        let error = generate_ssh_key_with(
+            home.path(),
+            app_data.path(),
+            &fake,
+            &crate::ssh_askpass::tests::MemoryVault::default(),
+            GenerateSshKeyRequest {
+                file_name: "id_wrong".to_owned(),
+                key_type: "rsa-4096".to_owned(),
+                ..GenerateSshKeyRequest::default()
+            },
+        )
+        .expect_err("다른 종류는 게시하지 않는다");
+        assert!(error.to_string().contains("다른 키"), "{error}");
+        assert!(!home.path().join(".ssh/id_wrong").exists());
+        assert!(!home.path().join(".ssh/id_wrong.pub").exists());
+    }
+
+    /// C9-2. RSA는 알고리즘 이름이 하나라 modulus 길이를 직접 센다. mpint 앞의 0 바이트는 세지 않는다.
+    #[test]
+    fn c9_2_rsa_modulus_bits_ignore_the_sign_byte() {
+        let mut blob = Vec::new();
+        for field in [b"ssh-rsa".as_slice(), &[1, 0, 1], &{
+            let mut modulus = vec![0u8];
+            modulus.push(0x80);
+            modulus.extend(std::iter::repeat_n(0xffu8, 255));
+            modulus
+        }] {
+            blob.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            blob.extend_from_slice(field);
+        }
+        let line = format!("ssh-rsa {} c", STANDARD.encode(blob));
+        assert_eq!(rsa_modulus_bits(&line), Some(2048));
+        assert_eq!(rsa_modulus_bits("ssh-rsa !!! c"), None);
+    }
+
+    /// C9-2. 모르는 종류는 `ssh-keygen`을 부르기 전에 거절하고, 빈 값은 Ed25519다.
+    #[test]
+    fn c9_2_key_kind_parsing_is_closed() {
+        assert_eq!(SshKeyKind::parse("").expect("default"), SshKeyKind::Ed25519);
+        assert_eq!(
+            SshKeyKind::parse("rsa-4096").expect("rsa"),
+            SshKeyKind::Rsa4096
+        );
+        assert!(SshKeyKind::parse("dsa").is_err());
+        assert!(SshKeyKind::parse("ed25519-sk").is_err());
+        assert_eq!(key_type_options().len(), SshKeyKind::ALL.len());
     }
 
     /// 실패 사유는 종료 코드를 항상 달고 나간다. Windows의 `ssh-keygen`은 환경이 망가지면

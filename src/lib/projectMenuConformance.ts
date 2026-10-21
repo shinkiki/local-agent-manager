@@ -187,6 +187,8 @@ export function nodeTestDeclaration(text: string, name: string): 'ok' | 'skipped
   return sawTitle ? 'skipped' : 'missing';
 }
 
+const RUST_CHAR_LITERAL_RE = /^'(?:\\(?:u\{[0-9a-fA-F]{1,6}\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'/;
+
 /**
  * 주석을 같은 길이의 공백으로 덮는다(줄바꿈은 그대로). 문자열 리터럴 안의 `//`는 코드다.
  *
@@ -252,6 +254,16 @@ export function stripComments(text: string, path: string): string {
         const close = '"' + '#'.repeat(h);
         const end = text.indexOf(close, j + 1);
         i = end < 0 ? text.length : end + close.length;
+        continue;
+      }
+    }
+    if (rust && c === "'") {
+      // 문자 리터럴 '"' 를 문자열 시작으로 읽으면 그 뒤 파일 전체의 문자열 상태가 뒤집혀
+      // `"https://…"` 의 `//` 가 주석으로 지워진다(project_overlays.rs 의 `starts_with('"')`).
+      // 수명(`'a`)은 닫는 따옴표가 없어 이 모양에 걸리지 않는다.
+      const literal = RUST_CHAR_LITERAL_RE.exec(text.slice(i, i + 12));
+      if (literal) {
+        i += literal[0].length;
         continue;
       }
     }

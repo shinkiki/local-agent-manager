@@ -86,17 +86,38 @@ COPY --from=ui /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
-# 에이전트 CLI 셋. 전부 PATH(/usr/local/bin)에 둔다 — 헤드리스 서버는 설정 터미널이 없어
-# 나중에 설치할 길이 없고, 백엔드는 PATH와 ~/.local/bin에서만 실행 파일을 찾는다.
+# 에이전트 CLI 셋은 /usr/local이 아니라 **씨앗** prefix(/opt/agent-manager/cli-seed)에 깐다.
+# 실제로 실행되는 사본은 엔트리포인트가 첫 기동에 HOME 볼륨의 `~/.local`로 심고, 그 뒤로는
+# 앱의 CLI 업데이트 버튼이 비root `agent`로 그 사본을 올린다 — 볼륨이라 컨테이너를 다시 만들어도
+# 올린 버전이 남는다. 이미지를 다시 빌드하면 바뀌는 것은 씨앗뿐이다.
+# `/usr/local/bin`에는 일부러 CLI를 두지 않는다. 남겨 두면 `~/.local` 사본이 사라졌을 때 탐색이
+# 조용히 이미지의 옛 버전으로 돌아간다. node·npm·npx는 런타임이라 그대로 `/usr/local`에 있다.
 ARG CLAUDE_CODE_VERSION=latest
 ARG CODEX_VERSION=latest
-RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@openai/codex@${CODEX_VERSION}" \
- && npm cache clean --force
+ENV AGENT_MANAGER_CLI_SEED=/opt/agent-manager/cli-seed
+# npm의 bin 링크가 상대 경로(`../lib/node_modules/…`)여야 엔트리포인트가 `cp -a`로 옮긴 뒤에도
+# 산다. 절대 경로로 바뀌면 사본이 씨앗(root 소유)을 가리켜 업데이트가 막히므로 빌드를 멈춘다.
+RUN npm install -g --prefix "${AGENT_MANAGER_CLI_SEED}" \
+      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@openai/codex@${CODEX_VERSION}" \
+ && npm cache clean --force \
+ && ls -l "${AGENT_MANAGER_CLI_SEED}/bin" \
+ && for cli in claude codex; do \
+      case "$(readlink "${AGENT_MANAGER_CLI_SEED}/bin/${cli}")" in \
+        ../lib/node_modules/*) ;; \
+        *) echo "씨앗 ${cli} 링크가 상대 경로가 아닙니다" >&2; exit 1 ;; \
+      esac; \
+    done
 # Antigravity CLI(`agy`)는 npm이 아니라 공식 부트스트랩 스크립트가 플랫폼별 네이티브 빌드를 받는다
 # (linux_amd64 지원). 버전 고정 옵션이 없어 빌드 시점의 최신이 들어가며, 어떤 버전인지 빌드 로그에
-# 남긴다. 실행 중 자동 업데이트는 백엔드가 막는다(antigravity_usage.rs).
-RUN curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
- && /usr/local/bin/agy --version
+# 남긴다. `--dir`이면 실행 파일은 그 폴더에만 놓이고, 스크립트가 부르는 `agy install`은 빌드
+# 사용자(root)의 `.profile`·`.bashrc`에 PATH 줄을 더할 뿐이다(2026-10-16 amd64 컨테이너 실측) —
+# `agent` 사용자에게는 닿지 않는다. 실행 중 자동 업데이트는 백엔드가 막는다(antigravity_usage.rs).
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir "${AGENT_MANAGER_CLI_SEED}/bin" \
+ && "${AGENT_MANAGER_CLI_SEED}/bin/agy" --version
+# 로그인 셸(설정 터미널 `/bin/sh -l`, 백엔드의 로그인 셸 PATH 조사)은 /etc/profile이 PATH를
+# 다시 세운다. 그 뒤에도 `~/.local/bin`이 앞에 오도록 profile.d에 한 파일 둔다. 사용자의
+# `~/.profile`(볼륨)은 건드리지 않는다.
+COPY deploy/synology/agent-manager-cli-path.sh /etc/profile.d/agent-manager-cli.sh
 
 COPY --from=server /build/target/release/agent-manager-server /usr/local/bin/agent-manager-server
 COPY --from=ui /app/dist /opt/agent-manager/dist
@@ -112,9 +133,16 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 # 이겼는지가 보이지 않는다.
 RUN groupadd -g 1000 agent \
  && useradd -u 1000 -g 1000 -m -d /home/agent -s /bin/bash agent
-# 전역 node_modules는 root 소유라 비root가 자동 업데이트를 할 수 없다. CLI 버전은
-# 이미지(CLAUDE_CODE_VERSION)가 정하므로 자동 업데이트를 꺼 매 턴 실패 경고를 없앤다.
-ENV HOME=/home/agent AGENT_MANAGER_USER=agent DISABLE_AUTOUPDATER=1
+# CLI는 사람이 앱의 업데이트 버튼을 누를 때만 올린다. 자동 업데이트를 켜 두면 매 턴 백그라운드에서
+# 받고, 진행 중인 채팅이 쓰는 실행 파일을 갈아 끼운다 — 버튼 쪽은 그 전에 관리 채팅·터미널을 멈춘다.
+#
+# NPM_CONFIG_PREFIX: 업데이트 버튼의 `npm install -g <pkg>@latest`가 HOME 볼륨의 `~/.local`에 쓴다.
+# 백엔드는 이 값을 읽지 않고 자식 프로세스가 물려받을 뿐이다(G8).
+# PATH: 서버 프로세스 PATH에서 `~/.local/bin`이 `/usr/local/bin`보다 앞에 와야 백엔드 탐색이
+# 사용자 사본을 잡는다. HOME은 이미지에서 `/home/agent`로 고정이다(엔트리포인트가 다르면 경고한다).
+ENV HOME=/home/agent AGENT_MANAGER_USER=agent DISABLE_AUTOUPDATER=1 \
+    NPM_CONFIG_PREFIX=/home/agent/.local \
+    PATH=/home/agent/.local/bin:$PATH
 
 # /data: 앱 데이터(세션 DB, 설정, 스킬). /workspace: 에이전트가 다룰 프로젝트 볼륨.
 VOLUME ["/data", "/workspace"]

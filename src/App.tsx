@@ -1,6 +1,9 @@
+import type { MessageRewindDraft } from "./lib/messageEdit";
 import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type MutableRefObject, type ComponentType, type ReactNode, type SetStateAction } from "react";
 import "./App.css";
-import type { ChatTab } from "./components/ChatView";
+import { type ChatHistoryNavigator } from "./appConversationHistory";
+import type { ConversationLocation } from "./lib/conversationHistory";
+import type { ChatTab, ChatViewAttentionTarget } from "./components/ChatView";
 import type { SettingsTabId } from "./components/SettingsView";
 import type { WorkflowsTabId } from "./components/WorkflowsView";
 import type { AddonsTabId } from "./components/AddonsView";
@@ -27,6 +30,7 @@ import {
   getCliUpdateStatus,
   getSchedulerSnapshot,
   getSessionSummary,
+  getLiveChats,
   getShutdownImpact,
   getSystemAutomationSnapshot,
   hasTauriRuntime,
@@ -147,10 +151,13 @@ const CliConnectionDrawer = lazyNamed(() => import("./components/CliConnectionDr
  * 요청 상태. 같은 탭을 다시 열어도 화면이 알아채도록 요청마다 새 번호를 매기며, 번호는
  * 네 화면이 공유하는 하나의 순번(nextRequestId)에서 받아 서로 겹치지 않는다.
  */
-function useTabRequest<T extends string>(nextRequestId: () => number): [TabRequest<T> | null, (tab: T) => void] {
-  const [request, setRequest] = useState<TabRequest<T> | null>(null);
-  const open = useCallback((tab: T) => {
-    setRequest({ tab, requestId: nextRequestId() });
+function useTabRequest<T extends string>(nextRequestId: () => number): [
+  (TabRequest<T> & { openGoalId?: string }) | null,
+  (tab: T, openGoalId?: string) => void,
+] {
+  const [request, setRequest] = useState<(TabRequest<T> & { openGoalId?: string }) | null>(null);
+  const open = useCallback((tab: T, openGoalId?: string) => {
+    setRequest({ tab, requestId: nextRequestId(), ...(openGoalId ? { openGoalId } : {}) });
   }, [nextRequestId]);
   return [request, open];
 }
@@ -230,13 +237,18 @@ function App() {
   const [themeMode, setThemeMode] = useStoredState<ThemeMode>(loadThemeMode, persistThemeMode);
   const [sidebarUsageDensity, setSidebarUsageDensity] = useStoredState<SidebarUsageDensity>(sidebarUsageDensityStore.load, sidebarUsageDensityStore.save);
   const [accentColor, setAccentColor] = useStoredState<AccentColor>(loadAccentColor, persistAccentColor);
+  const [editedChatTarget, setEditedChatTarget] = useState<{ target: ChatViewAttentionTarget; location: ConversationLocation; epoch: number } | null>(null);
+  const editedChatWaiter = useRef<{ resolve: () => void; reject: (error: Error) => void } | null>(null);
+  const chatHistoryNavigator = useRef<ChatHistoryNavigator | null>(null);
+  const [, setChatLocation] = useState<ConversationLocation>({ view: "chat" });
+  const navigationEpoch = useRef(0);
   const [selectedSession, setSelectedSession] = useState<SessionSummary | null>(null);
   const { error, setError } = useAppErrorBanner();
   const { toasts, pushToast, dismissToast } = useAppToasts();
   const [reconnecting, setReconnecting] = useState(false);
   const [appRefreshing, setAppRefreshing] = useState(false);
-  // 로고 새로고침이 올리는 나수. 스스로 다시 읽지 않는 패널이 이 값을 보고 다시 읽는다.
-  const [refreshNonce, setRefreshNonce] = useState(0);
+  // 로고 새로고침이 올리는 화면 세대. 바뀌면 열려 있던 화면이 새로 마운트돼 처음처럼 다시 읽는다.
+  const [viewGeneration, setViewGeneration] = useState(0);
   const [setupProviderId, setSetupProviderId] = useState<ProviderId | null>(null);
   const snapshotRef = useRef<ManagerSnapshot | null>(null);
   const automationRef = useRef<SystemAutomationSnapshot | null>(null);
@@ -362,19 +374,13 @@ function App() {
     provider.provider === "antigravity" && provider.cli.detected
   )));
   // 로컬 공급자는 계정 스냅샷에 없어 상태바가 연결 설정을 직접 읽는다. 사용량이 없으므로
-  // 주기 폴링도 필요 없다 — 한 번 읽고, 설정 화면에서 바꾸면 다음 기동에 반영된다.
+  // 주기 폴링도 필요 없다 — 기동 때 한 번 읽고, 설정을 바꾼 뒤에는 로고 새로고침이 다시 읽는다.
   const [localConnection, setLocalConnection] = useState<LocalLlmConnection | null>(null);
-  useEffect(() => {
-    let alive = true;
+  const loadLocalConnection = useCallback(() => getLocalLlmConnections()
     // 연결이 여럿이라(M7) 켜진 것 하나를 골라 상태바에 세운다. 없으면 로컬 줄이 서지 않는다.
-    void getLocalLlmConnections()
-      .then((next) => {
-        if (!alive) return;
-        setLocalConnection(next.connections.find((entry) => entry.enabled && entry.baseUrl.trim() !== "") ?? null);
-      })
-      .catch(() => undefined);
-    return () => { alive = false; };
-  }, []);
+    .then((next) => { setLocalConnection(next.connections.find((entry) => entry.enabled && entry.baseUrl.trim() !== "") ?? null); })
+    .catch(() => undefined), []);
+  useEffect(() => { void loadLocalConnection(); }, [loadLocalConnection]);
   // 계정 스냅샷 폴링·사용량 재조회 판정·Antigravity 별도 조회·상태 카드 새로고침은
   // useAccountUsageCenter가 통째로 맡는다. App 본문은 값과 새로고침 창구만 쓴다.
   const { accounts, setAccounts, antigravityUsage, statusRefreshing, refreshStatusCard } = useAccountUsageCenter({
@@ -389,21 +395,23 @@ function App() {
    * 로고 클릭 = 앱 데이터 새로고침. 스냅샷·계정·사용량은 사이드바 상태 카드와 같은
    * 경로로 다시 읽고, 세션 목록은 색인 조정까지 밀어 목록이 실제 파일을 따라가게 한다.
    * 두 경로 모두 자체적으로 중복 실행을 막고 실패를 스스로 보고하므로 여기서는
-   * 진행 표시만 맡는다. 화면을 다시 불러오지는 않아 작성 중인 입력은 남는다.
+   * 진행 표시만 맡는다. 페이지를 다시 불러오지는 않지만 채팅 밖 화면은 새로 마운트되므로
+   * 그 화면에서 저장하지 않은 입력은 사라진다 — 사용자가 직접 누르는 새로고침이라 감수한다.
    */
-  // 로고 새로고침은 화면 전체를 다시 읽는다. 상태 카드와 세션 목록만 읽던 동안은 회차 목표처럼
-  // 스스로 다시 읽지 않는 패널이 뒤처진 채 남아, 앱을 껐다 켜야 맞았다 — 그런데 끄면 페이싱과
-  // 세션이 함께 끊긴다. 스냅숏까지 다시 받고 나수를 올려 그 패널들에게도 다시 읽으라고 알린다.
-  // 스케줄러(10초)·사용량 예산(30초)처럼 이미 주기로 읽는 곳은 건드리지 않는다.
+  // 로고 새로고침은 화면 전체를 다시 읽는다. 처음에는 다시 읽을 패널마다 나수를 따로 꽂았는데,
+  // 꽂은 곳이 회차 목표 하나뿐이라 나머지 화면(설정·애드온·스킬·프로젝트…)은 마운트 때 읽은
+  // 값에 굳어 앱을 껐다 켜야 맞았다. 이제는 화면 세대를 올려 열려 있던 화면을 통째로 새로
+  // 마운트한다 — 화면이 늘어도 따로 배선할 것이 없다. 채팅만은 진행 중인 대화와 작성 중인
+  // 입력을 들고 있어 다시 마운트하지 않는다(채팅이 보는 스냅숏은 위에서 새로 받는다).
   const refreshApp = useCallback(async () => {
     setAppRefreshing(true);
     try {
-      await Promise.all([refresh(), refreshStatusCard(), reconcileSessionList()]);
-      setRefreshNonce((current) => current + 1);
+      await Promise.all([refresh(), refreshStatusCard(), reconcileSessionList(), loadLocalConnection()]);
+      setViewGeneration((current) => current + 1);
     } finally {
       setAppRefreshing(false);
     }
-  }, [refresh, reconcileSessionList, refreshStatusCard]);
+  }, [loadLocalConnection, refresh, reconcileSessionList, refreshStatusCard]);
 
 
   const pollAutomation = useCallback(async () => {
@@ -496,6 +504,7 @@ function App() {
   const modelOptions = useMemo(() => collectRecentModels(snapshot?.sessions ?? []), [snapshot?.sessions]);
 
   const activateView = useCallback((nextView: ViewId) => {
+    navigationEpoch.current += 1;
     setMountedViews((current) => {
       if (current.has(nextView)) return current;
       const next = new Set(current);
@@ -620,6 +629,7 @@ function App() {
   }, [aiaAttention, keepAiaMounted]);
 
   const selectSession = useCallback((session: SessionSummary | null) => {
+    navigationEpoch.current += 1;
     // 세션 팝아웃 창은 이 세션 하나만 보여주므로, 상세를 닫으면 창을 닫는다.
     if (!session && popoutRequest?.kind === "session") {
       void closePopoutWindow();
@@ -633,6 +643,40 @@ function App() {
     selectSession(session);
     activateView("sessions");
   }, [selectSession, activateView]);
+
+  const openEditedChat = useCallback(async (chatId: string, rewindDraft?: MessageRewindDraft): Promise<void> => {
+    const epoch = navigationEpoch.current;
+    const live = await getLiveChats();
+    if (epoch !== navigationEpoch.current) throw new Error(text("수정한 대화는 채팅 목록에서 열 수 있습니다.", "Open the edited conversation from the chat list."));
+    const chat = live.find((item) => item.chatId === chatId);
+    if (!chat) throw new Error(text("새 대화를 찾을 수 없습니다. 채팅 목록을 확인해 주세요.", "The new conversation could not be found. Check the chat list."));
+    if (editedChatWaiter.current) throw new Error(text("다른 대화를 여는 중입니다.", "Another conversation is opening."));
+    await new Promise<void>((resolve, reject) => {
+      editedChatWaiter.current = { resolve, reject };
+      setMountedViews((current) => new Set([...current, "chat"]));
+      setEditedChatTarget({
+        epoch,
+        target: { chatId, requestId: nextRequestId(), attentionId: "", markRead: false, rewindDraft },
+        location: { view: "chat", chatId, source: chat.source, sessionId: chat.providerSessionId },
+      });
+    });
+  }, [nextRequestId, text]);
+  const handleChatTarget = useCallback((target: ChatViewAttentionTarget, opened: boolean) => {
+    if (editedChatTarget?.target.requestId !== target.requestId) {
+      clearChatViewAttentionTarget(target, opened);
+      return;
+    }
+    const waiter = editedChatWaiter.current;
+    editedChatWaiter.current = null;
+    setEditedChatTarget(null);
+    if (opened && editedChatTarget.epoch === navigationEpoch.current) {
+      setChatLocation(editedChatTarget.location);
+      activateView("chat");
+      waiter?.resolve();
+    } else {
+      waiter?.reject(new Error(text("수정한 대화를 열지 못했습니다. 다시 시도하면 같은 대화를 엽니다.", "Could not open the edited conversation. Retry to open the same conversation.")));
+    }
+  }, [editedChatTarget, clearChatViewAttentionTarget, activateView, text]);
 
   // 대시보드 '반복 일정' 패널에서 채팅 뷰의 반복 요청 탭으로 바로 이동한다.
   const openSchedules = useCallback(() => {
@@ -757,7 +801,7 @@ function App() {
    * 패널마다 다르지 않다 — 여기서 한 번만 묶어 화면별로 다른 것(무엇을 그리는가)만 남긴다.
    */
   const panel = (id: ViewId, render: () => ReactNode) => (
-    <ViewPanel id={id} activeView={view} mounted={mountedViews}>{render}</ViewPanel>
+    <ViewPanel id={id} activeView={view} mounted={mountedViews} generation={id === "chat" ? 0 : viewGeneration}>{render}</ViewPanel>
   );
 
   return (
@@ -779,6 +823,7 @@ function App() {
             popoverClassName={view === "skills" || view === "instructions" ? "skill-menu-help-popover" : undefined}
           >{navigationHelpParagraphs(view, text).map((paragraph) => <span className="help-hint-paragraph" key={paragraph}>{paragraph}</span>)}{helpEmphasis && <strong className="help-hint-emphasis">{helpEmphasis}</strong>}</HelpHint></h1>
           <div className="topbar-actions">
+
             <AiaTopbarTrigger
               triggerRef={aiaTriggerRef}
               enabled={Boolean(aiaProviderId)}
@@ -807,15 +852,15 @@ function App() {
         <main className="view-content">
           <Suspense fallback={<LoadingState label={text("화면을 불러오는 중…", "Loading view…")} />}>
           {panel("dashboard", () => <MemoDashboardView snapshot={snapshot} scheduler={schedulerSnapshot} attention={visibleChatAttention} accounts={accounts} onOpenSession={openSession} onOpenSchedules={openSchedules} onConnectCli={connectCli} />)}
-          {panel("chat", () => <MemoChatView providers={snapshot.status.providers} accounts={accounts} projects={projectOptions} models={modelOptions} sessions={snapshot.sessions} messageDisplayMode={messageDisplayMode} transcriptLimit={transcriptLimit} onTranscriptLimitChange={setTranscriptLimit} scheduler={schedulerSnapshot} onRefreshScheduler={refreshScheduler} onSchedulerSnapshot={applySchedulerSnapshot} tabRequest={chatTabRequest} onConnectCli={connectCli} onOpenSession={openSession} onMetaChanged={updateSessionMeta} onSessionCatalogChanged={syncSessionCatalog} attentionTarget={chatViewAttentionTarget} onAttentionTargetHandled={clearChatViewAttentionTarget} popout={Boolean(popoutRequest)} />)}
-          {panel("sessions", () => <MemoSessionsView providers={snapshot.status.providers} sessions={snapshot.sessions} folders={snapshot.folders} catalogHealth={catalogHealth} onRefreshList={reconcileSessionList} selected={selectedSession} messageDisplayMode={messageDisplayMode} transcriptLimit={transcriptLimit} onTranscriptLimitChange={setTranscriptLimit} onSelect={selectSession} onMetaChanged={updateSessionMeta} onFoldersChanged={updateFolders} onSessionCatalogChanged={syncSessionCatalog} attentionTarget={sessionAttentionTarget} onAttentionTargetHandled={clearSessionAttentionTarget} popout={Boolean(popoutRequest)} />)}
+          {panel("chat", () => <MemoChatView historyNavigatorRef={chatHistoryNavigator} onHistoryLocationChange={setChatLocation} providers={snapshot.status.providers} accounts={accounts} projects={projectOptions} models={modelOptions} sessions={snapshot.sessions} messageDisplayMode={messageDisplayMode} transcriptLimit={transcriptLimit} onTranscriptLimitChange={setTranscriptLimit} scheduler={schedulerSnapshot} onRefreshScheduler={refreshScheduler} onSchedulerSnapshot={applySchedulerSnapshot} tabRequest={chatTabRequest} onConnectCli={connectCli} onOpenSession={openSession} onMetaChanged={updateSessionMeta} onSessionCatalogChanged={syncSessionCatalog} attentionTarget={editedChatTarget?.target ?? chatViewAttentionTarget} onAttentionTargetHandled={handleChatTarget} popout={Boolean(popoutRequest)} />)}
+          {panel("sessions", () => <MemoSessionsView active={view === "sessions"} onOpenChat={openEditedChat} providers={snapshot.status.providers} sessions={snapshot.sessions} folders={snapshot.folders} catalogHealth={catalogHealth} onRefreshList={reconcileSessionList} selected={selectedSession} messageDisplayMode={messageDisplayMode} transcriptLimit={transcriptLimit} onTranscriptLimitChange={setTranscriptLimit} onSelect={selectSession} onMetaChanged={updateSessionMeta} onFoldersChanged={updateFolders} onSessionCatalogChanged={syncSessionCatalog} attentionTarget={sessionAttentionTarget} onAttentionTargetHandled={clearSessionAttentionTarget} popout={Boolean(popoutRequest)} />)}
           {panel("docs", () => <MemoDocsView providers={snapshot.status.providers} accounts={accounts} models={modelOptions} onRequestAiaPrompt={requestAiaPrompt} />)}
           {panel("projects", () => <MemoProjectsView active={view === "projects"} tabRequest={projectsTabRequest} registryRevision={resourceRepositoryRevision} onRegistryChanged={invalidateResourceViews} onRequestAiaPrompt={requestAiaPrompt} />)}
           {panel("instructions", () => <MemoInstructionsView onChanged={reloadChangedInstructions} onRequestAiaPrompt={requestAiaPrompt} repositoryRevision={resourceRepositoryRevision} automation={automation} onAutomationChange={applyAutomationChange} />)}
           {panel("skills", () => <MemoSkillsView active={view === "skills"} skills={snapshot.skills} automation={automation} onAutomationChange={applyAutomationChange} onSkillsChanged={reloadChangedResources} onRequestAiaPrompt={requestAiaPrompt} aiaTransferAvailable={skillTransferAiaAvailable} catalogHealth={catalogHealth} repositoryRevision={resourceRepositoryRevision} />)}
           {panel("agents", () => <MemoAgentsView agents={snapshot.agents} automation={automation} onAutomationChange={applyAutomationChange} catalogHealth={catalogHealth} />)}
           {panel("artifacts", () => <MemoArtifactsView groups={snapshot.artifacts} automation={automation} onAutomationChange={applyAutomationChange} catalogHealth={catalogHealth} />)}
-          {panel("workflows", () => <MemoWorkflowsView active={view === "workflows"} onRequestAiaPrompt={requestAiaPrompt} tabRequest={workflowsTabRequest} pacingSuggestions={pacingSuggestions} automation={automation} onAutomationChange={applyAutomationChange} onSkillsChanged={reloadChangedResources} refreshNonce={refreshNonce} />)}
+          {panel("workflows", () => <MemoWorkflowsView active={view === "workflows"} onRequestAiaPrompt={requestAiaPrompt} tabRequest={workflowsTabRequest} pacingSuggestions={pacingSuggestions} automation={automation} onAutomationChange={applyAutomationChange} onSkillsChanged={reloadChangedResources} />)}
           {panel("addons", () => <MemoAddonsView active={view === "addons"} tabRequest={addonsTabRequest} />)}
           {panel("storage",() => <MemoStorageView active={view === "storage"} tabRequest={storageTabRequest} automation={automation} onRequestAiaPrompt={requestAiaPrompt} onRepositoryChanged={invalidateResourceViews} />)}
           {panel("settings", () => <MemoSettingsView active={view === "settings"} providers={snapshot.status.providers} accounts={accounts} models={modelOptions} onAccountsChange={setAccounts} onConnectCli={connectCli} themeMode={themeMode} onThemeModeChange={setThemeMode} accentColor={accentColor} onAccentColorChange={setAccentColor} navigationPreferences={navigationPreferences} onNavigationPreferencesChange={setNavigationPreferences} messageDisplayMode={messageDisplayMode} onMessageDisplayModeChange={setMessageDisplayMode} automation={automation} onAutomationChange={applyAutomationChange} onRequestAiaPrompt={requestAiaPrompt} tabRequest={settingsTabRequest} systemAgentNoticeRequest={systemAgentNoticeRequest} appVersionManifest={appVersionManifest} onSkillsChanged={reloadChangedResources} />)}
@@ -1173,10 +1218,16 @@ function useSchedulerCenter({ sessions, syncSessionCatalog, abandonedSessionSync
   // 10초 폴링이 화면에 먼저 올린 토글 상태를 되돌리지 못하게 막는다.
   const schedulerRevision = useRef(0);
 
+  // 트레이·단축키 토글도 화면 토글과 같이 세대를 올린다. 요청 전에 올려 이미 떠 있던
+  // 폴링 응답을 버리고, 응답 뒤에 다시 올려 그 사이 시작한 폴링(서버 반영 전 목록)도 버린다.
   useShellEvent("toggle-scheduler-pause", () => {
+    schedulerRevision.current += 1;
     void getSchedulerSnapshot()
       .then((current) => setSchedulesPaused(!current.paused))
-      .then(setSchedulerSnapshot)
+      .then((next) => {
+        schedulerRevision.current += 1;
+        setSchedulerSnapshot(next);
+      })
       .catch(reportFailure);
   });
 
@@ -1374,11 +1425,12 @@ function useAccountUsageCenter({ antigravityDetected, refresh, reportFailure, on
  * 판정과 패널 껍데기를 화면마다 따로 적으면 열두 줄이 같은 조건을 되풀이하므로 여기서
  * 함께 본다. 내용은 함수로 받아, 마운트되지 않은 화면의 props는 만들지도 않는다.
  */
-function ViewPanel({ id, activeView, mounted, children }: { id: ViewId; activeView: ViewId; mounted: Set<ViewId>; children: () => ReactNode }) {
+function ViewPanel({ id, activeView, mounted, generation, children }: { id: ViewId; activeView: ViewId; mounted: Set<ViewId>; generation: number; children: () => ReactNode }) {
   if (!mounted.has(id)) return null;
   // 경계를 화면마다 따로 둔다. 하나가 실패해도 이미 마운트된 다른 화면은 살아 있어야 한다.
+  // 세대를 열쇠로 두면 로고 새로고침 때 경계째 새로 마운트돼, 오류로 멈춘 화면도 함께 살아난다.
   return <section className={id === "docs" ? "view-panel docs-content" : "view-panel"} data-view={id} hidden={id !== activeView}>
-    <ErrorBoundary label={navigationLabel(id, "ko", (ko) => ko)} scope="view">{children()}</ErrorBoundary>
+    <ErrorBoundary key={generation} label={navigationLabel(id, "ko", (ko) => ko)} scope="view">{children()}</ErrorBoundary>
   </section>;
 }
 

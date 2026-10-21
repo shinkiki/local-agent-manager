@@ -81,7 +81,7 @@ row being here at all.
 | C5 | project policy adapter (`project_instructions.rs`) | configured policy repository, `AGENTS.md`, `CLAUDE.md`, or `GEMINI.md` inside a registered project or provider home config directory, and the linked documents that instruction imports, at their own relative paths under the same root | atomic staged replace per file; existing policy or linked-document changes require explicit overwrite; removal moves files to the app-owned trash as one group | yes, except repository path selection |
 | C6 | user directory adapter (`user_path.rs`) | up to three missing directories under an existing anchor the user typed, outside provider homes and app data | the created directories are empty; removing them restores the previous state | yes |
 | C8 | Claude settings adapter (`claude_settings.rs`) | only `enabledPlugins` and `skillOverrides` entries in user settings or an active registered project's local settings | private pre-write backups plus atomic same-directory replacement | yes |
-| C9 | SSH key adapter (`ssh_keys.rs`, `ssh_endpoints.rs`, `ssh_exec.rs`, `ssh_approvals.rs`) | one new Ed25519 key pair directly under `~/.ssh`, plus renaming one existing pair into `~/.ssh/.agent-manager-trash/`; key memos and per-key endpoints in the app data directory | creation: same-directory staging plus no-clobber hard-link publication, removing the staged files and any half-published link on failure. removal: the pair is moved, never erased, and is restored by moving it back out of the trash | yes |
+| C9 | SSH key adapter (`ssh_keys.rs`, `ssh_endpoints.rs`, `ssh_exec.rs`, `ssh_approvals.rs`, `ssh_askpass.rs`) | one new key pair (Ed25519, RSA or ECDSA) directly under `~/.ssh`, plus renaming one existing pair into `~/.ssh/.agent-manager-trash/`; key memos, connection servers and passphrase markers in the app data directory, and the OS Keychain item holding a key passphrase the user chose to store | creation: same-directory staging plus no-clobber hard-link publication, removing the staged files and any half-published link on failure. removal: the pair is moved, never erased, and is restored by moving it back out of the trash | yes |
 | C10 | database connection adapter (`db_connections.rs`, `db_sql.rs`, `db_exec.rs`, `db_approvals.rs`, `db_cli.rs`) | the external databases the user registered and enabled for agents, plus connection metadata in the app data directory and the OS Keychain item derived from the connection id | reads run inside an engine-level read-only transaction; writes run inside a transaction after a previewed row count, and the receipt records both the previewed and the committed count | registration, credential entry and statement execution are host-only; listing, the agent-use toggle and the connection check are remote-eligible in write mode |
 | C11 | session cleanup adapter (`session_cleanup.rs`) | app-data session stores, and session transcripts inside a `C4` credential profile — never a shared provider home | app-owned trash with manifest, purged after the configured retention | yes |
 | C13 | provider telemetry adapter (`provider_telemetry.rs`) | the usage-collection switches of installed provider CLIs — `env.DISABLE_TELEMETRY`, `env.DISABLE_ERROR_REPORTING`, `env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` in Claude user settings, `[otel] exporter` and `[otel] log_user_prompt` in `CODEX_HOME/config.toml`, `privacy.usageStatisticsEnabled` and `telemetry.enabled` in `~/.gemini/settings.json` | private pre-write backups plus atomic same-directory replacement | yes |
@@ -481,20 +481,25 @@ exception is deliberately the narrowest shape that answers the question a user a
   file entry of this kind. It is absent from the table for that reason, and the UI says so
   instead of leaving the user to wonder whether it was missed.
 
-### C9 — SSH key inventory, generation, endpoints, and execution (`ssh_keys.rs`, `ssh_endpoints.rs`, `ssh_exec.rs`, `ssh_approvals.rs`)
+### C9 — SSH key inventory, generation, servers, and execution (`ssh_keys.rs`, `ssh_endpoints.rs`, `ssh_exec.rs`, `ssh_approvals.rs`, `ssh_askpass.rs`)
 
 - **C9-1** Inventory reads only bounded, direct-child, regular, non-symlink `*.pub` files under the
   canonical `~/.ssh` directory. It validates the OpenSSH public blob and derives only the file name,
   path, public-key algorithm, SHA-256 fingerprint, comment, and whether a same-name regular,
   non-symlink private-key file exists. The private-key file is checked with metadata only and is
   never opened or returned.
-- **C9-2** Generation creates only a new Ed25519 pair at `~/.ssh/<validated name>` and
-  `~/.ssh/<validated name>.pub`. Both final paths must be absent; overwriting, importing, truncating,
+- **C9-2** Generation creates only a new pair at `~/.ssh/<validated name>` and
+  `~/.ssh/<validated name>.pub`, of one type from the closed `SshKeyKind` list — Ed25519 (default),
+  RSA 2048/3072/4096, ECDSA P-256/384/521 (user decision, 2026-10-19: AWS CodeCommit and similar
+  hosts accept RSA only). DSA (removed from OpenSSH) and FIDO `-sk` keys (a hardware touch does not
+  fit the remote UI or the timeout) are not offered. The published public key must carry the
+  algorithm the request asked for. Both final paths must be absent; overwriting, importing, truncating,
   changing permissions on, or otherwise modifying the contents of an existing SSH file is forbidden.
   The one permitted change to an existing file is the C9-7 rename into the trash directory.
 - **C9-3** Resolve the allowlisted official `ssh-keygen` executable and pass a structured argument
-  vector. Generate without a passphrase in a new owner-only staging directory directly under
-  `~/.ssh`; never execute a shell string and never include private-key bytes in process output,
+  vector. Generate in a new owner-only staging directory directly under `~/.ssh` — without a
+  passphrase (`-N ""`), or, when the user typed one, with the passphrase delivered through the C9-21
+  askpass session and **never** through `-N` (argv is readable by `ps`); never execute a shell string and never include private-key bytes in process output,
   logs, errors, IPC, or remote APIs.
 - **C9-4** Validate and canonicalize the home and SSH roots in Rust, refuse symlinked roots and
   targets, bound file-name and comment input, and publish the public key then private key with
@@ -524,9 +529,17 @@ exception is deliberately the narrowest shape that answers the question a user a
   length, are accepted only for a fingerprint present in the current inventory, and are dropped when
   that key is removed. A memo store that cannot be read is reported as an inventory issue instead of
   failing the key list.
-- **C9-9** An endpoint (host, port, user, agent-use flag) is device-local metadata keyed by
-  fingerprint under the same rules as C9-8 (G7, `ssh-key-endpoints-v1.json`), bounded to 512
-  entries, accepted only for a fingerprint in the current inventory, and dropped with the key.
+- **C9-9** A **connection server** (id, name, key fingerprint, host, port, user, agent-use flag) is
+  device-local metadata under the same rules as C9-8 (G7, `ssh-servers-v1.json`), bounded to 512
+  entries. Servers are an independent list that each *point at* one key (user decision,
+  2026-10-19): one key may serve many servers, so every execution path, approval token, sudo secret,
+  terminal and CLI relay addresses a server by its **server id** (`srv-…`), never by fingerprint. A
+  caller that still sends only a fingerprint is accepted only when exactly one server uses that key;
+  more than one is refused instead of guessed. A server is saved only for a fingerprint in the
+  current inventory, but it is **not** dropped with the key: it stays, reported with a reason in the
+  agent listing, until the key is restored or the server is switched to another key. The old
+  per-key store (`ssh-key-endpoints-v1.json`) is migrated once on first read, with ids derived from
+  the fingerprint, and the old file is left in place.
   Nothing in `~/.ssh` is written — `config`, `known_hosts`, and the key files are user-owned and
   stay untouched. Host, port, and user become `ssh` arguments, so they are validated to a bounded
   character set that cannot start with `-` or contain whitespace; agent use cannot be turned on for
@@ -542,7 +555,7 @@ exception is deliberately the narrowest shape that answers the question a user a
   the app never accepts an unknown host key on the user's behalf: `Host key verification failed` is
   reported with the guidance to connect once from a terminal. The receipt carries the destination
   and the `ssh` diagnostic, never private-key bytes.
-- **C9-12** Agents reach these endpoints through exactly two paths, both gated by the same agent-use
+- **C9-12** Agents reach these servers through exactly two paths, both gated by the same agent-use
   flag. An agent with its own shell (Claude, Codex) uses the bundled `ssh-endpoints` system skill and
   the read-only `<CLI> ssh list` subcommand, which lists exactly the entries whose agent-use flag is
   on, with the identity **path** and the `ssh` arguments to use; it runs `ssh` itself unless that
@@ -690,7 +703,7 @@ exception is deliberately the narrowest shape that answers the question a user a
   stdin and no PTY — this is a read-only terminal, and interactive programs are unsupported. A call
   with no conversation (a workflow step) streams nowhere and behaves exactly as before. Second, the
   skill path stops running `ssh` itself for that server: the C9-12 listing carries `terminalEnabled`
-  and `relayArgs`, and the skill runs `<CLI> ssh exec --fingerprint <fp> -- <command…>`. That
+  and `relayArgs`, and the skill runs `<CLI> ssh exec --server <server id> -- <command…>`. That
   subcommand never spawns `ssh`; it reads the backend port the running backend recorded in the CLI
   pointer file and posts `relay_ssh_command` (write-gated and host-only like `execute_ssh_command`)
   to the loopback API, so the command list is **enforced** on that path with no approval card — an
@@ -737,6 +750,24 @@ exception is deliberately the narrowest shape that answers the question a user a
   no new credential field or agent operation is introduced. Read-only remote access is refused
   by both the frontend connector and `authorize_terminal_open_request`, just like the general
   SSH shell under C9-19, including requests with an omitted mode.
+- **C9-21** A key passphrase the user chooses to store (at generation, or later for an existing key
+  after `ssh-keygen -y` proves it opens that key) lives only in the OS Keychain item
+  `Agent Manager SSH Key Passphrases`/`<fingerprint>`; app data holds only a "stored" marker and its
+  time (`ssh-key-passphrases-v1.json`, G7). It is **not** a C17 saved secret, because C17 values can be
+  auto-delivered into a chat and this one must never reach an agent (user decision, 2026-10-19). The
+  value is handed only to `ssh`/`scp`/`ssh-keygen` processes the backend itself spawns, through
+  OpenSSH askpass: `SSH_ASKPASS` is this executable, `SSH_ASKPASS_REQUIRE=force`, and the child
+  environment carries only `port:token` of a per-child loopback listener that answers exactly as many
+  prompts as that use needs — two for generation (enter + confirm), one for every connection or check, so
+  a hook or ProxyCommand inheriting the environment finds no answer left — and closes when the child ends — the value is never in argv, environment, a file, a log or a receipt. The
+  askpass entry point (`exit_if_invoked_as_ssh_askpass`, first line of both `main`s) answers only
+  key-passphrase prompts, never a server password or host-key question; for such keys the connection
+  options switch `BatchMode=yes` for `BatchMode=no` with public-key-only authentication and one
+  passphrase prompt. Agents with a shell never get `sshArgs` for a server whose key is locked
+  (`passphraseProtected`): they must use the `<CLI> ssh exec` relay, so askpass never enters an agent
+  shell. Deleting a key forgets its stored passphrase; forgetting deletes the Keychain item before the
+  marker, so a failed delete leaves the marker as the handle to retry. A generated key that still opens
+  with an empty passphrase, or whose type or RSA size differs from the request, is never published.
 
 ### C10 — database connections, statements, and approvals (`db_connections.rs`, `db_sql.rs`, `db_exec.rs`, `db_approvals.rs`, `db_cli.rs`)
 
@@ -875,7 +906,9 @@ only what the user chose to save.
 - **C17-3** A saved value reaches a chat only by being loaded into the `C15` memory store, where it
   keeps the `C15` TTL, scrubbing, and injection rules unchanged. It is loaded at two moments and no
   others: `request_chat_secret` for that name, and the run/write path resolving a name the chat does
-  not hold. The loaded entry carries `source: saved`, so the chat panel and the storage screen both
+  not hold. The one consumer outside chats is the project git panel's network operations for a
+  value a project's settings chose for a git remote host (`C16-11`); that path goes straight to the
+  git child's environment and never through the `C15` store. The loaded entry carries `source: saved`, so the chat panel and the storage screen both
   show which values were used without being asked for.
 - **C17-4** Exactly one command returns a value — `read_saved_secret_value`, behind the eye icon in
   Storage → Secrets. It is write-gated like the rest of the feature and absent from the AIA
@@ -991,8 +1024,9 @@ set is closed and every offered command is recoverable.
   (`--pathspec-from-file`, `--end-of-options`); an older binary is reported as `gitTooOld`.
 - **C16-3** Execution is non-interactive: `GIT_TERMINAL_PROMPT=0`, an empty `GIT_ASKPASS`,
   `GIT_EDITOR=true`, `GIT_SEQUENCE_EDITOR=true`, `LC_ALL=C`. A credential prompt therefore fails
-  fast as an `authFailed` receipt with the guidance to run the command once from a terminal, never
-  hangs. Reads run with `GIT_OPTIONAL_LOCKS=0`. Every command has a timeout (reads 20 s, local
+  fast as an `authFailed` receipt, never hangs. The receipt names the place to connect a credential
+  for that remote (`C16-10` key or `C16-11` token) — not "run it once from a terminal", which a
+  headless host has no seat for and which leaves nothing behind without a credential helper. Reads run with `GIT_OPTIONAL_LOCKS=0`. Every command has a timeout (reads 20 s, local
   mutations 60 s, network 120 s) and a timeout kills the process group so `ssh` and credential
   helpers die with it. One mutation per repository at a time; an overlapping call returns `busy`.
 - **C16-4** The offered mutations are exactly: stage / unstage (`add -A`, `restore --staged`, or
@@ -1058,6 +1092,44 @@ set is closed and every offered command is recoverable.
   is redacted from both captured streams before the receipt leaves Core, because `ssh` prints it in
   its own warnings and that receipt reaches a remote screen. Resolution failure is not a refusal:
   git falls back to its own defaults and ends in `authFailed` as before.
+- **C16-11** HTTPS remotes get the same narrow answer as `C16-10`, with a `C17` saved secret in
+  place of a key (user decision, 2026-10-18 — a NAS clone of a GitHub HTTPS remote could not be
+  pushed from the panel at all, while the same token already pushed it from the round skill). The
+  value stays a saved secret, but **which value a project uses is a project setting**, not a field
+  of the secret (user decision, 2026-10-20 — one token often serves several projects, and the same
+  `github.com` may need a different token per project). The gear right of the project list in
+  Projects → Source control (anchor `projects.git.remoteAuth`, moved there from the Settings tab by
+  user decision, 2026-10-20) opens Git remote auth, which picks
+  one saved secret name per (project, host) (`set_project_git_remote_token` /
+  `list_project_git_remote_tokens`, app data `project-git-remote-tokens-v1.json`, names only, keyed
+  by the project path like `B3` follows). The name must exist when chosen; a binding whose secret
+  was later deleted stays listed (`secretExists: false`) so it can be cleared, but is ignored by the
+  overview and by git. Only `network_mutate` reads the value: it asks git for the URL it will really
+  use (`remote get-url [--push]`, so `insteadOf`/`pushurl` apply), and when that is `https://` on a
+  host this project bound it reads the value from the OS Keychain (`saved_secrets::take_for_git_remote`) and
+  hands it to that one child as `http.https://<host>/.extraHeader: Authorization: Basic …` through
+  `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` (appended after any inherited
+  entries). So the value is never in argv, `ps`, a file or a shell string (`G4`, `G9`), and the
+  config key is scoped to that host. Plain `http://` never receives it. Because git hands its whole
+  environment to hooks and `core.fsmonitor`, a token-bearing call also points `core.hooksPath` at an
+  empty app-data folder, sets `core.fsmonitor=false`, forces `http.https://<host>/.sslVerify=true`
+  and clears `http.curloptResolve` — command-level config, so a repository (or an agent writing
+  `.git/hooks`) cannot run code with the header or redirect it. A repository- or worktree-level
+  `http.sslCAInfo`/`http.sslCAPath` for that host has no command-level reset, so the call is
+  refused with `Conflict` before git runs. The value and its base64 form are redacted from both
+  captured streams before the receipt leaves Core, and Core's own env copies are zeroized after the
+  run (the OS process API keeps its own copy for the child's lifetime). Like the `C16-10` key it is the user's own git, not an agent
+  capability: it ignores `agentEnabled`, never enters the `C15` chat store, and no agent child
+  receives it; `set_project_git_remote_token` is write-gated and both commands are absent from the
+  AIA catalog (`C17-4`), so an agent cannot pick the credential for its own push. The overview rates each remote's push URL without the network
+  (`GitRemote.auth.method`: `token`, `sshKey`, `credentialHelper` — credentials git uses on its
+  own: `credential.helper` or an existing `http.extraHeader` matched against the URL with and
+  without its username, or a `~/.netrc` — `urlCredential`, `sshDefault`, `notNeeded`, `unknown`
+  (also plain `http://` with nothing found, since such servers may accept anonymous pushes), or
+  `none`), and the panel disables push **only** for `none` — the one state in which `C16-3`
+  guarantees `authFailed` — while fetch and pull stay open for public repositories.
+  `GitRemote.auth.fetchHost` carries the HTTPS host of the fetch URL, which can differ from the
+  push URL; the settings card lists both, because the token is chosen per call from that call's URL. Lookup failure is not a refusal: git falls back to its defaults.
 - **C16-9** The file tab (`project_files.rs`) needs no exception: it is a G1-style read of the
   registered project folder. It lists and reads regular files only — dot-entries are shown, `.git`
   is hidden at every depth, symbolic links are hidden in listings and refused on read at every
@@ -1489,8 +1561,9 @@ Third-party MCP servers are the only outbound network dependency AIA can acquire
   tool outside the stored `enabledTools`.
 - **E6** A grant may carry `grantExpiresAt`, which must be in the future at registration. An
   expired grant is reported as `expired` and must not be used. `interface_revoke` withdraws it.
-- **E7** Limits: 32 interfaces, 64 enabled tools per interface, 512 KB remote response body,
-  256 KB exposed result.
+- **E7** Limits: 32 interfaces, 64 enabled tools per interface (the probed catalog itself may
+  hold up to 512 tools — external plugins share the parser, and hosted Notion exceeds 64),
+  512 KB remote response body, 256 KB exposed result.
 - **E8** The store `aia-mcp-interfaces.json` (lock file, temp write, atomic rename, fsync) and the
   audit log `aia-mcp-audit.jsonl` (rotated to `.previous.jsonl` at 2 MB) live in the app data
   directory. Neither the audit log nor the catalog may contain secrets.

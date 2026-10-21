@@ -133,7 +133,7 @@ pub fn run_db_query(
     request: DbQueryRequest,
 ) -> Result<DbQueryReceipt, CoreError> {
     let connection = agent_connection(app_data_dir, &request.connection_id)?;
-    let parsed = parse_sql(&request.sql)?;
+    let parsed = parse_sql(&request.sql, connection.engine)?;
     if parsed.kind != DbStatementKind::Read {
         return Err(CoreError::InvalidInput(format!(
             "{}는 조회 작업으로 실행할 수 없습니다. 변경 문장은 승인을 받는 실행 작업으로 부르세요",
@@ -182,7 +182,7 @@ pub fn run_db_statement(
     gate: Option<&dyn DbApprovalGate>,
 ) -> Result<DbStatementReceipt, CoreError> {
     let connection = agent_connection(app_data_dir, &request.connection_id)?;
-    let parsed = parse_sql(&request.sql)?;
+    let parsed = parse_sql(&request.sql, connection.engine)?;
     let kind = write_kind(parsed.kind)?;
     ensure_write_allowed(&connection, kind)?;
     ensure_scope(&parsed, &connection.schema_scope)?;
@@ -779,7 +779,10 @@ fn query_postgres(
         .batch_execute("BEGIN TRANSACTION READ ONLY")
         .map_err(postgres_error)?;
     let outcome = (|| -> Result<QueryOutcome, CoreError> {
-        // simple_query는 모든 값을 텍스트로 돌려주므로 타입 변환표가 필요 없다.
+        // C10-8. simple_query는 단순 질의 프로토콜이라 여러 문장을 그대로 실행한다. 먼저
+        // 확장 프로토콜의 Parse로 준비해 두 번째 문장이 있으면 엔진이 거부하게 하고, 통과한
+        // 한 문장만 simple_query로 돌린다 — 모든 값을 텍스트로 돌려받아 타입 변환표가 필요 없다.
+        client.prepare(sql).map_err(postgres_error)?;
         let messages = client.simple_query(sql).map_err(postgres_error)?;
         let mut columns: Vec<String> = Vec::new();
         let mut collector = RowCollector::new(limit);

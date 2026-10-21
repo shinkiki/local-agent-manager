@@ -32,8 +32,9 @@ use serde_json::{json, Value};
 use crate::clock::now_ms;
 use crate::scheduler::{ScheduleFrequency, ScheduleRecurrence};
 use crate::session_management::{
-    session_string_enum, SessionListRequest, SessionManagementStatus, SessionScopeFilters,
-    SessionStatisticsRequest, SessionTranscriptPageRequest, SystemAuditPhase,
+    canonical_filter_paths, matches_any_cwd, session_string_enum, SessionListRequest,
+    SessionManagementStatus, SessionScopeFilters, SessionStatisticsRequest,
+    SessionTranscriptPageRequest, SystemAuditPhase,
 };
 use crate::text_limit;
 use crate::{
@@ -1541,8 +1542,11 @@ fn cli_assert_in_scope(
             "이 정책의 공급자 범위에 없는 세션입니다".to_owned(),
         ));
     }
-    let cwd = cwd.unwrap_or_default();
-    if !policy.cwds.iter().any(|allowed| allowed == cwd) {
+    // 목록(`list_sessions`)과 같은 규칙으로 대조한다: 세션 경로를 정규화해 정규화된 허용 집합에
+    // 있어야 한다. 문자열 그대로 비교하면 끝 슬래시나 링크로 기록된 세션이 목록에는 나오고
+    // 원문 조회에서는 범위 밖으로 거절된다. 빈 허용 집합은 "제약 없음"이 아니라 거절이다(X8).
+    let allowed = canonical_filter_paths(&policy.cwds);
+    if allowed.is_empty() || !matches_any_cwd(cwd, &allowed) {
         return Err(CoreError::NotFound(
             "이 정책의 프로젝트 범위에 없는 세션입니다".to_owned(),
         ));
@@ -2591,5 +2595,58 @@ mod tests {
             SessionReadCliOp::LinkedFile.audit_name(),
             "session_read_cli_linked_file"
         );
+    }
+
+    fn scope_policy(cwds: Vec<String>) -> ResolvedSessionRead {
+        ResolvedSessionRead {
+            sources: vec![ProviderId::Claude],
+            cwds,
+            statuses: vec![],
+            from: 0,
+            to: 1000,
+            detail: SessionReadDetail::Summary,
+            max_sessions: 10,
+            max_turns_per_session: 50,
+            page_size: 20,
+            include_linked_files: false,
+            redaction: SessionReadRedaction::Credentials,
+            summary: "scope".to_owned(),
+            notes: vec![],
+        }
+    }
+
+    /// X4·X5: 원문 조회의 범위 판정은 목록과 같은 정규화 규칙을 따른다. 끝 슬래시나 링크로
+    /// 기록된 세션도 목록에 나온 이상 거절되지 않고, 범위 밖·경로 없음·빈 범위는 거절된다.
+    #[test]
+    fn cli_assert_in_scope_matches_list_canonicalization() {
+        let temp = TempDir::new().expect("temp");
+        let real = temp.path().join("project");
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&real).expect("real");
+        std::fs::create_dir_all(&other).expect("other");
+        let canonical = real.canonicalize().unwrap().to_string_lossy().into_owned();
+        let policy = scope_policy(vec![canonical.clone()]);
+
+        assert!(cli_assert_in_scope(&policy, ProviderId::Claude, Some(&canonical)).is_ok());
+        let slashed = format!("{canonical}/");
+        assert!(cli_assert_in_scope(&policy, ProviderId::Claude, Some(&slashed)).is_ok());
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).expect("symlink");
+            let link = link.to_string_lossy().into_owned();
+            assert!(cli_assert_in_scope(&policy, ProviderId::Claude, Some(&link)).is_ok());
+        }
+
+        let other = other.to_string_lossy().into_owned();
+        assert!(cli_assert_in_scope(&policy, ProviderId::Claude, Some(&other)).is_err());
+        assert!(cli_assert_in_scope(&policy, ProviderId::Claude, None).is_err());
+        assert!(cli_assert_in_scope(&policy, ProviderId::Codex, Some(&canonical)).is_err());
+        let empty = scope_policy(vec![]);
+        assert!(cli_assert_in_scope(&empty, ProviderId::Claude, Some(&canonical)).is_err());
+        // 저장된 범위가 모두 사라지면 정규화 뒤 빈 집합이 되고, "제약 없음"이 아니라 거절이다.
+        let gone = temp.path().join("gone").to_string_lossy().into_owned();
+        let vanished = scope_policy(vec![gone.clone()]);
+        assert!(cli_assert_in_scope(&vanished, ProviderId::Claude, Some(&gone)).is_err());
     }
 }

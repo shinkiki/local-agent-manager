@@ -54,6 +54,7 @@ export {
   runDocumentTriggerTest,
   searchDocumentEntries,
   setDocumentTriggerEnabled,
+  updateDocRoot,
   updateDocumentTrigger,
 } from "./ipcDocuments";
 export {
@@ -96,20 +97,16 @@ export {
   setDbConnectionEnabled,
 } from "./ipcDbConnections";
 export {
-  getLocalLlmConnection,
   getLocalLlmConnections,
   probeLocalLlmConnection,
   removeLocalLlmConnection,
   setDefaultLocalLlmConnection,
-  setLocalLlmConnection,
   upsertLocalLlmConnection,
 } from "./ipcLocalLlm";
 export {
   createRoundGoal,
   deleteRoundGoal,
-  deleteRoundReport,
   getRoundGoals,
-  getRoundReport,
   listRoundReports,
   resolveRoundDecision,
   updateRoundGoal,
@@ -117,11 +114,13 @@ export {
 export {
   checkSshEndpoint,
   deleteSshKey,
+  deleteSshServer,
   generateSshKey,
   getSshKeys,
   readSshPublicKey,
-  setSshKeyEndpoint,
+  saveSshServer,
   setSshKeyNote,
+  setSshKeyPassphrase,
 } from "./ipcSshKeys";
 export {
   beginExternalPluginOAuth,
@@ -315,26 +314,15 @@ export {
   revokeLoginSession,
   setLoginChannelRequirement,
   setLoginPassword,
-  setLoginUserId,
 } from "./ipcLogin";
 export type {
-  ChannelRequirements,
   LoginChannel,
-  LoginForm,
   LoginMethod,
   LoginSessionView,
   LoginSettingsView,
-  OtpSecretStorage,
   OtpSetup,
   Reauth,
 } from "./ipcLogin";
-export {
-  loginRequiredStore,
-  loginRequirementAny,
-  loginSessionToken,
-  LoginRequiredError,
-  NO_LOGIN_REQUIREMENT,
-} from "./loginSession";
 export type { LoginRequirement } from "./loginSession";
 export {
   getClaudePluginBranchRules,
@@ -362,7 +350,6 @@ export {
   getProjectGitOverview,
   getProjectGitStatus,
   getProjectOverlayDrift,
-  listProjectBranchFollows,
   listProjectEntries,
   listProjectOverlaySets,
   pullProjectGit,
@@ -374,7 +361,6 @@ export {
   saveProjectOverlaySet,
   snapshotProjectOverlay,
   searchProjectFiles,
-  setProjectBranchFollow,
   stageProjectGitPaths,
   stashProjectGit,
   switchProjectGitBranch,

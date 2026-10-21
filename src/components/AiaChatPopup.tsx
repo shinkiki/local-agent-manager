@@ -52,12 +52,13 @@ import {
   type ChatTurn,
 } from "./ChatConversation";
 import { VoiceInputControl } from "./VoiceControls";
-import { mergeComposerDraft, type AiaSuggestion } from "../lib/aiaSuggestions";
+import { composerAfterSend, mergeComposerDraft, type AiaSuggestion } from "../lib/aiaSuggestions";
 import { errorText } from "../lib/errorText";
 import { useI18n, type UiText } from "../lib/i18n";
 import {
   AiaMark,
   ChatApprovalDock,
+  ChatContextMeter,
   ChatQueueList,
   ChatSendActionMenu,
   ErrorBanner,
@@ -637,6 +638,7 @@ export function AiaChatPopup({ open, provider, runtime, providerName, providerCo
             onDecision={decide}
           />
           <ChatQueueList items={queue} onRemove={(id) => void removeQueued(id)} onRecall={(item) => { void removeQueued(item.id); draft.recallQueued(item.text, queuedAttachmentsToDrafts(item.attachments, session?.chatId ?? null)); }} />
+          {session && <div className="aia-context-bar"><ChatContextMeter usedTokens={session.contextUsedTokens} windowTokens={session.contextWindowTokens} /></div>}
           <AiaComposer
             inputRef={draft.inputRef}
             value={composer}
@@ -725,7 +727,8 @@ function useAiaComposerDraft({ connectionRef, providerConnected, usable, onError
   /** deliverNow면 응답 중에도 중단 없이 진행 중인 작업에 바로 전달한다. */
   const deliver = async (deliverNow: boolean, policy: AiaDeliveryPolicy) => {
     // 보낼 글은 `body`로 받는다 — 이 자리의 `text`는 문구 짝을 고르는 함수다.
-    const body = composer.trim();
+    const written = composer;
+    const body = written.trim();
     if ((!body && attachments.length === 0) || uploading) return;
     // 쓴 글이 있는데 보낼 길이 없으면 이유를 남긴다. 조용히 돌아가면 사용자에게는
     // 버튼이 먹지 않는 것과 구분되지 않는다.
@@ -770,7 +773,7 @@ function useAiaComposerDraft({ connectionRef, providerConnected, usable, onError
         // 새로 시작한 대화에는 끼어들 작업이 없다.
         steer: deliverNow && policy.staleAction === "send",
       });
-      setComposer("");
+      setComposer((current) => composerAfterSend(current, written));
       setAttachments([]);
     } catch (cause) {
       onError(errorText(cause));

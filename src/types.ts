@@ -670,12 +670,19 @@ export interface SshKeyView {
   hasPrivateKey: boolean;
   /** 이 기기에 적어 둔 메모. 공개키 파일이 아니라 앱 데이터에서 온다. */
   note: string | null;
-  /** 이 키로 붙는 연결 서버. 메모와 같은 기기 단위 설정이며 ~/.ssh는 손대지 않는다. */
-  endpoint: SshEndpointView | null;
+  /** C9-21. 이 키의 암호가 OS 보안 저장소에 저장돼 있는지. 값은 어디에도 실리지 않는다. */
+  passphraseSaved: boolean;
 }
 
-/** 인증키 하나에 묶인 연결 서버. agentEnabled가 켜져야 에이전트 목록에 나온다. */
+/** 연결 서버 하나. 접속에 쓸 키를 지문으로 가리키며, 키 하나를 여러 서버가 함께 쓸 수 있다.
+ *  agentEnabled가 켜져야 에이전트 목록에 나온다. */
 export interface SshEndpointView {
+  /** 서버 ID. 확인·터미널·실행이 이 값으로 서버를 고른다. */
+  id: string;
+  /** 사람이 붙인 이름. 비어 있으면 접속 대상(user@host:port)을 대신 보여 준다. */
+  name: string;
+  /** 접속에 쓸 키의 지문. */
+  fingerprint: string;
   host: string;
   port: number;
   user: string;
@@ -698,8 +705,10 @@ export interface SshEndpointView {
   updatedAt: number;
 }
 
-/** host가 빈 문자열이면 저장된 연결 서버를 지운다. */
-export interface SetSshKeyEndpointRequest {
+/** 연결 서버 저장. id가 없으면 새 서버를 만들고, 있으면 그 서버를 고친다. 삭제는 deleteSshServer. */
+export interface SaveSshServerRequest {
+  id: string | null;
+  name: string;
   fingerprint: string;
   host: string;
   port: number | null;
@@ -720,8 +729,14 @@ export interface SshCommandPolicyDefaults {
   denied: string[];
 }
 
+/** 서버 하나를 가리키는 요청. */
+export interface SshServerRef {
+  serverId: string;
+}
+
 /** 연결 확인 결과. 원격에서는 아무것도 바꾸지 않고 고정 명령 하나만 돌린다. */
 export interface SshEndpointCheckReceipt {
+  serverId: string;
   fingerprint: string;
   destination: string;
   reachable: boolean;
@@ -741,11 +756,32 @@ export interface SshKeysSnapshot {
   keys: SshKeyView[];
   issues: SshKeyIssue[];
   commandPolicyDefaults: SshCommandPolicyDefaults;
+  /** 저장된 연결 서버 전체. */
+  servers: SshEndpointView[];
+  /** 만들 수 있는 키 종류. 첫 항목(Ed25519)이 기본값이다. */
+  keyTypes: SshKeyTypeOption[];
+}
+
+export interface SshKeyTypeOption {
+  /** generateSshKey의 keyType 값. 예: "ed25519", "rsa-4096", "ecdsa-256" */
+  id: string;
+  label: string;
 }
 
 export interface GenerateSshKeyRequest {
   fileName: string;
   comment: string;
+  /** SshKeyTypeOption.id. 비우면 Ed25519다. */
+  keyType: string;
+  /** 비어 있지 않으면 이 암호로 개인키를 잠그고 OS 보안 저장소에 저장한다. */
+  passphrase: string | null;
+}
+
+/** C9-21. 이미 있는 키의 암호 저장(값이 있으면, 맞는 암호인지 확인한 뒤) 또는 삭제(빈 값). */
+export interface SetSshKeyPassphraseRequest {
+  fileName: string;
+  fingerprint: string;
+  passphrase: string;
 }
 
 /** 목록에서 고른 공개키 하나. 지문을 함께 보내 목록을 그린 뒤 바뀐 파일을 막는다. */
@@ -771,7 +807,10 @@ export interface SshKeyDeletionReceipt {
   trashPath: string;
   privateKeyMoved: boolean;
   noteRemoved: boolean;
-  endpointRemoved: boolean;
+  /** 저장해 둔 키 암호도 함께 지웠는지. */
+  passphraseRemoved: boolean;
+  /** 이 키를 쓰던 연결 서버 이름. 서버는 지워지지 않고 키를 되돌리거나 바꿀 때까지 쓸 수 없다. */
+  serversUsingKey: string[];
 }
 
 export interface SetSshKeyNoteRequest {
@@ -958,6 +997,8 @@ export interface SessionMeta {
   origin?: ChatOrigin | null;
   /** 이 대화에 남긴 읽던 자리. 만든 순서 그대로 온다. */
   bookmarks?: SessionBookmark[];
+  /** 사용자나 AIA가 직접 이어 둔 프로젝트 경로. 프로젝트 필터가 이 세션을 그 프로젝트에도 잡는다. */
+  linkedProjectPaths?: string[];
 }
 
 export type ChatOriginKind = "workflow" | "schedule" | "aia" | "user";
@@ -988,6 +1029,8 @@ export interface SessionMetaPatch {
   pinnedAccountId?: string | null;
   /** 읽던 자리 목록 통째 교체. 추가·이름변경·삭제 모두 새 목록을 보낸다. */
   bookmarks?: SessionBookmark[];
+  /** 직접 이어 둘 프로젝트 경로 목록 통째 교체. 빈 배열이면 모두 푼다. */
+  linkedProjectPaths?: string[];
 }
 
 /**
@@ -1058,6 +1101,11 @@ export interface SessionSummary {
    * 사용자 중단은 실패로 치지 않는다.
    */
   lastFailure: SessionLastFailure | null;
+  /**
+   * 작업 경로 밖에서 손댄 등록 프로젝트(그 프로젝트 세션들의 `cwd` 문자열). 파일 수정 도구가
+   * 쓴 경로와 `meta.linkedProjectPaths`에서 백엔드가 스냅샷마다 맞춘다. 비어 있으면 빠진다.
+   */
+  relatedProjects?: string[];
 }
 
 export type SessionFailureKind = "usageLimit" | "error";
@@ -1174,6 +1222,34 @@ export interface GitRemote {
   name: string;
   /** 사용자 정보(`user:token@`)는 가려져 온다. */
   url: string | null;
+  /** C16-11. push 주소에 쓸 수 있는 인증 수단을 네트워크 없이 매긴 판정. */
+  auth: GitRemoteAuth;
+}
+
+export type GitRemoteTransport = "https" | "http" | "ssh" | "local" | "other";
+
+/**
+ * C16-11. `none`만이 "반드시 실패한다"는 뜻이다. `sshDefault`는 ssh-agent나 기본 키로 붙을
+ * 수 있고 `unknown`은 판정할 수 없는 전송이라, 화면은 `none`일 때만 push를 막는다.
+ */
+export type GitRemoteAuthMethod =
+  | "token"
+  | "sshKey"
+  | "credentialHelper"
+  | "urlCredential"
+  | "sshDefault"
+  | "notNeeded"
+  | "none"
+  | "unknown";
+
+export interface GitRemoteAuth {
+  transport: GitRemoteTransport;
+  host: string | null;
+  method: GitRemoteAuthMethod;
+  /** `method`가 `token`일 때 프로젝트 설정이 고른 저장된 비밀값의 이름. 값은 실리지 않는다. */
+  tokenSecret: string | null;
+  /** 가져오기·받아서 합치기가 쓰는 주소가 HTTPS일 때 그 호스트(push 주소와 다를 수 있다). */
+  fetchHost?: string | null;
 }
 
 export interface GitWorktree {
@@ -1360,6 +1436,33 @@ export interface ProjectBranchFollows {
   schemaVersion: number;
   projectPath: string;
   follows: ProjectBranchFollow[];
+}
+
+/** C16-11. 프로젝트 설정이 호스트 하나에 고른 저장된 비밀값. 값은 실리지 않는다. */
+export interface ProjectGitRemoteTokenView {
+  host: string;
+  secretName: string;
+  username: string;
+  updatedAt: number;
+  /** 고른 값이 저장소 → 비밀정보에 아직 있는가. 지워졌으면 이 지정은 쓰이지 않는다. */
+  secretExists: boolean;
+}
+
+export interface ProjectGitRemoteTokens {
+  schemaVersion: number;
+  projectPath: string;
+  tokens: ProjectGitRemoteTokenView[];
+  /** 고를 수 있는 저장된 비밀값 이름. */
+  secretNames: string[];
+  defaultUsername: string;
+}
+
+export interface SetProjectGitRemoteTokenRequest {
+  projectPath: string;
+  host: string;
+  /** null이면 그 호스트의 지정을 해제한다. */
+  secretName: string | null;
+  username?: string | null;
 }
 
 export interface SetProjectBranchFollowRequest {
@@ -1665,6 +1768,8 @@ export interface ReadProjectFileRequest {
 
 export interface ProjectGitDiffRequest {
   projectPath: string;
+  /** 프로젝트 저장소에 연결된 워크트리. 주면 그 작업 트리·인덱스를 읽는다. */
+  worktreePath?: string | null;
   path: string;
   originalPath?: string | null;
   staged?: boolean;
@@ -1673,6 +1778,8 @@ export interface ProjectGitDiffRequest {
   /** B9. 둘을 함께 주면 `<from>...<to>` 범위. staged·commit과 상호배타다. */
   rangeFrom?: string | null;
   rangeTo?: string | null;
+  /** 전체 보기에서 파일의 바뀌지 않은 줄도 생략하지 않고 함께 읽는다. */
+  fullContext?: boolean;
 }
 
 export interface ProjectGitCommitFilesRequest {
@@ -2728,7 +2835,8 @@ export interface AccountLoginCallbackRelay {
 export type TerminalSshMode = "shell" | "installKey";
 
 export interface TerminalSshRequest {
-  fingerprint: string;
+  /** 연결 서버 ID. */
+  serverId: string;
   cols: number;
   rows: number;
   /** 적지 않으면 지금까지처럼 원격 셸이다. */
@@ -2844,6 +2952,8 @@ export interface ChatStartRequest {
   handoffOrigin?: SessionLink | null;
   /** 같은 공급자 세션을 원본으로 새 세션을 갈라낸다(fork). Codex·Claude만 받는다. */
   forkSessionId?: string | null;
+  /** Fork before this authoritative transcript item and replace its user message. */
+  editMessage?: { index: number; expectedText: string };
   unattended?: boolean;
   /**
    * 이 실행 계정을 세션에 고정할지. 고정은 이어가기 정책과 페일오버보다 우선하므로,
@@ -2865,6 +2975,8 @@ export interface ShutdownImpact {
 }
 
 export interface ChatSessionInfo {
+  /** A fork inherits transcript history even though it starts a new provider session. */
+  forked?: boolean;
   chatId: string;
   startedAt: number;
   source: ProviderId;
@@ -3010,10 +3122,10 @@ export type ChatEvent =
 export type ChatRejectionCode = "chatMissing" | "invalid" | "unavailable" | "sessionBusy";
 
 /**
- * accountSwitch와 pacingSuggestion은 채팅에 묶이지 않는 두 종류다. chatId·cwd가 비어 있고,
- * 각각 설정의 연결 탭과 워크플로 페이싱 탭으로 연다.
+ * accountSwitch·pacingSuggestion·roundDecision은 채팅에 묶이지 않는 세 종류다. chatId·cwd가
+ * 비어 있고, 각각 설정의 연결 탭·워크플로 페이싱 탭·워크플로 자동화 탭(회차 목표 상세)으로 연다.
  */
-export type ChatAttentionKind = "running" | "approval" | "completed" | "failed" | "accountSwitch" | "pacingSuggestion";
+export type ChatAttentionKind = "running" | "approval" | "completed" | "failed" | "accountSwitch" | "pacingSuggestion" | "roundDecision";
 
 /** 알림을 말풍선으로 띄울 때 쓰는 대화 미리보기. 앞부분만 담기며 뒤는 잘려 있다. */
 export interface ChatAttentionPreview {
@@ -3958,15 +4070,10 @@ export interface RoundGoalScheduleChange {
   enabled: boolean;
 }
 
-export type RoundDecisionMode = "manual" | "automatic";
+export type RoundDecisionMode = "manual" | "recommended" | "automatic";
 
-export interface RoundGoal {
+export interface RoundGoal extends RoundGoalInput {
   id: string;
-  title: string;
-  goal: string;
-  targetPath: string;
-  verification: string;
-  cadence: string;
   status: RoundGoalStatus;
   decisionMode: RoundDecisionMode;
   skillKey?: string | null;
@@ -3988,12 +4095,7 @@ export interface RoundGoalInput {
 }
 
 /** 부분 갱신. 없는 칸은 그대로, null 은 지운다. */
-export interface RoundGoalPatch {
-  title?: string;
-  goal?: string;
-  targetPath?: string;
-  verification?: string;
-  cadence?: string;
+export interface RoundGoalPatch extends Partial<RoundGoalInput> {
   status?: RoundGoalStatus;
   decisionMode?: RoundDecisionMode;
   skillKey?: string | null;
@@ -4020,6 +4122,8 @@ export interface RoundDecision {
   recommendation?: string | null;
   /** 사용자가 적은 답. 없으면 대기 중. */
   resolved?: string | null;
+  /** 사람이 꼭 정해야 하는 결정. 추천적용 모드에서도 자동으로 답하지 않는다. */
+  requiresHuman?: boolean;
 }
 
 export type RoundOutcome = "pass" | "partial" | "fail";
@@ -4131,9 +4235,20 @@ export interface DocRootStatus {
   id: string;
   name: string;
   path: string;
+  note?: string | null;
+  agentEnabled: boolean;
   agentData: boolean;
   exists: boolean;
   restricted: boolean;
+}
+
+export interface UpdateDocRootInput {
+  id: string;
+  name: string;
+  path: string;
+  note?: string | null;
+  agentEnabled: boolean;
+  createIfMissing?: boolean;
 }
 
 export interface DocFile {

@@ -309,6 +309,7 @@ test("절차 스킬은 워크플로와 같은 이름으로, 프로젝트마다 �
   const values = { ...initialValues(procedureCard), projectPath: "/repo", systemKey: "alpha" };
   const planned = plannedProcedureSkills(procedureCard, values, bundledSkills, {
     parallel: false,
+    paced: true,
     installed: new Set(),
   });
   assert.equal(planned.length, 1);
@@ -322,7 +323,7 @@ test("절차 스킬은 워크플로와 같은 이름으로, 프로젝트마다 �
     procedureCard,
     { ...values, systemKey: "beta" },
     bundledSkills,
-    { parallel: false, installed: new Set() },
+    { parallel: false, paced: true, installed: new Set() },
   );
   assert.notEqual(other[0].key, planned[0].key);
 });
@@ -341,6 +342,7 @@ test("이미 있는 스킬은 만들지 않고, 병렬을 켜야 레인 절차�
 
   const withLane = plannedProcedureSkills(procedureCard, values, bundledSkills, {
     parallel: true,
+    paced: true,
     installed: new Set(),
   });
   assert.deepEqual(withLane.map((skill) => skill.key), [contract.id, LANE_SKILL_KEY]);
@@ -348,9 +350,24 @@ test("이미 있는 스킬은 만들지 않고, 병렬을 켜야 레인 절차�
   // 사용자가 손봤을 수 있는 기존 사본은 건드리지 않는다.
   const skipped = plannedProcedureSkills(procedureCard, values, bundledSkills, {
     parallel: true,
+    paced: true,
     installed: new Set([contract.id]),
   });
   assert.deepEqual(skipped.map((skill) => skill.key), [LANE_SKILL_KEY]);
+});
+
+test("수동 실행만 만들 때는 병렬 스위치가 켜져 있어도 레인 절차를 만들지 않는다", () => {
+  // 계약은 페이싱 회차일 때만 레인을 의존으로 건다. 만드는 스킬도 같은 조건을 따라야
+  // 쓰이지 않는 스킬을 승인받아 남기지 않는다.
+  const values = { ...initialValues(procedureCard), projectPath: "/repo", systemKey: "alpha", parallelEnabled: "true" };
+  const contract = buildWorkflowContract(procedureCard.actions[0].workflow, values, { paced: false });
+  assert.ok(!contract.requiredSkills.includes(LANE_SKILL_KEY), contract.requiredSkills.join(","));
+  const planned = plannedProcedureSkills(procedureCard, values, bundledSkills, {
+    parallel: true,
+    paced: false,
+    installed: new Set(),
+  });
+  assert.deepEqual(planned.map((skill) => skill.key), [contract.id]);
 });
 
 test("걸러지는 식별자는 등록 전에 막는다 — 다른 프로젝트 워크플로를 덮어쓰기 때문", () => {
@@ -757,6 +774,14 @@ test("a selected procedure skill is an installed workflow dependency", () => {
   assert.deepEqual(selectedProcedureSkillKeys(values), ["team-delivery", "team-qa"]);
   assert.ok(contract.requiredSkills.includes("team-delivery"));
   assert.ok(contract.requiredSkills.includes("team-qa"));
+});
+
+test("a selected skill that repeats another dependency is required once", () => {
+  // 등록은 같은 키가 두 번 있는 계약을 거절한다(validate_required_skills).
+  const values = { projectPath: "/repo", roundSkill: "demo-round", qaSkill: "team-qa" };
+  const contract = buildWorkflowContract(card.actions[1].workflow, values, { paced: true });
+
+  assert.deepEqual(contract.requiredSkills, ["demo-round", "team-qa"]);
 });
 
 /**

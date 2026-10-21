@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Folder, RotateCcw } from "lucide-react";
 import { getClaudeSettingsStates, getProjectRegistry, getSkillDetail, setClaudeSkillOverride } from "../lib/ipc";
 import { useI18n, type UiText } from "../lib/i18n";
@@ -249,15 +249,24 @@ function useClaudeSkillOverride(
   const [selectedProject, setSelectedProject] = useState<string | null>(skill.scope === "project" ? intrinsicProject : null);
   const [settings, setSettings] = useState<ClaudeSettingsSnapshot | null>(claudeSettings);
   const [busy, setBusy] = useState(false);
+  // 저장이 끝나면 그보다 먼저 떠난 읽기 응답은 저장 전 상태다. 늦게 도착해도 방금 저장한
+  // 값을 덮지 않도록 저장마다 세대를 올리고, 읽기는 떠날 때의 세대가 그대로일 때만 반영한다.
+  const settingsGenerationRef = useRef(0);
+  // 저장 중에도 다른 스킬로 옮길 수 있다. 저장 결과는 떠날 때의 스킬·프로젝트가 아직 화면에
+  // 있을 때만 반영한다 — 아니면 새 스킬의 읽기 결과를 이전 스킬의 스냅샷이 대신한다.
+  const settingsContext = `${skill.directory}\u0000${selectedProject ?? intrinsicProject ?? ""}`;
+  const settingsContextRef = useRef(settingsContext);
+  settingsContextRef.current = settingsContext;
 
   useEffect(() => {
     if (skill.source !== "claude" || skill.scope === "plugin") return;
     let active = true;
+    const generation = settingsGenerationRef.current;
     const contextProject = selectedProject ?? intrinsicProject;
     Promise.all([getClaudeSettingsStates(contextProject), getProjectRegistry()])
       .then(([snapshot, entries]) => {
         if (!active) return;
-        setSettings(snapshot);
+        if (generation === settingsGenerationRef.current) setSettings(snapshot);
         setProjects(entries.filter((entry) => entry.active && entry.exists));
       })
       .catch((cause: unknown) => { if (active) setError(errorText(cause)); });
@@ -275,6 +284,7 @@ function useClaudeSkillOverride(
     if (!override || busy) return;
     setBusy(true);
     setError(null);
+    const savedContext = settingsContextRef.current;
     try {
       const next = await setClaudeSkillOverride({
         overrideKey: override.overrideKey,
@@ -282,7 +292,10 @@ function useClaudeSkillOverride(
         projectPath: selectedProject ?? intrinsicProject,
         value,
       });
-      setSettings(next);
+      if (savedContext === settingsContextRef.current) {
+        settingsGenerationRef.current += 1;
+        setSettings(next);
+      }
       // 화면 목록의 상태 배지는 전역 스냅샷을 보므로 범위 저장과 별개로 다시 읽어 올린다.
       void getClaudeSettingsStates(null).then(onClaudeSettingsChange).catch(() => undefined);
     } catch (cause) {

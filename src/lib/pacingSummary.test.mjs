@@ -246,6 +246,24 @@ test("실측 회당 소비가 없거나 0이면 남은 회차를 내지 않는�
   assert.deepEqual(zero.costs, [{ provider: "claude", tokens: null, percentPerRun: 0 }]);
 });
 
+test("순여유가 음수이면 잔여 회차는 0이고 다른 공급자의 잔여 회차를 갉아먹지 않는다", () => {
+  const single = consumerSummary(
+    consumer({ costs: costs({ claude: 10 }) }),
+    [account("a", { provider: "claude", overview: { netHeadroomPercent: -15 } })],
+  );
+  assert.equal(single.remainingRuns, 0);
+
+  const mixed = consumerSummary(
+    consumer({ costs: costs({ claude: 10, codex: 10 }) }),
+    [
+      account("a", { provider: "claude", overview: { netHeadroomPercent: -15 } }),
+      account("b", { provider: "codex", overview: { netHeadroomPercent: 30 } }),
+    ],
+  );
+  // Claude는 0회, Codex는 3회이므로 총 3회 (Claude의 음수가 Codex를 깎지 않음).
+  assert.equal(mixed.remainingRuns, 3);
+});
+
 /**
  * 사용량 한도가 없는 공급자는 창도 리셋도 없어 소진율을 잴 수 없다. 목록에 남으면 0%로
  * 읽혀 "여유가 가장 많은 계정"으로 뽑히고, 레인 폴백에서는 고를 수도 없는 칸이 생긴다.

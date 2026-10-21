@@ -39,7 +39,7 @@ with opener.open(request, timeout=180) as response:
 1. list_cypress_workspaces → 현재 요청의 프로젝트 path와 executionType이 정확히 맞는 작업공간을 명시적으로 선택하고 moduleReady 확인. 기본 작업공간이나 첫 항목을 자동 선택하지 않는다. Agent Manager 자체 QA는 agentManagerIsolated, 다른 사이트·프로젝트는 standard를 사용한다. 필요하면 사용자 요청 범위 내 add_cypress_workspace/install_cypress_module 사용.
 2. list_cypress_workspace_files/read_cypress_workspace_file로 기존 설정과 마스킹된 환경변수 키 확인.
 3. write_cypress_workspace_file로 e2e/ 아래 *.cy.js 작성. 비밀번호는 Cypress.env("키")로만 참조, 입력 log:false. 사용자 요청 사이트·동작에 한정.
-4. run_cypress_spec으로 해당 스펙만 실행하고 jobId 저장.
+4. run_cypress_spec으로 해당 스펙만 실행하고 jobId 저장. 특정 브라우저가 필요하면 browser에 이름(edge·chrome 등)을 넣고, 실제로 돈 브라우저·버전은 summary.browser로 확인한다.
 5. get_cypress_run_status로 끝날 때까지 조회. cy.saveResult로 저장한 artifacts 실제 내용으로 판정.
 
 사용 토글·등록 해제·환경변수 원문 읽기/쓰기는 에이전트 도구에 없다. 환경변수 값이나 쿠키·토큰을 문서·로그·스크린샷에 노출하지 않는다.

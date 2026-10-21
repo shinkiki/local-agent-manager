@@ -519,6 +519,16 @@ fn resolve_status(adapter: &ProviderCliAdapter) -> ProviderCliUpdateStatus {
     status.update_supported = plan.method.is_update_supported();
     status.unsupported_reason = plan.unsupported_reason.clone();
     status.update_command_label = plan.command_label.clone();
+    // 리눅스에서만 본다. 컨테이너 배포의 옛 이미지는 CLI가 root 소유 `/usr/local`에 있어
+    // 비root 서버가 돌리는 업데이트가 권한 오류로 끝난다. 데스크톱(macOS·Windows)의 업데이트
+    // 동작은 그대로 둔다. 방법(update_method)은 남겨 최신 버전 확인은 계속 된다.
+    #[cfg(target_os = "linux")]
+    if status.update_supported {
+        if let Some(reason) = read_only_install_reason(plan.source, &executable) {
+            status.update_supported = false;
+            status.unsupported_reason = Some(reason);
+        }
+    }
     status.check_supported = plan.method.is_check_supported();
     status.check_unsupported_reason = if status.check_supported {
         None
@@ -701,6 +711,70 @@ fn unsupported_plan(
         command_label: None,
         unsupported_reason: Some(reason),
     }
+}
+
+/// 업데이트 명령이 바꿔 써야 하는 폴더 가운데 현재 사용자가 쓸 수 없는 것이 있으면 그 사유.
+///
+/// npm 전역 설치는 패키지 폴더를 갈아 끼우므로 바깥쪽 `node_modules`와, 있으면 `<prefix>/bin`에
+/// 써야 한다. 자체 업데이트(`agy update` 등)는 실행 파일이 놓인 폴더다. Homebrew는 brew가 자기
+/// 권한 모델로 판단하므로 보지 않는다.
+///
+/// 쓰기 가능 여부는 `access(W_OK)`로만 묻는다. 시험 삼아 파일을 만들어 보면 그 자체가 설치
+/// 폴더에 대한 쓰기다.
+#[cfg(all(unix, any(target_os = "linux", test)))]
+fn read_only_install_reason(source: CliInstallSource, executable: &Path) -> Option<String> {
+    let blocked = install_write_targets(source, executable)
+        .into_iter()
+        .find(|dir| !is_writable_by_current_user(dir))?;
+    Some(format!(
+        "설치 위치({})에 현재 사용자가 쓸 수 없어 업데이트할 수 없습니다. 컨테이너 배포라면 이미지에 고정된 설치본입니다 — 새 이미지로 한 번 재생성하면 앱에서 업데이트할 수 있습니다",
+        blocked.display()
+    ))
+}
+
+#[cfg(all(unix, any(target_os = "linux", test)))]
+fn install_write_targets(source: CliInstallSource, executable: &Path) -> Vec<PathBuf> {
+    match source {
+        CliInstallSource::NpmGlobal => {
+            // 분류(classify_install_source)와 같이 가장 바깥 `node_modules`가 전역 루트다.
+            // 패키지 안에 중첩된 의존성 `node_modules`를 잡으면 엉뚱한 폴더를 본다.
+            let Some(root) = executable
+                .ancestors()
+                .filter(|dir| dir.file_name().is_some_and(|name| name == "node_modules"))
+                .last()
+            else {
+                return Vec::new();
+            };
+            let mut targets = vec![root.to_path_buf()];
+            if let Some(bin) = root
+                .parent()
+                .filter(|lib| lib.file_name().is_some_and(|name| name == "lib"))
+                .and_then(Path::parent)
+                .map(|prefix| prefix.join("bin"))
+                .filter(|bin| bin.is_dir())
+            {
+                targets.push(bin);
+            }
+            targets
+        }
+        CliInstallSource::Standalone => executable
+            .parent()
+            .map(|dir| vec![dir.to_path_buf()])
+            .unwrap_or_default(),
+        CliInstallSource::HomebrewCask
+        | CliInstallSource::HomebrewFormula
+        | CliInstallSource::NotDetected => Vec::new(),
+    }
+}
+
+#[cfg(all(unix, any(target_os = "linux", test)))]
+fn is_writable_by_current_user(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: NUL로 끝나는 유효한 C 문자열을 넘기고, access는 그 포인터를 보관하지 않는다.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
 }
 
 /// 정규화된 실행 파일 경로의 구조만으로 설치 출처를 판별한다. 경로 문자열을 명령에
@@ -1890,6 +1964,91 @@ mod tests {
             classify_install_source(Path::new("/Users/x/.local/bin/agy")),
             (CliInstallSource::Standalone, None)
         );
+    }
+
+    #[test]
+    fn headless_user_prefix_installs_plan_npm_and_self_update() {
+        // 컨테이너는 CLI를 HOME 볼륨의 `~/.local`에 둔다(deploy/synology, H11). 경로 구조만으로
+        // Claude·Codex는 npm 전역, agy는 자체 업데이트로 판별돼야 업데이트 버튼이 켜진다.
+        assert_eq!(
+            classify_install_source(Path::new(
+                "/home/agent/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+            )),
+            (
+                CliInstallSource::NpmGlobal,
+                Some("@anthropic-ai/claude-code".to_owned())
+            )
+        );
+        assert_eq!(
+            classify_install_source(Path::new(
+                "/home/agent/.local/lib/node_modules/@openai/codex/bin/codex.js"
+            )),
+            (
+                CliInstallSource::NpmGlobal,
+                Some("@openai/codex".to_owned())
+            )
+        );
+        let agy = ADAPTERS
+            .iter()
+            .find(|adapter| adapter.provider == ProviderId::Antigravity)
+            .expect("Antigravity 어댑터");
+        let plan = plan_update(agy, Path::new("/home/agent/.local/bin/agy"));
+        assert_eq!(plan.source, CliInstallSource::Standalone);
+        assert_eq!(plan.method, CliUpdateMethod::SelfUpdate);
+        assert_eq!(plan.command_label.as_deref(), Some("agy update"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_install_locations_block_the_update_with_a_recreate_hint() {
+        use std::os::unix::fs::PermissionsExt;
+        let prefix = temporary_directory();
+        let package = prefix.join("lib/node_modules/@openai/codex/bin");
+        // 중첩 의존성 node_modules — 바깥 전역 루트만 판정 대상이어야 한다.
+        let nested = prefix.join("lib/node_modules/@openai/codex/node_modules/dep/bin");
+        let bin = prefix.join("bin");
+        for dir in [&package, &nested, &bin] {
+            fs::create_dir_all(dir).expect("폴더");
+        }
+        let executable = package.join("codex.js");
+        let root = prefix.join("lib/node_modules");
+
+        assert_eq!(
+            install_write_targets(CliInstallSource::NpmGlobal, &nested.join("tool")),
+            vec![root.clone(), bin.clone()]
+        );
+        assert_eq!(
+            read_only_install_reason(CliInstallSource::NpmGlobal, &executable),
+            None
+        );
+        assert_eq!(
+            install_write_targets(CliInstallSource::Standalone, &bin.join("agy")),
+            vec![bin.clone()]
+        );
+        assert!(
+            install_write_targets(CliInstallSource::HomebrewCask, &executable).is_empty(),
+            "Homebrew는 brew가 판단한다"
+        );
+
+        // root 소유 이미지 레이어를 흉내 낸다. root로 돌면 access가 늘 통과하므로 건너뛴다.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).expect("권한");
+        let reason = read_only_install_reason(CliInstallSource::NpmGlobal, &executable);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("권한 복구");
+        let reason = reason.expect("쓸 수 없는 전역 루트는 막혀야 한다");
+        assert!(reason.contains(&root.display().to_string()));
+        assert!(reason.contains("재생성"));
+
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o555)).expect("권한");
+        let reason = read_only_install_reason(CliInstallSource::Standalone, &bin.join("agy"));
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("권한 복구");
+        assert!(
+            reason.is_some(),
+            "자체 업데이트도 실행 파일 폴더에 써야 한다"
+        );
+        let _ = fs::remove_dir_all(&prefix);
     }
 
     #[test]

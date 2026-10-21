@@ -211,6 +211,12 @@ fn parse_clock(value: &str) -> Result<u16, CoreError> {
     Ok(hours * 60 + minutes)
 }
 
+/// 저장할 시각을 `HH:MM` 정본으로. `parse_clock`이 받는 `9:5`·` +9:05` 같은 값도 같은 분을
+/// 뜻하지만 화면의 `<input type="time">`은 정본만 그리므로, 저장 전에 같은 뜻의 정본으로 바꾼다.
+pub(crate) fn canonical_clock(value: &str) -> Result<String, CoreError> {
+    parse_clock(value).map(format_clock)
+}
+
 /// 저장된 요일 번호를 계산에서 바로 쓸 수 있는 일요일 시작 마스크로 바꾼다.
 fn parse_weekdays(days: impl IntoIterator<Item = u8>) -> Result<[bool; 7], CoreError> {
     let mut weekdays = [false; 7];
@@ -503,5 +509,13 @@ mod tests {
             let minute = parse_clock(time_str).expect("parse");
             assert_eq!(format_clock(minute), time_str);
         }
+    }
+
+    #[test]
+    fn canonical_clock_keeps_the_minute_and_pads_to_hh_mm() {
+        assert_eq!(canonical_clock("9:5").expect("canon"), "09:05");
+        assert_eq!(canonical_clock(" +9:05 ").expect("canon"), "09:05");
+        assert_eq!(canonical_clock("23:59").expect("canon"), "23:59");
+        assert!(canonical_clock("24:00").is_err());
     }
 }

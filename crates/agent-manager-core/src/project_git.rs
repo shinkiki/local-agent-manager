@@ -54,6 +54,11 @@ const MAX_COMMIT_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_STASH_MESSAGE_CHARS: usize = 1_000;
 const MAX_STASH_INDEX: u32 = 10_000;
 const MAX_COMMIT_BODY_CHARS: usize = 2_000;
+/// C16-11. 토큰이 실리는 호출이 `core.hooksPath`로 가리키는 앱 데이터 안의 빈 폴더.
+const EMPTY_HOOKS_DIR: &str = "project-git-no-hooks";
+
+/// C16-11. 개요가 `remote get-url --push`로 실제 주소를 묻는 원격 수.
+const MAX_AUTH_PROBED_REMOTES: usize = 16;
 
 /// 모든 호출에 앞세우는 전역 옵션. 색·페이저·인용을 끄고 pathspec을 글자 그대로 본다 —
 /// 검증한 경로가 glob으로 풀리면 검증이 무의미해진다.
@@ -107,10 +112,24 @@ pub struct ProjectGitTarget {
     pub project_path: String,
 }
 
+/// 작업 트리 상태 읽기. `worktree_path` 를 주면 프로젝트 저장소에 연결된 그 워크트리를 읽는다
+/// (회차가 `git worktree` 로 따로 고치는 파일을 보려고). 읽기 전용이라 변경 명령에는 이 자리가
+/// 없다 — 스테이지·커밋은 언제나 등록 프로젝트 자신에만 간다.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitStatusRequest {
+    pub project_path: String,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectGitDiffRequest {
     pub project_path: String,
+    /// `ProjectGitStatusRequest::worktree_path` 와 같다. diff 도 읽기라 같은 워크트리를 연다.
+    #[serde(default)]
+    pub worktree_path: Option<String>,
     pub path: String,
     #[serde(default)]
     pub original_path: Option<String>,
@@ -125,6 +144,9 @@ pub struct ProjectGitDiffRequest {
     pub range_from: Option<String>,
     #[serde(default)]
     pub range_to: Option<String>,
+    /// 전체 보기에서는 hunk 사이의 바뀌지 않은 줄도 생략하지 않는다.
+    #[serde(default)]
+    pub full_context: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -363,6 +385,59 @@ pub struct GitBranch {
 pub struct GitRemote {
     pub name: String,
     pub url: Option<String>,
+    /// C16-11. 이 원격에 push할 때 쓸 수 있는 인증 수단을 네트워크 없이 매긴 판정.
+    pub auth: GitRemoteAuth,
+}
+
+/// C16-11. 원격 URL의 전송 방식.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitRemoteTransport {
+    Https,
+    Http,
+    Ssh,
+    Local,
+    Other,
+}
+
+/// C16-11. 그 원격에 붙을 때 이 어댑터가 쓸 수 있는 인증 수단.
+///
+/// 판정은 백엔드가 이미 아는 것(URL 모양·앱 설정·git 설정)으로만 내린다. 실제로 통과하는지는
+/// 원격에 붙어 봐야 알 수 있으므로, 화면은 `none`일 때만 push를 막고 나머지는 안내로 쓴다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitRemoteAuthMethod {
+    /// 저장된 비밀값 하나가 이 호스트의 git 원격용 토큰으로 지정돼 있다.
+    Token,
+    /// 애드온의 SSH 키 하나가 "git 원격용"으로 켜져 있다(C16-10).
+    SshKey,
+    /// git 설정에 이 URL에 맞는 credential helper가 있다(맥 키체인 등).
+    CredentialHelper,
+    /// URL 자체에 `user:password@`가 들어 있다.
+    UrlCredential,
+    /// SSH인데 켜 둔 키가 없다. ssh-agent나 `~/.ssh` 기본 키로 붙을 수도 있어 막지 않는다.
+    SshDefault,
+    /// 로컬 경로라 인증이 없다.
+    NotNeeded,
+    /// 이 어댑터가 쓸 수 있는 수단이 하나도 없다. HTTPS 원격이면 push는 반드시 실패한다.
+    None,
+    /// 판정할 수 없는 전송(`git://` 등).
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRemoteAuth {
+    pub transport: GitRemoteTransport,
+    /// HTTPS·HTTP·SSH 원격의 호스트(`github.com`, 필요하면 `:포트`).
+    pub host: Option<String>,
+    pub method: GitRemoteAuthMethod,
+    /// `method`가 `token`일 때 프로젝트 설정이 고른 저장된 비밀값의 이름. 값은 어디에도
+    /// 실리지 않는다.
+    pub token_secret: Option<String>,
+    /// 가져오기·끌어오기가 쓰는 주소가 HTTPS일 때 그 호스트. push 주소(`pushurl`)와 다를 수
+    /// 있고, 토큰은 호출마다 그 호출의 주소로 고르므로 설정 화면이 이 호스트도 보여야 한다.
+    pub fetch_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -687,6 +762,27 @@ fn test_network_identity() -> Option<crate::ssh_endpoints::ProjectGitIdentity> {
     TEST_NETWORK_IDENTITY.with(|cell| cell.borrow().clone())
 }
 
+// C16-11 시험용 (호스트, 사용자 이름, 값). 시험은 OS 보안 저장소를 열 수 없으므로 여기서
+// 덮어쓴다. 비어 있으면 제품 경로(저장된 비밀값)가 그대로 돈다.
+#[cfg(test)]
+thread_local! {
+    static TEST_GIT_TOKEN: std::cell::RefCell<Option<(String, String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_git_token(host: &str) -> Option<Option<GitRemoteToken>> {
+    TEST_GIT_TOKEN.with(|cell| {
+        cell.borrow().as_ref().map(|(bound, username, value)| {
+            (bound == host).then(|| GitRemoteToken {
+                secret_name: "TEST_GIT_TOKEN".to_owned(),
+                username: username.clone(),
+                value: zeroize::Zeroizing::new(value.clone()),
+            })
+        })
+    })
+}
+
 #[cfg(test)]
 fn record_call(argv: &[&str], input: Option<&[u8]>, env: &[(String, String)], env_remove: &[&str]) {
     RECORDED_CALLS.with(|cell| {
@@ -713,6 +809,9 @@ pub(crate) struct GitRunner {
     extra_env: Vec<(String, String)>,
     /// C16-10. 네트워크 작업 직전에 "git 원격용" 키를 찾아보기 위한 앱 데이터 경로.
     app_data_dir: PathBuf,
+    /// C16-11. 사용자가 고른 프로젝트 경로(저장소 최상위가 아닐 수 있다). 프로젝트 설정의
+    /// git 원격용 토큰 지정을 찾는 열쇠라 팔로우와 같은 모양([`follow_key`])이다.
+    project_key: String,
 }
 
 impl GitRunner {
@@ -746,6 +845,7 @@ impl GitRunner {
             }),
             extra_env,
             app_data_dir: app_data_dir.to_path_buf(),
+            project_key: follow_key(project_root),
         };
         runner.version = git_version_for(&runner)?;
         // 흔한 경우(작업 트리 안)는 한 번의 rev-parse로 끝난다. `--show-toplevel`은 bare
@@ -869,10 +969,10 @@ impl GitRunner {
     ) -> Result<CommandOutcome, CoreError> {
         let mut argv: Vec<&str> = GIT_BASE_ARGS.to_vec();
         argv.extend_from_slice(args);
-        let env = self.env(write, extra);
+        let mut env = self.env(write, extra);
         #[cfg(test)]
         record_call(&argv, input, &env, REMOVED_ENV);
-        run_capped_with(
+        let outcome = run_capped_with(
             &self.executable,
             &argv,
             timeout,
@@ -884,7 +984,14 @@ impl GitRunner {
                 strip_credential_env: true,
                 own_process_group: true,
             },
-        )
+        );
+        // C16-11. 합친 사본에도 토큰 헤더가 있다. 호출부가 자기 목록을 지우는 것과 같이 지운다.
+        if !extra.is_empty() {
+            for (_, value) in env.iter_mut() {
+                zeroize::Zeroize::zeroize(value);
+            }
+        }
+        outcome
     }
 
     fn read(&self, args: &[&str], timeout: Duration) -> Result<CommandOutcome, CoreError> {
@@ -955,32 +1062,178 @@ impl GitRunner {
     }
 
     fn remotes(&self) -> Result<Vec<GitRemote>, CoreError> {
-        let names = self.read(&["remote"], READ_TIMEOUT)?;
+        let names = self.remote_names()?;
         let urls = self.read(
             &["config", "--get-regexp", r"^remote\..*\.url$"],
             READ_TIMEOUT,
         )?;
+        // 판정에 드는 앱 설정은 원격마다가 아니라 한 번만 읽는다. 읽지 못하면 그 수단이
+        // 없는 것으로 보고 화면은 안내를 띄운다 — 개요 자체를 실패시킬 일은 아니다.
+        let identity = self.has_network_identity();
+        let token_hosts = self.token_hosts();
+        names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let url = urls.stdout.lines().find_map(|line| {
+                    let (key, value) = line.split_once(' ')?;
+                    (key == format!("remote.{name}.url")).then(|| value.trim().to_owned())
+                });
+                // push가 실제로 쓸 주소(`pushurl`·`insteadOf` 반영). 원격이 아주 많으면 앞쪽만
+                // 묻고 나머지는 설정의 url로 매긴다 — 판정은 안내이고 실행 경로는 따로 묻는다.
+                let push_url = if index < MAX_AUTH_PROBED_REMOTES {
+                    self.remote_url(&name, true)?.or_else(|| url.clone())
+                } else {
+                    url.clone()
+                };
+                let mut auth = self.remote_auth(push_url.as_deref(), identity, &token_hosts)?;
+                let fetch_url = if index < MAX_AUTH_PROBED_REMOTES {
+                    self.remote_url(&name, false)?.or_else(|| url.clone())
+                } else {
+                    url.clone()
+                };
+                auth.fetch_host = fetch_url
+                    .as_deref()
+                    .map(parse_remote_url)
+                    .filter(|parsed| parsed.transport == GitRemoteTransport::Https)
+                    .and_then(|parsed| parsed.host);
+                Ok(GitRemote {
+                    url: url.as_deref().map(redact_git_text),
+                    name,
+                    auth,
+                })
+            })
+            .collect()
+    }
+
+    fn remote_names(&self) -> Result<Vec<String>, CoreError> {
+        let names = self.read(&["remote"], READ_TIMEOUT)?;
         Ok(names
             .stdout
             .lines()
             .map(str::trim)
             .filter(|name| !name.is_empty())
-            .map(|name| GitRemote {
-                name: name.to_owned(),
-                url: urls.stdout.lines().find_map(|line| {
-                    let (key, value) = line.split_once(' ')?;
-                    (key == format!("remote.{name}.url")).then(|| redact_git_url(value.trim()))
-                }),
-            })
+            .map(str::to_owned)
             .collect())
     }
 
-    fn remote_names(&self) -> Result<Vec<String>, CoreError> {
-        Ok(self
-            .remotes()?
+    /// git이 그 원격에 실제로 쓸 주소. `insteadOf`·`pushurl`까지 git이 풀어 준다. 이름은
+    /// `resolve_remote`·`git remote`에서 온 것만 받는다.
+    fn remote_url(&self, remote: &str, push: bool) -> Result<Option<String>, CoreError> {
+        let mut args = vec!["remote", "get-url"];
+        if push {
+            args.push("--push");
+        }
+        args.push(remote);
+        let outcome = self.read(&args, READ_TIMEOUT)?;
+        Ok(outcome
+            .success
+            .then(|| {
+                outcome
+                    .stdout
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned()
+            })
+            .filter(|url| !url.is_empty()))
+    }
+
+    /// C16-11. 이 프로젝트의 설정이 git 원격용으로 고른 (호스트, 저장된 비밀값 이름). 고른 값이
+    /// 그새 지워졌으면 뺀다 — 쓸 수 없는 지정을 `token`으로 매기면 push가 열린 채 실패한다.
+    /// 값은 읽지 않는다.
+    fn token_hosts(&self) -> Vec<(String, String)> {
+        #[cfg(test)]
+        if let Some((host, _, _)) = TEST_GIT_TOKEN.with(|cell| cell.borrow().clone()) {
+            return vec![(host, "TEST_GIT_TOKEN".to_owned())];
+        }
+        let Ok(names) = crate::saved_secrets::saved_secret_names(&self.app_data_dir) else {
+            return Vec::new();
+        };
+        project_git_remote_bindings(&self.app_data_dir, &self.project_key)
+            .unwrap_or_default()
             .into_iter()
-            .map(|remote| remote.name)
-            .collect())
+            .filter(|binding| names.contains(&binding.secret_name))
+            .map(|binding| (binding.host, binding.secret_name))
+            .collect()
+    }
+
+    /// C16-11. 원격 하나의 인증 판정. 네트워크에 나가지 않는다.
+    fn remote_auth(
+        &self,
+        url: Option<&str>,
+        identity: bool,
+        token_hosts: &[(String, String)],
+    ) -> Result<GitRemoteAuth, CoreError> {
+        let Some(url) = url else {
+            return Ok(GitRemoteAuth {
+                transport: GitRemoteTransport::Other,
+                host: None,
+                method: GitRemoteAuthMethod::Unknown,
+                token_secret: None,
+                fetch_host: None,
+            });
+        };
+        let parsed = parse_remote_url(url);
+        let mut auth = GitRemoteAuth {
+            transport: parsed.transport,
+            host: parsed.host.clone(),
+            method: GitRemoteAuthMethod::Unknown,
+            token_secret: None,
+            fetch_host: None,
+        };
+        auth.method = match parsed.transport {
+            GitRemoteTransport::Local => GitRemoteAuthMethod::NotNeeded,
+            GitRemoteTransport::Other => GitRemoteAuthMethod::Unknown,
+            GitRemoteTransport::Ssh if identity => GitRemoteAuthMethod::SshKey,
+            GitRemoteTransport::Ssh => GitRemoteAuthMethod::SshDefault,
+            GitRemoteTransport::Https | GitRemoteTransport::Http => {
+                // 토큰은 HTTPS에만 싣는다. 평문 HTTP에 지정된 호스트가 있어도 쓰지 않는다.
+                let token = (parsed.transport == GitRemoteTransport::Https)
+                    .then(|| {
+                        token_hosts
+                            .iter()
+                            .find(|(host, _)| Some(host) == parsed.host.as_ref())
+                    })
+                    .flatten();
+                if let Some((_, name)) = token {
+                    auth.token_secret = Some(name.clone());
+                    GitRemoteAuthMethod::Token
+                } else if parsed.has_password {
+                    GitRemoteAuthMethod::UrlCredential
+                } else if self.has_git_credentials(&parsed)? {
+                    GitRemoteAuthMethod::CredentialHelper
+                } else if parsed.transport == GitRemoteTransport::Http {
+                    // 평문 HTTP는 인증 없이 받는 서버도 있어 "반드시 실패"라 할 수 없다.
+                    GitRemoteAuthMethod::Unknown
+                } else {
+                    GitRemoteAuthMethod::None
+                }
+            }
+        };
+        Ok(auth)
+    }
+
+    /// git이 앱 없이도 스스로 쓰는 자격증명이 이 URL에 있는가 — `credential.helper`,
+    /// 이미 설정된 `http.extraHeader`(CI 체크아웃이 남기는 것), curl이 늘 읽는 `~/.netrc`.
+    /// 비밀번호는 argv에 싣지 않는다 — 사용자 이름만 남긴 주소와 사용자 정보를 뗀 주소로 묻는다
+    /// (`credential.https://user@host.helper`처럼 사용자별로 적힌 helper도 맞추려고).
+    fn has_git_credentials(&self, parsed: &ParsedRemoteUrl) -> Result<bool, CoreError> {
+        let mut urls = vec![parsed.without_userinfo.as_str()];
+        if let Some(with_user) = parsed.with_username.as_deref() {
+            urls.push(with_user);
+        }
+        for url in urls {
+            for key in ["credential.helper", "http.extraHeader"] {
+                let outcome = self.read(&["config", "--get-urlmatch", key, url], READ_TIMEOUT)?;
+                if outcome.success && !outcome.stdout.trim().is_empty() {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(home_dir()
+            .is_ok_and(|home| home.join(".netrc").is_file() || home.join("_netrc").is_file()))
     }
 
     /// 사용자가 준 ref가 이 저장소의 커밋을 가리키는지 git에게 묻는다.
@@ -1110,40 +1363,145 @@ impl GitRunner {
 
     /// 네트워크 작업이 쓸 신원. 시험은 홈을 갈아 끼울 수 없으므로 여기 한 자리만 덮어쓴다 —
     /// 덮어쓰지 않으면 제품 경로가 그대로 돈다.
-    fn network_identity(&self) -> Option<crate::ssh_endpoints::ProjectGitIdentity> {
+    fn network_identity(
+        &self,
+    ) -> Result<Option<crate::ssh_endpoints::ProjectGitIdentity>, CoreError> {
         #[cfg(test)]
         if let Some(identity) = test_network_identity() {
-            return Some(identity);
+            return Ok(Some(identity));
         }
-        crate::ssh_endpoints::project_git_identity(&self.app_data_dir)
-            .ok()
-            .flatten()
+        // 신원을 만들지 못한 이유는 대개 "켜 둔 키가 없다·실행 파일이 없다"라 git 기본값으로
+        // 붙으면 된다. 저장된 키 암호를 꺼내지 못한 것(Conflict)만은 조용히 넘기지 않는다 —
+        // 그대로 붙으면 엉뚱한 신원의 인증 실패만 남으므로 이유를 오류로 올린다.
+        match crate::ssh_endpoints::project_git_identity(&self.app_data_dir) {
+            Ok(identity) => Ok(identity),
+            Err(error @ CoreError::Conflict(_)) => Err(error),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// C16-11. 개요의 판정용. "git 원격용" 키가 켜져 있는지만 본다 — 신원을 실제로 만들면 키
+    /// 암호를 OS 보안 저장소에서 꺼내게 되는데, 개요는 화면을 새로 고칠 때마다 불린다.
+    fn has_network_identity(&self) -> bool {
+        #[cfg(test)]
+        if test_network_identity().is_some() {
+            return true;
+        }
+        crate::ssh_endpoints::project_git_key_enabled(&self.app_data_dir)
     }
 
     /// C16-10. 원격과 말을 주고받는 변경(fetch·pull·push) 하나. `mutate`와 다른 것은 둘뿐이다
     /// — 사용자가 "git 원격용"으로 켠 SSH 키가 있으면 그 신원을 `GIT_SSH_COMMAND`로 **이
     /// 호출에만** 얹고, 그 키 경로가 `ssh`의 경고를 타고 영수증에 묻어 나오지 않도록 지운다.
     /// 읽기와 로컬 변경은 이 경로를 지나지 않으므로 신원도 받지 않는다.
+    ///
+    /// C16-11. 그 원격이 HTTPS이고 호스트에 git 원격용 토큰이 지정돼 있으면 그 값을
+    /// `http.<url>.extraHeader`로 **이 호출의 환경에만** 싣는다(`GIT_CONFIG_COUNT`·
+    /// `GIT_CONFIG_KEY_n`·`GIT_CONFIG_VALUE_n`). argv·디스크·셸 어디에도 값이 없다.
     fn network_mutate(
         &self,
         action: &str,
         args: &[&str],
         timeout: Duration,
+        remote: &str,
+        push: bool,
     ) -> Result<GitActionReceipt, CoreError> {
         // 신원을 못 만들면 인증을 더하지 못할 뿐이므로 변경 자체를 막지 않는다. git은
         // 지금까지처럼 자기 기본값으로 붙고, 자격증명이 없으면 `authFailed`로 끝난다.
-        let identity = self.network_identity();
-        let extra = identity
+        // 켜 둔 키의 암호를 꺼내지 못한 경우만 예외다(`network_identity`).
+        let identity = self.network_identity()?;
+        let mut extra = identity
             .as_ref()
-            .map(|identity| vec![("GIT_SSH_COMMAND".to_owned(), identity.ssh_command.clone())])
+            .map(crate::ssh_endpoints::ProjectGitIdentity::env)
             .unwrap_or_default();
+        let target = self
+            .remote_url(remote, push)?
+            .map(|url| parse_remote_url(&url));
+        let https_host = target
+            .as_ref()
+            .filter(|target| target.transport == GitRemoteTransport::Https)
+            .and_then(|target| target.host.clone());
+        let token = https_host
+            .as_deref()
+            .and_then(|host| self.network_token(host));
+        let header = match (&token, https_host.as_deref()) {
+            (Some(token), Some(host)) => {
+                if let Some(key) = self.local_tls_override(host)? {
+                    return Err(CoreError::Conflict(format!(
+                        "이 저장소의 설정(.git/config)이 {host}의 인증서 검증을 바꿔 두어({key}) git 원격용 토큰 {}을(를) 싣지 않았습니다. 그 설정을 지우거나 터미널에서 직접 인증하세요",
+                        token.secret_name
+                    )));
+                }
+                let hooks_dir = self.app_data_dir.join(EMPTY_HOOKS_DIR);
+                std::fs::create_dir_all(&hooks_dir)?;
+                Some(token_header_env(host, token, &hooks_dir, &mut extra))
+            }
+            _ => None,
+        };
         let head_before = self.head_sha()?;
-        let mut outcome = self.run_with(args, None, timeout, true, &extra)?;
+        let run = self.run_with(args, None, timeout, true, &extra);
+        for (_, value) in extra.iter_mut() {
+            zeroize::Zeroize::zeroize(value);
+        }
+        let mut outcome = run?;
         if let Some(identity) = &identity {
             redact_identity_path(&mut outcome, &identity.identity_path);
         }
+        if let (Some(token), Some(header)) = (&token, &header) {
+            redact_token(&mut outcome, token.value.as_str(), header.as_str());
+        }
         let head_after = self.head_sha()?;
-        self.receipt(action, outcome, head_before, head_after)
+        let mut receipt = self.receipt(action, outcome, head_before, head_after)?;
+        if receipt.outcome == GitOutcome::AuthFailed {
+            receipt.message = auth_failed_message(
+                target.as_ref().map(|target| target.transport),
+                target.as_ref().and_then(|target| target.host.as_deref()),
+                token.as_ref().map(|token| token.secret_name.as_str()),
+                identity.is_some(),
+            );
+        }
+        Ok(receipt)
+    }
+
+    /// C16-11. 저장소(또는 워크트리) 설정이 그 호스트의 인증서 묶음을 바꿔 두었으면 그 키.
+    /// 명령 수준에서 "기본값으로 되돌리기"를 적을 수 없는 설정이라, 토큰을 싣기 전에 묻는다 —
+    /// 저장소가 고른 CA로 가로채는 수신자에게 헤더가 풀린 채 가지 않게.
+    fn local_tls_override(&self, host: &str) -> Result<Option<&'static str>, CoreError> {
+        let url = format!("https://{host}/");
+        for scope in ["--local", "--worktree"] {
+            for key in ["http.sslCAInfo", "http.sslCAPath"] {
+                let outcome = self.read(
+                    &["config", scope, "--includes", "--get-urlmatch", key, &url],
+                    READ_TIMEOUT,
+                )?;
+                if outcome.success && !outcome.stdout.trim().is_empty() {
+                    return Ok(Some(key));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// C16-11. 이 프로젝트가 그 호스트에 쓰도록 고른 토큰. 꺼내지 못하면 인증을 더하지 못할
+    /// 뿐 작업은 막지 않는다.
+    fn network_token(&self, host: &str) -> Option<GitRemoteToken> {
+        #[cfg(test)]
+        if let Some(token) = test_git_token(host) {
+            return token;
+        }
+        let binding = project_git_remote_bindings(&self.app_data_dir, &self.project_key)
+            .ok()?
+            .into_iter()
+            .find(|binding| binding.host == host)?;
+        let value =
+            crate::saved_secrets::take_for_git_remote(&self.app_data_dir, &binding.secret_name)
+                .ok()
+                .flatten()?;
+        Some(GitRemoteToken {
+            secret_name: binding.secret_name,
+            username: binding.username,
+            value,
+        })
     }
 
     fn receipt(
@@ -1365,9 +1723,53 @@ fn overview_with(runner: &GitRunner) -> Result<GitRepositoryInfo, CoreError> {
 pub fn project_git_status(
     app_data_dir: &Path,
     project_root: &Path,
+    worktree_path: Option<&str>,
 ) -> Result<GitStatus, CoreError> {
-    let runner = GitRunner::open(app_data_dir, project_root)?;
+    let runner = open_read_target(app_data_dir, project_root, worktree_path)?;
     status_with(&runner)
+}
+
+/// 읽기 대상 저장소를 연다. 워크트리를 고르면 그 경로가 프로젝트 저장소의 `git worktree list`
+/// 에 있는 (bare 가 아닌) 워크트리일 때만 연다 — 등록하지 않은 임의 경로를 읽는 통로가 되면
+/// 안 된다(G10).
+fn open_read_target(
+    app_data_dir: &Path,
+    project_root: &Path,
+    worktree_path: Option<&str>,
+) -> Result<GitRunner, CoreError> {
+    let runner = GitRunner::open(app_data_dir, project_root)?;
+    let Some(requested) = worktree_path.map(str::trim).filter(|path| !path.is_empty()) else {
+        return Ok(runner);
+    };
+    let not_listed = || {
+        CoreError::InvalidInput(format!(
+            "이 프로젝트 저장소의 워크트리가 아닙니다: {requested}"
+        ))
+    };
+    let requested_path = std::fs::canonicalize(requested).map_err(|_| not_listed())?;
+    let listed = runner.read(&["worktree", "list", "--porcelain"], READ_TIMEOUT)?;
+    let worktree = parse_worktree_list(&listed.stdout, &runner.root)
+        .into_iter()
+        .find(|worktree| {
+            !worktree.bare
+                && std::fs::canonicalize(&worktree.path).ok().as_ref() == Some(&requested_path)
+        })
+        .ok_or_else(not_listed)?;
+    if worktree.is_current {
+        return Ok(runner);
+    }
+    // 목록은 `.git/worktrees/*/gitdir` 에서 오므로 저장소에 쓸 수 있는 쪽이 다른 저장소를
+    // 가리키게 바꿀 수 있다. 또 워크트리의 `.git` 파일이 지워지면 발견이 위로 올라가 프로젝트
+    // 저장소를 워크트리라는 이름으로 연다. 연 결과가 요청한 그 폴더이고 같은 저장소를
+    // 공유하는지까지 본다.
+    let opened = GitRunner::open(app_data_dir, &requested_path)?;
+    let same_root = std::fs::canonicalize(&opened.root).ok().as_ref() == Some(&requested_path);
+    let same_repository = std::fs::canonicalize(&opened.common_dir).ok()
+        == std::fs::canonicalize(&runner.common_dir).ok();
+    if !same_root || !same_repository {
+        return Err(not_listed());
+    }
+    Ok(opened)
 }
 
 fn status_with(runner: &GitRunner) -> Result<GitStatus, CoreError> {
@@ -1426,7 +1828,7 @@ pub fn project_git_diff(
     project_root: &Path,
     request: &ProjectGitDiffRequest,
 ) -> Result<GitDiff, CoreError> {
-    let runner = GitRunner::open(app_data_dir, project_root)?;
+    let runner = open_read_target(app_data_dir, project_root, request.worktree_path.as_deref())?;
     diff_with(&runner, request)
 }
 
@@ -1484,6 +1886,12 @@ fn diff_with(runner: &GitRunner, request: &ProjectGitDiffRequest) -> Result<GitD
         vec!["diff"]
     };
     args.extend(["--no-ext-diff", "--no-color", "--no-textconv", "-M"]);
+    if request.full_context {
+        // 파일 본문을 별도로 이어 붙이면 줄 번호와 추가·삭제 위치를 다시 맞춰야 한다. Git이
+        // 만든 unified diff의 문맥을 파일 전체로 넓혀 한 행 모델 안에서 원문과 변경을 함께
+        // 보여 준다. 실제 응답 크기는 아래 MAX_CAPTURED_OUTPUT_BYTES가 계속 제한한다.
+        args.push("--unified=2147483647");
+    }
     args.push("--end-of-options");
     if let Some(range) = range.as_deref() {
         args.push(range);
@@ -2097,6 +2505,309 @@ pub fn set_project_branch_follow(
 }
 
 // ---------------------------------------------------------------------------
+// git 원격 인증 — 프로젝트별 토큰 지정(C16-11)
+// ---------------------------------------------------------------------------
+
+const GIT_REMOTE_TOKENS_VERSION: u32 = 1;
+
+/// 프로젝트마다 "이 호스트의 HTTPS 원격에는 저장된 비밀값 X를 쓴다"는 선택. 값은 저장소 →
+/// 비밀정보(C17)에 있고 여기에는 **이름만** 남는다(G7). 팔로우와 같은 이유로 git config가
+/// 아니라 앱 데이터에 둔다 — 저장소를 공유하는 사람·워크트리가 이 기기의 선택을 보지 않게.
+///
+/// 지정을 저장된 비밀값 쪽이 아니라 프로젝트 쪽에 두는 것은 사용자 결정이다(2026-10-20). 값
+/// 하나를 여러 프로젝트가 쓰거나, 같은 `github.com`이라도 프로젝트마다 다른 토큰(조직별 PAT,
+/// 배포용 fine-grained 토큰)을 쓰는 것이 흔하고, 그 선택은 프로젝트를 보는 자리에서 내린다.
+const GIT_REMOTE_TOKENS_STORE: JsonStore = JsonStore {
+    file: "project-git-remote-tokens-v1.json",
+    lock_file: "project-git-remote-tokens-v1.lock",
+    label: "프로젝트 git 원격 인증 저장소",
+    version: GIT_REMOTE_TOKENS_VERSION,
+};
+
+/// 저장할 수 있는 지정 수 상한. 프로젝트 수백 개에 원격 호스트 몇 개씩을 담고도 남는다.
+const MAX_GIT_REMOTE_TOKENS: usize = 500;
+
+/// 사용자 이름을 비워 두면 쓰는 값. GitHub·Gitea 토큰은 이름을 보지 않는다.
+pub const DEFAULT_GIT_REMOTE_USERNAME: &str = "x-access-token";
+
+/// 호스트 이름 상한(DNS 이름 253자 + `:65535`).
+const MAX_GIT_HOST_LEN: usize = 259;
+const MAX_GIT_USERNAME_LEN: usize = 128;
+
+/// C16-11. git 원격 하나에 실을 토큰. `Debug`는 값을 가린다.
+pub(crate) struct GitRemoteToken {
+    pub(crate) secret_name: String,
+    pub(crate) username: String,
+    pub(crate) value: zeroize::Zeroizing<String>,
+}
+
+impl std::fmt::Debug for GitRemoteToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GitRemoteToken")
+            .field("secret_name", &self.secret_name)
+            .field("username", &self.username)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+/// 저장본 한 줄. 한 프로젝트·한 호스트에 값 하나다 — 둘이면 어느 값으로 인증했는지 영수증이
+/// 말할 수 없다.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProjectGitRemoteBinding {
+    project_path: String,
+    /// 소문자 호스트, 필요하면 `:포트`까지([`normalize_git_host`]). 원격 URL의 호스트와 글자
+    /// 그대로 비교한다. 호스트까지 묶는 것은 원격 주소가 다른 호스트로 바뀌었을 때 토큰이
+    /// 따라가지 않게 하기 위해서다.
+    host: String,
+    secret_name: String,
+    /// HTTP Basic 인증의 사용자 이름.
+    username: String,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitRemoteTokenStore {
+    schema_version: u32,
+    #[serde(default)]
+    bindings: Vec<ProjectGitRemoteBinding>,
+}
+
+impl Default for GitRemoteTokenStore {
+    fn default() -> Self {
+        Self {
+            schema_version: GIT_REMOTE_TOKENS_VERSION,
+            bindings: Vec::new(),
+        }
+    }
+}
+
+impl SchemaVersioned for GitRemoteTokenStore {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
+/// 화면에 실리는 지정 한 줄. 값은 없다.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitRemoteTokenView {
+    pub host: String,
+    pub secret_name: String,
+    pub username: String,
+    pub updated_at: i64,
+    /// 고른 값이 저장소 → 비밀정보에 아직 있는가. 지워졌으면 이 지정은 쓰이지 않는다.
+    pub secret_exists: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitRemoteTokens {
+    pub schema_version: u32,
+    pub project_path: String,
+    /// 이 프로젝트의 지정만. 다른 프로젝트의 선택은 실리지 않는다.
+    pub tokens: Vec<ProjectGitRemoteTokenView>,
+    /// 고를 수 있는 저장된 비밀값 이름. 값은 실리지 않는다.
+    pub secret_names: Vec<String>,
+    pub default_username: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetProjectGitRemoteTokenRequest {
+    pub project_path: String,
+    pub host: String,
+    /// 비우거나 빼면 그 호스트의 지정을 해제한다.
+    #[serde(default)]
+    pub secret_name: Option<String>,
+    /// 비우면 [`DEFAULT_GIT_REMOTE_USERNAME`].
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
+/// C16-11. 호스트 표기를 원격 URL과 비교할 모양으로 다듬는다. 스킴·경로·사용자 정보가 붙은
+/// 값은 URL을 통째로 붙여 넣은 것이므로 고쳐 쓰지 않고 거절한다 — 조용히 잘라 내면 사용자가
+/// 고른 것과 다른 호스트에 토큰이 묶인다.
+fn normalize_git_host(raw: &str) -> Result<String, CoreError> {
+    let host = raw.trim().to_ascii_lowercase();
+    let host = host.strip_suffix(":443").unwrap_or(&host).to_owned();
+    let refuse = |why: &str| {
+        Err(CoreError::InvalidInput(format!(
+            "git 원격 호스트는 github.com 같은 호스트 이름만 적습니다({why})"
+        )))
+    };
+    if host.is_empty() {
+        return refuse("비어 있음");
+    }
+    if host.len() > MAX_GIT_HOST_LEN {
+        return refuse("너무 김");
+    }
+    if host.contains("://") || host.contains('/') || host.contains('@') {
+        return refuse("주소 전체가 아니라 호스트만");
+    }
+    let (name, port) = match host.rsplit_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host.as_str(), None),
+    };
+    if let Some(port) = port {
+        if !port.parse::<u16>().is_ok_and(|port| port > 0) {
+            return refuse("포트는 1~65535");
+        }
+    }
+    let label_ok = |label: &str| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    };
+    if !name.split('.').all(label_ok) {
+        return refuse("영문·숫자·하이픈·점만");
+    }
+    Ok(host)
+}
+
+/// Basic 인증은 첫 `:`에서 이름과 값을 가르므로 이름에 `:`이 있으면 값이 잘린다.
+fn normalize_git_username(raw: Option<&str>) -> Result<String, CoreError> {
+    let username = raw.map(str::trim).unwrap_or_default();
+    if username.is_empty() {
+        return Ok(DEFAULT_GIT_REMOTE_USERNAME.to_owned());
+    }
+    if username.len() > MAX_GIT_USERNAME_LEN
+        || username
+            .chars()
+            .any(|ch| ch == ':' || ch.is_whitespace() || ch.is_control())
+    {
+        return Err(CoreError::InvalidInput(format!(
+            "git 사용자 이름은 공백·콜론 없이 {MAX_GIT_USERNAME_LEN}자까지입니다"
+        )));
+    }
+    Ok(username.to_owned())
+}
+
+/// 이 프로젝트의 지정. 값도 저장된 비밀값 목록도 읽지 않는다.
+fn project_git_remote_bindings(
+    app_data_dir: &Path,
+    key: &str,
+) -> Result<Vec<ProjectGitRemoteBinding>, CoreError> {
+    let store: GitRemoteTokenStore = GIT_REMOTE_TOKENS_STORE.read(app_data_dir)?;
+    Ok(store
+        .bindings
+        .into_iter()
+        .filter(|binding| binding.project_path == key)
+        .collect())
+}
+
+fn project_git_remote_tokens(
+    app_data_dir: &Path,
+    key: String,
+    store: GitRemoteTokenStore,
+) -> Result<ProjectGitRemoteTokens, CoreError> {
+    let mut secret_names = crate::saved_secrets::saved_secret_names(app_data_dir)?;
+    secret_names.sort();
+    let mut tokens: Vec<ProjectGitRemoteTokenView> = store
+        .bindings
+        .into_iter()
+        .filter(|binding| binding.project_path == key)
+        .map(|binding| ProjectGitRemoteTokenView {
+            secret_exists: secret_names.contains(&binding.secret_name),
+            host: binding.host,
+            secret_name: binding.secret_name,
+            username: binding.username,
+            updated_at: binding.updated_at,
+        })
+        .collect();
+    tokens.sort_by(|a, b| a.host.cmp(&b.host));
+    Ok(ProjectGitRemoteTokens {
+        schema_version: GIT_REMOTE_TOKENS_VERSION,
+        project_path: key,
+        tokens,
+        secret_names,
+        default_username: DEFAULT_GIT_REMOTE_USERNAME.to_owned(),
+    })
+}
+
+/// C16-11. 이 프로젝트가 호스트마다 고른 git 원격용 토큰과, 고를 수 있는 저장된 비밀값 이름.
+/// git을 띄우지 않고 값도 읽지 않는다.
+pub fn list_project_git_remote_tokens(
+    app_data_dir: &Path,
+    project_root: &Path,
+) -> Result<ProjectGitRemoteTokens, CoreError> {
+    let store: GitRemoteTokenStore = GIT_REMOTE_TOKENS_STORE.read(app_data_dir)?;
+    project_git_remote_tokens(app_data_dir, follow_key(project_root), store)
+}
+
+/// C16-11. 이 프로젝트의 한 호스트에 저장된 비밀값 하나를 고르거나(`secretName`) 해제한다.
+/// 값에는 손대지 않는다. 고르는 이름은 저장소 → 비밀정보에 지금 있는 것만 받는다 — 없는
+/// 이름을 받아 두면 push가 열린 채 인증 없이 나간다.
+pub fn set_project_git_remote_token(
+    app_data_dir: &Path,
+    project_root: &Path,
+    request: &SetProjectGitRemoteTokenRequest,
+) -> Result<ProjectGitRemoteTokens, CoreError> {
+    let host = normalize_git_host(&request.host)?;
+    let secret_name = request
+        .secret_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    let username = normalize_git_username(request.username.as_deref())?;
+    if let Some(name) = &secret_name {
+        if !crate::saved_secrets::saved_secret_names(app_data_dir)?.contains(name) {
+            return Err(CoreError::NotFound(format!(
+                "저장된 비밀값 {name}이(가) 없습니다. 저장소 → 비밀정보에서 먼저 저장하세요"
+            )));
+        }
+    }
+    let key = follow_key(project_root);
+    let store: GitRemoteTokenStore =
+        GIT_REMOTE_TOKENS_STORE.update(app_data_dir, |store: &mut GitRemoteTokenStore| {
+            let existing = store
+                .bindings
+                .iter()
+                .position(|binding| binding.project_path == key && binding.host == host);
+            match (secret_name.as_ref(), existing) {
+                (None, None) => Ok(false),
+                (None, Some(index)) => {
+                    store.bindings.remove(index);
+                    Ok(true)
+                }
+                (Some(name), Some(index)) => {
+                    let binding = &mut store.bindings[index];
+                    if binding.secret_name == *name && binding.username == username {
+                        return Ok(false);
+                    }
+                    binding.secret_name = name.clone();
+                    binding.username = username.clone();
+                    binding.updated_at = now_seconds();
+                    Ok(true)
+                }
+                (Some(name), None) => {
+                    if store.bindings.len() >= MAX_GIT_REMOTE_TOKENS {
+                        return Err(CoreError::InvalidInput(format!(
+                            "git 원격 인증 지정은 최대 {MAX_GIT_REMOTE_TOKENS}개까지 저장할 수 있습니다"
+                        )));
+                    }
+                    store.bindings.push(ProjectGitRemoteBinding {
+                        project_path: key.clone(),
+                        host: host.clone(),
+                        secret_name: name.clone(),
+                        username: username.clone(),
+                        updated_at: now_seconds(),
+                    });
+                    Ok(true)
+                }
+            }
+        })?;
+    project_git_remote_tokens(app_data_dir, key, store)
+}
+
+// ---------------------------------------------------------------------------
 // 공개 변경
 // ---------------------------------------------------------------------------
 
@@ -2410,7 +3121,7 @@ fn fetch_with(
     }
     args.push("--end-of-options");
     args.push(&remote);
-    runner.network_mutate("fetch", &args, NETWORK_TIMEOUT)
+    runner.network_mutate("fetch", &args, NETWORK_TIMEOUT, &remote, false)
 }
 
 pub fn pull_project_git(
@@ -2436,7 +3147,7 @@ fn pull_with(
     }
     args.push("--end-of-options");
     args.push(&remote);
-    runner.network_mutate("pull", &args, NETWORK_TIMEOUT)
+    runner.network_mutate("pull", &args, NETWORK_TIMEOUT, &remote, false)
 }
 
 pub fn push_project_git(
@@ -2469,7 +3180,7 @@ fn push_with(
     args.push("--end-of-options");
     args.push(&remote);
     args.push(&refspec);
-    runner.network_mutate("push", &args, NETWORK_TIMEOUT)
+    runner.network_mutate("push", &args, NETWORK_TIMEOUT, &remote, true)
 }
 
 /// C16-10. 영수증에서 개인키 경로를 가린다. `ssh`는 읽지 못하는 신원 파일을 경고하면서
@@ -2482,6 +3193,190 @@ fn redact_identity_path(outcome: &mut CommandOutcome, identity_path: &str) {
     }
     outcome.stdout = outcome.stdout.replace(identity_path, PLACEHOLDER);
     outcome.stderr = outcome.stderr.replace(identity_path, PLACEHOLDER);
+}
+
+/// C16-11. 원격 URL을 판정에 쓸 모양으로 가른다. 값은 어디에도 남기지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedRemoteUrl {
+    transport: GitRemoteTransport,
+    /// 소문자 호스트(기본 포트 443은 뗀다). [`normalize_git_host`]와 같은 모양.
+    host: Option<String>,
+    /// `user:password@`처럼 비밀번호까지 박혀 있는가.
+    has_password: bool,
+    /// 사용자 정보를 뗀 주소. `credential.helper`를 물을 때 argv에 싣는다.
+    without_userinfo: String,
+    /// 비밀번호만 떼고 사용자 이름은 남긴 주소(`https://user@host/…`). 사용자 이름이 없으면 없다.
+    with_username: Option<String>,
+}
+
+fn parse_remote_url(url: &str) -> ParsedRemoteUrl {
+    let url = url.trim();
+    let other = |transport| ParsedRemoteUrl {
+        transport,
+        host: None,
+        has_password: false,
+        without_userinfo: url.to_owned(),
+        with_username: None,
+    };
+    if let Some((scheme, rest)) = url.split_once("://") {
+        let transport = match scheme.to_ascii_lowercase().as_str() {
+            "https" => GitRemoteTransport::Https,
+            "http" => GitRemoteTransport::Http,
+            "ssh" | "git+ssh" | "ssh+git" => GitRemoteTransport::Ssh,
+            "file" => return other(GitRemoteTransport::Local),
+            _ => return other(GitRemoteTransport::Other),
+        };
+        let (authority, path) = match rest.find('/') {
+            Some(index) => rest.split_at(index),
+            None => (rest, ""),
+        };
+        let (userinfo, hostport) = match authority.rsplit_once('@') {
+            Some((userinfo, hostport)) => (Some(userinfo), hostport),
+            None => (None, authority),
+        };
+        let mut host = hostport.to_ascii_lowercase();
+        if transport == GitRemoteTransport::Https {
+            if let Some(stripped) = host.strip_suffix(":443") {
+                host = stripped.to_owned();
+            }
+        }
+        return ParsedRemoteUrl {
+            transport,
+            host: (!host.is_empty()).then_some(host),
+            has_password: userinfo.is_some_and(|userinfo| userinfo.contains(':')),
+            without_userinfo: format!("{scheme}://{hostport}{path}"),
+            with_username: userinfo
+                .map(|userinfo| userinfo.split(':').next().unwrap_or_default())
+                .filter(|user| !user.is_empty())
+                .map(|user| format!("{scheme}://{user}@{hostport}{path}")),
+        };
+    }
+    // 스킴이 없으면 로컬 경로이거나 scp 꼴(`[user@]host:path`)이다. git과 같은 규칙으로 가른다
+    // — 첫 `:`보다 앞에 `/`가 있으면 경로다. Windows 드라이브(`C:\`)도 경로다.
+    let colon = url.find(':');
+    let slash = url.find('/');
+    let is_drive = url.len() >= 2
+        && url.as_bytes()[1] == b':'
+        && url.as_bytes()[0].is_ascii_alphabetic()
+        && url
+            .as_bytes()
+            .get(2)
+            .is_none_or(|byte| *byte == b'\\' || *byte == b'/');
+    match colon {
+        Some(colon) if !is_drive && slash.is_none_or(|slash| colon < slash) => {
+            let authority = &url[..colon];
+            let host = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host)
+                .to_ascii_lowercase();
+            ParsedRemoteUrl {
+                transport: GitRemoteTransport::Ssh,
+                host: (!host.is_empty()).then_some(host),
+                has_password: false,
+                without_userinfo: url.to_owned(),
+                with_username: None,
+            }
+        }
+        _ => other(GitRemoteTransport::Local),
+    }
+}
+
+/// C16-11. 토큰을 `http.https://<호스트>/.extraHeader` 한 줄로 만들어 환경 목록에 더한다.
+///
+/// git은 `GIT_CONFIG_COUNT`·`GIT_CONFIG_KEY_n`·`GIT_CONFIG_VALUE_n`을 명령줄 `-c`와 같은
+/// 무게로 읽는다(2.31+). 백엔드가 이미 물려받은 묶음이 있으면 덮지 않고 그 뒤에 잇는다 —
+/// C16-2가 `GIT_CONFIG_*`를 사용자의 선택으로 남겨 두었기 때문이다. 키를 호스트 URL로
+/// 한정하므로 같은 git 호출이 다른 호스트(서브모듈 등)에 붙어도 이 헤더는 따라가지 않는다.
+/// 돌려주는 값은 영수증에서 가릴 base64 덩어리다.
+///
+/// 토큰이 실리는 호출은 **저장소가 고를 수 있는 실행 지점과 전송 설정을 함께 닫는다**. git은
+/// 자기 환경을 훅(`pre-push`·`post-merge`·`reference-transaction`…)과 `core.fsmonitor`에 그대로
+/// 물려주므로, 저장소 안의 훅이 있으면 그 환경의 헤더를 읽을 수 있다 — 에이전트가 `.git/hooks`를
+/// 쓰는 것만으로. 그래서 이 호출만은 훅을 빈 폴더로 돌리고(`core.hooksPath`) fsmonitor를 끄며,
+/// 그 호스트의 인증서 검증을 켜고(`sslVerify`) `curloptResolve`를 비운다. 명령 수준 설정이라
+/// 저장소 설정보다 이긴다. 인증서 묶음(`sslCAInfo`·`sslCAPath`)을 저장소가 바꿔 둔 경우는
+/// 되돌릴 값이 없으므로 호출부가 토큰을 싣지 않고 거절한다([`GitRunner::local_tls_override`]).
+fn token_header_env(
+    host: &str,
+    token: &GitRemoteToken,
+    hooks_dir: &Path,
+    env: &mut Vec<(String, String)>,
+) -> zeroize::Zeroizing<String> {
+    use base64::Engine as _;
+    let credentials =
+        zeroize::Zeroizing::new(format!("{}:{}", token.username, token.value.as_str()));
+    let encoded = zeroize::Zeroizing::new(
+        base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes()),
+    );
+    let inherited = std::env::var("GIT_CONFIG_COUNT")
+        .ok()
+        .and_then(|count| count.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let entries = [
+        (
+            "core.hooksPath".to_owned(),
+            hooks_dir.to_string_lossy().into_owned(),
+        ),
+        ("core.fsmonitor".to_owned(), "false".to_owned()),
+        (format!("http.https://{host}/.sslVerify"), "true".to_owned()),
+        ("http.curloptResolve".to_owned(), String::new()),
+        (
+            format!("http.https://{host}/.extraHeader"),
+            format!("Authorization: Basic {}", encoded.as_str()),
+        ),
+    ];
+    let count = entries.len();
+    for (offset, (key, value)) in entries.into_iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{}", inherited + offset), key));
+        env.push((format!("GIT_CONFIG_VALUE_{}", inherited + offset), value));
+    }
+    env.push((
+        "GIT_CONFIG_COUNT".to_owned(),
+        (inherited + count).to_string(),
+    ));
+    encoded
+}
+
+/// C16-11. 영수증에서 토큰을 가린다. git은 헤더를 찍지 않지만, 물려받은 `GIT_TRACE_CURL`
+/// 같은 것이 있으면 stderr에 나올 수 있고 그 영수증은 원격 화면까지 간다(G4).
+fn redact_token(outcome: &mut CommandOutcome, value: &str, encoded: &str) {
+    const PLACEHOLDER: &str = "<git 원격용 토큰>";
+    for needle in [value, encoded] {
+        if needle.is_empty() {
+            continue;
+        }
+        outcome.stdout = outcome.stdout.replace(needle, PLACEHOLDER);
+        outcome.stderr = outcome.stderr.replace(needle, PLACEHOLDER);
+    }
+}
+
+/// C16-11. 인증 실패 안내. 이 화면은 자격증명을 묻지 않으므로, 원격 종류에 맞는 연결
+/// 자리를 알려 주는 것이 사용자가 빠져나갈 유일한 길이다.
+fn auth_failed_message(
+    transport: Option<GitRemoteTransport>,
+    host: Option<&str>,
+    token: Option<&str>,
+    identity: bool,
+) -> String {
+    let host = host.unwrap_or("원격");
+    match (transport, token) {
+        (_, Some(name)) => format!(
+            "원격 인증에 실패했습니다. {host}에 저장된 비밀값 {name}으로 인증했지만 거절됐습니다. 토큰의 만료·권한(저장소 쓰기)을 확인하고 저장소 → 비밀정보에서 값을 다시 저장하거나 형상관리 탭의 프로젝트 목록 옆 톱니바퀴(git 원격 인증)에서 다른 값을 고르세요"
+        ),
+        (Some(GitRemoteTransport::Https), None) => format!(
+            "원격 인증에 실패했습니다. 이 화면은 자격증명을 묻지 않습니다. 저장소 → 비밀정보에 토큰을 저장하고 형상관리 탭의 프로젝트 목록 옆 톱니바퀴(git 원격 인증)에서 {host}에 그 값을 고른 뒤 다시 시도하세요"
+        ),
+        (Some(GitRemoteTransport::Http), None) => format!(
+            "원격 인증에 실패했습니다. 이 화면은 자격증명을 묻지 않고, 평문 HTTP 원격({host})에는 저장된 토큰을 싣지 않습니다. HTTPS 주소로 바꾸거나 git credential helper를 설정하세요"
+        ),
+        (Some(GitRemoteTransport::Ssh), None) if identity => format!(
+            "원격 인증에 실패했습니다. 애드온 → SSH 키의 'git 원격용' 키가 {host}에서 거절됐습니다. 그 공개키가 원격 계정(또는 배포 키)에 등록돼 있는지 확인하세요"
+        ),
+        (Some(GitRemoteTransport::Ssh), None) => format!(
+            "원격 인증에 실패했습니다. 이 화면은 자격증명을 묻지 않습니다. 애드온 → SSH 키에서 {host}에 등록한 키의 'git 원격용'을 켠 뒤 다시 시도하세요"
+        ),
+        _ => "원격 인증에 실패했습니다. 이 화면은 자격증명을 묻지 않습니다. HTTPS 원격은 형상관리 탭 톱니바퀴의 git 원격 인증(저장소 → 비밀정보의 값)으로, SSH 원격은 애드온 → SSH 키의 'git 원격용'으로 인증을 연결한 뒤 다시 시도하세요".to_owned(),
+    }
 }
 
 /// pull·push는 브랜치 위에서만 뜻이 있다. detached HEAD와 첫 커밋 전 저장소는 거절한다.
@@ -3159,8 +4054,7 @@ fn outcome_message(outcome: GitOutcome, action: &str, raw: &CommandOutcome) -> S
             "원격에 새 커밋이 있어 push가 거절됐습니다. 먼저 가져와 리베이스하세요".to_owned()
         }
         GitOutcome::AuthFailed => {
-            "원격 인증에 실패했습니다. 이 화면은 자격증명을 묻지 않으므로 터미널에서 같은 명령을 한 번 실행해 인증을 마친 뒤 다시 시도하세요"
-                .to_owned()
+            auth_failed_message(None, None, None, false)
         }
         GitOutcome::IdentityMissing => {
             "커밋 작성자 정보가 없습니다. 터미널에서 git config user.name·user.email을 설정하세요".to_owned()
@@ -3183,10 +4077,6 @@ fn outcome_message(outcome: GitOutcome, action: &str, raw: &CommandOutcome) -> S
 
 /// `scheme://user:token@host` 꼴의 사용자 정보를 지운다(C16-8). SHA를 지우지 않으려고
 /// 이 한 모양만 본다 — `ssh_output::redact`의 긴 토큰 마스킹은 커밋 해시를 삼킨다.
-fn redact_git_url(value: &str) -> String {
-    redact_git_text(value)
-}
-
 fn redact_git_text(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut rest = text;
@@ -3682,6 +4572,114 @@ def456\x1fdef\x1f\x1fAn\x1fan@x\x1f1699999999\x1fCn\x1f1699999999\x1f\x1fRoot\x1
     }
 
     #[test]
+    fn read_target_opens_only_worktrees_listed_by_the_project_repository() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let git = runner(&repo);
+        std::fs::write(repo.root.join("a.txt"), "one\n").expect("a");
+        stage_with(&git, &["a.txt".into()]).expect("stage");
+        assert!(commit_with(&git, "first").expect("commit").succeeded);
+        let parent = repo.root.parent().expect("parent").to_path_buf();
+        let linked = parent.join("linked");
+        let added = git
+            .read(
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "side",
+                    &linked.to_string_lossy(),
+                ],
+                READ_TIMEOUT,
+            )
+            .expect("worktree add");
+        assert!(added.success, "{}", added.stderr);
+        std::fs::write(linked.join("a.txt"), "two\n").expect("edit in worktree");
+
+        // 프로젝트 자신은 변경이 없고, 워크트리를 고르면 그쪽 변경이 보인다.
+        let own = project_git_status(&repo.app_data, &repo.root, None).expect("own status");
+        assert_eq!(own.unstaged_count, 0);
+        let linked_text = linked.to_string_lossy().into_owned();
+        let status = project_git_status(&repo.app_data, &repo.root, Some(&linked_text))
+            .expect("worktree status");
+        assert_eq!(status.unstaged_count, 1);
+        assert_eq!(status.head.branch.as_deref(), Some("side"));
+        let diff = project_git_diff(
+            &repo.app_data,
+            &repo.root,
+            &ProjectGitDiffRequest {
+                project_path: String::new(),
+                worktree_path: Some(linked_text),
+                path: "a.txt".into(),
+                original_path: None,
+                staged: false,
+                commit: None,
+                range_from: None,
+                range_to: None,
+                full_context: false,
+            },
+        )
+        .expect("worktree diff");
+        assert!(diff.patch.contains("+two"), "{}", diff.patch);
+
+        // 목록에 없는 저장소·폴더는 열지 않는다(G10).
+        let other = parent.join("other");
+        std::fs::create_dir_all(&other).expect("other");
+        let other_git = run_capped_with(
+            &git.executable,
+            &["init", "-q"],
+            READ_TIMEOUT,
+            &CappedOptions {
+                current_dir: Some(&other),
+                env: &test_env(),
+                ..CappedOptions::default()
+            },
+        )
+        .expect("git init other");
+        assert!(other_git.success, "{}", other_git.stderr);
+        for bad in [
+            other.to_string_lossy().into_owned(),
+            parent.join("missing").to_string_lossy().into_owned(),
+        ] {
+            let error = project_git_status(&repo.app_data, &repo.root, Some(&bad))
+                .expect_err("unlisted path must be refused");
+            assert!(error.to_string().contains("워크트리가 아닙니다"), "{error}");
+        }
+
+        // 목록 항목을 다른 저장소로 돌려놓아도(관리 파일 변조) 그 저장소는 열지 않는다.
+        let admin = repo.root.join(".git/worktrees/linked/gitdir");
+        let original_admin = std::fs::read_to_string(&admin).expect("gitdir");
+        std::fs::write(&admin, format!("{}\n", other.join(".git").display())).expect("forge");
+        let other_text = other.to_string_lossy().into_owned();
+        assert!(project_git_status(&repo.app_data, &repo.root, Some(&other_text)).is_err());
+        std::fs::write(&admin, original_admin).expect("restore");
+
+        // 프로젝트 안의 워크트리가 `.git` 파일을 잃으면 발견이 프로젝트 저장소로 올라간다 —
+        // 그걸 워크트리라고 보여 주지 않는다.
+        let inner = repo.root.join(".rounds").join("wt");
+        let added = git
+            .read(
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "inner",
+                    &inner.to_string_lossy(),
+                ],
+                READ_TIMEOUT,
+            )
+            .expect("inner worktree add");
+        assert!(added.success, "{}", added.stderr);
+        let inner_text = inner.to_string_lossy().into_owned();
+        assert!(project_git_status(&repo.app_data, &repo.root, Some(&inner_text)).is_ok());
+        std::fs::remove_file(inner.join(".git")).expect("drop .git file");
+        assert!(project_git_status(&repo.app_data, &repo.root, Some(&inner_text)).is_err());
+    }
+
+    #[test]
     fn c16_real_git_round_trip() {
         let Some(repo) = init_repo() else {
             return;
@@ -3711,12 +4709,14 @@ def456\x1fdef\x1f\x1fAn\x1fan@x\x1f1699999999\x1fCn\x1f1699999999\x1f\x1fRoot\x1
             &git,
             &ProjectGitDiffRequest {
                 project_path: String::new(),
+                worktree_path: None,
                 path: "a.txt".into(),
                 original_path: None,
                 staged: false,
                 commit: None,
                 range_from: None,
                 range_to: None,
+                full_context: false,
             },
         )
         .expect("diff");
@@ -3760,12 +4760,14 @@ def456\x1fdef\x1f\x1fAn\x1fan@x\x1f1699999999\x1fCn\x1f1699999999\x1f\x1fRoot\x1
             &git,
             &ProjectGitDiffRequest {
                 project_path: String::new(),
+                worktree_path: None,
                 path: "a.txt".into(),
                 original_path: None,
                 staged: false,
                 commit: Some(first_sha.clone()),
                 range_from: None,
                 range_to: None,
+                full_context: false,
             },
         )
         .expect("commit diff");
@@ -3779,12 +4781,14 @@ def456\x1fdef\x1f\x1fAn\x1fan@x\x1f1699999999\x1fCn\x1f1699999999\x1f\x1fRoot\x1
             &git,
             &ProjectGitDiffRequest {
                 project_path: String::new(),
+                worktree_path: None,
                 path: "a.txt".into(),
                 original_path: None,
                 staged: false,
                 commit: None,
                 range_from: None,
                 range_to: None,
+                full_context: false,
             },
         )
         .expect("diff");
@@ -4132,6 +5136,55 @@ mine
         assert!(none.incoming_files.is_empty() && none.outgoing_files.is_empty());
     }
 
+    #[test]
+    fn full_context_diff_keeps_the_whole_file_around_changes() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let git = runner(&repo);
+        let before = (1..=12)
+            .map(|line| format!("original line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(repo.root.join("whole.txt"), before).expect("write original");
+        stage_with(&git, &["whole.txt".into()]).expect("stage original");
+        commit_with(&git, "whole file base").expect("commit original");
+        let after = (1..=12)
+            .map(|line| {
+                if line == 6 {
+                    "changed line 6".to_owned()
+                } else {
+                    format!("original line {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(repo.root.join("whole.txt"), after).expect("change middle");
+        let request = |full_context| ProjectGitDiffRequest {
+            project_path: String::new(),
+            worktree_path: None,
+            path: "whole.txt".into(),
+            original_path: None,
+            staged: false,
+            commit: None,
+            range_from: None,
+            range_to: None,
+            full_context,
+        };
+
+        let compact = diff_with(&git, &request(false)).expect("compact diff");
+        assert!(!compact.patch.contains("original line 1\n"));
+        assert!(!compact.patch.contains("original line 12\n"));
+
+        let full = diff_with(&git, &request(true)).expect("full-context diff");
+        assert!(full.patch.contains(" original line 1\n"), "{}", full.patch);
+        assert!(full.patch.contains(" original line 12\n"), "{}", full.patch);
+        assert!(full.patch.contains("-original line 6\n"), "{}", full.patch);
+        assert!(full.patch.contains("+changed line 6\n"), "{}", full.patch);
+    }
+
     /// B9. 비교 요약이 집은 파일을 **그 요약과 같은 범위로** 연다.
     ///
     /// 2026-10-04에 이 시험이 붙은 이유: B8이 방향별 파일 목록을 실었지만 화면은 그것을
@@ -4217,12 +5270,14 @@ mine
                 &git,
                 &ProjectGitDiffRequest {
                     project_path: String::new(),
+                    worktree_path: None,
                     path: path.into(),
                     original_path: None,
                     staged: false,
                     commit: None,
                     range_from: Some(from.into()),
                     range_to: Some(to.into()),
+                    full_context: false,
                 },
             )
         };
@@ -4255,12 +5310,14 @@ mine
             &git,
             &ProjectGitDiffRequest {
                 project_path: String::new(),
+                worktree_path: None,
                 path: "a.txt".into(),
                 original_path: None,
                 staged: false,
                 commit: None,
                 range_from: Some("main".into()),
                 range_to: None,
+                full_context: false,
             },
         );
         assert!(
@@ -4273,12 +5330,14 @@ mine
             &git,
             &ProjectGitDiffRequest {
                 project_path: String::new(),
+                worktree_path: None,
                 path: "a.txt".into(),
                 original_path: None,
                 staged: true,
                 commit: None,
                 range_from: Some("main".into()),
                 range_to: Some("upstream-side".into()),
+                full_context: false,
             },
         );
         assert!(
@@ -4986,6 +6045,7 @@ mine
         let ssh_command = format!("'/usr/bin/ssh' -i '{identity_path}' -o IdentitiesOnly=yes");
         TEST_NETWORK_IDENTITY.with(|cell| {
             *cell.borrow_mut() = Some(crate::ssh_endpoints::ProjectGitIdentity {
+                askpass: None,
                 identity_path: identity_path.clone(),
                 ssh_command: ssh_command.clone(),
             });
@@ -5056,6 +6116,648 @@ mine
         );
     }
 
+    #[test]
+    fn c16_11_remote_urls_are_classified_like_git_does() {
+        let cases: &[(&str, GitRemoteTransport, Option<&str>, bool)] = &[
+            (
+                "https://github.com/o/r.git",
+                GitRemoteTransport::Https,
+                Some("github.com"),
+                false,
+            ),
+            (
+                "HTTPS://GitHub.com:443/o/r.git",
+                GitRemoteTransport::Https,
+                Some("github.com"),
+                false,
+            ),
+            (
+                "https://u:p@git.example.com:8443/r",
+                GitRemoteTransport::Https,
+                Some("git.example.com:8443"),
+                true,
+            ),
+            (
+                "https://u@github.com/o/r.git",
+                GitRemoteTransport::Https,
+                Some("github.com"),
+                false,
+            ),
+            (
+                "http://intranet/r.git",
+                GitRemoteTransport::Http,
+                Some("intranet"),
+                false,
+            ),
+            (
+                "ssh://git@github.com:22/o/r.git",
+                GitRemoteTransport::Ssh,
+                Some("github.com:22"),
+                false,
+            ),
+            (
+                "git@github.com:o/r.git",
+                GitRemoteTransport::Ssh,
+                Some("github.com"),
+                false,
+            ),
+            (
+                "nas:repos/r.git",
+                GitRemoteTransport::Ssh,
+                Some("nas"),
+                false,
+            ),
+            ("/srv/git/r.git", GitRemoteTransport::Local, None, false),
+            ("../r.git", GitRemoteTransport::Local, None, false),
+            ("./a:b", GitRemoteTransport::Local, None, false),
+            ("C:\\repos\\r.git", GitRemoteTransport::Local, None, false),
+            ("C:/repos/r.git", GitRemoteTransport::Local, None, false),
+            ("file:///srv/r.git", GitRemoteTransport::Local, None, false),
+            (
+                "git://example.com/r.git",
+                GitRemoteTransport::Other,
+                None,
+                false,
+            ),
+        ];
+        for (url, transport, host, password) in cases {
+            let parsed = parse_remote_url(url);
+            assert_eq!(parsed.transport, *transport, "{url}");
+            assert_eq!(parsed.host.as_deref(), *host, "{url}");
+            assert_eq!(parsed.has_password, *password, "{url}");
+        }
+        // credential helper를 물을 때 argv에 실리는 주소에는 사용자 정보가 없다.
+        assert_eq!(
+            parse_remote_url("https://u:secret@github.com/o/r.git").without_userinfo,
+            "https://github.com/o/r.git"
+        );
+    }
+
+    #[test]
+    fn c16_11_auth_failure_message_names_the_place_to_connect() {
+        let https = auth_failed_message(
+            Some(GitRemoteTransport::Https),
+            Some("github.com"),
+            None,
+            false,
+        );
+        assert!(
+            https.contains("비밀정보") && https.contains("github.com"),
+            "{https}"
+        );
+        let token = auth_failed_message(
+            Some(GitRemoteTransport::Https),
+            Some("github.com"),
+            Some("GITHUB_TOKEN"),
+            false,
+        );
+        assert!(
+            token.contains("GITHUB_TOKEN") && token.contains("만료"),
+            "{token}"
+        );
+        let http = auth_failed_message(
+            Some(GitRemoteTransport::Http),
+            Some("intranet"),
+            None,
+            false,
+        );
+        assert!(http.contains("평문 HTTP"), "{http}");
+        let ssh = auth_failed_message(
+            Some(GitRemoteTransport::Ssh),
+            Some("github.com"),
+            None,
+            false,
+        );
+        assert!(
+            ssh.contains("SSH 키") && ssh.contains("git 원격용"),
+            "{ssh}"
+        );
+        let ssh_key = auth_failed_message(
+            Some(GitRemoteTransport::Ssh),
+            Some("github.com"),
+            None,
+            true,
+        );
+        assert!(ssh_key.contains("공개키"), "{ssh_key}");
+        // 어느 안내도 터미널 로그인을 권하지 않는다 — 헤드리스 NAS에는 그 자리가 없다.
+        for message in [
+            https,
+            token,
+            ssh,
+            ssh_key,
+            auth_failed_message(None, None, None, false),
+        ] {
+            assert!(!message.contains("터미널에서 같은 명령"), "{message}");
+        }
+    }
+
+    struct ClearGitToken;
+    impl Drop for ClearGitToken {
+        fn drop(&mut self) {
+            TEST_GIT_TOKEN.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    fn set_test_git_token(host: &str, username: &str, value: &str) -> ClearGitToken {
+        TEST_GIT_TOKEN.with(|cell| {
+            *cell.borrow_mut() = Some((host.to_owned(), username.to_owned(), value.to_owned()));
+        });
+        ClearGitToken
+    }
+
+    /// 아무도 듣지 않는 루프백 포트. 묶었다 놓으면 연결은 즉시 거절된다.
+    fn refused_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("addr").port()
+    }
+
+    /// C16-11 — 토큰은 **그 호스트의 HTTPS 원격으로 가는 네트워크 호출 하나에만**, 환경으로만
+    /// 간다. 읽기·로컬 변경·평문 HTTP 원격·다른 호스트는 받지 않고, argv에는 어디에도 없다.
+    /// 실은 환경을 그대로 git에 다시 먹여 `http.extraHeader`로 읽히는지까지 본다 — 키 이름의
+    /// 철자 하나가 틀려도 git은 조용히 무시하고 `authFailed`로 끝나기 때문이다.
+    #[test]
+    fn c16_11_token_reaches_only_https_network_calls_of_the_bound_host_as_env() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let Ok(executable) = resolve_named_executable(&["git"]) else {
+            return;
+        };
+        let git = runner(&repo);
+        let port = refused_loopback_port();
+        let host = format!("127.0.0.1:{port}");
+        let token = "amTokenValue7Q";
+        for (name, url) in [
+            ("origin", format!("https://{host}/o/r.git")),
+            ("plain", format!("http://{host}/o/r.git")),
+            ("elsewhere", "https://127.0.0.2:1/o/r.git".to_owned()),
+        ] {
+            let added = git
+                .write(&["remote", "add", name, &url], None, READ_TIMEOUT)
+                .expect("remote add");
+            assert!(added.success, "{}", added.stderr);
+        }
+        let _token = set_test_git_token(&host, "me", token);
+        std::fs::write(repo.root.join("a.txt"), "a\n").expect("a.txt");
+
+        let recorder = ArgvRecorder::start();
+        status_with(&git).expect("status");
+        stage_with(&git, &["a.txt".to_owned()]).expect("stage");
+        assert!(
+            commit_with(&git, "토큰 범위 시험")
+                .expect("commit")
+                .succeeded
+        );
+        for remote in ["origin", "plain", "elsewhere"] {
+            let receipt = fetch_with(
+                &git,
+                &ProjectGitFetchRequest {
+                    project_path: repo.root.to_string_lossy().into_owned(),
+                    remote: Some(remote.to_owned()),
+                    prune: false,
+                },
+            )
+            .expect("fetch");
+            assert!(
+                !receipt.succeeded,
+                "{remote}: 아무도 듣지 않는 포트인데 성공했다"
+            );
+        }
+        let calls = recorder.taken_calls();
+        assert!(!calls.is_empty(), "기록된 호출이 없다 — 설비가 깨졌다");
+
+        use base64::Engine as _;
+        let expected_header = format!(
+            "Authorization: Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("me:{token}"))
+        );
+        let mut carried = Vec::new();
+        for call in &calls {
+            assert!(
+                call.argv
+                    .iter()
+                    .all(|arg| !arg.contains(token) && !arg.contains("Authorization")),
+                "토큰이 argv에 실렸다: {:?}",
+                call.argv
+            );
+            let keys: Vec<&(String, String)> = call
+                .env
+                .iter()
+                .filter(|(name, _)| {
+                    name.starts_with("GIT_CONFIG_KEY_") || name.starts_with("GIT_CONFIG_VALUE_")
+                })
+                .collect();
+            if keys.is_empty() {
+                continue;
+            }
+            let head = call.argv[GIT_BASE_ARGS.len()..].join(" ");
+            carried.push(head);
+            // 키 이름이 n번이면 값도 n번이다. 헤더 키는 그 호스트로만 한정된다.
+            let config: Vec<(String, String)> = call
+                .env
+                .iter()
+                .filter_map(|(name, key)| {
+                    let index = name.strip_prefix("GIT_CONFIG_KEY_")?;
+                    let value = call
+                        .env
+                        .iter()
+                        .find(|(other, _)| *other == format!("GIT_CONFIG_VALUE_{index}"))?;
+                    Some((key.clone(), value.1.clone()))
+                })
+                .collect();
+            let lookup = |wanted: &str| {
+                config
+                    .iter()
+                    .find(|(key, _)| key == wanted)
+                    .map(|(_, value)| value.clone())
+            };
+            assert_eq!(
+                lookup(&format!("http.https://{host}/.extraHeader")).as_deref(),
+                Some(expected_header.as_str())
+            );
+            // 토큰이 실리는 호출은 저장소 훅·fsmonitor에 그 환경을 넘기지 않고 인증서 검증을 켠다.
+            let hooks = lookup("core.hooksPath").expect("hooksPath");
+            assert!(hooks.ends_with(EMPTY_HOOKS_DIR), "{hooks}");
+            assert_eq!(lookup("core.fsmonitor").as_deref(), Some("false"));
+            assert_eq!(
+                lookup(&format!("http.https://{host}/.sslVerify")).as_deref(),
+                Some("true")
+            );
+            assert_eq!(lookup("http.curloptResolve").as_deref(), Some(""));
+
+            // git이 이 환경을 실제로 `http.<url>.extraheader`로 읽는가.
+            let mut env = test_env();
+            env.extend(
+                call.env
+                    .iter()
+                    .filter(|(name, _)| name.starts_with("GIT_CONFIG_"))
+                    .cloned(),
+            );
+            let probe_url = format!("https://{host}/o/r.git");
+            let probe = run_capped_with(
+                &executable,
+                &["config", "--get-urlmatch", "http.extraheader", &probe_url],
+                READ_TIMEOUT,
+                &CappedOptions {
+                    current_dir: Some(&repo.root),
+                    env: &env,
+                    ..CappedOptions::default()
+                },
+            )
+            .expect("git config --get-urlmatch");
+            assert!(
+                probe.success,
+                "git이 환경 설정을 읽지 못했다: {}",
+                probe.stderr
+            );
+            assert_eq!(probe.stdout.trim(), expected_header);
+        }
+        assert_eq!(
+            carried,
+            vec!["fetch --end-of-options origin".to_owned()],
+            "토큰이 닿은 호출: {carried:?}"
+        );
+    }
+
+    /// C16-11 — 가림이 `network_mutate`에 배선돼 있는지를 진짜 영수증으로 잰다. git은 연결에
+    /// 실패하면 원격 URL을 stderr에 그대로 적으므로, 토큰과 같은 글자를 URL 경로에 넣으면
+    /// 출력에 토큰이 나타나는 상황을 네트워크 없이 만들 수 있다.
+    #[test]
+    fn c16_11_token_is_redacted_from_the_receipt_of_a_real_fetch() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let git = runner(&repo);
+        let port = refused_loopback_port();
+        let host = format!("127.0.0.1:{port}");
+        let token = "amEchoedToken42";
+        let added = git
+            .write(
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    &format!("https://{host}/{token}.git"),
+                ],
+                None,
+                READ_TIMEOUT,
+            )
+            .expect("remote add");
+        assert!(added.success, "{}", added.stderr);
+        let _token = set_test_git_token(&host, "x-access-token", token);
+        let receipt = fetch_with(
+            &git,
+            &ProjectGitFetchRequest {
+                project_path: repo.root.to_string_lossy().into_owned(),
+                remote: Some("origin".to_owned()),
+                prune: false,
+            },
+        )
+        .expect("fetch");
+        assert!(!receipt.succeeded);
+        let combined = format!(
+            "{}\n{}\n{}",
+            receipt.stdout, receipt.stderr, receipt.message
+        );
+        assert!(
+            !combined.contains(token),
+            "영수증에 토큰이 남았다: {combined}"
+        );
+        assert!(
+            combined.contains("<git 원격용 토큰>"),
+            "git이 URL을 적지 않아 가림을 잴 수 없다(설비 확인): {combined}"
+        );
+    }
+
+    /// C16-11 — 개요의 원격 판정. 네트워크 없이 URL·앱 설정·git 설정만으로 매긴다.
+    #[test]
+    fn c16_11_overview_rates_each_remote_without_the_network() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let git = runner(&repo);
+        for (name, url) in [
+            ("origin", "https://github.com/o/r.git"),
+            ("gitlab", "https://gitlab.com/o/r.git"),
+            ("plain", "http://intranet/r.git"),
+            ("helped", "https://helped.example.com/r.git"),
+            ("embedded", "https://u:p@embedded.example.com/r.git"),
+            ("ssh", "git@github.com:o/r.git"),
+            ("local", "/srv/git/r.git"),
+        ] {
+            let added = git
+                .write(&["remote", "add", name, url], None, READ_TIMEOUT)
+                .expect("remote add");
+            assert!(added.success, "{}", added.stderr);
+        }
+        let configured = git
+            .write(
+                &[
+                    "config",
+                    "credential.https://helped.example.com.helper",
+                    "store",
+                ],
+                None,
+                READ_TIMEOUT,
+            )
+            .expect("config");
+        assert!(configured.success, "{}", configured.stderr);
+        // push 주소가 따로 있으면 push 판정은 그 주소로 한다.
+        let pushurl = git
+            .write(
+                &["config", "remote.gitlab.pushurl", "git@gitlab.com:o/r.git"],
+                None,
+                READ_TIMEOUT,
+            )
+            .expect("pushurl");
+        assert!(pushurl.success, "{}", pushurl.stderr);
+        let _token = set_test_git_token("github.com", "x-access-token", "unused");
+
+        let remotes = git.remotes().expect("remotes");
+        let method = |name: &str| {
+            remotes
+                .iter()
+                .find(|remote| remote.name == name)
+                .map(|remote| remote.auth.clone())
+                .expect(name)
+        };
+        let origin = method("origin");
+        assert_eq!(origin.method, GitRemoteAuthMethod::Token);
+        assert_eq!(origin.token_secret.as_deref(), Some("TEST_GIT_TOKEN"));
+        assert_eq!(origin.host.as_deref(), Some("github.com"));
+        assert_eq!(method("gitlab").method, GitRemoteAuthMethod::SshDefault);
+        // 평문 HTTP는 인증 없이 받는 서버도 있어 막지 않는다.
+        assert_eq!(method("plain").method, GitRemoteAuthMethod::Unknown);
+        assert_eq!(
+            method("helped").method,
+            GitRemoteAuthMethod::CredentialHelper
+        );
+        assert_eq!(
+            method("embedded").method,
+            GitRemoteAuthMethod::UrlCredential
+        );
+        assert_eq!(method("ssh").method, GitRemoteAuthMethod::SshDefault);
+        assert_eq!(method("local").method, GitRemoteAuthMethod::NotNeeded);
+        // 토큰이 묶이지 않은 HTTPS 호스트는 수단이 없다.
+        drop(_token);
+        let remotes = git.remotes().expect("remotes");
+        let origin = remotes
+            .iter()
+            .find(|remote| remote.name == "origin")
+            .expect("origin");
+        assert_eq!(origin.auth.method, GitRemoteAuthMethod::None);
+        assert!(origin.auth.token_secret.is_none());
+        // 비밀번호가 박힌 URL도 화면으로는 가려져 나간다(C16-8).
+        let embedded = remotes
+            .iter()
+            .find(|remote| remote.name == "embedded")
+            .expect("embedded");
+        assert!(!embedded.url.as_deref().unwrap_or_default().contains("u:p@"));
+    }
+
+    /// C16-11 — 리뷰 지적. (1) 저장소가 그 호스트의 인증서 묶음을 바꿔 두었으면 토큰을 싣지
+    /// 않고 거절한다. (2) 이미 설정된 `http.extraHeader`나 사용자별 helper가 있으면 `none`이
+    /// 아니다 — 예전처럼 push가 열려 있어야 한다. (3) 가져오기 주소의 호스트도 개요에 실린다.
+    #[test]
+    fn c16_11_tls_override_refuses_and_existing_git_credentials_keep_push_open() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let git = runner(&repo);
+        for args in [
+            vec!["remote", "add", "origin", "https://github.com/o/r.git"],
+            vec!["remote", "add", "ci", "https://ci.example.com/o/r.git"],
+            vec![
+                "remote",
+                "add",
+                "mine",
+                "https://me@user.example.com/o/r.git",
+            ],
+            vec!["remote", "add", "split", "https://gitlab.com/o/r.git"],
+            vec!["config", "remote.split.pushurl", "git@gitlab.com:o/r.git"],
+            vec![
+                "config",
+                "http.https://ci.example.com/.extraHeader",
+                "AUTHORIZATION: basic x",
+            ],
+            vec![
+                "config",
+                "credential.https://me@user.example.com.helper",
+                "store",
+            ],
+        ] {
+            let outcome = git.write(&args, None, READ_TIMEOUT).expect("git");
+            assert!(outcome.success, "{}", outcome.stderr);
+        }
+        let remotes = git.remotes().expect("remotes");
+        let auth = |name: &str| {
+            remotes
+                .iter()
+                .find(|remote| remote.name == name)
+                .map(|remote| remote.auth.clone())
+                .expect(name)
+        };
+        let netrc = home_dir()
+            .is_ok_and(|home| home.join(".netrc").is_file() || home.join("_netrc").is_file());
+        if !netrc {
+            assert_eq!(auth("origin").method, GitRemoteAuthMethod::None);
+        }
+        assert_eq!(auth("ci").method, GitRemoteAuthMethod::CredentialHelper);
+        assert_eq!(auth("mine").method, GitRemoteAuthMethod::CredentialHelper);
+        let split = auth("split");
+        assert_eq!(split.transport, GitRemoteTransport::Ssh);
+        assert_eq!(split.fetch_host.as_deref(), Some("gitlab.com"));
+        assert_eq!(auth("origin").fetch_host.as_deref(), Some("github.com"));
+
+        let _token = set_test_git_token("github.com", "x-access-token", "amTokenTls");
+        let ca = git
+            .write(
+                &["config", "http.sslCAInfo", "/tmp/evil-ca.pem"],
+                None,
+                READ_TIMEOUT,
+            )
+            .expect("config");
+        assert!(ca.success, "{}", ca.stderr);
+        let recorder = ArgvRecorder::start();
+        let refused = fetch_with(
+            &git,
+            &ProjectGitFetchRequest {
+                project_path: repo.root.to_string_lossy().into_owned(),
+                remote: Some("origin".to_owned()),
+                prune: false,
+            },
+        );
+        assert!(
+            matches!(&refused, Err(CoreError::Conflict(message)) if message.contains("http.sslCAInfo")),
+            "{refused:?}"
+        );
+        // 거절은 fetch를 띄우기 전이다.
+        assert!(recorder.taken_calls().iter().all(|call| call
+            .argv
+            .get(GIT_BASE_ARGS.len())
+            .map(String::as_str)
+            != Some("fetch")));
+    }
+
+    /// 시험용 저장된 비밀값 목록(이름만). OS 보안 저장소는 열지 않는다.
+    fn save_secret_names(app_data: &Path, names: &[&str]) {
+        let secrets: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name, "purpose": "시험", "createdAt": 1, "updatedAt": 1,
+                    "lastUsedAt": null, "agentEnabled": true,
+                })
+            })
+            .collect();
+        crate::app_data_file::write_private_json(
+            &app_data.join("saved-secrets-v1.json"),
+            &serde_json::json!({ "schemaVersion": 1, "secrets": secrets }),
+        )
+        .expect("saved secrets");
+    }
+
+    /// C16-11 — 토큰 지정은 프로젝트마다 한다(사용자 결정, 2026-10-20). 같은 호스트라도
+    /// 다른 프로젝트의 선택은 보이지도 쓰이지도 않고, 지워진 값은 판정에서 빠진다.
+    #[test]
+    fn c16_11_token_binding_is_per_project_and_follows_saved_secrets() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let other = repo.root.parent().expect("parent").join("other");
+        std::fs::create_dir_all(&other).expect("other");
+        save_secret_names(&repo.app_data, &["GH_ORG", "GH_ME"]);
+        let request = |path: &Path, host: &str, secret: Option<&str>, username: Option<&str>| {
+            SetProjectGitRemoteTokenRequest {
+                project_path: path.to_string_lossy().into_owned(),
+                host: host.to_owned(),
+                secret_name: secret.map(str::to_owned),
+                username: username.map(str::to_owned),
+            }
+        };
+
+        let listed = set_project_git_remote_token(
+            &repo.app_data,
+            &repo.root,
+            &request(&repo.root, " GitHub.com:443 ", Some("GH_ORG"), None),
+        )
+        .expect("bind");
+        assert_eq!(listed.secret_names, vec!["GH_ME", "GH_ORG"]);
+        assert_eq!(listed.tokens.len(), 1);
+        assert_eq!(listed.tokens[0].host, "github.com");
+        assert_eq!(listed.tokens[0].username, DEFAULT_GIT_REMOTE_USERNAME);
+        assert!(listed.tokens[0].secret_exists);
+        // 다른 프로젝트는 같은 호스트에 다른 값을 고를 수 있고, 서로의 선택을 보지 않는다.
+        let theirs = set_project_git_remote_token(
+            &repo.app_data,
+            &other,
+            &request(&other, "github.com", Some("GH_ME"), Some("me")),
+        )
+        .expect("bind other");
+        assert_eq!(theirs.tokens.len(), 1);
+        assert_eq!(theirs.tokens[0].secret_name, "GH_ME");
+        let mine = list_project_git_remote_tokens(&repo.app_data, &repo.root).expect("list");
+        assert_eq!(mine.tokens[0].secret_name, "GH_ORG");
+        // 없는 이름과 URL 통째는 저장하지 않는다.
+        assert!(matches!(
+            set_project_git_remote_token(
+                &repo.app_data,
+                &repo.root,
+                &request(&repo.root, "github.com", Some("MISSING"), None),
+            ),
+            Err(CoreError::NotFound(_))
+        ));
+        assert!(set_project_git_remote_token(
+            &repo.app_data,
+            &repo.root,
+            &request(&repo.root, "https://github.com/o/r", Some("GH_ORG"), None),
+        )
+        .is_err());
+        assert!(set_project_git_remote_token(
+            &repo.app_data,
+            &repo.root,
+            &request(&repo.root, "github.com", Some("GH_ORG"), Some("a:b")),
+        )
+        .is_err());
+
+        // 개요의 판정은 이 프로젝트의 선택으로 매긴다.
+        let git = runner(&repo);
+        let added = git
+            .write(
+                &["remote", "add", "origin", "https://github.com/o/r.git"],
+                None,
+                READ_TIMEOUT,
+            )
+            .expect("remote add");
+        assert!(added.success, "{}", added.stderr);
+        let origin = |git: &GitRunner| {
+            git.remotes()
+                .expect("remotes")
+                .into_iter()
+                .find(|remote| remote.name == "origin")
+                .expect("origin")
+                .auth
+        };
+        let auth = origin(&git);
+        assert_eq!(auth.method, GitRemoteAuthMethod::Token);
+        assert_eq!(auth.token_secret.as_deref(), Some("GH_ORG"));
+        // 고른 값이 저장소에서 지워지면 지정은 남아도(화면이 알려 준다) 판정에서는 빠진다.
+        save_secret_names(&repo.app_data, &["GH_ME"]);
+        assert_eq!(origin(&git).method, GitRemoteAuthMethod::None);
+        let stale = list_project_git_remote_tokens(&repo.app_data, &repo.root).expect("list");
+        assert!(!stale.tokens[0].secret_exists);
+        // 해제하면 그 줄이 사라지고 다른 프로젝트의 선택은 그대로다.
+        let cleared = set_project_git_remote_token(
+            &repo.app_data,
+            &repo.root,
+            &request(&repo.root, "github.com", None, None),
+        )
+        .expect("clear");
+        assert!(cleared.tokens.is_empty());
+        let theirs = list_project_git_remote_tokens(&repo.app_data, &other).expect("other");
+        assert_eq!(theirs.tokens.len(), 1);
+    }
+
     /// C16-10 — 가림이 `network_mutate`에 **배선되어 있는지**를 진짜 영수증으로 잰다.
     ///
     /// 함수를 직접 불러 재는 시험은 함수가 맞다는 것만 말한다. 호출부에서 그 한 줄을 지워도
@@ -5071,6 +6773,7 @@ mine
         let identity_path = "/tmp/am-test/.ssh/id_redaction_probe".to_owned();
         TEST_NETWORK_IDENTITY.with(|cell| {
             *cell.borrow_mut() = Some(crate::ssh_endpoints::ProjectGitIdentity {
+                askpass: None,
                 identity_path: identity_path.clone(),
                 // git은 이 값을 셸에 넘긴다. `ssh` 자리에 `echo`를 두면 `ssh`가 읽지 못하는
                 // 신원 파일을 경고할 때와 같은 자리에 같은 경로가 찍힌다.
@@ -5447,8 +7150,8 @@ mine
     ///
     /// `classify_failure`가 보는 `could not read username`·`terminal prompts disabled`
     /// 두 바늘이 모두 이 한 줄에 들어 있다. 어느 쪽이 사라져도 결말은 `Failed`로 떨어지고,
-    /// 그때 화면은 "터미널에서 같은 명령을 한 번 실행해 인증을 마치세요"라는 **유일하게
-    /// 쓸모 있는 안내** 대신 git stderr 첫 줄을 그대로 띄운다. 자격증명을 묻지 않는 것은
+    /// 그때 화면은 인증을 연결할 자리(C16-11)를 알려 주는 **유일하게 쓸모 있는 안내** 대신
+    /// git stderr 첫 줄을 그대로 띄운다. 자격증명을 묻지 않는 것은
     /// 이 어댑터의 설계(C16-3)이므로, 사용자가 빠져나갈 길을 아는 자리는 이 분류뿐이다.
     ///
     /// 세 명령을 모두 민다. fetch·pull·push는 각각 다른 인수 벡터를 지나지만 결말 분류는
@@ -5600,8 +7303,10 @@ mine
                 receipt.stderr
             );
             // 분류가 맞아야만 나오는 안내다. `Failed`로 떨어지면 git stderr 첫 줄이 대신 온다.
+            // C16-11: 응답기가 평문 HTTP이므로 토큰을 싣지 않는다는 안내까지 와야 한다.
             assert!(
-                receipt.message.contains("터미널"),
+                receipt.message.contains("자격증명을 묻지 않")
+                    && receipt.message.contains("평문 HTTP"),
                 "{label}: 인증 안내가 영수증에 없다: {}",
                 receipt.message
             );

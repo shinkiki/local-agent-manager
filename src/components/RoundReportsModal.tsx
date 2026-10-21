@@ -11,8 +11,9 @@ import { type PropsWithChildren, useCallback, useEffect, useMemo, useState } fro
 import { formatDateTime } from "../lib/format";
 import { useI18n } from "../lib/i18n";
 import { listRoundReports, resolveRoundDecision, updateRoundGoal } from "../lib/ipc";
+import { humanPendingDecisionCount, roundAnswerableDecisionCount } from "../lib/roundDecisions";
 import { roundTextParagraphs } from "../lib/roundText";
-import type { RoundDecision, RoundGoal, RoundReport } from "../types";
+import type { RoundDecision, RoundDecisionMode, RoundGoal, RoundReport } from "../types";
 import { ErrorBanner, Modal } from "./Shared";
 
 type Text = (ko: string, en: string) => string;
@@ -33,7 +34,7 @@ export function pendingDecisionCount(report: RoundReport): number {
   return report.decisions.filter((decision) => !decision.resolved).length;
 }
 
-/** 미결 결정 하나에 답하는 줄: 선택지 버튼(추천은 강조) + 직접 적기. */
+/** 미결 결정 하나에 답하는 줄: 선택지 버튼(추천은 강조) + 직접 적기. 사람 결정은 앞에 표시한다. */
 export function RoundDecisionForm({ decision, busy, value, onChange, onAnswer }: {
   decision: RoundDecision;
   busy: boolean;
@@ -43,7 +44,7 @@ export function RoundDecisionForm({ decision, busy, value, onChange, onAnswer }:
 }) {
   const { text } = useI18n();
   return (
-    <div className="path-field-group round-decision-form">
+    <div className="path-field-group round-decision-form" data-requires-human={decision.requiresHuman ? "true" : undefined}>
       {decision.options.map((option) => (
         <button key={option} className={`button compact${decision.recommendation === option ? " primary" : ""}`} type="button" disabled={busy} onClick={() => onAnswer(option)}>
           {option}{decision.recommendation === option ? ` (${text("추천", "recommended")})` : ""}
@@ -140,16 +141,35 @@ export function RoundReportsModal({ goal, onClose, onResolved, onGoalUpdated }: 
       .finally(() => setBusy(false));
   }, [load, onResolved]);
 
-  const setAutomatic = useCallback((automatic: boolean) => {
+  const setDecisionMode = useCallback((decisionMode: RoundDecisionMode) => {
     setBusy(true);
     setError(null);
-    updateRoundGoal(goal.id, { decisionMode: automatic ? "automatic" : "manual" })
+    updateRoundGoal(goal.id, { decisionMode })
       .then((updated) => onGoalUpdated(updated))
       .catch((cause) => setError(errorMessage(cause)))
       .finally(() => setBusy(false));
   }, [goal.id, onGoalUpdated]);
 
-  const pendingTotal = useMemo(() => (reports ?? []).reduce((sum, report) => sum + pendingDecisionCount(report), 0), [reports]);
+  // 배지는 카드와 같이 이 결정 방식에서 사람이 답할 건수만 센다.
+  const pendingTotal = useMemo(
+    () => (reports ?? []).reduce((sum, report) => sum + humanPendingDecisionCount(report, goal.decisionMode), 0),
+    [reports, goal.decisionMode],
+  );
+  const roundAnswerableTotal = useMemo(
+    () => (reports ?? []).reduce((sum, report) => sum + roundAnswerableDecisionCount(report, goal.decisionMode), 0),
+    [reports, goal.decisionMode],
+  );
+  const modeHelp: Record<RoundDecisionMode, string> = {
+    manual: text("다음 회차는 미결 질문에 답하지 않습니다. 여기서 직접 답합니다.", "The next round does not answer pending questions. Answer them here."),
+    recommended: text(
+      "사람 결정이 아닌 질문은 다음 회차가 추천안으로 답하고 이어서 진행합니다. 사람이 정할 결정만 남깁니다.",
+      "The next round answers questions that are not marked for a person with the recommended option and continues. Only decisions a person must make are left.",
+    ),
+    automatic: text(
+      "다음 회차부터 미결 질문을 보고서 맥락과 함께 분석해 선택지를 고르거나 구체적인 추가 요청을 작성하고, 그 작업까지 이어서 진행합니다. 새 권한을 부여하지는 않습니다.",
+      "Starting with the next round, analyze pending questions in report context, choose an option or write a concrete follow-up request, and continue that work. This does not grant new permissions.",
+    ),
+  };
   // 저장 중에는 배경 클릭·Esc 로 닫히지 않게 한다(Modal 계약).
   const close = useCallback(() => { if (!busy) onClose(); }, [busy, onClose]);
 
@@ -169,37 +189,38 @@ export function RoundReportsModal({ goal, onClose, onResolved, onGoalUpdated }: 
     >
       <div className="round-report-modal-body" data-goal-id={goal.id}>
         {error && <ErrorBanner message={error} />}
-        <label className={`round-auto-decision-toggle${goal.decisionMode === "automatic" ? " enabled" : ""}`}>
+        <label className={`round-auto-decision-toggle${roundAnswerableTotal > 0 ? " enabled" : ""}`}>
           <span>
-            <strong>{text("완전자동 결정", "Fully automatic decisions")}</strong>
-            <small>{text(
-              "다음 회차부터 미결 질문을 보고서 맥락과 함께 분석해 선택지를 고르거나 구체적인 추가 요청을 작성하고, 그 작업까지 이어서 진행합니다. 새 권한을 부여하지는 않습니다.",
-              "Starting with the next round, analyze pending questions in report context, choose an option or write a concrete follow-up request, and continue that work. This does not grant new permissions.",
-            )}</small>
+            <strong>{text("결정 방식", "Decision mode")}</strong>
+            <small>{modeHelp[goal.decisionMode]}</small>
           </span>
-          <input
-            type="checkbox"
-            checked={goal.decisionMode === "automatic"}
+          <select
+            value={goal.decisionMode}
             disabled={busy}
-            aria-label={text("완전자동 결정", "Fully automatic decisions")}
-            onChange={(event) => setAutomatic(event.target.checked)}
-          />
+            aria-label={text("결정 방식", "Decision mode")}
+            onChange={(event) => setDecisionMode(event.target.value as RoundDecisionMode)}
+          >
+            <option value="manual">{text("수동", "Manual")}</option>
+            <option value="recommended">{text("추천적용", "Apply recommendations")}</option>
+            <option value="automatic">{text("완전자동", "Fully automatic")}</option>
+          </select>
         </label>
-        {goal.decisionMode === "automatic" && pendingTotal > 0 && (
+        {roundAnswerableTotal > 0 && (
           <small className="round-auto-decision-notice">{text(
-            `대기 중인 ${pendingTotal}건은 다음 회차가 시작할 때 먼저 처리합니다.`,
-            `${pendingTotal} pending request(s) will be handled first when the next round starts.`,
+            `대기 중인 ${roundAnswerableTotal}건은 다음 회차가 시작할 때 먼저 처리합니다.`,
+            `${roundAnswerableTotal} pending request(s) will be handled first when the next round starts.`,
           )}</small>
         )}
         {reports !== null && reports.length === 0 && <p className="round-report-empty">{text("아직 보고가 없습니다.", "No reports yet.")}</p>}
         {(reports ?? []).map((report, position) => {
           const pending = pendingDecisionCount(report);
+          const humanPending = humanPendingDecisionCount(report, goal.decisionMode);
           const head = (
             <>
               <strong>{report.title}</strong>
               <span className={report.outcome === "pass" ? "health ready" : "health warning"}>{outcomeLabel(text, report.outcome)}</span>
               <span className="db-badge">{formatDateTime(report.recordedAt)}</span>
-              {pending > 0 && <span className="db-badge round-goal-pending">{text(`결정 대기 ${pending}`, `${pending} pending`)}</span>}
+              {humanPending > 0 && <span className="db-badge round-goal-pending">{text(`결정 대기 ${humanPending}`, `${humanPending} pending`)}</span>}
             </>
           );
           const body = (
@@ -209,7 +230,10 @@ export function RoundReportsModal({ goal, onClose, onResolved, onGoalUpdated }: 
                 const key = `${report.id}:${index}`;
                 return (
                   <div className="round-decision" key={key} data-decision-index={index}>
-                    <p>{decision.question}</p>
+                    <p>
+                      {decision.requiresHuman && <span className="db-badge round-decision-human">{text("사람 결정", "Needs a person")}</span>}
+                      {decision.question}
+                    </p>
                     <RoundDecisionForm
                       decision={decision}
                       busy={busy}

@@ -12,6 +12,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
 use crate::domain::{DocRoot, DocRootStatus};
 use crate::store::{load_metadata, with_metadata};
 use crate::user_home;
@@ -19,15 +21,55 @@ use crate::CoreError;
 
 /// 홈 아래 이 이름의 폴더는 공급자 소유라 문서 루트로 등록하지 않는다(G7).
 const AGENT_DATA_DIR_NAMES: [&str; 3] = [".claude", ".codex", ".gemini"];
+const MAX_DOC_ROOT_NOTE_CHARS: usize = 500;
 
-/// 등록된 폴더의 경로만 돌려준다. [`list_doc_roots`]와 달리 대상 폴더를 stat 하지
-/// 않는다.
+fn default_agent_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDocRootRequest {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default = "default_agent_enabled")]
+    pub agent_enabled: bool,
+    /// 경로가 없으면 그 칸을 만들고 변경한다. 화면이 "만들까요?"를 물어 사용자가
+    /// 승인했을 때만 켠다(C6-4b).
+    #[serde(default)]
+    pub create_if_missing: bool,
+}
+
+/// 에이전트 접근이 허용된(`agent_enabled == true`) 등록 폴더의 경로만 돌려준다.
+/// [`list_doc_roots`]와 달리 대상 폴더를 stat 하지 않는다.
 pub fn doc_root_paths(app_data_dir: &Path) -> Result<Vec<PathBuf>, CoreError> {
     Ok(load_metadata(app_data_dir)?
         .doc_roots
         .into_iter()
+        .filter(|root| root.agent_enabled)
         .map(|root| PathBuf::from(root.path))
         .collect())
+}
+
+/// AIA 시스템 MCP 등 에이전트 경로에서 특정 등록 폴더를 읽거나 쓸 때 에이전트 접근 허용
+/// 여부를 확인한다.
+pub fn ensure_doc_root_agent_enabled(app_data_dir: &Path, root_id: &str) -> Result<(), CoreError> {
+    if let Some(root) = load_metadata(app_data_dir)?
+        .doc_roots
+        .into_iter()
+        .find(|root| root.id == root_id)
+    {
+        if !root.agent_enabled {
+            return Err(CoreError::InvalidInput(format!(
+                "에이전트 접근이 비활성화된 등록 폴더입니다: {}",
+                root.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn list_doc_roots(app_data_dir: &Path) -> Result<Vec<DocRootStatus>, CoreError> {
@@ -45,19 +87,11 @@ pub fn list_doc_roots(app_data_dir: &Path) -> Result<Vec<DocRootStatus>, CoreErr
         .collect())
 }
 
-/// 문서 루트를 등록한다.
-///
-/// `create_if_missing`은 화면이 "만들까요?"를 물어 사용자가 승인했을 때만 켠다. 폴더
-/// 생성 자체(`create_directory`)는 임의 위치를 대상으로 해서 호스트 전용으로 남겨 두고,
-/// 문서 루트 등록이라는 이 한 자리에서만 원격에도 열어 준다 — 원격에서 폴더를 못 만들어
-/// 등록이 막히던 흐름은 여기뿐이었다. 만드는 규칙은 `create_user_directory`와 같아서
-/// 이미 있는 상위 폴더 바로 아래 마지막 한 칸만 생기고, 앱 데이터·공급자 홈은 막힌다.
-pub fn add_doc_root(
+fn resolve_and_validate_doc_root_path(
     app_data_dir: &Path,
-    name: &str,
     path: &str,
     create_if_missing: bool,
-) -> Result<DocRootStatus, CoreError> {
+) -> Result<PathBuf, CoreError> {
     // 입력 해석은 채팅 작업 경로와 같은 규칙을 쓴다(`user_path`). 없는 폴더는 화면이
     // "만들까요?"를 물을 수 있도록 고정 문구의 NotFound로 올라간다.
     let canonical = match crate::user_path::resolve_existing_directory(path) {
@@ -74,6 +108,47 @@ pub fn add_doc_root(
                 .to_owned(),
         ));
     }
+    Ok(canonical)
+}
+
+fn normalize_doc_root_name(name: &str, canonical: &Path, canonical_text: &str) -> String {
+    let display_name = name.trim();
+    if display_name.is_empty() {
+        canonical
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| canonical_text.to_owned())
+    } else {
+        display_name.chars().take(120).collect()
+    }
+}
+
+fn normalize_doc_root_note(note: Option<&str>) -> Result<Option<String>, CoreError> {
+    let Some(raw) = note.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if raw.chars().count() > MAX_DOC_ROOT_NOTE_CHARS {
+        return Err(CoreError::InvalidInput(format!(
+            "등록 폴더 비고는 {MAX_DOC_ROOT_NOTE_CHARS}자 이하로 입력하세요"
+        )));
+    }
+    Ok(Some(raw.to_owned()))
+}
+
+/// 문서 루트를 등록한다.
+///
+/// `create_if_missing`은 화면이 "만들까요?"를 물어 사용자가 만들 칸을 모두 확인하고
+/// 승인했을 때만 켠다(C6-4b). 만드는 일은 `create_user_directory`에 그대로 맡기므로
+/// 규칙도 같다 — 이미 있는 상위 폴더 아래로 없는 칸을 세 칸까지 한 칸씩 만들고(C6-4),
+/// 앱 데이터·공급자 홈은 막힌다(C6-5). 폴더 생성의 원격 허용 여부는 이 함수가 따로
+/// 정하지 않고 접속 채널 로그인(G11)을 따른다.
+pub fn add_doc_root(
+    app_data_dir: &Path,
+    name: &str,
+    path: &str,
+    create_if_missing: bool,
+) -> Result<DocRootStatus, CoreError> {
+    let canonical = resolve_and_validate_doc_root_path(app_data_dir, path, create_if_missing)?;
     let canonical_text = canonical.to_string_lossy().into_owned();
     with_metadata(app_data_dir, |metadata| {
         if metadata
@@ -83,24 +158,63 @@ pub fn add_doc_root(
         {
             return Err(CoreError::Conflict("이미 등록된 폴더입니다".to_owned()));
         }
-        let display_name = name.trim();
-        let display_name = if display_name.is_empty() {
-            canonical
-                .file_name()
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_else(|| canonical_text.clone())
-        } else {
-            display_name.chars().take(120).collect()
-        };
+        let display_name = normalize_doc_root_name(name, &canonical, &canonical_text);
         let root = DocRoot {
-            id: stable_id(&canonical_text),
+            id: unique_root_id(&metadata.doc_roots, &canonical_text),
             name: display_name,
             path: canonical_text,
+            note: None,
+            agent_enabled: true,
             agent_data: is_agent_data_path(&canonical),
         };
         metadata.doc_roots.push(root.clone());
         Ok(DocRootStatus {
             root,
+            exists: true,
+            restricted: false,
+        })
+    })
+}
+
+/// 등록 폴더의 설정(제목, 경로, 비고, 에이전트 접근가능 여부)을 변경한다.
+/// 기존 ID를 유지하므로 선택 상태나 파일 변경 트리거 연결이 끊기지 않는다.
+pub fn update_doc_root(
+    app_data_dir: &Path,
+    request: UpdateDocRootRequest,
+) -> Result<DocRootStatus, CoreError> {
+    let id = request.id.trim();
+    if id.is_empty() {
+        return Err(CoreError::InvalidInput(
+            "등록 폴더 ID가 필요합니다".to_owned(),
+        ));
+    }
+    let note = normalize_doc_root_note(request.note.as_deref())?;
+    let canonical =
+        resolve_and_validate_doc_root_path(app_data_dir, &request.path, request.create_if_missing)?;
+    let canonical_text = canonical.to_string_lossy().into_owned();
+    let display_name = normalize_doc_root_name(&request.name, &canonical, &canonical_text);
+    let agent_data = is_agent_data_path(&canonical);
+
+    with_metadata(app_data_dir, |metadata| {
+        if metadata
+            .doc_roots
+            .iter()
+            .any(|root| root.id != id && root.path == canonical_text)
+        {
+            return Err(CoreError::Conflict("이미 등록된 폴더입니다".to_owned()));
+        }
+        let Some(root) = metadata.doc_roots.iter_mut().find(|root| root.id == id) else {
+            return Err(CoreError::NotFound(
+                "등록 폴더를 찾을 수 없습니다".to_owned(),
+            ));
+        };
+        root.name = display_name;
+        root.path = canonical_text;
+        root.note = note;
+        root.agent_enabled = request.agent_enabled;
+        root.agent_data = agent_data;
+        Ok(DocRootStatus {
+            root: root.clone(),
             exists: true,
             restricted: false,
         })
@@ -143,6 +257,20 @@ fn is_restricted_doc_root_with_provider_dirs(
         let item = fs::canonicalize(&item).unwrap_or(item);
         path.starts_with(&item) || item.starts_with(&path)
     })
+}
+
+/// 경로로 만든 ID가 이미 쓰이고 있으면 번호를 붙여 다시 만든다. 설정에서 경로를 바꾼
+/// 폴더는 처음 등록한 경로로 만든 ID를 그대로 들고 있어서, 그 옛 경로를 다시 등록하면
+/// 같은 ID가 나온다.
+fn unique_root_id(roots: &[DocRoot], path: &str) -> String {
+    let taken = |id: &str| roots.iter().any(|root| root.id == id);
+    let mut id = stable_id(path);
+    let mut suffix = 2_u32;
+    while taken(&id) {
+        id = stable_id(&format!("{path}#{suffix}"));
+        suffix += 1;
+    }
+    id
 }
 
 fn stable_id(value: &str) -> String {
@@ -213,6 +341,7 @@ mod tests {
             .expect("만들고 등록한다");
         assert!(target.is_dir());
         assert_eq!(root.root.name, "QA");
+        assert!(root.root.agent_enabled);
         assert!(root.exists);
 
         // C6-4: 없는 칸이 둘이어도 세 칸까지는 함께 만든다. 오타로 줄줄이 생기는 것은
@@ -236,5 +365,96 @@ mod tests {
             .expect_err("앱 데이터 안은 거절한다");
         assert!(matches!(error, CoreError::InvalidInput(_)));
         assert!(!inside.exists());
+    }
+
+    #[test]
+    fn update_doc_root_updates_title_path_note_and_agent_access() {
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        let app_data = temp.path().join("app-data");
+        let folder_a = temp.path().join("docs-a");
+        let folder_b = temp.path().join("docs-b");
+        let folder_c = temp.path().join("docs-c");
+        fs::create_dir_all(&app_data).expect("app data");
+        fs::create_dir_all(&folder_a).expect("folder a");
+        fs::create_dir_all(&folder_b).expect("folder b");
+        fs::create_dir_all(&folder_c).expect("folder c");
+
+        let created = add_doc_root(
+            &app_data,
+            "초기 제목",
+            folder_a.to_string_lossy().as_ref(),
+            false,
+        )
+        .expect("register folder a");
+        let other = add_doc_root(
+            &app_data,
+            "다른 폴더",
+            folder_c.to_string_lossy().as_ref(),
+            false,
+        )
+        .expect("register folder c");
+
+        let updated = update_doc_root(
+            &app_data,
+            UpdateDocRootRequest {
+                id: created.root.id.clone(),
+                name: "변경된 제목".to_owned(),
+                path: folder_b.to_string_lossy().into_owned(),
+                note: Some("  팀 공유 문서 보관함  ".to_owned()),
+                agent_enabled: false,
+                create_if_missing: false,
+            },
+        )
+        .expect("update folder settings");
+
+        assert_eq!(updated.root.id, created.root.id);
+        assert_eq!(updated.root.name, "변경된 제목");
+        assert_eq!(
+            updated.root.path,
+            fs::canonicalize(&folder_b)
+                .expect("canonical folder b")
+                .to_string_lossy()
+        );
+        assert_eq!(updated.root.note.as_deref(), Some("팀 공유 문서 보관함"));
+        assert!(!updated.root.agent_enabled);
+
+        // 에이전트 접근이 꺼진 폴더는 에이전트 작업공간 경로 목록과 AIA 접근 검사에서 제외된다.
+        let agent_paths = doc_root_paths(&app_data).expect("agent doc root paths");
+        assert_eq!(agent_paths.len(), 1);
+        assert_eq!(agent_paths[0], PathBuf::from(&other.root.path));
+        assert!(ensure_doc_root_agent_enabled(&app_data, &created.root.id).is_err());
+        assert!(ensure_doc_root_agent_enabled(&app_data, &other.root.id).is_ok());
+
+        // 다른 등록 폴더와 같은 경로로 바꾸려는 요청은 충돌로 거절한다.
+        let conflict = update_doc_root(
+            &app_data,
+            UpdateDocRootRequest {
+                id: created.root.id.clone(),
+                name: "충돌".to_owned(),
+                path: folder_c.to_string_lossy().into_owned(),
+                note: None,
+                agent_enabled: true,
+                create_if_missing: false,
+            },
+        )
+        .expect_err("duplicate path must fail");
+        assert!(matches!(conflict, CoreError::Conflict(_)));
+
+        // 경로를 옮긴 폴더는 옛 경로로 만든 ID를 그대로 갖고 있다. 옛 경로를 다시 등록해도
+        // ID가 겹치지 않아야 선택·삭제·트리거가 다른 폴더에 붙지 않는다.
+        let reregistered = add_doc_root(
+            &app_data,
+            "옛 경로",
+            folder_a.to_string_lossy().as_ref(),
+            false,
+        )
+        .expect("re-register old path");
+        assert_ne!(reregistered.root.id, created.root.id);
+        let ids = list_doc_roots(&app_data)
+            .expect("list roots")
+            .into_iter()
+            .map(|root| root.root.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 3);
     }
 }

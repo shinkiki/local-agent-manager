@@ -278,13 +278,30 @@ fn restore_single_item(
 ) -> InstructionTrashRestoreResult {
     let original = PathBuf::from(&item.original_path);
 
-    match trash_store::prepare_restore_target(&original) {
+    // 배포 파일과 연결 문서는 배포 루트(`project_path`) 안에만 놓인다(C5-8). 공통 원본은
+    // 저장소 폴더 바로 아래 항목이라 상위 폴더가 곧 루트다.
+    let root = item
+        .project_path
+        .as_deref()
+        .map(Path::new)
+        .unwrap_or_else(|| original.parent().unwrap_or(&original));
+    match trash_store::prepare_restore_target(&original, root) {
         RestoreTarget::Ready => {}
         RestoreTarget::Occupied => {
             return InstructionTrashRestoreResult::from_item(
                 item,
                 InstructionTrashRestoreOutcome::Skipped,
                 Some("원래 경로에 이미 항목이 있어 덮어쓰지 않았습니다".to_owned()),
+            )
+        }
+        RestoreTarget::OutsideRoot => {
+            return InstructionTrashRestoreResult::from_item(
+                item,
+                InstructionTrashRestoreOutcome::Failed,
+                Some(
+                    "복구할 위치가 링크를 거쳐 원래 루트 밖을 가리켜 복구하지 않았습니다"
+                        .to_owned(),
+                ),
             )
         }
         RestoreTarget::ParentFailed(message) => {
@@ -502,5 +519,106 @@ mod tests {
         assert_eq!(purged, 1);
         let list_after = list_instruction_trash(&app_data).expect("비운 후 목록");
         assert!(list_after.items.is_empty());
+    }
+
+    fn draft(
+        group_id: &str,
+        kind: InstructionTrashItemKind,
+        provider: Option<ProviderId>,
+        name: &str,
+    ) -> InstructionTrashItemDraft {
+        InstructionTrashItemDraft {
+            group_id: group_id.to_owned(),
+            key: "shared-policy".to_owned(),
+            kind,
+            provider,
+            scope: provider.map(|_| "project".to_owned()),
+            project_path: None,
+            shared: true,
+            deleted_by: "user".to_owned(),
+            content_digest: None,
+            file_count: 1,
+            total_bytes: 1,
+            name: name.to_owned(),
+            description: String::new(),
+        }
+    }
+
+    // C5-9: 공통 원본과 배포 파일을 한 그룹으로 지웠으면 어느 항목으로 복구하든
+    // 그룹 전체가 원본부터 돌아온다. 정렬 키 클로저가 provider를 보지 않게 바뀌면
+    // 늦게 지운 원본이 뒤로 밀려 이 순서 단언이 깨진다.
+    #[test]
+    fn restore_brings_back_the_whole_group_with_the_source_first() {
+        let temp = tempdir().expect("임시 디렉터리 생성");
+        let app_data = temp.path().join("app_data");
+        let deployed = temp.path().join("project").join("AGENTS.md");
+        fs::create_dir_all(deployed.parent().unwrap()).unwrap();
+        fs::write(&deployed, "deployed").unwrap();
+        let source = temp.path().join("policies").join("shared-policy");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("AGENTS.md"), "source").unwrap();
+
+        let file_item = store_instruction_trash_item(
+            &app_data,
+            &deployed,
+            draft(
+                "group",
+                InstructionTrashItemKind::File,
+                Some(ProviderId::Codex),
+                "AGENTS.md",
+            ),
+        )
+        .expect("배포 파일 보관");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let source_item = store_instruction_trash_item(
+            &app_data,
+            &source,
+            draft(
+                "group",
+                InstructionTrashItemKind::Directory,
+                None,
+                "shared-policy",
+            ),
+        )
+        .expect("원본 보관");
+
+        // 원본이 나중에 지워져야 provider 정렬 키가 실제로 순서를 정한다.
+        assert!(source_item.deleted_at_ms > file_item.deleted_at_ms);
+        let receipt = restore_instruction_trash(&app_data, &file_item.id).expect("그룹 복구");
+        assert_eq!(receipt.group_id, "group");
+        let ids: Vec<_> = receipt.results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, [source_item.id.as_str(), file_item.id.as_str()]);
+        assert!(receipt.results.iter().all(|r| r.outcome.is_restored()));
+        assert_eq!(fs::read_to_string(&deployed).unwrap(), "deployed");
+        assert_eq!(
+            fs::read_to_string(source.join("AGENTS.md")).unwrap(),
+            "source"
+        );
+        assert!(list_instruction_trash(&app_data).unwrap().items.is_empty());
+    }
+
+    // C3-11: 실체가 사라진 항목은 Failed로 알리고 manifest를 남겨 목록에서 지우지 않는다.
+    #[test]
+    fn restore_reports_failed_and_keeps_the_entry_when_the_content_is_gone() {
+        let temp = tempdir().expect("임시 디렉터리 생성");
+        let app_data = temp.path().join("app_data");
+        let deployed = temp.path().join("AGENTS.md");
+        fs::write(&deployed, "deployed").unwrap();
+        let item = store_instruction_trash_item(
+            &app_data,
+            &deployed,
+            draft("lonely", InstructionTrashItemKind::File, None, "AGENTS.md"),
+        )
+        .expect("보관");
+        let (_, content) = trash_store::entry_paths(&trash_root(&app_data), &item.id);
+        fs::remove_file(&content).expect("실체 제거");
+
+        let receipt = restore_instruction_trash(&app_data, &item.id).expect("복구 시도");
+        assert_eq!(
+            receipt.results[0].outcome,
+            InstructionTrashRestoreOutcome::Failed
+        );
+        assert!(!deployed.exists());
+        assert_eq!(list_instruction_trash(&app_data).unwrap().items.len(), 1);
     }
 }

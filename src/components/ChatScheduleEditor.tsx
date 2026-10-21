@@ -20,6 +20,7 @@ import { displayPath } from "../lib/displayPath";
 import { useI18n, type UiText } from "../lib/i18n";
 import { supportsAiaSystemTools } from "../lib/aiaRuntime.ts";
 import { ALL_WEEKDAYS, weekdayChoiceLabel } from "../lib/pacingSchedule";
+import { clampScheduleNumber, INTERVAL_HOURS, RUN_HOUR, RUN_MINUTE, type ScheduleNumberBounds } from "../lib/scheduleNumber";
 import type {
   AccountSnapshot,
   ChatApprovalMode,
@@ -74,23 +75,6 @@ import { errorText } from "../lib/errorText";
  */
 const SCHEDULE_NAME_MAX = 120;
 
-// 주기 숫자 칸의 허용 범위. 백엔드가 받는 값과 같다(간격은 시간 단위, 실행 시각은 시·분).
-const INTERVAL_HOURS = { min: 1, max: 168 };
-const RUN_HOUR = { min: 0, max: 23 };
-const RUN_MINUTE = { min: 0, max: 59 };
-
-/**
- * 숫자 칸 초안을 범위 안 정수로 되돌린다. 칸은 문자열 초안으로 들고 있다가 칸을 떠날 때와
- * 저장할 때만 여기로 자른다 — 치는 도중에 Number("")를 담으면 지운 칸에 0이 끼어들어 다시 친
- * 값이 열 배가 된다(QA #33). 빈 칸·숫자 아님은 하한으로 떨어진다.
- */
-function clampScheduleNumber(raw: string, bounds: { min: number; max: number }): number {
-  const trimmed = raw.trim();
-  const parsed = Number(trimmed);
-  if (trimmed === "" || !Number.isFinite(parsed)) return bounds.min;
-  return Math.min(bounds.max, Math.max(bounds.min, Math.round(parsed)));
-}
-
 /**
  * 범위가 정해진 숫자 칸 하나의 초안. 간격·시·분 세 칸은 "문자열로 들고 있다가 칸을 떠날
  * 때와 저장할 때만 범위 안으로 자른다"는 같은 규칙을 쓰는데, 상태 선언과 `onBlur`의 보정
@@ -99,7 +83,7 @@ function clampScheduleNumber(raw: string, bounds: { min: number; max: number }):
  * 않으므로 한 벌로 모은다. `input`에 그대로 펼칠 수 있는 모양(`min`·`max`·두 손잡이)으로
  * 내보내 칸마다 범위를 다시 적지 않게 한다.
  */
-function useClampedNumberDraft(initial: number, bounds: { min: number; max: number }) {
+function useClampedNumberDraft(initial: number, bounds: ScheduleNumberBounds) {
   const [draft, setDraft] = useState(String(initial));
   return {
     /** 저장 직전에만 부른다 — 치는 도중이 아니라 여기서 범위 안으로 자른다. */

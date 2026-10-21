@@ -87,12 +87,16 @@ export {
  * 만들기 전에 설치해야 하는 절차 스킬. 워크플로마다 제 이름의 복사본이 하나씩 붙고,
  * 병렬을 켰으면 프로젝트를 가리지 않는 레인 절차가 더해진다. 이미 있는 키는 사용자가
  * 손봤을 수 있으므로 건드리지 않는다.
+ *
+ * 레인 절차는 계약이 의존으로 거는 조건과 같아야 한다(`buildWorkflowContract`):
+ * 페이싱 회차를 만들 때만이다. 수동 실행만 만드는 카드에서 병렬 스위치가 켜져 있어도
+ * 계약은 레인을 걸지 않으므로, 여기서 만들면 쓰이지 않는 스킬을 승인받아 남긴다.
  */
 export function plannedProcedureSkills(
   card: AiaOnboardingCard,
   values: OnboardingValues,
   bundled: readonly ProcedureSkill[],
-  { parallel, installed }: { parallel: boolean; installed: ReadonlySet<string> },
+  { parallel, paced, installed }: { parallel: boolean; paced: boolean; installed: ReadonlySet<string> },
 ): ProcedureSkill[] {
   const planned: ProcedureSkill[] = [];
   const seen = new Set<string>();
@@ -114,7 +118,7 @@ export function plannedProcedureSkills(
       const body = source.files.find((file) => file.path === "SKILL.md")?.content ?? "";
       add(key, description, procedureSkillFiles(body, key, description));
     }
-    if (parallel && workflow.parallel) {
+    if (paced && parallel && workflow.parallel) {
       const lane = bundled.find((skill) => skill.key === LANE_SKILL_KEY);
       if (lane) add(lane.key, lane.description, lane.files);
     }

@@ -4,7 +4,7 @@
  * 사용자는 목표만 적는다. "설계 시작"을 누르면 AIA 가 회차 설계 스킬(round-designer)을 따라
  * 스킬·스크립트·시험·워크플로 계약·반복 요청을 만들고, 등록은 승인 카드로 끝난다. 그 뒤 회차가
  * 남긴 구조화된 보고와 선택 요청은 목표 카드의 "회차 상세" 모달(RoundReportsModal)에서
- * 직접 답하거나 목표별 완전자동 모드로 다음 회차에 맡긴다. 카드에는 "결정 대기 N" 배지만
+ * 직접 답하거나 목표별 결정 방식(수동·추천적용·완전자동)으로 다음 회차에 맡긴다. 카드에는 "결정 대기 N" 배지만
  * 올라와 어느 목표를 열어야 하는지 알린다.
  *
  * 스크립트를 여기서 돌리지 않는다. 회차는 워크플로가 띄운 에이전트 채팅이 돈다.
@@ -20,9 +20,10 @@ import {
   listRoundReports,
   updateRoundGoal,
 } from "../lib/ipc";
+import { humanPendingDecisionCount } from "../lib/roundDecisions";
 import { roundDesignPrompt } from "../lib/roundDesign";
-import type { RoundGoal, RoundGoalInput, RoundGoalStatus, RoundReport } from "../types";
-import { pendingDecisionCount, RoundReportsModal, RoundText } from "./RoundReportsModal";
+import type { RoundDecisionMode, RoundGoal, RoundGoalInput, RoundGoalStatus, RoundReport } from "../types";
+import { RoundReportsModal, RoundText } from "./RoundReportsModal";
 import { ErrorBanner, useConfirm } from "./Shared";
 
 function errorMessage(error: unknown): string {
@@ -45,7 +46,18 @@ function statusLabel(text: Text, status: RoundGoalStatus): string {
   }
 }
 
-export function RoundGoalsPanel({ onRequestAiaPrompt, refreshNonce = 0 }: { onRequestAiaPrompt?: (prompt: string) => void; refreshNonce?: number }) {
+/**
+ * 마지막으로 처리한 목표 열기 요청 id. 요청은 App 상태에 남아 있으므로 패널 안의 ref 로 두면
+ * 워크플로 화면이 다시 마운트될 때 0 으로 돌아가 사용자가 닫은 모달이 저절로 다시 열린다.
+ * requestId 는 앱 전체에서 단조 증가하므로 모듈 변수 하나로 충분하다.
+ */
+let lastHandledOpenGoalRequest = 0;
+
+export function RoundGoalsPanel({ onRequestAiaPrompt, openGoalRequest = null }: {
+  onRequestAiaPrompt?: (prompt: string) => void;
+  /** 회차 결정 알림에서 특정 목표의 회차 상세 모달을 바로 열어 달라는 요청. */
+  openGoalRequest?: { goalId: string; requestId: number } | null;
+}) {
   const { text } = useI18n();
   const { confirm, confirmDialog } = useConfirm();
   const [goals, setGoals] = useState<RoundGoal[] | null>(null);
@@ -66,10 +78,26 @@ export function RoundGoalsPanel({ onRequestAiaPrompt, refreshNonce = 0 }: { onRe
       .finally(() => setBusy(false));
   }, []);
 
-  // 목표 상태는 이 화면 밖(회차·AIA·다른 기기)에서도 바뀐다. 마운트 때 한 번만 읽던 동안은
-  // 앱을 껐다 켜야 반영됐는데, 끄면 페이싱과 세션이 함께 끊긴다. 로고 새로고침이 올려 주는
-  // 나수를 같이 보고 다시 읽는다.
-  useEffect(() => { void load(); }, [load, refreshNonce]);
+  // 목표 상태는 이 화면 밖(회차·AIA·다른 기기)에서도 바뀐다. 여기서는 마운트 때 한 번 읽고,
+  // 로고 새로고침은 화면을 새로 마운트해 다시 읽게 한다(App의 ViewPanel).
+  useEffect(() => { void load(); }, [load]);
+
+  useEffect(() => {
+    if (!openGoalRequest || goals === null || lastHandledOpenGoalRequest === openGoalRequest.requestId) return;
+    lastHandledOpenGoalRequest = openGoalRequest.requestId;
+    const existing = goals.find((goal) => goal.id === openGoalRequest.goalId);
+    if (existing) {
+      setDetailGoal(existing);
+      return;
+    }
+    void getRoundGoals()
+      .then((nextGoals) => {
+        setGoals(nextGoals);
+        const found = nextGoals.find((goal) => goal.id === openGoalRequest.goalId);
+        if (found) setDetailGoal(found);
+      })
+      .catch((cause) => setError(errorMessage(cause)));
+  }, [goals, openGoalRequest]);
 
   const save = useCallback(() => {
     if (!draft) return;
@@ -123,15 +151,16 @@ export function RoundGoalsPanel({ onRequestAiaPrompt, refreshNonce = 0 }: { onRe
     if (goal.status === "draft") setStatus(goal, "designing");
   }, [onRequestAiaPrompt, setStatus]);
 
-  // 카드 배지용. 보고 목록은 모달이 목표별로 따로 조회하므로 여기서는 미결 개수만 센다.
+  const goalModes = useMemo(() => Object.fromEntries((goals ?? []).map((goal) => [goal.id, goal.decisionMode])) as Record<string, RoundDecisionMode>, [goals]);
+  // 카드 배지용. 보고 목록은 모달이 목표별로 따로 조회하므로 여기서는 결정 방식에서 사람이 답할 미결 개수만 센다.
   const pendingByGoal = useMemo(() => {
     const counts: Record<string, number> = {};
     for (const report of reports) {
       if (!report.goalId) continue;
-      counts[report.goalId] = (counts[report.goalId] ?? 0) + pendingDecisionCount(report);
+      counts[report.goalId] = (counts[report.goalId] ?? 0) + humanPendingDecisionCount(report, goalModes[report.goalId] ?? "manual");
     }
     return counts;
-  }, [reports]);
+  }, [reports, goalModes]);
 
   return (
     // 자동화 탭의 형제(AIA 선제 제안)와 같은 카드 틀을 쓴다. settings-subsection은 카드
@@ -149,8 +178,8 @@ export function RoundGoalsPanel({ onRequestAiaPrompt, refreshNonce = 0 }: { onRe
           {busy && <LoaderCircle className="spin" size={14} />}
         </div>
         <p>{text(
-          "목표만 적으면 AIA 가 회차 설계 스킬을 따라 스킬·스크립트·시험·워크플로·반복 요청을 만들고, 등록은 승인 카드로 끝납니다. 회차 상세에서 선택 요청에 직접 답하거나 목표별 완전자동 결정을 켤 수 있습니다.",
-          "Write the goal; AIA follows the round-designer skill to create the skill, scripts, tests, workflow, and recurring request, and registration ends with approval cards. In round detail, answer requests yourself or enable fully automatic decisions for that goal.",
+          "목표만 적으면 AIA 가 회차 설계 스킬을 따라 스킬·스크립트·시험·워크플로·반복 요청을 만들고, 등록은 승인 카드로 끝납니다. 회차 상세에서 선택 요청에 직접 답하거나 목표별 결정 방식(수동·추천적용·완전자동)을 고를 수 있습니다.",
+          "Write the goal; AIA follows the round-designer skill to create the skill, scripts, tests, workflow, and recurring request, and registration ends with approval cards. In round detail, answer requests yourself or choose the decision mode (manual, apply recommendations, fully automatic) for that goal.",
         )}</p>
       </header>
       <div className="settings-subsection">

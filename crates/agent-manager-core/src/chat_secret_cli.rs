@@ -12,7 +12,7 @@
 //!   내용의 자리표시자를 채운 파일을 백엔드가 대신 쓴다.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::ssh_endpoints::RELAY_CHAT_ID_ENV;
@@ -234,19 +234,36 @@ fn relay(
             "이 셸에 {RELAY_CHAT_ID_ENV}가 없습니다. Agent Manager가 띄운 대화의 셸에서만 비밀값을 쓸 수 있습니다"
         )));
     }
-    let pointer = crate::system_skills::read_session_read_cli_pointer(&options.app_data_dir)?;
-    let port = pointer.backend_port.ok_or_else(|| {
-        CoreError::Conflict(
-            "Agent Manager 백엔드가 포트를 남기지 않은 예전 버전입니다. 앱을 다시 시작한 뒤 시도하세요".to_owned(),
-        )
-    })?;
     let timeout = options
         .timeout_seconds
         .unwrap_or(crate::chat_secrets::DEFAULT_RUN_TIMEOUT_SECONDS)
         .min(crate::chat_secrets::MAX_RUN_TIMEOUT_SECONDS)
         .saturating_add(30);
+    relay_to_backend(
+        &options.app_data_dir,
+        command,
+        body,
+        Duration::from_secs(timeout),
+    )
+}
+
+/// CLI 하위 명령(`secret`·`db exec`·`ssh exec`)이 떠 있는 백엔드의 루프백 API에 명령 하나를
+/// 넘긴다. 포인터 파일에서 포트를 읽고, 거절 응답은 백엔드가 준 `error` 문구로 돌려준다.
+/// 세 하위 명령이 같은 몸통을 각자 적고 있던 것을 한 자리로 모았다.
+pub(crate) fn relay_to_backend(
+    app_data_dir: &Path,
+    command: &str,
+    body: &serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, CoreError> {
+    let pointer = crate::system_skills::read_session_read_cli_pointer(app_data_dir)?;
+    let port = pointer.backend_port.ok_or_else(|| {
+        CoreError::Conflict(
+            "Agent Manager 백엔드가 포트를 남기지 않은 예전 버전입니다. 앱을 다시 시작한 뒤 시도하세요".to_owned(),
+        )
+    })?;
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(timeout))
+        .timeout(timeout)
         .build()
         .map_err(|error| {
             CoreError::Runtime(format!("HTTP 클라이언트를 만들지 못했습니다: {error}"))

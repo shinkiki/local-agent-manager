@@ -128,3 +128,16 @@ export function mergeComposerDraft(current: string, prompt: string): string {
   if (!current.trim()) return addition;
   return `${current.trimEnd()}\n\n${addition}`;
 }
+
+/**
+ * 전송이 끝난 뒤 작성창에 남길 글. 전송(첨부 업로드·재시작 포함)이 도는 동안에도 작성창은
+ * 열려 있어 사용자가 글을 더 쓰거나 제안을 끼워 넣을 수 있다. 작성창이 아직 보낸 그 글
+ * 그대로일 때만 비우고, 그사이 바뀌었으면 보내지 않은 글이므로 그대로 둔다.
+ */
+export function composerAfterSend(current: string, sent: string): string {
+  if (current === sent) return "";
+  // 보낸 글 뒤에 이어 쓴 경우(제안 끼워 넣기도 이 모양이다)는 이미 보낸 앞부분만 걷는다.
+  // 다시 보내면 같은 글이 두 번 간다.
+  if (sent.trim() && current.startsWith(sent)) return current.slice(sent.length).trimStart();
+  return current;
+}

@@ -43,10 +43,10 @@ function attentionSessionLabel(item: ChatAttentionItem, sessions: SessionSummary
  * 대화 이름, 반복 요청·워크플로 회차면 어느 갈래에서 왔는지를 알려 주는 작업 경로다.
  */
 function groupSubtitle(group: AttentionGroup, sessions: SessionSummary[], text: (ko: string, en: string) => string): string {
-  // 대화에 묶이지 않는 두 종류는 폴더·세션 이름이 없다. 묶여도 본문이 보여야 머리줄만
+  // 대화에 묶이지 않는 종류는 폴더·세션 이름이 없다. 묶여도 본문이 보여야 머리줄만
   // 읽고 판단할 수 있으므로 대표 항목의 본문을 그대로 쓴다.
   if (group.reason === "account") return group.lead.detail ?? "";
-  if (group.lead.kind === "pacingSuggestion") return group.lead.detail ?? "";
+  if (group.lead.kind === "pacingSuggestion" || group.lead.kind === "roundDecision") return group.lead.detail ?? "";
   if (group.reason === "chat") return attentionSessionLabel(group.lead, sessions);
   const label = group.reason === "schedule" ? text("반복 회차", "Recurring run") : text("워크플로", "Workflow");
   // "외 N곳"은 수와 단위를 한 문장으로 만든다. 따로 그리면 영어 화면에서 "2items"처럼 붙는다.
@@ -293,13 +293,13 @@ function AttentionItemRow({ item, nested, sessions, onOpen, onDismiss }: {
   onDismiss: (items: ChatAttentionItem[]) => Promise<boolean>;
 }) {
   // 계정 전환은 세션이 없어 둘째 줄에 "A → B · 사유" 전환 문구를 대신 보인다.
-  // 채팅에 묶이지 않는 두 종류는 대화 이름이 없다. 본문을 그대로 둘째 줄로 쓴다.
-  const secondLine = item.kind === "accountSwitch" || item.kind === "pacingSuggestion"
+  // 채팅에 묶이지 않는 세 종류는 대화 이름이 없다. 본문을 그대로 둘째 줄로 쓴다.
+  const secondLine = item.kind === "accountSwitch" || item.kind === "pacingSuggestion" || item.kind === "roundDecision"
     ? item.detail ?? ""
     : attentionSessionLabel(item, sessions);
   return <AttentionSwipeItem
     className={attentionRowClassName(item.kind, !item.read || item.kind === "approval", nested ? "attention-item-nested" : undefined)}
-    dismissable={item.kind !== "approval"}
+    dismissable={item.kind !== "approval" && item.kind !== "roundDecision"}
     onOpen={() => onOpen(item)}
     onDismiss={() => onDismiss([item])}
   >

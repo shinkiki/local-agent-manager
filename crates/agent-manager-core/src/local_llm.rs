@@ -711,7 +711,20 @@ fn parse_models(body: &Value) -> Vec<String> {
 ///
 /// 주소는 OpenAI 호환 경로(`…/v1`)로 저장돼 있고 `/api/show`는 그 바깥이라 `/v1`을 떼고
 /// 부른다. OpenAI 규격에는 능력을 알려 주는 자리가 없어 서빙 서버 고유 경로를 쓴다.
+///
+/// `probe_local_llm`과 같은 이유로 본체를 전용 스레드에서 돌린다. 이 함수는 채팅 소켓
+/// 태스크 안의 `send_opencode_turn`에서 불리므로, `reqwest::blocking` 클라이언트를 그
+/// 자리에서 떨어뜨리면 그림 첨부가 있는 턴마다 소켓 태스크가 패닉한다.
 pub(crate) fn model_supports_vision(base_url: &str, model: &str) -> bool {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| model_supports_vision_blocking(base_url, model))
+            .join()
+    })
+    .unwrap_or(false)
+}
+
+fn model_supports_vision_blocking(base_url: &str, model: &str) -> bool {
     let root = base_url.trim_end_matches('/');
     let root = root.strip_suffix("/v1").unwrap_or(root);
     let Ok(client) = reqwest::blocking::Client::builder()
@@ -890,6 +903,24 @@ fn probe_local_llm_blocking(base_url: &str) -> Result<LocalLlmProbeResult, CoreE
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 채팅 소켓 태스크처럼 비동기 문맥 안에서 불려도 패닉하지 않고 `false`로 물러난다.
+    #[test]
+    fn model_supports_vision_survives_async_context() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("빈 포트")
+            .local_addr()
+            .expect("주소")
+            .port();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("런타임");
+        let sees = runtime.block_on(async {
+            model_supports_vision(&format!("http://127.0.0.1:{port}/v1"), "llava")
+        });
+        assert!(!sees);
+    }
 
     fn temp_dir() -> tempfile::TempDir {
         tempfile::Builder::new()

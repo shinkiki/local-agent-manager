@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
-import { ArrowLeft, ArrowRight, ChevronDown, PanelLeftClose, PanelLeftOpen, Plus, TriangleAlert, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, ChevronDown, PanelLeftClose, PanelLeftOpen, Plus, Settings, TriangleAlert, X } from "lucide-react";
 import {
   createDoc,
   createDocRoot,
@@ -11,6 +11,7 @@ import {
   getDocRoots,
   previewDirectoryCreation,
   putDoc,
+  updateDocRoot,
 } from "../lib/ipc";
 import type { AccountSnapshot, DocRootStatus, DocumentEntry, DocumentFile, ModelOption, ProviderStatus } from "../types";
 import { EmptyState, ErrorBanner, LoadingState, useConfirm, useEscapeToClose, type ConfirmRequest } from "./Shared";
@@ -23,6 +24,7 @@ import { DocumentTreePane, docRootTreeSource, useRequestGeneration } from "./Doc
 import { DocumentFilePane, type DocumentFilePaneProps } from "./DocumentFilePane";
 import { DocumentAutomationPanel } from "./DocumentAutomationPanel";
 import { errorText } from "../lib/errorText";
+import { createLatestGate } from "../lib/latestRequest";
 import { displayPath } from "../lib/displayPath";
 
 const DOC_HISTORY_LIMIT = 100;
@@ -97,7 +99,7 @@ export function DocsView({ providers, accounts, models, onRequestAiaPrompt }: Do
   } = useDocDraft(confirm);
   // 폴더 목록·선택·등록 폼은 문서 작업대와 상태를 나눠 갖지 않으므로 훅 한 벌로 모은다.
   // 오류만 화면 공용 배너로 올라오므로 setError를 넘겨 준다.
-  const { roots, selectedRoot, setSelectedRoot, removeRoot, rootForm } = useDocRootRegistry(setError, confirm);
+  const { roots, selectedRoot, setSelectedRoot, removeRoot, rootForm, rootSettings } = useDocRootRegistry(setError, confirm);
   const workspaceRef = useRef<HTMLElement>(null);
   // 사이드바 생명주기(열림 보존·좁은 화면 겹침·여닫은 뒤 포커스·Esc 닫기)는 문서 작업대와
   // 상태를 나눠 갖지 않으므로 훅 한 벌로 모은다. 호출 자리는 여기여야 한다 — 훅이 등록하는
@@ -183,6 +185,20 @@ export function DocsView({ providers, accounts, models, onRequestAiaPrompt }: Do
         rootList={{
           roots,
           selectedRoot,
+          settings: {
+            ...rootSettings,
+            submit: () => rootSettings.submit({
+              // 경로가 바뀌면 그 폴더에서 열려 있던 문서를 닫으므로, 초안이 있으면 먼저 되묻는다.
+              confirmPathChange: (root) =>
+                selectedRoot?.id === root.id ? confirmDiscardDraft("changeRootPath") : Promise.resolve(true),
+              onUpdated: (previous, updated) => {
+                if (previous && previous.path !== updated.path) {
+                  history.dropRoot(updated.id);
+                  if (selectedRoot?.id === updated.id) clearDocument();
+                }
+              },
+            }),
+          },
           onSelectRoot: (root) => void selectRoot(root),
           // 해제가 잊어야 하는 화면 쪽 기억(이동 기록·열려 있던 문서)은 등록부가 알 수
           // 없으므로 여기서 넘긴다. 등록부는 되묻기·삭제·목록 갱신까지만 맡는다.
@@ -377,7 +393,7 @@ function DocsSidebar({
           <DocNewFileRow {...newFile} />
           {selectedRoot.exists && !selectedRoot.restricted ? (
             <DocumentTreePane
-              key={`${selectedRoot.id}:${tree.revision}`}
+              key={`${selectedRoot.id}:${selectedRoot.path}:${tree.revision}`}
               source={docRootTreeSource(selectedRoot.id, text("등록 폴더 파일", "Registered folder files"))}
               selectedPath={tree.selectedPath}
               onSelect={tree.onSelect}
@@ -462,12 +478,13 @@ function DocRootForm({ form }: { form: DocRootFormState }) {
 interface DocRootListProps {
   roots: DocRootStatus[] | null;
   selectedRoot: DocRootStatus | null;
+  settings: DocRootSettingsState;
   onSelectRoot: (root: DocRootStatus) => void;
   onRemoveRoot: (root: DocRootStatus) => void;
 }
 
 /** 등록 폴더 목록. 로딩·빈 상태와 폴더 행 목록을 다룬다. */
-function DocRootList({ roots, selectedRoot, onSelectRoot, onRemoveRoot }: DocRootListProps) {
+function DocRootList({ roots, selectedRoot, settings, onSelectRoot, onRemoveRoot }: DocRootListProps) {
   const { text } = useI18n();
   if (roots === null) return <LoadingState label={text("등록 폴더 확인 중", "Checking registered folders")} />;
   if (roots.length === 0) {
@@ -475,49 +492,142 @@ function DocRootList({ roots, selectedRoot, onSelectRoot, onRemoveRoot }: DocRoo
   }
 
   return (
-    <div className="root-list">
-      {roots.map((root) => (
-        <DocRootRow
-          key={root.id}
-          root={root}
-          active={selectedRoot?.id === root.id}
-          onSelectRoot={onSelectRoot}
-          onRemoveRoot={onRemoveRoot}
-        />
-      ))}
+    <div className={settings.editingRootId ? "root-list has-editor" : "root-list"}>
+      {roots.map((root) => {
+        const editing = settings.editingRootId === root.id;
+        return (
+          <div key={root.id} className={editing ? "root-item editing" : "root-item"}>
+            <DocRootRow
+              root={root}
+              active={selectedRoot?.id === root.id}
+              editing={editing}
+              onSelectRoot={onSelectRoot}
+              onToggleSettings={settings.toggle}
+              onRemoveRoot={onRemoveRoot}
+            />
+            {editing && <DocRootSettingsForm settings={settings} />}
+          </div>
+        );
+      })}
     </div>
   );
 }
 
-/** 등록 폴더 행. 폴더 존재 여부 아이콘, 이름·경로 표시, 선택 및 제거 조작을 맡는다. */
+/** 등록 폴더 행. 폴더 존재 여부 아이콘, 이름·경로·비고·에이전트 접근 상태 표시, 선택·설정·제거 조작을 맡는다. */
 function DocRootRow({
   root,
   active,
+  editing,
   onSelectRoot,
+  onToggleSettings,
   onRemoveRoot,
 }: {
   root: DocRootStatus;
   active: boolean;
+  editing: boolean;
   onSelectRoot: (root: DocRootStatus) => void;
+  onToggleSettings: (root: DocRootStatus) => void;
   onRemoveRoot: (root: DocRootStatus) => void;
 }) {
+  const { text } = useI18n();
+  const settingsLabel = text("폴더 설정", "Folder settings");
   return (
     <div className={active ? "root-row active" : "root-row"}>
       <button type="button" onClick={() => onSelectRoot(root)}>
         {root.exists ? <ChevronDown size={13} /> : <TriangleAlert size={13} />}
         <span>
-          <strong>{root.name}</strong>
+          <span className="root-row-heading">
+            <strong>{root.name}</strong>
+            {root.agentEnabled && (
+              <small className="root-agent-badge">
+                {text("접근허용", "Access allowed")}
+              </small>
+            )}
+          </span>
           <code>{displayPath(root.path)}</code>
+          {root.note && <small className="root-note">{root.note}</small>}
         </span>
       </button>
-      <button
-        className="remove-root"
-        type="button"
-        onClick={() => onRemoveRoot(root)}
-        aria-label="폴더 제거"
-      >
-        <X size={13} />
-      </button>
+      <div className="root-row-actions">
+        <button
+          className={editing ? "edit-root active" : "edit-root"}
+          type="button"
+          onClick={() => onToggleSettings(root)}
+          aria-label={`${root.name} ${settingsLabel}`}
+          title={settingsLabel}
+          aria-expanded={editing}
+        >
+          <Settings size={13} />
+        </button>
+        <button
+          className="remove-root"
+          type="button"
+          onClick={() => onRemoveRoot(root)}
+          aria-label="폴더 제거"
+          title={text("폴더 제거", "Remove folder")}
+        >
+          <X size={13} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** 폴더별 설정 편집 폼(제목, 경로, 비고, 에이전트 접근가능 여부). */
+function DocRootSettingsForm({ settings }: { settings: DocRootSettingsState }) {
+  const { text } = useI18n();
+  return (
+    <div className="root-settings-form" role="region" aria-label={text("폴더 설정", "Folder settings")}>
+      <label className="root-settings-field">
+        <span>{text("제목", "Title")}</span>
+        <input
+          value={settings.name}
+          onChange={(event) => settings.setName(event.target.value)}
+          placeholder={text("표시 이름", "Display name")}
+        />
+      </label>
+      <label className="root-settings-field">
+        <span>{text("경로", "Path")}</span>
+        <input
+          value={settings.path}
+          onChange={(event) => settings.setPath(event.target.value)}
+          placeholder="/Users/me/Documents/notes"
+        />
+      </label>
+      <label className="root-settings-field">
+        <span>{text("비고", "Note")}</span>
+        <input
+          value={settings.note}
+          onChange={(event) => settings.setNote(event.target.value)}
+          placeholder={text("폴더 설명 또는 메모 (선택)", "Folder description or note (optional)")}
+        />
+      </label>
+      <label className="root-settings-toggle">
+        <input
+          type="checkbox"
+          checked={settings.agentEnabled}
+          onChange={(event) => settings.setAgentEnabled(event.target.checked)}
+        />
+        <span>{text("에이전트 접근가능", "Agent access enabled")}</span>
+      </label>
+      <div className="root-settings-actions">
+        <button
+          className="button subtle"
+          type="button"
+          disabled={settings.saving}
+          onClick={settings.cancel}
+        >
+          {text("취소", "Cancel")}
+        </button>
+        <button
+          className="button primary"
+          type="button"
+          disabled={settings.saving || !settings.path.trim()}
+          onClick={() => void settings.submit()}
+        >
+          {text("저장", "Save")}
+        </button>
+      </div>
     </div>
   );
 }
@@ -575,6 +685,30 @@ interface DocRootFormState {
   submit: () => Promise<void>;
 }
 
+/** 등록 폴더 개별 설정 편집 폼 상태. */
+interface DocRootSettingsState {
+  editingRootId: string | null;
+  name: string;
+  path: string;
+  note: string;
+  agentEnabled: boolean;
+  saving: boolean;
+  setName: (value: string) => void;
+  setPath: (value: string) => void;
+  setNote: (value: string) => void;
+  setAgentEnabled: (value: boolean) => void;
+  toggle: (root: DocRootStatus) => void;
+  cancel: () => void;
+  submit: (hooks?: DocRootSettingsSubmitHooks) => Promise<void>;
+}
+
+/** 설정 저장이 화면 쪽 기억(열린 문서·이동 기록)과 맞물리는 자리. 등록부는 이 기억을 모른다. */
+interface DocRootSettingsSubmitHooks {
+  /** 경로를 바꾸기 전에 부른다. false면 저장하지 않는다. */
+  confirmPathChange?: (root: DocRootStatus) => Promise<boolean>;
+  onUpdated?: (previous: DocRootStatus | undefined, updated: DocRootStatus) => void;
+}
+
 /**
  * 초안을 버리기 전에 되묻는 물음의 뒷말. 자리마다 문자열을 직접 넘기게 두면 같은 뒷말
  * ("이동할까요?")이 두 자리에 각자 적혀, 한쪽만 고치면 같은 물음이 두 문장으로 갈린다.
@@ -583,6 +717,7 @@ interface DocRootFormState {
 const DISCARD_QUESTIONS = {
   navigate: { ko: "이동할까요?", en: "Navigate anyway?" },
   createFile: { ko: "새 문서를 만들까요?", en: "Create a new document anyway?" },
+  changeRootPath: { ko: "폴더 경로를 바꿀까요?", en: "Change the folder path anyway?" },
 } as const;
 
 type DiscardQuestion = keyof typeof DISCARD_QUESTIONS;
@@ -946,13 +1081,25 @@ function useDocRootRegistry(
   const [name, setName] = useState("");
   const [path, setPath] = useState("");
 
+  const [editingRootId, setEditingRootId] = useState<string | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editPath, setEditPath] = useState("");
+  const [editNote, setEditNote] = useState("");
+  const [editAgentEnabled, setEditAgentEnabled] = useState(true);
+  const [savingSettings, setSavingSettings] = useState(false);
+
+  // 다시 읽기는 첫 화면 효과·등록·해제가 함께 부른다. 늦게 도착한 앞선 목록이 해제 뒤 목록을
+  // 덮으면 지운 폴더가 다시 나타나 선택되므로, 마지막으로 시작한 읽기만 반영한다.
+  const [reloadGate] = useState(createLatestGate);
   const reloadRoots = useCallback(async () => {
+    const isLatest = reloadGate.begin();
     await reportFailure(showError, async () => {
       const next = await getDocRoots();
+      if (!isLatest()) return;
       setRoots(next);
       setSelectedRoot((current) => next.find((root) => root.id === current?.id) ?? next[0] ?? null);
     });
-  }, [showError]);
+  }, [reloadGate, showError]);
 
   useEffect(() => { void reloadRoots(); }, [reloadRoots]);
 
@@ -1001,6 +1148,83 @@ function useDocRootRegistry(
     }
   };
 
+  const toggleSettings = (root: DocRootStatus) => {
+    if (editingRootId === root.id) {
+      setEditingRootId(null);
+      return;
+    }
+    setEditingRootId(root.id);
+    setEditName(root.name);
+    setEditPath(root.path);
+    setEditNote(root.note ?? "");
+    setEditAgentEnabled(root.agentEnabled);
+  };
+
+  const cancelSettings = () => {
+    setEditingRootId(null);
+  };
+
+  const submitSettings = async (
+    targetPath: string,
+    createIfMissing = false,
+    onUpdated?: (previous: DocRootStatus | undefined, updated: DocRootStatus) => void,
+  ) => {
+    if (!editingRootId) return;
+    const previous = roots?.find((item) => item.id === editingRootId);
+    const updated = await updateDocRoot({
+      id: editingRootId,
+      name: editName,
+      path: targetPath,
+      note: editNote.trim() || null,
+      agentEnabled: editAgentEnabled,
+      createIfMissing,
+    });
+    setEditingRootId(null);
+    onUpdated?.(previous, updated);
+    await reloadRoots();
+    setSelectedRoot((current) => (current?.id === updated.id ? updated : current));
+  };
+
+  const saveSettings = async ({ confirmPathChange, onUpdated }: DocRootSettingsSubmitHooks = {}) => {
+    if (!editingRootId) return;
+    const previous = roots?.find((item) => item.id === editingRootId);
+    // 입력값은 정규화 전이라 같은 폴더를 다르게 적어도 바뀐 것으로 본다. 초안이 없으면
+    // 묻지 않으므로 한 번 더 묻는 쪽이 초안을 말없이 잃는 쪽보다 낫다.
+    if (previous && editPath.trim() !== previous.path && confirmPathChange && !(await confirmPathChange(previous))) {
+      return;
+    }
+    showError(null);
+    setSavingSettings(true);
+    try {
+      await submitSettings(editPath, false, onUpdated);
+    } catch (cause) {
+      const missing = missingDirectoryPath(errorText(cause));
+      const plan = missing === null ? null : await previewDirectoryCreation(missing).catch(() => null);
+      const items = directoryCreationItems(plan, missing ?? "");
+      const accepted = missing !== null && await confirm({
+        title: "새 폴더 만들기",
+        message: items.length > 1
+          ? text(
+            "이 경로에 폴더가 없습니다. 아래 폴더를 차례로 만들고 경로를 변경할까요?",
+            "No folder exists at this path. Create the folders below in order and update the path?",
+          )
+          : text(
+            "이 경로에 폴더가 없습니다. 새로운 폴더를 만들고 경로를 변경할까요?",
+            "No folder exists at this path. Create a new folder and update the path?",
+          ),
+        items,
+        confirmLabel: text("만들고 저장", "Create and save"),
+      });
+      if (!accepted) {
+        showError(errorText(cause));
+        return;
+      }
+      await reportFailure(showError, () => submitSettings(missing, true, onUpdated));
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
   /**
    * 등록 해제. 되묻기·삭제·목록 다시 읽기는 등록과 같은 한 벌이라 여기 둔다. 예전에는 이
    * 하나만 화면 본문에 남아 있어 `reloadRoots`가 그 자리 하나 때문에 바깥으로 나가 있었다.
@@ -1022,6 +1246,7 @@ function useDocRootRegistry(
     if (!accepted) return;
     await reportFailure(showError, async () => {
       await deleteDocRoot(root.id);
+      if (editingRootId === root.id) setEditingRootId(null);
       forget();
       setSelectedRoot((current) => current?.id === root.id ? null : current);
       await reloadRoots();
@@ -1038,7 +1263,23 @@ function useDocRootRegistry(
     submit: addRoot,
   };
 
-  return { roots, selectedRoot, setSelectedRoot, removeRoot, rootForm };
+  const rootSettings: DocRootSettingsState = {
+    editingRootId,
+    name: editName,
+    path: editPath,
+    note: editNote,
+    agentEnabled: editAgentEnabled,
+    saving: savingSettings,
+    setName: setEditName,
+    setPath: setEditPath,
+    setNote: setEditNote,
+    setAgentEnabled: setEditAgentEnabled,
+    toggle: toggleSettings,
+    cancel: cancelSettings,
+    submit: saveSettings,
+  };
+
+  return { roots, selectedRoot, setSelectedRoot, removeRoot, rootForm, rootSettings };
 }
 
 /**

@@ -295,6 +295,17 @@ fn antigravity_registrations(
     let Ok(config) = crate::antigravity_mcp_sync::read_config(&home) else {
         return AntigravityRegistrations::default();
     };
+    registrations_pointing_at(&base, &config, attachable)
+}
+
+/// 설정 항목 가운데 지금 프록시 주소를 가리키고 켜져 있는 것만 등록으로 센다.
+/// 설정 파일을 읽는 일과 떼어 두어, 대조 규칙(꺼짐 제외·옛 주소 제외·조각 없는 주소 포함)을
+/// 홈 디렉터리 없이 시험한다.
+fn registrations_pointing_at(
+    base: &str,
+    config: &std::collections::BTreeMap<String, crate::antigravity_mcp_sync::ConfigEntry>,
+    attachable: &[(String, String)],
+) -> AntigravityRegistrations {
     let urls: Vec<&str> = config
         .values()
         .filter(|entry| !entry.disabled)
@@ -303,7 +314,7 @@ fn antigravity_registrations(
     let plugins = attachable
         .iter()
         .filter(|(id, _)| {
-            let current = crate::antigravity_mcp_sync::plugin_url(&base, id);
+            let current = crate::antigravity_mcp_sync::plugin_url(base, id);
             let legacy = format!("{base}/{id}");
             urls.iter().any(|url| *url == current || *url == legacy)
         })
@@ -765,5 +776,44 @@ mod tests {
         let instruction = instruction_for_agent(&catalog, "claude").unwrap();
         assert!(instruction.contains("mcp=비활성"));
         assert!(instruction.contains("mermaid=활성 (사용가능=예, 접근=appRender"));
+    }
+
+    /// P12. 켜진 항목 가운데 지금 프록시 주소(조각 있는 주소·조각 없는 옛 주소)를 가리키는 것만
+    /// 등록으로 센다. 포트가 바뀐 옛 등록과 사용자가 꺼 둔 항목은 닿지 않으므로 세지 않는다.
+    #[test]
+    fn p12_antigravity_registration_counts_only_live_enabled_proxy_urls() {
+        use crate::antigravity_mcp_sync::{plugin_url, ConfigEntry};
+        use std::collections::BTreeMap;
+        let base = "http://127.0.0.1:4100/plugins/key";
+        let stale = "http://127.0.0.1:4999/plugins/key";
+        let entry = |url: String, disabled: bool| ConfigEntry {
+            url: Some(url),
+            disabled,
+        };
+        let config = BTreeMap::from([
+            (
+                "notion".to_owned(),
+                entry(plugin_url(base, "notion"), false),
+            ),
+            ("jira".to_owned(), entry(format!("{base}/jira"), false)),
+            ("gmail".to_owned(), entry(plugin_url(stale, "gmail"), false)),
+            ("drive".to_owned(), entry(plugin_url(base, "drive"), true)),
+            (
+                "cypress".to_owned(),
+                entry(format!("{base}{}", crate::system_mcp::CYPRESS_PATH), false),
+            ),
+        ]);
+        let attachable: Vec<(String, String)> = ["notion", "jira", "gmail", "drive", "github"]
+            .iter()
+            .map(|id| ((*id).to_owned(), id.to_uppercase()))
+            .collect();
+
+        let found = registrations_pointing_at(base, &config, &attachable);
+        assert_eq!(found.plugins, vec!["notion".to_owned(), "jira".to_owned()]);
+        assert!(found.cypress);
+
+        let mut without_cypress = config.clone();
+        without_cypress.get_mut("cypress").unwrap().disabled = true;
+        assert!(!registrations_pointing_at(base, &without_cypress, &attachable).cypress);
     }
 }

@@ -1,3 +1,4 @@
+import { editableTranscriptText, supportsMessageEdit, type MessageRewindDraft } from "../lib/messageEdit";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type PointerEvent as ReactPointerEvent, type Dispatch, type ReactNode, type RefObject, type SetStateAction } from "react";
 import { createPortal } from "react-dom";
 import { AppWindow, Archive, ArchiveRestore, Check, ChevronDown, ExternalLink, Folder, GitBranch, GripVertical, MessagesSquare, PanelLeftOpen, ScrollText, SlidersHorizontal, SquareTerminal, Star, TriangleAlert, type LucideIcon } from "lucide-react";
@@ -9,6 +10,7 @@ import {
   getLiveChats,
   getProviderAccounts,
   getSessionLinkedFile,
+  getSessionDetail,
   hasTauriRuntime,
   openProviderSessionApp,
 } from "../lib/ipc";
@@ -44,6 +46,7 @@ import type {
   SessionMeta,
   SessionSummary,
   SessionTranscriptLimit,
+  TranscriptItem,
 } from "../types";
 import { reasoningOptionsFor, refreshProviderOptions, useProviderOptions } from "../lib/providerOptions";
 import { recentModelsFor } from "../lib/recentModels";
@@ -58,6 +61,8 @@ import { liveStreamBoundaryMs, transcriptBeforeLiveStream } from "../lib/transcr
 import { planExecutionRequest } from "../lib/planRestart";
 import { buildSessionHandoffMessage } from "../lib/sessionHandoff";
 import { saveSessionMetaPatch } from "../lib/sessionMetaSave";
+import { uniqueInOrder } from "../lib/sequence";
+import { collectSessionProjectOptions, linkableProjectOptions, sessionInProject, type SessionProjectOption } from "../lib/sessionProjects";
 import { orderSessionsForList } from "../lib/sessionList";
 import { sessionKey } from "../lib/sessionKey";
 import { sessionFailureTitle } from "../lib/sessionFailure";
@@ -97,6 +102,7 @@ import { SessionFolderSidebar, type FolderFilter } from "./SessionFolderSidebar"
 import { readSecondaryPaneOpen, writeSecondaryPaneOpen } from "../lib/secondaryPane";
 
 interface SessionsProps {
+  active?: boolean;
   providers: ProviderStatus[];
   sessions: SessionSummary[];
   folders: SessionFolder[];
@@ -116,6 +122,8 @@ interface SessionsProps {
   onRefreshList?: () => void;
   /** 이 화면이 이미 팝아웃 창일 때는 '새 창으로 열기'를 다시 제공하지 않는다. */
   popout?: boolean;
+  historyControls?: ReactNode;
+  onOpenChat?: (chatId: string, rewindDraft?: MessageRewindDraft) => Promise<void>;
 }
 
 export interface SessionAttentionTarget {
@@ -173,7 +181,6 @@ function matchesSessionQuery(session: SessionSummary, query: string, chatIds: re
     .some((value) => value.toLowerCase().includes(needle));
 }
 
-/** 한 번에 그리는 세션 행 수. '더 보기'로 이 단위만큼 늘린다. */
 // 목록을 좁히는 축은 한 벌로 묶어 둔다. 축이 하나 늘 때마다 상태 선언·걸러내기·되돌리기·
 // 렌더 구간 초기화 네 자리를 같이 고쳐야 했고, 한 자리만 빠뜨리면 "필터를 바꿨는데 목록이
 // 옛 구간에 멈춘다" 같은 어긋남이 생겼다.
@@ -311,7 +318,8 @@ const SESSION_LIST_FILTER_AXES: SessionListFilterAxis[] = [
     lookups.chatIds.get(sessionKey(session.source, session.id)) ?? [],
   ),
   (session, filters) => filters.source === "all" || session.source === filters.source,
-  (session, filters) => filters.project === "all" || session.cwd === filters.project,
+  // 작업 경로 밖에서 그 프로젝트를 손댄 대화(AIA에게 맡긴 프로젝트 작업 등)도 함께 잡는다.
+  (session, filters) => filters.project === "all" || sessionInProject(session, filters.project),
   // 보관함 칩은 켜면 보관한 세션'만' 보여 준다. 이 축만 양방향으로 걸러낸다.
   (session, filters) => filters.showHidden === session.meta.hidden,
   (session, filters) => filters.includeArchived || !session.archived,
@@ -376,6 +384,7 @@ function sameSessionFolderIds(left: string[], right: string[]): boolean {
 /** 세션 목록 위 공급자 탭. '전체' 다음에 공급자를 정본 순서대로 늘어놓는다. */
 const SESSION_SOURCE_TABS: readonly SessionListFilters["source"][] = ["all", ...PROVIDER_IDS];
 
+/** 한 번에 그리는 세션 행 수. '더 보기'로 이 단위만큼 늘린다. */
 const SESSION_RENDER_PAGE = 100;
 const SESSION_FOLDER_PANE_OPEN_KEY = "agent-manager.session-folder-pane";
 
@@ -480,37 +489,6 @@ function useSessionFolderDrag(assignToFolder: (session: SessionSummary, folderId
  * 세션이 걸리는 축만 풀어야 한다) 목록 화면 본문에 흩어져 있으면 한 자리만 고쳐도 나머지가
  * 어긋났다. 좁히기는 여기 한 벌만 두고, 화면 본문에는 그 결과를 배치하는 일만 남긴다.
  */
-/**
- * 프로젝트 좁히기 칸에 세울 항목 하나. 값은 세션의 작업 경로고, 보이는 문구는 그 경로를
- * 사람이 읽을 꼴로 줄인 것이다. 화면 쪽에서 다시 줄이지 않도록 완성된 문구로 넘긴다.
- */
-interface SessionProjectOption {
-  /** 필터 값으로 쓰는 세션의 작업 경로(`SessionListFilters.project`). */
-  path: string;
-  label: string;
-  count: number;
-}
-
-/**
- * 지금 들고 있는 세션에서 프로젝트 좁히기 목록을 만든다. 등록 프로젝트 목록(`ProjectOption`)과
- * 달리 보관·AIA 세션도 세는데, 이 칸은 "새 작업을 시작할 프로젝트"가 아니라 "이 목록에
- * 들어 있는 세션을 가르는 축"이라 목록에 보이는 것은 모두 고를 수 있어야 하기 때문이다.
- * 세션이 많은 프로젝트를 앞에 둔다.
- */
-function collectSessionProjectOptions(sessions: SessionSummary[]): SessionProjectOption[] {
-  const counts = new Map<string, SessionProjectOption>();
-  for (const session of sessions) {
-    if (!session.cwd) continue;
-    const known = counts.get(session.cwd);
-    if (known) {
-      known.count += 1;
-      continue;
-    }
-    counts.set(session.cwd, { path: session.cwd, label: displayPath(session.project ?? session.cwd), count: 1 });
-  }
-  return [...counts.values()].sort((left, right) => right.count - left.count);
-}
-
 interface SessionListScope {
   filters: SessionListFilters;
   patchFilters: (patch: Partial<SessionListFilters>) => void;
@@ -782,7 +760,7 @@ function useSessionListActions(
   };
 }
 
-export function SessionsView({ providers, sessions, folders, selected, messageDisplayMode, transcriptLimit, onTranscriptLimitChange, onSelect, onMetaChanged, onFoldersChanged, onSessionCatalogChanged, attentionTarget, onAttentionTargetHandled, catalogHealth = null, onRefreshList, popout = false }: SessionsProps) {
+export function SessionsView({ active = true, providers, sessions, folders, selected, messageDisplayMode, transcriptLimit, onTranscriptLimitChange, onSelect, onMetaChanged, onFoldersChanged, onSessionCatalogChanged, attentionTarget, onAttentionTargetHandled, catalogHealth = null, onRefreshList, popout = false, historyControls, onOpenChat }: SessionsProps) {
   const { text } = useI18n();
   const { filters, patchFilters, folderFilter, selectFolder, projects, folderScoped, filtered, visible, showMore } =
     useSessionListScope(sessions, folders, selected, onSelect);
@@ -802,6 +780,9 @@ export function SessionsView({ providers, sessions, folders, selected, messageDi
 
   const sessionDetail = selected ? (
     <SessionDrawer
+      active={active}
+      historyControls={historyControls}
+      onOpenChat={onOpenChat}
       key={sessionKey(selected.source, selected.id)}
       providers={providers}
       sessions={sessions}
@@ -938,7 +919,7 @@ function SessionListToolbar({
     .filter(({ key }) => filters[key] !== DEFAULT_SESSION_LIST_FILTERS[key]).length;
 
   return (
-    <section className="toolbar-card">
+    <section className="toolbar-card session-list-toolbar">
       {!folderPaneOpen && <button ref={folderPaneRestoreRef} className="secondary-pane-restore" type="button" data-ui-anchor="sessions.folders" onClick={onOpenFolderPane} aria-label={collapsedFolderRestoreLabel} title={collapsedFolderRestoreLabel} aria-expanded={false}><PanelLeftOpen size={15} /><span>{collapsedFolderLabel}</span></button>}
       <div className="source-tabs">
         {SESSION_SOURCE_TABS.map((item) => (
@@ -1142,7 +1123,7 @@ function SessionTableRow({
       </td>
       <td>
         <div className="project-cell" data-user-content>
-          <span className="cell-main">{session.project ? displayPath(session.project) : "–"}</span>
+          <span className="cell-main">{session.project ? displayPath(session.project) : "–"}<SessionRelatedProjectsChip session={session} /></span>
           <small title={session.cwd ? displayPath(session.cwd) : undefined}>{session.gitBranch ?? ""}</small>
         </div>
       </td>
@@ -1694,6 +1675,8 @@ function useSessionDrawerScroll({
   detail,
   continuationTurns,
   onBeforeJump,
+  transcript,
+  readingReadyRef,
 }: {
   bodyRef: RefObject<HTMLDivElement | null>;
   sessionId: string;
@@ -1705,14 +1688,18 @@ function useSessionDrawerScroll({
   continuationTurns: ChatTurn[];
   /** 화면을 새 요청 자리로 옮기기 직전에 부른다. 읽던 자리는 그 시점에만 남아 있다. */
   onBeforeJump: () => void;
+  transcript: SessionTranscriptState;
+  readingReadyRef: RefObject<boolean>;
 }): { pauseFollowingLatestMessages: () => void; resumeFollowingLatestMessages: () => void } {
   const initialPositionAppliedRef = useRef(false);
+  const restorePositionRef = useRef(sessionReadingState.get(sessionKey(sessionSource, sessionId)));
   const followLatestMessagesRef = useRef(messageDisplayMode === "latest");
   const handledContinuationUserMessageRef = useRef<string | null>(null);
 
   // 다른 세션이나 다른 표시 범위를 열면 최초 위치를 다시 잡아야 한다.
   useEffect(() => {
     initialPositionAppliedRef.current = false;
+    readingReadyRef.current = false;
     handledContinuationUserMessageRef.current = null;
   }, [sessionSource, sessionId, transcriptLimit]);
 
@@ -1728,16 +1715,40 @@ function useSessionDrawerScroll({
   }, [messageDisplayMode]);
 
   useEffect(() => {
-    if (messageDisplayMode === "start" || initialPositionAppliedRef.current || activeTab !== "conversation" || !detail) return undefined;
-    initialPositionAppliedRef.current = true;
-    return scheduleScrollFrame(() => {
+    if (initialPositionAppliedRef.current || !detail) return undefined;
+    const savedPosition = restorePositionRef.current;
+    const oldest = detail.transcript[0]?.index;
+    if (savedPosition?.oldestIndex !== undefined && oldest !== undefined && oldest > savedPosition.oldestIndex && transcript.earlierLoadCount > 0 && !transcript.earlierError) {
+      if (!transcript.loadingEarlier) void transcript.loadEarlier();
+      return undefined;
+    }
+    let cancelled = false;
+    let frame = 0;
+    const apply = () => {
+      if (cancelled) return;
       const body = bodyRef.current;
       if (!body) return;
-      // '마지막 보낸 메시지부터' 모드는 마지막 사용자 메시지를 화면 맨 위에 두고,
-      // 사용자 메시지가 없으면(세션 정보만 있는 경우) 맨 아래로 대신 이동한다.
-      if (messageDisplayMode === "latest" || !scrollToLastUserMessage(body)) scrollBodyToEnd(body);
-    });
-  }, [bodyRef, activeTab, messageDisplayMode, detail]);
+      if (savedPosition && activeTab !== "terminal") {
+        const anchor = savedPosition.anchor ? Array.from(body.querySelectorAll<HTMLElement>("[data-message-key]")).find((element) => element.dataset.messageKey === savedPosition.anchor) : null;
+        // Keep the regular 60-turn mount window. Expand only until the saved
+        // message appears, through the same control used for manual reading.
+        const expand = body.querySelector<HTMLButtonElement>(".transcript-mount-boundary button");
+        if (!anchor && savedPosition.anchor && expand) {
+          expand.click();
+          frame = requestAnimationFrame(apply);
+          return;
+        }
+        body.scrollTop = anchor ? body.scrollTop + anchor.getBoundingClientRect().top - body.getBoundingClientRect().top - (savedPosition.offset ?? 0) : savedPosition.top;
+        followLatestMessagesRef.current = false;
+      } else if (activeTab === "conversation" && messageDisplayMode !== "start") {
+        if (messageDisplayMode === "latest" || !scrollToLastUserMessage(body)) scrollBodyToEnd(body);
+      }
+      initialPositionAppliedRef.current = true;
+      readingReadyRef.current = true;
+    };
+    frame = requestAnimationFrame(apply);
+    return () => { cancelled = true; cancelAnimationFrame(frame); };
+  }, [bodyRef, activeTab, messageDisplayMode, detail, sessionSource, sessionId, transcript.earlierLoadCount, transcript.earlierError, transcript.loadingEarlier, transcript.loadEarlier, readingReadyRef]);
 
   useEffect(() => {
     if (messageDisplayMode !== "latest" || !followLatestMessagesRef.current || activeTab !== "conversation" || continuationTurns.length === 0) return undefined;
@@ -2648,7 +2659,19 @@ function useSessionContinuation({
  */
 type SessionContinuation = ReturnType<typeof useSessionContinuation>;
 
+// Window-local UI state only; no provider history or transcript text is persisted (G1/G2).
+interface SessionReadingState { tab: SessionDrawerTab; filter: ActivityFilter; top: number; oldestIndex?: number; anchor?: string; offset?: number }
+const sessionReadingState = new Map<string, SessionReadingState>();
+function rememberSessionReading(key: string, value: SessionReadingState) {
+  sessionReadingState.delete(key);
+  sessionReadingState.set(key, value);
+  if (sessionReadingState.size > 100) sessionReadingState.delete(sessionReadingState.keys().next().value!);
+}
+
 function SessionDrawer({
+  active,
+  historyControls,
+  onOpenChat,
   providers,
   sessions,
   session,
@@ -2680,6 +2703,9 @@ function SessionDrawer({
   attachRequestId: number;
   onAttachHandled: (opened: boolean) => void;
   popout: boolean;
+  active: boolean;
+  historyControls?: ReactNode;
+  onOpenChat?: (chatId: string, rewindDraft?: MessageRewindDraft) => Promise<void>;
 }) {
   const { text } = useI18n();
   const drawerTabs = sessionDrawerTabs(text);
@@ -2688,9 +2714,34 @@ function SessionDrawer({
   const metaEditor = useOptimisticSessionMeta(session, onMetaChanged, setError);
   const { meta, patchMeta } = metaEditor;
   const settingsPanel = useSessionSettingsPanel(session.source);
-  const [activeTab, setActiveTab] = useState<SessionDrawerTab>("conversation");
-  const [activityFilter, setActivityFilter] = useState<ActivityFilter>("all");
+  const readingKey = sessionKey(session.source, session.id);
+  const [activeTab, setActiveTab] = useState<SessionDrawerTab>(() => sessionReadingState.get(readingKey)?.tab ?? "conversation");
+  const [activityFilter, setActivityFilter] = useState<ActivityFilter>(() => sessionReadingState.get(readingKey)?.filter ?? "all");
   const drawerBodyRef = useRef<HTMLDivElement>(null);
+  const readingDetailRef = useRef<SessionDetail | null>(null);
+  const readingReadyRef = useRef(false);
+  useLayoutEffect(() => {
+    const body = drawerBodyRef.current;
+    if (!body) return;
+    const save = () => {
+      const currentDetail = readingDetailRef.current;
+      if (!currentDetail || !readingReadyRef.current || !body.isConnected) return;
+      const top = body.getBoundingClientRect().top;
+      const anchor = Array.from(body.querySelectorAll<HTMLElement>("[data-message-key]")).find((element) => element.getBoundingClientRect().bottom > top);
+      rememberSessionReading(readingKey, { tab: activeTab, filter: activityFilter, top: body.scrollTop, oldestIndex: currentDetail.transcript[0]?.index, anchor: anchor?.dataset.messageKey, offset: anchor ? anchor.getBoundingClientRect().top - top : undefined });
+    };
+    body.addEventListener("scroll", save, { passive: true });
+    return () => { save(); body.removeEventListener("scroll", save); };
+  }, [readingKey, activeTab, activityFilter]);
+  const editedBranchRef = useRef<{ index: number; text: string; chatId: string; sendImmediately: boolean; rewindDraft?: MessageRewindDraft } | null>(null);
+  const editPendingRef = useRef(false);
+  const editMountedRef = useRef(false);
+  const editVisibleRef = useRef(active);
+  editVisibleRef.current = active;
+  useEffect(() => {
+    editMountedRef.current = true;
+    return () => { editMountedRef.current = false; };
+  }, []);
   const focusConversation = useCallback(() => setActiveTab("conversation"), []);
   const loadLinkedFile = useCallback(
     (href: string) => getSessionLinkedFile(session.source, session.id, href),
@@ -2711,6 +2762,7 @@ function SessionDrawer({
     scrollContainerRef: drawerBodyRef,
   });
   const { detail, error: transcriptError, refresh: refreshSessionTranscript } = transcript;
+  readingDetailRef.current = detail;
 
   // 이어가기 실행 한 벌. 원문을 읽어 인계 메시지를 만들어야 해 `detail`이 선다음이다.
   const continuation = useSessionContinuation({
@@ -2761,6 +2813,8 @@ function SessionDrawer({
     detail,
     continuationTurns: continuation.turns,
     onBeforeJump: captureReadingPoint,
+    transcript,
+    readingReadyRef,
   });
 
   // 재연결 대상 실행이 백엔드 교체로 사라졌다면 원문뿐 아니라 Core가 별도 보관한
@@ -2786,6 +2840,40 @@ function SessionDrawer({
   );
 
   const forkCwd = continuation.target.cwd;
+  const editMessage = async (item: TranscriptItem, value: string, sendImmediately = true) => {
+    if (editPendingRef.current) throw new Error(text("메시지 편집을 처리 중입니다.", "An edit is already in progress."));
+    const expectedText = editableTranscriptText(item);
+    if (!forkCwd || expectedText === null || continuation.busy) throw new Error(text("진행 중인 작업이 끝난 뒤 다시 시도해 주세요.", "Wait for the current work to finish."));
+    if (!sendImmediately && !onOpenChat) throw new Error(text("채팅 화면에서 다시 시도해 주세요.", "Try again from the chat view."));
+    editPendingRef.current = true;
+    try {
+      const previous = editedBranchRef.current;
+      if (previous && previous.index === item.index && previous.text === value && previous.sendImmediately === sendImmediately) {
+        await (onOpenChat ? onOpenChat(previous.chatId, previous.rewindDraft) : openPopoutWindow({ kind: "chat", chatId: previous.chatId }));
+        return;
+      }
+      const rewindDraft = sendImmediately ? undefined : { text: value, history: (await getSessionDetail(session.source, session.id, "all")).transcript.filter((entry) => entry.index < item.index) };
+      const connection = await connectChat({
+        source: session.source, cwd: forkCwd, model: continuation.source === session.source ? continuation.model || null : null,
+        reasoningEffort: continuation.source === session.source ? continuation.reasoningEffort || null : null,
+        settings: continuation.source === session.source ? continuation.extraSettings : undefined,
+        mode: continuation.mode, approvalMode: continuation.approvalMode,
+        forkSessionId: session.id, editMessage: { index: item.index, expectedText }, unattended: false,
+      }, () => undefined);
+      try {
+        if (!editMountedRef.current || !editVisibleRef.current) {
+          await connection.stop();
+          return;
+        }
+        if (sendImmediately) await connection.send(value);
+        // Once sent, retrying a blocked popout only reopens this branch; never resends.
+        editedBranchRef.current = { index: item.index, text: value, chatId: connection.info.chatId, sendImmediately, rewindDraft };
+      } finally {
+        await connection.detach();
+      }
+      if (editMountedRef.current && editVisibleRef.current) await (onOpenChat ? onOpenChat(connection.info.chatId, rewindDraft) : openPopoutWindow({ kind: "chat", chatId: connection.info.chatId }));
+    } finally { editPendingRef.current = false; }
+  };
   return (
     <>
     <Drawer
@@ -2804,7 +2892,7 @@ function SessionDrawer({
         </button>
         <span data-user-content>{meta.customTitle ?? session.sourceTitle ?? session.title}</span>
       </>}
-      actions={<SessionDrawerHeaderActions
+      actions={<>{historyControls}<SessionDrawerHeaderActions
         session={session}
         popout={popout}
         continuationBusy={continuation.busy}
@@ -2823,7 +2911,7 @@ function SessionDrawer({
           unattended: false,
         }) : null}
         onError={setError}
-      />}
+      /></>}
       headerContent={<div className="session-drawer-header-content">
         {settingsPanel.expanded && <SessionDrawerSettingsPanel
           providers={providers}
@@ -2866,6 +2954,7 @@ function SessionDrawer({
       ) : <>
       {(error ?? transcriptError) && <ErrorBanner message={error ?? transcriptError ?? ""} />}
       <SessionDrawerTranscriptSection
+        onEditMessage={supportsMessageEdit(session.source) && forkCwd ? editMessage : undefined}
         activeTab={activeTab}
         transcript={transcript}
         transcriptLimit={transcriptLimit}
@@ -3044,6 +3133,8 @@ function SessionDrawerSettingsPanel({
 
       <SessionFolderPickerSection folders={folders} editor={editor} />
 
+      <SessionRelatedProjectsSection session={session} sessions={sessions} editor={editor} />
+
       <SessionContinuationAgentSection
         originSource={session.source}
         providers={selectableProviders}
@@ -3079,6 +3170,7 @@ function SessionDrawerSettingsPanel({
  * 표시 필터 상태는 드로어가 들고 있다 — 터미널 탭으로 갔다 와도 고른 값이 유지되어야 한다.
  */
 function SessionDrawerTranscriptSection({
+  onEditMessage,
   activeTab,
   transcript,
   transcriptLimit,
@@ -3088,6 +3180,7 @@ function SessionDrawerTranscriptSection({
   onOpenLocalLink,
   scrollContainerRef,
 }: {
+  onEditMessage?: (item: TranscriptItem, text: string, sendImmediately?: boolean) => Promise<void>;
   activeTab: SessionTranscriptTab;
   transcript: SessionTranscriptState;
   transcriptLimit: SessionTranscriptLimit;
@@ -3139,7 +3232,7 @@ function SessionDrawerTranscriptSection({
             error={earlierError}
             onLoad={() => void loadEarlier()}
           />
-          <TranscriptTurns items={visibleTranscript} mode={activeTab === "activity" ? "activity" : "conversation"} activityFilter={activityFilter} source={detail?.session.source ?? null} sessionId={detail?.session.id ?? null} onOpenLocalLink={onOpenLocalLink} scrollContainerRef={scrollContainerRef} windowed={transcriptLimit === "all"} />
+          <TranscriptTurns onEditMessage={onEditMessage} items={visibleTranscript} mode={activeTab === "activity" ? "activity" : "conversation"} activityFilter={activityFilter} source={detail?.session.source ?? null} sessionId={detail?.session.id ?? null} onOpenLocalLink={onOpenLocalLink} scrollContainerRef={scrollContainerRef} windowed={transcriptLimit === "all"} />
         </>
       )}
     </section>
@@ -3260,6 +3353,76 @@ function SessionFolderPickerSection({ folders, editor: { meta, saving, patchMeta
             {folder.name}{assigned && <Check size={11} />}
           </button>;
         })}
+      </div>
+    </section>
+  );
+}
+
+/**
+ * 목록 행의 관련 프로젝트 표시. 작업 경로 밖에서 손댄 프로젝트가 있으면 개수만 작게 달고,
+ * 이름은 툴팁으로 푼다 — 행 높이를 늘리지 않으면서 "왜 이 필터에 잡혔는지"를 알 수 있다.
+ */
+function SessionRelatedProjectsChip({ session }: { session: SessionSummary }) {
+  const { text } = useI18n();
+  // 같은 프로젝트를 끝 슬래시만 다른 문자열로 연 세션이 있으면 백엔드가 두 문자열을 모두
+  // 싣는다(필터가 원문 cwd로 고르므로). 개수와 이름은 한 번씩만 센다.
+  const related = uniqueInOrder((session.relatedProjects ?? []).map((path) => path.replace(/[\\/]+$/, "") || path));
+  if (related.length === 0) return null;
+  const names = related.map((path) => displayPath(path)).join("\n");
+  return (
+    <span className="session-related-chip" title={text(`작업 경로 밖에서 손댄 프로젝트\n${names}`, `Projects touched outside the working path\n${names}`)}>
+      {text(`+관련 ${related.length}`, `+${related.length} related`)}
+    </span>
+  );
+}
+
+/**
+ * 관련 프로젝트 구역. 파일 수정에서 자동으로 찾은 프로젝트는 읽기 전용으로 보이고, 셸 명령으로
+ * 고쳐 자동으로 잡히지 않은 프로젝트는 여기서 직접 이어 둔다. 이어 둔 프로젝트는 목록의
+ * 프로젝트 필터가 이 세션을 그 프로젝트에서도 보여 준다.
+ */
+function SessionRelatedProjectsSection({ session, sessions, editor: { meta, saving, patchMeta } }: {
+  session: SessionSummary;
+  sessions: SessionSummary[];
+  editor: SessionMetaEditor;
+}) {
+  const { text } = useI18n();
+  const linked = meta.linkedProjectPaths ?? [];
+  const options = useMemo(() => linkableProjectOptions(sessions, session), [sessions, session]);
+  const labelOf = (path: string) => options.find((option) => option.path === path)?.label ?? displayPath(path);
+  // 백엔드가 맞춘 결과 중 직접 이어 둔 것을 뺀 나머지가 자동으로 찾은 프로젝트다. 이어 둔 경로가
+  // 하위 폴더면 맞춘 프로젝트 경로와 문자열이 달라 양쪽에 보일 수 있지만, 둘 다 사실이다.
+  const detected = (session.relatedProjects ?? []).filter((path) => !linked.includes(path));
+  const addable = options.filter((option) => !linked.includes(option.path));
+  const setLinked = (next: string[]) => void patchMeta({ linkedProjectPaths: next });
+
+  return (
+    <section className="session-folder-picker session-related-projects">
+      <span>{text("관련 프로젝트", "Related projects")}</span>
+      <div>
+        {detected.map((path) => <button type="button" className="assigned auto" disabled key={`auto:${path}`} title={text("파일 수정 기록에서 자동으로 찾았습니다", "Detected from file edits")}>
+          {labelOf(path)} <small>{text("자동", "auto")}</small>
+        </button>)}
+        {linked.map((path) => <button
+          type="button"
+          className="assigned"
+          disabled={saving}
+          key={`linked:${path}`}
+          title={text(`${displayPath(path)} — 눌러서 연결 해제`, `${displayPath(path)} — click to unlink`)}
+          onClick={() => setLinked(linked.filter((known) => known !== path))}
+        >
+          {labelOf(path)} <Check size={11} />
+        </button>)}
+        {addable.length > 0 && <select
+          aria-label={text("관련 프로젝트 추가", "Add related project")}
+          value=""
+          disabled={saving}
+          onChange={(event) => { if (event.target.value) setLinked([...linked, event.target.value]); }}
+        >
+          <option value="">{text("+ 프로젝트 연결", "+ Link project")}</option>
+          {addable.map((option) => <option value={option.path} key={option.path}>{option.label}</option>)}
+        </select>}
+        {detected.length === 0 && linked.length === 0 && addable.length === 0 && <small>{text("연결할 프로젝트가 없습니다.", "No projects to link.")}</small>}
       </div>
     </section>
   );

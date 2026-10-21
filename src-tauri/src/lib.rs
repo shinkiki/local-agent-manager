@@ -123,7 +123,14 @@ impl ActiveBackendServiceSettings {
 /// registries from writing the same app-data and provider credential stores.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Register first so a second desktop exits before spawning a backend,
+    // replacing its log, or creating another tray icon. CLI calls bypass run().
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        show_main_window(app);
+    }));
+    builder
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())

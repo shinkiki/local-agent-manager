@@ -5,9 +5,10 @@ description: Agent Manager 설정에서 "에이전트 사용"을 켜 둔 SSH 인
 
 # 허용된 SSH 연결 서버로 접속하기
 
-사용자가 Agent Manager의 애드온 → SSH에서 인증키마다 연결 서버를 적고
-**에이전트 사용**을 켜 둔 것만 이 목록에 나온다. 목록에 없는 서버·키는 사용자가 열어 주지
-않은 것이므로 접속하지 않는다.
+사용자가 Agent Manager의 애드온 → SSH에서 연결 서버(IP·포트·사용자와 접속에 쓸 인증키)를
+추가하고 **에이전트 사용**을 켜 둔 것만 이 목록에 나온다. 목록에 없는 서버·키는 사용자가
+열어 주지 않은 것이므로 접속하지 않는다. 키 하나를 여러 서버가 함께 쓸 수 있으므로 서버는
+지문이 아니라 **`serverId`로** 가리킨다.
 
 ## 실행 파일 찾기
 
@@ -45,9 +46,11 @@ print("CLI_PREFIX=" + shlex.quote(" ".join(d.get("argvPrefix", []))))')"
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "endpoints": [
     {
+      "serverId": "srv-1a2b3c4d5e6f",
+      "name": "사내 빌드 서버",
       "fingerprint": "SHA256:…",
       "keyFileName": "id_deploy",
       "identityPath": "/Users/me/.ssh/id_deploy",
@@ -64,21 +67,23 @@ print("CLI_PREFIX=" + shlex.quote(" ".join(d.get("argvPrefix", []))))')"
       "fileTransferEnabled": true,
       "transferRoot": "/srv/releases",
       "terminalEnabled": true,
+      "passphraseProtected": false,
       "unrestrictedCommands": false,
-      "relayArgs": ["ssh", "exec", "--fingerprint", "SHA256:…", "--"]
+      "relayArgs": ["ssh", "exec", "--server", "srv-1a2b3c4d5e6f", "--"]
     }
   ],
-  "skipped": [{"fingerprint": "SHA256:…", "reason": "…"}],
+  "skipped": [{"serverId": "srv-…", "name": "…", "fingerprint": "SHA256:…", "reason": "…"}],
   "issues": []
 }
 ```
 
 - `endpoints`가 비어 있으면 **쓸 수 있는 서버가 없는 것이다.** 다른 키를 찾거나 `~/.ssh`를
-  뒤지지 말고, 사용자에게 애드온 → SSH에서 연결 서버를 적고 "에이전트 사용"을
+  뒤지지 말고, 사용자에게 애드온 → SSH에서 연결 서버를 추가하고 "에이전트 사용"을
   켜 달라고 말한다.
 - `skipped`는 사용자가 켜 두었지만 지금은 쓸 수 없는 항목이다(개인키 없음, 키 삭제됨).
   이유를 그대로 사용자에게 전한다.
-- `note`는 사용자가 이 키에 적어 둔 메모다. 어느 서버인지 고를 때의 근거로 쓴다.
+- `name`은 사용자가 서버에 붙인 이름이고 `note`는 키에 적어 둔 메모다. 어느 서버인지 고를
+  때의 근거로 쓴다.
 - `fileTransferEnabled`는 이 서버로 **파일을 올리고 받아도 되는지**이고, `transferRoot`가 그
   폴더다. 명령 목록과 **별개의 권한**이라 명령이 하나도 허용되지 않은 서버에 산출물만
   주고받게 해 둘 수도 있다. 꺼져 있으면(또는 `transferRoot`가 비어 있으면) 파일을 옮기지 않고
@@ -88,7 +93,11 @@ print("CLI_PREFIX=" + shlex.quote(" ".join(d.get("argvPrefix", []))))')"
   요청하거나, 읽기라면 허용된 명령(`tail`, `cat`)으로 내용을 받는다.
 
 - `terminalEnabled`는 사용자가 이 서버의 **출력 표시**를 켜 두었다는 뜻이다. 그 서버에서는
-  `ssh`를 직접 부르지 않고 아래 "출력 표시가 켜진 서버는 앱을 거쳐 실행" 절차로 실행한다.
+  `ssh`를 직접 부르지 않고 아래 "앱을 거쳐 실행" 절차로 실행한다.
+- `passphraseProtected`는 이 서버의 키에 **암호가 걸려 있고 그 암호를 앱만 갖고 있다**는
+  뜻이다. 그 서버는 `sshArgs`가 비어 있다. 언제나 아래 "앱을 거쳐 실행" 절차로 실행하고,
+  `ssh`·`scp`를 직접 부르거나 암호를 사용자에게 묻지 않는다. 이 경로에는 파일 전송이 없으므로
+  파일을 옮겨야 하면 사용자에게 알린다.
 
 ## 명령 정책을 먼저 읽는다
 
@@ -122,18 +131,18 @@ print("CLI_PREFIX=" + shlex.quote(" ".join(d.get("argvPrefix", []))))')"
   전부를 무의미하게 만든다. 설치·해제가 필요하면 그 작업을 하는 명령(`tar -xzf`, 패키지 관리자)이
   허용 목록에 있는지 확인하고, 없으면 사용자에게 요청한다.
 
-## 출력 표시가 켜진 서버는 앱을 거쳐 실행
+## 앱을 거쳐 실행 (출력 표시가 켜졌거나 암호 키인 서버)
 
-`terminalEnabled`가 true인 서버에서는 **`ssh`를 직접 부르지 않는다.** 대신 `relayArgs` 뒤에
-원격 명령 단어들을 붙여 같은 실행 파일로 부른다.
+`terminalEnabled`나 `passphraseProtected`가 true인 서버에서는 **`ssh`를 직접 부르지 않는다.**
+대신 `relayArgs` 뒤에 원격 명령 단어들을 붙여 같은 실행 파일로 부른다.
 
 ```sh
-"$CLI" $CLI_PREFIX ssh exec --fingerprint 'SHA256:…' -- systemctl status app --no-pager
-"$CLI" $CLI_PREFIX ssh exec --fingerprint 'SHA256:…' --timeout 120 -- tail -n 200 /var/log/app.log
+"$CLI" $CLI_PREFIX ssh exec --server 'srv-1a2b3c4d5e6f' -- systemctl status app --no-pager
+"$CLI" $CLI_PREFIX ssh exec --server 'srv-1a2b3c4d5e6f' --timeout 120 -- tail -n 200 /var/log/app.log
 # 파이프·인용이 들어가면 명령 전체를 큰따옴표로 감싸 **한 덩이로** 넘긴다. 그러지 않으면
 # 파이프를 네 셸이 먼저 먹어 CLI의 출력이 로컬 grep으로 들어간다.
-"$CLI" $CLI_PREFIX ssh exec --fingerprint 'SHA256:…' -- "journalctl -u app -n 200 | grep -i error"
-"$CLI" $CLI_PREFIX ssh exec --fingerprint 'SHA256:…' -- "grep -c 'foo bar' /var/log/app.log"
+"$CLI" $CLI_PREFIX ssh exec --server 'srv-1a2b3c4d5e6f' -- "journalctl -u app -n 200 | grep -i error"
+"$CLI" $CLI_PREFIX ssh exec --server 'srv-1a2b3c4d5e6f' -- "grep -c 'foo bar' /var/log/app.log"
 ```
 
 - 실행은 떠 있는 Agent Manager 백엔드가 하고, 출력은 **사용자가 보는 이 대화의 도구 카드에
@@ -152,11 +161,11 @@ print("CLI_PREFIX=" + shlex.quote(" ".join(d.get("argvPrefix", []))))')"
   직접 부르는 것으로 우회하지 말고 사용자에게 앱을 실행해 달라고 말한다.
 - `AGENT_MANAGER_CHAT_ID` 환경 변수는 Agent Manager가 이 대화의 셸에 심어 둔 값이다. 지우거나
   바꾸지 않는다 — 없으면 출력이 화면에 흐르지 않고 실행만 된다.
-- 파일 전송은 이 경로에 없다. 아래 `scp` 절 그대로 한다.
+- 파일 전송은 이 경로에 없다. 암호 키가 아닌 서버는 아래 `scp` 절 그대로 한다.
 
 ## 접속
 
-`terminalEnabled`가 false인 서버에서는 `sshCommand`를 그대로 쓰거나 `sshArgs` 뒤에 원격
+`terminalEnabled`와 `passphraseProtected`가 모두 false인 서버에서는 `sshCommand`를 그대로 쓰거나 `sshArgs` 뒤에 원격
 명령을 붙인다.
 
 ```sh
@@ -215,7 +224,7 @@ scp -i /Users/me/.ssh/id_deploy -P 22 -o IdentitiesOnly=yes -o BatchMode=yes \
 - 개인키 파일을 읽거나, 복사하거나, 내용을 출력하지 않는다. `ssh`에 경로만 넘긴다.
 - 목록에 없는 호스트·사용자·키로 접속하지 않는다. 사용자 `~/.ssh/config`를 뒤져 다른
   대상을 찾지 않는다.
-- `~/.ssh`의 어떤 파일도 고치지 않는다. 키 생성·삭제·메모·연결 서버 변경은 모두 Agent
-  Manager 설정 화면의 일이다.
+- `~/.ssh`의 어떤 파일도 고치지 않는다. 키 생성·삭제·메모·암호·연결 서버 추가와 변경은 모두
+  Agent Manager 설정 화면의 일이다.
 - 원격에서 되돌리기 어려운 명령(삭제, 서비스 중단, 배포)은 사용자에게 먼저 확인받는다.
   로컬에서와 같은 기준을 원격에서도 적용한다.

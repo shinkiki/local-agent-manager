@@ -46,6 +46,8 @@ const PATCH_RULES: { [Key in PatchKey]: PatchRule<Key> } = {
   customTitle: cleanOptional,
   pinnedAccountId: cleanOptional,
   folderIds: uniqueInOrder,
+  // 백엔드는 앞뒤 공백을 떼고 빈 값을 버린 뒤 같은 경로를 한 번만 둔다.
+  linkedProjectPaths: (paths) => uniqueInOrder(paths.map((path) => path.trim()).filter((path) => path.length > 0)),
   // 읽던 자리는 지금도 낙관 갱신하지 않는다. 목록을 통째로 교체하는 편집이라 서버가
   // 돌려준 목록을 그대로 받는 쪽이 화면과 저장본을 어긋나게 하지 않는다. 바꾸려면 여기
   // 한 줄을 규칙으로 채우면 되고, 그때까지 이 자리가 "빠뜨린 것이 아니다"를 말한다.

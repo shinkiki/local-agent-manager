@@ -13,7 +13,7 @@
  * 빈 칸은 "그대로 두기"이지 "지우기"가 아니다. 지우는 것은 버튼으로 따로 시킨다.
  */
 import { LoaderCircle, Plus, Server, Star, Trash2 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useI18n } from "../lib/i18n";
 import {
@@ -100,6 +100,11 @@ export function LocalLlmConnectionCard() {
   // 주소를 적으면 잠시 뒤 스스로 점검한다. Tailscale 너머 주소처럼 손으로 적는 값은 오타가
   // 흔하고, "확인"을 누를 때까지 결과를 감추면 저장한 뒤 채팅이 거절될 때 처음 안다.
   const draftBaseUrl = draft?.baseUrl ?? "";
+  // 손으로 누른 "확인"의 결과가 돌아왔을 때 화면이 여전히 그 주소를 보고 있는지 가린다.
+  // 기다리는 사이 주소를 고치거나 다른 연결을 열면, 앞 주소의 모델 목록이 지금 초안의
+  // 모델 선택지로 붙는다(자동 점검은 `alive`로 같은 것을 막는다).
+  const probeTargetRef = useRef<string | null>(null);
+  probeTargetRef.current = draft ? draftBaseUrl : null;
   useEffect(() => {
     if (!draft || !probeable(draftBaseUrl)) { setProbe(null); return; }
     let alive = true;
@@ -137,11 +142,12 @@ export function LocalLlmConnectionCard() {
 
   const runProbe = useCallback(() => {
     if (!draft) return;
+    const requested = draft.baseUrl;
     setBusy("probe");
     setError(null);
-    probeLocalLlmConnection(draft.baseUrl)
-      .then((result) => setProbe(result))
-      .catch((cause) => setError(errorMessage(cause)))
+    probeLocalLlmConnection(requested)
+      .then((result) => { if (probeTargetRef.current === requested) setProbe(result); })
+      .catch((cause) => { if (probeTargetRef.current === requested) setError(errorMessage(cause)); })
       .finally(() => setBusy(null));
   }, [draft]);
 

@@ -126,7 +126,10 @@ impl JsonStore {
 /// 정렬을 빠뜨리면 저장본의 순서가 뒤집힌다) 컴파일은 지나가고 저장본만 달라지므로
 /// 한 벌로 모은다.
 ///
-/// 정렬은 모두 안정 정렬이라 같은 시각의 항목끼리는 원래 순서를 지킨다.
+/// 같은 시각(밀리초가 같은 두 기록)이면 뒤에 덧붙은 쪽이 새것이다. 두 저장소 모두 새 기록을
+/// 끝에 `push` 하므로, 최신순 정렬 전에 목록을 뒤집어 안정 정렬이 그 순서를 "뒤가 먼저"로
+/// 지키게 한다 — 뒤집지 않으면 동점에서 방금 넣은 기록이 먼저 버려졌다. 정리가 끝나면 다시
+/// 뒤집기만 해도 오래된 순이 되고, 동점끼리는 원래 덧붙은 순서로 돌아온다.
 pub(crate) fn trim_to_retention<T, K: Eq + Hash>(
     items: &mut Vec<T>,
     max_total: usize,
@@ -134,6 +137,7 @@ pub(crate) fn trim_to_retention<T, K: Eq + Hash>(
     recorded_at: impl Fn(&T) -> i64,
     key: impl Fn(&T) -> K,
 ) {
+    items.reverse();
     items.sort_by_key(|item| std::cmp::Reverse(recorded_at(item)));
     let mut per_key: HashMap<K, usize> = HashMap::new();
     items.retain(|item| {
@@ -142,7 +146,7 @@ pub(crate) fn trim_to_retention<T, K: Eq + Hash>(
         *count <= max_per_key
     });
     items.truncate(max_total);
-    items.sort_by_key(|item| recorded_at(item));
+    items.reverse();
 }
 
 #[cfg(test)]
@@ -275,6 +279,19 @@ mod tests {
             vec![("a", 1), ("a", 2), ("a", 3), ("b", 4), ("b", 5), ("c", 6)];
         trim_to_retention(&mut items, 4, 2, |item| item.1, |item| item.0);
         assert_eq!(items, vec![("a", 3), ("b", 4), ("b", 5), ("c", 6)]);
+    }
+
+    /// 같은 시각의 기록은 뒤에 덧붙은 것이 새것이다. 상한에 걸리면 앞의 것이 버려지고,
+    /// 남은 동점끼리는 덧붙은 순서를 지킨다.
+    #[test]
+    fn retention_treats_the_later_appended_record_as_newer_on_equal_timestamps() {
+        let mut tagged: Vec<(usize, &str, i64)> = vec![(0, "a", 7), (1, "a", 7), (2, "a", 7)];
+        trim_to_retention(&mut tagged, 10, 2, |item| item.2, |item| item.1);
+        assert_eq!(tagged, vec![(1, "a", 7), (2, "a", 7)]);
+
+        let mut overall: Vec<(usize, i64)> = vec![(0, 1), (1, 5), (2, 5), (3, 5)];
+        trim_to_retention(&mut overall, 2, 10, |item| item.1, |_| ());
+        assert_eq!(overall, vec![(2, 5), (3, 5)]);
     }
 
     /// 상한에 닿지 않으면 버리는 것 없이 오래된 순 정렬만 남는다.

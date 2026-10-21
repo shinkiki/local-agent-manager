@@ -11,7 +11,7 @@
 //!
 //! # 토큰이 무엇에 묶이는가
 //!
-//! 발급된 토큰은 (대화, 지문, 정규화된 명령 문자열, 용도) 네 값에 묶이고 한 번만 쓰인다.
+//! 발급된 토큰은 (대화, 서버 ID, 정규화된 명령 문자열, 용도) 네 값에 묶이고 한 번만 쓰인다.
 //! 넷 중 하나라도 다르면 소모되지 않는다. 그래서 승인 뒤에 명령을 늘리거나(`ls /srv` →
 //! `ls /srv /etc`), 다른 서버에 같은 토큰을 쓰거나, 같은 토큰으로 두 번 실행하는 일이
 //! 성립하지 않는다. 만료는 짧다 — 승인은 "지금 이 대화에서 이것을 해라"는 뜻이고, 한참
@@ -83,7 +83,7 @@ impl SshApprovalScope {
 struct PendingSshApproval {
     id: String,
     chat_id: String,
-    fingerprint: String,
+    server_id: String,
     destination: String,
     command: String,
     scope: SshApprovalScope,
@@ -125,7 +125,7 @@ impl PendingSshApproval {
                 request.scope.as_str()
             )));
         }
-        if self.fingerprint != request.fingerprint {
+        if self.server_id != request.server_id {
             return Err(CoreError::Conflict(
                 "이 승인은 다른 연결 서버에 대한 것입니다. 같은 승인을 다른 서버에 쓸 수 없습니다"
                     .to_owned(),
@@ -211,7 +211,7 @@ impl ApprovalEntry for PendingSshApproval {
             scope: self.scope,
             destination: self.destination.clone(),
             command: self.command.clone(),
-            fingerprint: self.fingerprint.clone(),
+            server_id: self.server_id.clone(),
             needs_secret: self.needs_secret,
         }
     }
@@ -258,7 +258,7 @@ pub struct SshApprovalDecision {
     pub destination: String,
     pub command: String,
     /// C9-19. 사용자가 비밀번호를 함께 보냈을 때 그것을 어느 서버 앞으로 둘지 가른다.
-    pub fingerprint: String,
+    pub server_id: String,
     /// C9-19. 이 카드가 비밀번호를 요구했는지. 요구하지 않은 카드에 딸려 온 값은 버린다.
     pub needs_secret: bool,
 }
@@ -266,7 +266,7 @@ pub struct SshApprovalDecision {
 /// 승인 요청을 열 때 필요한 값.
 #[derive(Clone, Debug)]
 pub struct SshApprovalOpen<'a> {
-    pub fingerprint: &'a str,
+    pub server_id: &'a str,
     pub destination: &'a str,
     /// 정규화된 명령. 요청 원문이 아니라 실제로 넘어갈 값이어야 한다 — 대조하는 값과
     /// 사용자가 읽는 값이 다르면 승인은 다른 명령에 대한 것이 된다.
@@ -281,7 +281,7 @@ pub struct SshApprovalOpen<'a> {
 #[derive(Clone, Debug)]
 pub struct SshApprovalConsume<'a> {
     pub approval_id: &'a str,
-    pub fingerprint: &'a str,
+    pub server_id: &'a str,
     pub command: &'a str,
     pub scope: SshApprovalScope,
 }
@@ -302,18 +302,18 @@ pub trait SshApprovalGate {
     /// C9-19. 이 대화가 그 서버에 대해 sudo 비밀번호를 들고 있는지. 값을 묻지 않고 있는지만
     /// 묻는 자리다 — 승인 카드에 입력칸을 띄울지 가리는 데 쓴다. 대화가 없는 호출자는 값을
     /// 받을 자리도 없으므로 기본은 "없음"이다.
-    fn holds_sudo_secret(&self, _fingerprint: &str) -> bool {
+    fn holds_sudo_secret(&self, _server_id: &str) -> bool {
         false
     }
 
     /// C9-19. 실행 직전에 값을 꺼낸다. `Zeroizing`이라 호출자가 떨어뜨리면 함께 지워진다.
-    fn take_sudo_secret(&self, _fingerprint: &str) -> Option<Zeroizing<String>> {
+    fn take_sudo_secret(&self, _server_id: &str) -> Option<Zeroizing<String>> {
         None
     }
 
     /// C9-19. 원격이 그 값을 거절했을 때 버린다. 틀린 값을 들고 남은 시간 내내 실패하는
     /// 대신 다음 명령에서 다시 묻는다.
-    fn discard_sudo_secret(&self, _fingerprint: &str) {}
+    fn discard_sudo_secret(&self, _server_id: &str) {}
 }
 
 /// 대화별 승인 토큰 저장소. 규칙은 [`ApprovalLedger`]가 지키고, 여기서는 SSH 승인이
@@ -328,7 +328,7 @@ impl SshApprovalStore {
         Self::default()
     }
 
-    /// 승인 요청을 하나 연다. 같은 대화에서 같은 지문·명령·용도의 요청이 아직 답을
+    /// 승인 요청을 하나 연다. 같은 대화에서 같은 서버·명령·용도의 요청이 아직 답을
     /// 기다리고 있으면 새로 열지 않고 그 카드를 돌려준다 — 같은 도구 호출을 두 번 한
     /// AIA 때문에 사용자가 똑같은 카드를 두 장 받지는 않아야 한다.
     pub fn open(
@@ -341,7 +341,7 @@ impl SshApprovalStore {
             chat_id,
             now,
             |entry| {
-                entry.fingerprint == request.fingerprint
+                entry.server_id == request.server_id
                     && entry.command == request.command
                     && entry.scope == request.scope
             },
@@ -350,7 +350,7 @@ impl SshApprovalStore {
                     // 승인 id는 공급자 승인 id와 한 이름공간을 쓰므로 접두로 갈라 둔다.
                     id: format!("ssh-approval-{}", Uuid::new_v4()),
                     chat_id: chat_id.to_owned(),
-                    fingerprint: request.fingerprint.to_owned(),
+                    server_id: request.server_id.to_owned(),
                     destination: request.destination.to_owned(),
                     command: request.command.to_owned(),
                     scope: request.scope,
@@ -440,7 +440,7 @@ mod tests {
 
     fn open_request(command: &str, scope: SshApprovalScope) -> SshApprovalOpen<'_> {
         SshApprovalOpen {
-            fingerprint: PRINT,
+            server_id: PRINT,
             destination: "deploy@build.example.com:22",
             command,
             scope,
@@ -456,7 +456,7 @@ mod tests {
     ) -> SshApprovalConsume<'a> {
         SshApprovalConsume {
             approval_id,
-            fingerprint: PRINT,
+            server_id: PRINT,
             command,
             scope,
         }
@@ -504,6 +504,27 @@ mod tests {
         // 소모된 카드는 더 이상 대기 목록에 없고, 사용자도 다시 답할 수 없다.
         assert!(store.pending_cards(CHAT).is_empty());
         assert!(store.resolve(CHAT, &ticket.id, true).is_err());
+    }
+
+    /// C9-17-5. 먼저 온 결정이 남는다 — 거절한 카드에 늦게 온 허용이 토큰을 되살리지 않는다.
+    #[test]
+    fn c9_17_5_second_answer_never_flips_the_first_decision() {
+        let store = SshApprovalStore::new();
+        let (declined, _) = store
+            .open(CHAT, open_request("docker ps", SshApprovalScope::OneShot))
+            .expect("발급");
+        store.resolve(CHAT, &declined.id, false).expect("거절");
+        let error = store
+            .resolve(CHAT, &declined.id, true)
+            .expect_err("두 번째 답");
+        assert!(error.to_string().contains("이미 답"));
+        let error = store
+            .consume(
+                CHAT,
+                consume_request(&declined.id, "docker ps", SshApprovalScope::OneShot),
+            )
+            .expect_err("거절된 승인");
+        assert!(error.to_string().contains("거절"));
     }
 
     /// C9-17. 거절된 승인은 실행되지 않고, 만료된 토큰은 승인돼 있어도 쓸 수 없다.
@@ -575,7 +596,7 @@ mod tests {
                 CHAT,
                 SshApprovalConsume {
                     approval_id: &ticket.id,
-                    fingerprint: OTHER_PRINT,
+                    server_id: OTHER_PRINT,
                     command: "ls /srv",
                     scope: SshApprovalScope::OneShot,
                 },
@@ -637,7 +658,7 @@ mod tests {
                         CHAT,
                         SshApprovalConsume {
                             approval_id: &id,
-                            fingerprint: PRINT,
+                            server_id: PRINT,
                             command: "docker restart app",
                             scope: SshApprovalScope::OneShot,
                         },

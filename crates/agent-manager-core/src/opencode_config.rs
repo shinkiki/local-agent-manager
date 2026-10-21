@@ -250,8 +250,11 @@ pub fn apply(
             )))
         }
     };
-    let mut merged = merged(&existing, entry, models, api_key, plugin_shell);
-    prune_removed_providers(&mut merged, known_ids, &entry.id);
+    // 지워진 연결을 먼저 걷어낸다. [`merged`]가 남은 공급자를 보고 에이전트 항을 둘지
+    // 정하므로, 순서가 바뀌면 공급자는 다 사라지고 에이전트만 남는다(C14-2).
+    let mut existing = existing;
+    prune_removed_providers(&mut existing, known_ids, &entry.id);
+    let merged = merged(&existing, entry, models, api_key, plugin_shell);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
             CoreError::Runtime(format!("{}를 만들지 못했습니다: {error}", parent.display()))
@@ -1975,6 +1978,47 @@ mod tests {
         assert_eq!(
             written["provider"][PROVIDER_ID]["options"]["apiKey"],
             "비밀키"
+        );
+    }
+
+    #[test]
+    fn applying_disabled_connection_prunes_removed_providers_and_cleans_agents() {
+        // C14-2: 지워진 연결만 남은 상태에서 끄면 공급자와 에이전트가 함께 사라져야 한다.
+        let home = tempfile::tempdir().expect("홈");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("부모")).expect("디렉터리");
+        fs::write(
+            &path,
+            r#"{
+                "provider": {
+                    "agent-manager-local-old": { "options": {} }
+                },
+                "agent": {
+                    "agent-manager-local": { "mode": "subagent" }
+                }
+            }"#,
+        )
+        .expect("기존 파일");
+
+        apply(
+            home.path(),
+            &connection("http://127.0.0.1:11434/v1", false),
+            &[],
+            None,
+            &[],
+            false,
+        )
+        .expect("적용");
+
+        let written: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("읽기")).expect("json");
+        assert!(
+            written.get("provider").is_none(),
+            "provider 항이 남아있지 않아야 한다: {written:?}"
+        );
+        assert!(
+            written.get("agent").is_none(),
+            "agent 항이 남아있지 않아야 한다: {written:?}"
         );
     }
 

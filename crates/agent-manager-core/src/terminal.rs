@@ -125,7 +125,8 @@ pub struct AccountLoginCallbackRelay {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalSshRequest {
-    pub fingerprint: String,
+    /// 연결 서버 ID. 같은 서버는 같은 터미널로 다시 붙는다.
+    pub server_id: String,
     pub cols: u16,
     pub rows: u16,
     /// 이 창으로 무엇을 할지. 적지 않으면 지금까지처럼 원격 셸이다.
@@ -270,10 +271,10 @@ impl SessionKey {
         )
     }
 
-    fn ssh(fingerprint: &str, mode: TerminalSshMode) -> Self {
+    fn ssh(server_id: &str, mode: TerminalSshMode) -> Self {
         Self {
             source: None,
-            session_id: ssh_terminal_session_id(fingerprint, mode),
+            session_id: ssh_terminal_session_id(server_id, mode),
         }
     }
 
@@ -645,15 +646,15 @@ impl TerminalSupervisor {
         let launch = match request.mode {
             TerminalSshMode::Shell => crate::ssh_endpoints::ssh_terminal_launch(
                 &self.inner.app_data_dir,
-                &request.fingerprint,
+                &request.server_id,
             ),
             // C9-20. 공개키 등록은 원격 명령 하나를 달고 열려 끝나면 스스로 닫힌다.
             TerminalSshMode::InstallKey => crate::ssh_endpoints::ssh_key_install_launch(
                 &self.inner.app_data_dir,
-                &request.fingerprint,
+                &request.server_id,
             ),
         }?;
-        let key = SessionKey::ssh(&launch.fingerprint, request.mode);
+        let key = SessionKey::ssh(&launch.server_id, request.mode);
         self.open_with(
             key,
             request.cols,
@@ -1592,12 +1593,12 @@ fn validate_identifier(id: &str) -> Result<(), CoreError> {
 }
 
 /// 지문(`SHA256:base64`)은 잠금 파일 이름에 못 쓰는 글자를 담으므로, 세션 id는 영문·숫자만
-/// 남긴 지문으로 만든다. 같은 지문은 같은 id가 되어 재접속이 같은 터미널에 닿는다.
+/// 서버 ID로 만든다. 같은 서버는 같은 id가 되어 재접속이 같은 터미널에 닿는다.
 ///
 /// C9-20. 갈래가 다르면 id도 달라야 한다. 같은 id를 쓰면 열려 있던 원격 셸에 다시 붙어
 /// 버려서, 공개키를 등록하려고 누른 버튼이 등록을 하지 않는다.
-fn ssh_terminal_session_id(fingerprint: &str, mode: TerminalSshMode) -> String {
-    let body = fingerprint
+fn ssh_terminal_session_id(server_id: &str, mode: TerminalSshMode) -> String {
+    let body = server_id
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
         .collect::<String>();

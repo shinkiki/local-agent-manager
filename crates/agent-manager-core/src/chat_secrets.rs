@@ -894,13 +894,37 @@ fn resolve_executable(name: &str) -> Result<PathBuf, CoreError> {
 }
 
 /// 회수한 텍스트에서 비밀값을 지운다. 정확 일치만 잡는다.
+///
+/// 일치 구간을 원문에서 모두 모아 겹치거나 맞닿은 것을 합친 뒤 한 번에 바꾼다. 값을 하나씩
+/// 차례로 바꾸면 앞서 바꾼 값이 다른 값의 일부를 먹어(`abcd`가 `abcdefgh` 안에, `abcdXY`와
+/// `XYefgh`가 `abcdXYefgh`에서 겹쳐) 나머지 조각이 출력에 남는다(C15-5).
 pub(crate) fn scrub(text: &str, secrets: &[Zeroizing<String>]) -> String {
-    let mut scrubbed = text.to_owned();
-    for secret in secrets {
-        if secret.len() >= 4 {
-            scrubbed = scrubbed.replace(secret.as_str(), REDACTED);
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for secret in secrets.iter().filter(|secret| secret.len() >= 4) {
+        let mut from = 0;
+        while let Some(offset) = text[from..].find(secret.as_str()) {
+            let begin = from + offset;
+            ranges.push((begin, begin + secret.len()));
+            // 겹친 일치도 잡도록 한 글자만 넘어간다.
+            from = begin + text[begin..].chars().next().map_or(1, char::len_utf8);
         }
     }
+    ranges.sort_unstable();
+    let mut scrubbed = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut index = 0;
+    while index < ranges.len() {
+        let (begin, mut finish) = ranges[index];
+        index += 1;
+        while index < ranges.len() && ranges[index].0 <= finish {
+            finish = finish.max(ranges[index].1);
+            index += 1;
+        }
+        scrubbed.push_str(&text[cursor..begin]);
+        scrubbed.push_str(REDACTED);
+        cursor = finish;
+    }
+    scrubbed.push_str(&text[cursor..]);
     scrubbed
 }
 
@@ -1204,6 +1228,31 @@ mod tests {
         ];
         let scrubbed = scrub("token=hunter2secret ab", &secrets);
         assert_eq!(scrubbed, format!("token={REDACTED} ab"));
+    }
+
+    #[test]
+    fn scrub_removes_a_longer_value_that_contains_a_shorter_one() {
+        // C15-5: 짧은 값이 먼저 와도 긴 값의 조각이 남으면 안 된다.
+        let secrets = vec![
+            Zeroizing::new("abcd".to_owned()),
+            Zeroizing::new("abcdefgh".to_owned()),
+        ];
+        let scrubbed = scrub("key=abcdefgh short=abcd", &secrets);
+        assert_eq!(scrubbed, format!("key={REDACTED} short={REDACTED}"));
+    }
+
+    #[test]
+    fn scrub_removes_partially_overlapping_values_whole() {
+        // C15-5: 어느 쪽이 먼저 와도 겹친 두 값의 조각이 남지 않는다.
+        for secrets in [vec!["abcdXY", "XYefgh"], vec!["XYefgh", "abcdXY"]] {
+            let secrets: Vec<_> = secrets
+                .into_iter()
+                .map(|value| Zeroizing::new(value.to_owned()))
+                .collect();
+            assert_eq!(scrub("v=abcdXYefgh;", &secrets), format!("v={REDACTED};"));
+        }
+        let secrets = vec![Zeroizing::new("값값값값".to_owned())];
+        assert_eq!(scrub("a값값값값값b", &secrets), format!("a{REDACTED}b"));
     }
 
     #[test]

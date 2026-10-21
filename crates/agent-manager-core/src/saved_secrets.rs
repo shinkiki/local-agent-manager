@@ -27,6 +27,16 @@
 //! 결정, 2026-09-29). 꺼 두면 그 값은 저장소 화면에서만 살아 있고 어떤 대화에도 실리지
 //! 않으므로, 요청은 예전처럼 카드로 간다. 토글은 값을 지우지 않으므로, 잠시 닫아 두었다가
 //! 다시 여는 데 값을 다시 붙여 넣을 필요가 없다.
+//!
+//! # git 원격용 토큰(C16-11)
+//!
+//! 프로젝트 git이 HTTPS 원격과 주고받을 때(가져오기·끌어오기·푸시) 쓰는 토큰도 여기 값으로
+//! 둔다. 다만 **어느 프로젝트의 어느 호스트에 어떤 값을 쓸지는 이 모듈이 모른다** — 그 선택은
+//! 형상관리 탭의 git 원격 인증(프로젝트 목록 옆 톱니바퀴)에서 프로젝트마다 하고 `project_git`의 저장본에 이름으로만 남는다. 값 하나가
+//! 여러 프로젝트에 쓰일 수 있고, 같은 호스트라도 프로젝트마다 다른 값을 쓸 수 있기 때문이다.
+//! 이 모듈은 이름을 받아 값을 꺼내 줄 뿐이다([`take_for_git_remote`]). 에이전트 자동 사용과는
+//! 별개인 사용자 경로라 `agentEnabled`를 보지 않으며, 값은 대화 메모리로 실리지 않고 그 git
+//! 자식 프로세스의 환경에만 들어간다.
 
 use std::path::Path;
 
@@ -239,40 +249,173 @@ pub(crate) fn take_for_use(
     app_data_dir: &Path,
     name: &str,
 ) -> Result<Option<(String, Zeroizing<String>)>, CoreError> {
-    let store: SavedSecretStore = STORE.read(app_data_dir)?;
-    let Some(entry) = store.secrets.iter().find(|entry| entry.name == name) else {
-        return Ok(None);
-    };
-    // C17-5. 에이전트 사용을 끈 값은 없는 것처럼 답한다. 저장은 사용자의 보관이고, 자동
-    // 사용은 그 위에 따로 켜는 것이다.
-    if !entry.agent_enabled {
-        return Ok(None);
-    }
-    let purpose = entry.purpose.clone();
-    let Some(value) =
-        crate::accounts::read_os_keychain_password(SAVED_SECRET_KEYCHAIN_SERVICE, name)?
-    else {
-        return Ok(None);
-    };
-    // 사용 시각은 기록이 목적이라, 남기지 못해도 값은 그대로 내보낸다.
-    let _ = STORE.update(app_data_dir, |store: &mut SavedSecretStore| {
-        match store.secrets.iter_mut().find(|entry| entry.name == name) {
-            Some(entry) => {
-                entry.last_used_at = Some(now_ms());
-                Ok(true)
-            }
-            None => Ok(false),
+    take_for_use_with(app_data_dir, name, || {
+        crate::accounts::read_os_keychain_password(SAVED_SECRET_KEYCHAIN_SERVICE, name)
+    })
+}
+
+fn take_for_use_with(
+    app_data_dir: &Path,
+    name: &str,
+    read_value: impl FnOnce() -> Result<Option<Zeroizing<String>>, CoreError>,
+) -> Result<Option<(String, Zeroizing<String>)>, CoreError> {
+    // C17-5. 허용 여부 검사와 값 읽기를 토글·삭제와 같은 잠금 아래 묶는다. 메타데이터만
+    // 읽고 잠금을 놓으면, 자동 사용을 끈 뒤에도 이전 true로 키체인을 읽을 수 있다.
+    STORE.with_lock(app_data_dir, || {
+        let mut store: SavedSecretStore = STORE.load_unlocked(app_data_dir)?;
+        let Some(entry) = store.secrets.iter_mut().find(|entry| entry.name == name) else {
+            return Ok(None);
+        };
+        if !entry.agent_enabled {
+            return Ok(None);
         }
-    });
-    Ok(Some((purpose, value)))
+        let Some(value) = read_value()? else {
+            return Ok(None);
+        };
+        let purpose = entry.purpose.clone();
+        entry.last_used_at = Some(now_ms());
+        // 사용 시각은 기록이 목적이라, 남기지 못해도 값은 그대로 내보낸다.
+        let _ = STORE.save_unlocked(app_data_dir, &store);
+        Ok(Some((purpose, value)))
+    })
+}
+
+/// C16-11. 저장된 값의 이름들. 프로젝트 설정이 git 원격용 토큰을 고를 목록이자, 지정된
+/// 이름이 아직 살아 있는지 개요가 확인하는 자리다. 값은 읽지 않으므로 화면을 새로 고칠 때마다
+/// 불러도 OS 보안 저장소를 깨우지 않는다.
+pub(crate) fn saved_secret_names(app_data_dir: &Path) -> Result<Vec<String>, CoreError> {
+    let store: SavedSecretStore = STORE.read(app_data_dir)?;
+    Ok(store.secrets.into_iter().map(|entry| entry.name).collect())
+}
+
+/// C16-11. 프로젝트 설정이 그 프로젝트의 git 원격용으로 고른 값을 이름으로 꺼낸다. 프로젝트
+/// git의 네트워크 작업 하나만 부르고, 꺼낸 값은 그 git 자식의 환경으로만 간다. 이름이 없거나
+/// OS 보안 저장소에서 항목이 사라졌으면 `Ok(None)` — 인증을 더하지 못할 뿐 작업은 git
+/// 기본값으로 그대로 간다.
+///
+/// 에이전트 자동 사용(`agentEnabled`)은 보지 않는다. 이 경로는 사용자 자신의 git이고, 그
+/// 토글을 끈 것은 "대화에 싣지 말라"는 뜻이지 "내 git에도 쓰지 말라"는 뜻이 아니다.
+pub(crate) fn take_for_git_remote(
+    app_data_dir: &Path,
+    name: &str,
+) -> Result<Option<Zeroizing<String>>, CoreError> {
+    take_for_git_remote_with(app_data_dir, name, || {
+        crate::accounts::read_os_keychain_password(SAVED_SECRET_KEYCHAIN_SERVICE, name)
+    })
+}
+
+fn take_for_git_remote_with(
+    app_data_dir: &Path,
+    name: &str,
+    read_value: impl FnOnce() -> Result<Option<Zeroizing<String>>, CoreError>,
+) -> Result<Option<Zeroizing<String>>, CoreError> {
+    STORE.with_lock(app_data_dir, || {
+        let mut store: SavedSecretStore = STORE.load_unlocked(app_data_dir)?;
+        let Some(entry) = store.secrets.iter_mut().find(|entry| entry.name == name) else {
+            return Ok(None);
+        };
+        let Some(value) = read_value()? else {
+            return Ok(None);
+        };
+        entry.last_used_at = Some(now_ms());
+        let _ = STORE.save_unlocked(app_data_dir, &store);
+        Ok(Some(value))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 키체인에 닿지 않는 검사만 여기 둔다. OS 보안 저장소 쓰기는 CI에 없을 수 있어
-    /// 저장·열람 경로는 통합 검사가 아니라 손으로 확인한다.
+    /// OS 키체인은 호출하지 않는다. 자동 사용 경로에는 메모리 안의 시험 값을 주입한다.
+    fn stored_secret() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("temporary app data");
+        STORE
+            .save_unlocked(
+                directory.path(),
+                &SavedSecretStore {
+                    schema_version: STORE_VERSION,
+                    secrets: vec![SavedSecretView {
+                        name: "API_KEY".to_owned(),
+                        purpose: "시험".to_owned(),
+                        created_at: 1,
+                        updated_at: 1,
+                        last_used_at: None,
+                        agent_enabled: true,
+                    }],
+                },
+            )
+            .expect("synthetic metadata");
+        directory
+    }
+
+    #[test]
+    fn c17_5_auto_use_holds_the_toggle_lock_while_reading_the_value() {
+        let directory = stored_secret();
+        let result = take_for_use_with(directory.path(), "API_KEY", || {
+            let contender = crate::app_data_file::open_private_file(
+                &directory.path().join(STORE.lock_file),
+                false,
+            )?;
+            assert!(matches!(
+                fs4::FileExt::try_lock(&contender),
+                Err(fs4::TryLockError::WouldBlock)
+            ));
+            Ok(Some(Zeroizing::new("test-value".to_owned())))
+        })
+        .expect("auto use")
+        .expect("enabled value");
+        assert_eq!(result.0, "시험");
+        assert_eq!(result.1.as_str(), "test-value");
+        let store: SavedSecretStore = STORE.read(directory.path()).expect("metadata");
+        assert!(store.secrets[0].last_used_at.is_some());
+    }
+
+    #[test]
+    fn c17_5_disabled_or_missing_entries_never_read_the_keychain() {
+        let directory = stored_secret();
+        set_saved_secret_agent_enabled(directory.path(), "API_KEY", false).expect("disable");
+        for name in ["API_KEY", "MISSING"] {
+            assert!(take_for_use_with(directory.path(), name, || {
+                panic!("disabled or absent metadata must not read a value")
+            })
+            .expect("no auto use")
+            .is_none());
+        }
+        let store: SavedSecretStore = STORE.read(directory.path()).expect("metadata");
+        assert_eq!(store.secrets[0].last_used_at, None);
+    }
+
+    #[test]
+    fn c17_6_missing_value_or_keychain_error_does_not_record_usage() {
+        let directory = stored_secret();
+        assert!(take_for_use_with(directory.path(), "API_KEY", || Ok(None))
+            .expect("missing keychain item")
+            .is_none());
+        assert!(matches!(
+            take_for_use_with(directory.path(), "API_KEY", || {
+                Err(CoreError::Runtime("keychain unavailable".to_owned()))
+            }),
+            Err(CoreError::Runtime(_))
+        ));
+        let store: SavedSecretStore = STORE.read(directory.path()).expect("metadata");
+        assert_eq!(store.secrets[0].last_used_at, None);
+    }
+
+    #[test]
+    fn c17_3_usage_timestamp_write_failure_does_not_discard_the_value() {
+        let directory = stored_secret();
+        let result = take_for_use_with(directory.path(), "API_KEY", || {
+            // 저장 대상만 시험용 디렉터리로 바꿔 timestamp 쓰기 실패를 만든다.
+            std::fs::remove_file(STORE.path(directory.path()))?;
+            std::fs::create_dir(STORE.path(directory.path()))?;
+            Ok(Some(Zeroizing::new("test-value".to_owned())))
+        })
+        .expect("timestamp failure is non-fatal")
+        .expect("enabled value");
+        assert_eq!(result.1.as_str(), "test-value");
+    }
+
     #[test]
     fn saved_secret_store_defaults_to_current_schema() {
         let store = SavedSecretStore::default();
@@ -321,6 +464,31 @@ mod tests {
         .expect("옛 저장본은 새 칸 없이도 읽혀야 한다");
         assert!(store.secrets[0].agent_enabled);
         assert_eq!(store.secrets[0].last_used_at, None);
+    }
+
+    /// C16-11. git 경로는 에이전트 자동 사용과 별개다. 토글을 꺼도 사용자 자신의 git은 값을
+    /// 쓰고, 없는 이름은 키체인을 읽지 않는다.
+    #[test]
+    fn c16_11_git_token_ignores_agent_use_and_reads_only_the_named_value() {
+        let directory = stored_secret();
+        set_saved_secret_agent_enabled(directory.path(), "API_KEY", false).expect("disable");
+        assert!(take_for_git_remote_with(directory.path(), "MISSING", || {
+            panic!("an unknown name must not read a value")
+        })
+        .expect("unknown")
+        .is_none());
+        let value = take_for_git_remote_with(directory.path(), "API_KEY", || {
+            Ok(Some(Zeroizing::new("ghp_test".to_owned())))
+        })
+        .expect("named")
+        .expect("value");
+        assert_eq!(value.as_str(), "ghp_test");
+        let store: SavedSecretStore = STORE.read(directory.path()).expect("metadata");
+        assert!(store.secrets[0].last_used_at.is_some());
+        assert_eq!(
+            saved_secret_names(directory.path()).expect("names"),
+            vec!["API_KEY".to_owned()]
+        );
     }
 
     #[test]

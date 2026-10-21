@@ -137,25 +137,83 @@ pub(crate) fn read_pgpass_password(
         return Ok(None);
     }
     let raw = Zeroizing::new(std::fs::read_to_string(path)?);
+    // libpq처럼 줄 끝의 개행만 떼고 공백은 남긴다 — 공백으로 끝나는 비밀번호도 값이다.
     for line in raw.lines() {
-        let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let fields = line.splitn(5, ':').collect::<Vec<_>>();
-        if fields.len() != 5 {
+        let Some((patterns, password)) = split_pgpass_line(line) else {
             continue;
-        }
-        let matches = |pattern: &str, value: &str| pattern == "*" || pattern == value;
-        if matches(fields[0], host)
-            && matches(fields[1], &port.to_string())
-            && matches(fields[2], database)
-            && matches(fields[3], user)
+        };
+        let port = port.to_string();
+        let values = [host, port.as_str(), database, user];
+        if patterns
+            .iter()
+            .zip(values)
+            .all(|(pattern, value)| pattern.matches(value))
         {
-            return Ok(Some(Zeroizing::new(fields[4].to_owned())));
+            return Ok(Some(password));
         }
     }
     Ok(None)
+}
+
+/// `pgpass` 줄의 앞 네 칸 하나. libpq처럼 이스케이프되지 않은 `*` 한 글자만 와일드카드다 —
+/// `\*`는 글자 그대로의 별표다.
+enum PgpassPattern {
+    Any,
+    Exact(String),
+}
+
+impl PgpassPattern {
+    fn matches(&self, value: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Exact(expected) => expected == value,
+        }
+    }
+}
+
+/// `pgpass` 한 줄을 libpq 규칙대로 나눈다. 칸 안의 `:`·`\`는 `\`로 이스케이프되고
+/// (PostgreSQL 문서 "The Password File"). 다섯째 칸은 libpq `passwordFromFile`과 같이
+/// 이스케이프되지 않은 `:` 또는 줄 끝까지다.
+///
+/// `splitn(5, ':')`로 나누던 동안에는 비밀번호의 `\:`가 백슬래시째 남아 틀린 값을 서버에
+/// 보냈고, 앞 칸에 이스케이프가 있는 줄은 어떤 접속에도 맞지 않았다.
+fn split_pgpass_line(line: &str) -> Option<([PgpassPattern; 4], Zeroizing<String>)> {
+    let mut chars = line.chars();
+    let mut patterns = Vec::with_capacity(4);
+    while patterns.len() < 4 {
+        let mut field = String::new();
+        let mut escaped_any = false;
+        loop {
+            match chars.next()? {
+                ':' => break,
+                '\\' => {
+                    field.push(chars.next()?);
+                    escaped_any = true;
+                }
+                other => field.push(other),
+            }
+        }
+        patterns.push(if field == "*" && !escaped_any {
+            PgpassPattern::Any
+        } else {
+            PgpassPattern::Exact(field)
+        });
+    }
+    // 미리 줄 길이만큼 잡아 둔다 — 자라며 재할당되면 앞 버퍼가 지워지지 않은 채 풀린다(G4).
+    let mut password = Zeroizing::new(String::with_capacity(line.len()));
+    // libpq는 비밀번호도 이스케이프되지 않은 `:`에서 끊고, 뒤에 글자가 없는 `\\`는 그대로 둔다.
+    while let Some(next) = chars.next() {
+        match next {
+            ':' => break,
+            '\\' => password.push(chars.next().unwrap_or('\\')),
+            other => password.push(other),
+        }
+    }
+    let patterns: [PgpassPattern; 4] = patterns.try_into().ok()?;
+    Some((patterns, password))
 }
 
 #[cfg(test)]
@@ -186,5 +244,33 @@ mod tests {
         assert_eq!(found.as_deref().map(String::as_str), Some("secret"));
         let missing = read_pgpass_password(&path, "host", 5432, "anything", "other").expect("read");
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn c10_5_pgpass_unescapes_colons_and_backslashes_like_libpq() {
+        let dir = TempDir::new().expect("temp");
+        let path = dir.path().join(".pgpass");
+        std::fs::write(
+            &path,
+            "db\\:1:5432:*:app:pa\\:ss\\\\w:rd\nother:5432:\\*:app:literal\n\
+             h:5432:d:u:end\\\n  h:5432:d:sp:x\nh:5432:d:sp:  spaced \\ \na\\:b:5432:d:u\n",
+        )
+        .expect("write");
+        let found = read_pgpass_password(&path, "db:1", 5432, "x", "app").expect("read");
+        assert_eq!(found.as_deref().map(String::as_str), Some("pa:ss\\w"));
+        // 이스케이프한 별표는 와일드카드가 아니다.
+        let star = read_pgpass_password(&path, "other", 5432, "x", "app").expect("read");
+        assert!(star.is_none());
+        let literal = read_pgpass_password(&path, "other", 5432, "*", "app").expect("read");
+        assert_eq!(literal.as_deref().map(String::as_str), Some("literal"));
+        // 뒤에 글자가 없는 백슬래시는 그대로 남는다.
+        let trailing = read_pgpass_password(&path, "h", 5432, "d", "u").expect("read");
+        assert_eq!(trailing.as_deref().map(String::as_str), Some("end\\"));
+        // 앞 공백이 붙은 줄은 호스트가 달라 맞지 않고, 비밀번호의 공백은 깎지 않는다.
+        let spaced = read_pgpass_password(&path, "h", 5432, "d", "sp").expect("read");
+        assert_eq!(spaced.as_deref().map(String::as_str), Some("  spaced  "));
+        // 이스케이프를 풀면 네 칸뿐인 줄은 건너뛴다.
+        let short = read_pgpass_password(&path, "a:b", 5432, "d", "u").expect("read");
+        assert!(short.is_none());
     }
 }

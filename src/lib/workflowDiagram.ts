@@ -352,10 +352,15 @@ function referencedSteps(step: SystemWorkflowStep): string[] {
  * 따옴표 하나뿐이고, 그것도 `#quot;` 같은 엔티티가 아니라 홑따옴표로 바꾼다 — `htmlLabels:
  * false`에서 엔진은 `#40;`을 `&#40;`로만 되돌리고 SVG 글자로 그대로 찍어, 계약 이름의
  * `(NAS)`가 묶음 제목에 `&#40;NAS&#41;`로 보였다.
+ *
+ * 같은 이유로 사람이 쓴 `#12;`·`#abc;`도 엔진(`encodeEntities`, 정규식 `#\w+;`)이 엔티티로
+ * 읽어 `PR #12; 정리`가 `&#12;`로 깨진다. 엔진에는 그 패턴을 피할 escape가 없으므로
+ * `#` 뒤에 폭 없는 공백(U+200B)을 끼워 패턴만 끊는다 — 보이는 글자는 그대로다.
  */
 function escapeLabel(value: string): string {
   return value
     .replace(/[<>]/g, "")
     .replace(/"/g, "'")
+    .replace(/#(?=\w+;)/g, "#\u200B")
     .replace(/\n/g, "<br/>");
 }

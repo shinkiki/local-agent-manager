@@ -242,6 +242,40 @@ fn ensure_char_limit(value: &str, max_chars: usize, label: &str) -> Result<(), C
     Ok(())
 }
 
+/// 세션 하나에 직접 이어 둘 수 있는 프로젝트 수. 한 대화가 손대는 프로젝트는 몇 개를
+/// 넘지 않고, 목록 필터가 세션마다 이 목록을 훑는다.
+const MAX_LINKED_PROJECT_PATHS: usize = 16;
+const MAX_LINKED_PROJECT_PATH_CHARS: usize = 1024;
+
+/// 직접 이어 둔 프로젝트 경로를 다듬는다. 앞뒤 공백을 떼고 같은 경로는 한 번만 두며,
+/// 절대 경로만 받는다 — 상대 경로는 어느 작업 경로 기준인지 저장본만으로는 알 수 없다.
+/// 등록 프로젝트인지는 여기서 묻지 않는다. 프로젝트 목록은 세션에서 역산되어 지금 없더라도
+/// 나중에 생길 수 있으므로, 스냅샷이 맞출 때 걸러진다.
+fn validate_linked_project_paths(paths: Vec<String>) -> Result<Vec<String>, CoreError> {
+    let mut unique: Vec<String> = Vec::new();
+    for path in paths {
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        ensure_char_limit(path, MAX_LINKED_PROJECT_PATH_CHARS, "관련 프로젝트 경로")?;
+        if !Path::new(path).is_absolute() {
+            return Err(CoreError::InvalidInput(format!(
+                "관련 프로젝트는 절대 경로로 지정해야 합니다: {path}"
+            )));
+        }
+        if !unique.iter().any(|known| known == path) {
+            unique.push(path.to_owned());
+        }
+    }
+    if unique.len() > MAX_LINKED_PROJECT_PATHS {
+        return Err(CoreError::InvalidInput(format!(
+            "관련 프로젝트는 세션당 {MAX_LINKED_PROJECT_PATHS}개까지 지정할 수 있습니다"
+        )));
+    }
+    Ok(unique)
+}
+
 pub fn update_session_meta(
     app_data_dir: &Path,
     source: ProviderId,
@@ -250,6 +284,10 @@ pub fn update_session_meta(
 ) -> Result<SessionMeta, CoreError> {
     validate_identifier(session_id)?;
     let bookmarks = patch.bookmarks.map(validate_bookmarks).transpose()?;
+    let linked_project_paths = patch
+        .linked_project_paths
+        .map(validate_linked_project_paths)
+        .transpose()?;
     with_metadata(app_data_dir, |metadata| {
         let folder_ids = if let Some(folder_ids) = patch.folder_ids {
             let known = metadata
@@ -302,6 +340,9 @@ pub fn update_session_meta(
         }
         if let Some(bookmarks) = bookmarks {
             current.bookmarks = bookmarks;
+        }
+        if let Some(paths) = linked_project_paths {
+            current.linked_project_paths = paths;
         }
         Ok(current.clone())
     })
@@ -635,14 +676,17 @@ pub(crate) fn record_cleaned_sessions(
     }
     with_metadata_changed(app_data_dir, |metadata| {
         let mut added = 0;
+        let mut pruned = false;
         for key in keys {
             if metadata.cleaned_sessions.insert(key.clone()) {
                 added += 1;
             }
-            metadata.sessions.remove(key);
-            metadata.session_working_directories.remove(key);
+            // 이미 내려간 키라도 그 뒤에 다시 붙은 메타·작업 경로가 있으면 지운 것을 저장해야
+            // 한다. 새로 내려간 수만으로 저장 여부를 정하면 그 삭제가 메모리에서만 일어난다.
+            pruned |= metadata.sessions.remove(key).is_some();
+            pruned |= metadata.session_working_directories.remove(key).is_some();
         }
-        Ok((added > 0, added))
+        Ok((added > 0 || pruned, added))
     })
 }
 
@@ -669,7 +713,10 @@ pub(crate) use crate::chat_runtime_store::{
 /// 문서 루트의 등록·해제와 보호 경계 판정은 [`crate::doc_roots`]가 맡는다. 호출부가
 /// 쓰던 `store::` 경로를 그대로 두려고 여기서 다시 내보낸다.
 pub(crate) use crate::doc_roots::is_restricted_doc_root;
-pub use crate::doc_roots::{add_doc_root, doc_root_paths, list_doc_roots, remove_doc_root};
+pub use crate::doc_roots::{
+    add_doc_root, doc_root_paths, ensure_doc_root_agent_enabled, list_doc_roots, remove_doc_root,
+    update_doc_root, UpdateDocRootRequest,
+};
 /// 문서 루트 안의 파일 트리 읽기·쓰기는 [`crate::document_tree`]가 맡는다. 호출부가
 /// 쓰던 `store::` 경로를 그대로 두려고 여기서 다시 내보낸다.
 pub use crate::document_tree::{
@@ -814,6 +861,7 @@ mod tests {
                 folder_ids: None,
                 pinned_account_id: None,
                 bookmarks: None,
+                linked_project_paths: None,
             },
         )
         .expect("metadata must save");
@@ -843,6 +891,31 @@ mod tests {
             0
         );
 
+        // 이미 내려간 키에 메타가 다시 붙었어도, 다시 기록하면 그 메타까지 저장소에서 빠진다.
+        persist_session_profile(
+            temp.path(),
+            ProviderId::Claude,
+            "1234567890abcdef",
+            ChatProfile::Standard,
+        )
+        .expect("metadata must save");
+        persist_session_working_directory(
+            temp.path(),
+            ProviderId::Claude,
+            "1234567890abcdef",
+            temp.path(),
+        )
+        .expect("working directory must save");
+        assert_eq!(
+            record_cleaned_sessions(temp.path(), &keys).expect("tombstone must record"),
+            0
+        );
+        let reloaded = load_metadata(temp.path()).expect("metadata must load");
+        assert!(!reloaded.sessions.contains_key("claude:1234567890abcdef"));
+        assert!(!reloaded
+            .session_working_directories
+            .contains_key("claude:1234567890abcdef"));
+
         // 기록을 비우면 다음 재조사에서 세션이 되돌아온다.
         assert_eq!(
             clear_cleaned_sessions(temp.path()).expect("tombstones must clear"),
@@ -864,6 +937,7 @@ mod tests {
             folder_ids: None,
             pinned_account_id: None,
             bookmarks: None,
+            linked_project_paths: None,
         };
         update_session_meta(temp.path(), ProviderId::Claude, "1234567890abcdef", patch)
             .expect("metadata must save");
@@ -901,6 +975,7 @@ mod tests {
                     folder_ids: None,
                     pinned_account_id: None,
                     bookmarks: None,
+                    linked_project_paths: None,
                 },
             );
             sender.send(result).expect("test receiver must remain open");
@@ -1266,6 +1341,7 @@ mod tests {
                 folder_ids: None,
                 pinned_account_id: Some(Some("claude-account-pinned-01".to_owned())),
                 bookmarks: None,
+                linked_project_paths: None,
             },
         )
         .expect("pin must save");
@@ -1299,6 +1375,7 @@ mod tests {
                 folder_ids: None,
                 pinned_account_id: Some(None),
                 bookmarks: None,
+                linked_project_paths: None,
             },
         )
         .expect("pin must clear");
@@ -1328,6 +1405,7 @@ mod tests {
                 folder_ids: Some(vec![folder.id.clone()]),
                 pinned_account_id: None,
                 bookmarks: None,
+                linked_project_paths: None,
             },
         )
         .expect("folder assignment must save");
@@ -1359,6 +1437,7 @@ mod tests {
                 folder_ids: Some(folder_ids),
                 pinned_account_id: None,
                 bookmarks: None,
+                linked_project_paths: None,
             },
         )
         .expect("folder assignment must save");
@@ -1453,6 +1532,73 @@ mod tests {
             .expect("metadata must reload")
             .sessions
             .contains_key("claude:fedcba0987654321"));
+    }
+
+    fn save_linked_projects(
+        app_data_dir: &Path,
+        paths: Vec<&str>,
+    ) -> Result<SessionMeta, CoreError> {
+        update_session_meta(
+            app_data_dir,
+            ProviderId::Claude,
+            "1234567890abcdef",
+            SessionMetaPatch {
+                linked_project_paths: Some(paths.into_iter().map(str::to_owned).collect()),
+                ..SessionMetaPatch::default()
+            },
+        )
+    }
+
+    #[test]
+    fn linked_project_paths_are_trimmed_deduplicated_and_replaced_whole() {
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        let saved = save_linked_projects(
+            temp.path(),
+            vec![" /repo/app ", "", "/repo/app", "/repo/tools"],
+        )
+        .expect("linked projects must save");
+        assert_eq!(saved.linked_project_paths, vec!["/repo/app", "/repo/tools"]);
+        let reloaded = session_meta(temp.path(), ProviderId::Claude, "1234567890abcdef")
+            .expect("metadata must read");
+        assert_eq!(reloaded.linked_project_paths, saved.linked_project_paths);
+
+        // 다른 항목만 고치는 패치는 이어 둔 프로젝트를 건드리지 않고, 빈 목록은 모두 푼다.
+        let favorite = update_session_meta(
+            temp.path(),
+            ProviderId::Claude,
+            "1234567890abcdef",
+            SessionMetaPatch {
+                favorite: Some(true),
+                ..SessionMetaPatch::default()
+            },
+        )
+        .expect("favorite must save");
+        assert_eq!(favorite.linked_project_paths.len(), 2);
+        let cleared = save_linked_projects(temp.path(), vec![]).expect("clear must save");
+        assert!(cleared.linked_project_paths.is_empty());
+    }
+
+    #[test]
+    fn linked_project_paths_reject_relative_or_too_many_paths() {
+        // 상대 경로는 어느 작업 경로 기준인지 저장본만으로 알 수 없다.
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        assert!(matches!(
+            save_linked_projects(temp.path(), vec!["repo/app"]),
+            Err(CoreError::InvalidInput(_))
+        ));
+        let many = (0..=MAX_LINKED_PROJECT_PATHS)
+            .map(|index| format!("/repo/p{index}"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            save_linked_projects(temp.path(), many.iter().map(String::as_str).collect()),
+            Err(CoreError::InvalidInput(_))
+        ));
+        assert!(
+            session_meta(temp.path(), ProviderId::Claude, "1234567890abcdef")
+                .expect("metadata must read")
+                .linked_project_paths
+                .is_empty()
+        );
     }
 
     #[test]

@@ -38,10 +38,8 @@ use crate::ssh_command_policy::{
     command_allowance, enforce_hard_command_refusals, enforce_redirect_policy,
     sudo_prompt_positions, validate_remote_command, CommandAllowance,
 };
-use crate::ssh_endpoints::{
-    connect_args, destination, endpoint_of, scp_args, target, SshEndpointView,
-};
-use crate::ssh_keys::{private_key_present, validate_fingerprint};
+use crate::ssh_endpoints::{connect_args, destination, scp_args, target, SshEndpointView};
+use crate::ssh_keys::{private_key_present, SshKeyView};
 use crate::ssh_output::{
     cap_output, diagnose_outcome, mentions_missing_command, mentions_sudo_auth_failure, redact,
     strip_key_blocks, strip_sudo_prompt, KeyBlockFilter, MAX_OUTPUT_CHARS,
@@ -151,19 +149,61 @@ const REFUSED_LOCAL_SEGMENTS: &[&str] = &[
 /// 사용자가 고른 엔드포인트를 실행 직전에 다시 확인한 결과. 지문·개인키·에이전트 사용
 /// 여부를 화면이 아니라 저장본과 파일시스템에서 다시 읽으므로, 목록을 그린 뒤 토글이
 /// 꺼졌으면 여기서 멈춘다.
+/// C9-21. 실행 한 번 동안 꺼내 둔 키 암호. 전송 하나가 ssh를 여러 번 부르므로 보안 저장소는
+/// 처음 한 번만 읽는다. `Debug`에 값이 찍히지 않게 따로 감싼다.
+#[derive(Default)]
+struct PassphraseCache(std::cell::OnceCell<Option<zeroize::Zeroizing<String>>>);
+
+impl std::fmt::Debug for PassphraseCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PassphraseCache(..)")
+    }
+}
+
 #[derive(Debug)]
 struct ResolvedEndpoint {
+    server_id: String,
     fingerprint: String,
     identity: String,
     endpoint: SshEndpointView,
     destination: String,
     target: String,
+    /// C9-21. 암호를 꺼낼 때 다시 보는 키와 앱 데이터 위치. 승인 대기로 돌아가는 호출은
+    /// 보안 저장소를 두드리지 않도록, 값은 실제로 접속하기 직전에만 꺼낸다.
+    key: SshKeyView,
+    app_data_dir: PathBuf,
+    passphrase: PassphraseCache,
+}
+
+impl ResolvedEndpoint {
+    fn locked(&self) -> bool {
+        self.key.passphrase_saved
+    }
+
+    /// 자식 하나에 붙일 askpass 세션. 세션은 자식마다 새로 열고(한 번만 답한다), 값은 처음
+    /// 한 번만 보안 저장소에서 꺼낸다.
+    fn askpass(&self) -> Result<Option<crate::ssh_askpass::AskpassSession>, CoreError> {
+        let passphrase = match self.passphrase.0.get() {
+            Some(cached) => cached.clone(),
+            None => {
+                let loaded = crate::ssh_endpoints::key_passphrase(&self.app_data_dir, &self.key)?;
+                let _ = self.passphrase.0.set(loaded.clone());
+                loaded
+            }
+        };
+        crate::ssh_endpoints::askpass_session(passphrase)
+    }
 }
 
 /// 원격 명령 실행 요청. 명령은 한 줄이며 셸 메타문자를 담을 수 없다.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecuteSshCommandRequest {
+    /// 실행할 연결 서버. 비면 예전 호출처럼 `fingerprint`로 고르되, 그 키를 쓰는 서버가
+    /// 하나일 때만 받는다.
+    #[serde(default)]
+    pub server_id: Option<String>,
+    #[serde(default)]
     pub fingerprint: String,
     pub command: String,
     #[serde(default)]
@@ -188,6 +228,7 @@ pub struct ExecuteSshCommandRequest {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SshCommandReceipt {
+    pub server_id: String,
     pub fingerprint: String,
     pub destination: String,
     /// 규칙과 맞춰 본 정규화된 명령. 요청 원문이 아니라 실제로 넘긴 값이다.
@@ -217,6 +258,11 @@ pub struct SshCommandReceipt {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AllowSshCommandRequest {
+    /// 실행할 연결 서버. 비면 예전 호출처럼 `fingerprint`로 고르되, 그 키를 쓰는 서버가
+    /// 하나일 때만 받는다.
+    #[serde(default)]
+    pub server_id: Option<String>,
+    #[serde(default)]
     pub fingerprint: String,
     pub command: String,
     /// 목록 추가 용도로 발급된 승인 토큰. 없으면 승인 요청만 열고 목록은 바꾸지 않는다.
@@ -228,6 +274,7 @@ pub struct AllowSshCommandRequest {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SshCommandAllowlistReceipt {
+    pub server_id: String,
     pub fingerprint: String,
     pub destination: String,
     pub command: String,
@@ -246,6 +293,11 @@ pub struct SshCommandAllowlistReceipt {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadSshFileRequest {
+    /// 실행할 연결 서버. 비면 예전 호출처럼 `fingerprint`로 고르되, 그 키를 쓰는 서버가
+    /// 하나일 때만 받는다.
+    #[serde(default)]
+    pub server_id: Option<String>,
+    #[serde(default)]
     pub fingerprint: String,
     pub local_path: String,
     #[serde(default)]
@@ -258,6 +310,7 @@ pub struct UploadSshFileRequest {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SshUploadReceipt {
+    pub server_id: String,
     pub fingerprint: String,
     pub destination: String,
     pub remote_path: String,
@@ -283,6 +336,11 @@ pub struct SshUploadReceipt {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadSshFileRequest {
+    /// 실행할 연결 서버. 비면 예전 호출처럼 `fingerprint`로 고르되, 그 키를 쓰는 서버가
+    /// 하나일 때만 받는다.
+    #[serde(default)]
+    pub server_id: Option<String>,
+    #[serde(default)]
     pub fingerprint: String,
     pub remote_path: String,
     pub local_path: String,
@@ -294,6 +352,7 @@ pub struct DownloadSshFileRequest {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SshDownloadReceipt {
+    pub server_id: String,
     pub fingerprint: String,
     pub destination: String,
     pub remote_path: String,
@@ -376,7 +435,12 @@ fn execute_ssh_command_with(
     // 셸 메타문자·길이), 그리고 하드 거부(셸·인터프리터·네트워크 페치 앞머리와 그 서버의
     // 차단 목록)를 **먼저** 지나야 승인 자리에 닿는다. 승인이 대신할 수 있는 것은 허용
     // 목록 대조 한 자리뿐이고, 그 앞의 어느 검사도 토큰으로 넘기지 못한다.
-    let resolved = resolve_endpoint(home, app_data_dir, &request.fingerprint)?;
+    let resolved = resolve_endpoint(
+        home,
+        app_data_dir,
+        request.server_id.as_deref(),
+        &request.fingerprint,
+    )?;
     let line = validate_remote_command(&request.command)?;
     enforce_hard_command_refusals(&resolved.endpoint, &line)?;
     enforce_redirect_policy(&resolved.endpoint, &line)?;
@@ -391,7 +455,7 @@ fn execute_ssh_command_with(
     let wants_secret = !sudo_positions.is_empty();
     let secret_pending = wants_secret
         && !gate
-            .map(|gate| gate.holds_sudo_secret(&resolved.fingerprint))
+            .map(|gate| gate.holds_sudo_secret(&resolved.server_id))
             .unwrap_or(false);
 
     let approval_id = match command_allowance(&resolved.endpoint, &line) {
@@ -431,7 +495,7 @@ fn execute_ssh_command_with(
     // C9-19. 값을 꺼내는 것은 승인 자리를 모두 지난 뒤다. 원격에 나가는 줄에만 `-S`가
     // 붙고, 영수증·승인 카드에 남는 것은 사용자가 읽은 원본(`command`)이다.
     let secret = if wants_secret {
-        gate.and_then(|gate| gate.take_sudo_secret(&resolved.fingerprint))
+        gate.and_then(|gate| gate.take_sudo_secret(&resolved.server_id))
     } else {
         None
     };
@@ -463,7 +527,7 @@ fn execute_ssh_command_with(
     // 실패를 반복하는 대신 다음 명령에서 다시 묻는다.
     if wants_secret && mentions_sudo_auth_failure(&outcome.stderr) {
         if let Some(gate) = gate {
-            gate.discard_sudo_secret(&resolved.fingerprint);
+            gate.discard_sudo_secret(&resolved.server_id);
         }
     }
     // C9-19. sudo 프롬프트는 우리가 붙인 `-S` 때문에 생긴 것이라 사용자가 요청한 출력이
@@ -479,6 +543,7 @@ fn execute_ssh_command_with(
     let stderr = cap_receipt_text(&outcome.stderr, request.max_lines);
     let diagnosis = diagnose_outcome(&outcome);
     Ok(SshCommandReceipt {
+        server_id: resolved.server_id,
         fingerprint: resolved.fingerprint,
         destination: resolved.destination,
         command,
@@ -505,6 +570,7 @@ fn approval_pending_receipt(
     ticket: SshApprovalTicket,
 ) -> SshCommandReceipt {
     SshCommandReceipt {
+        server_id: resolved.server_id.clone(),
         fingerprint: resolved.fingerprint.clone(),
         destination: resolved.destination.clone(),
         command,
@@ -546,7 +612,7 @@ fn take_ssh_approval(
 ) -> Result<SshApprovalStep, CoreError> {
     let Some(approval_id) = approval_id else {
         let ticket = gate.open_ssh_approval(SshApprovalOpen {
-            fingerprint: &resolved.fingerprint,
+            server_id: &resolved.server_id,
             destination: &resolved.destination,
             command,
             scope,
@@ -557,7 +623,7 @@ fn take_ssh_approval(
     };
     gate.consume_ssh_approval(SshApprovalConsume {
         approval_id,
-        fingerprint: &resolved.fingerprint,
+        server_id: &resolved.server_id,
         command,
         scope,
     })?;
@@ -573,7 +639,12 @@ fn allow_ssh_command_permanently_with(
     // 목록에 적히는 순간 이 명령은 승인 없이 실행된다. 그래서 적기 전에도 실행 경로와
     // 같은 정규화·하드 거부를 지난다 — 셸 앞머리나 차단 목록에 걸리는 줄을 목록에 남겨
     // 두면, 사용자는 허용했다고 읽지만 실행은 늘 거절되는 규칙이 쌓인다.
-    let resolved = resolve_endpoint(home, app_data_dir, &request.fingerprint)?;
+    let resolved = resolve_endpoint(
+        home,
+        app_data_dir,
+        request.server_id.as_deref(),
+        &request.fingerprint,
+    )?;
     let line = validate_remote_command(&request.command)?;
     enforce_hard_command_refusals(&resolved.endpoint, &line)?;
     let command = line.render();
@@ -606,6 +677,7 @@ fn allow_ssh_command_permanently_with(
         SshApprovalStep::Consumed(approval_id) => approval_id,
         SshApprovalStep::Pending(ticket) => {
             return Ok(SshCommandAllowlistReceipt {
+            server_id: resolved.server_id,
             fingerprint: resolved.fingerprint,
             destination: resolved.destination,
             command,
@@ -621,15 +693,13 @@ fn allow_ssh_command_permanently_with(
     };
     let mut added = false;
     for rule in &rules {
-        added |= crate::ssh_endpoints::append_allowed_command(
-            app_data_dir,
-            &resolved.fingerprint,
-            rule,
-        )?;
+        added |=
+            crate::ssh_endpoints::append_allowed_command(app_data_dir, &resolved.server_id, rule)?;
     }
     // 목록은 방금 바뀌었으므로 저장본에서 다시 읽어 돌려준다.
-    let updated = resolve_endpoint(home, app_data_dir, &resolved.fingerprint)?;
+    let updated = resolve_endpoint(home, app_data_dir, Some(&resolved.server_id), "")?;
     Ok(SshCommandAllowlistReceipt {
+        server_id: updated.server_id.clone(),
         fingerprint: updated.fingerprint,
         destination: updated.destination,
         command,
@@ -656,7 +726,12 @@ fn upload_ssh_file_with(
     scp: &Path,
     request: &UploadSshFileRequest,
 ) -> Result<SshUploadReceipt, CoreError> {
-    let (resolved, root) = open_transfer(home, app_data_dir, &request.fingerprint)?;
+    let (resolved, root) = open_transfer(
+        home,
+        app_data_dir,
+        request.server_id.as_deref(),
+        &request.fingerprint,
+    )?;
     let source = resolve_local_source(app_data_dir, home, &request.local_path)?;
     let remote_path = join_remote_path(&root, &request.remote_path, &source.file_name)?;
 
@@ -696,7 +771,8 @@ fn upload_ssh_file_with(
     );
 
     Ok(SshUploadReceipt {
-        fingerprint: resolved.fingerprint,
+        server_id: resolved.server_id.clone(),
+        fingerprint: resolved.fingerprint.clone(),
         destination: resolved.destination,
         remote_path,
         bytes: source.bytes,
@@ -720,7 +796,12 @@ fn download_ssh_file_with(
     scp: &Path,
     request: &DownloadSshFileRequest,
 ) -> Result<SshDownloadReceipt, CoreError> {
-    let (resolved, root) = open_transfer(home, app_data_dir, &request.fingerprint)?;
+    let (resolved, root) = open_transfer(
+        home,
+        app_data_dir,
+        request.server_id.as_deref(),
+        &request.fingerprint,
+    )?;
     // 받을 원격 파일은 전송 폴더 아래로만 정해진다. 이름을 생략할 수 없는 쪽은 여기다 —
     // 로컬처럼 "상대편 파일 이름"으로 채울 값이 없다.
     if request.remote_path.trim().is_empty() {
@@ -794,7 +875,8 @@ fn download_ssh_file_with(
     );
 
     Ok(SshDownloadReceipt {
-        fingerprint: resolved.fingerprint,
+        server_id: resolved.server_id.clone(),
+        fingerprint: resolved.fingerprint.clone(),
         destination: resolved.destination,
         remote_path,
         local_path: destination.path.to_string_lossy().into_owned(),
@@ -821,23 +903,18 @@ fn remove_partial_download(destination: &LocalDestination) {
     let _ = std::fs::remove_file(&destination.path);
 }
 
-/// 실행 직전에 저장본과 파일시스템을 다시 읽는다. 화면이 보낸 값은 지문뿐이다.
+/// 실행 직전에 저장본과 파일시스템을 다시 읽는다. 호출자가 보낸 값은 서버 ID(또는 예전
+/// 호출의 지문)뿐이다.
 fn resolve_endpoint(
     home: &Path,
     app_data_dir: &Path,
+    server_id: Option<&str>,
     fingerprint: &str,
 ) -> Result<ResolvedEndpoint, CoreError> {
-    let fingerprint = validate_fingerprint(fingerprint)?.to_owned();
-    let snapshot = crate::ssh_keys::snapshot_with_metadata(home, app_data_dir)?;
-    let key = snapshot
-        .keys
-        .iter()
-        .find(|key| key.fingerprint == fingerprint)
-        .ok_or_else(|| {
-            CoreError::NotFound("이 지문의 공개키를 ~/.ssh에서 찾지 못했습니다".to_owned())
-        })?;
-    let endpoint = endpoint_of(key)
-        .ok_or_else(|| CoreError::NotFound("이 키에 저장된 연결 서버가 없습니다".to_owned()))?;
+    let crate::ssh_endpoints::ResolvedServer {
+        server: endpoint,
+        key,
+    } = crate::ssh_endpoints::resolve_server(home, app_data_dir, server_id, fingerprint)?;
     // 에이전트 사용 토글이 곧 접근 허용 결정이다. 꺼져 있으면 조용히 건너뛰지 않고
     // 왜 거절했는지 말한다 — 사용자가 켤 자리를 찾을 수 있어야 한다.
     if !endpoint.agent_enabled {
@@ -852,11 +929,15 @@ fn resolve_endpoint(
         ));
     }
     Ok(ResolvedEndpoint {
-        fingerprint,
+        server_id: endpoint.id.clone(),
+        fingerprint: key.fingerprint.clone(),
         identity: identity.to_string_lossy().into_owned(),
         destination: destination(&endpoint),
         target: target(&endpoint),
         endpoint,
+        key,
+        app_data_dir: app_data_dir.to_path_buf(),
+        passphrase: PassphraseCache::default(),
     })
 }
 
@@ -868,9 +949,10 @@ fn resolve_endpoint(
 fn open_transfer(
     home: &Path,
     app_data_dir: &Path,
+    server_id: Option<&str>,
     fingerprint: &str,
 ) -> Result<(ResolvedEndpoint, String), CoreError> {
-    let resolved = resolve_endpoint(home, app_data_dir, fingerprint)?;
+    let resolved = resolve_endpoint(home, app_data_dir, server_id, fingerprint)?;
     if !resolved.endpoint.file_transfer_enabled {
         return Err(CoreError::Conflict(
             "이 연결 서버는 파일 전송이 꺼져 있습니다. 애드온 → SSH → 연결 서버에서 파일 전송을 켜고 전송 폴더를 적어야 합니다".to_owned(),
@@ -928,7 +1010,11 @@ fn run_scp(
     to: &str,
     timeout: Duration,
 ) -> Result<crate::cli_interface::CommandOutcome, CoreError> {
-    let mut args = scp_args(&resolved.identity, &resolved.endpoint.port.to_string());
+    let mut args = scp_args(
+        &resolved.identity,
+        &resolved.endpoint.port.to_string(),
+        resolved.locked(),
+    );
     args.extend(noninteractive_args());
     args.extend([
         "-q".to_owned(),
@@ -937,7 +1023,9 @@ fn run_scp(
         to.to_owned(),
     ]);
     let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
-    crate::cli_interface::run_capped(scp, &borrowed, timeout)
+    let askpass = resolved.askpass()?;
+    let env = crate::ssh_askpass::env_of(askpass.as_ref());
+    crate::cli_interface::run_capped_with_env(scp, &borrowed, timeout, &env)
 }
 
 /// 이미 있는 파일을 말없이 덮지 않는다는 거절 한 벌. 올릴 때는 원격 경로, 받을 때는 로컬
@@ -951,7 +1039,11 @@ fn overwrite_conflict(subject: &str) -> CoreError {
 /// 접속 인자와 원격 명령을 한 argv로 조립한다. 모아서 돌리는 경로와 흘리는 경로가 같은
 /// argv를 쓰도록 한 곳에 둔다.
 fn ssh_argv(resolved: &ResolvedEndpoint, remote: &[&str]) -> Vec<String> {
-    let mut args = connect_args(&resolved.identity, &resolved.endpoint.port.to_string());
+    let mut args = connect_args(
+        &resolved.identity,
+        &resolved.endpoint.port.to_string(),
+        resolved.locked(),
+    );
     args.extend(noninteractive_args());
     args.push(resolved.target.clone());
     args.extend(remote.iter().map(|value| (*value).to_owned()));
@@ -982,7 +1074,22 @@ fn run_ssh_with_input(
 ) -> Result<crate::cli_interface::CommandOutcome, CoreError> {
     let args = ssh_argv(resolved, remote);
     let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
-    crate::cli_interface::run_capped_with_input(executable, &borrowed, timeout, input)
+    let askpass = resolved.askpass()?;
+    let env = crate::ssh_askpass::env_of(askpass.as_ref());
+    // C9-19. sudo 비밀번호처럼 명령줄에 실을 수 없는 입력은 stdin으로 한 번 써 넣고 닫는다 —
+    // 인자·환경은 같은 호스트의 다른 프로세스가 `ps`로 읽는다. `sudo -S`는 개행까지 읽어야
+    // 한 줄로 판단하므로 개행을 함께 보낸다.
+    let line = zeroize::Zeroizing::new(input.map(|value| format!("{value}\n")));
+    crate::cli_interface::run_capped_with(
+        executable,
+        &borrowed,
+        timeout,
+        &crate::cli_interface::CappedOptions {
+            env: &env,
+            input: line.as_deref().map(str::as_bytes),
+            ..crate::cli_interface::CappedOptions::default()
+        },
+    )
 }
 
 /// C9-18. 종료를 기다리지 않고 줄이 생기는 대로 싱크에 넘기면서 같은 결과를 모은다.
@@ -1005,6 +1112,18 @@ fn run_ssh_streaming(
     let args = ssh_argv(resolved, &[command]);
     let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
     let mut process = crate::cli_interface::capped_command(executable, &borrowed);
+    // C9-21. 세션은 이 함수가 끝날 때까지 살아 있어야 한다 — 자식이 암호를 묻는 시점은
+    // 기동 직후지만, 끝까지 붙들어 두는 편이 수명을 따로 따질 필요가 없다.
+    let askpass = match resolved.askpass() {
+        Ok(session) => session,
+        Err(error) => {
+            terminal.ssh_terminal_finished(false, false, &error.to_string());
+            return Err(error);
+        }
+    };
+    if let Some(session) = &askpass {
+        session.apply(&mut process);
+    }
     if input.is_some() {
         process.stdin(std::process::Stdio::piped());
     }
@@ -1603,6 +1722,8 @@ mod tests {
 
     fn endpoint_request(fingerprint: &str) -> SetSshKeyEndpointRequest {
         SetSshKeyEndpointRequest {
+            id: None,
+            name: String::new(),
             fingerprint: fingerprint.to_owned(),
             host: "build.example.com".to_owned(),
             port: Some(2222),
@@ -1681,14 +1802,16 @@ mod tests {
         let fingerprint = key_fixture(home.path(), true);
 
         // 저장된 연결 서버가 없다.
-        let error = resolve_endpoint(home.path(), app_data.path(), &fingerprint).expect_err("없음");
+        let error =
+            resolve_endpoint(home.path(), app_data.path(), None, &fingerprint).expect_err("없음");
         assert!(matches!(error, CoreError::NotFound(_)));
 
         // 에이전트 사용이 꺼져 있다.
         let mut request = endpoint_request(&fingerprint);
         request.agent_enabled = false;
         set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &request).expect("저장");
-        let error = resolve_endpoint(home.path(), app_data.path(), &fingerprint).expect_err("꺼짐");
+        let error =
+            resolve_endpoint(home.path(), app_data.path(), None, &fingerprint).expect_err("꺼짐");
         assert!(matches!(error, CoreError::Conflict(_)));
         assert!(error.to_string().contains("에이전트 사용"));
 
@@ -1698,19 +1821,21 @@ mod tests {
         assert!(resolve_endpoint(
             home.path(),
             app_data.path(),
+            None,
             "SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         )
         .is_err());
-        assert!(resolve_endpoint(home.path(), app_data.path(), "not-a-fingerprint").is_err());
+        assert!(resolve_endpoint(home.path(), app_data.path(), None, "not-a-fingerprint").is_err());
         // 켜 둔 뒤에는 개인키 경로가 확정된다.
-        let resolved = resolve_endpoint(home.path(), app_data.path(), &fingerprint).expect("확정");
+        let resolved =
+            resolve_endpoint(home.path(), app_data.path(), None, &fingerprint).expect("확정");
         assert!(Path::new(&resolved.identity).ends_with(".ssh/id_example"));
         assert_eq!(resolved.destination, "deploy@build.example.com:2222");
 
         // 개인키가 사라지면 다시 거절된다.
         fs::remove_file(home.path().join(".ssh/id_example")).expect("remove");
-        let error =
-            resolve_endpoint(home.path(), app_data.path(), &fingerprint).expect_err("개인키 없음");
+        let error = resolve_endpoint(home.path(), app_data.path(), None, &fingerprint)
+            .expect_err("개인키 없음");
         assert!(error.to_string().contains("개인키"));
     }
 
@@ -1737,7 +1862,9 @@ mod tests {
         request.transfer_root = "/srv/releases/".to_owned();
         let snapshot =
             set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &request).expect("저장");
-        let endpoint = snapshot.keys[0].endpoint.as_ref().expect("endpoint");
+        let endpoint =
+            crate::ssh_endpoints::endpoint_for_key(&snapshot, &snapshot.keys[0].fingerprint)
+                .expect("endpoint");
         assert!(endpoint.file_transfer_enabled);
         assert_eq!(endpoint.transfer_root, "/srv/releases");
 
@@ -1746,7 +1873,9 @@ mod tests {
         request.transfer_root = "/srv/releases".to_owned();
         let snapshot =
             set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &request).expect("저장");
-        let endpoint = snapshot.keys[0].endpoint.as_ref().expect("endpoint");
+        let endpoint =
+            crate::ssh_endpoints::endpoint_for_key(&snapshot, &snapshot.keys[0].fingerprint)
+                .expect("endpoint");
         assert!(!endpoint.file_transfer_enabled);
         assert!(endpoint.transfer_root.is_empty());
 
@@ -1935,6 +2064,7 @@ mod tests {
         endpoint.terminal_enabled = true;
         set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &endpoint).expect("저장");
         let request = |command: &str, timeout: Option<u64>| ExecuteSshCommandRequest {
+            server_id: None,
             fingerprint: fingerprint.clone(),
             command: command.to_owned(),
             timeout_seconds: timeout,
@@ -2054,6 +2184,7 @@ mod tests {
         )
         .expect("저장");
         let request = |command: &str, timeout: Option<u64>| ExecuteSshCommandRequest {
+            server_id: None,
             fingerprint: fingerprint.clone(),
             command: command.to_owned(),
             timeout_seconds: timeout,
@@ -2164,6 +2295,7 @@ mod tests {
             "echo 'sha256sum: /srv/releases/app.tgz: No such file or directory' >&2\nexit 1",
         );
         let request = |overwrite: bool| UploadSshFileRequest {
+            server_id: None,
             fingerprint: fingerprint.clone(),
             local_path: payload.to_string_lossy().into_owned(),
             remote_path: String::new(),
@@ -2300,6 +2432,7 @@ mod tests {
             &ssh_absent,
             &scp_ok,
             &UploadSshFileRequest {
+                server_id: None,
                 fingerprint: fingerprint.clone(),
                 local_path: oversized.to_string_lossy().into_owned(),
                 remote_path: String::new(),
@@ -2459,6 +2592,7 @@ mod tests {
         let mut endpoint = endpoint_request(&fingerprint);
         set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &endpoint).expect("저장");
         let request = |overwrite: bool| DownloadSshFileRequest {
+            server_id: None,
             fingerprint: fingerprint.clone(),
             remote_path: "logs/app.log".to_owned(),
             local_path: landed.to_string_lossy().into_owned(),
@@ -2666,7 +2800,7 @@ mod tests {
                 .expect("사용자 결정");
             assert!(decision.needs_secret, "비밀번호를 묻지 않은 카드입니다");
             self.secrets
-                .store(self.chat_id, &decision.fingerprint, secret)
+                .store(self.chat_id, &decision.server_id, secret)
                 .expect("비밀번호 보관");
         }
 
@@ -2729,6 +2863,7 @@ mod tests {
         approval_id: Option<&str>,
     ) -> ExecuteSshCommandRequest {
         ExecuteSshCommandRequest {
+            server_id: None,
             fingerprint: fingerprint.to_owned(),
             command: command.to_owned(),
             timeout_seconds: None,
@@ -3322,6 +3457,7 @@ mod tests {
                 home.path(),
                 app_data.path(),
                 &AllowSshCommandRequest {
+                    server_id: None,
                     fingerprint: fingerprint.clone(),
                     command: command.to_owned(),
                     approval_id: approval.map(str::to_owned),

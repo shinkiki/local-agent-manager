@@ -728,11 +728,17 @@ fn plugin_states(home: &Path, documents: &ScopeDocuments) -> Vec<ClaudePluginSta
             let setting =
                 documents.resolve("enabledPlugins", &installed.plugin_id, plugin_setting_value);
             // 우리가 쓰지 않는 모양(배열·객체·문자열)으로 적힌 값은 사용자가 손으로 넣은
-            // 설정이다. 켜진 것으로 보되 덮어쓰지 않도록 잠근다.
+            // 설정이다. 켜진 것으로 보되 덮어쓰지 않도록 잠근다. 해석하지 못한 값(숫자·null)도
+            // 쓰기 경로가 덮어쓰기를 거절하므로(C8-1) 스킬과 같이 잠가 실패할 토글을 내밀지 않는다.
             let locked = setting.locked(
                 setting
                     .winner_value()
-                    .is_some_and(ClaudePluginSettingValue::is_custom),
+                    .is_some_and(ClaudePluginSettingValue::is_custom)
+                    || documents.has_unreadable(
+                        "enabledPlugins",
+                        &installed.plugin_id,
+                        plugin_setting_value,
+                    ),
             );
             ClaudePluginState {
                 plugin_id: installed.plugin_id,
@@ -1038,6 +1044,25 @@ mod tests {
             &home,
             None,
             &plugin_request(Some(false)),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn c8_1_unreadable_plugin_value_locks_the_toggle_the_write_path_refuses() {
+        let (_root, home, app_data) = fixture();
+        fs::write(
+            home.join(".claude/settings.json"),
+            r#"{"enabledPlugins":{"demo@official":1}}"#,
+        )
+        .expect("numeric settings");
+        let snapshot = load_claude_settings_states_with_home(&home, None).expect("load");
+        assert!(snapshot.plugins[0].locked);
+        assert!(set_claude_plugin_enabled_with_home(
+            &app_data,
+            &home,
+            None,
+            &plugin_request(Some(true)),
         )
         .is_err());
     }

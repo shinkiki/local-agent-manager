@@ -385,7 +385,7 @@ function assertCreatable({ card, values, paced, skillsRoot, sources }: CreationR
  * 복사본이 붙으므로, 한 프로젝트의 절차를 고쳐도 다른 프로젝트 회차는 그대로다.
  * 이미 있는 키는 사용자가 손봤을 수 있어 건드리지 않는다.
  */
-async function createProcedureSkills({ card, values, skills, parallel, confirm, text, made }: CreationRun): Promise<void> {
+async function createProcedureSkills({ card, values, skills, paced, parallel, confirm, text, made }: CreationRun): Promise<void> {
   const installed = new Set((await getCommonSkillDigests().catch(() => [])).map((skill) => skill.key));
   const missingSelected = selectedProcedureSkillKeys(values).filter((key) => !installed.has(key));
   if (missingSelected.length > 0) {
@@ -394,7 +394,7 @@ async function createProcedureSkills({ card, values, skills, parallel, confirm, 
       `The selected procedure skill is not installed: ${missingSelected.join(", ")}. Install it as a common skill, then try again.`,
     ));
   }
-  const needed = plannedProcedureSkills(card, values, skills, { parallel, installed });
+  const needed = plannedProcedureSkills(card, values, skills, { parallel, paced, installed });
   if (needed.length === 0) return;
   const accepted = await confirm({
     title: text("회차 절차 스킬 만들기", "Create the round procedure skills"),

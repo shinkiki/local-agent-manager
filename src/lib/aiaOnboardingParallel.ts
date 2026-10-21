@@ -131,7 +131,7 @@ function field(
  * 단계에 앱이 덧붙인다. 기본은 **꺼짐**이다 — 레인 풀·디스크·작업브랜치 푸시가 프로젝트마다
  * 성립하는지 다르므로, 사용자가 켤 때만 병렬로 돈다.
  */
-export function parallelFields(projectPathField: string): AiaOnboardingField[] {
+export function parallelFields(): AiaOnboardingField[] {
   const onlyWhenOn = { visibleWhen: { field: PARALLEL_FIELD_KEYS.enabled, equals: "true" } };
 
   return [
@@ -158,7 +158,9 @@ export function parallelFields(projectPathField: string): AiaOnboardingField[] {
     field(PARALLEL_FIELD_KEYS.pool, "레인 풀", "Lane pool", "text", {
       defaultValue: PARALLEL_DEFAULTS.pool,
       help: {
-        ko: `${projectPathField} 아래의 상대 경로. 저장소에 커밋되지 않게 .git/info/exclude에 더해집니다.`,
+        // 칸 키(`projectPathField`, 예: `projectPath`)를 문구에 끼우던 동안에는 화면에
+        // "projectPath 아래의 상대 경로"가 그대로 떴다. 영어 문구처럼 뜻으로 적는다.
+        ko: "프로젝트 폴더 아래의 상대 경로. 저장소에 커밋되지 않게 .git/info/exclude에 더해집니다.",
         en: "Relative to the project. Added to .git/info/exclude so it is never committed.",
       },
       ...onlyWhenOn,

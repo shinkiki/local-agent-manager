@@ -1,3 +1,6 @@
+import { UserMessageHeader } from "./UserMessageHeader";
+import { MessageEdit } from "./MessageEdit";
+import { editableTranscriptText, supportsMessageEdit } from "../lib/messageEdit";
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { CircleAlert, History, Image as ImageIcon, OctagonPause, X } from "lucide-react";
 import {
@@ -130,9 +133,13 @@ export function useSessionTranscript({
   const [refreshRevision, setRefreshRevision] = useState(0);
   const { measure, restore, forget } = useTopInsertScrollAnchor(scrollContainerRef);
   const refresh = useCallback(() => setRefreshRevision((current) => current + 1), []);
+  // 세션·한도·새로고침이 바뀔 때마다 올린다. 이전 구간 응답이 늦게 오면 이미 다른
+  // 트랜스크립트를 보고 있을 수 있으므로, 요청 시점의 값과 다르면 버린다.
+  const generationRef = useRef(0);
 
   useEffect(() => {
     let active = true;
+    generationRef.current += 1;
     setDetail(null);
     setError(null);
     setLoadingEarlier(false);
@@ -162,19 +169,22 @@ export function useSessionTranscript({
     setLoadingEarlier(true);
     setEarlierError(null);
     measure();
+    const generation = generationRef.current;
     try {
       const page = await getSessionDetail(source, sessionId, limit, oldestTranscriptIndex);
+      if (generation !== generationRef.current) return;
       setDetail((prev) => prev && {
         ...prev,
         transcript: [...page.transcript, ...prev.transcript],
         truncated: page.transcript.length > 0 ? page.truncated : false,
       });
     } catch (cause) {
+      if (generation !== generationRef.current) return;
       // 붙이지 못했으므로 재 둔 높이는 버린다.
       forget();
       setEarlierError(errorText(cause));
     } finally {
-      setLoadingEarlier(false);
+      if (generation === generationRef.current) setLoadingEarlier(false);
     }
   }, [earlierLoadCount, forget, limit, loadingEarlier, measure, oldestTranscriptIndex, sessionId, source]);
 
@@ -267,6 +277,7 @@ export function ActivityFilterSelect({ value, onChange }: {
  * 그대로 넘겨주기만 하던 세 인자를 컨텍스트로 돌린다.
  */
 interface TranscriptViewSource {
+  onEditMessage?: (item: TranscriptItem, text: string, sendImmediately?: boolean) => Promise<void>;
   source: ProviderId | null;
   sessionId: string | null;
   onOpenLocalLink: (href: string) => void;
@@ -283,10 +294,10 @@ const TRANSCRIPT_MOUNT_STEP = 60;
 const TRANSCRIPT_MOUNT_MARGIN = "600px 0px 0px 0px";
 
 // 트랜스크립트는 수백 개 항목을 그리므로, 상위 폴링·연결 상태 변화에 딸려 재조정되지 않도록 memo한다.
-export const TranscriptTurns = memo(function TranscriptTurns({ items, mode, activityFilter = "all", source, sessionId, onOpenLocalLink, scrollContainerRef, windowed = false }: { items: TranscriptItem[]; mode: "conversation" | "activity"; activityFilter?: ActivityFilter; source: ProviderId | null; sessionId: string | null; onOpenLocalLink: (href: string) => void; scrollContainerRef?: RefObject<HTMLElement | null>; /** 표시 범위가 '전체'일 때만 켠다. 아래 주석 참고. */ windowed?: boolean }) {
+export const TranscriptTurns = memo(function TranscriptTurns({ items, mode, activityFilter = "all", source, sessionId, onOpenLocalLink, onEditMessage, scrollContainerRef, windowed = false }: { onEditMessage?: (item: TranscriptItem, text: string, sendImmediately?: boolean) => Promise<void>; items: TranscriptItem[]; mode: "conversation" | "activity"; activityFilter?: ActivityFilter; source: ProviderId | null; sessionId: string | null; onOpenLocalLink: (href: string) => void; scrollContainerRef?: RefObject<HTMLElement | null>; /** 표시 범위가 '전체'일 때만 켠다. 아래 주석 참고. */ windowed?: boolean }) {
   const { text } = useI18n();
   const turns = useMemo(() => groupTranscriptTurns(items), [items]);
-  const viewSource = useMemo<TranscriptViewSource>(() => ({ source, sessionId, onOpenLocalLink }), [source, sessionId, onOpenLocalLink]);
+  const viewSource = useMemo<TranscriptViewSource>(() => ({ source, sessionId, onOpenLocalLink, onEditMessage }), [source, sessionId, onOpenLocalLink, onEditMessage]);
   const { hiddenCount, visibleTurns, topBoundaryRef, showEarlierTurns } =
     useTranscriptMountWindow(turns, items, windowed, scrollContainerRef);
 
@@ -477,6 +488,10 @@ function ConversationActivitySummary({ items }: { items: TranscriptItem[] }) {
 
 const TranscriptArticle = memo(function TranscriptArticle({ item, blocks, speechReady = false }: { item: TranscriptItem; blocks: TranscriptBlockView; speechReady?: boolean }) {
   const { text } = useI18n();
+  const { source, onEditMessage } = useContext(TranscriptViewContext);
+  const editableText = editableTranscriptText(item);
+  const [editMessageContainer, setEditMessageContainer] = useState<HTMLElement | null>(null);
+  const canEdit = blocks === "conversation" && onEditMessage && supportsMessageEdit(source) && editableText !== null;
   const shown = visibleTranscriptBlocks(item, blocks);
   const { visible } = shown;
   if (visible.length === 0) return null;
@@ -498,11 +513,12 @@ const TranscriptArticle = memo(function TranscriptArticle({ item, blocks, speech
     return <div className="transcript-tool-sequence">{visible.map((block, index) => <BlockView block={block} key={index} />)}</div>;
   }
   return (
-    <article className={`message message-${kind}`} data-message-key={transcriptMessageKey(item.index)}>
-      <header><strong>{label}</strong><span>{item.model ?? ""}</span><time>{formatDate(item.timestamp)}</time></header>
+    <article ref={canEdit ? setEditMessageContainer : undefined} tabIndex={canEdit ? 0 : undefined} className={`message message-${kind}`} data-message-key={transcriptMessageKey(item.index)}>
+      {item.role === "user" ? <UserMessageHeader timestamp={item.timestamp} /> : <header><strong>{label}</strong><span>{item.model ?? ""}</span><time>{formatDate(item.timestamp)}</time></header>}
       {copyText && speechReady && <SpeechPlaybackAction responseId={`session:${item.index}:${item.timestamp ?? "unknown"}`} text={copyText} />}
       {copyText && <CopyAction value={copyText} kind="response" className="message-copy-action" />}
       {visible.map((block, index) => <BlockView block={block} copyable={Boolean(copyText)} key={index} />)}
+      {blocks === "conversation" && onEditMessage && supportsMessageEdit(source) && editableText !== null && <MessageEdit messageContainer={editMessageContainer} text={editableText} onSend={(value, sendImmediately) => onEditMessage(item, value, sendImmediately)} />}
       {item.usage && <footer>{text(
         `입력 ${formatTokens(item.usage.input)} · 출력 ${formatTokens(item.usage.output)} · 캐시 ${formatTokens(item.usage.cacheRead + item.usage.cacheWrite)}`,
         `In ${formatTokens(item.usage.input)} · Out ${formatTokens(item.usage.output)} · Cache ${formatTokens(item.usage.cacheRead + item.usage.cacheWrite)}`,

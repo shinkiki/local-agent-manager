@@ -137,18 +137,6 @@ impl DbCliOptions {
 /// 변경 실행은 떠 있는 백엔드로 넘긴다. 승인 카드는 대화에 뜨는 것이고, 대화를 아는
 /// 것은 백엔드뿐이다.
 fn relay_db_statement(options: &DbCliOptions) -> Result<serde_json::Value, CoreError> {
-    let pointer = crate::system_skills::read_session_read_cli_pointer(&options.app_data_dir)?;
-    let port = pointer.backend_port.ok_or_else(|| {
-        CoreError::Conflict(
-            "Agent Manager 백엔드가 포트를 남기지 않은 예전 버전입니다. 앱을 다시 시작한 뒤 시도하세요".to_owned(),
-        )
-    })?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|error| {
-            CoreError::Runtime(format!("HTTP 클라이언트를 만들지 못했습니다: {error}"))
-        })?;
     let body = serde_json::json!({
         "request": {
             "connectionId": options.connection_required()?,
@@ -157,29 +145,12 @@ fn relay_db_statement(options: &DbCliOptions) -> Result<serde_json::Value, CoreE
         },
         "chatId": options.chat_id,
     });
-    let response = client
-        .post(format!(
-            "http://127.0.0.1:{port}/api/invoke/relay_db_statement"
-        ))
-        .json(&body)
-        .send()
-        .map_err(|error| {
-            CoreError::Conflict(format!(
-                "Agent Manager 백엔드(127.0.0.1:{port})에 연결하지 못했습니다. 앱이 실행 중인지 확인하세요: {error}"
-            ))
-        })?;
-    let status = response.status();
-    let value: serde_json::Value = response
-        .json()
-        .map_err(|error| CoreError::Runtime(format!("백엔드 응답을 읽지 못했습니다: {error}")))?;
-    if !status.is_success() {
-        let message = value
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("백엔드가 요청을 거절했습니다");
-        return Err(CoreError::Conflict(message.to_owned()));
-    }
-    Ok(value)
+    crate::chat_secret_cli::relay_to_backend(
+        &options.app_data_dir,
+        "relay_db_statement",
+        &body,
+        Duration::from_secs(120),
+    )
 }
 
 #[cfg(test)]

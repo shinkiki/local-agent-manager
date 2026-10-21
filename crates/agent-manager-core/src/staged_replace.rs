@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::Path;
 
+use crate::app_data_file::sync_dir;
 use crate::domain::wire_enum;
 use crate::CoreError;
 
@@ -72,6 +73,12 @@ impl StagedReplace<'_> {
             }
             self.kind.discard(self.stage);
             return Err(CoreError::Io(error));
+        }
+        // 두 이름 바꾸기는 상위 폴더 항목이라, 폴더를 fsync 하지 않으면 전원이 나갔을 때
+        // 성공을 돌려준 교체가 사라질 수 있다(ext4·btrfs). 교체는 이미 끝났으므로 동기화
+        // 실패를 오류로 돌려주지 않는다 — 실패는 "대상은 교체 전 그대로"를 뜻하는 계약이다.
+        if let Some(parent) = self.target.parent() {
+            let _ = sync_dir(parent);
         }
         Ok(())
     }

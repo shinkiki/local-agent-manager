@@ -389,3 +389,11 @@ test('comparisonLines는 분모를 제목에 찍고 축마다 한 줄을 낸다'
     ['  기준선 대비 실패 종류: 달라진 종류 없다 (기준선 10회 ↔ 이번 20회)'],
   );
 });
+
+// 시험이 panic 전에 찍은 출력이 진단 블록 머리에 오면, 지문은 그 출력이 아니라 panic 메시지여야 한다.
+test('diagnosticSignature 는 panic 앞에 잡힌 표준 출력을 지문으로 쓰지 않는다', () => {
+  const body = (message) =>
+    `준비 완료\nthread 'm::tests::a' (77) panicked at src/m.rs:10:5:\n${message}\nnote: run with \`RUST_BACKTRACE=1\`\n`;
+  assert.equal(diagnosticSignature(body('첫 원인')), '첫 원인');
+  assert.notEqual(diagnosticSignature(body('첫 원인')), diagnosticSignature(body('둘째 원인')));
+});

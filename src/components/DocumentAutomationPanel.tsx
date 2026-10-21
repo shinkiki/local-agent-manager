@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
 import { Bot, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useI18n } from "../lib/i18n";
+import { createLatestGate } from "../lib/latestRequest";
 import type { UiText } from "../lib/i18nLocale";
 import {
   acknowledgeDocumentOfflineReport,
@@ -265,15 +266,21 @@ function useDocumentAutomationSnapshot() {
   const [snapshot, setSnapshot] = useState<DocumentAutomationSnapshot | null>(null);
   const { busy, error, setError, run } = useBusyAction();
 
+  // 첫 적재·새로고침 버튼·작업 뒤 다시 읽기가 겹칠 수 있다. 늦게 도착한 앞선 응답이 새
+  // 스냅샷(방금 저장한 트리거가 든)을 덮지 않게 마지막 읽기만 반영한다.
+  const [loadGate] = useState(createLatestGate);
+
   // 첫 적재와 다시 읽기는 진행 표시를 켜지 않는다(예전 그대로). 실패 문구만 같은 자리에 쓴다.
   const refresh = useCallback(async () => {
+    const isLatest = loadGate.begin();
     setError(null);
     try {
-      setSnapshot(await getDocumentAutomationSnapshot());
+      const next = await getDocumentAutomationSnapshot();
+      if (isLatest()) setSnapshot(next);
     } catch (cause) {
-      setError(errorText(cause));
+      if (isLatest()) setError(errorText(cause));
     }
-  }, [setError]);
+  }, [loadGate, setError]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 

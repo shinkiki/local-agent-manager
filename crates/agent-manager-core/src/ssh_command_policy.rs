@@ -71,19 +71,52 @@ pub(crate) fn validate_remote_command(value: &str) -> Result<RemoteCommandLine, 
 /// 한 단계에서 실제로 실행될 앞머리들을 뽑는다. `sudo systemctl restart app`이면
 /// `["sudo", "systemctl"]`이다. 감싸는 앞머리에서 멈추면 `sudo sh -c …`가 지나간다.
 fn command_heads(argv: &[&str]) -> Vec<String> {
-    let mut heads = Vec::new();
-    for token in argv {
+    command_head_positions(argv)
+        .into_iter()
+        .map(|index| head_name(argv[index]).to_owned())
+        .collect()
+}
+
+/// 실행 자리의 앞머리 이름. 경로로 적힌 `/usr/bin/rm`도 `rm`이다. 지정 단어는 원본 그대로
+/// 두어 거부 쪽이 알아보게 한다.
+fn head_name(token: &str) -> &str {
+    if is_assignment_word(token) {
+        return token;
+    }
+    token.rsplit('/').next().unwrap_or(token)
+}
+
+/// [`command_heads`]가 보는 실행 자리의 토큰 번호. 차단 목록도 같은 자리에서 대조한다 —
+/// 첫 단어만 보면 `nohup rm -rf …`가 `rm -rf` 차단을 비켜 간다.
+fn command_head_positions(argv: &[&str]) -> Vec<usize> {
+    let mut positions = Vec::new();
+    for (index, token) in argv.iter().enumerate() {
         if token.starts_with('-') {
             continue;
         }
-        let head = token.rsplit('/').next().unwrap_or(token).to_owned();
-        let wrapper = WRAPPER_COMMAND_HEADS.contains(&head.as_str());
-        heads.push(head);
-        if !wrapper {
+        // 실행 자리의 `NAME=값`은 원격 셸(첫 자리)과 `sudo`(감싸인 자리)가 명령이 아니라
+        // 환경 변수 지정으로 읽고, 그 뒤 토큰을 실행한다. 여기서 멈추지 않고 경로 꼬리를
+        // 앞머리로 삼으면 `X=1 bash -c …`의 앞머리가 `X=1`이 되어 하드 거부와 차단 목록을
+        // 모두 지나간다. 원본 그대로 넘겨 거부 쪽이 알아보게 한다.
+        positions.push(index);
+        if is_assignment_word(token) || !WRAPPER_COMMAND_HEADS.contains(&head_name(token)) {
             break;
         }
     }
-    heads
+    positions
+}
+
+/// 셸이 환경 변수 지정으로 읽는 단어인지 — `=` 앞이 비어 있지 않은 식별자다. 따옴표로 감싸
+/// 들어왔어도 정본에서 맨몸으로 다시 적히므로(`is_bare_char`) 출처와 무관하게 본다.
+fn is_assignment_word(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|value| value.is_ascii_alphanumeric() || value == '_')
 }
 
 /// C9-19. 이 줄에서 원격 `sudo`가 비밀번호를 물을 수 있는 자리들 — `(단계 번호, 그 단계의
@@ -230,6 +263,11 @@ pub(crate) fn enforce_hard_command_refusals(
     for stage in line.stages() {
         let argv = stage.argv();
         for head in command_heads(&argv) {
+            if is_assignment_word(&head) {
+                return Err(CoreError::Conflict(format!(
+                    "실행 자리의 환경 변수 지정 \"{head}\"은(는) 쓸 수 없습니다. 원격은 그 뒤 단어를 명령으로 실행하므로 앞머리 거부와 차단 목록이 그 명령을 보지 못합니다. 변수 없이 명령만 요청하세요"
+                )));
+            }
             if REFUSED_COMMAND_HEADS.contains(&head.as_str()) {
                 return Err(CoreError::Conflict(format!(
                     "{head}은(는) 이 인터페이스가 대신 실행하지 않습니다. 셸·인터프리터·네트워크 내려받기 명령은 허용 목록에 적혀 있어도, 사용자가 1회 승인을 해 주어도, 파이프라인의 중간 단계여도 거절합니다 — 그 한 줄이 나머지 규칙 전부를 무의미하게 만들기 때문입니다. 필요한 작업을 그 도구 없이 표현하거나 사용자에게 직접 실행을 요청하세요"
@@ -238,11 +276,17 @@ pub(crate) fn enforce_hard_command_refusals(
         }
         // 차단이 우선한다. 허용 목록에 걸리는 명령이어도, 사용자가 1회 승인을 해 주어도
         // 차단에 걸리면 실행하지 않는다.
-        if let Some(rule) = endpoint
-            .denied_commands
-            .iter()
-            .find(|rule| matches_denied_rule(&argv, rule))
-        {
+        let denied = command_head_positions(&argv).into_iter().find_map(|index| {
+            // 규칙은 경로로 적혔을 수도(`/bin/rm -rf`) 이름으로 적혔을 수도 있다. 둘 다 본다.
+            let raw = &argv[index..];
+            let mut named = raw.to_vec();
+            named[0] = head_name(named[0]);
+            endpoint
+                .denied_commands
+                .iter()
+                .find(|rule| matches_denied_rule(raw, rule) || matches_denied_rule(&named, rule))
+        });
+        if let Some(rule) = denied {
             return Err(CoreError::Conflict(format!(
                 "이 서버의 차단 명령 \"{rule}\"에 \"{}\"이(가) 걸려 실행하지 않았습니다. 1회 승인으로도 우회할 수 없으며, 목록은 애드온 → SSH → 연결 서버 → 고급 설정에서 사용자가 정합니다",
                 stage.render_command()
@@ -421,6 +465,9 @@ mod tests {
 
     fn view(allowed: &[&str], denied: &[&str]) -> SshEndpointView {
         SshEndpointView {
+            id: "srv-test".to_owned(),
+            name: String::new(),
+            fingerprint: "SHA256:test".to_owned(),
             host: "build.example.com".to_owned(),
             port: 22,
             user: "deploy".to_owned(),
@@ -537,6 +584,42 @@ mod tests {
                 "{command}"
             );
         }
+        // C9-14. 실행 자리의 환경 변수 지정은 뒤 명령을 가려 거부와 차단을 지나가게 한다.
+        for command in [
+            "X=1 bash -c id",
+            "LD_PRELOAD=/tmp/x.so rm -rf /srv/app",
+            "_A=/usr/bin/sh sh",
+            "sudo X=1 bash",
+            "nohup 'X=1' rm -rf /",
+        ] {
+            assert!(
+                enforce_command_policy(&endpoint, command).is_err(),
+                "{command}"
+            );
+        }
+        // C9-13/C9-14. 감싸는 앞머리 뒤의 실행 자리도 차단 목록이 본다. 첫 단어만 맞춰 보면
+        // `nohup rm -rf …`가 `rm -rf` 차단을 비켜 간다.
+        for command in [
+            "nohup rm -rf /srv/app",
+            "nice setsid rm -rf /srv/app",
+            "/usr/bin/nohup cat /etc/shadow",
+            "/bin/rm -rf /srv/app",
+        ] {
+            assert!(
+                enforce_command_policy(&endpoint, command).is_err(),
+                "{command}"
+            );
+        }
+        // 인자 자리의 같은 단어는 실행 자리가 아니다.
+        enforce_command_policy(&endpoint, "echo rm -rf").expect("인자");
+        enforce_command_policy(&endpoint, "nohup echo rm -rf").expect("감싼 인자");
+        // 경로로 적은 차단 규칙도 그대로 걸린다.
+        let mut by_path = view(&[], &["/bin/rm -rf"]);
+        by_path.unrestricted_commands = true;
+        assert!(enforce_command_policy(&by_path, "nohup /bin/rm -rf /srv/app").is_err());
+        // 인자 자리의 `=`은 지정이 아니다.
+        enforce_command_policy(&endpoint, "systemctl set-environment A=1").expect("인자");
+        enforce_command_policy(&endpoint, "dd if=/dev/zero of=x count=1").expect("인자");
         // 허용 목록이 비어 있어도 무제한이면 실행한다 — 승인 자리가 아예 없다.
         let mut empty = view(&[], &["rm -rf"]);
         empty.unrestricted_commands = true;

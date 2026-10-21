@@ -1,12 +1,17 @@
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import { AppWindow, CalendarClock, ExternalLink, GitBranch, MessagesSquare, PanelLeftOpen, Plus, RotateCw, ScrollText } from "lucide-react";
 import { attachChat, connectChat, supportsDeliveryDuringTurn, supportsSessionFork, type ChatConnection } from "../lib/chat";
+import { editableTranscriptText, supportsMessageEdit, type MessageRewindDraft } from "../lib/messageEdit";
+import { resolveLiveMessageEdit } from "../lib/chatMessageEdit";
 import { ChatRejectedError } from "../lib/chatReconnect";
+import type { ChatHistoryNavigator } from "../appConversationHistory";
+import type { ConversationLocation } from "../lib/conversationHistory";
 import type { TabRequest } from "../lib/uiGuide";
 import {
   createDirectory,
   getDetachedChatForSession,
   getLiveChats,
+  getSessionDetail,
   hasTauriRuntime,
   openProviderSessionApp,
   previewDirectoryCreation,
@@ -102,6 +107,7 @@ import { ChatLaunchForm, useCliConnectionCards, useLaunchAdvancedSettings } from
 import { hideChatCloseConfirmation, shouldConfirmChatClose } from "../lib/chatCloseConfirmation";
 import { errorText } from "../lib/errorText";
 import { saveSessionMetaPatch } from "../lib/sessionMetaSave";
+import { createLatestGate } from "../lib/latestRequest";
 
 interface ChatViewProps {
   providers: ProviderStatus[];
@@ -132,9 +138,12 @@ interface ChatViewProps {
   tabRequest?: TabRequest<ChatTab> | null;
   /** 이 화면이 이미 팝아웃 창일 때는 '새 창으로 열기'를 다시 제공하지 않는다. */
   popout?: boolean;
+  historyNavigatorRef?: MutableRefObject<ChatHistoryNavigator | null>;
+  onHistoryLocationChange?: (location: ConversationLocation) => void;
 }
 
 export interface ChatViewAttentionTarget {
+  rewindDraft?: MessageRewindDraft;
   chatId: string;
   attentionId: string;
   markRead: boolean;
@@ -204,7 +213,7 @@ function chatCloseConfirmMessage(scope: ChatCloseScope, active: boolean): string
     : runtimeText("이 채팅 실행을 종료하고 채팅 목록에서 제거합니다.", "Close this chat run and remove it from the chat list.");
 }
 
-export function ChatView({ providers, accounts, projects, models, sessions, messageDisplayMode, transcriptLimit, onTranscriptLimitChange, scheduler, onRefreshScheduler, onSchedulerSnapshot, onConnectCli, onOpenSession, onMetaChanged, onSessionCatalogChanged, attentionTarget, onAttentionTargetHandled, tabRequest = null, popout = false }: ChatViewProps) {
+export function ChatView({ providers, accounts, projects, models, sessions, messageDisplayMode, transcriptLimit, onTranscriptLimitChange, scheduler, onRefreshScheduler, onSchedulerSnapshot, onConnectCli, onOpenSession, onMetaChanged, onSessionCatalogChanged, attentionTarget, onAttentionTargetHandled, tabRequest = null, popout = false, historyNavigatorRef, onHistoryLocationChange }: ChatViewProps) {
   // 정적 치환기는 화면에 그려지는 텍스트 노드만 덮는다. aria-label·title·placeholder처럼
   // 속성으로만 있는 문구는 여기서 text(ko, en)으로 직접 고른다.
   const { text } = useI18n();
@@ -458,7 +467,9 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
       return tab === "activity" ? activityLogRef.current : chatStreamRef.current;
     },
   }), [tab]);
+  const [rewindPreviews, setRewindPreviews] = useState<Record<string, TranscriptItem[]>>({});
   const transcript = useChatTranscriptHistory({
+    previewItems: session ? rewindPreviews[session.chatId] : undefined,
     session,
     turns,
     limit: transcriptLimit,
@@ -467,6 +478,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     activityFilter,
     scrollContainerRef: historyScrollRef,
     onOpenLocalLink: linkedFilePreview.open,
+    onEditMessage: session && supportsMessageEdit(session.source) ? (item, value, sendImmediately) => editPreviousMessage(item, value, sendImmediately) : undefined,
   });
 
   // 대화 안에서 찾기(Cmd+F / Ctrl+F). 대화 탭과 작업 기록 탭이 각자 다른 요소를 굴리므로
@@ -519,12 +531,17 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     applySessionInfo(info);
   }, [applySessionInfo]);
 
+  // 폴링과 닫기·전환 직후의 갱신이 겹치면 먼저 보낸 요청의 응답이 나중에 도착할 수 있다.
+  // 그 응답은 방금 닫은 채팅이 아직 든 사진이라, 반영하면 탭이 다음 폴링까지 되살아난다.
+  const liveChatsGateRef = useRef(createLatestGate());
   const refreshLiveChats = useCallback(async () => {
+    const isLatest = liveChatsGateRef.current.begin();
     // 스냅숏은 이 시각의 사진이다. 응답을 기다리는 사이에 도착한 state 이벤트보다
     // 과거인지 판정하는 데 쓴다.
     const requestedAt = Date.now();
     // 화면의 채팅은 그대로 두고, 폴링 루프만 백오프하도록 실패를 전달한다.
     const chats = await getLiveChats("standard");
+    if (!isLatest()) return;
     setLiveChats(chats);
     // 안전망: 라이브 state 이벤트를 놓쳐 표시가 실제 상태와 어긋나면 스냅숏으로 맞춘다.
     const active = sessionRef.current;
@@ -731,10 +748,16 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     if (!attentionTarget) return undefined;
     let cancelled = false;
     void switchChat(attentionTarget.chatId).then((opened) => {
-      if (!cancelled) onAttentionTargetHandled(attentionTarget, opened);
+      if (!cancelled) {
+        if (opened && attentionTarget.rewindDraft && sessionRef.current?.chatId === attentionTarget.chatId) {
+          putComposerDraft(attentionTarget.rewindDraft.text, []);
+          setRewindPreviews((current) => ({ ...current, [attentionTarget.chatId]: attentionTarget.rewindDraft!.history }));
+        }
+        onAttentionTargetHandled(attentionTarget, opened);
+      }
     });
     return () => { cancelled = true; };
-  }, [attentionTarget, onAttentionTargetHandled, switchChat]);
+  }, [attentionTarget, onAttentionTargetHandled, switchChat, putComposerDraft]);
 
   const providerModels = models.filter((option) => option.source === source);
   const { launchAdvancedSettings } = useLaunchAdvancedSettings({
@@ -1374,6 +1397,26 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     }
   };
 
+  const historyOpenRef = useRef<ChatHistoryNavigator>(async () => false);
+  historyOpenRef.current = async (chatId) => {
+    if (chatId) return switchChat(chatId);
+    if (chatSwitchingRef.current) return false;
+    await newChat();
+    return sessionRef.current === null;
+  };
+  useEffect(() => {
+    if (!historyNavigatorRef) return;
+    const open: ChatHistoryNavigator = (chatId) => historyOpenRef.current(chatId);
+    historyNavigatorRef.current = open;
+    return () => { if (historyNavigatorRef.current === open) historyNavigatorRef.current = null; };
+  }, [historyNavigatorRef]);
+  useEffect(() => {
+    if (chatSwitching || phase === "connecting") return;
+    onHistoryLocationChange?.(session
+      ? { view: "chat", chatId: session.chatId, source: session.source, sessionId: session.providerSessionId }
+      : { view: "chat" });
+  }, [chatSwitching, phase, session?.chatId, session?.source, session?.providerSessionId, onHistoryLocationChange]);
+
   /**
    * 이 대화를 원본으로 새 세션을 갈라낸다(fork). 원본 채팅은 "새 채팅"처럼 백그라운드에
    * 두고, 같은 경로·모델·추론·권한으로 원본 대화를 이어받은 새 세션을 이 자리에 띄운다.
@@ -1419,6 +1462,79 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
       void refreshLiveChats();
     }
   };
+
+  function editPreviousMessage(item: TranscriptItem, value: string, sendImmediately = true): Promise<void> {
+    const owner = sessionRef.current?.chatId;
+    return queueChatSwitch(async () => {
+      if (!owner || sessionRef.current?.chatId !== owner) throw new Error(text("채팅이 변경되었습니다. 다시 선택해 주세요.", "The chat changed. Select the message again."));
+      await runMessageEdit(item, value, sendImmediately);
+    });
+  }
+
+  async function runMessageEdit(item: TranscriptItem, value: string, sendImmediately: boolean): Promise<void> {
+    const current = sessionRef.current;
+    const expectedText = editableTranscriptText(item);
+    if (!current?.providerSessionId || expectedText === null || !supportsMessageEdit(current.source)) throw new Error(text("편집할 원본 메시지를 확인할 수 없습니다.", "Cannot identify the original message to edit."));
+    if (chatSwitchingRef.current || (phaseRef.current === "running" || phaseRef.current === "waitingApproval" || phaseRef.current === "connecting") || queueRef.current.length > 0) throw new Error(text("응답과 대기열 처리가 끝난 뒤 편집해 주세요.", "Wait until the response and queued messages finish before editing."));
+    markChatSwitching(true);
+    let branch: ChatConnection | null = null;
+    let adopted = false;
+    let sent = false;
+    const originalGeneration = connectionGenerationRef.current;
+    const stillCurrent = () => originalGeneration === connectionGenerationRef.current && sessionRef.current?.chatId === current.chatId;
+    const buffered: ChatEvent[] = [];
+    let deliver = (event: ChatEvent) => { buffered.push(event); };
+    try {
+      const history = sendImmediately ? undefined : (await getSessionDetail(current.source, current.providerSessionId, "all")).transcript.filter((entry) => entry.index < item.index);
+      if (!stillCurrent()) throw new Error(text("채팅이 변경되었습니다. 다시 선택해 주세요.", "The chat changed. Select the message again."));
+      // Keep the original connection and draft until the new branch is ready.
+      branch = await connectChat({
+        source: current.source, cwd: current.cwd,
+        model: model.trim() || null, reasoningEffort: reasoningEffort || null,
+        mode, approvalMode, settings: extraSettings, unattended: false,
+        forkSessionId: current.providerSessionId, editMessage: { index: item.index, expectedText },
+      }, (event) => deliver(event));
+      if (!stillCurrent()) throw new Error(text("채팅이 변경되었습니다. 다시 선택해 주세요.", "The chat changed. Select the message again."));
+      if (sendImmediately) { await branch.send(value); sent = true; }
+      if (!stillCurrent()) throw new Error(sent ? text("수정한 메시지는 새 채팅으로 전송되었습니다. 채팅 목록에서 열어 주세요.", "The edited message was sent to a new chat. Open it from the chat list.") : text("채팅이 변경되었습니다. 다시 선택해 주세요.", "The chat changed. Select the message again."));
+      rememberChatLocalState(current.chatId);
+      const { connection: previous, generation } = takeConnection();
+      applyChatSurface(connectingChatSurface());
+      connectionRef.current = branch;
+      applyAttachSnapshot(branch.info, generation);
+      deliver = eventsForGeneration(generation);
+      for (const event of buffered) deliver(event);
+      buffered.length = 0;
+      adopted = true;
+      if (!sendImmediately) {
+        putComposerDraft(value, []);
+        setRewindPreviews((previews) => ({ ...previews, [branch!.info.chatId]: history ?? [] }));
+      }
+      setTab("conversation");
+      if (previous) await detachQuietly(previous);
+    } catch (cause) {
+      // Only this newly-created branch may be stopped; the original is never rewound by hand.
+      if (branch && !adopted) {
+        if (!sent) await branch.stop().catch(() => undefined);
+        await detachQuietly(branch);
+      }
+      throw cause;
+    } finally {
+      markChatSwitching(false);
+      void refreshLiveChats();
+    }
+  }
+
+  async function editLiveMessage(entry: Extract<ChatEntry, { type: "message" }>, value: string, sendImmediately = true): Promise<void> {
+    const current = sessionRef.current;
+    if (!current?.providerSessionId) throw new Error(text("아직 세션 기록이 준비되지 않았습니다.", "The session record is not ready yet."));
+    const detail = await getSessionDetail(current.source, current.providerSessionId, "all");
+    if (sessionRef.current?.chatId !== current.chatId) throw new Error(text("채팅이 변경되었습니다. 다시 선택해 주세요.", "The chat changed. Select the message again."));
+    const replay = turns.flatMap((turn) => turn.entries).filter((candidate): candidate is Extract<ChatEntry, { type: "message" }> => candidate.type === "message" && candidate.role === "user");
+    const item = resolveLiveMessageEdit(detail.transcript, replay, entry.id);
+    if (!item) throw new Error(text("원본 메시지를 정확히 찾을 수 없습니다. 세션 기록에서 해당 메시지를 편집해 주세요.", "Cannot uniquely identify the original message. Edit it from the session record."));
+    await editPreviousMessage(item, value, sendImmediately);
+  }
 
   /**
    * 채팅을 별도 창으로 연다. 백엔드가 화면마다 구독을 따로 유지하므로 이 창의 대화는
@@ -1687,7 +1803,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
             <div className="chat-stream" aria-live="polite" ref={chatStreamRef}>
               {transcript.history}
               {turns.length === 0 && !transcript.history && <EmptyState title={text("CLI가 연결되었습니다", "CLI connected")} detail={text("아래 입력창에서 첫 메시지를 보내세요.", "Send your first message from the composer below.")} />}
-              {turns.map((turn) => <ChatConversationTurn turn={turn} chatId={activeChatId} onDecision={decide} onOpenLocalLink={linkedFilePreview.open} key={turn.id} />)}
+              {turns.map((turn) => <ChatConversationTurn onEditMessage={session && supportsMessageEdit(session.source) ? editLiveMessage : undefined} turn={turn} chatId={activeChatId} onDecision={decide} onOpenLocalLink={linkedFilePreview.open} key={turn.id} />)}
             </div>
             <ChatScrollControls
               targetRef={chatStreamRef}

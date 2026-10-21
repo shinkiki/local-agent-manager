@@ -20,6 +20,10 @@ export function attentionNotificationDetail(
   if (item.kind === "accountSwitch" || item.kind === "pacingSuggestion") {
     return `${sourceName(item.source)}: ${item.detail?.trim() || item.title}`;
   }
+  // 회차 결정은 공급자·세션·폴더가 없다. 목표 제목(title)과 남은 건수(detail)를 함께 적는다.
+  if (item.kind === "roundDecision") {
+    return item.detail?.trim() ? `${item.title} · ${item.detail.trim()}` : item.title;
+  }
   const session = item.providerSessionId
     ? sessions.find((candidate) => (
       candidate.source === item.source && candidate.id === item.providerSessionId
@@ -58,6 +62,7 @@ const ATTENTION_LABELS: Record<NotifiableAttentionKind, () => string> = {
   failed: () => runtimeText("작업 실패", "Task failed"),
   accountSwitch: () => runtimeText("계정 자동전환", "Automatic account switch"),
   pacingSuggestion: () => runtimeText("페이싱 제안", "Pacing suggestion"),
+  roundDecision: () => runtimeText("회차 결정 대기", "Round decision pending"),
 };
 
 function kindLabel(kind: ChatAttentionItem["kind"]): string | undefined {

@@ -3906,10 +3906,10 @@ fn select_path<'v>(value: &'v Value, path: &str) -> Result<&'v Value, CoreError>
     }
     let mut current = value;
     for segment in path.split('.') {
-        current = if let Ok(index) = segment.parse::<usize>() {
-            current.get(index)
-        } else {
-            current.get(segment)
+        // 숫자 구간은 배열에서만 색인이다. 객체에서는 `"2026"` 같은 키 이름 그대로 찾는다.
+        current = match (current, segment.parse::<usize>()) {
+            (Value::Array(items), Ok(index)) => items.get(index),
+            _ => current.get(segment),
         }
         .ok_or_else(|| {
             CoreError::InvalidInput(format!("결과에서 path {path}을(를) 찾을 수 없습니다"))
@@ -4011,7 +4011,7 @@ fn append_completion_brief(arguments: &mut Value, brief: &Value) {
     *message = Value::String(text);
 }
 
-/// 목표의 완전자동 결정 모드를 회차 에이전트 지침으로 붙인다. 이것은 권한 승인이 아니라
+/// 목표의 추천적용·완전자동 결정 모드를 회차 에이전트 지침으로 붙인다. 이것은 권한 승인이 아니라
 /// 이미 허용된 목표 범위 안의 기술 판단을 이어 가는 정책이다. 새 권한·외부 공개·파괴적
 /// 변경이 필요하면 기존 승인 경계를 그대로 지키도록 문구에도 명시한다.
 fn append_decision_automation_brief(arguments: &mut Value, brief: &Value) {
@@ -4035,6 +4035,19 @@ fn append_decision_automation_brief(arguments: &mut Value, brief: &Value) {
     let mut text = message.as_str().unwrap_or_default().to_owned();
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
+    }
+    if brief.get("mode").and_then(Value::as_str) == Some("recommended") {
+        text.push_str(&format!(
+            "\n---\n[회차 추천적용 결정] 목표: {goal_title} ({goal_id})\n\
+             추천안으로 답할 미결 선택 요청: {pending_count}건. 작업을 시작하기 전에 `list_round_reports`로 이 목표의 \
+             `pendingDecisions=true` 보고를 최신 상태로 읽으세요. `requiresHuman`이 false이고 `recommendation`이 있는 \
+             결정만 그 추천안을 그대로 답으로 `resolve_round_decision`에 기록하고, 기록한 답은 이번 회차의 추가 지시로 \
+             간주해 가능한 작업까지 이어서 수행하세요. `requiresHuman`이 true이거나 추천안이 없는 결정에는 답하지 말고 \
+             사람이 정하도록 남기세요. 이 모드는 새 권한을 주지 않습니다. 목표 범위를 넓히거나 외부 공개, 복구하기 \
+             어려운 변경, 비밀 접근처럼 별도 사용자 권한이 필요한 일은 기존 승인·안전 규칙을 그대로 지키세요.\n"
+        ));
+        *message = Value::String(text);
+        return;
     }
     text.push_str(&format!(
         "\n---\n[회차 완전자동 결정] 목표: {goal_title} ({goal_id})\n\
@@ -4262,6 +4275,14 @@ mod tests {
         assert!(registry.propose(with("{run.index}")).is_err());
         // 닫히지 않은 중괄호.
         assert!(registry.propose(with("{input.goal")).is_err());
+    }
+
+    #[test]
+    fn select_path_reads_numeric_object_keys_and_array_indexes() {
+        let value = json!({"byYear": {"2026": "ok"}, "list": ["a", "b"]});
+        assert_eq!(select_path(&value, "byYear.2026").expect("key"), "ok");
+        assert_eq!(select_path(&value, "list.1").expect("index"), "b");
+        assert!(select_path(&value, "list.2").is_err());
     }
 
     #[test]
@@ -5274,6 +5295,25 @@ mod tests {
     }
 
     #[test]
+    fn recommended_decision_brief_answers_only_with_recommendations_and_leaves_human_ones() {
+        let brief = json!({
+            "goalId": "goal-1",
+            "goalTitle": "리팩토링 회차",
+            "mode": "recommended",
+            "pendingCount": 1
+        });
+        let mut arguments = json!({"request": {"message": "원래 회차 지시"}});
+        append_decision_automation_brief(&mut arguments, &brief);
+        let message = arguments["request"]["message"].as_str().unwrap();
+        assert!(message.starts_with("원래 회차 지시\n"));
+        assert!(message.contains("[회차 추천적용 결정]"));
+        assert!(!message.contains("[회차 완전자동 결정]"));
+        assert!(message.contains("추천안을 그대로 답으로"));
+        assert!(message.contains("`requiresHuman`이 true이거나 추천안이 없는 결정에는 답하지 말고"));
+        assert!(message.contains("새 권한을 주지 않습니다"));
+    }
+
+    #[test]
     fn a_paced_round_refreshes_plans_cleans_up_and_launches_each_planned_run() {
         let (_dir, registry) = registry();
         register_approved(&registry, usage_paced_round_contract()).expect("register");
@@ -5604,6 +5644,66 @@ mod tests {
         assert_eq!(steps[3]["status"], "failed");
         assert_eq!(steps[4]["stepId"], "run-2");
         assert_eq!(steps[4]["status"], "succeeded");
+    }
+
+    /// 계정 고정 거부(실행 게이트)로 한 건이 실패해도 뒤 건은 모두 뜨고, 영수증은 그 실패를
+    /// 계정과 함께 남긴 채 회차를 실패로 표시한다 — 일부 기동이 실패를 가리지 않는다.
+    #[test]
+    fn a_pin_refusal_on_one_run_leaves_the_other_runs_launching() {
+        let (_dir, registry) = registry();
+        register_approved(&registry, usage_paced_round_contract()).expect("register");
+        let launched = std::cell::RefCell::new(Vec::new());
+        let invoker = |operation: &str, arguments: Value, _site: &WorkflowCallSite<'_>| {
+            if operation == "plan_usage_paced_runs" {
+                return Ok(fake_plan(&[
+                    ("antigravity-a", "antigravity"),
+                    ("claude-b", "claude"),
+                    ("codex-c", "codex"),
+                ]));
+            }
+            if operation == "start_chat" {
+                let account = arguments["request"]["chat"]["accountId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                if account == "antigravity-a" {
+                    return Err(CoreError::Conflict(
+                        "사용량이 소진된 계정은 고정할 수 없습니다. 한도가 리셋되면 다시 시도하세요"
+                            .to_owned(),
+                    ));
+                }
+                launched.borrow_mut().push(account);
+            }
+            Ok(json!({"ok": true}))
+        };
+        let receipt = registry
+            .execute_paced_round(
+                WorkflowExecuteRequest {
+                    workflow_id: "usage-paced-round".to_owned(),
+                    arguments: json!({"projectPath": "/tmp/project", "message": "go"}),
+                    idempotency_key: "round-pin-refused".to_owned(),
+                    ..Default::default()
+                },
+                PacedRoundOptions { max_runs: 3 },
+                &invoker,
+            )
+            .expect("round");
+        assert_eq!(*launched.borrow(), ["claude-b", "codex-c"]);
+        assert_eq!(receipt["round"]["plannedRuns"], 3);
+        assert_eq!(receipt["round"]["launchedRuns"], 2);
+        assert_eq!(receipt["succeeded"], false);
+        assert_eq!(receipt["failedStepId"], "run-1");
+        let steps = receipt["steps"].as_array().expect("steps");
+        let run = |id: &str| {
+            steps
+                .iter()
+                .find(|step| step["stepId"] == id)
+                .unwrap_or_else(|| panic!("{id} 단계 행"))
+        };
+        assert_eq!(run("run-1")["status"], "failed");
+        assert_eq!(run("run-1")["accountId"], "antigravity-a");
+        assert_eq!(run("run-2")["status"], "succeeded");
+        assert_eq!(run("run-3")["status"], "succeeded");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "agent-manager-server"
-version = "0.3.2"
+version = "0.4.0"
 description = "Loopback-only HTTP adapter for Agent Manager remote access"
 edition = "2021"
 publish = false

@@ -58,17 +58,27 @@ pub fn verify_totp(
     let first = center.saturating_sub(TOTP_ALLOWED_SKEW_STEPS);
     let last = center.saturating_add(TOTP_ALLOWED_SKEW_STEPS);
     let mut accepted = None;
+    // C20-2: 마지막 사용 스텝이 이미 창 밖이어도 그 코드의 재사용은 거부한다.
+    // 첫 인증 때 충돌한 뒤쪽 스텝이 아직 창 밖이면 최신 일치 기록만으로는 부족하다.
+    let mut replayed = last_used_step.is_some_and(|step| {
+        let used_code = format_code(totp_code(secret, step));
+        bool::from(used_code.as_bytes().ct_eq(expected.as_bytes()))
+    });
     for step in first..=last {
         let candidate = format_code(totp_code(secret, step));
         let matches = candidate.as_bytes().ct_eq(expected.as_bytes()).into();
-        if matches && accepted.is_none() {
+        // C20-2: 코드가 여러 스텝에서 같으면 가장 최신 스텝까지 사용한 것으로 기록한다.
+        // 첫 일치만 기록하면 창이 이동해 그 스텝이 빠진 뒤 같은 코드가 다시 통과한다.
+        if matches {
+            replayed |= last_used_step.is_some_and(|used| step <= used);
             accepted = Some(step);
         }
     }
-    match (accepted, last_used_step) {
-        // 이미 쓴 스텝(또는 그보다 앞)의 코드는 재사용이다.
-        (Some(step), Some(used)) if step <= used => None,
-        (step, _) => step,
+    // 이미 쓴 스텝과 맞으면 더 최신 스텝도 같더라도 재사용이다(C20-2).
+    if replayed {
+        None
+    } else {
+        accepted
     }
 }
 
@@ -220,6 +230,67 @@ mod tests {
         assert_eq!(
             verify_totp(RFC_SECRET, now, Some(center - 1), &code),
             Some(center)
+        );
+    }
+
+    #[test]
+    fn c20_2_colliding_steps_cannot_replay_the_code_after_the_window_moves() {
+        // 공개 RFC 키에서 인접한 두 스텝이 같은 6자리 코드를 만든다.
+        let earlier = 910_737;
+        let later = earlier + 1;
+        let code = "911617";
+        assert_eq!(format_code(totp_code(RFC_SECRET, earlier)), code);
+        assert_eq!(format_code(totp_code(RFC_SECRET, later)), code);
+
+        let used_before_collision =
+            verify_totp(RFC_SECRET, (earlier - 1) * TOTP_STEP_SECONDS, None, code);
+        assert_eq!(used_before_collision, Some(earlier));
+        assert_eq!(
+            verify_totp(
+                RFC_SECRET,
+                (later + 1) * TOTP_STEP_SECONDS,
+                used_before_collision,
+                code,
+            ),
+            None,
+            "마지막 사용 스텝이 창 밖으로 나간 뒤에도 같은 코드는 재사용이다",
+        );
+        for center in [earlier, later] {
+            assert_eq!(
+                verify_totp(
+                    RFC_SECRET,
+                    center * TOTP_STEP_SECONDS,
+                    used_before_collision,
+                    code,
+                ),
+                None,
+                "이미 쓴 코드가 최신 스텝과도 같아도 재사용이다",
+            );
+            let accepted = verify_totp(RFC_SECRET, center * TOTP_STEP_SECONDS, None, code);
+            for replay_center in [center, later + 1] {
+                assert_eq!(
+                    verify_totp(
+                        RFC_SECRET,
+                        replay_center * TOTP_STEP_SECONDS,
+                        accepted,
+                        code,
+                    ),
+                    None,
+                    "코드 충돌도 재사용할 수 없다: {center} -> {replay_center}",
+                );
+            }
+            assert_eq!(accepted, Some(later));
+        }
+        let next_code = format_code(totp_code(RFC_SECRET, later + 1));
+        assert_ne!(next_code, code);
+        assert_eq!(
+            verify_totp(
+                RFC_SECRET,
+                (later + 1) * TOTP_STEP_SECONDS,
+                Some(later),
+                &next_code,
+            ),
+            Some(later + 1),
         );
     }
 

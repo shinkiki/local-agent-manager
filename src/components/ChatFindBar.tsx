@@ -379,6 +379,9 @@ export function useChatFind({ containerRef, enabled, resetKey, priority = 0 }: {
     // IME 조합을 끝내는 Enter 는 아직 찾기 명령이 아니다.
     if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
     event.preventDefault();
+    // 불러오는 동안에는 다시 세지 않아 결과 수가 옛 값이다. 이전·다음 단추를 잠근 것과
+    // 같은 이유로 Enter 도 넘기지 않는다 — 끝나면 어차피 첫 자리로 돌아간다.
+    if (expanding !== null) return;
     step(event.shiftKey ? -1 : 1);
   };
 

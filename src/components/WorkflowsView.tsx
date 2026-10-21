@@ -58,6 +58,7 @@ import { UsageBudgetPanel } from "./UsageBudgetPanel";
 import { errorText } from "../lib/errorText";
 
 import { formatDateTime } from "../lib/format";
+import { relatedSkillKeys } from "../lib/workflowSkillOwnership";
 export type WorkflowsTabId = "catalog" | "recurring" | "automation";
 
 /**
@@ -85,16 +86,14 @@ const workflowsTabs: { id: WorkflowsTabId; icon: ComponentType<{ size?: number; 
 interface Props {
   active: boolean;
   onRequestAiaPrompt?: (prompt: string) => void;
-  /// 다른 화면(AIA 화면 안내)이 특정 탭을 열어 달라는 요청. requestId가 바뀔 때마다 전환한다.
-  tabRequest?: TabRequest<WorkflowsTabId> | null;
+  /// 다른 화면(AIA 화면 안내·알림)이 특정 탭을 열어 달라는 요청. requestId가 바뀔 때마다 전환한다.
+  tabRequest?: (TabRequest<WorkflowsTabId> & { openGoalId?: string }) | null;
   /** 페이싱 관측이 올린 제안 알림. 페이싱 탭 위에 배너로 깔린다. */
   pacingSuggestions?: readonly ChatAttentionItem[];
   /** 자동화 탭의 온보딩 카드가 읽고 쓰는 시스템 자동화 스냅숏. */
   automation?: SystemAutomationSnapshot | null;
   onAutomationChange?: (snapshot: SystemAutomationSnapshot) => void;
   onSkillsChanged?: () => void;
-  /** 로고 새로고침이 올리는 나수. 스스로 다시 읽지 않는 회차 목표 패널이 보고 다시 읽는다. */
-  refreshNonce?: number;
 }
 
 /**
@@ -115,7 +114,7 @@ function PacingSuggestionBanner({ items }: { items: readonly ChatAttentionItem[]
   </section>;
 }
 
-export function WorkflowsView({ active, onRequestAiaPrompt, tabRequest, pacingSuggestions = [], automation = null, onAutomationChange, onSkillsChanged, refreshNonce = 0 }: Props) {
+export function WorkflowsView({ active, onRequestAiaPrompt, tabRequest, pacingSuggestions = [], automation = null, onAutomationChange, onSkillsChanged }: Props) {
   const { text } = useI18n();
   const [tab, setTab] = useState<WorkflowsTabId>("catalog");
   useEffect(() => {
@@ -145,7 +144,10 @@ export function WorkflowsView({ active, onRequestAiaPrompt, tabRequest, pacingSu
         잠깐 다녀오는 것만으로 채우던 값이 경고 없이 사라지면 안 된다(애드온 화면에서 쓰던
         수명 규칙 그대로다). 안쪽 조회·폴링은 보일 때만 돌도록 `active`로 가른다. */}
     <div className="workflows-automation" hidden={tab !== "automation"}>
-      <RoundGoalsPanel onRequestAiaPrompt={onRequestAiaPrompt} refreshNonce={refreshNonce} />
+      <RoundGoalsPanel
+        onRequestAiaPrompt={onRequestAiaPrompt}
+        openGoalRequest={tabRequest?.openGoalId ? { goalId: tabRequest.openGoalId, requestId: tabRequest.requestId } : null}
+      />
       <AiaOnboardingCards
         active={active && tab === "automation"}
         automation={automation}
@@ -1278,29 +1280,6 @@ function workflowRunConfirm(
     warning: effects.length > 0 ? effects.join(" / ") : undefined,
     confirmLabel: isPaced ? runRoundLabel(text) : text("실행", "Run"),
     tone: readOnly && !isPaced ? "default" : "danger",
-  };
-}
-
-/**
- * 이 워크플로와 함께 지울 수 있는 절차 스킬. 계약이 선언한 보관 스킬 가운데 셋을 뺀다 —
- * 이 장치에 없는 것(`missingSkills`: 계약만 오고 절차는 오지 않은 상태라 지울 것이 없다),
- * 다른 등록 워크플로가 같이 거는 것(그쪽 절차가 끊긴다), 중복이다. 남은 것(`exclusive`)만
- * 확인 대화가 선택지로 내고, 다른 워크플로가 쓰는 것은 "남긴다"고 말하기 위해 따로 담는다.
- */
-function relatedSkillKeys(
-  workflow: SystemWorkflowSummary,
-  workflows: readonly SystemWorkflowSummary[],
-): { exclusive: string[]; shared: string[] } {
-  const present = Array.from(new Set(workflow.requiredSkills ?? []))
-    .filter((key) => !(workflow.missingSkills ?? []).includes(key));
-  const elsewhere = new Set(
-    workflows
-      .filter((other) => other.id !== workflow.id)
-      .flatMap((other) => other.requiredSkills ?? []),
-  );
-  return {
-    exclusive: present.filter((key) => !elsewhere.has(key)),
-    shared: present.filter((key) => elsewhere.has(key)),
   };
 }
 

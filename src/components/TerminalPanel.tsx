@@ -5,7 +5,7 @@ import { openExternalUrl } from "../lib/externalUrl";
 import { writeClipboardText } from "../lib/clipboard";
 import { TerminalHintCollector, hasTerminalHints, hintLinkLabel, type TerminalHints } from "../lib/terminalHints";
 import { connectAccountLoginTerminal, connectSetupTerminal, connectSshTerminal, connectTerminal, type TerminalConnection } from "../lib/terminal";
-import type { AccountLoginSessionView, CodexLoginMethod, ProviderId, SessionSummary, SshKeyView, TerminalEvent, TerminalPhase, TerminalSessionInfo, TerminalSshMode } from "../types";
+import type { AccountLoginSessionView, CodexLoginMethod, ProviderId, SessionSummary, SshEndpointView, SshKeyView, TerminalEvent, TerminalPhase, TerminalSessionInfo, TerminalSshMode } from "../types";
 import { ErrorBanner, NoticeBanner } from "./Shared";
 import { errorText } from "../lib/errorText";
 import { relayCodexLoginCallback } from "../lib/ipc";
@@ -56,27 +56,29 @@ export function SetupTerminalPanel({ source }: { source: ProviderId }) {
 }
 
 /**
- * SSH 창 둘(직접 접속·공개키 등록)이 같은 전제로 열린다 — 저장된 연결 서버가 있고, 같은
- * 이름의 개인키가 있어야 한다. 두 창이 그 판정과 표시 이름을 따로 계산하고 있었고,
- * 키 목록의 두 버튼도 같은 조건을 자기 식으로 한 번 더 적어 두어 세 곳이 함께 움직여야
- * 했다. 판정을 여기 한 곳에 두고 못 여는 이유를 그대로 돌려준다.
+ * SSH 창 둘(직접 접속·공개키 등록)이 같은 전제로 열린다 — 저장된 연결 서버가 있고, 그 서버가
+ * 가리키는 키가 ~/.ssh에 남아 있으며 같은 이름의 개인키가 있어야 한다. 두 창이 그 판정과
+ * 표시 이름을 따로 계산하고 있었고, 서버 목록의 두 버튼도 같은 조건을 자기 식으로 한 번 더
+ * 적어 두어 세 곳이 함께 움직여야 했다. 판정을 여기 한 곳에 두고 못 여는 이유를 그대로 돌려준다.
+ *
+ * 창은 서버 단위로 열린다. 키 하나를 여러 서버가 함께 쓸 수 있어 지문만으로는 어느 서버인지
+ * 정해지지 않기 때문이다. `sshKey`는 서버의 지문으로 키 목록에서 찾은 값이고, 없으면 null이다.
  */
-export function sshTerminalTarget(sshKey: SshKeyView, text: UiText = (ko) => ko): { blockedReason: string | null; destination: string } {
-  const endpoint = sshKey.endpoint;
-  const blockedReason = !endpoint
-    ? text("이 키에 저장된 연결 서버가 없습니다. 먼저 연결 서버를 적으세요.", "No connection server is saved for this key. Please specify a connection server first.")
+export function sshTerminalTarget(server: SshEndpointView, sshKey: SshKeyView | null, text: UiText = (ko) => ko): { blockedReason: string | null; destination: string } {
+  const blockedReason = !sshKey
+    ? text("이 서버가 쓰는 키가 ~/.ssh에 없습니다. 서버를 수정해 다른 키를 고르세요.", "The key this server uses is not in ~/.ssh. Edit the server and choose another key.")
     : !sshKey.hasPrivateKey
       ? text("같은 이름의 개인키가 없어 이 키로는 접속할 수 없습니다.", "Cannot connect with this key because no private key with the same name exists.")
       : null;
   return {
     blockedReason,
-    destination: endpoint ? `${endpoint.user}@${endpoint.host}:${endpoint.port}` : sshKey.fileName,
+    destination: `${server.user}@${server.host}:${server.port}`,
   };
 }
 
-/** 이 키로 SSH 창을 열 수 있는지. 열 수 없는 키에는 버튼 자체를 내지 않는다. */
-export function canOpenSshTerminal(sshKey: SshKeyView): boolean {
-  return sshTerminalTarget(sshKey).blockedReason === null;
+/** 이 서버로 SSH 창을 열 수 있는지. 열 수 없는 서버에는 버튼 자체를 내지 않는다. */
+export function canOpenSshTerminal(server: SshEndpointView, sshKey: SshKeyView | null): boolean {
+  return sshTerminalTarget(server, sshKey).blockedReason === null;
 }
 
 interface SshTerminalModeSpec {
@@ -122,13 +124,13 @@ function getSshTerminalSpec(mode: TerminalSshMode, text: UiText): SshTerminalMod
  * 치는 셸이다), BatchMode를 빼 패스프레이즈·암호·호스트 키 확인 프롬프트가 이 창에 그대로
  * 온다. 그래서 known_hosts에 없던 호스트도 여기서 한 번 답하면 등록된다.
  */
-export function SshTerminalPanel({ sshKey, mode = "shell" }: { sshKey: SshKeyView; mode?: TerminalSshMode }) {
+export function SshTerminalPanel({ server, sshKey, mode = "shell" }: { server: SshEndpointView; sshKey: SshKeyView | null; mode?: TerminalSshMode }) {
   const { text } = useI18n();
-  const { blockedReason, destination } = sshTerminalTarget(sshKey, text);
+  const { blockedReason, destination } = sshTerminalTarget(server, sshKey, text);
   const spec = getSshTerminalSpec(mode, text);
   return <TerminalSurface
     connect={(cols, rows, onEvent) => connectSshTerminal(
-      { fingerprint: sshKey.fingerprint, cols, rows, ...(mode === "shell" ? {} : { mode }) },
+      { serverId: server.id, cols, rows, ...(mode === "shell" ? {} : { mode }) },
       onEvent,
     )}
     blockedReason={blockedReason}
@@ -137,20 +139,20 @@ export function SshTerminalPanel({ sshKey, mode = "shell" }: { sshKey: SshKeyVie
     identity={destination}
     footer={spec.footer}
     exitLabel={spec.exitLabel}
-    introLines={spec.introLines(destination, sshKey.fileName)}
+    introLines={spec.introLines(destination, sshKey?.fileName ?? server.fingerprint)}
     setup
   />;
 }
 
 /**
- * C9-20. 이 키의 공개키를 원격 `authorized_keys`에 한 번 등록하는 창.
+ * C9-20. 서버가 쓰는 키의 공개키를 그 서버의 `authorized_keys`에 한 번 등록하는 창.
  *
  * Windows에는 `ssh-copy-id`가 없어 키를 서버에 올리려면 손으로 옮겨야 했다. 그 한 번을
  * 대신한다. 앱은 비밀번호를 받지도 저장하지도 않는다 — 서버가 물으면 사용자가 이 창에
  * 직접 답하고, 등록이 끝나면 그 뒤로는 키로만 붙는다.
  */
-export function SshKeyInstallPanel({ sshKey }: { sshKey: SshKeyView }) {
-  return <SshTerminalPanel sshKey={sshKey} mode="installKey" />;
+export function SshKeyInstallPanel({ server, sshKey }: { server: SshEndpointView; sshKey: SshKeyView | null }) {
+  return <SshTerminalPanel server={server} sshKey={sshKey} mode="installKey" />;
 }
 
 export function AccountLoginTerminalPanel({ login, remote, codexMethod, onCompletionChange }: {
@@ -414,6 +416,12 @@ function useTerminalSurface({ openConnection, introLines, onCompletionChange, co
       fitRef.current?.fit();
       const { cols, rows } = normalizedTerminalSize(terminal);
       const connection = await openConnection(cols, rows, handleEvent);
+      // 연결을 여는 사이 패널이 닫혔으면 해제 정리는 이미 끝났다. 여기서 ref에 넣으면
+      // 아무도 detach하지 않아 백엔드 첨부 소켓이 남으므로 바로 놓는다.
+      if (terminalRef.current !== terminal) {
+        void connection.detach();
+        return;
+      }
       setInfo(connection.info);
       updatePhase(connection.info.state);
       if (isFinished(connection.info.state)) {
@@ -427,6 +435,7 @@ function useTerminalSurface({ openConnection, introLines, onCompletionChange, co
         terminal.focus();
       }
     } catch (cause) {
+      if (terminalRef.current !== terminal) return;
       updatePhase("idle");
       setError(errorText(cause));
     }
@@ -693,7 +702,7 @@ function openSurfaceTerminal(host: HTMLDivElement, options: {
 }
 
 /**
- * 모바일 폭에서는 아래 입력줄이 유일한 입력 경로다. 뷰포트가 바뀔 때마다 stdin과
+ * 모바일 폭에서는 아래 입력줄이 유일한 입력 경로다. 뷰포트가 바뀔 때마다 키 입력과
  * xterm의 숨은 입력창 속성을 거기에 맞추고, 그 숨은 입력창이 포커스를 가져가면
  * 실행 중인 세션에 한해 입력줄로 되돌린다.
  */
@@ -703,9 +712,14 @@ function attachMobileInputMode(host: HTMLDivElement, terminal: Terminal, compose
 }): () => void {
   const mobileViewport = window.matchMedia(MOBILE_TERMINAL_QUERY);
   const xtermInput = host.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+  // 키보드만 막고 `disableStdin`은 건드리지 않는다. 그 옵션은 사람이 친 키뿐 아니라 xterm이
+  // 스스로 답하는 제어 응답까지 함께 삼킨다. Windows ConPTY는 세션을 열자마자 커서 위치를
+  // 묻고(`ESC[6n`) 그 답이 올 때까지 자식 출력을 한 바이트도 내보내지 않으므로, 답이 막히면
+  // 모바일 폭에서는 CLI가 멀쩡히 떠 있는데도 터미널이 끝까지 빈 화면으로 남았다
+  // (Codex 기기 코드 로그인에서 실측 — 일회용 코드가 영영 뜨지 않는다).
+  terminal.attachCustomKeyEventHandler(() => !mobileViewport.matches);
   const updateMobileInputMode = () => {
     const useMobileComposer = mobileViewport.matches;
-    terminal.options.disableStdin = useMobileComposer;
     if (!xtermInput) return;
     xtermInput.readOnly = useMobileComposer;
     xtermInput.tabIndex = useMobileComposer ? -1 : 0;

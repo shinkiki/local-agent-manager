@@ -26,7 +26,7 @@ RUN mkdir -p /data /workspace && chown 1000:1000 /workspace
 RUN printf '#!/bin/sh\necho "DBUS_SESSION_BUS_ADDRESS=stub;"\necho "DBUS_SESSION_BUS_PID=1;"\n' > /usr/local/bin/dbus-launch \
  && printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/gnome-keyring-daemon \
  && printf '#!/bin/sh\n# 시크릿 서비스 흉내. store는 stdin을 파일로 받고 lookup은 그 파일을 돌려준다.\n# KEYRING_PROBE_MODE로 세 가지 고장을 만든다 — locked(store 실패), swallow(store는\n# 성공하고 값은 사라짐), hang(프롬프터 없는 컨테이너에서 멈춰 서는 경우).\n# 진짜 gnome-keyring을 넣지는 않으므로 "빈 키링 첫 기동"과 default collection 별칭 문제는\n# 이 시험의 범위 밖이고, 실기기 실측으로만 확인된다.\nf=/tmp/secret-tool-probe\ncase "$1" in\n  store)\n    [ "${KEYRING_PROBE_MODE}" = "locked" ] && exit 1\n    [ "${KEYRING_PROBE_MODE}" = "hang" ] && sleep 120\n    cat > "$f"\n    [ "${KEYRING_PROBE_MODE}" = "swallow" ] && : > "$f"\n    exit 0 ;;\n  lookup) [ -s "$f" ] || exit 1; cat "$f"; exit 0 ;;\n  clear) rm -f "$f"; exit 0 ;;\nesac\nexit 0\n' > /usr/local/bin/secret-tool \
- && printf '#!/bin/sh\necho "RUN-UID=$(id -u) RUN-GID=$(id -g) HOME=$HOME"\necho "GROUPS=$(id -G)"\necho "ARGV=$*"\nstat -c "OWN %%u:%%g %%n" /data /home/agent /workspace\n' > /usr/local/bin/agent-manager-server \
+ && printf '#!/bin/sh\necho "RUN-UID=$(id -u) RUN-GID=$(id -g) HOME=$HOME"\necho "GROUPS=$(id -G)"\necho "ARGV=$*"\necho "KEYRING_PASSWORD=${KEYRING_PASSWORD-unset}"\nstat -c "OWN %%u:%%g %%n" /data /home/agent /workspace\n' > /usr/local/bin/agent-manager-server \
  && chmod +x /usr/local/bin/dbus-launch /usr/local/bin/gnome-keyring-daemon /usr/local/bin/secret-tool /usr/local/bin/agent-manager-server
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
@@ -53,7 +53,8 @@ run_expecting_failure() {
 fail=0
 expect() {
   local label="$1" needle="$2" output="$3"
-  if printf '%s' "${output}" | grep -qF -- "${needle}"; then
+  # V2/L13: grep -q가 먼저 끝나도 pipefail이 printf의 SIGPIPE를 실패로 보지 않게 한다.
+  if grep -qF -- "${needle}" <<< "${output}"; then
     echo "ok   ${label}"
   else
     echo "FAIL ${label}: '${needle}' 없음"
@@ -69,6 +70,8 @@ expect "기본 uid/gid는 전용 사용자" "RUN-UID=1000 RUN-GID=1000 HOME=/hom
 # 검사들이 아무것도 거르지 못한다.
 expect "서버 argv 유지" "--app-data-dir /data --tailscale-host h --tailscale-user u" "${default_out}"
 expect "볼륨 소유권 이전" "OWN 1000:1000 /data" "${default_out}"
+# 잠금 해제가 끝난 볼트 암호가 서버 환경(→ 에이전트 CLI·터미널)으로 넘어가지 않는다.
+expect "볼트 암호는 서버 환경에 남지 않는다" "KEYRING_PASSWORD=unset" "${default_out}"
 
 # gid 100은 이미지에 이미 있는 users 그룹이다. 시놀로지 공유 폴더의 기본 gid이므로
 # 중복을 거절하면 가장 흔한 배포가 뜨지 않는다.
@@ -99,7 +102,7 @@ expect "경고 뒤에도 기동" "RUN-UID=1000" "${ws_out}"
 # 위 "기본 uid/gid" 검사가 이미 같은 출력으로 보고 있다.
 expect_no_server() {
   local label="$1" output="$2"
-  if printf '%s' "${output}" | grep -qF "RUN-UID="; then
+  if grep -qF "RUN-UID=" <<< "${output}"; then
     echo "FAIL ${label}: 볼트 검사가 실패했는데 서버가 기동했다"
     fail=1
   else

@@ -4,6 +4,7 @@ import { SERVICE_ICON_SRC, type ServiceIconName } from "../assets/serviceIcons";
 import { beginExternalPluginOAuth, cancelExternalPluginOAuth, getExternalPlugins, getWebAccessStatus, hasTauriRuntime, registerExternalPlugin, removeExternalPlugin, setExternalPluginEnabled, setExternalPluginToken, setExternalPluginToolPolicies, setExternalPluginToolPolicy, submitExternalPluginOAuthCallback, updateExternalPlugin, verifyExternalPlugin, type WebAccessStatus } from "../lib/ipc";
 import { splitPluginNames } from "../lib/pluginNames";
 import { pluginRemoteNotice } from "../lib/pluginRemoteNotice";
+import { isOAuthKind, isPluginConnectionChanged } from "../lib/pluginConnectionChange";
 import { markBuiltinToolsChanged } from "../lib/builtinToolsSignal";
 import { openExternalUrl } from "../lib/externalUrl";
 import { CopyAction } from "./CopyAction";
@@ -61,11 +62,6 @@ const GOOGLE_MCP_DOCS_URL = "https://developers.google.com/workspace/guides/conf
 
 /** 디바이스 인가에 쓸 OAuth 앱을 만드는 곳(Client ID만 필요, Device Flow 스위치를 켠다). */
 const GITHUB_OAUTH_APPS_URL = "https://github.com/settings/developers";
-
-/** 브라우저 승인으로 토큰을 받는 방식인지. 두 방식은 화면에서 같은 자리를 쓴다. */
-function isOAuthKind(auth: ExternalPluginAuthKind): boolean {
-  return auth === "oauth" || auth === "oauthDevice";
-}
 
 /** 사용자가 직접 붙여 넣는 토큰으로 붙는 방식인지. 토큰 입력 칸과 [토큰 변경]이 같은 판정을 쓴다. */
 function usesStaticToken(auth: ExternalPluginAuthKind): boolean {
@@ -217,17 +213,6 @@ function statusFor(plugin: ExternalPluginView, text: UiText): { tone: "ok" | "wa
   if (!plugin.credentialReady) return { tone: "warn", label: isOAuthKind(plugin.auth) ? text("인증 필요", "Sign-in required") : text("토큰 필요", "Token required") };
   if (plugin.lastVerifiedAt !== null) return { tone: "ok", label: text(`연결됨 · 도구 ${plugin.tools.length}개`, `Connected · ${plugin.tools.length} tools`) };
   return { tone: "ok", label: text("연결 준비됨", "Ready to connect") };
-}
-
-/** 편집이 연결 지점을 바꾸는지. 백엔드는 이때 저장된 자격증명과 확인 결과를 초기화한다. */
-function isConnectionChanged(draft: DraftForm, editing: ExternalPluginView | null): boolean {
-  if (!editing) return false;
-  return (
-    draft.auth !== editing.auth
-    || (draft.auth !== "notionToken" && draft.url.trim() !== (editing.url ?? ""))
-    || (isOAuthKind(draft.auth) && (draft.clientId.trim() !== "" || draft.clientSecret.trim() !== ""))
-    || (isOAuthKind(draft.auth) && draft.scope.trim() !== (editing.scope ?? "").trim())
-  );
 }
 
 /** client_secret은 어느 클라이언트의 것인지 알 수 없으므로 client_id 없이는 보내지 않는다. */
@@ -409,7 +394,7 @@ export function ExternalPluginsCard({ active }: { active: boolean }) {
 
   const submitEdit = async (target: ExternalPluginView, draft: DraftForm) => {
     // 인증 없는 플러그인은 지울 자격증명이 없으니 조용히 저장한다(확인 결과 초기화는 폼 안내문이 설명한다).
-    const asksAgain = isConnectionChanged(draft, target) && target.auth !== "none" && target.credentialReady;
+    const asksAgain = isPluginConnectionChanged(draft, target) && target.auth !== "none" && target.credentialReady;
     await runAfterConfirm(`update:${target.id}`, asksAgain ? {
       title: text("연결 정보 변경", "Change connection"),
       message: text(
@@ -650,7 +635,7 @@ function ExternalPluginForm({
   onSubmitDraft,
 }: ExternalPluginFormProps) {
   const { text } = useI18n();
-  const editConnectionChanged = isConnectionChanged(draft, editing);
+  const editConnectionChanged = isPluginConnectionChanged(draft, editing);
   const draftIncomplete = isDraftIncomplete(draft, editing);
   const patch = (part: Partial<DraftForm>) => onChangeDraft({ ...draft, ...part });
 

@@ -203,10 +203,7 @@ fn tool_call_output(update: &serde_json::Value) -> Option<String> {
                 .as_str()
         })
         .collect::<Vec<_>>()
-        .join(
-            "
-",
-        );
+        .join("\n");
     (!text.trim().is_empty()).then_some(text)
 }
 
@@ -579,13 +576,7 @@ mod tests {
         match parse_session_update(&value).expect("update") {
             AcpSessionUpdate::ToolCall { detail, output, .. } => {
                 assert_eq!(detail.as_deref(), Some("ls"));
-                assert_eq!(
-                    output.as_deref(),
-                    Some(
-                        "a.txt
-b.txt"
-                    )
-                );
+                assert_eq!(output.as_deref(), Some("a.txt\nb.txt"));
             }
             other => panic!("도구 호출로 읽지 못했다: {other:?}"),
         }

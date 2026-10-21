@@ -59,6 +59,11 @@ struct Ledger {
     /// 항목이 빠졌다가 다시 등록될 때도 끈 채로 되살리려고 관찰한 값을 남긴다.
     #[serde(default)]
     disabled: BTreeSet<String>,
+    /// 끈 채로 되살리려고 `add` 뒤에 부른 `disable`이 실패한 항목. 설정에는 켜진 채로 남아
+    /// 있으므로, 이 표시 없이는 다음 관찰이 사용자가 켠 것으로 읽고 끈 의도를 지운다.
+    /// 다음 동기화가 `disable`을 다시 시도하고 성공을 확인한 뒤에야 지운다.
+    #[serde(default)]
+    pending_disable: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +75,10 @@ enum Action {
         keep_disabled: bool,
     },
     Remove {
+        name: String,
+    },
+    /// 끄기 대기 항목의 `disable`을 다시 시도한다.
+    Disable {
         name: String,
     },
     /// 설정은 이미 맞다. 장부에만 적는다.
@@ -147,7 +156,8 @@ fn plan(
                 actions.push(Action::Add {
                     name: name.clone(),
                     url: url.clone(),
-                    keep_disabled: entry.disabled,
+                    // 끄기 대기 항목은 설정에 켜진 채 있어도 끈 채로 옮긴다.
+                    keep_disabled: entry.disabled || user_disabled.contains(name),
                 })
             }
             Some(_) => actions.push(Action::Conflict { name: name.clone() }),
@@ -286,6 +296,17 @@ fn run_agy(executable: &Path, args: &[&str]) -> Result<(), CoreError> {
     )))
 }
 
+/// 끈 상태를 되살린다. 실패하면 끄기 대기로 남겨 다음 동기화가 다시 시도하게 한다.
+fn disable(executable: &Path, name: &str, ledger: &mut Ledger) -> Result<(), CoreError> {
+    let result = run_agy(executable, &["mcp", "disable", name]);
+    if result.is_ok() {
+        ledger.pending_disable.remove(name);
+    } else {
+        ledger.pending_disable.insert(name.to_owned());
+    }
+    result
+}
+
 /// 계획을 공식 CLI로 실행한다. 명령 하나가 성공할 때마다 장부를 고치므로, 중간에 실패해도
 /// 장부는 실제 설정과 어긋나지 않는다.
 fn apply(
@@ -304,11 +325,12 @@ fn apply(
                 ledger.entries.insert(name.clone(), url.clone());
                 report.added.push(name.clone());
                 if *keep_disabled {
-                    run_agy(executable, &["mcp", "disable", name])
+                    disable(executable, name, ledger)
                 } else {
                     Ok(())
                 }
             }),
+            Action::Disable { name } => disable(executable, name, ledger),
             Action::Remove { name } => run_agy(executable, &["mcp", "remove", name])
                 .or_else(|error| {
                     // 그새 사용자가 지웠다면 목적은 이미 이뤄졌다.
@@ -412,12 +434,36 @@ fn sync_with(
             .is_some_and(|url| owned_by_app(name, url, base, &ledger.entries));
         if ours && entry.disabled {
             ledger.disabled.insert(name.clone());
+            ledger.pending_disable.remove(name);
+        } else if ours && ledger.pending_disable.contains(name) {
+            // 켜진 것은 `disable`이 실패했기 때문이지 사용자가 켜서가 아니다.
+            ledger.disabled.insert(name.clone());
         } else if ours {
             ledger.disabled.remove(name);
+        } else {
+            // 사용자가 같은 이름을 다른 서버로 바꿨다. 끄기 대기는 그 서버의 것이 아니다.
+            ledger.pending_disable.remove(name);
         }
     }
-    let actions = plan(&current, &desired, &ledger.entries, &ledger.disabled, base);
-    if actions.is_empty() && ledger.conflicts.is_empty() && ledger.disabled == disabled_before {
+    let pending_before = ledger.pending_disable.clone();
+    ledger
+        .pending_disable
+        .retain(|name| desired.contains_key(name));
+    let mut actions = plan(&current, &desired, &ledger.entries, &ledger.disabled, base);
+    for name in &ledger.pending_disable {
+        let planned = actions
+            .iter()
+            .any(|action| matches!(action, Action::Add { name: added, .. } if added == name));
+        let enabled_here = current.get(name).is_some_and(|entry| !entry.disabled);
+        if enabled_here && !planned {
+            actions.push(Action::Disable { name: name.clone() });
+        }
+    }
+    if actions.is_empty()
+        && ledger.conflicts.is_empty()
+        && ledger.disabled == disabled_before
+        && ledger.pending_disable == pending_before
+    {
         return Ok(SyncReport::default());
     }
     let (report, failure) = apply(executable, actions, &mut ledger);
@@ -789,6 +835,110 @@ mod tests {
         assert!(
             !argv.contains("mine"),
             "사용자 서버에는 손대지 않는다: {argv}"
+        );
+    }
+
+    /// `add` 뒤 `disable`이 실패해도 사용자가 꺼 둔 의도는 성공을 확인할 때까지 남고, 다음
+    /// 동기화가 `disable`을 다시 시도한다. 사용자가 같은 이름을 다른 서버로 바꾸면 그 의도는
+    /// 그 서버의 것이 아니므로 지운다.
+    #[cfg(unix)]
+    #[test]
+    fn p12_retries_a_failed_disable_until_it_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        let app_data = tempfile::tempdir().expect("app data");
+        let home = tempfile::tempdir().expect("home");
+        crate::external_plugins::ExternalPluginRegistry::new(app_data.path().to_path_buf())
+            .register(crate::ExternalPluginManifestRequest {
+                id: "mock".to_owned(),
+                display_name: "Mock".to_owned(),
+                names: None,
+                url: Some("http://127.0.0.1:3000/mcp".to_owned()),
+                auth: crate::external_plugins::PluginAuthKind::None,
+                token: None,
+                client_id: None,
+                client_secret: None,
+                scope: None,
+            })
+            .expect("register");
+        std::fs::create_dir_all(home.path().join(".gemini/config")).expect("config dir");
+        let write_config = |url: &str, disabled: bool| {
+            std::fs::write(
+                config_path(home.path()),
+                serde_json::json!({"mcpServers": {
+                    "mock": {"serverUrl": url, "disabled": disabled}
+                }})
+                .to_string(),
+            )
+            .expect("config");
+        };
+        let bin = tempfile::tempdir().expect("bin");
+        let log = bin.path().join("argv.log");
+        let fail_disable = bin.path().join("fail-disable");
+        let fake = bin.path().join("agy");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nif [ \"$2\" = disable ] && [ -e '{fail}' ]; then echo boom >&2; exit 1; fi\n",
+                log = log.display(),
+                fail = fail_disable.display()
+            ),
+        )
+        .expect("script");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let current = plugin_url(BASE, "mock");
+
+        // 옛 주소에서 꺼 둔 항목을 새 주소로 옮기는데 disable이 실패한다.
+        write_config(&format!("{BASE}/mock"), true);
+        std::fs::write(&fail_disable, "").expect("flag");
+        assert!(sync_with(app_data.path(), home.path(), &fake, BASE, None).is_err());
+        assert!(load_ledger(app_data.path())
+            .pending_disable
+            .contains("mock"));
+
+        // CLI가 새 주소로 켠 채 등록해 두었다. 켜진 것을 사용자가 켠 것으로 읽지 않는다.
+        write_config(&current, false);
+        assert!(sync_with(app_data.path(), home.path(), &fake, BASE, None).is_err());
+        let ledger = load_ledger(app_data.path());
+        assert!(ledger.pending_disable.contains("mock"));
+        assert!(ledger.disabled.contains("mock"));
+
+        std::fs::remove_file(&fail_disable).expect("flag");
+        sync_with(app_data.path(), home.path(), &fake, BASE, None).expect("sync");
+        let ledger = load_ledger(app_data.path());
+        assert!(ledger.pending_disable.is_empty());
+        assert!(ledger.disabled.contains("mock"));
+        let argv = std::fs::read_to_string(&log).expect("log");
+        assert_eq!(argv.matches("mcp disable mock").count(), 3, "{argv}");
+
+        // 끄기 대기 중에 프록시 주소가 옮겨도 새 주소로 끈 채 다시 등록한다.
+        let mut ledger = load_ledger(app_data.path());
+        ledger.pending_disable.insert("mock".to_owned());
+        save_ledger(app_data.path(), &mut ledger).expect("save");
+        write_config(&current, false);
+        let moved = "http://127.0.0.1:9/plugins/key";
+        sync_with(app_data.path(), home.path(), &fake, moved, None).expect("moved");
+        let argv = std::fs::read_to_string(&log).expect("log");
+        assert!(
+            argv.ends_with(&format!(
+                "mcp add --type http mock {}\nmcp disable mock\n",
+                plugin_url(moved, "mock")
+            )),
+            "{argv}"
+        );
+        assert!(load_ledger(app_data.path()).pending_disable.is_empty());
+
+        // 사용자가 같은 이름을 다른 서버로 바꾸면 끄기 대기는 사라진다.
+        let before = std::fs::read_to_string(&log).expect("log");
+        let mut ledger = load_ledger(app_data.path());
+        ledger.pending_disable.insert("mock".to_owned());
+        save_ledger(app_data.path(), &mut ledger).expect("save");
+        write_config("https://mcp.example.com/mcp", false);
+        let _ = sync_with(app_data.path(), home.path(), &fake, BASE, None);
+        assert!(load_ledger(app_data.path()).pending_disable.is_empty());
+        let after = std::fs::read_to_string(&log).expect("log");
+        assert!(
+            !after[before.len()..].contains("disable"),
+            "사용자 서버는 끄지 않는다: {after}"
         );
     }
 

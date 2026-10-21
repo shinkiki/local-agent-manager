@@ -37,6 +37,8 @@ export function sessionMetaWithDefaults(meta: Partial<SessionMeta> | null | unde
     origin: meta?.origin ?? null,
     handoffOrigin: meta?.handoffOrigin ?? null,
     handoffTargets: meta?.handoffTargets ?? [],
+    // 통째 교체 패치라, 여기서 빠지면 화면이 빈 목록을 들고 있다가 다음 연결 때 저장된 연결을 지운다.
+    linkedProjectPaths: Array.isArray(meta?.linkedProjectPaths) ? meta.linkedProjectPaths : [],
   };
 }
 

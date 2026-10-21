@@ -23,6 +23,7 @@ import {
 } from "../lib/chatSecrets";
 import { errorText } from "../lib/errorText";
 import { useI18n, type UiText } from "../lib/i18n";
+import { createLatestGate } from "../lib/latestRequest";
 import type { SavedSecretView } from "../types";
 import { AppToggle, EmptyState, ErrorBanner, useConfirm } from "./Shared";
 
@@ -76,26 +77,34 @@ export function SavedSecretsCard({ active, reloadSignal = 0 }: {
   // 눈 아이콘으로 드러낸 값. 목록을 다시 읽거나 탭을 떠나면 통째로 비운다.
   const [revealed, setRevealed] = useState<Record<string, string>>({});
 
+  // 다시 읽기는 첫 효과·신호·새로고침 버튼이 함께 부른다. 늦게 도착한 앞선 목록이 저장·수정·
+  // 삭제·토글 뒤 목록을 덮지 않도록 마지막으로 시작한 읽기만 반영한다.
+  const [loadGate] = useState(createLatestGate);
   const load = useCallback(async () => {
+    const isLatest = loadGate.begin();
     try {
       const snapshot = await listSavedSecrets();
+      if (!isLatest()) return;
       setSecrets(snapshot.secrets);
       setRevealed({});
       setError(null);
     } catch (cause) {
+      if (!isLatest()) return;
       setError(errorText(cause));
     }
-  }, []);
+  }, [loadGate]);
 
   useEffect(() => {
     if (!active) {
+      loadGate.begin();
       setRevealed({});
       return;
     }
     void load();
-  }, [active, reloadSignal, load]);
+  }, [active, reloadSignal, load, loadGate]);
 
   const apply = (next: SavedSecretView[]) => {
+    loadGate.begin();
     setSecrets(next);
     setRevealed({});
     setError(null);
@@ -246,8 +255,8 @@ export function SavedSecretsCard({ active, reloadSignal = 0 }: {
                       ? <span className="storage-secrets-masked" aria-hidden="true">••••••••</span>
                       : <code className="storage-secrets-plain">{shown}</code>}
                   </td>
-                  <td className="storage-secrets-purpose">{secret.purpose}</td>
-                  <td>
+                  <td className="storage-secrets-purpose" data-label={text("용도", "Purpose")}>{secret.purpose}</td>
+                  <td data-label={text("에이전트 사용", "Agent use")}>
                     <AppToggle
                       checked={secret.agentEnabled}
                       disabled={locked}
@@ -255,7 +264,7 @@ export function SavedSecretsCard({ active, reloadSignal = 0 }: {
                       onChange={(next) => void setEnabled(secret.name, next)}
                     />
                   </td>
-                  <td className="storage-secrets-left">{lastUsed ?? text("없음", "never")}</td>
+                  <td className="storage-secrets-left" data-label={text("마지막 사용", "Last used")}>{lastUsed ?? text("없음", "never")}</td>
                   <td className="storage-secrets-actions">
                     <button
                       className={`button compact${open ? " active" : ""}`}

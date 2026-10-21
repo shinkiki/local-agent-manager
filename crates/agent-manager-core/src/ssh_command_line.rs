@@ -255,6 +255,8 @@ struct WordBuilder {
     started: bool,
     expansion_bare: bool,
     expansion_quoted: bool,
+    /// 따옴표에서 온 글자가 하나라도 있는지. 셸은 따옴표가 섞인 단어를 서술자 번호로 읽지 않는다.
+    quoted: bool,
 }
 
 impl WordBuilder {
@@ -266,6 +268,9 @@ impl WordBuilder {
             } else {
                 self.expansion_bare = true;
             }
+        }
+        if quoted {
+            self.quoted = true;
         }
         self.text.push(character);
     }
@@ -290,12 +295,14 @@ impl WordBuilder {
         self.started = false;
         self.expansion_bare = false;
         self.expansion_quoted = false;
+        self.quoted = false;
         Ok(Some(word))
     }
 
     /// 앞에 붙은 파일 서술자 숫자인지. `2>&1`의 `2`가 단어가 아니라 방향 표시인 자리다.
+    /// `'2'>x`·`""2>x`처럼 따옴표가 낀 단어는 셸에게 인자이므로 번호로 읽지 않는다.
     fn take_fd(&mut self) -> Option<u8> {
-        if self.expansion_bare || self.expansion_quoted {
+        if self.quoted || self.expansion_bare || self.expansion_quoted {
             return None;
         }
         let fd = match self.text.as_str() {
@@ -382,6 +389,7 @@ fn scan_quoted(
     quote: char,
 ) -> Result<(), CoreError> {
     word.started = true;
+    word.quoted = true;
     loop {
         let Some(inner) = characters.next() else {
             return Err(CoreError::InvalidInput(
@@ -660,6 +668,15 @@ mod tests {
         assert_eq!(render("sort < in.txt"), "sort <in.txt");
         assert_eq!(render("app 2> err.log"), "app 2>err.log");
         assert!(refused("cat << EOF").contains("여기 문서"));
+        // 따옴표가 낀 숫자는 셸에게 인자다. 서술자로 읽으면 인자가 사라지고 방향이 바뀐다.
+        assert_eq!(render("echo '2'>out.log"), "echo 2 >out.log");
+        assert_eq!(render("echo \"\"2>out.log"), "echo 2 >out.log");
+        assert_eq!(render("echo 2>out.log"), "echo 2>out.log");
+        assert_eq!(render("cat '0'<in.txt"), "cat 0 <in.txt");
+        assert_eq!(render("echo 2''>out.log"), "echo 2 >out.log");
+        assert_eq!(render("echo '2'>&1"), "echo 2 >&1");
+        // 정본을 다시 읽어도 같은 뜻이어야 한다 — 원격 셸이 읽는 것이 그 정본이다.
+        assert_eq!(render("echo 2 >out.log"), "echo 2 >out.log");
         assert!(refused("app >").contains("대상이 없습니다"));
     }
 

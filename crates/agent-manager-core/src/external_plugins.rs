@@ -762,6 +762,7 @@ fn pending_oauth() -> &'static Mutex<HashMap<String, PendingOAuth>> {
 
 struct ManagedServer {
     child: Child,
+    group: Option<crate::cli_interface::ProcessGroup>,
     port: u16,
     /// 프록시만 아는 서버 쪽 bearer 토큰. 매 기동마다 새로 만든다.
     auth_token: String,
@@ -772,12 +773,19 @@ fn managed_servers() -> &'static Mutex<HashMap<String, ManagedServer>> {
     SERVERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn terminate_managed_server(server: &mut ManagedServer) {
+    if let Some(group) = &server.group {
+        group.kill();
+    }
+    let _ = server.child.kill();
+    let _ = server.child.wait();
+}
+
 /// 백엔드가 내려갈 때 내장 서버를 함께 끝낸다. `SystemMcpServer::drop`이 부른다.
 pub(crate) fn shutdown_managed_servers() {
     if let Ok(mut servers) = managed_servers().lock() {
         for (_, mut server) in servers.drain() {
-            let _ = server.child.kill();
-            let _ = server.child.wait();
+            terminate_managed_server(&mut server);
         }
     }
 }
@@ -785,8 +793,7 @@ pub(crate) fn shutdown_managed_servers() {
 fn stop_managed_server(id: &str) {
     if let Ok(mut servers) = managed_servers().lock() {
         if let Some(mut server) = servers.remove(id) {
-            let _ = server.child.kill();
-            let _ = server.child.wait();
+            terminate_managed_server(&mut server);
         }
     }
 }
@@ -3995,7 +4002,9 @@ fn ensure_notion_server(id: &str, notion_token: &str) -> Result<(u16, String), C
         match server.child.try_wait() {
             Ok(None) => return Ok((server.port, server.auth_token.clone())),
             _ => {
-                servers.remove(id);
+                if let Some(mut old) = servers.remove(id) {
+                    terminate_managed_server(&mut old);
+                }
             }
         }
     }
@@ -4032,6 +4041,7 @@ fn ensure_notion_server(id: &str, notion_token: &str) -> Result<(u16, String), C
     let mut child = command.spawn().map_err(|error| {
         CoreError::Runtime(format!("Notion MCP 서버를 시작하지 못했습니다: {error}"))
     })?;
+    let group = crate::cli_interface::ProcessGroup::attach(&child);
     let deadline = Instant::now() + MANAGED_SERVER_READY_TIMEOUT;
     loop {
         if TcpStream::connect_timeout(
@@ -4043,12 +4053,18 @@ fn ensure_notion_server(id: &str, notion_token: &str) -> Result<(u16, String), C
             break;
         }
         if let Ok(Some(status)) = child.try_wait() {
+            if let Some(group) = &group {
+                group.kill();
+            }
             return Err(CoreError::Runtime(format!(
                 "Notion MCP 서버가 바로 종료되었습니다 (종료 코드 {}). 토큰과 Node.js 설치를 확인해 주세요",
                 status.code().unwrap_or(-1)
             )));
         }
         if Instant::now() >= deadline {
+            if let Some(group) = &group {
+                group.kill();
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Err(CoreError::Runtime(
@@ -4062,6 +4078,7 @@ fn ensure_notion_server(id: &str, notion_token: &str) -> Result<(u16, String), C
         id.to_owned(),
         ManagedServer {
             child,
+            group,
             port,
             auth_token: auth_token.clone(),
         },
@@ -5637,5 +5654,123 @@ mod tests {
         // 알 수 없는 값에 대한 파싱 거절 검증
         let error = "unknown".parse::<PluginToolPolicy>().expect_err("unknown");
         assert!(matches!(error, CoreError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn managed_server_termination_kills_process_group_descendants() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let pid_file = directory.path().join("grandchild.pid");
+        #[cfg(unix)]
+        let mut command = {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = Command::new("sh");
+            cmd.args([
+                "-c",
+                &format!("sleep 30 & echo $! > '{}'; wait", pid_file.display()),
+            ]);
+            cmd.process_group(0);
+            cmd
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "timeout /T 30"]);
+            cmd
+        };
+        #[cfg(not(any(unix, windows)))]
+        let mut command = Command::new("sleep");
+
+        let child = command.spawn().expect("spawn test process");
+        let group = crate::cli_interface::ProcessGroup::attach(&child);
+
+        #[cfg(unix)]
+        let grandchild: u32 = {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut pid = None;
+            while Instant::now() < deadline {
+                if let Ok(content) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(parsed) = content.trim().parse::<u32>() {
+                        pid = Some(parsed);
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            pid.expect("grandchild pid must be written")
+        };
+
+        let mut server = ManagedServer {
+            child,
+            group,
+            port: 0,
+            auth_token: "test".to_owned(),
+        };
+
+        terminate_managed_server(&mut server);
+        assert!(server.child.try_wait().expect("try_wait").is_some());
+
+        #[cfg(unix)]
+        {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while is_process_running(grandchild) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                !is_process_running(grandchild),
+                "손자 프로세스(PID {grandchild})가 그룹 종료로 함께 정리되어야 한다"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn is_process_running(pid: u32) -> bool {
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            return stat
+                .rsplit_once(')')
+                .map(|(_, after)| !after.trim_start().starts_with('Z'))
+                .unwrap_or(true);
+        }
+        crate::process_signal::pid_exists(pid).unwrap_or(false)
+    }
+
+    #[test]
+    fn stop_managed_server_removes_and_terminates() {
+        #[cfg(unix)]
+        let mut command = {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 30"]);
+            cmd.process_group(0);
+            cmd
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "timeout /T 30"]);
+            cmd
+        };
+        #[cfg(not(any(unix, windows)))]
+        let mut command = Command::new("sleep");
+
+        let child = command.spawn().expect("spawn test process");
+        let group = crate::cli_interface::ProcessGroup::attach(&child);
+        let id = "test_managed_server_cleanup";
+        {
+            let mut servers = managed_servers().lock().expect("lock");
+            servers.insert(
+                id.to_owned(),
+                ManagedServer {
+                    child,
+                    group,
+                    port: 0,
+                    auth_token: "test".to_owned(),
+                },
+            );
+        }
+        stop_managed_server(id);
+        {
+            let servers = managed_servers().lock().expect("lock");
+            assert!(!servers.contains_key(id));
+        }
     }
 }

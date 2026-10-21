@@ -7,8 +7,6 @@ import {
   cliUpdateAlert,
   cliUpdateBlockedReason,
   hasCliUpdateAlert,
-  CLI_HEADLESS_IMAGE_HINT,
-  isHeadlessImageUpdateBlock,
   modelCacheBlockedReason,
   shouldShowManualUpdateHint,
   runtimeStopConfirmationCount,
@@ -59,36 +57,35 @@ test("탐지되지 않았거나 자동 업데이트 미지원이면 사유를 �
   );
 });
 
-test("헤드리스에서는 업데이트가 막히고 이미지 재빌드를 사유로 안내한다", () => {
+test("헤드리스라는 이유만으로는 업데이트를 막지 않고 백엔드의 지원 여부를 따른다", () => {
+  // 컨테이너는 CLI를 HOME 볼륨의 ~/.local에 둬 앱이 올릴 수 있다(H11). 막을지는 백엔드가
+  // 설치 위치에 쓸 수 있는지로 정한다.
   const headless = { headless: true };
   const updatable = status({ checked: true, latestVersion: "0.147.0", updateAvailable: true });
-  assert.equal(canRunCliUpdate(updatable, headless), false);
-  assert.equal(cliUpdateBlockedReason(updatable, headless), CLI_HEADLESS_IMAGE_HINT);
-  assert.equal(isHeadlessImageUpdateBlock(updatable, headless), true);
-  assert.match(CLI_HEADLESS_IMAGE_HINT, /이미지를 다시 빌드/);
+  assert.equal(canRunCliUpdate(updatable, headless), true);
+  assert.equal(cliUpdateBlockedReason(updatable, headless), null);
 
-  // brew·npm 미지원 사유가 있어도 헤드리스 사유가 앞선다. 재빌드와 수동 명령을 동시에
-  // 말하면 어느 쪽이 갱신 경로인지 흐려진다.
-  const unsupported = status({ updateSupported: false, unsupportedReason: "brew 실행 파일을 찾지 못했습니다" });
-  assert.equal(cliUpdateBlockedReason(unsupported, headless), CLI_HEADLESS_IMAGE_HINT);
+  // 옛 이미지(root 소유 /usr/local)는 백엔드가 updateSupported를 끄고 재생성 사유를 준다.
+  // 화면은 그 사유를 그대로 싣는다.
+  const readOnly = status({
+    updateSupported: false,
+    unsupportedReason: "설치 위치(/usr/local/lib/node_modules)에 현재 사용자가 쓸 수 없어 업데이트할 수 없습니다. 컨테이너 배포라면 이미지에 고정된 설치본입니다 — 새 이미지로 한 번 재생성하면 앱에서 업데이트할 수 있습니다",
+  });
+  assert.equal(canRunCliUpdate(readOnly, headless), false);
+  assert.match(cliUpdateBlockedReason(readOnly, headless), /재생성/);
 
-  // 수동 업데이트 안내도 같은 이유로 헤드리스에서만 사라진다.
+  // 막혔을 때 호스트 셸 수동 명령은 헤드리스에서만 숨긴다.
   const withHint = status({ manualUpdateHint: "brew upgrade --cask codex" });
   assert.equal(shouldShowManualUpdateHint(withHint, headless), false);
   assert.equal(shouldShowManualUpdateHint(withHint, writable), true);
   assert.equal(shouldShowManualUpdateHint(status({ manualUpdateHint: null }), writable), false);
 
-  // 탐지되지 않은 CLI는 그대로 미탐지로 알린다 — 재빌드해도 설치되지 않은 CLI는 없다.
+  // 탐지되지 않은 CLI는 그대로 미탐지로 알린다.
   assert.match(cliUpdateBlockedReason(status({ executablePath: null }), headless), /탐지되지 않았습니다/);
-  assert.equal(isHeadlessImageUpdateBlock(status({ executablePath: null }), headless), false);
 
-  // 최신 버전 확인과 캐시 정리는 헤드리스에서도 그대로 동작한다(읽기와 앱 데이터 정리다).
+  // 최신 버전 확인과 캐시 정리도 헤드리스에서 그대로 동작한다.
   assert.equal(canCheckCliUpdate(updatable, headless), true);
   assert.equal(canClearModelCaches(status({ modelCaches: [cache()] }), headless), true);
-
-  // 호스트(헤드리스 아님)에서는 아무것도 달라지지 않는다.
-  assert.equal(canRunCliUpdate(updatable, { writable: true, headless: false }), true);
-  assert.equal(isHeadlessImageUpdateBlock(updatable, { writable: true, headless: false }), false);
 });
 
 test("캐시 정리는 불일치가 있을 때만 열리고, 캐시가 없는 공급자는 미지원으로 표시한다", () => {

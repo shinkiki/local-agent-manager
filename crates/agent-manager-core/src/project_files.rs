@@ -313,7 +313,7 @@ pub fn search_project_files(
     });
     // git 상태는 결과가 정해진 뒤 한 번만 읽는다(F4). 줄마다 `git status`를 부르면 결과
     // 상한만큼 프로세스를 띄우게 되고, 저장소가 아니면 그 비용이 전부 헛것이 된다.
-    let status = project_git_status(app_data_dir, root).ok();
+    let status = project_git_status(app_data_dir, root, None).ok();
     // overlay 장부도 같은 이유로 한 번만 읽는다. git 상태와 달리 git을 띄우지 않으므로,
     // 저장소가 잠겨 있거나 저장소가 아니어도 이 칸은 답할 수 있다 —
     // `list_project_overlay_sets`가 그렇게 설계된 조회다(C19-1).

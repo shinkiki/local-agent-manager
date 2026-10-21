@@ -90,6 +90,20 @@ mod tests {
     }
 
     #[test]
+    fn read_capped_drains_past_the_limit_v2() {
+        let data: Vec<u8> = (0..MAX_CAPTURED_OUTPUT_BYTES * 3 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let mut reader = std::io::Cursor::new(data.as_slice());
+
+        let kept = read_capped(&mut reader);
+
+        assert_eq!(kept, data[..MAX_CAPTURED_OUTPUT_BYTES]);
+        // V2: 저장량만 확인하면 상한에서 읽기까지 멈춰 자식 파이프를 막는 회귀를 놓친다.
+        assert_eq!(reader.position(), data.len() as u64);
+    }
+
+    #[test]
     fn append_capped_str_backs_off_to_a_character_boundary() {
         let mut output = String::from("ab");
         // 상한까지 2바이트가 남았는데 다음 글자는 3바이트라, 한 글자도 붙지 않는다.

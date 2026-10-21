@@ -2389,6 +2389,7 @@ fn hide_generated_antigravity_session(app_data_dir: &Path, bytes: &[u8]) {
             folder_ids: None,
             pinned_account_id: None,
             bookmarks: None,
+            linked_project_paths: None,
         },
     );
 }

@@ -16,10 +16,10 @@ const branch = (name, extra = {}) => ({
 });
 
 test("B4 같은 접두사 브랜치는 폴더 하나로 묶이고 잎은 마지막 조각만 보인다", () => {
-  const tree = buildGitBranchTree([branch("round/lane-L02"), branch("dev-history"), branch("round/lane-L01")]);
+  const tree = buildGitBranchTree([branch("round/lane-L02"), branch("develop"), branch("round/lane-L01")]);
 
   assert.deepEqual(tree.map((node) => [node.kind, node.kind === "folder" ? node.path : node.label]), [
-    ["branch", "dev-history"],
+    ["branch", "develop"],
     ["folder", "round"],
   ]);
   const round = tree[1];
@@ -37,14 +37,14 @@ test("B4 루트 브랜치를 먼저 모으되 같은 종류의 최근 순은 뒤
 test("B4 폴더가 먼저 들어와도 루트 브랜치 뒤로 모인다", () => {
   const tree = buildGitBranchTree([
     branch("round/lane-L02"),
-    branch("dev-history"),
+    branch("develop"),
     branch("feat/login"),
     branch("main"),
     branch("round/lane-L01"),
   ]);
 
   assert.deepEqual(tree.map((node) => [node.kind, node.label]), [
-    ["branch", "dev-history"],
+    ["branch", "develop"],
     ["branch", "main"],
     ["folder", "round"],
     ["branch", "feat/login"],
@@ -105,12 +105,12 @@ test("B4 세 단계 접두사도 단계마다 폴더가 서고 HEAD 표식이 �
 });
 
 test("B4 HEAD가 든 폴더는 접힌 채로도 표식을 달 수 있게 hasHead가 위로 전해진다", () => {
-  const tree = buildGitBranchTree([branch("round/lane-L01", { isHead: true }), branch("round/lane-L02"), branch("dev-history")]);
+  const tree = buildGitBranchTree([branch("round/lane-L01", { isHead: true }), branch("round/lane-L02"), branch("develop")]);
 
   const round = tree.find((node) => node.kind === "folder" && node.path === "round");
   assert.equal(round?.hasHead, true);
   assert.equal(tree[0].kind, "branch");
-  assert.equal(tree[0].label, "dev-history");
+  assert.equal(tree[0].label, "develop");
 });
 
 test("B4 일괄 펴기는 중첩된 폴더 경로까지 모은다", () => {

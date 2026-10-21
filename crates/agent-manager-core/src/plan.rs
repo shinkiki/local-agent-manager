@@ -1486,13 +1486,6 @@ fn parse_choice(options: &[String], value: &str) -> Result<usize, CoreError> {
     )))
 }
 
-/// 계획 턴에 여는 도구 셋. 이름과 인자 모양이 여기 한 곳에만 있어, 배선(9.3)과 이 모듈의
-/// 검사가 서로 다른 계약을 보지 않는다.
-///
-/// **평평하다.** `properties` 밑은 문자열이거나 문자열 배열뿐이고, 배열 안에 객체를 두지
-/// 않는다. 2026-09-25 실측에서 중첩한 모양은 CPU 레인 0/6이었고, 깨질 때 `tools`가 통째로
-/// 문자열로 무너져 사라졌다 — 어느 도구를 열지가 이 설계의 전부인데 그것이 날아간다.
-/// [`tests::planning_tool_schemas_stay_flat`]이 그 평평함을 지킨다.
 /// 제 이름을 한 글자 틀린 조종 도구를 되돌린다. 그보다 멀면 되돌리지 않는다.
 ///
 /// 실측에서 GPU 가 `finiish_plan` 을 불렀다(2026-09-26). 조종 도구 넷은 뜻이 분명하므로
@@ -1539,6 +1532,13 @@ pub(crate) fn draft_planning_tool_schemas() -> Vec<Value> {
         .collect()
 }
 
+/// 계획 턴에 여는 도구 셋. 이름과 인자 모양이 여기 한 곳에만 있어, 배선(9.3)과 이 모듈의
+/// 검사가 서로 다른 계약을 보지 않는다.
+///
+/// **평평하다.** `properties` 밑은 문자열이거나 문자열 배열뿐이고, 배열 안에 객체를 두지
+/// 않는다. 2026-09-25 실측에서 중첩한 모양은 CPU 레인 0/6이었고, 깨질 때 `tools`가 통째로
+/// 문자열로 무너져 사라졌다 — 어느 도구를 열지가 이 설계의 전부인데 그것이 날아간다.
+/// [`tests::planning_tool_schemas_stay_flat`]이 그 평평함을 지킨다.
 pub(crate) fn planning_tool_schemas() -> Vec<Value> {
     // insert_step 이 여기 함께 있는 이유: MCP 도구 목록은 세션이 열릴 때 한 번 읽힌다.
     // 계획을 세우는 동안과 도는 동안 목록을 갈아 끼울 수 없으므로 다 내보내고, 지금 쓸 수
@@ -1750,12 +1750,6 @@ pub(crate) fn parse_insert_after(after: Option<&str>) -> Result<Option<usize>, C
     })
 }
 
-/// 메모를 상한까지 자른다. 거절하지 않는 것은 메모가 모델이 아니라 실행 결과에서 오기
-/// 때문이다 — 길다는 이유로 끝난 단계 하나를 통째로 실패로 만들 일이 아니다.
-/// 결과 본문을 상한까지 자른다.
-///
-/// 메모와 달리 줄바꿈을 지우지 않는다 — 본문은 사람이 읽거나 요약에 그대로 실리는 글이라
-/// 한 줄로 눌러 놓으면 읽을 수 없게 된다.
 /// 계획 턴에 보내는 글. 도구 색인과 요청을 한 덩이로 묶는다.
 ///
 /// 규칙은 에이전트 프롬프트(`PLAN_PROMPT`)가 들고, 여기서는 **이번 채팅에 무엇이 붙어
@@ -2107,6 +2101,10 @@ fn first_line(description: &str) -> String {
     String::new()
 }
 
+/// 결과 본문을 상한까지 자른다.
+///
+/// 메모와 달리 줄바꿈을 지우지 않는다 — 본문은 사람이 읽거나 요약에 그대로 실리는 글이라
+/// 한 줄로 눌러 놓으면 읽을 수 없게 된다.
 fn clamp_body(body: &str) -> String {
     let body = body.trim();
     if body.chars().count() <= MAX_STEP_BODY_CHARS {
@@ -2115,6 +2113,8 @@ fn clamp_body(body: &str) -> String {
     body.chars().take(MAX_STEP_BODY_CHARS).collect()
 }
 
+/// 메모를 상한까지 자른다. 거절하지 않는 것은 메모가 모델이 아니라 실행 결과에서 오기
+/// 때문이다 — 길다는 이유로 끝난 단계 하나를 통째로 실패로 만들 일이 아니다.
 fn clamp_note(note: &str) -> String {
     let note = note.trim().replace(['\r', '\n'], " ");
     if note.chars().count() <= MAX_STEP_NOTE_CHARS {

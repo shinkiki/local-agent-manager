@@ -76,7 +76,7 @@ description: 사용자가 적은 회차 목표 하나를 스킬·스크립트·�
   "measures":[{"label":"GPU","before":"18/20","after":"18/20"}],
   "failureKinds":[{"kind":"노션 → write","before":2,"after":0}],
   "fixes":["<고친 것>"],"commits":["<해시>"],"reverted":["<되돌린 부수효과>"],
-  "decisions":[{"question":"<사람이 정할 것>","options":["a","b"],"recommendation":"a"}],
+  "decisions":[{"question":"<사람이 정할 것>","options":["a","b"],"recommendation":"a","requiresHuman":false}],
   "next":["<다음 회차가 이어받을 것>"]}}
 ```
 
@@ -84,6 +84,7 @@ description: 사용자가 적은 회차 목표 하나를 스킬·스크립트·�
 - `outcome`: 고친 것이 재측정을 통과해 반영됐으면 pass, 측정만 했거나 일부면 partial, 되돌렸거나 막혔으면 fail.
 - `failureKinds` 가 판정이다. 합격률은 `measures` 에 참고로 적는다.
 - `decisions` 는 회차가 하지 않은 일이다. 사용자가 화면에서 답하면 `resolved` 가 채워진다. 다음 회차는 `list_round_reports` 로 그 답을 읽고 시작한다.
+- `requiresHuman` 은 목표가 추천적용(`recommended`) 모드일 때 다음 회차가 자동으로 답하지 않고 사람에게 남길 결정이다. 되돌리기 어렵거나 밖으로 나가는 영향(배포·삭제·외부 게시·계정·비용), 보안 정책의 트레이드오프, 제품 방향·사용자 화면 정책 변경, 선택지마다 사용자 데이터·설정이 다르게 바뀌는 결정은 `true`, 코드 내부 구현 방식만 다른 결정은 `false` 다
 
 ## 5. 워크플로와 반복 요청
 

@@ -33,7 +33,9 @@ use crate::domain::{
     TranscriptImageBlock, TranscriptItem, WeeklyCount,
 };
 use crate::identifier::validate_identifier;
-use crate::project_registry::{build_project_registry, ProjectPathResolver, ProjectPolicy};
+use crate::project_registry::{
+    apply_related_projects, build_project_registry, ProjectPathResolver, ProjectPolicy,
+};
 use crate::providers::inspect_local_environment;
 use crate::store;
 use crate::user_home::home_dir;
@@ -110,7 +112,15 @@ const RUNTIME_FAILURE_TWIN_TOLERANCE_MS: i64 = 5_000;
 // v8: 마지막 요청의 실패(lastFailure)를 스캔에서 추적하므로 예전 항목도 다시 읽어야 한다.
 // v9: Antigravity 작업 경로를 `file:///C:/...`에서 딸 때 앞 슬래시를 떼도록 바뀌어, 이미
 //     `/C:/...`로 저장된 cwd를 다시 읽어야 한다(제외가 막히던 경로).
-const SESSION_CATALOG_SCHEMA_VERSION: u32 = 9;
+// v10: Claude 스캔이 파일 수정 도구가 쓴 폴더(writtenDirs)를 모아 관련 프로젝트를 찾으므로,
+//      이미 끝까지 읽은 기록도 처음부터 다시 읽어야 한다.
+// v11: Antigravity 서브에이전트를 색인의 부모 id로 표시하도록 바뀌어, 이미 저장된 항목도
+//      부모 id를 얻으려면 다시 읽어야 한다.
+const SESSION_CATALOG_SCHEMA_VERSION: u32 = 11;
+/// 세션 하나가 모아 두는 수정 폴더 수 상한. 작업 경로 밖의 폴더만 모으므로 대개 몇 개고,
+/// 관련 프로젝트 판정에는 프로젝트마다 한 곳이면 충분하다. 넘으면 더 모으지 않는다 — 이
+/// 값은 세션 색인 파일에 그대로 실리고 개정마다 다시 쓰인다.
+const MAX_WRITTEN_DIRS_PER_SESSION: usize = 64;
 /// Codex 롤아웃 꼬리에서 마지막 턴의 끝맺음을 찾을 때 읽는 바이트 수. 끝맺음 뒤에는 토큰
 /// 집계 몇 줄만 따르고, `task_complete`는 마지막 답 본문을 함께 담으므로 이 정도가 필요하다.
 const CODEX_ROLLOUT_TAIL_BYTES: u64 = 64 * 1024;
@@ -146,6 +156,45 @@ struct ClaudeScanState {
     /// 가장 최근 레코드가 실패 안내였으면 그 실패. 뒤에 사용자 요청이나 정상 응답이 오면 비운다.
     #[serde(default)]
     last_failure: Option<SessionLastFailure>,
+    /// 파일 수정 도구(Edit·Write·MultiEdit·NotebookEdit)가 쓴 파일의 상위 폴더. 처음 본 순서로
+    /// 한 번씩만 둔다. 작업 경로 밖의 등록 프로젝트를 찾는 재료다(`related_projects`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    written_dirs: Vec<String>,
+    /// 작업 경로 안쪽 폴더의 워크트리 판정 기억. 같은 폴더를 고칠 때마다 파일시스템을 다시
+    /// 묻지 않게 하는 파일 한 번 훑기 동안의 캐시라 저장하지도, 상태 비교에 넣지도 않고,
+    /// 훑기가 끝나면 비운다(`scan_claude_catalog_entry`).
+    #[serde(skip)]
+    worktree_memo: WorktreeMemo,
+}
+
+/// 폴더 → 본 체크아웃 경로(워크트리가 아니면 `None`) 기억. 비교에서는 늘 같다고 답한다 —
+/// 캐시가 찼는지에 따라 스캔 상태가 달라 보이면 안 된다.
+#[derive(Debug, Clone, Default)]
+struct WorktreeMemo(HashMap<PathBuf, Option<PathBuf>>);
+
+impl PartialEq for WorktreeMemo {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for WorktreeMemo {}
+
+/// 워크트리 판정 기억의 상한. 넘으면 비우고 다시 채운다.
+const MAX_WORKTREE_MEMO_ENTRIES: usize = 512;
+
+impl WorktreeMemo {
+    fn main_checkout_path(&mut self, dir: &Path, base: &Path) -> Option<PathBuf> {
+        if let Some(known) = self.0.get(dir) {
+            return known.clone();
+        }
+        if self.0.len() >= MAX_WORKTREE_MEMO_ENTRIES {
+            self.0.clear();
+        }
+        let resolved = worktree_main_checkout_path(dir, base);
+        self.0.insert(dir.to_path_buf(), resolved.clone());
+        resolved
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -970,7 +1019,11 @@ fn compose_manager_snapshot(
     let (mut sessions, metadata) = catalog_sessions_with_metadata(app_data_dir, persisted)?;
     // 제외 프로젝트의 세션은 여기서 빠진다. 이 목록을 읽는 모든 곳(대시보드·아티팩트·스킬
     // 스캔·지침 배포 대상·세션 참조·AIA 작업 루트·화면)이 같은 결과를 본다.
-    let registry = apply_project_policy(&mut sessions, &metadata);
+    let mut resolver = ProjectPathResolver::default();
+    let registry = apply_project_policy(&mut sessions, &metadata, &mut resolver);
+    // 정규화 결과를 레지스트리와 나눠 쓴다. 관련 프로젝트는 화면 목록에만 필요해 초기
+    // 리소스 스캔의 프로젝트 판정(`registered_project_paths`)에서는 셈하지 않는다.
+    apply_related_projects(&mut sessions, &registry, &mut resolver, Some(home));
     let pending_projects = registry
         .into_iter()
         .filter(|entry| entry.pending)
@@ -1086,10 +1139,10 @@ fn project_policy(metadata: &store::AppMetadata) -> ProjectPolicy {
 fn apply_project_policy(
     sessions: &mut Vec<SessionSummary>,
     metadata: &store::AppMetadata,
+    resolver: &mut ProjectPathResolver,
 ) -> Vec<ProjectRegistryEntry> {
     let policy = project_policy(metadata);
-    let mut resolver = ProjectPathResolver::default();
-    let registry = build_project_registry(sessions, &policy, &mut resolver);
+    let registry = build_project_registry(sessions, &policy, resolver);
     sessions.retain(|session| !resolver.is_excluded(&policy, session));
     registry
 }
@@ -1291,7 +1344,11 @@ fn registered_project_paths(
     persisted: &PersistedSessionCatalog,
 ) -> Result<Vec<PathBuf>, CoreError> {
     let (mut sessions, metadata) = catalog_sessions_with_metadata(app_data_dir, persisted)?;
-    apply_project_policy(&mut sessions, &metadata);
+    apply_project_policy(
+        &mut sessions,
+        &metadata,
+        &mut ProjectPathResolver::default(),
+    );
     Ok(crate::skill_library::project_paths_from_sessions(&sessions))
 }
 
@@ -1492,6 +1549,144 @@ pub fn load_session_transcript_before(
         transcript_limit,
         Some(before_index),
     )
+}
+
+/// Official provider fork cutoffs. No provider-owned file is ever changed (G1-G3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MessageEditBoundary {
+    Fresh,
+    CodexBeforeTurn {
+        id: String,
+        prefix_turn_ids: Vec<String>,
+    },
+    ClaudeAfterMessage(String),
+}
+
+pub(crate) fn resolve_message_edit_boundary(
+    app_data_dir: &Path,
+    source: ProviderId,
+    id: &str,
+    index: usize,
+    expected_text: &str,
+) -> Result<MessageEditBoundary, CoreError> {
+    validate_identifier(id)?;
+    let home = home_dir()?;
+    let metadata = store::load_metadata(app_data_dir)?;
+    let session = resolve_session(app_data_dir, &home, source, id, &metadata)?;
+    let path = fs::canonicalize(&session.file_path)?;
+    resolve_message_edit_file(&path, source, index, expected_text)
+}
+
+fn resolve_message_edit_file(
+    path: &Path,
+    source: ProviderId,
+    index: usize,
+    expected_text: &str,
+) -> Result<MessageEditBoundary, CoreError> {
+    let invalid = || {
+        CoreError::InvalidInput("편집할 메시지의 안전한 분기 위치를 확인할 수 없습니다. 첨부 또는 같은 턴의 추가 지시가 있는 메시지는 편집할 수 없습니다".to_owned())
+    };
+    if !matches!(source, ProviderId::Claude | ProviderId::Codex) || expected_text.trim().is_empty()
+    {
+        return Err(invalid());
+    }
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut lines = TranscriptLineReader::default();
+    let mut ordinal = 0;
+    let mut turn_id: Option<String> = None;
+    let mut turn_users = 0;
+    let mut turn_ids = Vec::<String>::new();
+    let mut session_meta_seen = false;
+    let mut seen_messages = HashSet::new();
+    let mut matches = Vec::new();
+    while let Some((offset, line)) = lines.next_line(&mut reader)? {
+        let record: Value = serde_json::from_slice(line).map_err(|_| invalid())?;
+        if source == ProviderId::Codex {
+            if record.get("type").and_then(Value::as_str) == Some("turn_context") {
+                let next = record
+                    .pointer("/payload/turn_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if next != turn_id {
+                    turn_users = 0;
+                }
+                turn_id = next;
+            }
+            if record.pointer("/payload/type").and_then(Value::as_str) == Some("task_started") {
+                turn_id = record
+                    .pointer("/payload/turn_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                turn_users = 0;
+            }
+            if let Some(id) = &turn_id {
+                if !turn_ids.contains(id) {
+                    turn_ids.push(id.clone());
+                }
+            }
+        }
+        let item = if source == ProviderId::Claude {
+            claude_transcript_item(&record, ordinal, offset)
+        } else {
+            let is_meta = record.get("type").and_then(Value::as_str) == Some("session_meta");
+            let include_meta = is_meta && !session_meta_seen;
+            session_meta_seen |= is_meta;
+            codex_transcript_item(&record, ordinal, include_meta, offset)
+        };
+        if let Some(item) = item {
+            if item.role == "user" {
+                let text: Option<Vec<&str>> = item
+                    .blocks
+                    .iter()
+                    .map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if (index == ordinal || index == offset)
+                    && text.map(|parts| parts.join("\n\n")).as_deref() == Some(expected_text)
+                {
+                    let boundary = if source == ProviderId::Codex {
+                        if turn_users != 0 {
+                            return Err(invalid());
+                        }
+                        let id = turn_id.clone().ok_or_else(invalid)?;
+                        let cutoff = turn_ids
+                            .iter()
+                            .position(|seen| seen == &id)
+                            .ok_or_else(invalid)?;
+                        MessageEditBoundary::CodexBeforeTurn {
+                            id,
+                            prefix_turn_ids: turn_ids[..cutoff].to_vec(),
+                        }
+                    } else {
+                        match record.get("parentUuid").and_then(Value::as_str) {
+                            Some(parent) if seen_messages.contains(parent) => {
+                                MessageEditBoundary::ClaudeAfterMessage(parent.to_owned())
+                            }
+                            None if seen_messages.is_empty() => MessageEditBoundary::Fresh,
+                            _ => return Err(invalid()),
+                        }
+                    };
+                    matches.push(boundary);
+                }
+                turn_users += 1;
+            }
+            ordinal += 1;
+        }
+        if let Some(uuid) = record.get("uuid").and_then(Value::as_str) {
+            if matches!(
+                record.get("type").and_then(Value::as_str),
+                Some("user" | "assistant")
+            ) {
+                seen_messages.insert(uuid.to_owned());
+            }
+        }
+    }
+    if matches.len() != 1 {
+        return Err(invalid());
+    }
+    Ok(matches.remove(0))
 }
 
 fn load_session_detail_window(
@@ -2382,6 +2577,13 @@ fn apply_session_metadata(session: &mut SessionSummary, metadata: &HashMap<Strin
 
 /// 공급자 색인이 cwd를 제공하지 않을 때만 Agent Manager가 실행 시 기록한 경로를 쓴다.
 /// 공급자가 가진 경로가 언제나 우선이므로 파생 메타데이터가 원본을 덮지 않는다.
+///
+/// 서브에이전트는 Agent Manager 채팅이 띄운 실행이 아니어서 자기 기록이 없다. 부모와
+/// 같은 프로세스·같은 작업 경로에서 돌므로 부모의 기록을 쓴다 — Antigravity가 신뢰 폴더를
+/// 여럿 적어 색인 경로를 비운 서브에이전트(2026-10-19 `6486e842`)가 경로 없이 남던 자리다.
+/// 부모 한 단계의 실행 기록만 본다. 부모의 경로가 색인에서 온 경우는 서브에이전트도 같은
+/// 신뢰 폴더 목록을 물려받아 자기 색인에서 같은 경로를 얻고, 서브에이전트의 서브에이전트는
+/// 아직 보지 못했다.
 fn apply_session_working_directory(
     session: &mut SessionSummary,
     working_directories: &HashMap<String, String>,
@@ -2389,7 +2591,10 @@ fn apply_session_working_directory(
     if session.cwd.is_some() {
         return;
     }
-    let Some(cwd) = working_directories.get(&session_key(session.source, &session.id)) else {
+    let recorded = |id: &str| working_directories.get(&session_key(session.source, id));
+    let Some(cwd) =
+        recorded(&session.id).or_else(|| session.parent_session_id.as_deref().and_then(recorded))
+    else {
         return;
     };
     if session.project.is_none() {
@@ -2475,6 +2680,9 @@ fn scan_claude_catalog_entry(
             break;
         }
     }
+    // 워크트리 판정 기억은 이번 파일 한 번 훑기 동안만 쓴다. 저장 상태에 남기면 카탈로그를
+    // 다시 짤 때마다 통째로 복사된다.
+    scan.worktree_memo = WorktreeMemo::default();
     Ok(ClaudeCatalogEntry {
         path: path.to_string_lossy().into_owned(),
         fingerprint,
@@ -2570,6 +2778,7 @@ fn apply_claude_assistant_record(scan: &mut ClaudeScanState, record: &Value) {
     if model.is_none() && record_interrupt_label(record).is_some() {
         return;
     }
+    collect_claude_written_dirs(scan, record);
     // CLI가 답 자리에 남긴 실패 안내(한도·인증 만료·거절)는 이 세션의 마지막
     // 사건으로 남기고, 정상 응답이 오면 지운다.
     scan.last_failure = claude_api_error_text(record).map(|text| {
@@ -2601,6 +2810,145 @@ fn apply_claude_assistant_record(scan: &mut ClaudeScanState, record: &Value) {
         record,
         "/message/usage/cache_creation_input_tokens",
     ));
+}
+
+/// 파일을 고치는 Claude 도구와 그 경로가 담기는 입력 키.
+const CLAUDE_FILE_WRITE_TOOLS: [(&str, &str); 4] = [
+    ("Edit", "file_path"),
+    ("MultiEdit", "file_path"),
+    ("Write", "file_path"),
+    ("NotebookEdit", "notebook_path"),
+];
+
+/// 답 하나에 실린 파일 수정 도구 호출에서 고친 파일의 상위 폴더를 모은다. 읽기만 한 경로는
+/// 세지 않는다 — 다른 프로젝트를 들여다본 것만으로 그 프로젝트 작업이 되지는 않는다. 셸
+/// 명령으로 고친 경로는 명령 문자열을 해석해야 해 여기서 잡지 않고, 직접 이어 두기
+/// (`linked_project_paths`)로 메운다. 상대 경로는 그 레코드의 작업 경로를 기준으로 푼다.
+///
+/// 세션 작업 경로(시작 경로, 목록의 `cwd`) 안쪽 수정은 자기 일이라 모으지 않는다. 레코드의
+/// `cwd`는 셸이 `cd`할 때마다 바뀌므로 상대 경로를 풀 때만 쓴다 — 그걸 경계로 삼으면 다른
+/// 프로젝트로 `cd`해 고친 수정이 자기 일로 빠진다. 다만 작업 경로 안에 만든 git 워크트리는
+/// 다른 저장소의 작업이라 그 워크트리의 본 체크아웃 경로로 옮겨 모은다 — AIA가 자기
+/// 작업공간에 워크트리를 만들어 프로젝트를 고치는 흐름이 여기서 잡힌다. 세션 작업 경로가
+/// 워크트리 자신이어도 같다. 워크트리는 작업이 끝나면 지워지므로 기록을 읽는 그때 판정해
+/// 결과를 색인에 남긴다(지운 뒤에 처음부터 다시 읽으면 그 수정은 잡히지 않는다).
+fn collect_claude_written_dirs(scan: &mut ClaudeScanState, record: &Value) {
+    let Some(parts) = record.pointer("/message/content").and_then(Value::as_array) else {
+        return;
+    };
+    let base = scan.cwd.as_deref().map(lexical_normalize);
+    let record_cwd = record
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(lexical_normalize)
+        .or_else(|| base.clone());
+    for part in parts {
+        if scan.written_dirs.len() >= MAX_WRITTEN_DIRS_PER_SESSION {
+            return;
+        }
+        if part.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        let name = part.get("name").and_then(Value::as_str).unwrap_or_default();
+        let Some(key) = CLAUDE_FILE_WRITE_TOOLS
+            .iter()
+            .find_map(|(tool, key)| (*tool == name).then_some(*key))
+        else {
+            continue;
+        };
+        let Some(path) = part
+            .pointer(&format!("/input/{key}"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.trim().is_empty())
+        else {
+            continue;
+        };
+        let path = Path::new(path);
+        let path = if path.is_absolute() {
+            lexical_normalize(path)
+        } else if let Some(record_cwd) = &record_cwd {
+            lexical_normalize(record_cwd.join(path))
+        } else {
+            continue;
+        };
+        let Some(dir) = path.parent() else {
+            continue;
+        };
+        let dir = match &base {
+            Some(base) if dir.starts_with(base) => {
+                match scan.worktree_memo.main_checkout_path(dir, base) {
+                    Some(mapped) => mapped,
+                    None => continue,
+                }
+            }
+            _ => dir.to_path_buf(),
+        };
+        let Some(dir) = dir.to_str() else {
+            continue;
+        };
+        if !scan.written_dirs.iter().any(|known| known == dir) {
+            scan.written_dirs.push(dir.to_owned());
+        }
+    }
+}
+
+/// `.`·`..`를 파일시스템을 묻지 않고 접는다. 경로를 비교하기 전에 접지 않으면
+/// `/ws/../other`가 `/ws` 아래로 읽힌다.
+fn lexical_normalize(path: impl AsRef<Path>) -> PathBuf {
+    use std::path::Component;
+    let mut normalized = PathBuf::new();
+    for component in path.as_ref().components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
+/// `dir`가 `base`(그 자신 포함) 안쪽의 git 워크트리 안이면, 본 체크아웃에서 같은 자리의
+/// 경로. 워크트리는 `.git` 파일에 `gitdir: <본 저장소>/.git/worktrees/<이름>`을 적어 둔다.
+/// 그 사이에 일반 저장소(`.git` 폴더)가 먼저 나오면 워크트리가 아니다.
+pub(crate) fn worktree_main_checkout_path(dir: &Path, base: &Path) -> Option<PathBuf> {
+    for root in dir.ancestors() {
+        if !root.starts_with(base) {
+            return None;
+        }
+        let marker = root.join(".git");
+        if marker.is_dir() {
+            return None;
+        }
+        if !marker.is_file() {
+            if root == base {
+                return None;
+            }
+            continue;
+        }
+        let text = fs::read_to_string(&marker).ok()?;
+        let gitdir = text
+            .lines()
+            .find_map(|line| line.strip_prefix("gitdir:"))?
+            .trim();
+        let gitdir = lexical_normalize(root.join(gitdir));
+        let worktrees = gitdir.parent()?;
+        let common = worktrees.parent()?;
+        if worktrees.file_name()? != "worktrees" || common.file_name()? != ".git" {
+            return None;
+        }
+        let main = common.parent()?;
+        // 워크트리 맨 위 폴더면 본 체크아웃 자신이다. 빈 조각을 붙이면 끝 슬래시가 남아
+        // 같은 폴더가 다른 문자열이 된다.
+        let rest = dir.strip_prefix(root).ok()?;
+        return Some(if rest.as_os_str().is_empty() {
+            main.to_path_buf()
+        } else {
+            main.join(rest)
+        });
+    }
+    None
 }
 
 /// 슬래시 명령의 출력은 isMeta 표시 없이 `type: "user"`로 남는 CLI 주입 레코드다.
@@ -2749,6 +3097,7 @@ fn claude_summary_from_entry(entry: &ClaudeCatalogEntry) -> SessionSummary {
         model: entry.scan.model.clone(),
         git_branch: entry.scan.git_branch.clone(),
         is_subagent: false,
+        parent_session_id: None,
         aia_workspace: false,
         aia_chat: false,
         aia_chat_opens_as_standard: false,
@@ -2759,6 +3108,8 @@ fn claude_summary_from_entry(entry: &ClaudeCatalogEntry) -> SessionSummary {
         file_path: entry.path.clone(),
         meta: SessionMeta::default(),
         last_failure: entry.scan.last_failure.clone(),
+        related_projects: Vec::new(),
+        written_dirs: entry.scan.written_dirs.clone(),
     }
 }
 
@@ -3007,6 +3358,7 @@ fn list_opencode_sessions(home: &Path) -> Vec<SessionSummary> {
                 model: model.as_deref().and_then(opencode_model_name),
                 git_branch: None,
                 is_subagent: false,
+                parent_session_id: None,
                 aia_workspace: false,
                 aia_chat: false,
                 aia_chat_opens_as_standard: false,
@@ -3018,6 +3370,8 @@ fn list_opencode_sessions(home: &Path) -> Vec<SessionSummary> {
                 file_path: path.to_string_lossy().into_owned(),
                 meta: SessionMeta::default(),
                 last_failure: None,
+                related_projects: Vec::new(),
+                written_dirs: Vec::new(),
             })
         },
     );
@@ -3220,6 +3574,7 @@ fn codex_session_from_row(
             thread_source.as_deref(),
             Some("subagent" | "guardian_review")
         ),
+        parent_session_id: None,
         aia_workspace: false,
         aia_chat: false,
         aia_chat_opens_as_standard: false,
@@ -3230,6 +3585,8 @@ fn codex_session_from_row(
         file_path: resolved_path.to_string_lossy().into_owned(),
         meta: SessionMeta::default(),
         last_failure: None,
+        related_projects: Vec::new(),
+        written_dirs: Vec::new(),
     })
 }
 
@@ -3250,6 +3607,8 @@ struct AgIndexEntry {
     step_count: Option<u64>,
     updated_at: Option<i64>,
     workspace: Option<String>,
+    /// 서브에이전트 대화면 그 대화를 띄운 부모 대화 id.
+    parent: Option<String>,
 }
 
 /// 공유 홈과 계정 프로필 홈을 함께 훑는다. 공유 홈이 언제나 먼저다.
@@ -3386,7 +3745,8 @@ fn antigravity_session_from_path(
         token_usage: None,
         model: None,
         git_branch: None,
-        is_subagent: false,
+        is_subagent: indexed.parent.is_some(),
+        parent_session_id: indexed.parent,
         aia_workspace: false,
         aia_chat: false,
         aia_chat_opens_as_standard: false,
@@ -3397,6 +3757,8 @@ fn antigravity_session_from_path(
         file_path: path.to_string_lossy().into_owned(),
         meta: SessionMeta::default(),
         last_failure: None,
+        related_projects: Vec::new(),
+        written_dirs: Vec::new(),
     }
 }
 
@@ -3405,9 +3767,7 @@ fn read_ag_summary_index(gemini: &Path) -> HashMap<String, AgIndexEntry> {
     let Ok(connection) = open_sqlite_readonly(&path) else {
         return HashMap::new();
     };
-    let Ok(mut statement) = connection.prepare(
-        "SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris FROM conversation_summaries",
-    ) else {
+    let Ok(mut statement) = connection.prepare(&ag_summary_index_query(&connection)) else {
         return HashMap::new();
     };
     let Ok(rows) = statement.query_map([], |row| {
@@ -3417,24 +3777,43 @@ fn read_ag_summary_index(gemini: &Path) -> HashMap<String, AgIndexEntry> {
         let count = row.get::<_, Option<u64>>(3)?;
         let updated = row.get::<_, Option<String>>(4)?;
         let workspaces = row.get::<_, Option<String>>(5)?;
-        Ok((id, title, preview, count, updated, workspaces))
+        // 부모 열은 덧붙은 정보다. 형이 어긋나도 그 대화의 제목·경로까지 잃지 않게 이 열만 버린다.
+        let parent = row.get::<_, Option<String>>(6).ok().flatten();
+        Ok((id, title, preview, count, updated, workspaces, parent))
     }) else {
         return HashMap::new();
     };
     rows.flatten()
-        .map(|(id, title, preview, step_count, updated, workspaces)| {
-            let workspace = ag_index_workspace(workspaces);
-            (
-                id,
-                AgIndexEntry {
-                    title: first_non_empty([title, preview]).map(cap_provider_title),
-                    step_count,
-                    updated_at: updated.as_deref().and_then(parse_time),
-                    workspace,
-                },
-            )
-        })
+        .map(
+            |(id, title, preview, step_count, updated, workspaces, parent)| {
+                let workspace = ag_index_workspace(workspaces);
+                (
+                    id,
+                    AgIndexEntry {
+                        title: first_non_empty([title, preview]).map(cap_provider_title),
+                        step_count,
+                        updated_at: updated.as_deref().and_then(parse_time),
+                        workspace,
+                        // 최상위 대화는 이 열이 NULL이 아니라 빈 문자열이다.
+                        parent: parent.filter(|parent| !parent.is_empty()),
+                    },
+                )
+            },
+        )
         .collect()
+}
+
+/// 요약 색인 조회문. `parent_conversation_id`는 서브에이전트가 생긴 뒤의 CLI에만 있는
+/// 열이라, 없는 색인에서 그 열을 고르면 조회 전체가 실패해 모든 대화의 제목·경로를 잃는다.
+/// 열이 없으면 NULL로 채워 같은 모양의 행을 받는다.
+fn ag_summary_index_query(connection: &Connection) -> String {
+    let has_parent = connection
+        .prepare("SELECT parent_conversation_id FROM conversation_summaries LIMIT 0")
+        .is_ok();
+    format!(
+        "SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, {} FROM conversation_summaries",
+        if has_parent { "parent_conversation_id" } else { "NULL" }
+    )
 }
 
 /// 색인의 `workspace_uris`를 세션 cwd로 쓸지 정한다.
@@ -5139,6 +5518,10 @@ fn codex_session_record_item(
             Some("세션 정보"),
             codex_session_info(payload),
         )),
+        // 파일 변경은 response_item 에 남지 않는다 — 코드 모드에서는 `exec` 의 스크립트 안에서
+        // 패치가 돌아, 무엇을 고쳤는지는 끝난 항목 알림(`item_completed`)의 `FileChange` 에만
+        // 있다. 실행 중 카드와 같은 이름·같은 `changes` 를 실어 화면이 같은 diff 로 그린다.
+        Some("event_msg") => codex_file_change_item(payload, index, timestamp),
         Some("compacted") => Some(transcript_item(
             index,
             "meta",
@@ -5151,6 +5534,35 @@ fn codex_session_record_item(
         )),
         _ => None,
     }
+}
+
+fn codex_file_change_item(
+    payload: &Value,
+    index: usize,
+    timestamp: Option<i64>,
+) -> Option<TranscriptItem> {
+    if payload.get("type").and_then(Value::as_str) != Some("item_completed") {
+        return None;
+    }
+    let item = payload.get("item")?;
+    if item.get("type").and_then(Value::as_str) != Some("FileChange") {
+        return None;
+    }
+    let changes = item.get("changes").filter(|changes| match changes {
+        Value::Object(map) => !map.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        _ => false,
+    })?;
+    Some(transcript_item(
+        index,
+        "assistant",
+        timestamp,
+        None,
+        ContentBlock::ToolUse {
+            name: "파일 변경".to_owned(),
+            input_json: pretty_json(changes),
+        },
+    ))
 }
 
 /// message 페이로드를 말풍선 또는 컨텍스트 항목으로. 자동 주입된 사용자 메시지와
@@ -6013,6 +6425,99 @@ mod tests {
 
     /// 하네스가 세션에 적는 모델은 문자열이 아니라 JSON 한 덩이다. 실측 모양으로 고정한다.
     #[test]
+    fn g1_g2_message_edit_resolves_exact_boundary_without_mutating_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.jsonl");
+        let records = [
+            json!({"type":"user","uuid":"u1","parentUuid":null,"message":{"content":"first"}}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"text","text":"reply"}]}}),
+            json!({"type":"user","uuid":"u2","parentUuid":"a1","message":{"content":"second"}}),
+        ];
+        let original = records.iter().map(|v| format!("{v}\n")).collect::<String>();
+        fs::write(&path, &original).unwrap();
+        assert_eq!(
+            resolve_message_edit_file(&path, ProviderId::Claude, 0, "first").unwrap(),
+            MessageEditBoundary::Fresh
+        );
+        assert_eq!(
+            resolve_message_edit_file(&path, ProviderId::Claude, 2, "second").unwrap(),
+            MessageEditBoundary::ClaudeAfterMessage("a1".to_owned())
+        );
+        let offset = records[..2].iter().map(|v| format!("{v}\n").len()).sum();
+        assert!(resolve_message_edit_file(&path, ProviderId::Claude, offset, "second").is_ok());
+        assert!(resolve_message_edit_file(&path, ProviderId::Claude, 2, "stale").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn g3_message_edit_repeated_headers_keep_display_ordinals_and_turn_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.jsonl");
+        let records = [
+            json!({"type":"session_meta","payload":{}}),
+            json!({"type":"turn_context","payload":{"turn_id":"t1"}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"same"}]}}),
+            json!({"type":"session_meta","payload":{}}),
+            json!({"type":"turn_context","payload":{"turn_id":"t2"}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"same"}]}}),
+        ];
+        fs::write(
+            &path,
+            records.iter().map(|v| format!("{v}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let parsed = parse_codex_transcript(&path, None, None).unwrap();
+        let users: Vec<_> = parsed
+            .items
+            .iter()
+            .filter(|item| item.role == "user")
+            .collect();
+        assert_eq!(users.len(), 2);
+        assert_eq!(
+            resolve_message_edit_file(&path, ProviderId::Codex, users[0].index, "same").unwrap(),
+            MessageEditBoundary::CodexBeforeTurn {
+                id: "t1".to_owned(),
+                prefix_turn_ids: vec![]
+            }
+        );
+        assert_eq!(
+            resolve_message_edit_file(&path, ProviderId::Codex, users[1].index, "same").unwrap(),
+            MessageEditBoundary::CodexBeforeTurn {
+                id: "t2".to_owned(),
+                prefix_turn_ids: vec!["t1".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn g3_message_edit_refuses_codex_steering_inside_same_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.jsonl");
+        let records = [
+            json!({"type":"turn_context","payload":{"turn_id":"turn-one"}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first"}]}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"steer"}]}}),
+        ];
+        fs::write(
+            &path,
+            records.iter().map(|v| format!("{v}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let first_offset = format!("{}\n", records[0]).len();
+        assert_eq!(
+            resolve_message_edit_file(&path, ProviderId::Codex, first_offset, "first").unwrap(),
+            MessageEditBoundary::CodexBeforeTurn {
+                id: "turn-one".to_owned(),
+                prefix_turn_ids: vec![]
+            }
+        );
+        let steer_offset = first_offset + format!("{}\n", records[1]).len();
+        assert!(
+            resolve_message_edit_file(&path, ProviderId::Codex, steer_offset, "steer").is_err()
+        );
+    }
+
+    #[test]
     fn the_harness_model_json_yields_the_bare_name() {
         assert_eq!(
             opencode_model_name(
@@ -6128,6 +6633,7 @@ mod tests {
             model: None,
             git_branch: None,
             is_subagent: false,
+            parent_session_id: None,
             aia_workspace: false,
             aia_chat: false,
             aia_chat_opens_as_standard: false,
@@ -6138,6 +6644,8 @@ mod tests {
             file_path: String::new(),
             meta: SessionMeta::default(),
             last_failure: None,
+            related_projects: Vec::new(),
+            written_dirs: Vec::new(),
         }
     }
 
@@ -6253,6 +6761,89 @@ mod tests {
             Some("/provider/authoritative-project")
         );
         assert_eq!(session.project.as_deref(), Some("authoritative-project"));
+    }
+
+    /// 서브에이전트는 자기 실행 기록이 없어 부모의 기록을 쓰되, 자기 기록이 있으면 그것이 이긴다.
+    #[test]
+    fn subagent_without_its_own_record_uses_the_parent_working_directory() {
+        let mut session = session_with_cwd("subagent", PathBuf::from("/unused"));
+        session.source = ProviderId::Antigravity;
+        session.cwd = None;
+        session.project = None;
+        session.is_subagent = true;
+        session.parent_session_id = Some("parent".to_owned());
+        let mut working_directories = HashMap::from([(
+            session_key(ProviderId::Antigravity, "parent"),
+            "/workspace/parent-project".to_owned(),
+        )]);
+
+        apply_session_working_directory(&mut session, &working_directories);
+        assert_eq!(session.cwd.as_deref(), Some("/workspace/parent-project"));
+        assert_eq!(session.project.as_deref(), Some("parent-project"));
+
+        session.cwd = None;
+        session.project = None;
+        working_directories.insert(
+            session_key(ProviderId::Antigravity, "subagent"),
+            "/workspace/own-record".to_owned(),
+        );
+        apply_session_working_directory(&mut session, &working_directories);
+        assert_eq!(session.cwd.as_deref(), Some("/workspace/own-record"));
+
+        // 다른 공급자의 같은 id 기록은 부모로 보지 않는다.
+        session.cwd = None;
+        session.project = None;
+        let other_source = HashMap::from([(
+            session_key(ProviderId::Codex, "parent"),
+            "/workspace/codex".to_owned(),
+        )]);
+        apply_session_working_directory(&mut session, &other_source);
+        assert_eq!(session.cwd, None);
+    }
+
+    /// 부모 id 열이 있는 색인은 서브에이전트를 가려내고(최상위는 빈 문자열), 열이 없는 옛
+    /// 색인도 조회 전체가 실패하지 않고 나머지 값을 그대로 읽는다.
+    #[test]
+    fn antigravity_index_reads_parent_ids_and_tolerates_an_index_without_them() {
+        let home = tempfile::tempdir().expect("홈");
+        let gemini = home.path().join(".gemini");
+        let path = ag_summary_index_path(&gemini);
+        fs::create_dir_all(path.parent().expect("색인 폴더")).expect("색인 폴더");
+        let connection = Connection::open(&path).expect("색인");
+        connection
+            .execute_batch(
+                r#"CREATE TABLE conversation_summaries (
+                    conversation_id TEXT, title TEXT, preview TEXT, step_count INTEGER,
+                    last_modified_time TEXT, workspace_uris TEXT, parent_conversation_id TEXT);
+                INSERT INTO conversation_summaries VALUES
+                    ('parent', '부모', '', 3, NULL, '["file:///a","file:///b"]', ''),
+                    ('child', '', '', 5, NULL, '["file:///a","file:///b"]', 'parent');"#,
+            )
+            .expect("색인 행");
+        drop(connection);
+
+        let index = read_ag_summary_index(&gemini);
+        assert_eq!(index["parent"].parent, None);
+        assert_eq!(index["child"].parent.as_deref(), Some("parent"));
+        assert_eq!(index["child"].workspace, None);
+
+        fs::remove_file(&path).expect("색인 지우기");
+        let connection = Connection::open(&path).expect("옛 색인");
+        connection
+            .execute_batch(
+                r#"CREATE TABLE conversation_summaries (
+                    conversation_id TEXT, title TEXT, preview TEXT, step_count INTEGER,
+                    last_modified_time TEXT, workspace_uris TEXT);
+                INSERT INTO conversation_summaries VALUES
+                    ('old', '옛 대화', '', 7, NULL, '["file:///workspace/project"]');"#,
+            )
+            .expect("옛 색인 행");
+        drop(connection);
+
+        let index = read_ag_summary_index(&gemini);
+        assert_eq!(index["old"].title.as_deref(), Some("옛 대화"));
+        assert_eq!(index["old"].step_count, Some(7));
+        assert_eq!(index["old"].parent, None);
     }
 
     #[test]
@@ -6985,6 +7576,21 @@ mod tests {
         assert!(!unrelated.aia_workspace);
         assert!(!unrelated.aia_chat);
         assert_ne!(unrelated.project.as_deref(), Some(AIA_WORKSPACE_PROJECT));
+    }
+
+    /// 형제 앱 데이터 판정은 `-접미` 관계만 본다. 나란한 접미(`…-dev`·`…-dev2`)나 `-` 없이
+    /// 이어진 이름(`datax`)을 같은 앱으로 묶으면 무관한 폴더의 대화가 AIA 로 표시된다.
+    #[test]
+    fn sibling_app_data_names_follow_only_the_dash_suffix_relation() {
+        assert!(is_sibling_app_data_name("data", "data"));
+        assert!(is_sibling_app_data_name("data", "data-dev"));
+        assert!(is_sibling_app_data_name("data-dev", "data"));
+        assert!(!is_sibling_app_data_name("data-dev", "data-dev2"));
+        // 한쪽이 다른 쪽에 `-접미`를 더한 모양이면 접미 이름끼리도 이어진다.
+        assert!(is_sibling_app_data_name("data-dev", "data-dev-2"));
+        assert!(!is_sibling_app_data_name("data", "datax"));
+        assert!(!is_sibling_app_data_name("data", "data_dev"));
+        assert!(!is_sibling_app_data_name("data", "dat"));
     }
 
     /// AIA 작업공간을 작업 경로로 골라 연 일반 채팅. 적힌 프로필이 `Standard`면 경로가
@@ -7743,6 +8349,115 @@ mod tests {
     }
 
     #[test]
+    fn claude_scan_collects_folders_written_by_file_edit_tools_only() {
+        let mut scan = ClaudeScanState {
+            cwd: Some("/data/aia-workspace".to_owned()),
+            ..ClaudeScanState::default()
+        };
+        let record = json!({
+            "type": "assistant",
+            "cwd": "/data/aia-workspace",
+            "message": {
+                "model": "claude-opus-5-5",
+                "content": [
+                    { "type": "text", "text": "고칩니다" },
+                    { "type": "tool_use", "name": "Edit", "input": { "file_path": "/repo/app/src/main.rs" } },
+                    { "type": "tool_use", "name": "Write", "input": { "file_path": "/repo/app/src/lib.rs" } },
+                    // 작업 경로 안쪽은 자기 일이라 모으지 않고, `..`는 접어서 판정한다.
+                    { "type": "tool_use", "name": "MultiEdit", "input": { "file_path": "drafts/note.md" } },
+                    { "type": "tool_use", "name": "Write", "input": { "file_path": "../other/./x.rs" } },
+                    { "type": "tool_use", "name": "NotebookEdit", "input": { "notebook_path": "/repo/nb/a.ipynb" } },
+                    // 읽기만 한 경로와 셸 명령은 세지 않는다.
+                    { "type": "tool_use", "name": "Read", "input": { "file_path": "/repo/read/x.rs" } },
+                    { "type": "tool_use", "name": "Bash", "input": { "command": "sed -i s/a/b/ /repo/sh/y.rs" } },
+                    { "type": "tool_use", "name": "Edit", "input": { "file_path": "  " } }
+                ]
+            }
+        });
+        update_claude_scan(&mut scan, &record);
+        assert_eq!(
+            scan.written_dirs,
+            vec!["/repo/app/src", "/data/other", "/repo/nb"]
+        );
+
+        // 상한에 닿으면 더 모으지 않는다.
+        scan.written_dirs = (0..MAX_WRITTEN_DIRS_PER_SESSION)
+            .map(|index| format!("/d/{index}"))
+            .collect();
+        update_claude_scan(&mut scan, &record);
+        assert_eq!(scan.written_dirs.len(), MAX_WRITTEN_DIRS_PER_SESSION);
+    }
+
+    #[test]
+    fn claude_scan_maps_worktrees_inside_the_working_path_to_their_main_checkout() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("aia-workspace");
+        let main = root.path().join("repos/app");
+        let worktree = workspace.join("wt-feature");
+        let clone = workspace.join("scratch-clone");
+        fs::create_dir_all(main.join(".git/worktrees/wt-feature")).expect("main git");
+        fs::create_dir_all(main.join("docs")).expect("main docs");
+        fs::create_dir_all(worktree.join("src/ui")).expect("worktree");
+        fs::create_dir_all(clone.join(".git")).expect("clone git");
+        fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                main.join(".git/worktrees/wt-feature").display()
+            ),
+        )
+        .expect("worktree marker");
+        let text = |path: &Path| path.to_string_lossy().into_owned();
+        let edit = |path: PathBuf| json!({ "type": "tool_use", "name": "Edit", "input": { "file_path": path } });
+        let mut scan = ClaudeScanState::default();
+        // 세션은 작업공간에서 시작했고, 셸은 그 뒤 워크트리로 `cd`했다. 경계는 시작 경로다.
+        update_claude_scan(
+            &mut scan,
+            &json!({ "type": "user", "cwd": text(&workspace), "message": { "content": "시작" } }),
+        );
+        let in_worktree = json!({
+            "type": "assistant",
+            "cwd": text(&worktree),
+            "message": {
+                "model": "claude-opus-5-5",
+                "content": [
+                    edit(worktree.join("src/ui/view.tsx")),
+                    { "type": "tool_use", "name": "Write", "input": { "file_path": "README.md" } },
+                    // 작업공간 안의 일반 저장소와 그냥 폴더는 자기 일로 남는다.
+                    edit(clone.join("x.rs")),
+                    edit(workspace.join("notes/a.md")),
+                ]
+            }
+        });
+        update_claude_scan(&mut scan, &in_worktree);
+        // 본 체크아웃으로 `cd`해 고친 수정도 다른 프로젝트 작업으로 남는다.
+        let in_main = json!({
+            "type": "assistant",
+            "cwd": text(&main),
+            "message": { "model": "claude-opus-5-5", "content": [edit(main.join("docs/a.md"))] }
+        });
+        update_claude_scan(&mut scan, &in_main);
+        assert_eq!(
+            scan.written_dirs,
+            vec![
+                text(&main.join("src/ui")),
+                text(&main),
+                text(&main.join("docs"))
+            ]
+        );
+
+        // 세션 작업 경로가 워크트리 자신이어도 본 체크아웃으로 옮긴다.
+        let mut scan = ClaudeScanState::default();
+        let record = json!({
+            "type": "assistant",
+            "cwd": text(&worktree),
+            "message": { "model": "claude-opus-5-5", "content": [edit(worktree.join("src/ui/view.tsx"))] }
+        });
+        update_claude_scan(&mut scan, &record);
+        assert_eq!(scan.written_dirs, vec![text(&main.join("src/ui"))]);
+    }
+
+    #[test]
     fn codex_transcript_keeps_messages_that_only_carry_an_image() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("rollout.jsonl");
@@ -7772,6 +8487,49 @@ mod tests {
         let read = read_transcript_image(&path, image.source_offset, &image.source_pointer)
             .expect("image bytes");
         assert_eq!(read.bytes, b"webp bytes");
+    }
+
+    #[test]
+    fn codex_transcript_shows_completed_file_changes_as_file_change_cards() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("rollout.jsonl");
+        let changes = json!({
+            "/w/a.rs": {"type": "update", "unified_diff": "@@ -1 +1 @@\n-a\n+b\n", "move_path": null},
+        });
+        write_json_lines(
+            &path,
+            &[
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-10-13T07:41:40Z",
+                    "payload": {"type": "item_completed", "item": {"type": "FileChange", "id": "x", "changes": changes}},
+                }),
+                // 다른 끝난 항목과 빈 변경은 항목이 아니다.
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-10-13T07:41:41Z",
+                    "payload": {"type": "item_completed", "item": {"type": "AgentMessage", "id": "y"}},
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-10-13T07:41:42Z",
+                    "payload": {"type": "item_completed", "item": {"type": "FileChange", "id": "z", "changes": {}}},
+                }),
+            ],
+        );
+
+        let parsed = parse_codex_transcript(&path, None, None).expect("transcript");
+        assert_eq!(parsed.items.len(), 1, "{:?}", parsed.items);
+        let item = &parsed.items[0];
+        assert_eq!(item.role, "assistant");
+        let Some(ContentBlock::ToolUse { name, input_json }) = item.blocks.first() else {
+            panic!("파일 변경 블록이 없습니다: {:?}", item.blocks);
+        };
+        assert_eq!(name, "파일 변경");
+        assert_eq!(
+            serde_json::from_str::<Value>(input_json).expect("json"),
+            changes
+        );
     }
 
     #[test]
@@ -8651,6 +9409,7 @@ mod tests {
                 folder_ids: Some(vec![folder.id.clone()]),
                 pinned_account_id: None,
                 bookmarks: None,
+                linked_project_paths: None,
             },
         )
         .expect("metadata update");

@@ -352,6 +352,22 @@ fn load_common_packs(
             continue;
         };
 
+        // 번들 팩을 같은 packId 로 덮는 것은 의도된 재정의지만, 앞선 공통 스킬이 이미 낸
+        // packId 를 뒤 스킬이 다시 내면 앞 스킬이 아무 알림 없이 사라진다. 온보딩 팩
+        // (`aia_onboarding.rs`)과 같이 먼저 온 것을 두고 뒤의 것을 사유와 함께 건너뛴다
+        // (W5 팩에 W6-6 의 "조용히 사라지지 않는다"를 같은 모양으로 적용).
+        if effective
+            .get(&pack.pack_id)
+            .is_some_and(|existing| existing.skill_key.is_some())
+        {
+            issues.push(AiaSuggestionCatalogIssue {
+                skill_key: key,
+                message: format!("이미 있는 팩 id입니다: {}", pack.pack_id),
+                using_last_known_good: false,
+            });
+            continue;
+        }
+
         if source == AiaSuggestionPackSource::CommonSkill {
             cache_pack(home, &key, &pack);
         }
@@ -960,6 +976,41 @@ mod tests {
             .definitions
             .iter()
             .any(|entry| entry.definition.id == "extra-tip"));
+    }
+
+    /// W5·W6-6 원칙: 두 공통 스킬이 같은 packId 를 내면 앞 스킬이 조용히 사라지지 않아야 한다.
+    #[test]
+    fn duplicate_common_pack_id_keeps_first_and_reports_issue() {
+        let temp = TempDir::new().expect("temp");
+        write_pack(
+            temp.path(),
+            "a-first",
+            &pack_json("shared-pack", "first-tip", "앞 제목"),
+        );
+        write_pack(
+            temp.path(),
+            "b-second",
+            &pack_json("shared-pack", "second-tip", "뒤 제목"),
+        );
+
+        let catalog = load_aia_suggestion_catalog_from_home(temp.path()).expect("catalog");
+        let shared = catalog
+            .packs
+            .iter()
+            .find(|entry| entry.pack.pack_id == "shared-pack")
+            .expect("shared pack");
+        assert_eq!(shared.skill_key.as_deref(), Some("a-first"));
+        assert!(catalog
+            .definitions
+            .iter()
+            .any(|entry| entry.definition.id == "first-tip"));
+        assert!(catalog
+            .definitions
+            .iter()
+            .all(|entry| entry.definition.id != "second-tip"));
+        assert_eq!(catalog.issues.len(), 1);
+        assert_eq!(catalog.issues[0].skill_key, "b-second");
+        assert!(!catalog.issues[0].using_last_known_good);
     }
 
     #[test]

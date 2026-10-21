@@ -14,7 +14,7 @@
  * `ipc.ts`가 이 파일의 이름을 그대로 다시 내보내므로 화면 쪽 import 경로는 예전 그대로
  * `lib/ipc`다.
  */
-import type { DocFile, DocRootStatus, DocumentAutomationSnapshot, DocumentEntryPage, DocumentFile, DocumentTrigger, DocumentTriggerInput, DocumentTriggerRun, LinkedFile } from "../types";
+import type { DocFile, DocRootStatus, DocumentAutomationSnapshot, DocumentEntryPage, DocumentFile, DocumentTrigger, DocumentTriggerInput, DocumentTriggerRun, LinkedFile, UpdateDocRootInput } from "../types";
 import { call } from "./ipcTransport";
 
 export function getDocRoots(): Promise<DocRootStatus[]> {
@@ -28,6 +28,15 @@ export function getDocRoots(): Promise<DocRootStatus[]> {
  */
 export function createDocRoot(name: string, path: string, createIfMissing = false): Promise<DocRootStatus> {
   return call<DocRootStatus>("create_doc_root", { request: { name, path, createIfMissing } });
+}
+
+export function updateDocRoot(request: UpdateDocRootInput): Promise<DocRootStatus> {
+  return call<DocRootStatus>("update_doc_root", {
+    request: {
+      ...request,
+      createIfMissing: request.createIfMissing ?? false,
+    },
+  });
 }
 
 export function deleteDocRoot(id: string): Promise<void> {

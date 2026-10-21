@@ -139,8 +139,13 @@ pub(crate) struct KeyBlockFilter {
 
 impl KeyBlockFilter {
     pub(crate) fn filter_line(&mut self, line: &str) -> Option<String> {
-        if line.contains("-----BEGIN") {
-            self.skipping = true;
+        if let Some(begin) = line.rfind("-----BEGIN") {
+            // 줄바꿈을 지운 키(`tr -d '\n'`, JSON 문자열 속 `\n`)는 BEGIN과 END가 한 줄에
+            // 온다. 그 줄에서 블록이 끝났는데 건너뛰기를 켜 두면 뒤따르는 출력이 다음
+            // END가 올 때까지 — 대개 끝까지 — 통째로 사라진다. 마지막 BEGIN 뒤를 보는 것은
+            // 한 줄 키 뒤에 새 블록이 열린 줄(`… -----END A----- -----BEGIN B-----`)에서
+            // 다음 줄부터의 B 본문을 계속 막기 위해서다.
+            self.skipping = !line[begin..].contains("-----END");
             return Some("[생략된 키 블록]".to_owned());
         }
         if self.skipping {
@@ -255,6 +260,20 @@ mod tests {
         assert!(body.contains("[생략된 키 블록]"));
         assert!(body.contains("token=AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKK"));
         assert_eq!(strip_key_blocks("a\nb\n"), "a\nb\n");
+
+        // 한 줄에 BEGIN과 END가 함께 온 키도 지우되, 그 뒤 출력은 그대로 남는다.
+        let one_line = "{\"key\":\"-----BEGIN OPENSSH PRIVATE KEY-----\\nb3BlbnNzaC1rZXktdjEAAAAA\\n-----END OPENSSH PRIVATE KEY-----\"}\nafter\n";
+        let body = strip_key_blocks(one_line);
+        assert!(!body.contains("b3BlbnNzaC1rZXktdjEAAAAA"));
+        assert_eq!(body, "[생략된 키 블록]\nafter\n");
+        let mut filter = KeyBlockFilter::default();
+        assert!(filter
+            .filter_line("x -----BEGIN K----- y -----END K-----")
+            .is_some());
+        assert_eq!(filter.filter_line("next").as_deref(), Some("next"));
+        // 한 줄 키 뒤에 열린 새 블록의 본문은 다음 줄에서도 막는다.
+        let chained = "-----BEGIN A----- xxx -----END A----- -----BEGIN B-----\nSECRETB\n-----END B-----\nafter\n";
+        assert_eq!(strip_key_blocks(chained), "[생략된 키 블록]\nafter\n");
 
         // 없는 파일과 없는 도구를 구분한다. 구분하지 않으면 없는 파일이 "도구 없음"으로
         // 보고돼 사용자가 원격에 도구를 깔러 간다.

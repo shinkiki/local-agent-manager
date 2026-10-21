@@ -11,7 +11,8 @@
  * 용도·출처·남은 시간만 그리고, 입력칸의 값은 저장을 누른 즉시 비운다. 실패했을 때도
  * 값을 남겨 두지 않는다. 다시 붙여 넣는 손품이 값을 화면 상태에 오래 남기는 것보다 싸다.
  */
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { createLatestGate } from "../lib/latestRequest";
 import { ChevronDown, KeyRound, Trash2 } from "lucide-react";
 import { listChatSecrets, removeChatSecret, setChatSecret } from "../lib/ipc";
 import {
@@ -77,27 +78,38 @@ export function ChatSecretsPanel({ chatId, disabled = false, refreshSignal = 0 }
   const [value, setValue] = useState("");
   // 남은 시간은 분 단위라 매초 새로 그릴 이유가 없다. 패널이 열려 있는 동안만 분마다 되센다.
   const [now, setNow] = useState(() => Date.now());
+  // 채팅을 옮긴 뒤 앞 채팅의 조회·저장·삭제 응답이 늦게 오면 그 채팅의 이름들이 새 채팅
+  // 줄에 떠, 지우기를 누르면 새 채팅에 없는 이름을 지우려다 실패한다. 조회는 마지막에 시작한
+  // 것만 반영한다(채팅을 옮기는 것도 새 시작이다). 저장·삭제는 채팅이 그대로면 늘 반영한다 —
+  // 그 사이 끼어든 조회 때문에 사용자가 누른 동작의 실패가 사라지면 안 된다.
+  const [listGate] = useState(createLatestGate);
+  const chatIdRef = useRef(chatId);
+  chatIdRef.current = chatId;
 
   const refresh = useCallback(async (id: string) => {
+    const isCurrent = listGate.begin();
     try {
       const snapshot = await listChatSecrets(id);
+      if (!isCurrent()) return;
       setSecrets(snapshot.secrets);
       setError(null);
     } catch (cause) {
+      if (!isCurrent()) return;
       setError(errorMessage(cause, text("비밀값 목록을 불러오지 못했습니다.", "Could not load the secrets.")));
     }
-  }, [text]);
+  }, [listGate, text]);
 
   // 채팅이 바뀌면 이전 대화의 목록을 남기지 않는다. 닫힌 상태에서도 버튼의 개수는 맞아야
   // 하므로 한 번은 읽는다.
   useEffect(() => {
+    listGate.begin();
     setSecrets([]);
     setError(null);
     setName("");
     setPurpose("");
     setValue("");
     if (chatId) void refresh(chatId);
-  }, [chatId, refresh]);
+  }, [chatId, listGate, refresh]);
 
   // 승인 카드가 값을 맡긴 직후. 닫혀 있어도 읽어야 줄이 나타난다.
   useEffect(() => {
@@ -136,15 +148,17 @@ export function ChatSecretsPanel({ chatId, disabled = false, refreshSignal = 0 }
     const payload = { chatId, name: normalized, purpose: purpose.trim(), value };
     setValue("");
     setBusy(true);
+    const isCurrent = () => chatIdRef.current === chatId;
     try {
       const snapshot = await setChatSecret(payload);
+      if (!isCurrent()) return;
       setSecrets(snapshot.secrets);
       setError(null);
       setName("");
       setPurpose("");
       await refresh(chatId);
     } catch (cause) {
-      setError(errorMessage(cause, text("비밀값을 저장하지 못했습니다.", "Could not save the secret.")));
+      if (isCurrent()) setError(errorMessage(cause, text("비밀값을 저장하지 못했습니다.", "Could not save the secret.")));
     } finally {
       setBusy(false);
     }
@@ -153,13 +167,15 @@ export function ChatSecretsPanel({ chatId, disabled = false, refreshSignal = 0 }
   const remove = async (secretName: string) => {
     if (!chatId || busy) return;
     setBusy(true);
+    const isCurrent = () => chatIdRef.current === chatId;
     try {
       const snapshot = await removeChatSecret({ chatId, name: secretName });
+      if (!isCurrent()) return;
       setSecrets(snapshot.secrets);
       setError(null);
       await refresh(chatId);
     } catch (cause) {
-      setError(errorMessage(cause, text("비밀값을 삭제하지 못했습니다.", "Could not remove the secret.")));
+      if (isCurrent()) setError(errorMessage(cause, text("비밀값을 삭제하지 못했습니다.", "Could not remove the secret.")));
     } finally {
       setBusy(false);
     }

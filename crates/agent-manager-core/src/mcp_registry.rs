@@ -34,6 +34,10 @@ const MAX_EXPOSED_RESULT_BYTES: usize = 256 * 1024;
 const MAX_AUDIT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_INTERFACES: usize = 32;
 const MAX_ENABLED_TOOLS: usize = 64;
+/// 서버가 내놓는 도구 카탈로그 전체의 상한. E7의 64개는 **켜 둔** 도구 수이고(`enabledTools`),
+/// 카탈로그는 그보다 클 수 있다 — 호스팅 노션 MCP가 64개를 넘기자 연결 확인이 통째로
+/// 막혔다(2026-10-18). 응답 본문은 `MAX_REMOTE_BODY_BYTES`가 따로 묶는다.
+const MAX_CATALOG_TOOLS: usize = 512;
 const MAX_RECENT_AUDIT: usize = 50;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -218,7 +222,8 @@ impl McpInterfaceRegistry {
                     "localScheme": "http 또는 https",
                     "authentication": "1차에서는 URL에 인증정보가 없는 MCP만 지원",
                     "maxInterfaces": MAX_INTERFACES,
-                    "maxEnabledToolsPerInterface": MAX_ENABLED_TOOLS
+                    "maxEnabledToolsPerInterface": MAX_ENABLED_TOOLS,
+                    "maxCatalogToolsPerInterface": MAX_CATALOG_TOOLS
                 }
             }))
         })
@@ -708,7 +713,7 @@ pub(crate) fn parse_tools(result: &Value) -> Result<Vec<McpRemoteTool>, CoreErro
         .is_some_and(|cursor| !cursor.is_empty())
     {
         return Err(CoreError::Conflict(format!(
-            "1차 동적 MCP는 최대 {MAX_ENABLED_TOOLS}개의 비페이지 도구 카탈로그만 지원합니다"
+            "1차 동적 MCP는 최대 {MAX_CATALOG_TOOLS}개의 비페이지 도구 카탈로그만 지원합니다"
         )));
     }
     let raw_tools = result
@@ -717,8 +722,11 @@ pub(crate) fn parse_tools(result: &Value) -> Result<Vec<McpRemoteTool>, CoreErro
         .ok_or_else(|| {
             CoreError::Runtime("MCP tools/list 응답에 tools 배열이 없습니다".to_owned())
         })?;
-    if raw_tools.len() > MAX_ENABLED_TOOLS {
-        return Err(CoreError::TooLarge(MAX_ENABLED_TOOLS as u64));
+    if raw_tools.len() > MAX_CATALOG_TOOLS {
+        return Err(CoreError::Conflict(format!(
+            "MCP 서버가 도구 {}개를 반환했습니다. 최대 {MAX_CATALOG_TOOLS}개까지 지원합니다",
+            raw_tools.len()
+        )));
     }
     let mut tools = Vec::with_capacity(raw_tools.len());
     let mut names = BTreeSet::new();
@@ -813,7 +821,7 @@ fn parse_http_response(response: Response) -> Result<Option<Value>, CoreError> {
     if body.is_empty() {
         return Ok(None);
     }
-    if content_type.starts_with("text/event-stream") {
+    if is_event_stream(&content_type) {
         let text = std::str::from_utf8(&body)
             .map_err(|_| CoreError::Runtime("MCP SSE 응답이 UTF-8이 아닙니다".to_owned()))?;
         return parse_sse_json(text).map(Some);
@@ -821,6 +829,16 @@ fn parse_http_response(response: Response) -> Result<Option<Value>, CoreError> {
     serde_json::from_slice(&body)
         .map(Some)
         .map_err(CoreError::Json)
+}
+
+/// 응답이 SSE 인지. 미디어 타입은 대소문자를 가리지 않고(RFC 9110 8.3.1) `;` 뒤 매개변수는
+/// 판정에 쓰지 않는다. `starts_with` 로 보면 `Text/Event-Stream` 은 JSON 으로 읽혀 실패하고
+/// `text/event-streamx` 같은 다른 타입이 SSE 로 읽힌다.
+fn is_event_stream(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 fn parse_sse_json(text: &str) -> Result<Value, CoreError> {
@@ -993,6 +1011,16 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn event_stream_media_type_ignores_case_and_parameters() {
+        assert!(is_event_stream("text/event-stream"));
+        assert!(is_event_stream("Text/Event-Stream; charset=utf-8"));
+        assert!(is_event_stream(" text/event-stream ;charset=UTF-8"));
+        assert!(!is_event_stream("application/json"));
+        assert!(!is_event_stream("text/event-streamx"));
+        assert!(!is_event_stream(""));
+    }
+
     fn sample_tools() -> Vec<McpRemoteTool> {
         vec![McpRemoteTool {
             name: "search".to_owned(),
@@ -1036,6 +1064,21 @@ mod tests {
         .unwrap();
         assert_eq!(event["id"], 1);
         assert!(parse_tools(&json!({"tools": [], "nextCursor": "more"})).is_err());
+
+        // E7의 64개는 켜 둔 도구 수다. 그보다 큰 카탈로그도 읽혀야 한다.
+        let catalog = |count: usize| {
+            json!({"tools": (0..count)
+                .map(|index| json!({"name": format!("tool_{index}")}))
+                .collect::<Vec<_>>()})
+        };
+        assert_eq!(
+            parse_tools(&catalog(MAX_ENABLED_TOOLS + 10)).unwrap().len(),
+            MAX_ENABLED_TOOLS + 10
+        );
+        assert!(matches!(
+            parse_tools(&catalog(MAX_CATALOG_TOOLS + 1)),
+            Err(CoreError::Conflict(_))
+        ));
 
         let bounded = bounded_remote_result(json!({
             "content": [{"type": "text", "text": "x".repeat(MAX_EXPOSED_RESULT_BYTES)}],

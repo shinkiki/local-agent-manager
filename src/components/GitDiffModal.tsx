@@ -1,8 +1,10 @@
 import { ExternalLink, Maximize2, Minimize2 } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useI18n } from "../lib/i18n";
 import type { UiText } from "../lib/i18nLocale";
+import { getProjectGitDiff } from "../lib/ipc";
 import { openPopoutWindow } from "../lib/popoutWindow";
+import { displayPath } from "../lib/displayPath";
 import type { GitDiff } from "../types";
 import { ErrorBanner, LoadingState, Modal } from "./Shared";
 import { UnifiedDiffView } from "./UnifiedDiffView";
@@ -17,6 +19,8 @@ export interface GitDiffTarget {
   /** B9. 비교 요약에서 연 파일은 커밋 하나가 아니라 `<from>...<to>` 범위다. */
   rangeFrom?: string | null;
   rangeTo?: string | null;
+  /** 워크트리 목록에서 연 파일. 그 워크트리의 작업 트리·인덱스다. */
+  worktreePath?: string | null;
 }
 
 /** 대상이 무엇과 무엇을 견주는지 한 줄. 모달 제목과 새 창 제목이 같은 말을 쓴다. */
@@ -24,7 +28,8 @@ export function gitDiffTargetLabel(target: GitDiffTarget, text: UiText): string 
   // 범위를 커밋 제목으로 적으면 어느 범위를 보고 있는지 사라진다 — 요약이 집은 범위를 그대로 쓴다.
   if (target.rangeFrom && target.rangeTo) return `${target.rangeFrom}...${target.rangeTo}`;
   if (target.commit) return `${text("커밋", "Commit")} ${target.commit.slice(0, 7)}`;
-  return target.staged ? text("스테이지됨", "Staged") : text("작업 트리", "Working tree");
+  const side = target.staged ? text("스테이지됨", "Staged") : text("작업 트리", "Working tree");
+  return target.worktreePath ? `${text("연결된 워크트리", "Linked worktree")} ${displayPath(target.worktreePath)} · ${side}` : side;
 }
 
 /** diff 본문. 종류별 안내와 잘림 표시는 모달과 별도 창이 같아야 한다. */
@@ -61,9 +66,34 @@ export function GitDiffModal({ target, diff, error, loading, onClose }: {
 }) {
   const { text } = useI18n();
   const [full, setFull] = useState(false);
+  const [fullDiff, setFullDiff] = useState<GitDiff | null>(null);
+  const [fullError, setFullError] = useState<string | null>(null);
+  const [fullLoading, setFullLoading] = useState(false);
   const label = gitDiffTargetLabel(target, text);
+  useEffect(() => {
+    if (!full) return;
+    let live = true;
+    setFullDiff(null);
+    setFullError(null);
+    setFullLoading(true);
+    getProjectGitDiff({
+      ...target,
+      worktreePath: target.worktreePath ?? null,
+      rangeFrom: target.rangeFrom ?? null,
+      rangeTo: target.rangeTo ?? null,
+      fullContext: true,
+    })
+      .then((next) => { if (live) setFullDiff(next); })
+      .catch((cause: unknown) => { if (live) setFullError(cause instanceof Error ? cause.message : String(cause)); })
+      .finally(() => { if (live) setFullLoading(false); });
+    return () => { live = false; };
+  }, [full, target.projectPath, target.worktreePath, target.path, target.originalPath, target.staged, target.commit, target.rangeFrom, target.rangeTo]);
   let body: ReactNode;
-  if (error) body = <ErrorBanner message={error} />;
+  if (full) {
+    if (fullError) body = <ErrorBanner message={fullError} />;
+    else if (fullDiff === null || fullLoading) body = <LoadingState label={text("파일 전체 내용과 변경 내용을 읽고 있습니다", "Reading the full file and its changes")} />;
+    else body = <GitDiffBody diff={fullDiff} />;
+  } else if (error) body = <ErrorBanner message={error} />;
   else if (diff === null || (loading && diff.path !== target.path)) body = <LoadingState label={text("차이를 읽고 있습니다", "Reading the diff")} />;
   else body = <GitDiffBody diff={diff} />;
   const openWindow = () => {

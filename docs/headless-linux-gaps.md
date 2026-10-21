@@ -67,7 +67,7 @@ tailnet HTTPS(`TAILSCALE_HOST`, protocolVersion 12, `channel: remote`,
 | H08 | P1 | 개선 | git 자격증명 | 컨테이너에 credential helper도 SSH 키도 없어 HTTPS·SSH 원격 모두 인증 실패한다 | `AGENTS.md` C16-3(빈 `GIT_ASKPASS`), 이미지에 helper 없음 | **축소안(사용자 2026-10-11):** SSH 애드온 키에 "git 원격용" 표시를 두고 **프로젝트 git(화면·API의 fetch·pull·push)에만** `GIT_SSH_COMMAND`로 주입한다. 에이전트 자식 프로세스에는 넣지 않는다(C9·C16-2 경계 유지). 키는 파일에 복사되지 않고 경로만 넘기며, 원격 응답에서 경로는 가린다 | 완료(G01 2026-10-11) |
 | H09 | P2 | 개선 | 백엔드 설정 | 원격 편집 토글이 호스트 전용이라 헤드리스에서는 `.env`를 고치고 재기동해야만 바뀌었다 | C20이 `remoteWrite` 토글 자체를 없앰 | 토글이 사라져 해당 없음. 원격 권한은 채널 로그인(C20)이 결정한다 | 해당없음 |
 | H10 | P2 | 문서화 | 백엔드 설정 | Tailscale 서비스 켜기·끄기 UI가 "앱을 재시작합니다" 흐름인데 헤드리스는 사이드카가 담당해 해당 없다 | `SettingsView.tsx:3300-3312` | 헤드리스 표시가 있으면 Tailscale 서비스 카드를 "사이드카가 담당" 읽기 전용 안내로 바꾼다 | 완료(G03 2026-10-10) |
-| H11 | P2 | 문서화 | CLI 연결 | CLI 설정 터미널이 호스트 전용이고, 컨테이너 CLI는 이미지 빌드 시점에 고정된다 | `src/lib/terminal.ts:45`, `cli_updates.rs:90` 업데이트 안내가 brew·npm 기준 | 헤드리스에서는 CLI 업데이트 버튼·안내 대신 "이미지 재빌드로 갱신" 문구를 보인다 | 완료(G05 2026-10-10) |
+| H11 | P2 | 개선 | CLI 연결 | 컨테이너 CLI가 root 소유 이미지 레이어(`/usr/local`)에 고정돼 앱의 업데이트 버튼이 막혀 있었다. 예전 수용 기준("이미지 재빌드로 갱신" 안내, G05 2026-10-10 완료)을 2026-10-16 사람 결정으로 뒤집었다 | `deploy/synology/Dockerfile` 씨앗 prefix, `entrypoint.sh` 씨앗 심기, `cli_updates.rs` `read_only_install_reason`, `src/lib/cliUpdate.ts` | 이미지는 CLI를 씨앗(`/opt/agent-manager/cli-seed`)으로만 담고 엔트리포인트가 HOME 볼륨 `~/.local`에 없는 것만 심는다. 헤드리스에서도 업데이트 버튼이 켜져 Claude·Codex는 `npm install -g`(prefix `~/.local`), `agy`는 `agy update`로 올라가고 `down`/`up -d` 뒤에도 유지된다. `AGENT_MANAGER_RESEED_CLI=1`이면 씨앗으로 되돌린다. 쓸 수 없는 설치본(옛 이미지)은 백엔드가 재생성 사유로 버튼을 끈다. 씨앗 갈래는 `deploy/synology/test-cli-seed.sh`가 고정한다 | 보류(NAS 재배포 실측 대기 — 아래 재배포 실측 목록 H11) |
 | H12 | P3 | 검증 | 자원 저장소 | 자원 저장소 경로 변경이 호스트 전용이다. 컨테이너 `/data` 고정이면 문제없는지 확인 | `remote.rs` host-only `set_resource_repository`, `resource_repository.rs:57` Linux 분기 | NAS에서 스킬 게시·동기화가 `/data` 경로로 동작하는 것을 실측 보고 | 완료(G05 2026-10-10) |
 | L01 | P1 | 검증 | 계정 로그인 | Claude 로그인(코드 붙여넣기)·Codex(기기 코드)가 컨테이너 pty + 키링 조합에서 끝나는지 미검증 | `accounts.rs:1758` `begin_login`, `TerminalPanel.tsx:179-205`, `deploy/synology/README.md` 미검증 절 | NAS 원격 화면에서 Claude 계정 추가가 "로그인 완료 저장"까지 가고 채팅 1턴이 돈다. 결과(성공·실패 지점)를 보고에 남긴다 | 완료(사람 2026-10-10: 원격 로그인·저장 성공, 채팅은 L13 때문에 실패했다가 IS_SANDBOX=1로 통과) |
 | L02 | P2 | 검증 | 자격증명 볼트 | Secret Service 백엔드에 항목 한도가 없고(`None`) 암호 env로 자동 해제된다. 재기동·암호 변경 시 동작 미확인 | `os_keychain.rs:645`, `entrypoint.sh` | 재기동 후 기존 계정이 그대로 보이고, 암호를 바꾸면 명확한 오류로 끝난다(조용히 빈 목록이 아니다) | 완료(G02 2026-10-11) |
@@ -97,6 +97,7 @@ tailnet HTTPS(`TAILSCALE_HOST`, protocolVersion 12, `channel: remote`,
 | ID | 할 일 | 상태 |
 | --- | --- | --- |
 | L10 | `.env`에 `TS_USERSPACE=true`를 넣고 스택을 재생성한 뒤 serve·`Tailscale-User-Login` 헤더·`/api/access`가 그대로 동작하는지 실측 | 완료(2026-10-11, 전부 정상) |
+| H11 | 새 이미지로 재생성 → 기동 로그에 세 CLI `씨앗 심음` 줄 → CLI 화면 경로가 `/home/agent/.local/...`이고 업데이트 버튼이 켜짐 → Claude·Codex·`agy` 업데이트 성공(`agy update`가 `~/.local/bin/agy`를 제자리에서 바꾸는지 포함) → `down`/`up -d` 뒤 버전 유지 → `AGENT_MANAGER_RESEED_CLI=1` 기동으로 씨앗 복귀 → `/usr/local/bin`에 CLI 없음 → 계정 화면 사용량 조회 정상. 끝나면 위 표 H11을 `완료(사람 YYYY-MM-DD)`로 | 대기 |
 
 ## 회차가 지키는 것
 

@@ -13,9 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::app_data_file::write_private_json;
 use crate::domain::ProviderId;
+use crate::store_lock;
 use crate::CoreError;
 
 const META_FILE: &str = "skill-meta.json";
+const META_LOCK_FILE: &str = "skill-meta.lock";
 const META_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +71,8 @@ fn update_skill_meta<F>(app_data_dir: &Path, mutate: F) -> Result<(), CoreError>
 where
     F: FnOnce(&mut SkillMetaStore) -> bool,
 {
+    // G7: atomic replace만으로는 동시 갱신의 유실을 막지 못하므로 읽기부터 저장까지 잠근다.
+    let _lock = store_lock::acquire(app_data_dir, META_LOCK_FILE, "스킬 메타 저장소")?;
     let mut store = load_skill_meta(app_data_dir);
     if mutate(&mut store) {
         save_skill_meta(app_data_dir, &store)?;
@@ -113,6 +117,60 @@ pub(crate) fn remove_skill_meta(app_data_dir: &Path, key: &str) -> Result<(), Co
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn g7_concurrent_origin_and_auto_sync_updates_preserve_every_entry() {
+        const WORKERS: usize = 8;
+        const BATCHES: usize = 2;
+        let temp = tempdir().expect("tempdir");
+        let app_data_dir = temp.path();
+        let barrier = std::sync::Barrier::new(WORKERS);
+
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for worker in 0..WORKERS {
+                let barrier = &barrier;
+                workers.push(scope.spawn(move || {
+                    let mut results = Vec::new();
+                    for batch in 0..BATCHES {
+                        let key = format!("skill-{batch}-{worker}");
+                        barrier.wait();
+                        results.push(record_skill_origin(
+                            app_data_dir,
+                            &key,
+                            SkillOriginMeta {
+                                provider: ProviderId::Claude,
+                                scope: "personal".into(),
+                                project_path: None,
+                                archived_at_ms: Some(worker as i64),
+                            },
+                        ));
+                        barrier.wait();
+                        results.push(set_skill_auto_sync(app_data_dir, &key, true));
+                    }
+                    results
+                }));
+            }
+            for worker in workers {
+                for result in worker.join().expect("worker must finish") {
+                    result.expect("concurrent update must succeed");
+                }
+            }
+        });
+
+        let store = load_skill_meta(app_data_dir);
+        assert_eq!(store.skills.len(), WORKERS * BATCHES);
+        for batch in 0..BATCHES {
+            for worker in 0..WORKERS {
+                let key = format!("skill-{batch}-{worker}");
+                let entry = store.skills.get(&key).expect("concurrent entry preserved");
+                assert!(entry.auto_sync, "auto sync lost for {key}");
+                let origin = entry.origin.as_ref().expect("concurrent origin preserved");
+                assert_eq!(origin.provider, ProviderId::Claude);
+                assert_eq!(origin.archived_at_ms, Some(worker as i64));
+            }
+        }
+    }
 
     #[test]
     fn test_record_origin_and_set_auto_sync_and_remove() {

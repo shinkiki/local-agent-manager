@@ -25,7 +25,7 @@ test("the same commit yields the same item id however it was written down", () =
 });
 
 test("something that is not a commit hash is refused rather than given an id", () => {
-  for (const bad of ["", "   ", "abc123", "origin/dev-history", "539927cz1f2e", null, undefined]) {
+  for (const bad of ["", "   ", "abc123", "origin/develop", "539927cz1f2e", null, undefined]) {
     assert.throws(() => commitItemId(bad), /커밋 해시/, JSON.stringify(bad));
   }
 });

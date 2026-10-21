@@ -532,8 +532,9 @@ function recentRoundTally(runs: ScheduleRun[] | undefined): { worked: number; re
   for (const run of runs ?? []) {
     if (!run.round) continue;
     tally ??= { worked: 0, rested: 0, launched: 0 };
+    // 백엔드가 u32로 세므로(scheduler.rs ScheduleRunRound) 0 아니면 양수다 — 두 갈래면 충분하다.
     if (run.round.launchedRuns > 0) tally.worked += 1;
-    else if (run.round.launchedRuns === 0) tally.rested += 1;
+    else tally.rested += 1;
     tally.launched += run.round.launchedRuns;
   }
   return tally;

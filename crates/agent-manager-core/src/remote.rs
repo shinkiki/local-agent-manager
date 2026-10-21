@@ -22,30 +22,31 @@ use crate::tailscale_cli::{
     serve_target, validate_tailscale_host, TailscaleIdentity,
 };
 use crate::{
-    add_doc_root, create_session_folder, delete_session_folder, inspect_local_environment,
-    list_doc_roots, list_doc_tree, list_document_entries, list_session_folders, load_agent_detail,
-    load_aia_suggestion_catalog, load_artifact_detail, load_common_skill_detail,
-    load_common_skill_digests, load_session_detail_with_limit, load_session_summary,
-    load_session_transcript_before, load_session_transcript_image, load_skill_library_for_projects,
-    load_storage_overview, migrate_legacy_macos_credential_vault,
+    add_doc_root, create_session_folder, delete_session_folder, ensure_doc_root_agent_enabled,
+    inspect_local_environment, list_doc_roots, list_doc_tree, list_document_entries,
+    list_session_folders, load_agent_detail, load_aia_suggestion_catalog, load_artifact_detail,
+    load_common_skill_detail, load_common_skill_digests, load_session_detail_with_limit,
+    load_session_summary, load_session_transcript_before, load_session_transcript_image,
+    load_skill_library_for_projects, load_storage_overview, migrate_legacy_macos_credential_vault,
     prepare_account_management_storage, read_doc, read_doc_linked_file,
     read_doc_linked_file_download, read_document_file, read_document_file_download,
     remove_doc_root, reorder_session_folder, save_doc, search_document_entries, session_meta,
-    set_project_active, update_session_folder, update_session_meta, AccountSupervisor, AppError,
-    AppErrorKind, ChatApprovalDecision, ChatEvent, ChatInputFileDownload, ChatModelOption,
-    ChatProfile, ChatReasoningOption, ChatRejectionCode, ChatSettingField, ChatStartRequest,
-    ChatSupervisor, CoreError, DocumentActionContext, DocumentActionError, DocumentActionExecutor,
-    DocumentActionOption, DocumentActionReceipt, DocumentAutomationOptions,
-    DocumentAutomationSupervisor, DocumentChatAction, DocumentTriggerAction, FolderMoveDirection,
-    LinkedFileDownload, LoginAuth, LoginChannel, LoginMethod, LoginRequirement, ProviderId, Reauth,
-    ScheduleRunListRequest, ScheduleWorkflowAction, ScheduleWorkflowExecutor,
-    ScheduledRequestInput, ScheduledRequestListRequest, SchedulerHandle, SchedulerSupervisor,
-    SendChatMessageRequest, SessionCatalog, SessionListRequest, SessionMetaPatch,
-    SessionStatisticsRequest, SessionTranscriptLimit, SessionTranscriptPageRequest,
-    SkillPublishRequest, StartChatRequest, SystemAuditListRequest, SystemAutomationSettingsInput,
-    SystemLanguageRequest, TerminalAccountLoginRequest, TerminalEvent, TerminalOpenRequest,
-    TerminalSetupRequest, TerminalSshRequest, TerminalSupervisor, TranscriptImage, TranslationMenu,
-    TranslationSupervisor,
+    set_project_active, update_doc_root, update_session_folder, update_session_meta,
+    AccountSupervisor, AppError, AppErrorKind, ChatApprovalDecision, ChatEvent,
+    ChatInputFileDownload, ChatModelOption, ChatProfile, ChatReasoningOption, ChatRejectionCode,
+    ChatSettingField, ChatStartRequest, ChatSupervisor, CoreError, DocumentActionContext,
+    DocumentActionError, DocumentActionExecutor, DocumentActionOption, DocumentActionReceipt,
+    DocumentAutomationOptions, DocumentAutomationSupervisor, DocumentChatAction,
+    DocumentTriggerAction, FolderMoveDirection, LinkedFileDownload, LoginAuth, LoginChannel,
+    LoginMethod, LoginRequirement, ProviderId, Reauth, ScheduleRunListRequest,
+    ScheduleWorkflowAction, ScheduleWorkflowExecutor, ScheduledRequestInput,
+    ScheduledRequestListRequest, SchedulerHandle, SchedulerSupervisor, SendChatMessageRequest,
+    SessionCatalog, SessionListRequest, SessionMetaPatch, SessionStatisticsRequest,
+    SessionTranscriptLimit, SessionTranscriptPageRequest, SkillPublishRequest, StartChatRequest,
+    SystemAuditListRequest, SystemAutomationSettingsInput, SystemLanguageRequest,
+    TerminalAccountLoginRequest, TerminalEvent, TerminalOpenRequest, TerminalSetupRequest,
+    TerminalSshRequest, TerminalSupervisor, TranscriptImage, TranslationMenu,
+    TranslationSupervisor, UpdateDocRootRequest,
 };
 use bytes::Bytes;
 use flate2::write::GzEncoder;
@@ -84,7 +85,10 @@ pub const DEFAULT_REMOTE_ACCESS_PORT: u16 = crate::DEFAULT_BACKEND_SERVICE_PORT;
 /// 12: C20 접근 채널 로그인 — `/api/access`가 `channel`·`authenticated`·`loginRequired`를
 ///     싣고 `writable`을 버렸다. `/api/login`·`/api/logout`과 로그인 설정 명령이 추가됐다.
 /// 12: `/api/access`에 헤드리스 표시(`headless`)가 함께 실린다.
-pub const REMOTE_API_PROTOCOL_VERSION: u32 = 12;
+/// 13: C9 SSH 연결 서버가 키에서 독립했다 — `set_ssh_key_endpoint`가 `save_ssh_server`·
+///     `delete_ssh_server`로 바뀌고 확인·터미널·실행이 `serverId`로 서버를 고른다.
+/// 14: 등록 폴더 설정 변경 명령(`update_doc_root`)이 추가됐다.
+pub const REMOTE_API_PROTOCOL_VERSION: u32 = 14;
 const MIN_REMOTE_ACCESS_PORT: u16 = crate::MIN_BACKEND_SERVICE_PORT;
 /// 재시작 시 이전 백엔드가 저장소 잠금을 놓을 때까지 기다리는 최대 시간.
 const BACKEND_OWNERSHIP_HANDOVER_WAIT: Duration = Duration::from_secs(15);
@@ -2428,6 +2432,8 @@ impl StandaloneRuntime {
         chats
             .set_session_catalog(session_catalog.clone())
             .map_err(|error| error.to_string())?;
+        // 알림 저장소는 메모리라 재시작하면 회차 결정 알림이 사라진다. 보고에서 다시 만든다.
+        refresh_round_decision_attention(&app_data_dir, &chats);
         // 사용량 100% 도달·에이전트 제한 응답 트리거를 받아 자동전환이 켜진
         // 계정끼리 활성 계정을 순환시키는 백그라운드 실행기.
         crate::session_management::spawn_auto_switch_loop(
@@ -3690,7 +3696,7 @@ enum RemoteTerminalOpenRequest {
     Session(TerminalOpenRequest),
     AccountLogin(TerminalAccountLoginRequest),
     Setup(TerminalSetupRequest),
-    /// C9-19. `fingerprint`만 있는 본문. 다른 변형은 `source`나 `loginId`를 요구하므로
+    /// C9-19. `serverId`만 있는 본문. 다른 변형은 `source`나 `loginId`를 요구하므로
     /// 겹치지 않는다.
     Ssh(TerminalSshRequest),
 }
@@ -4102,6 +4108,7 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "delete_session_folder"
             | "create_directory"
             | "create_doc_root"
+            | "update_doc_root"
             | "delete_doc_root"
             | "create_doc"
             | "put_doc"
@@ -4181,7 +4188,9 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "generate_ssh_key"
             | "delete_ssh_key"
             | "set_ssh_key_note"
-            | "set_ssh_key_endpoint"
+            | "set_ssh_key_passphrase"
+            | "save_ssh_server"
+            | "delete_ssh_server"
             | "check_ssh_endpoint"
             | "execute_ssh_command"
             | "relay_ssh_command"
@@ -4291,6 +4300,9 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "pull_project_git"
             | "push_project_git"
             | "set_project_branch_follow"
+            // C16-11. 프로젝트 설정의 git 원격 인증 지정. 값이 아니라 이름만 바꾸지만, 고른 값이
+            // 다음 push의 자격증명이 되므로 저장된 비밀값 토글과 같은 게이트 아래 둔다.
+            | "set_project_git_remote_token"
             // C19-4. 세트 저장·삭제는 쓰기 게이트를 지나고 write mode에서 원격 가능하다.
             // 작업 트리가 아니라 앱 데이터의 장부를 바꾸고, 삭제는 지우지 않고 앱 소유
             // 휴지통으로 옮기므로 되돌릴 자리가 남는다. 호스트 전용 목록에는 overlay 명령이
@@ -5415,7 +5427,12 @@ fn dispatch_command(
         // C9-2~C9-5. ~/.ssh 직접 하위 새 키 생성만 허용하며 write/host gate를 거친다.
         "generate_ssh_key" => {
             let args: RequestEnvelope<crate::GenerateSshKeyRequest> = parse_params(params)?;
-            to_value(crate::generate_ssh_key(args.request)?)
+            to_value(crate::generate_ssh_key(app_data_dir, args.request)?)
+        }
+        // C9-21. 키 암호를 OS 보안 저장소에 저장하거나 지운다. 값은 응답에 실리지 않는다.
+        "set_ssh_key_passphrase" => {
+            let args: RequestEnvelope<crate::SetSshKeyPassphraseRequest> = parse_params(params)?;
+            to_value(crate::set_ssh_key_passphrase(app_data_dir, args.request)?)
         }
         // C9-7. 키 쌍을 ~/.ssh 안 휴지통으로 옮기는 호스트 전용 write다. 개인키 삭제는
         // 되돌리기 어려우므로 원격에는 열지 않는다.
@@ -5428,16 +5445,18 @@ fn dispatch_command(
             let args: RequestEnvelope<crate::SetSshKeyNoteRequest> = parse_params(params)?;
             to_value(crate::set_ssh_key_note(app_data_dir, args.request)?)
         }
-        // C9-9/C9-10. 저장 대상은 앱 데이터뿐이지만, 에이전트 사용을 켜는 순간 이 기기의
-        // 에이전트에게 서버 접속을 여는 결정이라 호스트 화면에서만 내린다.
-        "set_ssh_key_endpoint" => {
-            let args: RequestEnvelope<crate::SetSshKeyEndpointRequest> = parse_params(params)?;
-            to_value(crate::set_ssh_key_endpoint(app_data_dir, args.request)?)
+        // C9-9/C9-10. 연결 서버 저장·삭제. 저장 대상은 앱 데이터뿐이다.
+        "save_ssh_server" => {
+            let args: RequestEnvelope<crate::SaveSshServerRequest> = parse_params(params)?;
+            to_value(crate::save_ssh_server(app_data_dir, args.request)?)
         }
-        // C9-11. 저장된 지점으로 한 번 붙어 고정 명령 하나만 돌리는 확인이다. 개인키를
-        // 쓰는 바깥 연결이므로 호스트 전용으로 둔다.
+        "delete_ssh_server" => {
+            let args: RequestEnvelope<crate::SshServerRef> = parse_params(params)?;
+            to_value(crate::delete_ssh_server(app_data_dir, args.request)?)
+        }
+        // C9-11. 저장된 서버로 한 번 붙어 고정 명령 하나만 돌리는 확인이다.
         "check_ssh_endpoint" => {
-            let args: RequestEnvelope<crate::SshKeyRef> = parse_params(params)?;
+            let args: RequestEnvelope<crate::SshServerRef> = parse_params(params)?;
             to_value(crate::check_ssh_endpoint(app_data_dir, args.request)?)
         }
         // 로컬 LLM 연결 한 벌. API 키는 값이 아니라 `apiKeyConfigured` 여부로만 실린다.
@@ -6127,6 +6146,7 @@ fn dispatch_ui_and_cypress_command(
                 &workspace,
                 args.spec.as_deref(),
                 args.config_file.as_deref(),
+                args.browser.as_deref(),
                 args.env.unwrap_or_default(),
             )?)
         }
@@ -6162,6 +6182,64 @@ fn require_aia_chat_id<'a>(chat_id: Option<&'a str>, command: &str) -> Result<&'
     chat_id.ok_or_else(|| {
         CoreError::InvalidInput(format!("{command}는 AIA 대화 안에서만 호출할 수 있습니다"))
     })
+}
+
+/// 이 결정 방식에서 사람이 답해야 남는 미결 결정 수. 화면의 "결정 대기" 배지
+/// (`src/lib/roundDecisions.ts` `humanPendingDecisionCount`)와 같은 기준이다: 완전자동은
+/// 회차가 모두 답하고, 추천적용은 사람 결정이 아니고 추천안이 있는 것만 회차가 답한다.
+fn human_pending_round_decisions(
+    mode: crate::RoundDecisionMode,
+    decisions: &[crate::RoundDecision],
+) -> usize {
+    decisions
+        .iter()
+        .filter(|decision| decision.resolved.is_none())
+        .filter(|decision| match mode {
+            crate::RoundDecisionMode::Automatic => false,
+            crate::RoundDecisionMode::Recommended => {
+                decision.requires_human
+                    || decision
+                        .recommendation
+                        .as_deref()
+                        .is_none_or(|text| text.trim().is_empty())
+            }
+            crate::RoundDecisionMode::Manual => true,
+        })
+        .count()
+}
+
+/// 진행 중인 목표마다 사람이 답할 결정 수를 다시 세어 알림을 맞춘다. 실패는 알림만
+/// 못 맞춘 것이라 부른 작업을 실패시키지 않고 로그로 남긴다.
+fn refresh_round_decision_attention(app_data_dir: &Path, chats: &ChatSupervisor) {
+    let entries = (|| -> Result<Vec<crate::RoundDecisionAttention>, CoreError> {
+        let reports = crate::list_round_reports(
+            app_data_dir,
+            crate::RoundReportQuery {
+                goal_id: None,
+                pending_decisions: true,
+                limit: None,
+            },
+        )?;
+        Ok(crate::list_round_goals(app_data_dir)?
+            .into_iter()
+            .filter(|goal| goal.status == crate::RoundGoalStatus::Active)
+            .map(|goal| crate::RoundDecisionAttention {
+                pending: reports
+                    .iter()
+                    .filter(|report| report.goal_id.as_deref() == Some(goal.id.as_str()))
+                    .map(|report| {
+                        human_pending_round_decisions(goal.decision_mode, &report.decisions)
+                    })
+                    .sum(),
+                goal_id: goal.id,
+                goal_title: goal.title,
+            })
+            .collect())
+    })();
+    match entries {
+        Ok(entries) => chats.sync_round_decision_attention(&entries),
+        Err(error) => eprintln!("[agent-manager] 회차 결정 알림을 맞추지 못했습니다: {error}"),
+    }
 }
 
 /// `dispatch_command`가 한 벌짜리 match로 받던 명령을 갈래별로 나눈 자리 가운데
@@ -6429,6 +6507,8 @@ fn dispatch_session_command(
                 }
                 _ => None,
             };
+            // 결정 방식·상태가 바뀌면 사람이 답할 건수도 바뀐다.
+            refresh_round_decision_attention(app_data_dir, chats);
             // 함께 바꾼 것은 영수증으로 돌려준다. 말하지 않으면 사용자는 목표만 바뀐 줄 안다.
             let mut value = to_value(goal)?;
             if let (Some(object), Some(changed)) = (value.as_object_mut(), changed) {
@@ -6438,7 +6518,9 @@ fn dispatch_session_command(
         }
         "delete_round_goal" => {
             let args: RequestEnvelope<IdArg> = parse_params(params)?;
-            to_value(crate::delete_round_goal(app_data_dir, &args.request.id)?)
+            crate::delete_round_goal(app_data_dir, &args.request.id)?;
+            refresh_round_decision_attention(app_data_dir, chats);
+            to_value(())
         }
         "list_round_reports" => {
             let args: RequestEnvelope<crate::RoundReportQuery> = parse_params(params)?;
@@ -6450,20 +6532,26 @@ fn dispatch_session_command(
         }
         "record_round_report" => {
             let args: RequestEnvelope<crate::RoundReportInput> = parse_params(params)?;
-            to_value(crate::record_round_report(app_data_dir, args.request)?)
+            let report = crate::record_round_report(app_data_dir, args.request)?;
+            refresh_round_decision_attention(app_data_dir, chats);
+            to_value(report)
         }
         "resolve_round_decision" => {
             let args: RequestEnvelope<ResolveRoundDecisionArg> = parse_params(params)?;
-            to_value(crate::resolve_round_decision(
+            let report = crate::resolve_round_decision(
                 app_data_dir,
                 &args.request.id,
                 args.request.index,
                 &args.request.answer,
-            )?)
+            )?;
+            refresh_round_decision_attention(app_data_dir, chats);
+            to_value(report)
         }
         "delete_round_report" => {
             let args: RequestEnvelope<IdArg> = parse_params(params)?;
-            to_value(crate::delete_round_report(app_data_dir, &args.request.id)?)
+            crate::delete_round_report(app_data_dir, &args.request.id)?;
+            refresh_round_decision_attention(app_data_dir, chats);
+            to_value(())
         }
         "get_session_folders" => to_value(list_session_folders(app_data_dir)?),
         "create_session_folder" => {
@@ -7008,9 +7096,13 @@ fn dispatch_project_command(
             to_value(crate::project_git_overview(app_data_dir, &root)?)
         }
         "get_project_git_status" => {
-            let args: RequestEnvelope<crate::ProjectGitTarget> = parse_params(params)?;
+            let args: RequestEnvelope<crate::ProjectGitStatusRequest> = parse_params(params)?;
             let root = project(&args.request.project_path)?;
-            to_value(crate::project_git_status(app_data_dir, &root)?)
+            to_value(crate::project_git_status(
+                app_data_dir,
+                &root,
+                args.request.worktree_path.as_deref(),
+            )?)
         }
         "get_project_git_diff" => {
             let args: RequestEnvelope<crate::ProjectGitDiffRequest> = parse_params(params)?;
@@ -7042,6 +7134,24 @@ fn dispatch_project_command(
             let args: RequestEnvelope<crate::SetProjectBranchFollowRequest> = parse_params(params)?;
             let root = project(&args.request.project_path)?;
             to_value(crate::set_project_branch_follow(
+                app_data_dir,
+                &root,
+                &args.request,
+            )?)
+        }
+        // C16-11. 프로젝트 설정의 git 원격 인증. 이름만 오가고 값은 실리지 않는다. 저장된
+        // 비밀값 토글처럼 AIA 카탈로그에는 없다(C17-4) — 에이전트가 자기 push에 쓸 자격증명을
+        // 고르는 길을 열지 않는다.
+        "list_project_git_remote_tokens" => {
+            let args: RequestEnvelope<crate::ProjectGitTarget> = parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::list_project_git_remote_tokens(app_data_dir, &root)?)
+        }
+        "set_project_git_remote_token" => {
+            let args: RequestEnvelope<crate::SetProjectGitRemoteTokenRequest> =
+                parse_params(params)?;
+            let root = project(&args.request.project_path)?;
+            to_value(crate::set_project_git_remote_token(
                 app_data_dir,
                 &root,
                 &args.request,
@@ -7238,12 +7348,27 @@ fn dispatch_project_command(
 /// 하나다. 문서 루트·트리·파일 조회와 문서 자동화 트리거 명령.
 /// 아는 이름이 아니면 다음 갈래로 넘긴다 — 갈래를 나눠도 인가 판정
 /// 는 요청 경계의 로그인 게이트(C20)가 끝냈으므로 그대로다.
+fn require_doc_root_agent_access(
+    actor: SessionReadActor,
+    app_data_dir: &Path,
+    root_id: &str,
+) -> Result<(), CoreError> {
+    if matches!(actor, SessionReadActor::Aia) {
+        ensure_doc_root_agent_enabled(app_data_dir, root_id)?;
+    }
+    Ok(())
+}
+
 fn dispatch_document_command(
     context: &SystemCommandContext<'_>,
     command: &str,
     params: Value,
 ) -> Result<Value, ApiError> {
-    let &SystemCommandContext { app_data_dir, .. } = context;
+    let &SystemCommandContext {
+        app_data_dir,
+        actor,
+        ..
+    } = context;
     match command {
         "get_doc_roots" => to_value(list_doc_roots(app_data_dir)?),
         // 만들기 전에 무엇이 생기는지 알려 준다(C6-4b). 확인 대화는 이 목록을 그대로
@@ -7279,6 +7404,10 @@ fn dispatch_document_command(
                 args.request.create_if_missing,
             )?)
         }
+        "update_doc_root" => {
+            let args: RequestEnvelope<UpdateDocRootRequest> = parse_params(params)?;
+            to_value(update_doc_root(app_data_dir, args.request)?)
+        }
         "delete_doc_root" => {
             let args: IdArg = parse_params(params)?;
             remove_doc_root(app_data_dir, &args.id)?;
@@ -7286,10 +7415,12 @@ fn dispatch_document_command(
         }
         "get_doc_tree" => {
             let args: RootIdArg = parse_params(params)?;
+            require_doc_root_agent_access(actor, app_data_dir, &args.root_id)?;
             to_value(list_doc_tree(app_data_dir, &args.root_id)?)
         }
         "list_document_entries" => {
             let args: DocumentListArg = parse_params(params)?;
+            require_doc_root_agent_access(actor, app_data_dir, &args.root_id)?;
             to_value(list_document_entries(
                 app_data_dir,
                 &args.root_id,
@@ -7300,6 +7431,7 @@ fn dispatch_document_command(
         }
         "search_document_entries" => {
             let args: DocumentSearchArg = parse_params(params)?;
+            require_doc_root_agent_access(actor, app_data_dir, &args.root_id)?;
             to_value(search_document_entries(
                 app_data_dir,
                 &args.root_id,
@@ -7310,6 +7442,7 @@ fn dispatch_document_command(
         }
         "get_document_file" => {
             let args: DocumentFileArg = parse_params(params)?;
+            require_doc_root_agent_access(actor, app_data_dir, &args.root_id)?;
             to_value(read_document_file(
                 app_data_dir,
                 &args.root_id,
@@ -7318,6 +7451,7 @@ fn dispatch_document_command(
         }
         "get_doc" => {
             let args: RequestEnvelope<DocumentFileArg> = parse_params(params)?;
+            require_doc_root_agent_access(actor, app_data_dir, &args.request.root_id)?;
             to_value(read_doc(
                 app_data_dir,
                 &args.request.root_id,
@@ -7326,6 +7460,7 @@ fn dispatch_document_command(
         }
         "get_doc_linked_file" => {
             let args: RequestEnvelope<DocLinkedFileRequest> = parse_params(params)?;
+            require_doc_root_agent_access(actor, app_data_dir, &args.request.root_id)?;
             to_value(read_doc_linked_file(
                 app_data_dir,
                 &args.request.root_id,
@@ -7335,6 +7470,7 @@ fn dispatch_document_command(
         }
         "create_doc" => {
             let args: RequestEnvelope<CreateDocRequest> = parse_params(params)?;
+            require_doc_root_agent_access(actor, app_data_dir, &args.request.root_id)?;
             to_value(crate::create_doc(
                 app_data_dir,
                 &args.request.root_id,
@@ -7344,6 +7480,7 @@ fn dispatch_document_command(
         }
         "put_doc" => {
             let args: RequestEnvelope<SaveDocRequest> = parse_params(params)?;
+            require_doc_root_agent_access(actor, app_data_dir, &args.request.root_id)?;
             to_value(save_doc(
                 app_data_dir,
                 &args.request.root_id,
@@ -8939,6 +9076,9 @@ struct CypressRunRequest {
     /// 설정으로 돈다.
     #[serde(default)]
     config_file: Option<String>,
+    /// 실행 브라우저 이름(`edge`, `chrome` 등). 생략하면 Electron.
+    #[serde(default)]
+    browser: Option<String>,
     #[serde(default)]
     env: Option<BTreeMap<String, String>>,
 }
@@ -9124,6 +9264,30 @@ struct SaveDocRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 알림이 세는 건수는 화면 배지(`humanPendingDecisionCount`)와 같아야 한다.
+    #[test]
+    fn human_pending_round_decisions_follow_the_decision_mode() {
+        let decision = |recommendation: Option<&str>, requires_human: bool, resolved: bool| {
+            crate::RoundDecision {
+                question: "q".to_owned(),
+                options: Vec::new(),
+                recommendation: recommendation.map(str::to_owned),
+                resolved: resolved.then(|| "a".to_owned()),
+                requires_human,
+            }
+        };
+        let decisions = [
+            decision(Some("추천"), false, false),
+            decision(Some("추천"), true, false),
+            decision(None, false, false),
+            decision(Some("추천"), true, true),
+        ];
+        use crate::RoundDecisionMode::*;
+        assert_eq!(human_pending_round_decisions(Manual, &decisions), 3);
+        assert_eq!(human_pending_round_decisions(Recommended, &decisions), 2);
+        assert_eq!(human_pending_round_decisions(Automatic, &decisions), 0);
+    }
     use crate::terminal::TerminalSshMode;
     use tempfile::tempdir;
 
@@ -10539,7 +10703,9 @@ mod tests {
         assert!(is_write_command("set_ssh_key_note"));
         // C9-10. 엔드포인트 저장과 연결 확인은 write이지만, 2026-09-03 결정으로 원격
         // write에서도 허용한다 — 비밀값 없는 앱 데이터이고 지우면 그대로 돌아간다.
-        assert!(is_write_command("set_ssh_key_endpoint"));
+        assert!(is_write_command("save_ssh_server"));
+        assert!(is_write_command("delete_ssh_server"));
+        assert!(is_write_command("set_ssh_key_passphrase"));
         assert!(is_write_command("check_ssh_endpoint"));
         // C9-14/C9-15. 원격 명령 실행과 파일 업로드는 다른 시스템의 상태를 바꾸고 되돌리는
         // 방법이 앱 안에 없다. 원격 브라우저 UI에는 열지 않고 호스트 화면과 AIA 시스템
@@ -10679,7 +10845,7 @@ mod tests {
     #[test]
     fn ssh_terminal_open_c9_19_parses_the_default_shell_mode() {
         let message = Message::text(
-            r#"{"type":"open","request":{"fingerprint":"SHA256:abc","cols":100,"rows":30}}"#,
+            r#"{"type":"open","request":{"serverId":"srv-abc","cols":100,"rows":30}}"#,
         );
         let parsed = parse_terminal_message(message).expect("ssh terminal open");
         let TerminalClientMessage::Open { request } = parsed else {
@@ -10689,11 +10855,11 @@ mod tests {
         assert!(matches!(
             &request,
             RemoteTerminalOpenRequest::Ssh(TerminalSshRequest {
-                fingerprint,
+                server_id,
                 cols: 100,
                 rows: 30,
                 mode: TerminalSshMode::Shell,
-            }) if fingerprint == "SHA256:abc"
+            }) if server_id == "srv-abc"
         ));
     }
 
@@ -10701,7 +10867,7 @@ mod tests {
     #[test]
     fn ssh_key_install_terminal_open_c9_20_parses_the_install_mode() {
         let message = Message::text(
-            r#"{"type":"open","request":{"fingerprint":"SHA256:abc","cols":100,"rows":30,"mode":"installKey"}}"#,
+            r#"{"type":"open","request":{"serverId":"srv-abc","cols":100,"rows":30,"mode":"installKey"}}"#,
         );
         let parsed = parse_terminal_message(message).expect("ssh key install open");
         let TerminalClientMessage::Open { request } = parsed else {

@@ -5,6 +5,7 @@ import { closesTopEscapeLayer, createEscapeLayerStack } from "../lib/escapeLayer
 import { CopyAction } from "./CopyAction";
 import { displayPath } from "../lib/displayPath";
 import { errorText } from "../lib/errorText";
+import { createLatestGate } from "../lib/latestRequest";
 import type { ProviderId, QueuedChatMessage, WorkflowInputField } from "../types";
 import { useI18n } from "../lib/i18n";
 import { folderDropMessage, splitDroppedFolders } from "../lib/fileDrop";
@@ -505,7 +506,11 @@ function stableErrorCode(message: string): string {
 export function useBusyAction<T extends string = string>() {
   const [busy, setBusy] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // 막지 않는 갈래에서 두 실행이 겹치면, 먼저 끝난 실행이 `busy`를 비워 아직 도는 뒤 실행의
+  // 버튼 잠금과 "…중" 표시가 풀렸다. `busy`는 마지막에 시작한 실행만 되돌린다.
+  const [gate] = useState(createLatestGate);
   const run = useCallback(async (token: T, action: () => Promise<void>) => {
+    const isLatest = gate.begin();
     setBusy(token);
     setError(null);
     try {
@@ -513,9 +518,9 @@ export function useBusyAction<T extends string = string>() {
     } catch (cause) {
       setError(errorText(cause));
     } finally {
-      setBusy(null);
+      if (isLatest()) setBusy(null);
     }
-  }, []);
+  }, [gate]);
   return { busy, error, setError, run };
 }
 
@@ -539,13 +544,12 @@ export type { ChatApprovalDecider, ChatApprovalPrompt } from "./ApprovalPrompts"
 // 창 크기를 모르면(공급자가 알려주지 않았거나 압축 직후) 토큰 수만 적는다.
 export function ChatContextMeter({ usedTokens, windowTokens }: { usedTokens: number | null; windowTokens: number | null }) {
   const { text } = useI18n();
-  if (usedTokens == null) return null;
-  const percent = windowTokens ? Math.min(100, Math.round((usedTokens / windowTokens) * 100)) : null;
+  const percent = usedTokens != null && windowTokens && windowTokens > 0 ? Math.min(100, Math.round((usedTokens / windowTokens) * 100)) : null;
   const level = percent == null ? "" : percent >= 90 ? " critical" : percent >= 75 ? " warning" : "";
   return <div className={`chat-context-meter${level}`} title={text("마지막 요청 기준 컨텍스트 사용량 추정", "Estimated context usage based on last request")}>
     <em>{text("컨텍스트", "Context")}</em>
-    {percent != null && <div className="progress" role="img" aria-label={`${text("컨텍스트 사용량", "Context usage")} ${percent}%`}><span style={{ width: `${percent}%` }} /></div>}
-    <b>{percent != null ? `${percent}% · ${formatTokenCount(usedTokens)}/${formatTokenCount(windowTokens!)}` : `${formatTokenCount(usedTokens)} ${text("토큰", "tokens")}`}</b>
+    {<div className={`progress${percent == null ? " context-unknown" : ""}`} role="img" aria-label={percent == null ? text("컨텍스트 사용량 정보 없음", "Context usage unavailable") : `${text("컨텍스트 사용량", "Context usage")} ${percent}%`}><span style={{ width: `${percent ?? 0}%` }} /></div>}
+    <b>{usedTokens == null ? text("정보 없음", "Unavailable") : percent != null ? `${percent}% · ${formatTokenCount(usedTokens)}/${formatTokenCount(windowTokens!)}` : `${formatTokenCount(usedTokens)} ${text("토큰", "tokens")}`}</b>
   </div>;
 }
 

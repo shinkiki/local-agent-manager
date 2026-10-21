@@ -2326,6 +2326,7 @@ fn run_start_request(
         resume_session_id: resume_session_id.map(str::to_owned),
         handoff_origin: None,
         fork_session_id: None,
+        edit_message: None,
         origin: Some(ChatOrigin {
             kind: ChatOriginKind::Schedule,
             workflow_id: None,

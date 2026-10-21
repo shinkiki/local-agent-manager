@@ -38,16 +38,21 @@ use crate::CoreError;
 ///
 /// 저장본은 여기서 한 번만 읽고 필요한 자리로 넘긴다. 카탈로그·항목 목록·갱신 시각이
 /// 각자 같은 파일을 다시 읽고 있어, 한 응답 안에서 서로 다른 저장본을 볼 수 있었다.
+/// `catalog_env`는 모델 목록을 묻는 CLI에 얹을 계정 자격증명 환경이다. Antigravity는
+/// 로그인이 계정 프로필 홈에 있어, 이 환경 없이 띄우면 로그인된 계정이 있어도
+/// "로그인 필요"로 실패한다. 계정을 두지 않거나 목록을 직접 내보내지 않는 공급자는
+/// 빈 목록을 넘긴다.
 pub fn load_chat_provider_options(
     source: ProviderId,
     app_data_dir: Option<&std::path::Path>,
+    catalog_env: &[(String, String)],
 ) -> ChatProviderOptions {
     let overrides = app_data_dir.map(load_schema_overrides).unwrap_or_default();
     let proposed = overrides.trusted_catalog(source);
     let settings = merged_setting_fields(source, &overrides);
     let settings_updated_at = schema_overrides_updated_at(source, &overrides);
     let supported_reasoning_efforts = merged_reasoning_options(source, &overrides);
-    let (mut models, mut catalog_error) = match load_cli_models(source) {
+    let (mut models, mut catalog_error) = match load_cli_models(source, catalog_env) {
         Some(Ok(models)) => (models, None),
         Some(Err(error)) => (Vec::new(), Some(error.to_string())),
         None => (Vec::new(), None),
@@ -169,7 +174,10 @@ fn promote_default_model(mut models: Vec<ChatModelOption>) -> Vec<ChatModelOptio
 }
 
 /// CLI가 모델 목록을 내보내는 공급자만 실제 카탈로그를 읽는다.
-fn load_cli_models(source: ProviderId) -> Option<Result<Vec<ChatModelOption>, CoreError>> {
+fn load_cli_models(
+    source: ProviderId,
+    catalog_env: &[(String, String)],
+) -> Option<Result<Vec<ChatModelOption>, CoreError>> {
     match source {
         ProviderId::Codex => Some(
             resolve_executable(source)
@@ -187,7 +195,7 @@ fn load_cli_models(source: ProviderId) -> Option<Result<Vec<ChatModelOption>, Co
         // `agy models`는 이미 모델 패밀리 순으로 내보내므로 CLI 순서를 그대로 쓴다.
         ProviderId::Antigravity => Some(
             resolve_executable(source)
-                .and_then(|executable| load_antigravity_model_catalog(&executable)),
+                .and_then(|executable| load_antigravity_model_catalog(&executable, catalog_env)),
         ),
         ProviderId::Claude => None,
         // 로컬 공급자의 목록은 CLI가 아니라 서빙 서버가 들고 있고 연결마다 다르다.
@@ -1356,15 +1364,16 @@ const MODEL_CATALOG_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// 모델 카탈로그 조회용 자식을 띄운다. 두 공급자 조회가 같은 순서로 헤드리스 설정을
 /// 얹고 같은 모양의 기동 실패 문구를 적고 있어 한 자리로 모았다. 갈리는 것은 인자와
-/// 파이프 구성뿐이라 그것만 받는다.
+/// 파이프·환경 구성뿐이라 그것만 받는다. 헤드리스 설정을 먼저 얹어, 호출자가 넘기는
+/// `PATH`(Antigravity의 브라우저 차단 경로)가 그 보정에 덮이지 않게 한다.
 fn spawn_model_catalog_child(
     executable: &std::path::Path,
     subject: &str,
     configure: impl FnOnce(&mut Command),
 ) -> Result<Child, CoreError> {
     let mut command = Command::new(executable);
-    configure(&mut command);
     configure_headless_command(&mut command);
+    configure(&mut command);
     command.spawn().map_err(|error| {
         CoreError::Runtime(format!(
             "{subject} 모델 목록을 시작하지 못했습니다: {error}"
@@ -1452,14 +1461,24 @@ fn parse_codex_model(value: &Value) -> Option<ChatModelOption> {
 
 /// `agy models`는 stdout에 `모델ID\t표시명` TSV를 내보낸다(진행 안내는 stderr).
 /// 네트워크 조회라 응답이 없으면 멈출 수 있어 마감 시한을 두고 기다린다.
+///
+/// 계정 홈으로 뜨면 실제 토큰으로 갱신까지 시도하므로 사용량 조회(`/usage`)와 같은
+/// 보호를 받는다 — 같은 차례 잠금으로 동시 갱신을 막고, 인증이 어긋나도 로그인 창 대신
+/// 실패로 끝나게 브라우저 차단 경로를 앞에 둔다.
 fn load_antigravity_model_catalog(
     executable: &std::path::Path,
+    catalog_env: &[(String, String)],
 ) -> Result<Vec<ChatModelOption>, CoreError> {
+    let _turn = crate::antigravity_usage::cli_turn();
     let mut child =
         spawn_model_catalog_child(executable, ANTIGRAVITY_CATALOG_SUBJECT, |command| {
             let (update_key, update_value) = crate::antigravity_usage::no_auto_update_env();
+            if let Some((key, value)) = crate::antigravity_usage::no_browser_path(executable) {
+                command.env(key, value);
+            }
             command
                 .arg("models")
+                .envs(catalog_env.iter().map(|(key, value)| (key, value)))
                 .env(update_key, update_value)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -1639,7 +1658,7 @@ mod tests {
     #[test]
     fn local_models_do_not_come_from_a_cli() {
         // 목록은 CLI 가 아니라 연결마다 서빙 서버에 묻는다(M7 7.3).
-        assert!(load_cli_models(ProviderId::Local).is_none());
+        assert!(load_cli_models(ProviderId::Local, &[]).is_none());
     }
 
     #[test]
@@ -1653,7 +1672,7 @@ mod tests {
         assert!(!list[0].enabled);
         assert!(list[0].models.is_empty());
         assert!(list[0].catalog_error.is_none());
-        let options = load_chat_provider_options(ProviderId::Local, Some(dir.path()));
+        let options = load_chat_provider_options(ProviderId::Local, Some(dir.path()), &[]);
         assert_eq!(options.local_connections.len(), 1);
         assert!(options.models.is_empty());
         assert!(options.catalog_error.is_none());
@@ -2305,12 +2324,14 @@ mod tests {
             "updatedAt": 30
         });
         write_stored_schema(&dir, &stored);
-        let options = load_chat_provider_options(ProviderId::Claude, Some(dir.path()));
+        let options = load_chat_provider_options(ProviderId::Claude, Some(dir.path()), &[]);
         assert!(options.catalog_stale);
         // 오래됐다고 선택지를 지우지는 않는다.
         assert_eq!(options.models.len(), 1);
         // CLI가 목록을 직접 내보내는 공급자는 재조사 대상이 아니다.
-        assert!(!load_chat_provider_options(ProviderId::Codex, Some(dir.path())).catalog_stale);
+        assert!(
+            !load_chat_provider_options(ProviderId::Codex, Some(dir.path()), &[]).catalog_stale
+        );
     }
 
     /// 기존 제안을 그대로 두는 '차이 없음' 완료도 지금 설치된 CLI 버전을 확인한 것으로
@@ -2363,7 +2384,9 @@ mod tests {
         );
         assert_eq!(reloaded.catalogs["claude"].models.len(), 1);
         // 다시 읽어도 재조사 대상이 아니다 — 같은 버전에서 요청이 재발하지 않는다.
-        assert!(!load_chat_provider_options(ProviderId::Claude, Some(dir.path())).catalog_stale);
+        assert!(
+            !load_chat_provider_options(ProviderId::Claude, Some(dir.path()), &[]).catalog_stale
+        );
     }
 
     /// 유지할 제안도 새 제안도 없는 호출은 '차이 없음'이 아니다. 항목 제안만 담긴 호출은
@@ -2733,6 +2756,36 @@ mod tests {
     #[test]
     fn parse_antigravity_models_handles_empty_output() {
         assert!(parse_antigravity_models("").is_empty());
+    }
+
+    /// 로그인은 계정 프로필 홈에 있다. 목록 조회가 그 홈을 받지 못하면 실제 CLI처럼
+    /// "로그인 필요"로 끝나고, 받으면 그 계정의 목록이 돌아와야 한다.
+    #[test]
+    #[cfg(unix)]
+    fn antigravity_model_catalog_runs_in_the_account_profile_home() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = schema_dir();
+        let profile = dir.path().join("profile");
+        fs::create_dir(&profile).expect("profile");
+        let script = dir.path().join("fake-agy");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n[ \"$HOME\" = '{}' ] || {{ echo 'Please sign in' >&2; exit 1; }}\nprintf 'gemini-4-argon-high\\tGemini 4 Argon (High)\\n'\n",
+                profile.display()
+            ),
+        )
+        .expect("fixture");
+        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("권한");
+
+        assert!(load_antigravity_model_catalog(&script, &[]).is_err());
+        let env = crate::credential_profiles::antigravity_home_env(&profile.to_string_lossy());
+        let models = load_antigravity_model_catalog(&script, &env).expect("프로필 홈 조회");
+        assert_eq!(model_ids(&models), ["gemini-4-argon-high"]);
+        assert_eq!(models[0].display_name, "Gemini 4 Argon (High)");
     }
 
     #[test]

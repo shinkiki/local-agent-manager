@@ -967,6 +967,38 @@ mod tests {
         assert_eq!(service_slug("  "), "");
     }
 
+    /// Claude와 Codex가 같은 귀속 규칙을 공유한다는 것을 규칙 자체에서 고정한다. 수집기
+    /// 시험은 `http`+url과 `stdio`+command 두 모양만 지나가므로, url 없는 원격 전송이나
+    /// 실행 명령 없는 항목이 기기 공유로 새는 변경을 잡지 못한다.
+    #[test]
+    fn transport_scope_shares_only_local_commands_without_remote_markers() {
+        let url = Some("https://mcp.example.com/mcp");
+        assert_eq!(
+            transport_scope(None, Some("stdio"), Some("node")),
+            ToolScope::Shared
+        );
+        // Codex 설정에는 transport 칸이 없다.
+        assert_eq!(transport_scope(None, None, Some("npx")), ToolScope::Shared);
+        assert_eq!(transport_scope(url, None, None), ToolScope::Account);
+        // url이 있으면 실행 명령이 함께 적혀 있어도 원격 인증을 탄다.
+        assert_eq!(transport_scope(url, None, Some("npx")), ToolScope::Account);
+        // 원격 전송 표기는 url이 빠져 있어도 계정 단위다.
+        assert_eq!(
+            transport_scope(None, Some("sse"), Some("node")),
+            ToolScope::Account
+        );
+        assert_eq!(
+            transport_scope(None, Some("http"), None),
+            ToolScope::Account
+        );
+        // 무엇을 띄울지 모르는 항목을 기기 공유로 단정하지 않는다.
+        assert_eq!(transport_scope(None, None, None), ToolScope::Account);
+        assert_eq!(
+            transport_scope(None, Some("stdio"), None),
+            ToolScope::Account
+        );
+    }
+
     #[test]
     fn labels_known_services_and_title_cases_the_rest() {
         assert_eq!(service_label("github"), "GitHub");

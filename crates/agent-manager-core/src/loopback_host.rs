@@ -5,7 +5,7 @@ use reqwest::Url;
 use crate::CoreError;
 
 fn is_loopback_name(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+    matches!(host, "127.0.0.1" | "[::1]") || host.eq_ignore_ascii_case("localhost")
 }
 
 /// HTTP `Host` 헤더가 허용된 로컬 loopback 주소인지 확인한다.
@@ -67,6 +67,37 @@ mod tests {
             "[::1]:4178",
         ] {
             assert!(is_loopback_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn g11_localhost_host_header_ignores_ascii_case() {
+        for host in [
+            "LOCALHOST",
+            "LocalHost",
+            "LOCALHOST:4178",
+            "LocalHost:65535",
+        ] {
+            assert!(is_loopback_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn g11_localhost_case_does_not_relax_authority_validation() {
+        for host in [
+            "LOCALHOST.example.com",
+            "LOCALHOST.",
+            " LOCALHOST",
+            "LOCALHOST ",
+            "LOCALHOST@127.0.0.1",
+            "[LOCALHOST]",
+            "LOCALHOST:",
+            "LOCALHOST:0",
+            "LOCALHOST:65536",
+            "LOCALHOST:invalid",
+            "LOCALHOST:4178:9000",
+        ] {
+            assert!(!is_loopback_host(host), "{host}");
         }
     }
 

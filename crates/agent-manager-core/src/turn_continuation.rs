@@ -201,4 +201,38 @@ mod tests {
         assert_eq!(lines[0]["interruptedCount"], 1);
         assert_eq!(lines[0]["promptVersion"], prompt_version());
     }
+
+    /// 상한에 닿은 기록은 직전 파일 하나로 돌아가고, 그보다 오래된 직전 파일은 버려진다.
+    /// 돌리기가 빠지면 기록이 앱 데이터에서 끝없이 자란다.
+    #[test]
+    fn a_full_record_rotates_into_the_single_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = vec![b'x'; MAX_RECORD_FILE_BYTES as usize];
+        fs::write(dir.path().join(RECORD_FILE), &full).unwrap();
+        fs::write(dir.path().join(PREVIOUS_RECORD_FILE), b"oldest").unwrap();
+        let entry = ContinuationRecord::new(
+            ProviderId::Claude,
+            None,
+            "chat-old",
+            "chat-new",
+            None,
+            None,
+            1,
+            0,
+        );
+        record(dir.path(), &entry).unwrap();
+
+        let previous = fs::read(dir.path().join(PREVIOUS_RECORD_FILE)).unwrap();
+        assert_eq!(previous, full);
+        let current = fs::read_to_string(dir.path().join(RECORD_FILE)).unwrap();
+        assert_eq!(current.lines().count(), 1);
+        assert!(current.contains("\"chatId\":\"chat-new\""));
+
+        // 상한 아래의 기록은 돌리지 않고 이어 붙인다.
+        fs::remove_file(dir.path().join(PREVIOUS_RECORD_FILE)).unwrap();
+        record(dir.path(), &entry).unwrap();
+        assert!(!dir.path().join(PREVIOUS_RECORD_FILE).exists());
+        let current = fs::read_to_string(dir.path().join(RECORD_FILE)).unwrap();
+        assert_eq!(current.lines().count(), 2);
+    }
 }

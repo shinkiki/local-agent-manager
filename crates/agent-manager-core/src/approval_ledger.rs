@@ -160,6 +160,14 @@ pub(crate) trait ApprovalEntry {
         })
     }
 
+    /// 이미 답한 항목에 다시 답하려 할 때.
+    fn already_answered(&self) -> CoreError {
+        CoreError::Conflict(format!(
+            "이 {} 승인 요청에는 이미 답했습니다",
+            Self::WORDING.subject
+        ))
+    }
+
     /// 만료된 항목을 꺼내려 할 때.
     fn already_expired(&self, usage: ApprovalUse) -> CoreError {
         CoreError::Conflict(match usage {
@@ -244,6 +252,11 @@ impl<T: ApprovalEntry> ApprovalLedger<T> {
         granted: bool,
     ) -> Result<T::Decision, CoreError> {
         self.with_usable(chat_id, approval_id, now, ApprovalUse::Resolve, |entry| {
+            // 먼저 온 결정이 남는다(C9-17-5). 다른 화면의 늦은 두 번째 답이 거절을 허용으로
+            // 뒤집으면, 에이전트가 이미 "거절됐다"고 들은 토큰이 다시 쓸 수 있게 된다.
+            if entry.granted().is_some() {
+                return Err(entry.already_answered());
+            }
             entry.set_granted(granted);
             Ok(entry.decision(granted))
         })

@@ -1,4 +1,5 @@
 import { sourceName } from "./format.ts";
+import { matchesNeedle } from "./menuSearch.ts";
 import type { Translate } from "./skillLocaleText.ts";
 import type { SkillSyncState } from "./skillSyncState.ts";
 import type {
@@ -208,17 +209,13 @@ export function sortSkillEntries(entries: SkillLibraryEntry[]): SkillLibraryEntr
 export function matchesSkillQuery(entry: SkillLibraryEntry, query: string): boolean {
   const needle = query.trim().toLowerCase();
   if (!needle) return true;
-  const contains = (value: string | null | undefined): boolean => (
-    typeof value === "string" && value.toLowerCase().includes(needle)
-  );
-  const targets = [
+  return matchesNeedle([
     entry.key,
     entry.name,
     entry.description,
     entry.common?.directory,
     ...entry.providers.flatMap((state) => [state.directory, state.origin, state.scope]),
-  ];
-  return targets.some(contains);
+  ], needle);
 }
 
 /**

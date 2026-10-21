@@ -7,7 +7,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { evaluateAiaSuggestions, mergeComposerDraft } from "./aiaSuggestions.ts";
+import { composerAfterSend, evaluateAiaSuggestions, mergeComposerDraft } from "./aiaSuggestions.ts";
 import { catalog, definition, evaluation } from "./aiaSuggestionFixtures.mjs";
 
 test("the evaluator accepts the nested effective-pack shape returned by core", () => {
@@ -30,4 +30,12 @@ test("composer merge appends with one blank line and never manufactures content"
   assert.equal(mergeComposerDraft("", "  제안 명령  "), "제안 명령");
   assert.equal(mergeComposerDraft("기존 초안\n\n", "제안 명령"), "기존 초안\n\n제안 명령");
   assert.equal(mergeComposerDraft("기존 초안", "   "), "기존 초안");
+});
+
+test("composerAfterSend clears only the text that was sent", () => {
+  assert.equal(composerAfterSend("hello ", "hello "), "");
+  // 전송 중에 더 쓰거나 제안을 끼워 넣은 글은 보내지 않았으므로 남긴다.
+  assert.equal(composerAfterSend("hello\n\nmore", "hello"), "more");
+  assert.equal(composerAfterSend("edited hello", "hello"), "edited hello");
+  assert.equal(composerAfterSend("", "hello"), "");
 });

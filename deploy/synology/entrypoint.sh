@@ -18,10 +18,17 @@ drop_privileges() {
   uid="${PUID:-$(id -u "${AGENT_USER}")}"
   gid="${PGID:-$(id -g "${AGENT_USER}")}"
 
+  # L13: 두 값을 계정 변경보다 먼저 검사한다. 숫자가 아닌 값은 도구마다 사용자 이름이나
+  # 부호로 다르게 해석하므로 십진수만 받고, 00 같은 0의 다른 표기도 거절한다.
+  if [[ ! "${uid}" =~ ^[0-9]+$ || ! "${gid}" =~ ^[0-9]+$ ]]; then
+    echo "PUID/PGID는 십진수 숫자로만 적어야 합니다." >&2
+    exit 1
+  fi
+
   # uid/gid 0은 받지 않는다. 받아 주면 setpriv 뒤에도 여전히 root라 이 함수가 자기 자신을
   # 끝없이 다시 실행하고(restart: unless-stopped와 합쳐지면 chown -R이 반복된다), 무엇보다
   # root를 피하려고 만든 경로가 조용히 root로 돌아간다.
-  if [ "${uid}" = "0" ] || [ "${gid}" = "0" ]; then
+  if [[ "${uid}" =~ ^0+$ || "${gid}" =~ ^0+$ ]]; then
     echo "PUID/PGID에 0을 쓸 수 없습니다(root로는 에이전트 CLI가 돌지 않습니다)." >&2
     exit 1
   fi
@@ -101,6 +108,82 @@ require KEYRING_PASSWORD
 require TAILSCALE_HOST
 require TAILSCALE_USER
 
+# 에이전트 CLI 씨앗 심기. 이미지는 CLI를 씨앗 prefix(`AGENT_MANAGER_CLI_SEED`)에만 담고, 실제로
+# 실행되는 사본은 HOME 볼륨의 `~/.local`에 둔다 — 앱의 업데이트 버튼이 비root로 그 사본을 올리고,
+# 볼륨이라 컨테이너를 다시 만들어도 올린 버전이 남는다(Dockerfile의 씨앗 주석).
+#
+# 권한을 내린 **뒤**에 돈다. root로 볼륨에 파일을 만들면 다음 업데이트가 소유권에 막힌다.
+#
+# CLI마다 `~/.local/bin/<cli>`가 없을 때만 심는다. 있으면 사용자가 앱에서 올린 버전이므로
+# 이미지 씨앗이 더 새 것이어도 덮지 않는다 — 버전을 비교해 자동으로 고르면 사람이 올린 판이
+# 재생성 한 번에 조용히 바뀐다. 씨앗으로 되돌리는 길은 `AGENT_MANAGER_RESEED_CLI=1` 하나다.
+#
+# bin 항목을 맨 마지막에 놓는다. bin이 있다는 것이 "심기 끝"의 표시라, 중간에 멈춰도 다음
+# 기동이 처음부터 다시 심는다. 각 조각은 임시 이름으로 복사한 뒤 `mv`로 바꿔 넣는다.
+#
+# 심기 실패는 기동을 멈추지 않는다. 볼트와 달리 서버는 CLI 없이도 뜨고, 앱의 CLI 화면이
+# "탐지되지 않음"으로 원인을 보인다. 대신 로그에 남긴다.
+seed_cli_dir="${AGENT_MANAGER_CLI_SEED:-/opt/agent-manager/cli-seed}"
+user_prefix="${HOME}/.local"
+
+if [ "${HOME}" != "/home/agent" ]; then
+  # 이미지의 NPM_CONFIG_PREFIX·PATH는 `/home/agent/.local`로 고정이다. HOME이 다르면 앱이 올린
+  # CLI가 이 스크립트가 심은 곳과 다른 데 깔린다.
+  echo "경고: HOME이 ${HOME}입니다. 이미지의 CLI 경로(/home/agent/.local)와 달라 앱 업데이트가 다른 위치에 설치될 수 있습니다." >&2
+fi
+
+cli_version() {
+  local out
+  out="$(timeout 15 "$1" --version 2>/dev/null | head -n 1)" || true
+  printf '%s' "${out:-버전 확인 실패}"
+}
+
+# 원본을 임시 이름으로 복사한 뒤 대상과 바꾼다. 디렉터리든 링크든 파일이든 `cp -a`로 그대로 옮긴다.
+replace_from_seed() {
+  local src="$1" dest="$2" tmp
+  tmp="$(dirname "${dest}")/.seed-$(basename "${dest}").$$"
+  rm -rf "${tmp}"
+  cp -a "${src}" "${tmp}" || { rm -rf "${tmp}"; return 1; }
+  rm -rf "${dest}"
+  mv "${tmp}" "${dest}"
+}
+
+# 인자: CLI 이름, npm 패키지(없으면 빈 문자열 — 단일 실행 파일).
+seed_cli() {
+  local cli="$1" package="$2" bin="${user_prefix}/bin/$1" reason
+  if [ ! -e "${seed_cli_dir}/bin/${cli}" ]; then
+    echo "CLI 씨앗 ${cli}: 이미지에 씨앗이 없어 건너뜁니다." >&2
+    return 0
+  fi
+  if [ "${AGENT_MANAGER_RESEED_CLI:-}" = "1" ]; then
+    reason="재심기(AGENT_MANAGER_RESEED_CLI=1)"
+  elif [ -e "${bin}" ] || [ -L "${bin}" ]; then
+    echo "CLI ${cli}: 설치본 유지 $(cli_version "${bin}") (씨앗 $(cli_version "${seed_cli_dir}/bin/${cli}"))"
+    return 0
+  else
+    reason="첫 심기"
+  fi
+
+  mkdir -p "${user_prefix}/bin" || return 1
+  if [ -n "${package}" ]; then
+    mkdir -p "$(dirname "${user_prefix}/lib/node_modules/${package}")" || return 1
+    replace_from_seed "${seed_cli_dir}/lib/node_modules/${package}" \
+      "${user_prefix}/lib/node_modules/${package}" || return 1
+  fi
+  replace_from_seed "${seed_cli_dir}/bin/${cli}" "${bin}" || return 1
+  echo "CLI ${cli}: 씨앗 심음(${reason}) $(cli_version "${bin}")"
+}
+
+if [ "${AGENT_MANAGER_RESEED_CLI:-}" = "1" ]; then
+  echo "AGENT_MANAGER_RESEED_CLI=1: 세 CLI를 이미지 씨앗으로 되돌립니다. 되돌린 뒤에는 이 값을 지우세요 — 남겨 두면 기동할 때마다 앱에서 올린 버전을 덮습니다." >&2
+fi
+for entry in "claude @anthropic-ai/claude-code" "codex @openai/codex" "agy "; do
+  read -r seed_name seed_package <<< "${entry}"
+  if ! seed_cli "${seed_name}" "${seed_package:-}"; then
+    echo "경고: CLI ${seed_name}을(를) ${user_prefix}에 심지 못했습니다. 디스크 공간과 ${HOME} 소유권을 확인하세요." >&2
+  fi
+done
+
 # D-Bus 세션 버스.
 eval "$(dbus-launch --sh-syntax)"
 export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
@@ -110,6 +193,11 @@ mkdir -p "${HOME}/.local/share/keyrings"
 while IFS= read -r assignment; do
   [ -n "${assignment}" ] && export "${assignment?}"
 done < <(printf '%s' "${KEYRING_PASSWORD}" | gnome-keyring-daemon --unlock --components=secrets)
+# 볼트 암호는 위 잠금 해제에만 쓴다. 지우지 않으면 서버를 거쳐 에이전트 CLI·터미널·회차가
+# 모두 물려받아, 에이전트가 `env` 한 번으로 암호를 읽고 세션 기록에 평문으로 남길 수 있다
+# (키링 파일 사본만 있으면 어디서든 열린다). 서버는 이 값을 읽지 않고, 아래 실패 안내는
+# 값이 아니라 변수 이름만 쓴다. `docker inspect`에 남는 컨테이너 설정은 이 줄로 지울 수 없다.
+unset KEYRING_PASSWORD
 
 # L02: 볼트가 실제로 열렸는지 기동 전에 확인하고, 열리지 않았으면 **멈춘다.**
 #

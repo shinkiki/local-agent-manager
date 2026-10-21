@@ -11,6 +11,7 @@
  */
 import { Bookmark, Eye, EyeOff, KeyRound, PenLine, RefreshCw, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { createLatestGate } from "../lib/latestRequest";
 import { listAllChatSecrets, readChatSecretValue, rememberChatSecret, removeChatSecret, setChatSecret } from "../lib/ipc";
 import {
   CHAT_SECRET_PURPOSE_MAX,
@@ -64,29 +65,41 @@ export function StorageSecretsTab({ active }: { active: boolean }) {
   // C17. 대화 비밀값을 보관으로 옮길 때마다 오르는 수. 위 카드가 목록을 다시 읽을 신호다.
   const [savedSignal, setSavedSignal] = useState(0);
 
+  // 다시 읽기는 폴링·새로고침 버튼이 함께 부른다. 늦게 도착한 앞선 목록이 저장·삭제 뒤 목록을
+  // 덮지 않도록 마지막으로 시작한 읽기만 반영한다. 드러낸 값 읽기도 같은 이유로 문을 따로 둔다 —
+  // 탭을 떠나거나 목록을 다시 읽은 뒤 도착한 값이 화면에 다시 채워지면 안 된다(G4).
+  const [loadGate] = useState(createLatestGate);
+  const [revealGate] = useState(createLatestGate);
   const load = useCallback(async () => {
+    const isLatest = loadGate.begin();
     try {
-      setOverview(await listAllChatSecrets());
+      const next = await listAllChatSecrets();
+      if (!isLatest()) return;
+      revealGate.begin();
+      setOverview(next);
       setRevealed({});
       setError(null);
       setNow(Date.now());
     } catch (cause) {
+      if (!isLatest()) return;
       setError(errorText(cause));
       throw cause;
     }
-  }, []);
+  }, [loadGate, revealGate]);
   // 탭이 보일 때만 돈다. 켜지는 순간 첫 회차가 바로 돌아 탭 진입마다 다시 읽는 셈이다.
   const refresh = usePoll(load, 30_000, { enabled: active });
 
   useEffect(() => {
     if (!active) {
-      // 탭을 떠나면 드러낸 값을 두지 않는다.
+      // 탭을 떠나면 드러낸 값을 두지 않고, 아직 오는 중인 읽기도 버린다.
+      loadGate.begin();
+      revealGate.begin();
       setRevealed({});
       return undefined;
     }
     const timer = window.setInterval(() => setNow(Date.now()), 60_000);
     return () => window.clearInterval(timer);
-  }, [active]);
+  }, [active, loadGate, revealGate]);
 
   const revealKey = (key: SecretKey) => `${key.chatId}\n${key.name}`;
   const toggleReveal = async (key: SecretKey) => {
@@ -99,12 +112,15 @@ export function StorageSecretsTab({ active }: { active: boolean }) {
       });
       return;
     }
+    const isLatest = revealGate.begin();
     setBusy(key);
     try {
       const view = await readChatSecretValue({ chatId: key.chatId, name: key.name });
+      if (!isLatest()) return;
       setRevealed((current) => ({ ...current, [id]: view.value }));
       setError(null);
     } catch (cause) {
+      if (!isLatest()) return;
       setError(errorText(cause));
     } finally {
       setBusy(null);
@@ -112,6 +128,8 @@ export function StorageSecretsTab({ active }: { active: boolean }) {
   };
 
   const applySnapshot = (chatId: string, secrets: ChatSecretSummary[]) => {
+    // 이 응답이 가장 새 상태다. 진행 중인 목록 읽기가 늦게 와서 되돌리지 못하게 한다.
+    loadGate.begin();
     setOverview((current) => {
       if (!current) return current;
       // 비어 버린 대화는 묶음째 내린다 — 백엔드 목록도 비어 있는 대화를 싣지 않는다.
@@ -291,13 +309,13 @@ function SecretsGroupCard({ group, now, busy, editing, revealed, onToggleReveal,
                     ? <span className="storage-secrets-masked" aria-hidden="true">••••••••</span>
                     : <code className="storage-secrets-plain">{shown}</code>}
                 </td>
-                <td className="storage-secrets-purpose">{secret.purpose}</td>
-                <td>
+                <td className="storage-secrets-purpose" data-label={text("용도", "Purpose")}>{secret.purpose}</td>
+                <td data-label={text("출처", "Source")}>
                   <em className={`storage-secrets-source storage-secrets-source-${secret.source}`}>
                     {secret.source === "agent" ? text("에이전트", "agent") : secret.source === "saved" ? text("저장됨", "saved") : text("사용자", "user")}
                   </em>
                 </td>
-                <td className="storage-secrets-left">{minutes === 0 ? text("만료됨", "expired") : text(`${minutes}분`, `${minutes} min`)}</td>
+                <td className="storage-secrets-left" data-label={text("남은 시간", "Time left")}>{minutes === 0 ? text("만료됨", "expired") : text(`${minutes}분`, `${minutes} min`)}</td>
                 <td className="storage-secrets-actions">
                   <button
                     className={`button compact${open ? " active" : ""}`}

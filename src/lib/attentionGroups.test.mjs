@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { attentionFolderSummary, groupAttentionItems } from "./attentionGroups.ts";
+import { attentionFolderSummary, groupAttentionItems, roundDecisionGoalId } from "./attentionGroups.ts";
+import { attentionNotificationDetail } from "./webNotificationContent.ts";
 
 function item(overrides) {
   return {
@@ -138,4 +139,27 @@ test("반복 요청 없이 돌린 워크플로는 워크플로 id로 묶인다",
   const groups = groupAttentionItems([step("a"), step("b")]);
   assert.equal(groups.length, 1);
   assert.equal(groups[0].reason, "workflow");
+});
+
+test("회차 결정 대기는 목표 ID를 뽑고 워크플로 묶음·지우기 불가로 다룬다", () => {
+  assert.equal(roundDecisionGoalId("round-decision:goal-1:1700000000-uuid"), "goal-1");
+  assert.equal(roundDecisionGoalId("round-decision:goal-1"), null);
+  assert.equal(roundDecisionGoalId("round-decision::1"), null);
+  assert.equal(roundDecisionGoalId("turn:chat-1:1"), null);
+
+  const decision = item({
+    id: "round-decision:goal-1:1",
+    chatId: "",
+    cwd: "",
+    kind: "roundDecision",
+    title: "회차 결정 대기: M10",
+    detail: "사람이 답할 결정 2건",
+  });
+  const groups = groupAttentionItems([decision]);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].reason, "workflow");
+  assert.equal(groups[0].dismissable, false);
+  assert.equal(groups[0].unreadCount, 1);
+  assert.deepEqual(groups[0].folders, []);
+  assert.equal(attentionNotificationDetail(decision), "회차 결정 대기: M10 · 사람이 답할 결정 2건");
 });

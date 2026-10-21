@@ -24,7 +24,8 @@ export function ChatActivityGroup<Entry>({
 }: ChatActivityGroupProps<Entry>) {
   const [expanded, setExpanded] = useState(false);
 
-  const visible = expanded ? entries : active ? entries.slice(-1) : [];
+  // 실행 중에도 사용자가 펼치기 전에는 개수와 상태만 갱신한다.
+  const visible = expanded ? entries : [];
   return (
     <div className={`turn-activity-summary${expanded ? " expanded" : ""}${active ? " active" : ""}`}>
       <button

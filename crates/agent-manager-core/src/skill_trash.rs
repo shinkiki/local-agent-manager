@@ -174,17 +174,22 @@ pub(crate) fn store_trash_item(
     let root = trash_root(app_data_dir);
     let entry = trash_store::begin_entry(&root, &draft.key)?;
 
+    // 링크도 디렉터리와 같은 `move_path`로 옮긴다 — 링크 파일 자체만 옮기고(대상은 따라가지
+    // 않는다), rename이 안 되는 볼륨 사이에서는 같은 대상의 링크를 휴지통에 다시 만든 뒤 원본
+    // 링크를 지운다. 예전에는 rename이 실패하면 곧바로 링크를 지워 휴지통에 실체가 없었고,
+    // manifest 쓰기까지 실패하면 `commit`이 되돌릴 것이 없어 링크가 흔적 없이 사라졌다(C3-11).
+    // 링크를 다시 만들 수 없을 때(Windows에서 심볼릭 링크 권한이 없는 경우)만 예전처럼
+    // 링크를 지우고 manifest의 대상 경로로 복구하게 둔다 — 그 경우까지 실패로 돌리면 볼륨이
+    // 다른 링크 스킬은 지울 수조차 없게 된다.
     let moved = match draft.kind {
         SkillTrashItemKind::Directory => trash_store::move_path(source, entry.content()),
-        SkillTrashItemKind::Link => {
-            // 링크는 링크 파일 자체만 옮긴다. rename이 안 되는 환경이면 manifest의
-            // 대상 경로로 복구할 수 있으므로 링크를 지우는 것으로 충분하다.
-            if fs::rename(source, entry.content()).is_err() {
-                fs::remove_file(source).map_err(CoreError::Io)
-            } else {
-                Ok(())
+        SkillTrashItemKind::Link => trash_store::move_path(source, entry.content()).or_else(|_| {
+            if fs::symlink_metadata(entry.content()).is_ok() {
+                // 복제는 됐고 원본 링크 제거만 실패했다 — 아래 재시도가 실패하면 원본이 남으므로 복제본은 치운다.
+                let _ = fs::remove_file(entry.content());
             }
-        }
+            fs::remove_file(source).map_err(CoreError::Io)
+        }),
     };
     if let Err(error) = moved {
         entry.abort();
@@ -252,13 +257,24 @@ pub fn restore_skill_trash(
 fn restore_single_item(trash_root: &Path, item: &SkillTrashItem) -> SkillTrashRestoreResult {
     let original = PathBuf::from(&item.original_path);
 
-    match trash_store::prepare_restore_target(&original) {
+    // 스킬은 설치 루트·저장소 폴더의 바로 아래 항목이라 상위 폴더가 곧 루트다.
+    match trash_store::prepare_restore_target(&original, original.parent().unwrap_or(&original)) {
         RestoreTarget::Ready => {}
         RestoreTarget::Occupied => {
             return SkillTrashRestoreResult::from_item(
                 item,
                 SkillTrashRestoreOutcome::Skipped,
                 Some("원래 경로에 이미 항목이 있어 덮어쓰지 않았습니다".to_owned()),
+            )
+        }
+        RestoreTarget::OutsideRoot => {
+            return SkillTrashRestoreResult::from_item(
+                item,
+                SkillTrashRestoreOutcome::Failed,
+                Some(
+                    "복구할 위치가 링크를 거쳐 원래 루트 밖을 가리켜 복구하지 않았습니다"
+                        .to_owned(),
+                ),
             )
         }
         RestoreTarget::ParentFailed(message) => {
@@ -383,6 +399,65 @@ mod tests {
             "invalid".parse::<SkillTrashRestoreOutcome>(),
             Err(CoreError::InvalidInput(_))
         ));
+    }
+
+    /// 휴지통과 다른 볼륨(tmpfs)에 있는 링크를 지워도 링크 실체가 휴지통에 남아야 한다.
+    /// rename이 EXDEV로 실패하는 실제 경로를 타야 의미가 있으므로 `/dev/shm`이 다른
+    /// 장치일 때만 확인한다.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn link_moved_across_volumes_keeps_the_link_in_trash() {
+        use std::os::unix::fs::MetadataExt;
+        let app_data = tempdir().unwrap();
+        let Ok(other_volume) = tempfile::tempdir_in("/dev/shm") else {
+            eprintln!("/dev/shm 없음 — 볼륨 간 이동 확인 생략");
+            return;
+        };
+        if fs::metadata(other_volume.path()).unwrap().dev()
+            == fs::metadata(app_data.path()).unwrap().dev()
+        {
+            eprintln!("/dev/shm이 같은 장치 — 볼륨 간 이동 확인 생략");
+            return;
+        }
+        let link = other_volume.path().join("linked-skill");
+        std::os::unix::fs::symlink("../relative/target", &link).unwrap();
+
+        let item = store_trash_item(
+            app_data.path(),
+            &link,
+            SkillTrashItemDraft {
+                group_id: "group".to_owned(),
+                key: "linked-skill".to_owned(),
+                kind: SkillTrashItemKind::Link,
+                link_target: Some("../relative/target".to_owned()),
+                provider: Some(ProviderId::Claude),
+                scope: None,
+                shared: true,
+                deleted_by: "test".to_owned(),
+                content_digest: None,
+                file_count: 0,
+                total_bytes: 0,
+                name: "linked-skill".to_owned(),
+                description: String::new(),
+            },
+        )
+        .unwrap();
+        assert!(fs::symlink_metadata(&link).is_err());
+        let (_, content) = trash_store::entry_paths(&trash_root(app_data.path()), &item.id);
+        assert_eq!(
+            fs::read_link(&content).expect("link kept in trash"),
+            Path::new("../relative/target")
+        );
+
+        let receipt = restore_skill_trash(app_data.path(), &item.id).unwrap();
+        assert_eq!(
+            receipt.results[0].outcome,
+            SkillTrashRestoreOutcome::Restored
+        );
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new("../relative/target")
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //!
 //! # 무엇에 묶이는가
 //!
-//! (대화, 지문) 두 값에 묶인다. 다른 대화는 같은 서버에 대해서도 이 값을 보지 못하고,
+//! (대화, 서버 ID) 두 값에 묶인다. 다른 대화는 같은 서버에 대해서도 이 값을 보지 못하고,
 //! 같은 대화라도 다른 서버에는 쓰이지 않는다. [`SSH_SECRET_TTL_MS`]가 지나면 스스로
 //! 사라지고, 대화가 끝나면 [`SshSecretStore::discard_chat`]으로 즉시 사라진다.
 //!
@@ -43,7 +43,7 @@ const MAX_ENTRIES: usize = 16;
 /// 들고 있는 값 하나. `Zeroizing`이 drop 시점에 버퍼를 0으로 덮는다.
 struct StoredSecret {
     chat_id: String,
-    fingerprint: String,
+    server_id: String,
     secret: Zeroizing<String>,
     expires_at: i64,
 }
@@ -53,8 +53,8 @@ impl StoredSecret {
         now >= self.expires_at
     }
 
-    fn matches(&self, chat_id: &str, fingerprint: &str) -> bool {
-        self.chat_id == chat_id && self.fingerprint == fingerprint
+    fn matches(&self, chat_id: &str, server_id: &str) -> bool {
+        self.chat_id == chat_id && self.server_id == server_id
     }
 }
 
@@ -85,9 +85,9 @@ impl SshSecretStore {
         Self::default()
     }
 
-    /// 사용자가 승인 카드에 입력한 값을 받아 둔다. 같은 (대화, 지문)에 이미 값이 있으면
+    /// 사용자가 승인 카드에 입력한 값을 받아 둔다. 같은 (대화, 서버 ID)에 이미 값이 있으면
     /// 갈아 끼운다 — 사용자가 다시 입력했다는 것은 앞의 값이 틀렸다는 뜻이다.
-    pub fn store(&self, chat_id: &str, fingerprint: &str, secret: &str) -> Result<(), CoreError> {
+    pub fn store(&self, chat_id: &str, server_id: &str, secret: &str) -> Result<(), CoreError> {
         if secret.is_empty() {
             return Err(CoreError::InvalidInput(
                 "비밀번호가 비어 있습니다".to_owned(),
@@ -95,7 +95,7 @@ impl SshSecretStore {
         }
         let now = now_ms();
         let mut entries = self.lock_live(now)?;
-        entries.retain(|entry| !entry.matches(chat_id, fingerprint));
+        entries.retain(|entry| !entry.matches(chat_id, server_id));
         if entries.len() >= MAX_ENTRIES {
             return Err(CoreError::Conflict(
                 "들고 있는 SSH 비밀번호가 너무 많습니다".to_owned(),
@@ -103,7 +103,7 @@ impl SshSecretStore {
         }
         entries.push(StoredSecret {
             chat_id: chat_id.to_owned(),
-            fingerprint: fingerprint.to_owned(),
+            server_id: server_id.to_owned(),
             secret: Zeroizing::new(secret.to_owned()),
             expires_at: now + SSH_SECRET_TTL_MS,
         });
@@ -113,13 +113,13 @@ impl SshSecretStore {
     /// 이 대화가 이 서버에 대해 값을 들고 있는지. 값 자체는 돌려주지 않는다 — 실행 경로
     /// 밖에서 이 질문에 답해야 하는 자리(승인 카드를 비밀번호 칸과 함께 띄울지)가 있고,
     /// 그 자리에 값을 내주면 통로가 하나 늘어난다.
-    pub fn holds(&self, chat_id: &str, fingerprint: &str) -> bool {
+    pub fn holds(&self, chat_id: &str, server_id: &str) -> bool {
         let now = now_ms();
         self.lock_live(now)
             .map(|entries| {
                 entries
                     .iter()
-                    .any(|entry| entry.matches(chat_id, fingerprint))
+                    .any(|entry| entry.matches(chat_id, server_id))
             })
             .unwrap_or(false)
     }
@@ -128,20 +128,20 @@ impl SshSecretStore {
     /// 동안 다시 묻지 않는 것이 이 저장소의 목적이고, 수명은 TTL과 대화 종료가 정한다.
     ///
     /// 돌려주는 값은 `Zeroizing`이라 호출자가 떨어뜨리는 순간 그 복사본도 0으로 덮인다.
-    pub fn peek(&self, chat_id: &str, fingerprint: &str) -> Option<Zeroizing<String>> {
+    pub fn peek(&self, chat_id: &str, server_id: &str) -> Option<Zeroizing<String>> {
         let now = now_ms();
         let entries = self.lock_live(now).ok()?;
         entries
             .iter()
-            .find(|entry| entry.matches(chat_id, fingerprint))
+            .find(|entry| entry.matches(chat_id, server_id))
             .map(|entry| entry.secret.clone())
     }
 
     /// 그 서버의 값을 버린다. 비밀번호가 틀렸을 때 실행 경로가 부른다 — 틀린 값을 들고
     /// 남은 TTL 동안 계속 실패하는 대신 다음 명령에서 다시 묻는다.
-    pub fn discard(&self, chat_id: &str, fingerprint: &str) {
+    pub fn discard(&self, chat_id: &str, server_id: &str) {
         if let Ok(mut entries) = self.lock() {
-            entries.retain(|entry| !entry.matches(chat_id, fingerprint));
+            entries.retain(|entry| !entry.matches(chat_id, server_id));
         }
     }
 
@@ -230,6 +230,59 @@ mod tests {
     }
 
     #[test]
+    fn store_refuses_a_new_pair_once_the_cap_is_reached() {
+        let store = store();
+        for index in 0..MAX_ENTRIES {
+            store
+                .store(&format!("chat-{index}"), PRINT, "a")
+                .expect("store");
+        }
+        assert!(matches!(
+            store.store("chat-new", PRINT, "a"),
+            Err(CoreError::Conflict(_))
+        ));
+        assert!(!store.holds("chat-new", PRINT));
+    }
+
+    #[test]
+    fn replacing_an_existing_pair_succeeds_at_the_cap() {
+        let store = store();
+        for index in 0..MAX_ENTRIES {
+            store
+                .store(&format!("chat-{index}"), PRINT, "old")
+                .expect("store");
+        }
+        store
+            .store("chat-0", PRINT, "new")
+            .expect("다시 입력한 값은 상한에 걸리지 않고 갈아 끼워져야 한다");
+        assert_eq!(
+            store.peek("chat-0", PRINT).as_ref().map(|v| v.as_str()),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn expired_entries_free_room_under_the_cap() {
+        let store = store();
+        {
+            let mut entries = store.entries.lock().expect("lock");
+            for index in 0..MAX_ENTRIES {
+                entries.push(StoredSecret {
+                    chat_id: format!("chat-{index}"),
+                    server_id: PRINT.to_owned(),
+                    secret: Zeroizing::new("stale".to_owned()),
+                    expires_at: now_ms() - 1,
+                });
+            }
+        }
+        store
+            .store("chat-new", PRINT, "a")
+            .expect("만료된 항목은 상한을 차지하지 않아야 한다");
+        assert!(store.holds("chat-new", PRINT));
+        assert_eq!(store.entries.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
     fn empty_secret_is_rejected() {
         let store = store();
         assert!(store.store(CHAT, PRINT, "").is_err());
@@ -264,7 +317,7 @@ mod tests {
             let mut entries = store.entries.lock().expect("lock");
             entries.push(StoredSecret {
                 chat_id: CHAT.to_owned(),
-                fingerprint: PRINT.to_owned(),
+                server_id: PRINT.to_owned(),
                 secret: Zeroizing::new("stale".to_owned()),
                 expires_at: now_ms() - 1,
             });

@@ -1183,3 +1183,19 @@ test('literal 점검은 마크다운과 JSON 을 코드처럼 깎지 않는다',
     true,
   );
 });
+
+// Rust 문자 리터럴 '"' 를 문자열 시작으로 읽으면 그 뒤 문자열 상태가 뒤집혀 살아 있는
+// URL의 `//`가 주석으로 지워진다. project_overlays.rs에 실제로 `starts_with('"')`가 있다.
+test('주석 제거는 Rust 문자 리터럴의 큰따옴표를 문자열 시작으로 읽지 않는다', () => {
+  const rust = [
+    "fn f<'a>(rest: &'a str) -> bool { rest.starts_with('\"') || rest.ends_with('\\'') }",
+    'const DOCS: &str = "https://example.test/a";',
+    '"live_command" => {}',
+    '// "dead_command" => {}',
+  ].join('\n');
+  const stripped = stripComments(rust, 'crates/agent-manager-core/src/project_overlays.rs');
+  assert.ok(stripped.includes('https://example.test/a'));
+  assert.ok(stripped.includes('"live_command"'));
+  assert.ok(!stripped.includes('"dead_command"'));
+  assert.equal(stripped.length, rust.length);
+});

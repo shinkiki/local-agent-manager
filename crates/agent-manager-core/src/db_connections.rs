@@ -594,8 +594,9 @@ fn validate_connection_secret(
     let secret = request
         .secret
         .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        // 비어 있는지만 공백을 빼고 본다. 값 자체를 다듬으면 앞뒤 공백이 있는 비밀번호가
+        // 다른 값으로 저장되어, 접속이 이유 없이 실패한다.
+        .filter(|value| !value.trim().is_empty())
         .map(validate_secret)
         .transpose()?;
     if secret.is_some() && credential_source != DbCredentialSource::AppKeychain {
@@ -1043,6 +1044,19 @@ mod tests {
         assert_eq!(connection.max_rows, DEFAULT_MAX_ROWS);
         let serialized = serde_json::to_string(&snapshot).expect("json");
         assert!(!serialized.contains("password"));
+    }
+
+    #[test]
+    fn c10_5_connection_secret_keeps_surrounding_whitespace() {
+        let mut payload = request("공백");
+        payload.secret = Some(" pw ".to_owned());
+        let secret = validate_connection_secret(DbCredentialSource::AppKeychain, &payload)
+            .expect("accepted");
+        assert_eq!(secret.as_deref(), Some(" pw "));
+        payload.secret = Some("   ".to_owned());
+        let blank = validate_connection_secret(DbCredentialSource::AppKeychain, &payload)
+            .expect("blank is no secret");
+        assert_eq!(blank, None);
     }
 
     #[test]

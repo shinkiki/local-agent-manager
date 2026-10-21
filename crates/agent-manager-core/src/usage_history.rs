@@ -108,7 +108,9 @@ impl UsageCycleRecord {
 
     /// 동일 주기의 새 관측값으로 최대 소진율과 관측 시각을 갱신한다.
     fn record_observation(&mut self, used_percent: f64, resets_at: i64, at: i64) {
-        self.peak_used_percent = self.peak_used_percent.max(used_percent);
+        // 첫 관측과 같은 범위로 자른다. 자르지 않으면 같은 120% 관측이 주기의 첫
+        // 관측이면 100, 두 번째부터면 120으로 남아 정점이 관측 순서에 따라 달라진다.
+        self.peak_used_percent = self.peak_used_percent.max(used_percent.clamp(0.0, 100.0));
         self.resets_at = resets_at;
         self.first_observed_at = self.first_observed_at.min(at);
         self.last_observed_at = self.last_observed_at.max(at);
@@ -396,6 +398,23 @@ mod tests {
         assert_eq!(series.cycles[0].first_observed_at, reset - 6 * DAY);
         assert_eq!(series.cycles[0].last_observed_at, reset - 2 * DAY);
         assert_eq!(series.cycles[1].peak_used_percent, 10.0);
+    }
+
+    #[test]
+    fn a_later_observation_is_clamped_like_the_first() {
+        let mut store = HistoryStore::default();
+        let resets_at = Some(10 * 24 * 60 * 60 * 1000);
+        apply(
+            &mut store,
+            "a",
+            &usage(vec![("7일", 40.0, resets_at)], 1_000),
+        );
+        apply(
+            &mut store,
+            "a",
+            &usage(vec![("7일", 130.0, resets_at)], 2_000),
+        );
+        assert_eq!(store.accounts["a"].cycles[0].peak_used_percent, 100.0);
     }
 
     #[test]

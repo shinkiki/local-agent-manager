@@ -409,4 +409,162 @@ mod tests {
             .expect_err("not answered");
         assert!(matches!(error, CoreError::Conflict(_)));
     }
+
+    #[test]
+    fn c10_12_a_token_rejects_a_different_connection_id() {
+        let store = DbApprovalStore::new();
+        let ticket = open(&store, "UPDATE t SET a = 1");
+        store.resolve("chat", &ticket.id, true).expect("resolve");
+
+        let error = store
+            .consume(
+                "chat",
+                DbApprovalConsume {
+                    approval_id: &ticket.id,
+                    connection_id: "other_connection",
+                    sql: "UPDATE t SET a = 1",
+                    kind: DbApprovalKind::Dml,
+                },
+            )
+            .expect_err("different connection");
+        assert!(matches!(error, CoreError::Conflict(ref msg) if msg.contains("다른 연결")));
+    }
+
+    #[test]
+    fn c10_12_a_token_rejects_a_different_statement_kind() {
+        let store = DbApprovalStore::new();
+        let ticket = open(&store, "UPDATE t SET a = 1");
+        store.resolve("chat", &ticket.id, true).expect("resolve");
+
+        let error = store
+            .consume(
+                "chat",
+                DbApprovalConsume {
+                    approval_id: &ticket.id,
+                    connection_id: "kbf",
+                    sql: "UPDATE t SET a = 1",
+                    kind: DbApprovalKind::Ddl,
+                },
+            )
+            .expect_err("different statement kind");
+        assert!(
+            matches!(error, CoreError::Conflict(ref msg) if msg.contains("dml 문장으로 받은 것"))
+        );
+    }
+
+    #[test]
+    fn c10_12_a_rejected_token_cannot_be_consumed() {
+        let store = DbApprovalStore::new();
+        let ticket = open(&store, "UPDATE t SET a = 1");
+        store
+            .resolve("chat", &ticket.id, false)
+            .expect("resolve as rejected");
+
+        let error = store
+            .consume(
+                "chat",
+                DbApprovalConsume {
+                    approval_id: &ticket.id,
+                    connection_id: "kbf",
+                    sql: "UPDATE t SET a = 1",
+                    kind: DbApprovalKind::Dml,
+                },
+            )
+            .expect_err("rejected token");
+        assert!(
+            matches!(error, CoreError::Conflict(ref msg) if msg.contains("사용자가 이 요청을 거절했습니다"))
+        );
+    }
+
+    #[test]
+    fn c10_12_duplicate_open_in_the_same_chat_returns_the_existing_ticket() {
+        let store = DbApprovalStore::new();
+        let (first_ticket, first_card) = store
+            .open(
+                "chat",
+                DbApprovalOpen {
+                    connection_id: "kbf",
+                    destination: "app@db:3306/appdb",
+                    environment: "개발",
+                    sql: "UPDATE t SET a = 1",
+                    kind: DbApprovalKind::Dml,
+                    previewed_rows: Some(3),
+                    reason: "사유 1",
+                },
+            )
+            .expect("first open");
+
+        let (second_ticket, second_card) = store
+            .open(
+                "chat",
+                DbApprovalOpen {
+                    connection_id: "kbf",
+                    destination: "app@db:3306/appdb",
+                    environment: "개발",
+                    sql: "UPDATE t SET a = 1",
+                    kind: DbApprovalKind::Dml,
+                    previewed_rows: Some(5),
+                    reason: "사유 2",
+                },
+            )
+            .expect("second open");
+
+        assert_eq!(first_ticket.id, second_ticket.id);
+        assert_eq!(first_card.id, second_card.id);
+        assert_eq!(store.pending_cards("chat").len(), 1);
+    }
+
+    #[test]
+    fn c10_12_card_detail_handles_dml_without_preview_and_ddl_statements() {
+        let store = DbApprovalStore::new();
+        let (_ticket_dml, card_dml) = store
+            .open(
+                "chat_dml",
+                DbApprovalOpen {
+                    connection_id: "kbf",
+                    destination: "app@db:3306/appdb",
+                    environment: "운영",
+                    sql: "INSERT INTO t VALUES (1)",
+                    kind: DbApprovalKind::Dml,
+                    previewed_rows: None,
+                    reason: "신규 행 등록",
+                },
+            )
+            .expect("open dml without preview");
+        assert!(card_dml.detail.contains("영향 행 수를 세지 못했습니다"));
+        assert_eq!(card_dml.title, "데이터베이스 변경 1회 실행 승인");
+
+        let (_ticket_ddl, card_ddl) = store
+            .open(
+                "chat_ddl",
+                DbApprovalOpen {
+                    connection_id: "kbf",
+                    destination: "app@db:3306/appdb",
+                    environment: "운영",
+                    sql: "ALTER TABLE t ADD COLUMN c INT",
+                    kind: DbApprovalKind::Ddl,
+                    previewed_rows: None,
+                    reason: "컬럼 추가",
+                },
+            )
+            .expect("open ddl");
+        assert!(card_ddl
+            .detail
+            .contains("구조 변경은 대부분의 엔진에서 암시적 커밋이라 예행이 성립하지 않습니다"));
+        assert!(card_ddl.detail.contains("허용하면 되돌릴 수 없습니다"));
+        assert_eq!(card_ddl.title, "데이터베이스 구조 변경 승인");
+    }
+
+    #[test]
+    fn c10_12_owns_and_discard_chat() {
+        let store = DbApprovalStore::new();
+        let ticket = open(&store, "UPDATE t SET a = 1");
+        assert!(store.owns(&ticket.id));
+        assert!(!store.owns("db-approval-nonexistent"));
+
+        assert_eq!(store.pending_cards("chat").len(), 1);
+        store.discard_chat("chat");
+        assert!(store.pending_cards("chat").is_empty());
+        assert!(!store.owns(&ticket.id));
+    }
 }

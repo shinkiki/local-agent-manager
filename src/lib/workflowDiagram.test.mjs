@@ -111,3 +111,12 @@ test("a contract without steps still draws, and invents no step box", () => {
   // 봉투가 없는 계약에는 없는 묶음에 style을 걸지 않는다 — 걸면 그림이 통째로 사라진다.
   assert.doesNotMatch(workflowDiagram(sequential), /style wf_envelope/);
 });
+
+test("a literal #word; in a label is not read as an entity by the engine", () => {
+  const diagram = workflowDiagram({ ...sequential, displayName: "PR #12; 정리 #abc;" });
+  // mermaid encodeEntities 는 #\w+; 를 엔티티로 바꾼다. 원문에 그 패턴이 남으면 안 된다.
+  assert.doesNotMatch(diagram, /#\w+;/);
+  assert.match(diagram, /PR #\u200B12; 정리 #\u200Babc;/);
+  // 엔티티 모양이 아닌 #은 건드리지 않는다.
+  assert.match(workflowDiagram({ ...sequential, displayName: "#12 다음 #;" }), /#12 다음 #;/);
+});

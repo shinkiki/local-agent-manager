@@ -1,8 +1,16 @@
-//! C9-9~C9-12: SSH 인증키별 접속 엔드포인트와 에이전트 사용 여부.
+//! C9-9~C9-12: SSH 연결 서버 목록과 에이전트 사용 여부.
+//!
+//! # 서버가 키에 매달리지 않는 이유
+//!
+//! 처음에는 접속 지점을 키 지문 하나에 하나씩 붙였다. 그러면 서버를 추가하려면 키부터
+//! 있어야 하고, 개인키 하나로 여러 서버에 붙는 흔한 쓰임을 표현할 수 없다. 그래서 서버를
+//! 독립된 목록으로 두고 서버마다 접속에 쓸 키 지문을 하나 가리키게 했다(2026-10-19 사용자
+//! 결정). 실행·승인·터미널·스킬은 모두 서버 ID로 서버를 고른다. 예전 저장본
+//! (`ssh-key-endpoints-v1.json`)은 처음 읽을 때 지문에서 파생한 ID로 옮기고 원본은 남긴다.
 //!
 //! # 왜 별도 저장소인가
 //!
-//! 엔드포인트는 공개키에서 파생되지 않는 기기 단위 메타데이터다. 메모(C9-8)와 같은 이유로
+//! 연결 서버는 공개키에서 파생되지 않는 기기 단위 메타데이터다. 메모(C9-8)와 같은 이유로
 //! `~/.ssh`가 아니라 앱 데이터에만 둔다(G7). `~/.ssh/config`를 고쳐 넣지 않는 것도 같은
 //! 이유다 — 그 파일은 사용자와 다른 도구가 함께 쓰는 사용자 소유 설정이고, 여기서 필요한
 //! 것은 "이 키로 어디에 붙고, 에이전트에게 열어 줄 것인가"라는 앱 쪽 결정뿐이다.
@@ -21,7 +29,7 @@
 //! 개인키는 어느 경로에서도 열지 않는다 — `ssh`에 경로만 넘긴다(G4). 목록에는 사용자가 켠
 //! 키만 나오므로, 토글이 곧 접근 허용 결정이다.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -30,15 +38,13 @@ use serde::{Deserialize, Serialize};
 use crate::clock::now_ms;
 use crate::json_store::{JsonStore, SchemaVersioned};
 use crate::ssh_keys::{
-    attach_sidecar, edit_sidecar, load_sidecar, private_key_present, remove_from_sidecar,
-    resolve_public_key, validate_fingerprint, FingerprintSidecar, SshKeyIssue, SshKeyRef,
-    SshKeyView, SshKeysSnapshot,
+    private_key_present, validate_fingerprint, SshKeyIssue, SshKeyView, SshKeysSnapshot,
 };
 use crate::user_home::home_dir;
 use crate::CoreError;
 
 const ENDPOINTS_VERSION: u32 = 1;
-/// 엔드포인트도 메모와 같은 기기 단위 메타데이터라 앱 데이터에만 둔다(G7).
+/// 키 지문마다 접속 지점 하나를 두던 예전 저장본. 서버 목록으로 옮길 때 한 번 읽는다.
 const ENDPOINTS_STORE: JsonStore = JsonStore {
     file: "ssh-key-endpoints-v1.json",
     lock_file: "ssh-key-endpoints-v1.lock",
@@ -46,7 +52,22 @@ const ENDPOINTS_STORE: JsonStore = JsonStore {
     version: ENDPOINTS_VERSION,
 };
 
+const SERVERS_VERSION: u32 = 1;
+/// 연결 서버도 메모와 같은 기기 단위 메타데이터라 앱 데이터에만 둔다(G7).
+const SERVERS_STORE: JsonStore = JsonStore {
+    file: "ssh-servers-v1.json",
+    lock_file: "ssh-servers-v1.lock",
+    label: "SSH 연결 서버 저장소",
+    version: SERVERS_VERSION,
+};
+
+/// `<CLI> ssh list` 응답 모양의 버전. 2: 항목이 서버 ID·이름·암호 키 여부를 싣는다.
+const AGENT_LISTING_VERSION: u32 = 2;
+
 const MAX_ENDPOINTS: usize = 512;
+const MAX_SERVER_NAME_CHARS: usize = 80;
+const SERVER_ID_PREFIX: &str = "srv-";
+const MAX_SERVER_ID_CHARS: usize = 40;
 const MAX_HOST_CHARS: usize = 253;
 const MAX_USER_CHARS: usize = 64;
 const DEFAULT_SSH_PORT: u16 = 22;
@@ -128,10 +149,20 @@ const DEFAULT_DENIED_COMMANDS: &[&str] = &[
     "truncate",
 ];
 
-/// 지문 하나에 묶인 접속 지점. 저장본과 화면 표시가 같은 모양이라 한 타입을 함께 쓴다.
+/// 연결 서버 하나. 저장본과 화면 표시가 같은 모양이라 한 타입을 함께 쓴다.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SshEndpointView {
+    /// 서버 ID. 실행·승인·터미널이 이 값으로 서버를 고른다. 키 하나를 여러 서버가 함께 쓰므로
+    /// 지문은 서버를 가리킬 수 없다.
+    #[serde(default)]
+    pub id: String,
+    /// 사람이 붙인 이름. 비어 있으면 화면은 접속 대상을 이름 대신 보여 준다.
+    #[serde(default)]
+    pub name: String,
+    /// 이 서버에 접속할 키의 지문.
+    #[serde(default)]
+    pub fingerprint: String,
     pub host: String,
     pub port: u16,
     pub user: String,
@@ -271,12 +302,15 @@ impl SshEndpointView {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+/// 연결 서버 저장 요청. `id`가 없으면 새 서버를 만들고, 있으면 그 서버를 고친다.
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SetSshKeyEndpointRequest {
-    pub fingerprint: String,
-    /// 빈 값이면 저장된 엔드포인트를 지운다.
+pub struct SaveSshServerRequest {
     #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: String,
+    pub fingerprint: String,
     pub host: String,
     #[serde(default)]
     pub port: Option<u16>,
@@ -300,10 +334,18 @@ pub struct SetSshKeyEndpointRequest {
     pub project_git_enabled: bool,
 }
 
+/// 서버 하나를 가리키는 요청.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshServerRef {
+    pub server_id: String,
+}
+
 /// 연결 확인 결과. 원격에서 무엇도 바꾸지 않았고, 개인키 내용은 어느 필드에도 없다.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SshEndpointCheckReceipt {
+    pub server_id: String,
     pub fingerprint: String,
     pub destination: String,
     pub reachable: bool,
@@ -315,6 +357,9 @@ pub struct SshEndpointCheckReceipt {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSshEndpointView {
+    /// 서버 ID. 실행 작업과 `relayArgs`가 이 값으로 서버를 고른다.
+    pub server_id: String,
+    pub name: String,
     pub fingerprint: String,
     /// 개인키 파일 이름. 공개키는 여기에 `.pub`이 붙는다.
     pub key_file_name: String,
@@ -335,6 +380,9 @@ pub struct AgentSshEndpointView {
     pub transfer_root: String,
     /// 터미널 표시(C9-18). true면 `ssh`를 직접 부르지 않고 `relayArgs`로 앱을 거쳐 실행한다.
     pub terminal_enabled: bool,
+    /// C9-21. 키에 암호가 걸려 있어 앱만 열 수 있다. true면 `sshArgs`가 비어 있고, 언제나
+    /// `relayArgs`로 앱을 거쳐 실행한다 — 암호는 에이전트 셸에 들어가지 않는다.
+    pub passphrase_protected: bool,
     /// 무제한 명령 허용. true면 허용 목록 대조와 1회 승인이 빠지고 차단 목록만 남는다.
     pub unrestricted_commands: bool,
     /// `<CLI>`와 접두사 뒤에 붙여 이 서버에서 명령을 실행하는 인자. 마지막 `--` 뒤에
@@ -346,6 +394,8 @@ pub struct AgentSshEndpointView {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSshEndpointSkip {
+    pub server_id: String,
+    pub name: String,
     pub fingerprint: String,
     pub reason: String,
 }
@@ -366,6 +416,29 @@ struct SshEndpointStore {
     endpoints: BTreeMap<String, SshEndpointView>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SshServerStore {
+    schema_version: u32,
+    #[serde(default)]
+    servers: Vec<SshEndpointView>,
+}
+
+impl SchemaVersioned for SshServerStore {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
+impl Default for SshServerStore {
+    fn default() -> Self {
+        Self {
+            schema_version: SERVERS_VERSION,
+            servers: Vec::new(),
+        }
+    }
+}
+
 impl SchemaVersioned for SshEndpointStore {
     fn schema_version(&self) -> u32 {
         self.schema_version
@@ -381,117 +454,300 @@ impl Default for SshEndpointStore {
     }
 }
 
-/// C9-9. 지문에 묶인 접속 지점과 에이전트 사용 여부를 저장한다. 호스트가 비면 삭제다.
-pub fn set_ssh_key_endpoint(
+/// C9-9. 연결 서버 하나를 만들거나 고친다.
+pub fn save_ssh_server(
     app_data_dir: &Path,
-    request: SetSshKeyEndpointRequest,
+    request: SaveSshServerRequest,
 ) -> Result<SshKeysSnapshot, CoreError> {
-    set_ssh_key_endpoint_with(&home_dir()?, app_data_dir, &request)
+    save_ssh_server_with(&home_dir()?, app_data_dir, &request)
 }
 
-/// C9-11. 저장된 엔드포인트로 한 번 붙어 보고 끊는다. 원격에서는 `true`만 돌린다.
+/// C9-9. 연결 서버 하나를 지운다. 키 파일과 다른 서버는 그대로다.
+pub fn delete_ssh_server(
+    app_data_dir: &Path,
+    request: SshServerRef,
+) -> Result<SshKeysSnapshot, CoreError> {
+    delete_ssh_server_with(&home_dir()?, app_data_dir, &request)
+}
+
+/// C9-11. 저장된 서버로 한 번 붙어 보고 끊는다. 원격에서는 앱이 정한 고정 명령만 돌린다.
 pub fn check_ssh_endpoint(
     app_data_dir: &Path,
-    request: SshKeyRef,
+    request: SshServerRef,
 ) -> Result<SshEndpointCheckReceipt, CoreError> {
     let executable = crate::providers::resolve_named_executable(&["ssh"])?;
     check_ssh_endpoint_with(&home_dir()?, app_data_dir, &executable, &request)
 }
 
-/// C9-12. 스킬이 부르는 목록. 에이전트 사용을 켠 키만 나온다.
+/// C9-12. 스킬이 부르는 목록. 에이전트 사용을 켠 서버만 나온다.
 pub fn list_agent_ssh_endpoints(app_data_dir: &Path) -> Result<AgentSshEndpointsView, CoreError> {
     list_agent_ssh_endpoints_with(&home_dir()?, app_data_dir)
 }
 
-/// 실행 경로 테스트가 홈과 앱 데이터를 직접 지정해 엔드포인트를 심을 때 쓰는 입구.
+/// 실행 경로 테스트가 홈과 앱 데이터를 직접 지정해 서버를 심을 때 쓰는 입구.
+/// 지금은 이 입구를 부르는 시험이 없다 — 서버를 심는 시험이 다시 생길 때 쓴다.
 #[cfg(test)]
-pub(crate) fn set_ssh_key_endpoint_for_test(
+#[allow(dead_code)]
+pub(crate) fn save_ssh_server_for_test(
     home: &Path,
     app_data_dir: &Path,
-    request: &SetSshKeyEndpointRequest,
+    request: &SaveSshServerRequest,
 ) -> Result<SshKeysSnapshot, CoreError> {
-    set_ssh_key_endpoint_with(home, app_data_dir, request)
+    save_ssh_server_with(home, app_data_dir, request)
 }
 
-fn set_ssh_key_endpoint_with(
+fn save_ssh_server_with(
     home: &Path,
     app_data_dir: &Path,
-    request: &SetSshKeyEndpointRequest,
+    request: &SaveSshServerRequest,
 ) -> Result<SshKeysSnapshot, CoreError> {
     let fingerprint = validate_fingerprint(&request.fingerprint)?.to_owned();
-    let mut snapshot = crate::ssh_keys::snapshot_with_metadata(home, app_data_dir)?;
+    let existing_id = request
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(validate_server_id)
+        .transpose()?
+        .map(str::to_owned);
+    let snapshot = crate::ssh_keys::snapshot_with_metadata(home, app_data_dir)?;
     let key = snapshot
         .keys
         .iter()
         .find(|key| key.fingerprint == fingerprint)
         .ok_or_else(|| {
-            CoreError::NotFound("엔드포인트를 붙일 공개키를 ~/.ssh에서 찾지 못했습니다".to_owned())
+            CoreError::NotFound("이 서버에 쓸 공개키를 ~/.ssh에서 찾지 못했습니다".to_owned())
         })?;
-
     let host = request.host.trim();
-    let endpoint = if host.is_empty() {
-        None
-    } else {
-        let transfer_root = validate_endpoint_options(request, key.has_private_key)?;
-        // C16-10. 감쌀 수 없는 경로는 **켜는 자리에서** 거절한다. 쓰는 자리에서만 거절하면
-        // 토글은 저장된 채로 켜져 보이고 git은 말없이 신원 없이 붙는다 — 사용자가 읽을 수
-        // 있는 실패가 어디에도 남지 않는다.
-        if request.project_git_enabled {
-            let identity = PathBuf::from(&key.path).with_extension("");
-            ssh_command_line("ssh", &identity.to_string_lossy())?;
-        }
-        Some(SshEndpointView {
-            host: validate_host(host)?.to_owned(),
-            port: validate_port(request.port)?,
-            user: validate_user(&request.user)?.to_owned(),
-            agent_enabled: request.agent_enabled,
-            allowed_commands: validate_command_rules(&request.allowed_commands, "허용")?,
-            denied_commands: validate_command_rules(&request.denied_commands, "차단")?,
-            file_transfer_enabled: request.file_transfer_enabled,
-            transfer_root,
-            terminal_enabled: request.terminal_enabled,
-            unrestricted_commands: request.unrestricted_commands,
-            project_git_enabled: request.project_git_enabled,
-            updated_at: now_ms(),
-        })
+    if host.is_empty() {
+        return Err(CoreError::InvalidInput(
+            "서버 주소(IP 또는 호스트 이름)가 필요합니다".to_owned(),
+        ));
+    }
+    let transfer_root = validate_endpoint_options(request, key.has_private_key)?;
+    // C16-10. 감쌀 수 없는 경로는 **켜는 자리에서** 거절한다. 쓰는 자리에서만 거절하면
+    // 토글은 저장된 채로 켜져 보이고 git은 말없이 신원 없이 붙는다 — 사용자가 읽을 수
+    // 있는 실패가 어디에도 남지 않는다.
+    if request.project_git_enabled {
+        let identity = PathBuf::from(&key.path).with_extension("");
+        ssh_command_line("ssh", &identity.to_string_lossy(), false)?;
+    }
+    let mut server = SshEndpointView {
+        id: existing_id.clone().unwrap_or_else(new_server_id),
+        name: validate_server_name(&request.name)?.to_owned(),
+        fingerprint: fingerprint.clone(),
+        host: validate_host(host)?.to_owned(),
+        port: validate_port(request.port)?,
+        user: validate_user(&request.user)?.to_owned(),
+        agent_enabled: request.agent_enabled,
+        allowed_commands: validate_command_rules(&request.allowed_commands, "허용")?,
+        denied_commands: validate_command_rules(&request.denied_commands, "차단")?,
+        file_transfer_enabled: request.file_transfer_enabled,
+        transfer_root,
+        terminal_enabled: request.terminal_enabled,
+        unrestricted_commands: request.unrestricted_commands,
+        project_git_enabled: request.project_git_enabled,
+        updated_at: now_ms(),
     };
 
-    edit_endpoints(app_data_dir, |endpoints| {
-        match endpoint {
-            None => {
-                endpoints.remove(&fingerprint);
-            }
-            Some(endpoint) => {
-                if !endpoints.contains_key(&fingerprint) && endpoints.len() >= MAX_ENDPOINTS {
-                    return Err(CoreError::TooLarge(MAX_ENDPOINTS as u64));
-                }
-                // C16-10. git 원격용은 기기 전체에서 한 키다. 조용히 다른 키를 꺼 버리면
-                // 사용자가 끈 적 없는 설정이 사라지므로, 켜져 있는 키를 알려 주고 거절한다.
-                if endpoint.project_git_enabled {
-                    let other = endpoints
-                        .iter()
-                        .find(|(other, saved)| **other != fingerprint && saved.project_git_enabled)
-                        .map(|(other, _)| other.clone());
-                    if let Some(other) = other {
-                        return Err(CoreError::Conflict(format!(
-                            "git 원격용으로 이미 다른 키({other})가 켜져 있습니다. 그 키를 먼저 끄세요"
-                        )));
-                    }
-                }
-                endpoints.insert(fingerprint.clone(), endpoint);
+    edit_servers(app_data_dir, |servers| {
+        // C16-10. git 원격용은 기기 전체에서 한 서버(한 키)다. 조용히 다른 서버를 꺼 버리면
+        // 사용자가 끈 적 없는 설정이 사라지므로, 켜져 있는 서버를 알려 주고 거절한다.
+        if server.project_git_enabled {
+            if let Some(other) = servers
+                .iter()
+                .find(|saved| saved.id != server.id && saved.project_git_enabled)
+            {
+                return Err(CoreError::Conflict(format!(
+                    "git 원격용으로 이미 다른 서버({})가 켜져 있습니다. 그 서버를 먼저 끄세요",
+                    display_name(other)
+                )));
             }
         }
-        // 지울 항목이 없어도 저장한다. 화면 저장은 저장본이 남는 것 자체가 결과다.
+        match &existing_id {
+            Some(id) => {
+                let slot = servers
+                    .iter_mut()
+                    .find(|saved| &saved.id == id)
+                    .ok_or_else(|| CoreError::NotFound(server_not_found(id)))?;
+                *slot = server.clone();
+            }
+            None => {
+                if servers.len() >= MAX_ENDPOINTS {
+                    return Err(CoreError::TooLarge(MAX_ENDPOINTS as u64));
+                }
+                // 무작위 ID가 겹칠 일은 사실상 없지만, 겹치면 다른 서버를 덮게 되므로 다시 뽑는다.
+                while servers.iter().any(|saved| saved.id == server.id) {
+                    server.id = new_server_id();
+                }
+                servers.push(server.clone());
+            }
+        }
         Ok(true)
     })?;
-    attach_endpoints(&mut snapshot, app_data_dir);
-    Ok(snapshot)
+    crate::ssh_keys::snapshot_with_metadata(home, app_data_dir)
+}
+
+fn delete_ssh_server_with(
+    home: &Path,
+    app_data_dir: &Path,
+    request: &SshServerRef,
+) -> Result<SshKeysSnapshot, CoreError> {
+    let id = validate_server_id(&request.server_id)?.to_owned();
+    edit_servers(app_data_dir, |servers| {
+        let before = servers.len();
+        servers.retain(|saved| saved.id != id);
+        if servers.len() == before {
+            return Err(CoreError::NotFound(server_not_found(&id)));
+        }
+        Ok(true)
+    })?;
+    crate::ssh_keys::snapshot_with_metadata(home, app_data_dir)
+}
+
+/// 실행 경로가 고른 서버와 그 서버가 가리키는 키. 화면이 보낸 값이 아니라 저장본과
+/// `~/.ssh`를 다시 읽어 만든다.
+pub(crate) struct ResolvedServer {
+    pub(crate) server: SshEndpointView,
+    pub(crate) key: SshKeyView,
+}
+
+/// 서버를 고른다. `server_id`가 있으면 그 서버이고, 없으면 예전 호출처럼 지문으로 고르되
+/// 그 키를 쓰는 서버가 정확히 하나일 때만 받는다 — 여럿이면 어느 서버인지 추측하지 않는다.
+/// 둘 다 주어졌는데 서로 다른 키를 가리키면 거절한다.
+pub(crate) fn resolve_server(
+    home: &Path,
+    app_data_dir: &Path,
+    server_id: Option<&str>,
+    fingerprint: &str,
+) -> Result<ResolvedServer, CoreError> {
+    let snapshot = crate::ssh_keys::snapshot_with_metadata(home, app_data_dir)?;
+    let fingerprint = fingerprint.trim();
+    let server = match server_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(id) => {
+            let id = validate_server_id(id)?;
+            let server = snapshot
+                .servers
+                .iter()
+                .find(|saved| saved.id == id)
+                .cloned()
+                .ok_or_else(|| CoreError::NotFound(server_not_found(id)))?;
+            if !fingerprint.is_empty() && validate_fingerprint(fingerprint)? != server.fingerprint {
+                return Err(CoreError::Conflict(
+                    "serverId와 fingerprint가 서로 다른 서버를 가리킵니다".to_owned(),
+                ));
+            }
+            server
+        }
+        None => {
+            let fingerprint = validate_fingerprint(fingerprint)?;
+            let mut matches = snapshot
+                .servers
+                .iter()
+                .filter(|saved| saved.fingerprint == fingerprint);
+            let first = matches.next().cloned().ok_or_else(|| {
+                CoreError::NotFound("이 키에 저장된 연결 서버가 없습니다".to_owned())
+            })?;
+            if matches.next().is_some() {
+                return Err(CoreError::Conflict(
+                    "이 키를 쓰는 연결 서버가 여러 개입니다. serverId로 서버를 고르세요".to_owned(),
+                ));
+            }
+            first
+        }
+    };
+    let key = snapshot
+        .keys
+        .iter()
+        .find(|key| key.fingerprint == server.fingerprint)
+        .cloned()
+        .ok_or_else(|| {
+            CoreError::NotFound(format!(
+                "연결 서버 {}가 쓰는 키(지문 {})를 ~/.ssh에서 찾지 못했습니다. 키를 되돌리거나 서버에 다른 키를 고르세요",
+                display_name(&server),
+                server.fingerprint
+            ))
+        })?;
+    Ok(ResolvedServer { server, key })
+}
+
+/// 키 삭제 영수증에 싣는 "이 키를 쓰던 서버" 이름들. 읽지 못하면 비운다.
+pub(crate) fn servers_using_key(app_data_dir: &Path, fingerprint: &str) -> Vec<String> {
+    load_servers(app_data_dir)
+        .map(|servers| {
+            servers
+                .iter()
+                .filter(|server| server.fingerprint == fingerprint)
+                .map(display_name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 화면·영수증에 쓰는 서버 표기. 이름이 없으면 접속 대상이다.
+pub(crate) fn display_name(server: &SshEndpointView) -> String {
+    if server.name.is_empty() {
+        destination(server)
+    } else {
+        server.name.clone()
+    }
+}
+
+fn server_not_found(id: &str) -> String {
+    format!("연결 서버 {id}를 찾지 못했습니다. 목록을 새로 고친 뒤 다시 고르세요")
+}
+
+fn new_server_id() -> String {
+    format!(
+        "{SERVER_ID_PREFIX}{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    )
+}
+
+/// 예전 저장본을 옮길 때의 ID. 같은 지문은 언제나 같은 ID가 되어, 옮기기가 두 번 돌아도
+/// 승인·터미널이 가리키던 자리가 흔들리지 않는다.
+fn migrated_server_id(fingerprint: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(fingerprint.as_bytes());
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{SERVER_ID_PREFIX}{}", &hex[..12])
+}
+
+pub(crate) fn validate_server_id(value: &str) -> Result<&str, CoreError> {
+    let value = value.trim();
+    let valid = value.starts_with(SERVER_ID_PREFIX)
+        && value.len() > SERVER_ID_PREFIX.len()
+        && value.len() <= MAX_SERVER_ID_CHARS
+        && value.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        });
+    if !valid {
+        return Err(CoreError::InvalidInput(format!(
+            "서버 ID 형식이 아닙니다: {value}"
+        )));
+    }
+    Ok(value)
+}
+
+fn validate_server_name(value: &str) -> Result<&str, CoreError> {
+    let value = value.trim();
+    if value.chars().count() > MAX_SERVER_NAME_CHARS
+        || value.chars().any(|character| character.is_control())
+    {
+        return Err(CoreError::InvalidInput(format!(
+            "서버 이름은 제어문자 없이 {MAX_SERVER_NAME_CHARS}자 이하여야 합니다"
+        )));
+    }
+    Ok(value)
 }
 
 /// 에이전트 실행에 딸린 선택지는 서로 독립된 토글이 아니다. 저장 배선과 분리해
 /// 개인키·에이전트 사용·파일 전송·출력 표시 사이의 의존성을 한 자리에서 검증한다.
 fn validate_endpoint_options(
-    request: &SetSshKeyEndpointRequest,
+    request: &SaveSshServerRequest,
     has_private_key: bool,
 ) -> Result<String, CoreError> {
     // 개인키가 없으면 이 키로는 접속 자체가 되지 않는다. 에이전트에게 켜 주는 순간
@@ -547,13 +803,13 @@ fn require_agent_use(
 
 /// C9-17. 사용자가 승인한 명령 한 줄을 그 서버의 허용 명령 목록 끝에 적는다.
 ///
-/// 화면 편집(`set_ssh_key_endpoint`)이 목록을 통째로 교체하는 것과 달리 여기서는 **한 줄만
+/// 화면 편집(`save_ssh_server`)이 목록을 통째로 교체하는 것과 달리 여기서는 **한 줄만
 /// 덧붙인다**. 통째로 받으면 이미 적혀 있던 규칙을 이 경로가 지울 수 있고, 그것은 사용자가
 /// 승인 카드에서 읽은 결정("이 명령을 추가한다")보다 넓다. 같은 줄이 이미 있으면 아무것도
 /// 바꾸지 않고 `false`를 돌려준다.
 pub(crate) fn append_allowed_command(
     app_data_dir: &Path,
-    fingerprint: &str,
+    server_id: &str,
     command: &str,
 ) -> Result<bool, CoreError> {
     let rule = command.trim();
@@ -562,10 +818,11 @@ pub(crate) fn append_allowed_command(
             "허용 목록에 적을 명령이 비어 있습니다".to_owned(),
         ));
     }
-    edit_endpoints(app_data_dir, |endpoints| {
-        let endpoint = endpoints
-            .get_mut(fingerprint)
-            .ok_or_else(|| CoreError::NotFound("이 키에 저장된 연결 서버가 없습니다".to_owned()))?;
+    edit_servers(app_data_dir, |servers| {
+        let endpoint = servers
+            .iter_mut()
+            .find(|saved| saved.id == server_id)
+            .ok_or_else(|| CoreError::NotFound(server_not_found(server_id)))?;
         if endpoint.allowed_commands.iter().any(|value| value == rule) {
             return Ok(false);
         }
@@ -581,37 +838,37 @@ fn check_ssh_endpoint_with(
     home: &Path,
     app_data_dir: &Path,
     executable: &Path,
-    request: &SshKeyRef,
+    request: &SshServerRef,
 ) -> Result<SshEndpointCheckReceipt, CoreError> {
-    let (_, public_path, view) = resolve_public_key(home, request)?;
-    let endpoint = load_endpoints(app_data_dir)?
-        .remove(&view.fingerprint)
-        .ok_or_else(|| CoreError::NotFound("이 키에 저장된 접속 지점이 없습니다".to_owned()))?;
-    let identity = public_path.with_extension("");
+    let ResolvedServer { server, key } =
+        resolve_server(home, app_data_dir, Some(&request.server_id), "")?;
+    let identity = Path::new(&key.path).with_extension("");
     if !private_key_present(&identity)? {
         return Err(CoreError::Conflict(
             "같은 이름의 개인키가 없어 접속을 확인할 수 없습니다".to_owned(),
         ));
     }
+    let askpass = askpass_for(app_data_dir, &key)?;
 
-    let destination = destination(&endpoint);
+    let destination = destination(&server);
     let identity = identity.to_string_lossy().into_owned();
-    let port = endpoint.port.to_string();
-    let connect_timeout = format!("ConnectTimeout={CHECK_CONNECT_TIMEOUT_SECONDS}");
-    let mut args = connect_args(&identity, &port);
+    let port = server.port.to_string();
+    let mut args = connect_args(&identity, &port, askpass.is_some());
     args.extend([
         "-o".to_owned(),
-        connect_timeout,
-        "-o".to_owned(),
-        "NumberOfPasswordPrompts=0".to_owned(),
-        target(&endpoint),
+        format!("ConnectTimeout={CHECK_CONNECT_TIMEOUT_SECONDS}"),
+        target(&server),
         CHECK_REMOTE_COMMAND.to_owned(),
     ]);
     let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let outcome = crate::cli_interface::run_capped(executable, &borrowed, CHECK_TIMEOUT)?;
+    let env = crate::ssh_askpass::env_of(askpass.as_ref());
+    let outcome =
+        crate::cli_interface::run_capped_with_env(executable, &borrowed, CHECK_TIMEOUT, &env)?;
+    drop(askpass);
 
     Ok(SshEndpointCheckReceipt {
-        fingerprint: view.fingerprint,
+        server_id: server.id,
+        fingerprint: server.fingerprint,
         destination,
         reachable: outcome.success,
         timed_out: outcome.timed_out,
@@ -619,11 +876,45 @@ fn check_ssh_endpoint_with(
     })
 }
 
+/// C9-21. 이 키의 저장된 암호. 암호가 없는 키(보통)는 `None`이고 보안 저장소를 두드리지 않는다.
+pub(crate) fn key_passphrase(
+    app_data_dir: &Path,
+    key: &SshKeyView,
+) -> Result<Option<zeroize::Zeroizing<String>>, CoreError> {
+    if !key.passphrase_saved {
+        return Ok(None);
+    }
+    crate::ssh_askpass::load_passphrase(
+        &crate::ssh_askpass::OsPassphraseVault,
+        app_data_dir,
+        &key.fingerprint,
+    )
+}
+
+/// C9-21. 접속 한 번 동안 열려 있을 askpass 세션. 한 번만 답한다.
+pub(crate) fn askpass_session(
+    passphrase: Option<zeroize::Zeroizing<String>>,
+) -> Result<Option<crate::ssh_askpass::AskpassSession>, CoreError> {
+    passphrase
+        .map(|secret| {
+            crate::ssh_askpass::AskpassSession::start(secret, crate::ssh_askpass::CONNECT_ANSWERS)
+        })
+        .transpose()
+}
+
+/// 키의 암호를 꺼내 바로 세션을 연다. 접속을 한 번만 하는 자리(연결 확인·git)가 쓴다.
+pub(crate) fn askpass_for(
+    app_data_dir: &Path,
+    key: &SshKeyView,
+) -> Result<Option<crate::ssh_askpass::AskpassSession>, CoreError> {
+    askpass_session(key_passphrase(app_data_dir, key)?)
+}
+
 /// C9-19. 사용자가 직접 타이핑하는 대화형 터미널의 실행 사양. `ssh` 실행 파일과 인자만
 /// 담고, 개인키는 경로로만 넘어간다(G4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SshTerminalLaunch {
-    pub fingerprint: String,
+    pub server_id: String,
     pub destination: String,
     pub executable: std::path::PathBuf,
     pub args: Vec<String>,
@@ -637,19 +928,19 @@ pub struct SshTerminalLaunch {
 /// 사용자가 그 창에서 직접 답하는 것이 이 터미널이 있는 이유이기 때문이다.
 pub fn ssh_terminal_launch(
     app_data_dir: &Path,
-    fingerprint: &str,
+    server_id: &str,
 ) -> Result<SshTerminalLaunch, CoreError> {
     let executable = crate::providers::resolve_named_executable(&["ssh"])?;
-    ssh_terminal_launch_with(&home_dir()?, app_data_dir, &executable, fingerprint)
+    ssh_terminal_launch_with(&home_dir()?, app_data_dir, &executable, server_id)
 }
 
 fn ssh_terminal_launch_with(
     home: &Path,
     app_data_dir: &Path,
     executable: &Path,
-    fingerprint: &str,
+    server_id: &str,
 ) -> Result<SshTerminalLaunch, CoreError> {
-    let resolved = resolve_interactive_target(home, app_data_dir, fingerprint)?;
+    let resolved = resolve_interactive_target(home, app_data_dir, server_id)?;
     let mut args = resolved.interactive_args();
     args.push(target(&resolved.endpoint));
     Ok(resolved.launch(executable, args))
@@ -666,22 +957,22 @@ fn ssh_terminal_launch_with(
 /// 같다.
 pub fn ssh_key_install_launch(
     app_data_dir: &Path,
-    fingerprint: &str,
+    server_id: &str,
 ) -> Result<SshTerminalLaunch, CoreError> {
     let executable = crate::providers::resolve_named_executable(&["ssh"])?;
-    ssh_key_install_launch_with(&home_dir()?, app_data_dir, &executable, fingerprint)
+    ssh_key_install_launch_with(&home_dir()?, app_data_dir, &executable, server_id)
 }
 
 fn ssh_key_install_launch_with(
     home: &Path,
     app_data_dir: &Path,
     executable: &Path,
-    fingerprint: &str,
+    server_id: &str,
 ) -> Result<SshTerminalLaunch, CoreError> {
-    let resolved = resolve_interactive_target(home, app_data_dir, fingerprint)?;
+    let resolved = resolve_interactive_target(home, app_data_dir, server_id)?;
     let public_key = crate::ssh_keys::authorized_key_line(
         home,
-        &SshKeyRef {
+        &crate::ssh_keys::SshKeyRef {
             file_name: resolved.file_name.clone(),
             fingerprint: resolved.fingerprint.clone(),
         },
@@ -719,6 +1010,7 @@ fn authorized_keys_command(public_key: &str) -> String {
 /// 대화형 실행 두 갈래가 공통으로 요구하는 것: 목록에 있는 키, 저장된 연결 서버, 그리고
 /// 같은 이름의 개인키.
 struct InteractiveTarget {
+    server_id: String,
     fingerprint: String,
     file_name: String,
     endpoint: SshEndpointView,
@@ -744,7 +1036,7 @@ impl InteractiveTarget {
     fn launch(self, executable: &Path, args: Vec<String>) -> SshTerminalLaunch {
         SshTerminalLaunch {
             destination: destination(&self.endpoint),
-            fingerprint: self.fingerprint,
+            server_id: self.server_id,
             executable: executable.to_path_buf(),
             args,
         }
@@ -754,21 +1046,9 @@ impl InteractiveTarget {
 fn resolve_interactive_target(
     home: &Path,
     app_data_dir: &Path,
-    fingerprint: &str,
+    server_id: &str,
 ) -> Result<InteractiveTarget, CoreError> {
-    let fingerprint = validate_fingerprint(fingerprint)?.to_owned();
-    let snapshot = crate::ssh_keys::snapshot_with_metadata(home, app_data_dir)?;
-    let key = snapshot
-        .keys
-        .iter()
-        .find(|key| key.fingerprint == fingerprint)
-        .ok_or_else(|| {
-            CoreError::NotFound("이 지문의 공개키를 ~/.ssh에서 찾지 못했습니다".to_owned())
-        })?;
-    let endpoint = key
-        .endpoint
-        .clone()
-        .ok_or_else(|| CoreError::NotFound("이 키에 저장된 연결 서버가 없습니다".to_owned()))?;
+    let ResolvedServer { server, key } = resolve_server(home, app_data_dir, Some(server_id), "")?;
     let identity = Path::new(&key.path).with_extension("");
     if !private_key_present(&identity)? {
         return Err(CoreError::Conflict(
@@ -776,9 +1056,10 @@ fn resolve_interactive_target(
         ));
     }
     Ok(InteractiveTarget {
-        fingerprint,
+        server_id: server.id.clone(),
+        fingerprint: key.fingerprint.clone(),
         file_name: key.file_name.clone(),
-        endpoint,
+        endpoint: server,
         identity,
     })
 }
@@ -790,17 +1071,31 @@ fn list_agent_ssh_endpoints_with(
     let snapshot = crate::ssh_keys::snapshot_with_metadata(home, app_data_dir)?;
     let mut endpoints = Vec::new();
     let mut skipped = Vec::new();
-    let mut listed = BTreeSet::new();
-    for key in &snapshot.keys {
-        let Some(endpoint) = key.endpoint.as_ref().filter(|value| value.agent_enabled) else {
+    for server in snapshot
+        .servers
+        .iter()
+        .filter(|server| server.agent_enabled)
+    {
+        let skip = |reason: &str| AgentSshEndpointSkip {
+            server_id: server.id.clone(),
+            name: server.name.clone(),
+            fingerprint: server.fingerprint.clone(),
+            reason: reason.to_owned(),
+        };
+        // 키가 지워졌는데 서버만 남은 항목도 조용히 빼지 않는다. 사용자는 켜 두었다고
+        // 알고 있으므로, 왜 안 보이는지 함께 말해야 설정 화면을 다시 열 수 있다.
+        let Some(key) = snapshot
+            .keys
+            .iter()
+            .find(|key| key.fingerprint == server.fingerprint)
+        else {
+            skipped.push(skip("이 서버가 쓰는 키의 공개키가 ~/.ssh에 없습니다"));
             continue;
         };
-        listed.insert(key.fingerprint.clone());
         if !key.has_private_key {
-            skipped.push(AgentSshEndpointSkip {
-                fingerprint: key.fingerprint.clone(),
-                reason: "같은 이름의 개인키가 없어 이 키로는 접속할 수 없습니다".to_owned(),
-            });
+            skipped.push(skip(
+                "같은 이름의 개인키가 없어 이 키로는 접속할 수 없습니다",
+            ));
             continue;
         }
         let identity_path = Path::new(&key.path)
@@ -812,86 +1107,111 @@ fn list_agent_ssh_endpoints_with(
             .strip_suffix(".pub")
             .unwrap_or(&key.file_name)
             .to_owned();
-        let mut ssh_args = connect_args(&identity_path, &endpoint.port.to_string());
-        ssh_args.push(target(endpoint));
+        // C9-21. 암호가 걸린 키는 에이전트 셸에서 직접 열 수 없다. 접속 인자를 내주지 않고
+        // 앱 경유 실행만 남긴다 — 암호가 에이전트 환경에 들어갈 길을 만들지 않는다.
+        let passphrase_protected = key.passphrase_saved;
+        let ssh_args = if passphrase_protected {
+            Vec::new()
+        } else {
+            let mut args = connect_args(&identity_path, &server.port.to_string(), false);
+            args.push(target(server));
+            args
+        };
         endpoints.push(AgentSshEndpointView {
+            server_id: server.id.clone(),
+            name: server.name.clone(),
             fingerprint: key.fingerprint.clone(),
             key_file_name,
             identity_path,
-            host: endpoint.host.clone(),
-            port: endpoint.port,
-            user: endpoint.user.clone(),
+            host: server.host.clone(),
+            port: server.port,
+            user: server.user.clone(),
             note: key.note.clone(),
-            destination: destination(endpoint),
-            ssh_command: ssh_command(&ssh_args),
+            destination: destination(server),
+            ssh_command: if ssh_args.is_empty() {
+                String::new()
+            } else {
+                ssh_command(&ssh_args)
+            },
             ssh_args,
-            command_policy_mode: endpoint.command_policy_mode(),
-            allowed_commands: endpoint.allowed_commands.clone(),
-            denied_commands: endpoint.denied_commands.clone(),
-            file_transfer_enabled: endpoint.file_transfer_enabled,
-            transfer_root: endpoint.transfer_root.clone(),
-            terminal_enabled: endpoint.terminal_enabled,
-            unrestricted_commands: endpoint.unrestricted_commands,
-            relay_args: relay_args(&key.fingerprint),
+            command_policy_mode: server.command_policy_mode(),
+            allowed_commands: server.allowed_commands.clone(),
+            denied_commands: server.denied_commands.clone(),
+            file_transfer_enabled: server.file_transfer_enabled,
+            transfer_root: server.transfer_root.clone(),
+            terminal_enabled: server.terminal_enabled,
+            passphrase_protected,
+            unrestricted_commands: server.unrestricted_commands,
+            relay_args: relay_args(&server.id),
         });
     }
 
-    // 키가 지워졌는데 저장본만 남은 항목도 조용히 빼지 않는다. 사용자는 켜 두었다고
-    // 알고 있으므로, 왜 안 보이는지 함께 말해야 설정 화면을 다시 열 수 있다.
-    for (fingerprint, endpoint) in load_endpoints(app_data_dir)? {
-        if endpoint.agent_enabled && !listed.contains(&fingerprint) {
-            skipped.push(AgentSshEndpointSkip {
-                fingerprint,
-                reason: "이 지문의 공개키가 ~/.ssh에 없습니다".to_owned(),
-            });
-        }
-    }
-
     Ok(AgentSshEndpointsView {
-        schema_version: ENDPOINTS_VERSION,
+        schema_version: AGENT_LISTING_VERSION,
         endpoints,
         skipped,
         issues: snapshot.issues,
     })
 }
 
-/// 엔드포인트 표도 메모와 같은 지문별 사이드카다. 잠금·저장·이어 붙이기 배선은
-/// [`FingerprintSidecar`]가 갖고, 여기서는 담는 값과 문구만 준다.
-impl FingerprintSidecar for SshEndpointStore {
-    type Value = SshEndpointView;
-    const STORE: JsonStore = ENDPOINTS_STORE;
-    const ATTACH_FAILURE: &'static str =
-        "SSH 엔드포인트 설정을 읽지 못해 접속 지점 없이 표시합니다";
-
-    fn table_mut(&mut self) -> &mut BTreeMap<String, SshEndpointView> {
-        &mut self.endpoints
-    }
-
-    fn into_table(self) -> BTreeMap<String, SshEndpointView> {
-        self.endpoints
+/// 저장된 서버 전체를 키 목록 스냅샷에 붙인다. 읽지 못해도 키 목록은 보여 줘야 하므로
+/// 실패는 issues로만 알린다.
+pub(crate) fn attach_servers(snapshot: &mut SshKeysSnapshot, app_data_dir: &Path) {
+    match load_servers(app_data_dir) {
+        Ok(servers) => snapshot.servers = servers,
+        Err(error) => snapshot.issues.push(SshKeyIssue {
+            path: SERVERS_STORE
+                .path(app_data_dir)
+                .to_string_lossy()
+                .into_owned(),
+            message: format!("SSH 연결 서버 설정을 읽지 못해 서버 없이 표시합니다: {error}"),
+        }),
     }
 }
 
-pub(crate) fn attach_endpoints(snapshot: &mut SshKeysSnapshot, app_data_dir: &Path) {
-    attach_sidecar::<SshEndpointStore>(snapshot, app_data_dir, |key, endpoint| {
-        key.endpoint = endpoint;
-    });
+/// 서버 저장본을 잠근 채 읽는다. 아직 없고 예전 지문별 저장본이 있으면 이 자리에서 한 번
+/// 옮겨 적는다. 예전 파일은 지우지 않는다 — 옮긴 결과가 이상하면 그대로 되돌아갈 수 있다.
+fn load_servers_unlocked(app_data_dir: &Path) -> Result<SshServerStore, CoreError> {
+    if SERVERS_STORE.path(app_data_dir).exists() || !ENDPOINTS_STORE.path(app_data_dir).exists() {
+        return SERVERS_STORE.load_unlocked(app_data_dir);
+    }
+    let legacy: SshEndpointStore = ENDPOINTS_STORE.read(app_data_dir)?;
+    let servers = legacy
+        .endpoints
+        .into_iter()
+        .map(|(fingerprint, mut endpoint)| {
+            endpoint.id = migrated_server_id(&fingerprint);
+            endpoint.name = String::new();
+            endpoint.fingerprint = fingerprint;
+            endpoint
+        })
+        .collect();
+    let store = SshServerStore {
+        schema_version: SERVERS_VERSION,
+        servers,
+    };
+    SERVERS_STORE.save_unlocked(app_data_dir, &store)?;
+    Ok(store)
 }
 
-/// 키가 사라지면 그 접속 지점도 가리킬 대상이 없다. 메모와 같은 시점에 함께 지운다.
-pub(crate) fn remove_endpoint(app_data_dir: &Path, fingerprint: &str) -> Result<bool, CoreError> {
-    remove_from_sidecar::<SshEndpointStore>(app_data_dir, fingerprint)
-}
-
-fn edit_endpoints(
+fn edit_servers(
     app_data_dir: &Path,
-    edit: impl FnOnce(&mut BTreeMap<String, SshEndpointView>) -> Result<bool, CoreError>,
+    edit: impl FnOnce(&mut Vec<SshEndpointView>) -> Result<bool, CoreError>,
 ) -> Result<bool, CoreError> {
-    edit_sidecar::<SshEndpointStore>(app_data_dir, edit)
+    SERVERS_STORE.with_lock(app_data_dir, || {
+        let mut store = load_servers_unlocked(app_data_dir)?;
+        let changed = edit(&mut store.servers)?;
+        if changed {
+            SERVERS_STORE.save_unlocked(app_data_dir, &store)?;
+        }
+        Ok(changed)
+    })
 }
 
-fn load_endpoints(app_data_dir: &Path) -> Result<BTreeMap<String, SshEndpointView>, CoreError> {
-    load_sidecar::<SshEndpointStore>(app_data_dir)
+fn load_servers(app_data_dir: &Path) -> Result<Vec<SshEndpointView>, CoreError> {
+    SERVERS_STORE.with_lock(app_data_dir, || {
+        Ok(load_servers_unlocked(app_data_dir)?.servers)
+    })
 }
 
 /// C16-10. 프로젝트 git의 네트워크 작업이 쓸 신원 하나.
@@ -901,6 +1221,29 @@ pub(crate) struct ProjectGitIdentity {
     pub(crate) identity_path: String,
     /// `GIT_SSH_COMMAND`에 넣을 값. git이 셸 없이 자기 분해기로 나누므로 경로를 따옴표로 감싼다.
     pub(crate) ssh_command: String,
+    /// C9-21. 키에 암호가 걸려 있으면 이 호출 동안 열려 있는 askpass 세션. git이 띄우는 `ssh`가
+    /// 환경을 물려받아 암호를 받는다.
+    pub(crate) askpass: Option<std::sync::Arc<crate::ssh_askpass::AskpassSession>>,
+}
+
+impl ProjectGitIdentity {
+    /// git 호출 하나에 얹을 환경.
+    pub(crate) fn env(&self) -> Vec<(String, String)> {
+        let mut env = vec![("GIT_SSH_COMMAND".to_owned(), self.ssh_command.clone())];
+        if let Some(session) = &self.askpass {
+            env.extend(session.env());
+        }
+        env
+    }
+}
+
+/// C16-11. "git 원격용"을 켜 둔 서버가 있는가. 키를 열지도, 암호를 꺼내지도 않는다 — 형상관리
+/// 개요가 원격마다 인증 수단을 매길 때 화면을 새로 고칠 때마다 부르는 자리다. 읽지 못하면 없는
+/// 것으로 본다.
+pub(crate) fn project_git_key_enabled(app_data_dir: &Path) -> bool {
+    load_servers(app_data_dir)
+        .map(|servers| servers.iter().any(|server| server.project_git_enabled))
+        .unwrap_or(false)
 }
 
 /// C16-10. "git 원격용"을 켜 둔 키가 있으면 그 신원을 만들어 준다.
@@ -917,21 +1260,18 @@ fn project_git_identity_with(
     home: &Path,
     app_data_dir: &Path,
 ) -> Result<Option<ProjectGitIdentity>, CoreError> {
-    // 켜 둔 키가 없는 것이 보통이므로 앱 데이터 한 번만 읽고 끝낸다. `~/.ssh` 훑기는
-    // 실제로 켜 둔 키가 있을 때만 치른다.
-    let endpoints = load_endpoints(app_data_dir)?;
-    if !endpoints
-        .values()
-        .any(|endpoint| endpoint.project_git_enabled)
-    {
+    // 켜 둔 서버가 없는 것이 보통이므로 앱 데이터 한 번만 읽고 끝낸다. `~/.ssh` 훑기는
+    // 실제로 켜 둔 서버가 있을 때만 치른다.
+    let servers = load_servers(app_data_dir)?;
+    let Some(server) = servers.iter().find(|server| server.project_git_enabled) else {
         return Ok(None);
-    }
+    };
     let snapshot = crate::ssh_keys::snapshot_with_metadata(home, app_data_dir)?;
-    let Some(key) = snapshot.keys.iter().find(|key| {
-        key.endpoint
-            .as_ref()
-            .is_some_and(|endpoint| endpoint.project_git_enabled)
-    }) else {
+    let Some(key) = snapshot
+        .keys
+        .iter()
+        .find(|key| key.fingerprint == server.fingerprint)
+    else {
         return Ok(None);
     };
     if !key.has_private_key {
@@ -943,10 +1283,25 @@ fn project_git_identity_with(
     }
     let identity_path = identity.to_string_lossy().into_owned();
     let executable = crate::providers::resolve_named_executable(&["ssh"])?;
-    let ssh_command = ssh_command_line(&executable.to_string_lossy(), &identity_path)?;
+    // 암호를 꺼내지 못한 것은 "신원 없음"과 다르다. 조용히 git 기본 신원으로 붙으면 사용자는
+    // 엉뚱한 인증 실패만 본다 — 읽을 수 있는 이유를 그대로 올린다(git 경로는 Conflict를
+    // 삼키지 않는다).
+    let askpass = askpass_for(app_data_dir, key)
+        .map_err(|error| {
+            CoreError::Conflict(format!(
+                "git 원격용 키의 암호를 꺼내지 못했습니다. 애드온 → SSH에서 암호를 다시 저장하세요: {error}"
+            ))
+        })?
+        .map(std::sync::Arc::new);
+    let ssh_command = ssh_command_line(
+        &executable.to_string_lossy(),
+        &identity_path,
+        askpass.is_some(),
+    )?;
     Ok(Some(ProjectGitIdentity {
         identity_path,
         ssh_command,
+        askpass,
     }))
 }
 
@@ -955,7 +1310,11 @@ fn project_git_identity_with(
 /// 되지 않도록 작은따옴표로 감싼다. 그 안에서 무력해지지 않는 것은 작은따옴표 자신뿐이라
 /// 그것과 제어문자만 거절하면 된다 — 조용히 잘린 인자를 넘기는 것보다 켜는 자리에서
 /// 실패하는 편이 낫다(G9).
-fn ssh_command_line(executable: &str, identity_path: &str) -> Result<String, CoreError> {
+fn ssh_command_line(
+    executable: &str,
+    identity_path: &str,
+    locked: bool,
+) -> Result<String, CoreError> {
     for value in [executable, identity_path] {
         if value.contains('\'') || value.chars().any(char::is_control) {
             return Err(CoreError::InvalidInput(
@@ -964,39 +1323,61 @@ fn ssh_command_line(executable: &str, identity_path: &str) -> Result<String, Cor
             ));
         }
     }
-    Ok(format!(
-        "'{executable}' -i '{identity_path}' -o IdentitiesOnly=yes -o BatchMode=yes"
-    ))
+    let mut line = format!("'{executable}' -i '{identity_path}'");
+    for option in auth_options(locked) {
+        line.push_str(" -o ");
+        line.push_str(&option);
+    }
+    Ok(line)
 }
 
 /// 모든 접속에 공통으로 붙는 인자. 저장한 키만 쓰게 하고(`IdentitiesOnly`), 어떤 경로에서도
-/// 암호 프롬프트로 멈추지 않게 한다(`BatchMode`).
-pub(crate) fn connect_args(identity: &str, port: &str) -> Vec<String> {
-    transport_args(identity, "-p", port)
+/// 사람에게 묻는 프롬프트로 멈추지 않게 한다. `locked`는 C9-21 암호 키다.
+pub(crate) fn connect_args(identity: &str, port: &str, locked: bool) -> Vec<String> {
+    transport_args(identity, "-p", port, locked)
 }
 
 /// `scp`에 붙는 공통 인자. `ssh`와 같은 뜻이지만 포트 플래그가 `-P`로 다르다.
-pub(crate) fn scp_args(identity: &str, port: &str) -> Vec<String> {
-    transport_args(identity, "-P", port)
+pub(crate) fn scp_args(identity: &str, port: &str, locked: bool) -> Vec<String> {
+    transport_args(identity, "-P", port, locked)
 }
 
 /// 두 인자 벌의 실체. 포트 플래그만 다르므로 그것만 받는다.
-fn transport_args(identity: &str, port_flag: &str, port: &str) -> Vec<String> {
-    vec![
+fn transport_args(identity: &str, port_flag: &str, port: &str, locked: bool) -> Vec<String> {
+    let mut args = vec![
         "-i".to_owned(),
         identity.to_owned(),
         port_flag.to_owned(),
         port.to_owned(),
-        "-o".to_owned(),
-        "IdentitiesOnly=yes".to_owned(),
-        "-o".to_owned(),
-        "BatchMode=yes".to_owned(),
-    ]
+    ];
+    for option in auth_options(locked) {
+        args.push("-o".to_owned());
+        args.push(option);
+    }
+    args
 }
 
-/// 인벤토리 항목에 붙어 있는 저장된 엔드포인트. 실행 경로가 저장본을 다시 읽을 때 쓴다.
-pub(crate) fn endpoint_of(key: &SshKeyView) -> Option<SshEndpointView> {
-    key.endpoint.clone()
+/// 인증 옵션. 암호 없는 키는 `BatchMode`로 어떤 질문도 받지 않는다.
+///
+/// C9-21. 암호 키는 `BatchMode`를 켜면 askpass까지 막히므로 끄되, 질문이 키 암호 하나만 남게
+/// 좁힌다 — 공개키 인증만 쓰고(비밀번호·키보드 대화형 인증 끔) 암호 질문은 한 번이다. 이
+/// 옵션들은 다른 옵션보다 **앞에** 놓인다. `ssh`는 같은 옵션의 첫 값을 쓰므로, 뒤에 붙는
+/// `NumberOfPasswordPrompts=0`이 암호 질문을 다시 막지 못한다. 호스트 키 확인 질문은
+/// askpass가 답하지 않으므로(키 암호 질문이 아니다) 예전처럼 실패로 끝난다.
+fn auth_options(locked: bool) -> Vec<String> {
+    let options: &[&str] = if locked {
+        &[
+            "IdentitiesOnly=yes",
+            "BatchMode=no",
+            "PreferredAuthentications=publickey",
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+            "NumberOfPasswordPrompts=1",
+        ]
+    } else {
+        &["IdentitiesOnly=yes", "BatchMode=yes"]
+    };
+    options.iter().map(|value| (*value).to_owned()).collect()
 }
 
 /// `ssh`가 받는 목적지. IPv6 리터럴은 대괄호로 감싸야 사용자 이름과 구분된다.
@@ -1016,12 +1397,12 @@ pub(crate) fn destination(endpoint: &SshEndpointView) -> String {
 /// 스킬이 그대로 붙여 넣을 수 있는 한 줄. 홈 경로에 공백이 있어도 깨지지 않게 인용한다.
 /// C9-18. 터미널 표시가 켜진 서버에서 스킬이 `ssh` 대신 쓰는 경유 실행 인자. `<CLI>`와
 /// 접두사 뒤에 붙이고, 마지막 `--` 뒤에 원격 명령 단어를 그대로 이어 붙인다.
-pub(crate) fn relay_args(fingerprint: &str) -> Vec<String> {
+pub(crate) fn relay_args(server_id: &str) -> Vec<String> {
     vec![
         "ssh".to_owned(),
         "exec".to_owned(),
-        "--fingerprint".to_owned(),
-        fingerprint.to_owned(),
+        "--server".to_owned(),
+        server_id.to_owned(),
         "--".to_owned(),
     ]
 }
@@ -1242,9 +1623,12 @@ fn parse_list_args(args: impl Iterator<Item = String>) -> Result<std::path::Path
 /// 어느 대화에서 왔는지 안다. 없으면 출력은 흐르지 않고 실행만 된다.
 pub const RELAY_CHAT_ID_ENV: &str = "AGENT_MANAGER_CHAT_ID";
 
-/// `<CLI> ssh exec --fingerprint <지문> [--timeout <초>] [--app-data-dir <경로>] -- <명령…>`
+/// `<CLI> ssh exec --server <서버 ID> [--timeout <초>] [--app-data-dir <경로>] -- <명령…>`
+///
+/// 예전 스킬이 쓰던 `--fingerprint <지문>`도 받는다. 그 키를 쓰는 서버가 하나일 때만 실행된다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SshExecCliOptions {
+    pub(crate) server_id: Option<String>,
     pub(crate) fingerprint: String,
     pub(crate) command: String,
     pub(crate) timeout_seconds: Option<u64>,
@@ -1264,12 +1648,14 @@ impl SshExecCliOptions {
         chat_id: Option<String>,
     ) -> Result<Self, CoreError> {
         let mut args = FlagArgs::new(args);
+        let mut server_id = None;
         let mut fingerprint = None;
         let mut timeout_seconds = None;
         let mut app_data_dir = None;
         let mut command_words: Option<Vec<String>> = None;
         while let Some(flag) = args.next_flag() {
             match flag.as_str() {
+                "--server" => server_id = Some(args.value("--server")?),
                 "--fingerprint" => fingerprint = Some(args.value("--fingerprint")?),
                 "--timeout" => {
                     let raw = args.value("--timeout")?;
@@ -1289,9 +1675,12 @@ impl SshExecCliOptions {
                 }
             }
         }
-        let fingerprint = fingerprint.ok_or_else(|| {
-            CoreError::InvalidInput("--fingerprint <지문>이 필요합니다".to_owned())
-        })?;
+        if server_id.is_none() && fingerprint.is_none() {
+            return Err(CoreError::InvalidInput(
+                "--server <서버 ID>가 필요합니다".to_owned(),
+            ));
+        }
+        let fingerprint = fingerprint.unwrap_or_default();
         let command = command_words
             .filter(|words| !words.is_empty())
             .map(|words| words.join(" "))
@@ -1301,6 +1690,7 @@ impl SshExecCliOptions {
                 )
             })?;
         Ok(Self {
+            server_id,
             fingerprint,
             command,
             timeout_seconds,
@@ -1314,56 +1704,91 @@ impl SshExecCliOptions {
 /// 실시간 출력이 모두 백엔드에 있고, 백엔드가 없으면 실행하지 않는다(그때는 스킬이 `ssh`를
 /// 직접 쓰는 경로로 돌아가는 대신 사용자에게 앱 실행을 요청한다).
 fn relay_ssh_command(options: &SshExecCliOptions) -> Result<serde_json::Value, CoreError> {
-    let pointer = crate::system_skills::read_session_read_cli_pointer(&options.app_data_dir)?;
-    let port = pointer.backend_port.ok_or_else(|| {
-        CoreError::Conflict(
-            "Agent Manager 백엔드가 포트를 남기지 않은 예전 버전입니다. 앱을 다시 시작한 뒤 시도하세요".to_owned(),
-        )
-    })?;
     let timeout_seconds = options
         .timeout_seconds
         .unwrap_or(crate::ssh_exec::DEFAULT_COMMAND_TIMEOUT_SECONDS)
         .min(crate::ssh_exec::MAX_COMMAND_TIMEOUT_SECONDS);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(timeout_seconds.saturating_add(30)))
-        .build()
-        .map_err(|error| {
-            CoreError::Runtime(format!("HTTP 클라이언트를 만들지 못했습니다: {error}"))
-        })?;
     let body = serde_json::json!({
         "request": {
+            "serverId": options.server_id,
             "fingerprint": options.fingerprint,
             "command": options.command,
             "timeoutSeconds": options.timeout_seconds,
         },
         "chatId": options.chat_id,
     });
-    let response = client
-        .post(format!("http://127.0.0.1:{port}/api/invoke/relay_ssh_command"))
-        .json(&body)
-        .send()
-        .map_err(|error| {
-            CoreError::Conflict(format!(
-                "Agent Manager 백엔드(127.0.0.1:{port})에 연결하지 못했습니다. 앱이 실행 중인지 확인하세요: {error}"
-            ))
-        })?;
-    let status = response.status();
-    let value: serde_json::Value = response
-        .json()
-        .map_err(|error| CoreError::Runtime(format!("백엔드 응답을 읽지 못했습니다: {error}")))?;
-    if !status.is_success() {
-        let message = value
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("백엔드가 요청을 거절했습니다");
-        return Err(CoreError::Conflict(message.to_owned()));
+    crate::chat_secret_cli::relay_to_backend(
+        &options.app_data_dir,
+        "relay_ssh_command",
+        &body,
+        Duration::from_secs(timeout_seconds.saturating_add(30)),
+    )
+}
+
+/// 예전 "키 하나에 접속 지점 하나" 모양으로 쓰인 시험을 그대로 돌리는 심. 같은 지문의
+/// 서버가 있으면 그 서버를 고치고, 호스트가 비면 그 서버를 지운다.
+#[cfg(test)]
+pub(crate) type SetSshKeyEndpointRequest = SaveSshServerRequest;
+
+#[cfg(test)]
+pub(crate) fn set_ssh_key_endpoint_for_test(
+    home: &Path,
+    app_data_dir: &Path,
+    request: &SaveSshServerRequest,
+) -> Result<SshKeysSnapshot, CoreError> {
+    let existing = load_servers(app_data_dir)?
+        .into_iter()
+        .find(|server| server.fingerprint == request.fingerprint)
+        .map(|server| server.id);
+    if request.host.trim().is_empty() {
+        if let Some(server_id) = existing {
+            return delete_ssh_server_with(home, app_data_dir, &SshServerRef { server_id });
+        }
+        return crate::ssh_keys::snapshot_with_metadata(home, app_data_dir);
     }
-    Ok(value)
+    let mut request = request.clone();
+    request.id = existing;
+    save_ssh_server_with(home, app_data_dir, &request)
+}
+
+/// 시험이 "이 키의 서버"를 꺼내는 자리. 키 하나에 서버 하나인 시험에서만 쓴다.
+#[cfg(test)]
+pub(crate) fn endpoint_for_key<'a>(
+    snapshot: &'a SshKeysSnapshot,
+    fingerprint: &str,
+) -> Option<&'a SshEndpointView> {
+    snapshot
+        .servers
+        .iter()
+        .find(|server| server.fingerprint == fingerprint)
+}
+
+#[cfg(test)]
+fn load_endpoints_for_test(
+    app_data_dir: &Path,
+) -> Result<BTreeMap<String, SshEndpointView>, CoreError> {
+    Ok(load_servers(app_data_dir)?
+        .into_iter()
+        .map(|server| (server.fingerprint.clone(), server))
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 시험이 "이 키의 서버 ID"를 얻는 자리. 서버가 아직 없으면 없는 ID를 돌려준다.
+    fn sid(app_data_dir: &Path, fingerprint: &str) -> String {
+        load_servers(app_data_dir)
+            .ok()
+            .and_then(|servers| {
+                servers
+                    .into_iter()
+                    .find(|server| server.fingerprint == fingerprint)
+            })
+            .map(|server| server.id)
+            .unwrap_or_else(|| "srv-missing".to_owned())
+    }
     use std::fs;
 
     use base64::engine::general_purpose::STANDARD;
@@ -1402,6 +1827,8 @@ mod tests {
 
     fn request(fingerprint: &str, agent_enabled: bool) -> SetSshKeyEndpointRequest {
         SetSshKeyEndpointRequest {
+            id: None,
+            name: String::new(),
             fingerprint: fingerprint.to_owned(),
             host: "build.example.com".to_owned(),
             port: Some(2222),
@@ -1425,10 +1852,14 @@ mod tests {
         let fingerprint = fixture(home.path(), true);
         let before = fs::read_to_string(home.path().join(".ssh/id_example.pub")).expect("read");
 
-        let snapshot =
-            set_ssh_key_endpoint_with(home.path(), app_data.path(), &request(&fingerprint, true))
-                .expect("save");
-        let endpoint = snapshot.keys[0].endpoint.as_ref().expect("endpoint");
+        let snapshot = set_ssh_key_endpoint_for_test(
+            home.path(),
+            app_data.path(),
+            &request(&fingerprint, true),
+        )
+        .expect("save");
+        let endpoint =
+            endpoint_for_key(&snapshot, &snapshot.keys[0].fingerprint).expect("endpoint");
         assert_eq!(endpoint.host, "build.example.com");
         assert_eq!(endpoint.port, 2222);
         assert_eq!(endpoint.user, "deploy");
@@ -1437,13 +1868,15 @@ mod tests {
             fs::read_to_string(home.path().join(".ssh/id_example.pub")).expect("read"),
             before
         );
-        assert!(app_data.path().join(ENDPOINTS_STORE.file).is_file());
+        assert!(app_data.path().join(SERVERS_STORE.file).is_file());
 
         // 호스트를 비우면 저장본에서 사라진다.
-        let cleared = set_ssh_key_endpoint_with(
+        let cleared = set_ssh_key_endpoint_for_test(
             home.path(),
             app_data.path(),
             &SetSshKeyEndpointRequest {
+                id: None,
+                name: String::new(),
                 fingerprint: fingerprint.clone(),
                 host: "   ".to_owned(),
                 port: None,
@@ -1459,8 +1892,10 @@ mod tests {
             },
         )
         .expect("clear");
-        assert!(cleared.keys[0].endpoint.is_none());
-        assert!(load_endpoints(app_data.path()).expect("load").is_empty());
+        assert!(endpoint_for_key(&cleared, &cleared.keys[0].fingerprint).is_none());
+        assert!(load_endpoints_for_test(app_data.path())
+            .expect("load")
+            .is_empty());
     }
 
     /// C9-9. 목록에 없는 지문, 옵션처럼 읽히는 호스트, 개인키 없는 키의 에이전트 사용은
@@ -1471,7 +1906,7 @@ mod tests {
         let app_data = tempfile::tempdir().expect("app data");
         let fingerprint = fixture(home.path(), false);
 
-        assert!(set_ssh_key_endpoint_with(
+        assert!(set_ssh_key_endpoint_for_test(
             home.path(),
             app_data.path(),
             &request("SHA256:ZZZZ", false),
@@ -1487,19 +1922,20 @@ mod tests {
         assert_eq!(validate_port(None).expect("default"), DEFAULT_SSH_PORT);
 
         // 개인키가 없으면 에이전트 사용은 켤 수 없지만, 접속 지점 저장 자체는 된다.
-        assert!(set_ssh_key_endpoint_with(
+        assert!(set_ssh_key_endpoint_for_test(
             home.path(),
             app_data.path(),
             &request(&fingerprint, true),
         )
         .is_err());
-        let snapshot =
-            set_ssh_key_endpoint_with(home.path(), app_data.path(), &request(&fingerprint, false))
-                .expect("save");
+        let snapshot = set_ssh_key_endpoint_for_test(
+            home.path(),
+            app_data.path(),
+            &request(&fingerprint, false),
+        )
+        .expect("save");
         assert!(
-            !snapshot.keys[0]
-                .endpoint
-                .as_ref()
+            !endpoint_for_key(&snapshot, &snapshot.keys[0].fingerprint)
                 .expect("endpoint")
                 .agent_enabled
         );
@@ -1515,14 +1951,14 @@ mod tests {
         let off = list_agent_ssh_endpoints_with(home.path(), app_data.path()).expect("list");
         assert!(off.endpoints.is_empty() && off.skipped.is_empty());
 
-        set_ssh_key_endpoint_with(home.path(), app_data.path(), &request(&fingerprint, false))
+        set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &request(&fingerprint, false))
             .expect("save");
         assert!(list_agent_ssh_endpoints_with(home.path(), app_data.path())
             .expect("list")
             .endpoints
             .is_empty());
 
-        set_ssh_key_endpoint_with(home.path(), app_data.path(), &request(&fingerprint, true))
+        set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &request(&fingerprint, true))
             .expect("save");
         let view = list_agent_ssh_endpoints_with(home.path(), app_data.path()).expect("list");
         assert_eq!(view.endpoints.len(), 1);
@@ -1558,15 +1994,14 @@ mod tests {
 
         let mut off = request(&fingerprint, false);
         off.terminal_enabled = true;
-        assert!(set_ssh_key_endpoint_with(home.path(), app_data.path(), &off).is_err());
+        assert!(set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &off).is_err());
 
         let mut on = request(&fingerprint, true);
         on.terminal_enabled = true;
-        let snapshot = set_ssh_key_endpoint_with(home.path(), app_data.path(), &on).expect("save");
+        let snapshot =
+            set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &on).expect("save");
         assert!(
-            snapshot.keys[0]
-                .endpoint
-                .as_ref()
+            endpoint_for_key(&snapshot, &snapshot.keys[0].fingerprint)
                 .expect("endpoint")
                 .terminal_enabled
         );
@@ -1576,7 +2011,7 @@ mod tests {
         assert!(entry.terminal_enabled);
         assert_eq!(
             entry.relay_args,
-            vec!["ssh", "exec", "--fingerprint", fingerprint.as_str(), "--"]
+            vec!["ssh", "exec", "--server", entry.server_id.as_str(), "--"]
         );
 
         // 필드가 없는 예전 저장본은 꺼진 것으로 읽힌다.
@@ -1597,12 +2032,14 @@ mod tests {
 
         let mut off = request(&fingerprint, false);
         off.unrestricted_commands = true;
-        assert!(set_ssh_key_endpoint_with(home.path(), app_data.path(), &off).is_err());
+        assert!(set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &off).is_err());
 
         let mut on = request(&fingerprint, true);
         on.unrestricted_commands = true;
-        let snapshot = set_ssh_key_endpoint_with(home.path(), app_data.path(), &on).expect("save");
-        let endpoint = snapshot.keys[0].endpoint.as_ref().expect("endpoint");
+        let snapshot =
+            set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &on).expect("save");
+        let endpoint =
+            endpoint_for_key(&snapshot, &snapshot.keys[0].fingerprint).expect("endpoint");
         assert!(endpoint.unrestricted_commands);
         // 허용 목록이 그대로 남아 있어도 모드는 무제한이다 — 토글을 끄면 그 목록으로 돌아온다.
         assert!(!endpoint.allowed_commands.is_empty());
@@ -1644,14 +2081,17 @@ mod tests {
         let mut bare_request = request(&bare, false);
         bare_request.project_git_enabled = true;
         assert!(
-            set_ssh_key_endpoint_with(bare_home.path(), bare_app.path(), &bare_request).is_err()
+            set_ssh_key_endpoint_for_test(bare_home.path(), bare_app.path(), &bare_request)
+                .is_err()
         );
 
         // 에이전트 사용이 꺼진 채로 켜진다. 다른 세 토글과 갈리는 지점이다.
         let mut on = request(&first, false);
         on.project_git_enabled = true;
-        let snapshot = set_ssh_key_endpoint_with(home.path(), app_data.path(), &on).expect("save");
-        let endpoint = snapshot.keys[0].endpoint.as_ref().expect("endpoint");
+        let snapshot =
+            set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &on).expect("save");
+        let endpoint =
+            endpoint_for_key(&snapshot, &snapshot.keys[0].fingerprint).expect("endpoint");
         assert!(endpoint.project_git_enabled && !endpoint.agent_enabled);
         // 에이전트 목록에는 그대로 나오지 않는다 — 이 토글은 에이전트에게 아무것도 열지 않는다.
         assert!(list_agent_ssh_endpoints_with(home.path(), app_data.path())
@@ -1692,11 +2132,11 @@ mod tests {
             .clone();
         let mut both = request(&second, false);
         both.project_git_enabled = true;
-        let error = set_ssh_key_endpoint_with(home.path(), app_data.path(), &both)
+        let error = set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &both)
             .expect_err("두 번째 키는 거절한다");
         assert!(matches!(error, CoreError::Conflict(_)));
         assert!(
-            load_endpoints(app_data.path())
+            load_endpoints_for_test(app_data.path())
                 .expect("store")
                 .get(&first)
                 .expect("first")
@@ -1705,7 +2145,7 @@ mod tests {
 
         // 끄면 신원이 사라지고, 그때 git은 자기 기본값으로 붙는다.
         let off = request(&first, false);
-        set_ssh_key_endpoint_with(home.path(), app_data.path(), &off).expect("save");
+        set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &off).expect("save");
         assert!(project_git_identity_with(home.path(), app_data.path())
             .expect("identity")
             .is_none());
@@ -1722,13 +2162,14 @@ mod tests {
     /// 않는 작은따옴표 자체와 제어문자가 들어 있으면 거절한다(G9).
     #[test]
     fn c16_10_ssh_command_line_quotes_paths_and_refuses_unquotable_ones() {
-        let line = ssh_command_line("/usr/bin/ssh", "/Users/a b/.ssh/id_ed25519").expect("line");
+        let line =
+            ssh_command_line("/usr/bin/ssh", "/Users/a b/.ssh/id_ed25519", false).expect("line");
         assert_eq!(
             line,
             "'/usr/bin/ssh' -i '/Users/a b/.ssh/id_ed25519' -o IdentitiesOnly=yes -o BatchMode=yes"
         );
-        assert!(ssh_command_line("/usr/bin/ssh", "/home/it's/id").is_err());
-        assert!(ssh_command_line("/usr/bin/ssh", "/home/a\nb/id").is_err());
+        assert!(ssh_command_line("/usr/bin/ssh", "/home/it's/id", false).is_err());
+        assert!(ssh_command_line("/usr/bin/ssh", "/home/a\nb/id", false).is_err());
     }
 
     /// C9-18. `ssh exec`는 지문과 `--` 뒤의 명령을 요구하고, 명령 단어는 한 칸씩 띄워
@@ -1834,13 +2275,23 @@ mod tests {
         let fingerprint = fixture(home.path(), true);
 
         assert!(matches!(
-            ssh_terminal_launch_with(home.path(), app_data.path(), ssh, &fingerprint),
+            ssh_terminal_launch_with(
+                home.path(),
+                app_data.path(),
+                ssh,
+                &sid(app_data.path(), &fingerprint)
+            ),
             Err(CoreError::NotFound(_))
         ));
-        set_ssh_key_endpoint_with(home.path(), app_data.path(), &request(&fingerprint, false))
+        set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &request(&fingerprint, false))
             .expect("save");
-        let launch = ssh_terminal_launch_with(home.path(), app_data.path(), ssh, &fingerprint)
-            .expect("launch");
+        let launch = ssh_terminal_launch_with(
+            home.path(),
+            app_data.path(),
+            ssh,
+            &sid(app_data.path(), &fingerprint),
+        )
+        .expect("launch");
         assert_eq!(launch.destination, "deploy@build.example.com:2222");
         assert_eq!(launch.executable, ssh);
         assert!(launch.args.contains(&"IdentitiesOnly=yes".to_owned()));
@@ -1857,7 +2308,12 @@ mod tests {
         // 개인키가 없으면 대화형이라도 붙을 수 없다.
         fs::remove_file(home.path().join(".ssh/id_example")).expect("remove private");
         assert!(matches!(
-            ssh_terminal_launch_with(home.path(), app_data.path(), ssh, &fingerprint),
+            ssh_terminal_launch_with(
+                home.path(),
+                app_data.path(),
+                ssh,
+                &sid(app_data.path(), &fingerprint)
+            ),
             Err(CoreError::Conflict(_))
         ));
     }
@@ -1874,14 +2330,24 @@ mod tests {
 
         // 연결 서버가 없으면 등록할 곳도 없다.
         assert!(matches!(
-            ssh_key_install_launch_with(home.path(), app_data.path(), ssh, &fingerprint),
+            ssh_key_install_launch_with(
+                home.path(),
+                app_data.path(),
+                ssh,
+                &sid(app_data.path(), &fingerprint)
+            ),
             Err(CoreError::NotFound(_))
         ));
-        set_ssh_key_endpoint_with(home.path(), app_data.path(), &request(&fingerprint, false))
+        set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &request(&fingerprint, false))
             .expect("save");
 
-        let launch = ssh_key_install_launch_with(home.path(), app_data.path(), ssh, &fingerprint)
-            .expect("launch");
+        let launch = ssh_key_install_launch_with(
+            home.path(),
+            app_data.path(),
+            ssh,
+            &sid(app_data.path(), &fingerprint),
+        )
+        .expect("launch");
         assert_eq!(launch.destination, "deploy@build.example.com:2222");
         assert!(launch.args.contains(&"IdentitiesOnly=yes".to_owned()));
         // 비밀번호·호스트 키 프롬프트가 사용자에게 닿아야 한다.
@@ -1904,7 +2370,12 @@ mod tests {
         // 개인키가 없으면 등록도 할 수 없다.
         fs::remove_file(home.path().join(".ssh/id_example")).expect("remove private");
         assert!(matches!(
-            ssh_key_install_launch_with(home.path(), app_data.path(), ssh, &fingerprint),
+            ssh_key_install_launch_with(
+                home.path(),
+                app_data.path(),
+                ssh,
+                &sid(app_data.path(), &fingerprint)
+            ),
             Err(CoreError::Conflict(_))
         ));
     }
@@ -1929,18 +2400,23 @@ mod tests {
             .keys[0]
             .fingerprint
             .clone();
-        set_ssh_key_endpoint_with(home.path(), app_data.path(), &request(&fingerprint, false))
+        set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &request(&fingerprint, false))
             .expect("save");
 
-        let launch = ssh_key_install_launch_with(home.path(), app_data.path(), ssh, &fingerprint)
-            .expect("launch");
+        let launch = ssh_key_install_launch_with(
+            home.path(),
+            app_data.path(),
+            ssh,
+            &sid(app_data.path(), &fingerprint),
+        )
+        .expect("launch");
         let command = launch.args.last().expect("remote command");
 
         // 명령에 실리는 공개키 한 줄에는 따옴표가 없어야 한다. 있으면 우리가 감싼 인용이
         // 끊기고 그 뒤가 원격 셸의 명령이 된다.
         let line = crate::ssh_keys::authorized_key_line(
             home.path(),
-            &SshKeyRef {
+            &crate::ssh_keys::SshKeyRef {
                 file_name: "id_example.pub".to_owned(),
                 fingerprint,
             },
@@ -1960,15 +2436,210 @@ mod tests {
         assert!(!command.contains("rm -rf /"), "{command}");
     }
 
+    /// C9-9. 키 하나를 여러 서버가 함께 쓴다. 지문만으로는 어느 서버인지 고를 수 없으므로
+    /// 실행 경로는 서버 ID를 요구하고, 지문만 온 예전 호출은 서버가 하나일 때만 받는다.
+    #[test]
+    fn c9_9_one_key_serves_many_servers_and_ids_pick_between_them() {
+        let home = tempfile::tempdir().expect("home");
+        let app_data = tempfile::tempdir().expect("app data");
+        let fingerprint = fixture(home.path(), true);
+
+        let mut first = request(&fingerprint, true);
+        first.name = "빌드 서버".to_owned();
+        save_ssh_server_with(home.path(), app_data.path(), &first).expect("first");
+        assert!(resolve_server(home.path(), app_data.path(), None, &fingerprint).is_ok());
+
+        let mut second = request(&fingerprint, true);
+        second.host = "10.0.0.7".to_owned();
+        second.port = Some(22);
+        let snapshot = save_ssh_server_with(home.path(), app_data.path(), &second).expect("second");
+        assert_eq!(snapshot.servers.len(), 2);
+        assert_ne!(snapshot.servers[0].id, snapshot.servers[1].id);
+        assert!(snapshot
+            .servers
+            .iter()
+            .all(|server| server.fingerprint == fingerprint));
+
+        let error = resolve_server(home.path(), app_data.path(), None, &fingerprint)
+            .err()
+            .expect("둘 중 하나를 추측하지 않는다");
+        assert!(matches!(error, CoreError::Conflict(_)));
+        let picked = resolve_server(
+            home.path(),
+            app_data.path(),
+            Some(&snapshot.servers[1].id),
+            "",
+        )
+        .expect("ID로 고른다");
+        assert_eq!(picked.server.host, "10.0.0.7");
+        assert!(resolve_server(
+            home.path(),
+            app_data.path(),
+            Some(&snapshot.servers[1].id),
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        .is_err());
+
+        let listing = list_agent_ssh_endpoints_with(home.path(), app_data.path()).expect("list");
+        assert_eq!(listing.endpoints.len(), 2);
+        assert_eq!(listing.endpoints[0].name, "빌드 서버");
+        assert_eq!(listing.endpoints[1].relay_args[3], snapshot.servers[1].id);
+
+        // 고치기는 ID로 그 서버만 바꾸고, 지우기도 그 서버만 지운다.
+        let mut edit = second.clone();
+        edit.id = Some(snapshot.servers[1].id.clone());
+        edit.user = "ops".to_owned();
+        let edited = save_ssh_server_with(home.path(), app_data.path(), &edit).expect("edit");
+        assert_eq!(edited.servers.len(), 2);
+        assert_eq!(edited.servers[1].user, "ops");
+        let deleted = delete_ssh_server_with(
+            home.path(),
+            app_data.path(),
+            &SshServerRef {
+                server_id: snapshot.servers[0].id.clone(),
+            },
+        )
+        .expect("delete");
+        assert_eq!(deleted.servers.len(), 1);
+        assert_eq!(deleted.servers[0].host, "10.0.0.7");
+        assert!(home.path().join(".ssh/id_example").is_file());
+        // 없는 ID는 고치지도 지우지도 않는다.
+        assert!(delete_ssh_server_with(
+            home.path(),
+            app_data.path(),
+            &SshServerRef {
+                server_id: snapshot.servers[0].id.clone(),
+            },
+        )
+        .is_err());
+        let mut ghost = second.clone();
+        ghost.id = Some("srv-000000000000".to_owned());
+        assert!(save_ssh_server_with(home.path(), app_data.path(), &ghost).is_err());
+        // 주소 없는 서버는 저장하지 않는다(삭제는 별도 작업이다).
+        let mut blank = second;
+        blank.host = " ".to_owned();
+        assert!(save_ssh_server_with(home.path(), app_data.path(), &blank).is_err());
+    }
+
+    /// C9-9. 키별 접속 지점 저장본은 처음 읽을 때 지문에서 파생한 ID로 옮겨지고 원본은 남는다.
+    #[test]
+    fn c9_9_legacy_endpoint_store_migrates_once_with_stable_ids() {
+        let home = tempfile::tempdir().expect("home");
+        let app_data = tempfile::tempdir().expect("app data");
+        let fingerprint = fixture(home.path(), true);
+        let legacy = serde_json::json!({
+            "schemaVersion": 1,
+            "endpoints": {
+                fingerprint.clone(): {
+                    "host": "legacy.example.com",
+                    "port": 2200,
+                    "user": "deploy",
+                    "agentEnabled": true,
+                    "allowedCommands": ["ls"],
+                    "updatedAt": 1
+                }
+            }
+        });
+        fs::write(
+            app_data.path().join(ENDPOINTS_STORE.file),
+            serde_json::to_vec(&legacy).expect("json"),
+        )
+        .expect("legacy store");
+
+        let snapshot =
+            crate::ssh_keys::snapshot_with_metadata(home.path(), app_data.path()).expect("load");
+        assert_eq!(snapshot.servers.len(), 1);
+        let server = &snapshot.servers[0];
+        assert_eq!(server.id, migrated_server_id(&fingerprint));
+        assert_eq!(server.fingerprint, fingerprint);
+        assert_eq!(server.host, "legacy.example.com");
+        assert_eq!(server.allowed_commands, ["ls"]);
+        assert!(app_data.path().join(SERVERS_STORE.file).is_file());
+        assert!(app_data.path().join(ENDPOINTS_STORE.file).is_file());
+
+        // 옮긴 뒤에는 새 저장본이 기준이다. 예전 파일이 남아 있어도 다시 옮기지 않는다.
+        delete_ssh_server_with(
+            home.path(),
+            app_data.path(),
+            &SshServerRef {
+                server_id: server.id.clone(),
+            },
+        )
+        .expect("delete");
+        assert!(load_servers(app_data.path()).expect("reload").is_empty());
+    }
+
+    /// C9-21. 암호가 저장된 키의 서버는 에이전트에게 접속 인자를 내주지 않는다. 언제나 앱
+    /// 경유 실행이라 암호가 에이전트 셸에 들어가지 않는다.
+    #[test]
+    fn c9_21_passphrase_servers_are_relay_only_in_the_agent_listing() {
+        let home = tempfile::tempdir().expect("home");
+        let app_data = tempfile::tempdir().expect("app data");
+        let fingerprint = fixture(home.path(), true);
+        save_ssh_server_with(home.path(), app_data.path(), &request(&fingerprint, true))
+            .expect("save");
+        let vault = crate::ssh_askpass::tests::MemoryVault::default();
+        crate::ssh_askpass::store_passphrase(&vault, app_data.path(), &fingerprint, "s3cret")
+            .expect("store");
+
+        let listing = list_agent_ssh_endpoints_with(home.path(), app_data.path()).expect("list");
+        let entry = &listing.endpoints[0];
+        assert!(entry.passphrase_protected);
+        assert!(entry.ssh_args.is_empty());
+        assert!(entry.ssh_command.is_empty());
+        assert_eq!(entry.relay_args[2], "--server");
+        let serialized = serde_json::to_string(&listing).expect("json");
+        assert!(!serialized.contains("s3cret"));
+    }
+
+    /// C9-21. 암호 키의 인증 옵션은 질문을 키 암호 하나로 좁히고, 뒤에 붙는 옵션보다 앞에 온다.
+    #[test]
+    fn c9_21_locked_auth_options_allow_only_one_passphrase_prompt() {
+        let open = connect_args("/k", "22", false);
+        assert!(open.contains(&"BatchMode=yes".to_owned()));
+        let locked = connect_args("/k", "22", true);
+        for option in [
+            "BatchMode=no",
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+            "PreferredAuthentications=publickey",
+            "NumberOfPasswordPrompts=1",
+        ] {
+            assert!(locked.contains(&option.to_owned()), "{option}");
+        }
+        assert!(!locked.contains(&"BatchMode=yes".to_owned()));
+        let line = ssh_command_line("/usr/bin/ssh", "/k", true).expect("line");
+        assert!(line.contains("-o BatchMode=no"), "{line}");
+        assert!(line.contains("-o PasswordAuthentication=no"), "{line}");
+    }
+
+    /// C9-9. 키를 지워도 서버는 남고, 에이전트 목록에는 이유와 함께 빠진다.
+    #[test]
+    fn c9_9_servers_outlive_their_key_and_explain_why_they_are_skipped() {
+        let home = tempfile::tempdir().expect("home");
+        let app_data = tempfile::tempdir().expect("app data");
+        let fingerprint = fixture(home.path(), true);
+        save_ssh_server_with(home.path(), app_data.path(), &request(&fingerprint, true))
+            .expect("save");
+        assert_eq!(
+            servers_using_key(app_data.path(), &fingerprint),
+            ["deploy@build.example.com:2222"]
+        );
+        fs::remove_file(home.path().join(".ssh/id_example.pub")).expect("remove public");
+        let listing = list_agent_ssh_endpoints_with(home.path(), app_data.path()).expect("list");
+        assert!(listing.endpoints.is_empty());
+        assert_eq!(listing.skipped.len(), 1);
+        assert!(listing.skipped[0].reason.contains("~/.ssh에 없습니다"));
+    }
+
     /// C9-11. 확인은 저장된 지점으로만 붙고, 실패 문구는 사용자가 읽을 수 있게 남는다.
     #[test]
     fn c9_check_requires_a_saved_endpoint_and_reports_the_reason() {
         let home = tempfile::tempdir().expect("home");
         let app_data = tempfile::tempdir().expect("app data");
         let fingerprint = fixture(home.path(), true);
-        let reference = SshKeyRef {
-            file_name: "id_example.pub".to_owned(),
-            fingerprint: fingerprint.clone(),
+        let reference = SshServerRef {
+            server_id: sid(app_data.path(), &fingerprint),
         };
 
         // 저장된 지점이 없으면 ssh를 부르지 않는다. 실행 파일 자리에 없는 경로를 줘도
@@ -1981,7 +2652,7 @@ mod tests {
         )
         .is_err());
 
-        set_ssh_key_endpoint_with(home.path(), app_data.path(), &request(&fingerprint, true))
+        set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &request(&fingerprint, true))
             .expect("save");
         assert!(
             check_message(false, false, "ssh: Host key verification failed.\n")
@@ -2001,10 +2672,14 @@ mod tests {
         let app_data = tempfile::tempdir().expect("app data");
         let fingerprint = fixture(home.path(), true);
 
-        let snapshot =
-            set_ssh_key_endpoint_with(home.path(), app_data.path(), &request(&fingerprint, true))
-                .expect("save");
-        let endpoint = snapshot.keys[0].endpoint.as_ref().expect("endpoint");
+        let snapshot = set_ssh_key_endpoint_for_test(
+            home.path(),
+            app_data.path(),
+            &request(&fingerprint, true),
+        )
+        .expect("save");
+        let endpoint =
+            endpoint_for_key(&snapshot, &snapshot.keys[0].fingerprint).expect("endpoint");
         assert_eq!(endpoint.allowed_commands, ["git pull", "systemctl status"]);
         assert_eq!(endpoint.denied_commands, ["rm -rf"]);
 
@@ -2018,7 +2693,7 @@ mod tests {
         // 허용 목록을 비우면 차단 목록만 적용된다.
         let mut open_policy = request(&fingerprint, true);
         open_policy.allowed_commands = Vec::new();
-        set_ssh_key_endpoint_with(home.path(), app_data.path(), &open_policy).expect("save");
+        set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &open_policy).expect("save");
         let entry = &list_agent_ssh_endpoints_with(home.path(), app_data.path())
             .expect("list")
             .endpoints[0];
@@ -2058,6 +2733,9 @@ mod tests {
     #[test]
     fn ipv6_hosts_are_bracketed_and_paths_with_spaces_stay_quoted() {
         let endpoint = SshEndpointView {
+            id: "srv-test".to_owned(),
+            name: String::new(),
+            fingerprint: "SHA256:test".to_owned(),
             host: "fd7a:1234::5".to_owned(),
             port: 22,
             user: "deploy".to_owned(),

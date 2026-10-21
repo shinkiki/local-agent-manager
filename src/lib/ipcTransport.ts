@@ -31,6 +31,7 @@ import {
   LEGACY_BACKEND_SERVICE_PORT,
   validBackendServicePort,
 } from "./backend";
+import { readJsonPayload } from "./responsePayload.ts";
 
 
 /** 이 UI가 요구하는 백엔드 계약. 백엔드 `REMOTE_API_PROTOCOL_VERSION`과 **정확히**
@@ -40,8 +41,10 @@ import {
  *  11: 프로젝트 파일 조회와 C16 git 형상관리 명령을 지원한다.
  *  12: C20 접근 채널 로그인 — `/api/access`가 `channel`·`authenticated`·`loginRequired`를
  *      싣고 `writable`을 버렸다.
- *      헤드리스 표시(`headless`)도 함께 온다. */
-const EXPECTED_BACKEND_PROTOCOL_VERSION = 12;
+ *      헤드리스 표시(`headless`)도 함께 온다.
+ *  13: SSH 연결 서버가 키에서 독립한 계약을 지원한다.
+ *  14: 등록 폴더 설정 변경(`update_doc_root`)을 지원한다. */
+const EXPECTED_BACKEND_PROTOCOL_VERSION = 14;
 
 /** 단일 백엔드까지 요청이 도달하지 못한 네트워크 수준 실패. */
 export class RemoteConnectionError extends Error {
@@ -121,12 +124,6 @@ export function postJson(
   });
 }
 
-/** 응답 본문을 JSON으로 읽되 본문이 비었거나 JSON이 아니면 null. 성공·실패 응답
- *  모두 같은 방식으로 읽으므로 본문을 두 번 소비하지 않도록 한 번만 부른다. */
-async function readJsonPayload<T>(response: Response): Promise<T | null> {
-  return await response.json().catch(() => null) as T | null;
-}
-
 /** 다른 갱신이 진행 중이어서 백엔드가 받지 않은 요청(503). 오류가 아니라 재시도 신호다. */
 export class BackendBusyError extends Error {
   readonly command: string;
@@ -179,19 +176,24 @@ function requestTimeoutSignal(timeoutMs: number | undefined): AbortSignal | unde
   return timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined;
 }
 
-/** 명령 POST의 제한시간 수명주기. 응답 해석과 503 판정은 호출 계약을 아는 `call`이 맡는다. */
-async function remoteCommandResponse(
+/**
+ * 명령 POST의 제한시간 수명주기. 신호는 요청과 본문 읽기 양쪽에 걸리므로 둘 다 이 안에서
+ * 끝낸다 — 본문을 밖에서 읽으면 그 사이의 중단이 시간 초과로 알려지지 않는다. 응답 해석과
+ * 503 판정은 호출 계약을 아는 `call`이 맡는다.
+ */
+async function remoteCommandResponse<T>(
   command: string,
   args: Record<string, unknown>,
   timeoutMs?: number,
-): Promise<Response> {
+): Promise<{ response: Response; payload: T | null }> {
   const signal = requestTimeoutSignal(timeoutMs);
   try {
-    return await postJson(
+    const response = await postJson(
       backendHttpUrl(`/api/invoke/${encodeURIComponent(command)}`),
       args,
       { signal },
     );
+    return { response, payload: await readJsonPayload<T>(response, signal) };
   } catch (cause) {
     // 중단은 연결 실패가 아니라 시간 초과다. 재연결 배너 대신 재시도 가능한 오류로 알린다.
     if (signal?.aborted && timeoutMs) throw new BackendTimeoutError(command, timeoutMs);
@@ -201,8 +203,7 @@ async function remoteCommandResponse(
 
 export async function call<T>(command: string, args: Record<string, unknown> = {}, options: RequestTimeoutOptions = {}): Promise<T> {
   await ensureBackendProtocol();
-  const response = await remoteCommandResponse(command, args, options.timeoutMs);
-  const payload = await readJsonPayload<{ error?: string } | T>(response);
+  const { response, payload } = await remoteCommandResponse<{ error?: string } | T>(command, args, options.timeoutMs);
   if (!response.ok) {
     // 503은 "지금은 다른 갱신이 돌고 있다"는 뜻이다. 오류 배너 대신 재시도로 다룬다.
     if (response.status === 503) {
@@ -276,12 +277,19 @@ export function ensureBackendProtocol(): Promise<WebAccessStatus> {
 /** 제한시간을 넘기면 요청을 끊고 연결 실패(`RemoteConnectionError`)로 알린다 — 악수를
  *  기다리는 쪽에는 "이 주소는 닿지 않는다"가 곧 결론이라 재시도 신호와 구분하지 않는다. */
 export async function getWebAccessStatus(options: RequestTimeoutOptions = {}): Promise<WebAccessStatus> {
+  const signal = requestTimeoutSignal(options.timeoutMs);
   const response = await remoteFetch(backendHttpUrl("/api/access"), {
     cache: "no-store",
     headers: { Accept: "application/json" },
-    signal: requestTimeoutSignal(options.timeoutMs),
+    signal,
   });
-  const payload = await readJsonPayload<WebAccessPayload>(response);
+  let payload: WebAccessPayload | null;
+  try {
+    payload = await readJsonPayload<WebAccessPayload>(response, signal);
+  } catch (cause) {
+    // 본문을 읽다 끊긴 것도 요청이 끊긴 것과 같은 결론이다 — 이 주소는 제때 닿지 않는다.
+    throw new RemoteConnectionError(cause);
+  }
   if (!response.ok) {
     throw failedResponseError(payload, response.status, "원격 접근 상태를 확인하지 못했습니다");
   }

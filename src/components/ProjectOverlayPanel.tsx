@@ -106,12 +106,23 @@ export function ProjectOverlayPanel({ projectPath, active }: {
   // 되돌리기 어려운 종류의 친절이다. 화면이 하는 일은 그 사실을 적고 버튼을 내미는 데까지다.
   const driftedSets = drift === null ? [] : drift.sets.filter((entry) => entry.headMoved);
 
+  // 본문 읽기의 차례. 다른 세트를 연달아 열거나 닫은 뒤 늦게 온 앞선 응답이 지금 연 세트를
+  // 덮거나 닫은 보기를 다시 여는 일을 막는다 — 마지막으로 연(또는 닫은) 차례의 응답만 그린다.
+  const patchRequestRef = useRef(0);
   const openPatch = (setId: string, focusPath: string | null = null) => {
+    const request = ++patchRequestRef.current;
     setPatchError(null);
     setPatchFocus(focusPath);
     readProjectOverlayPatch({ projectPath, setId })
-      .then(setPatch)
-      .catch((cause) => setPatchError(cause instanceof Error ? cause.message : String(cause)));
+      .then((next) => { if (request === patchRequestRef.current) setPatch(next); })
+      .catch((cause) => {
+        if (request === patchRequestRef.current) setPatchError(cause instanceof Error ? cause.message : String(cause));
+      });
+  };
+  const closePatch = () => {
+    patchRequestRef.current += 1;
+    setPatch(null);
+    setPatchFocus(null);
   };
 
   const act = (token: string, call: () => Promise<ProjectOverlayReceipt>) => {
@@ -323,7 +334,7 @@ export function ProjectOverlayPanel({ projectPath, active }: {
         </section>
       </div>
       {patchError && <ErrorBanner message={patchError} />}
-      {patch && <OverlayPatchView patch={patch} focusPath={patchFocus} onClose={() => { setPatch(null); setPatchFocus(null); }} />}
+      {patch && <OverlayPatchView patch={patch} focusPath={patchFocus} onClose={closePatch} />}
       {confirmDialog}
     </div>
   );

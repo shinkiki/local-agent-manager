@@ -34,12 +34,22 @@ interface AttentionGroupScope {
   scope: string;
 }
 
+/** 회차 결정 알림 ID(`round-decision:<goalId>:<시각>-<구분자>`)에서 목표 ID를 꺼낸다. */
+export function roundDecisionGoalId(attentionId: string): string | null {
+  if (!attentionId.startsWith("round-decision:")) return null;
+  const body = attentionId.slice("round-decision:".length);
+  const colon = body.lastIndexOf(":");
+  return colon > 0 ? body.slice(0, colon) : null;
+}
+
 /** 묶음의 범위. 공급자와 종류는 아이콘·배지가 묶음마다 하나뿐이라 늘 키에 함께 넣는다. */
 function groupScope(item: ChatAttentionItem): AttentionGroupScope {
   if (item.kind === "accountSwitch") return { reason: "account", scope: "account" };
   // 페이싱 제안은 회차가 아니라 페이싱 전체에 대한 것이라 소비자별로 나누지 않는다.
   // 같은 key끼리는 백엔드가 이미 교체하므로 여기서는 한 묶음으로만 모은다.
   if (item.kind === "pacingSuggestion") return { reason: "workflow", scope: "pacing-suggestion" };
+  // 회차 결정도 채팅이 없고 목표별로 백엔드가 하나만 유지하므로 한 묶음으로 모은다.
+  if (item.kind === "roundDecision") return { reason: "workflow", scope: "round-decision" };
   const origin = item.origin;
   const consumerId = origin?.consumerId ?? origin?.scheduleId ?? null;
   if (consumerId) {
@@ -63,9 +73,9 @@ function isUnreadAttention(item: ChatAttentionItem): boolean {
   return !item.read || item.kind === "approval";
 }
 
-/** 승인 대기 항목은 통째로 삭제할 수 없다. */
+/** 승인 대기와 회차 결정 항목은 개별·묶음 삭제할 수 없다(서버가 삭제를 거절한다). */
 function isDismissableAttention(item: ChatAttentionItem): boolean {
-  return item.kind !== "approval";
+  return item.kind !== "approval" && item.kind !== "roundDecision";
 }
 
 /**

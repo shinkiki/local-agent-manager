@@ -89,6 +89,8 @@ const summary = {
     })),
   })),
   screenshots: runs.flatMap((run) => (run.screenshots ?? []).map((shot) => shot.path)),
+  // 지정한 이름이 아니라 Cypress가 실제로 띄운 브라우저와 버전. QA 증적의 실행 환경이다.
+  ...(results.browserName ? { browser: `${results.browserName} ${results.browserVersion ?? ""}`.trim() } : {}),
 };
 writeSummary(job.summaryPath, summary);
 process.exit(summary.failed > 0 ? 1 : 0);

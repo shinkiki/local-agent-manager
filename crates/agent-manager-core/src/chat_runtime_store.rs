@@ -308,6 +308,56 @@ mod tests {
         );
     }
 
+    /// 보관 한도는 공급자까지 포함한 세션 키로 센다. 같은 세션 id를 쓰는 다른 공급자의
+    /// 기록이 이쪽 세션 몫을 깎거나, 한 세션이 한도를 넘겨 쌓이면 안 된다.
+    #[test]
+    fn runtime_failures_are_capped_per_provider_session() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let session = "session-1234567890";
+        persist_runtime_failure(
+            temp.path(),
+            ProviderId::Codex,
+            session,
+            "chat-12345678901",
+            "turn-codex-00000",
+            "failed",
+            "runtimeFailed",
+            "codex",
+            0,
+        )
+        .expect("codex failure");
+        let extra = 3;
+        for index in 0..MAX_RUNTIME_FAILURES_PER_SESSION + extra {
+            persist_runtime_failure(
+                temp.path(),
+                ProviderId::Claude,
+                session,
+                "chat-12345678901",
+                &format!("turn-{index:011}"),
+                "failed",
+                "runtimeFailed",
+                "claude",
+                index as i64 + 1,
+            )
+            .expect("claude failure");
+        }
+
+        let claude =
+            runtime_failures_for(temp.path(), ProviderId::Claude, session).expect("claude");
+        assert_eq!(claude.len(), MAX_RUNTIME_FAILURES_PER_SESSION);
+        assert_eq!(
+            claude[0].occurred_at,
+            extra as i64 + 1,
+            "oldest are dropped"
+        );
+        let codex = runtime_failures_for(temp.path(), ProviderId::Codex, session).expect("codex");
+        assert_eq!(
+            codex.len(),
+            1,
+            "another provider's session keeps its record"
+        );
+    }
+
     #[test]
     fn runtime_failure_replaces_the_same_turn_and_filters_by_session() {
         let temp = tempfile::tempdir().expect("temp directory");

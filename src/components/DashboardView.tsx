@@ -1,13 +1,13 @@
 import { Fragment, useCallback, useEffect, useMemo, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { formatBytes, formatRelative, formatTokens, sourceName } from "../lib/format";
 import { formatRunningElapsed, recentSessionActivity, type RecentSessionActivity } from "../lib/sessionActivity";
-import { isWaitingRunStatus } from "../lib/schedulerSnapshot";
+import { recurrenceLabel, scheduleRunStatus } from "../lib/scheduleOverview";
 import { cumulativeUsage, recentMonthPeriods, weeklyUsageOverview, type CumulativeUsage, type MonthPeriod, type WeeklyUsageRow } from "../lib/usageDashboard";
 import { getAccountUsageHistory, getAntigravityPacingUsage } from "../lib/ipc";
 import { PROVIDER_IDS } from "../lib/providerIds";
 import { sessionKey } from "../lib/sessionKey";
 import { useI18n } from "../lib/i18n";
-import type { AccountSnapshot, AccountUsageHistory, AppLocale, ChatAttentionSnapshot, ManagerSnapshot, ProviderAccountView, ProviderId, ProviderStatus, ScheduleRecurrence, ScheduleRun, ScheduleRunStatus, ScheduledRequest, SchedulerSnapshot, SessionSummary } from "../types";
+import type { AccountSnapshot, AccountUsageHistory, AppLocale, ChatAttentionSnapshot, ManagerSnapshot, ProviderAccountView, ProviderId, ProviderStatus, ScheduleRun, ScheduledRequest, SchedulerSnapshot, SessionSummary } from "../types";
 import { EmptyState, ProviderMark, SourceBadge } from "./Shared";
 import { errorText } from "../lib/errorText";
 import { displayPath } from "../lib/displayPath";
@@ -861,72 +861,6 @@ function ScheduleOverviewRow({ schedule, runs, onOpen }: { schedule: ScheduledRe
       </div>
     </button>
   );
-}
-
-/** 일정 행의 상태 클래스와 표시 문구가 같은 실행 판정에서 나오도록 한 자리에서 결정한다. */
-function scheduleRunStatus(schedule: ScheduledRequest, runs: ScheduleRun[], text: Text) {
-  if (!schedule.enabled) return { status: "paused", label: text("일시정지", "Paused") };
-
-  const activeRun = runs.find((run) => run.status === "running" || isWaitingRunStatus(run.status));
-  if (activeRun) {
-    return {
-      status: isWaitingRunStatus(activeRun.status) ? activeRun.status : "running",
-      label: runStatusLabel(activeRun.status, text),
-    };
-  }
-  if (schedule.manualRunRequestedAt) {
-    return { status: "requested", label: text("실행 요청됨", "Run requested") };
-  }
-
-  const lastRun = runs[0];
-  return lastRun
-    ? { status: lastRun.status, label: runStatusLabel(lastRun.status, text) }
-    : { status: "idle", label: text("대기", "Waiting") };
-}
-
-/** 같은 요일의 한국어·영어 이름이 서로 다른 인덱스로 어긋나지 않게 한 줄로 묶는다. */
-const WEEKDAY_LABELS = [
-  { ko: "일", en: "Sun" },
-  { ko: "월", en: "Mon" },
-  { ko: "화", en: "Tue" },
-  { ko: "수", en: "Wed" },
-  { ko: "목", en: "Thu" },
-  { ko: "금", en: "Fri" },
-  { ko: "토", en: "Sat" },
-] as const;
-
-function recurrenceLabel(recurrence: ScheduleRecurrence, text: Text): string {
-  const time = `${String(recurrence.hour).padStart(2, "0")}:${String(recurrence.minute).padStart(2, "0")}`;
-  switch (recurrence.frequency) {
-    case "hourly": return recurrence.interval === 1 ? text("매시간", "Every hour") : text(`매 ${recurrence.interval}시간`, `Every ${recurrence.interval} hours`);
-    case "daily": return text(`매일 ${time}`, `Daily at ${time}`);
-    case "weekdays": return text(`평일 ${time}`, `Weekdays at ${time}`);
-    case "weekly": {
-      const weekday = WEEKDAY_LABELS[recurrence.weekday];
-      return text(
-        `매주 ${weekday?.ko ?? "?"}요일 ${time}`,
-        `Every ${weekday?.en ?? "?"} at ${time}`,
-      );
-    }
-    case "cron": return `Cron ${recurrence.cron ?? "–"}`;
-    case "auto": return text("자동 · 가드 창 간격", "Auto · guard window interval");
-  }
-}
-
-/** 반복 일정의 각 실행 상태별 한국어·영어 대응표 */
-const SCHEDULE_RUN_STATUS_LABELS: Record<ScheduleRunStatus, { ko: string; en: string }> = {
-  completed: { ko: "완료", en: "Completed" },
-  failed: { ko: "실패", en: "Failed" },
-  cancelled: { ko: "취소됨", en: "Cancelled" },
-  skipped: { ko: "건너뜀", en: "Skipped" },
-  waitingForAccount: { ko: "계정 준비 대기", en: "Waiting for account" },
-  waitingForUsage: { ko: "사용량 복구 대기", en: "Waiting for usage to recover" },
-  running: { ko: "실행 중", en: "Running" },
-};
-
-function runStatusLabel(status: ScheduleRunStatus, text: Text): string {
-  const label = SCHEDULE_RUN_STATUS_LABELS[status] ?? SCHEDULE_RUN_STATUS_LABELS.running;
-  return text(label.ko, label.en);
 }
 
 /**

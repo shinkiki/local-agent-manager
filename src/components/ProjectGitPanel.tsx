@@ -1,9 +1,10 @@
-import { type ReactElement, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, Download, FoldVertical, Folder, GitBranch as GitBranchIcon, GitCompareArrows, Layers, Link2, RefreshCw, Search, Sparkles, UnfoldVertical, X } from "lucide-react";
+import { type ReactElement, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { ArrowDown, ArrowDownToLine, ArrowUp, ArrowUpFromLine, ChevronDown, ChevronRight, CircleQuestionMark, CloudDownload, Download, FoldVertical, Folder, GitBranch as GitBranchIcon, GitCompareArrows, History, Layers, Link2, RefreshCw, Search, Settings, Sparkles, TriangleAlert, UnfoldVertical, X } from "lucide-react";
 import { useI18n } from "../lib/i18n";
 import type { UiText } from "../lib/i18nLocale";
 import { formatDate, formatRelative } from "../lib/format";
 import { displayPath } from "../lib/displayPath";
+import { usePoll } from "../lib/poll";
 import {
   commitProjectGit,
   fetchProjectGit,
@@ -28,7 +29,10 @@ import { buildGitBranchTree, collectGitBranchFolderPaths, type GitBranchTreeLeaf
 import { filterGitCommits } from "../lib/gitCommitSearch";
 import { buildGitFileTree, type GitFileTreeNode } from "../lib/gitFileTree";
 import { canRequestGitConflictAia, gitConflictAiaPrompt } from "../lib/gitConflictAiaPrompt";
+import { gitPushAuthBlocked, gitRemoteAuthHint } from "../lib/gitRemoteAuth";
 import { MAX_AIA_REVIEW_COMMITS, buildAiaCommitReviewRequest, resolveAiaReviewSelection } from "../lib/projectAiaHandoff";
+import { GIT_SYNC_HELP } from "../lib/gitSyncHelp";
+import { phraseText } from "../lib/phrase";
 import type {
   GitActionReceipt,
   GitBranch,
@@ -49,7 +53,8 @@ import type {
   GitWorktree,
   ProjectOverlayReapply,
 } from "../types";
-import { EmptyState, ErrorBanner, LoadingState, NoticeBanner, useBusyAction, useConfirm, useEscapeToClose, useOutsidePointerToClose, type ConfirmRequest } from "./Shared";
+import { EmptyState, ErrorBanner, LoadingState, Modal, NoticeBanner, useBusyAction, useConfirm, useEscapeToClose, useOutsidePointerToClose, type ConfirmRequest } from "./Shared";
+import { MarkdownPreview } from "./MarkdownPreview";
 import { useRequestGeneration } from "./DocumentTreePane";
 import { GitDiffModal } from "./GitDiffModal";
 
@@ -62,14 +67,25 @@ import { GitDiffModal } from "./GitDiffModal";
  * 오류가 아니므로 배너에 그대로 적고, 성공·실패 어느 쪽이든 개요를 다시 읽는다(충돌한
  * 리베이스는 `inProgress`를 바꾼다).
  */
-export function ProjectGitPanel({ projectPath, active, onRequestAiaPrompt }: {
+export function ProjectGitPanel({ projectPath, active, onRequestAiaPrompt, authRevision = 0, onOpenRemoteAuth }: {
   projectPath: string;
   active: boolean;
   onRequestAiaPrompt: (prompt: string) => void;
+  /** C16-11. git 원격 인증 지정이 바뀔 때마다 오른다. 오르면 개요를 다시 읽어 판정을 새로 매긴다. */
+  authRevision?: number;
+  /** C16-11. 올리기가 막혔다는 안내에서 git 원격 인증 창을 바로 연다. */
+  onOpenRemoteAuth?: () => void;
 }) {
   const { text } = useI18n();
   const { confirm, confirmDialog } = useConfirm();
   const git = useProjectGit(projectPath, active);
+  const { refresh } = git;
+  const seenAuthRevision = useRef(authRevision);
+  useEffect(() => {
+    if (seenAuthRevision.current === authRevision) return;
+    seenAuthRevision.current = authRevision;
+    void refresh();
+  }, [authRevision, refresh]);
   const {
     overview, status, loading, loadError, receipt, busy, actionError,
     overlayReapply, overlayReapplyError,
@@ -118,6 +134,7 @@ export function ProjectGitPanel({ projectPath, active, onRequestAiaPrompt }: {
         loading={loading}
         confirm={confirm}
         git={git}
+        onOpenRemoteAuth={onOpenRemoteAuth}
       />
       {repository.inProgress && <InProgressBanner inProgress={repository.inProgress} conflictedFiles={conflictedFiles} locked={locked} confirm={confirm} onRequestAiaConflictHelp={requestAiaConflictHelp} git={git} />}
       {receipt && <ReceiptBanner receipt={receipt} showAiaHelp={repository.inProgress === null} onRequestAiaConflictHelp={requestAiaConflictHelp} />}
@@ -128,7 +145,7 @@ export function ProjectGitPanel({ projectPath, active, onRequestAiaPrompt }: {
           <ChangesSection status={status} locked={locked} git={git} />
           <CommitBox status={status} locked={locked} git={git} />
           <BranchesSection repository={repository} locked={locked} confirm={confirm} git={git} />
-          <WorktreesSection worktrees={repository.worktrees} />
+          <WorktreesSection worktrees={repository.worktrees} git={git} />
           <StashesSection repository={repository} locked={locked} confirm={confirm} git={git} />
         </div>
         <div className="git-panel-main">
@@ -164,9 +181,18 @@ interface DiffSelection {
   /** B9. 비교 요약에서 연 파일. 둘 다 있으면 `<from>...<to>` 범위이고 commit·staged는 쓰지 않는다. */
   rangeFrom?: string | null;
   rangeTo?: string | null;
+  /** 워크트리 목록에서 연 파일. 그 워크트리의 작업 트리·인덱스를 읽는다. */
+  worktreePath?: string | null;
 }
 
 const LOG_PAGE = 30;
+
+/**
+ * 패널이 보이는 동안 작업 트리 상태를 다시 읽는 간격. 에이전트가 파일을 고치는 동안 새로고침
+ * 버튼을 누르지 않아도 변경 목록과 열린 diff가 따라오게 한다. `git status` 한 번이라 개요·
+ * 이력(브랜치·로그)은 다시 읽지 않는다 — 그쪽은 커밋이 생길 때만 바뀐다.
+ */
+const GIT_STATUS_POLL_MS = 10_000;
 
 interface ProjectGitState {
   projectPath: string;
@@ -191,6 +217,18 @@ interface ProjectGitState {
   mutate: (key: GitBusyKey, action: () => Promise<GitActionReceipt>) => Promise<GitActionReceipt | null>;
   selectDiff: (selection: DiffSelection | null) => void;
   loadMoreLog: () => void;
+  /**
+   * 이력 칸이 보여 주는 브랜치의 전체 ref(`refs/heads/…`·`refs/remotes/…`). null 이면 HEAD
+   * (현재 브랜치)다. 브랜치 목록에서 이름을 눌러 고르며, 체크아웃하지 않고 이력만 바꿔 보여
+   * 준다. 짧은 이름으로 읽으면 같은 이름의 태그가 먼저 풀리므로 전체 ref 를 쓴다.
+   */
+  logReference: string | null;
+  setLogReference: (reference: string | null) => void;
+  /** 변경 목록을 펼친 연결 워크트리 하나. 없으면 null. */
+  openWorktree: string | null;
+  worktreeStatus: GitStatus | null;
+  worktreeError: string | null;
+  setOpenWorktree: (worktreePath: string | null) => void;
 }
 
 function useProjectGit(projectPath: string, active: boolean): ProjectGitState {
@@ -208,14 +246,34 @@ function useProjectGit(projectPath: string, active: boolean): ProjectGitState {
   const [log, setLog] = useState<GitLog | null>(null);
   const [logError, setLogError] = useState<string | null>(null);
   const [logLoading, setLogLoading] = useState(false);
+  const [logReference, setLogReference] = useState<string | null>(null);
   const { busy, error: actionError, run } = useBusyAction<GitBusyKey>();
+  const [openWorktree, setOpenWorktreeState] = useState<string | null>(null);
+  const [worktreeStatus, setWorktreeStatus] = useState<GitStatus | null>(null);
+  const [worktreeError, setWorktreeError] = useState<string | null>(null);
   const overviewGeneration = useRequestGeneration();
   const diffGeneration = useRequestGeneration();
   const logGeneration = useRequestGeneration();
+  const worktreeGeneration = useRequestGeneration();
+  /** 마지막으로 상태를 읽기 시작한 시각. 방금 읽었으면 폴링이 한 번 건너뛴다. */
+  const statusReadAt = useRef(0);
+  /**
+   * 펼친 워크트리의 최신값. 폴링 회차는 클릭 직후 다시 그리기 전에도 돌 수 있어 상태 대신
+   * 이것을 읽고, 응답도 이것과 경로가 맞을 때만 받는다.
+   */
+  const openWorktreeRef = useRef<string | null>(null);
+  /**
+   * 폴링 회차마다 늘어 열린 작업 트리 diff를 다시 읽게 한다. 이미 ` M`인 파일을 계속 고치면
+   * 상태 JSON은 그대로라 상태만으로는 diff가 따라오지 않는다.
+   */
+  const [diffTick, setDiffTick] = useState(0);
+  /** 지금 `diff`가 어느 선택의 결과인지. 선택이 바뀌면 앞 diff를 먼저 지운다. */
+  const diffKey = useRef<string | null>(null);
 
   const refresh = useCallback(() => {
     const generation = overviewGeneration.open();
     setLoading(true);
+    statusReadAt.current = Date.now();
     return overviewGeneration.latest(
       generation,
       () => Promise.all([getProjectGitOverview(projectPath), getProjectGitStatus(projectPath)]),
@@ -237,12 +295,72 @@ function useProjectGit(projectPath: string, active: boolean): ProjectGitState {
     void refresh();
   }, [active, refresh]);
 
+  const loadWorktreeStatus = useCallback((worktreePath: string) => {
+    const generation = worktreeGeneration.open();
+    return worktreeGeneration.latest(generation, () => getProjectGitStatus(projectPath, worktreePath), {
+      onResult: (next) => {
+        if (openWorktreeRef.current !== worktreePath) return;
+        setWorktreeStatus((current) => sameJson(current, next) ? current : next);
+        setWorktreeError(null);
+      },
+      onError: (message) => {
+        if (openWorktreeRef.current === worktreePath) setWorktreeError(message);
+      },
+    });
+  }, [projectPath, worktreeGeneration]);
+
+  const setOpenWorktree = useCallback((worktreePath: string | null) => {
+    // 앞 워크트리의 늦은 응답이 새로 연 쪽에 붙지 않게 세대를 먼저 넘긴다.
+    worktreeGeneration.open();
+    openWorktreeRef.current = worktreePath;
+    setOpenWorktreeState(worktreePath);
+    setWorktreeStatus(null);
+    setWorktreeError(null);
+    if (worktreePath !== null) void loadWorktreeStatus(worktreePath);
+  }, [loadWorktreeStatus, worktreeGeneration]);
+
+  // 다른 프로젝트로 바뀌면 앞 프로젝트의 워크트리 경로는 뜻이 없다.
+  useEffect(() => { setOpenWorktree(null); }, [projectPath, setOpenWorktree]);
+  // 고른 브랜치 이름도 그 프로젝트에서만 뜻이 있다.
+  useEffect(() => { setLogReference(null); }, [projectPath]);
+
+  // 펼친 워크트리가 지워지거나 정리 대상이 되면 접는다 — 줄은 사라졌는데 폴링만 남지 않게.
+  useEffect(() => {
+    const open = openWorktreeRef.current;
+    const worktrees = overview?.repository?.worktrees;
+    if (open === null || worktrees === undefined) return;
+    if (!worktrees.some((worktree) => worktree.path === open && !worktree.isCurrent && !worktree.bare && !worktree.prunable)) setOpenWorktree(null);
+  }, [overview, setOpenWorktree]);
+
+  /**
+   * 보이는 동안 상태만 다시 읽는다. 결과가 같으면 상태 객체를 바꾸지 않아 열린 diff도 다시
+   * 읽지 않는다. 읽는 사이 새로고침·변경 작업이 시작됐으면(개요 세대가 넘어갔으면) 그쪽
+   * 결과가 최신이라 이 응답은 버린다.
+   */
+  const pollStatus = useCallback(async () => {
+    if (busy !== null) return;
+    const reads: Promise<unknown>[] = [];
+    if (Date.now() - statusReadAt.current >= GIT_STATUS_POLL_MS / 2) {
+      const generation = overviewGeneration.current();
+      statusReadAt.current = Date.now();
+      reads.push(getProjectGitStatus(projectPath).then((next) => {
+        if (overviewGeneration.current() !== generation) return;
+        setStatus((current) => sameJson(current, next) ? current : next);
+      }));
+    }
+    const worktree = openWorktreeRef.current;
+    if (worktree !== null) reads.push(loadWorktreeStatus(worktree));
+    await Promise.all(reads);
+    if (selectedDiff !== null && !isFixedDiff(selectedDiff)) setDiffTick((tick) => tick + 1);
+  }, [busy, selectedDiff, loadWorktreeStatus, overviewGeneration, projectPath]);
+  usePoll(pollStatus, GIT_STATUS_POLL_MS, { enabled: active && overview?.repository != null });
+
   const loadLog = useCallback((skip: number) => {
     const generation = logGeneration.open();
     setLogLoading(true);
     return logGeneration.latest(
       generation,
-      () => getProjectGitLog({ projectPath, limit: LOG_PAGE, skip }),
+      () => getProjectGitLog({ projectPath, reference: logReference, limit: LOG_PAGE, skip }),
       {
         onResult: (page) => {
           setLogError(null);
@@ -252,17 +370,38 @@ function useProjectGit(projectPath: string, active: boolean): ProjectGitState {
         onSettled: () => setLogLoading(false),
       },
     );
-  }, [logGeneration, projectPath]);
+  }, [logGeneration, projectPath, logReference]);
 
-  // 개요가 새로 올 때마다(켜짐·변경 뒤·새로고침) 이력을 첫 페이지부터 다시 읽는다.
+  // 개요가 새로 올 때마다(켜짐·변경 뒤·새로고침), 그리고 보는 브랜치를 바꿀 때 이력을 첫
+  // 페이지부터 다시 읽는다. 고른 브랜치가 개요에서 사라졌으면(삭제·fetch --prune) 없는
+  // 이름으로 읽어 오류를 띄우지 않고 HEAD 로 돌아간다.
   useEffect(() => {
     if (!active || overview === null) return;
-    if (overview.repository === null || overview.repository.head.unborn) {
+    const repository = overview.repository;
+    // 읽지 않고 비우는 갈래도 세대를 넘긴다. 앞서 나간 다른 브랜치의 요청이 늦게 도착해 빈
+    // HEAD 이력 자리에 붙으면, 보는 브랜치 표시 없이 엉뚱한 이력이 선다.
+    const clearLog = () => {
+      logGeneration.open();
+      setLogLoading(false);
       setLog(null);
+    };
+    if (repository === null) {
+      clearLog();
       return;
     }
+    if (logReference !== null && !repositoryBranchRefs(repository).includes(logReference)) {
+      setLogReference(null);
+      return;
+    }
+    // 첫 커밋 전이라도 다른 브랜치(예: fetch 한 원격)는 이력이 있다. HEAD 만 비어 있다.
+    if (logReference === null && repository.head.unborn) {
+      clearLog();
+      return;
+    }
+    // 앞 브랜치의 페이지 뒤에 새 브랜치의 페이지가 이어 붙지 않게, 기준이 바뀌면 비우고 읽는다.
+    setLog((current) => current !== null && current.reference !== (logReference ?? "HEAD") ? null : current);
     void loadLog(0);
-  }, [active, overview, loadLog]);
+  }, [active, overview, loadLog, logReference, logGeneration]);
 
   const loadMoreLog = useCallback(() => {
     if (log === null || !log.hasMore || logLoading) return;
@@ -273,23 +412,28 @@ function useProjectGit(projectPath: string, active: boolean): ProjectGitState {
   // 커밋 대상은 내용이 고정이라 상태와 무관하다.
   useEffect(() => {
     // 범위 diff 는 커밋처럼 내용이 고정이라 작업 트리 상태를 기다리지 않는다.
-    const fixed = selectedDiff?.commit !== null || (selectedDiff?.rangeFrom != null && selectedDiff?.rangeTo != null);
-    if (!active || selectedDiff === null || (!fixed && status === null)) {
-      if (selectedDiff === null) setDiff(null);
-      return;
+    const fixed = selectedDiff !== null && isFixedDiff(selectedDiff);
+    const key = selectedDiff === null ? null : JSON.stringify(selectedDiff);
+    if (key !== diffKey.current) {
+      // 다른 파일·다른 트리로 옮기면 앞 diff가 새 제목 아래 남지 않게 먼저 비운다.
+      diffKey.current = key;
+      setDiff(null);
+      setDiffError(null);
     }
+    if (!active || selectedDiff === null || (!fixed && status === null)) return;
     const generation = diffGeneration.open();
     setDiffLoading(true);
     void diffGeneration.latest(
       generation,
-      () => getProjectGitDiff({ projectPath, path: selectedDiff.path, originalPath: selectedDiff.originalPath, staged: selectedDiff.staged, commit: selectedDiff.commit, rangeFrom: selectedDiff.rangeFrom ?? null, rangeTo: selectedDiff.rangeTo ?? null }),
+      () => getProjectGitDiff({ projectPath, worktreePath: selectedDiff.worktreePath ?? null, path: selectedDiff.path, originalPath: selectedDiff.originalPath, staged: selectedDiff.staged, commit: selectedDiff.commit, rangeFrom: selectedDiff.rangeFrom ?? null, rangeTo: selectedDiff.rangeTo ?? null }),
       {
-        onResult: (next) => { setDiff(next); setDiffError(null); },
+        onResult: (next) => { setDiff((current) => sameJson(current, next) ? current : next); setDiffError(null); },
         onError: setDiffError,
         onSettled: () => setDiffLoading(false),
       },
     );
-  }, [active, selectedDiff, status, projectPath, diffGeneration]);
+    // 워크트리 상태도 따라간다 — 열린 워크트리 diff가 그쪽 변경을 따라 다시 읽힌다.
+  }, [active, selectedDiff, status, worktreeStatus, diffTick, projectPath, diffGeneration]);
 
   /**
    * HEAD를 옮기는 작업(C19-3이 이름까지 적은 switch·pull·rebase). 이 뒤에만 overlay를
@@ -333,6 +477,9 @@ function useProjectGit(projectPath: string, active: boolean): ProjectGitState {
             setOverlayReapplyError(error instanceof Error ? error.message : String(error));
           }
         }
+        // 브랜치를 옮기면 이력 칸은 새 HEAD 를 따라간다. 둘러보던 브랜치에 남아 있으면 방금
+        // 전환한 브랜치가 아닌 이력이 보인다. 실패한 전환은 HEAD 가 그대로라 보던 것을 둔다.
+        if (key === "switch" && !gitFailed) setLogReference(null);
         await refresh();
       }
     });
@@ -343,8 +490,36 @@ function useProjectGit(projectPath: string, active: boolean): ProjectGitState {
     projectPath, overview, status, loading, loadError, receipt, busy, actionError,
     selectedDiff, diff, diffError, diffLoading, log, logError, logLoading, overlayReapply,
     overlayReapplyError,
-    refresh, mutate, selectDiff: setSelectedDiff, loadMoreLog,
+    refresh, mutate, selectDiff: setSelectedDiff, loadMoreLog, logReference, setLogReference,
+    openWorktree, worktreeStatus, worktreeError, setOpenWorktree,
   };
+}
+
+/** 이력 칸에서 브랜치를 가리키는 전체 ref. 짧은 이름은 같은 이름의 태그와 겹칠 수 있다. */
+function branchLogRef(name: string, remote: boolean): string {
+  return remote ? `refs/remotes/${name}` : `refs/heads/${name}`;
+}
+
+/** 목록에 보이는 모든 브랜치의 전체 ref. 보던 브랜치가 사라졌는지 가를 때 쓴다. */
+function repositoryBranchRefs(repository: GitRepositoryInfo): string[] {
+  return [
+    ...repository.localBranches.map((branch) => branchLogRef(branch.name, false)),
+    ...repository.remoteBranches.map((branch) => branchLogRef(branch.name, true)),
+  ];
+}
+
+/** 전체 ref 를 목록에 보이는 브랜치 이름으로 되돌린다. */
+function branchLogLabel(reference: string): string {
+  return reference.replace(/^refs\/(heads|remotes)\//, "");
+}
+
+/** 커밋·범위 diff는 내용이 고정이라 작업 트리가 바뀌어도 다시 읽지 않는다. */
+function isFixedDiff(selection: DiffSelection): boolean {
+  return selection.commit !== null || (selection.rangeFrom != null && selection.rangeTo != null);
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 /**
@@ -449,17 +624,19 @@ function OverlayReapplyBanner({ result }: { result: ProjectOverlayReapply }) {
 // ---------------------------------------------------------------------------
 // 개요 머리
 
-function OverviewHeader({ projectPath, repository, locked, loading, confirm, git }: {
+function OverviewHeader({ projectPath, repository, locked, loading, confirm, git, onOpenRemoteAuth }: {
   projectPath: string;
   repository: GitRepositoryInfo;
   locked: boolean;
   loading: boolean;
   confirm: (request: ConfirmRequest) => Promise<boolean>;
   git: ProjectGitState;
+  onOpenRemoteAuth?: () => void;
 }) {
   const { text } = useI18n();
   const [pullMode, setPullMode] = useState<GitPullMode>("ffOnly");
   const [rebaseOpen, setRebaseOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   const { head, upstream } = repository;
   const branchNames = useMemo(
     () => [...repository.localBranches, ...repository.remoteBranches].map((branch) => branch.name),
@@ -477,16 +654,21 @@ function OverviewHeader({ projectPath, repository, locked, loading, confirm, git
 
   // C20. push는 더 이상 호스트 전용이 아니다 — 로그인한 원격 화면도 같은 권한으로 밀어올린다.
   // 바깥으로 나가는 명령이라 UI 확인창(아래 `confirm`)은 그대로 둔다.
-  const pushDisabled = locked || head.unborn || head.detached;
+  // C16-11. 이 화면은 자격증명을 묻지 않으므로, 쓸 인증 수단이 하나도 없는 원격으로의 push는
+  // 반드시 `authFailed`로 끝난다. 그 경우만 막고 어디서 연결하는지 바로 아래에 적는다.
+  const pushRemote = repository.remotes.find((remote) => remote.name === remoteName);
+  const pushAuthBlocked = gitPushAuthBlocked(pushRemote);
+  const authHint = gitRemoteAuthHint(pushRemote, text);
+  const pushDisabled = locked || head.unborn || head.detached || pushAuthBlocked;
 
   const push = async () => {
     const message = upstream === null
       ? text(`${head.branch ?? ""} → ${remoteName}\n업스트림이 없어 이 브랜치를 ${remoteName}에 새로 올리고 추적하도록 설정합니다.`, `${head.branch ?? ""} → ${remoteName}\nNo upstream: this branch will be pushed to ${remoteName} and set to track it.`)
       : text(`${head.branch ?? ""} → ${upstream.name}`, `${head.branch ?? ""} → ${upstream.name}`);
     const accepted = await confirm({
-      title: text("밀어올리기", "Push"),
+      title: text("올리기", "Push"),
       message,
-      confirmLabel: text("밀어올리기", "Push"),
+      confirmLabel: text("올리기", "Push"),
     });
     if (!accepted) return;
     await git.mutate("push", () => pushProjectGit({ projectPath, remote: remoteName, setUpstream: upstream === null }));
@@ -495,8 +677,8 @@ function OverviewHeader({ projectPath, repository, locked, loading, confirm, git
   const startRebase = async () => {
     if (!rebaseTarget) return;
     const accepted = await confirm({
-      title: text("리베이스 시작", "Start rebase"),
-      message: text(`${headLabel}을(를) ${rebaseTarget} 위로 리베이스합니다. 충돌이 나면 여기서 계속·건너뛰기·중단할 수 있습니다.`, `Rebase ${headLabel} onto ${rebaseTarget}. If conflicts occur you can continue, skip, or abort here.`),
+      title: text("브랜치 위로 옮기기", "Start rebase"),
+      message: text(`${headLabel}에만 있는 커밋을 ${rebaseTarget} 끝 위로 다시 쌓습니다(리베이스). 다시 쌓인 커밋은 SHA가 바뀝니다. 충돌이 나면 여기서 계속·건너뛰기·중단할 수 있습니다.`, `Replay the commits only ${headLabel} has on top of ${rebaseTarget}. Replayed commits get new SHAs. If conflicts occur you can continue, skip, or abort here.`),
       confirmLabel: text("시작", "Start"),
     });
     if (!accepted) return;
@@ -518,34 +700,95 @@ function OverviewHeader({ projectPath, repository, locked, loading, confirm, git
         )}
         {repository.isLinkedWorktree && <small className="git-repo-root">{text("연결된 워크트리", "Linked worktree")}</small>}
       </div>
+      {/* 버튼 이름만으로는 무엇이 어디로 옮겨 가는지 읽히지 않아, 한국어 이름 옆에 git 용어를
+          작게 붙이고 title 에 한 줄 설명을, 도움말 창에 그림 설명서를 둔다. */}
       <div className="git-overview-actions">
-        <button className="button compact" type="button" onClick={() => void git.refresh()} disabled={loading}>
+        <button
+          className="button compact"
+          type="button"
+          onClick={() => void git.refresh()}
+          disabled={loading}
+          title={text("화면의 브랜치·변경·이력을 다시 읽습니다. 원격과는 통신하지 않습니다.", "Re-read branches, changes, and history. Does not contact the remote.")}
+        >
           <RefreshCw size={13} />{text("새로고침", "Refresh")}
         </button>
-        <button className="button compact" type="button" disabled={locked} onClick={() => void git.mutate("fetch", () => fetchProjectGit({ projectPath, prune: true }))}>
-          {text("가져오기", "Fetch")}
+        <button
+          className="button compact"
+          type="button"
+          disabled={locked}
+          onClick={() => void git.mutate("fetch", () => fetchProjectGit({ projectPath, prune: true }))}
+          title={text("git fetch --prune — 원격의 새 커밋·브랜치 정보만 받아 옵니다. 내 파일과 브랜치는 그대로입니다.", "git fetch --prune — download new commits and branches from the remote. Your files and branches stay as they are.")}
+        >
+          <CloudDownload size={13} />{text("원격 확인", "Fetch")}<GitTerm term="fetch" />
         </button>
         <span className="git-action-group">
-          <button className="button compact" type="button" disabled={locked || head.unborn} onClick={() => void git.mutate("pull", () => pullProjectGit({ projectPath, mode: pullMode }))}>
-            {text("끌어오기", "Pull")}
+          <button
+            className="button compact"
+            type="button"
+            disabled={locked || head.unborn}
+            onClick={() => void git.mutate("pull", () => pullProjectGit({ projectPath, mode: pullMode }))}
+            title={pullMode === "ffOnly"
+              ? text("git pull --ff-only — 원격의 새 커밋을 받아 내 브랜치를 앞으로 감습니다. 내 커밋과 갈라져 있으면 아무것도 바꾸지 않습니다.", "git pull --ff-only — take the remote's new commits and fast-forward your branch. Changes nothing if your commits have diverged.")
+              : text("git pull --rebase — 원격의 새 커밋을 받고, 아직 올리지 않은 내 커밋을 그 뒤로 다시 쌓습니다.", "git pull --rebase — take the remote's new commits and replay your unpushed commits after them.")}
+          >
+            <ArrowDownToLine size={13} />{text("받아서 합치기", "Pull")}<GitTerm term="pull" />
           </button>
-          <select aria-label={text("끌어오기 방식", "Pull mode")} value={pullMode} disabled={locked} onChange={(event) => setPullMode(event.target.value as GitPullMode)}>
-            <option value="ffOnly">{text("빨리감기만", "Fast-forward only")}</option>
-            <option value="rebase">{text("리베이스", "Rebase")}</option>
+          <select
+            aria-label={text("받아서 합치기 방식", "Pull mode")}
+            title={text("갈라지지 않았으면 '빨리감기만', 아직 안 올린 내 커밋이 있으면 '내 커밋 재배치'를 고르세요.", "Use fast-forward only when nothing diverged; use rebase when you have unpushed commits.")}
+            value={pullMode}
+            disabled={locked}
+            onChange={(event) => setPullMode(event.target.value as GitPullMode)}
+          >
+            <option value="ffOnly">{text("빨리감기만 (안전)", "Fast-forward only (safe)")}</option>
+            <option value="rebase">{text("내 커밋 재배치 (rebase)", "Rebase my commits")}</option>
           </select>
         </span>
-        <button className="button compact" type="button" disabled={pushDisabled} onClick={() => void push()}>
-          {text("밀어올리기", "Push")}
+        <button
+          className="button compact"
+          type="button"
+          disabled={pushDisabled}
+          onClick={() => void push()}
+          title={pushAuthBlocked && authHint ? authHint : upstream === null
+            ? text(`git push --set-upstream — 이 브랜치를 ${remoteName}에 새로 올리고 따라가도록 설정합니다.`, `git push --set-upstream — publish this branch to ${remoteName} and track it.`)
+            : text(`git push — 내 커밋을 ${upstream.name}에 올립니다.`, `git push — upload your commits to ${upstream.name}.`)}
+        >
+          <ArrowUpFromLine size={13} />{text("올리기", "Push")}<GitTerm term="push" />
         </button>
-        <button className="button compact" type="button" disabled={locked || head.unborn || repository.inProgress !== null} onClick={() => setRebaseOpen((open) => !open)}>
-          {text("리베이스…", "Rebase…")}
+        <button
+          className="button compact"
+          type="button"
+          disabled={locked || head.unborn || repository.inProgress !== null}
+          onClick={() => setRebaseOpen((open) => !open)}
+          aria-expanded={rebaseOpen}
+          title={text("git rebase — 내 브랜치에만 있는 커밋을 고른 브랜치의 끝 위로 다시 쌓습니다.", "git rebase — replay the commits only your branch has on top of the branch you pick.")}
+        >
+          <GitCompareArrows size={13} />{text("브랜치 위로 옮기기…", "Rebase onto…")}<GitTerm term="rebase" />
+        </button>
+        <button
+          className="button compact git-sync-help-button"
+          type="button"
+          onClick={() => setHelpOpen(true)}
+          title={text("각 버튼이 무엇을 어디로 옮기는지 그림으로 설명합니다.", "Explains with diagrams what each button moves where.")}
+        >
+          <CircleQuestionMark size={13} />{text("도움말", "Help")}
         </button>
       </div>
+      {authHint && (
+        <div className="notice-banner git-remote-auth" role="note" data-git-remote-auth={pushRemote?.auth?.method}>
+          <span>{authHint}</span>
+          {onOpenRemoteAuth && (
+            <button className="button compact" type="button" onClick={onOpenRemoteAuth}>
+              <Settings size={13} />{text("원격 인증 설정", "Remote auth settings")}
+            </button>
+          )}
+        </div>
+      )}
       {rebaseOpen && (
         <form className="git-inline-form git-rebase-form" onSubmit={(event) => { event.preventDefault(); void startRebase(); }}>
           <label>
-            <span>{text("대상", "Onto")}</span>
-            <select aria-label={text("리베이스 대상", "Rebase onto")} value={rebaseTarget} onChange={(event) => setRebaseOnto(event.target.value)}>
+            <span>{text("이 브랜치 위로", "Onto")}</span>
+            <select aria-label={text("옮길 대상 브랜치", "Rebase onto")} value={rebaseTarget} onChange={(event) => setRebaseOnto(event.target.value)}>
               {branchNames.map((name) => <option key={name} value={name}>{name}</option>)}
             </select>
           </label>
@@ -553,7 +796,32 @@ function OverviewHeader({ projectPath, repository, locked, loading, confirm, git
           <button className="button compact" type="button" onClick={() => setRebaseOpen(false)}>{text("닫기", "Close")}</button>
         </form>
       )}
+      {helpOpen && <GitSyncHelpModal onClose={() => setHelpOpen(false)} />}
     </div>
+  );
+}
+
+/**
+ * 한국어 버튼 이름 옆에 붙는 git 용어. 다른 설명서나 터미널에서 같은 동작을 찾을 때
+ * 쓰는 이름이라 남겨 두고, 영어 화면은 이름이 곧 용어라 붙이지 않는다.
+ */
+function GitTerm({ term }: { term: string }) {
+  const { locale } = useI18n();
+  if (locale !== "ko") return null;
+  // 화면을 읽어 주는 도구에는 "원격 확인fetch"처럼 붙어 읽히므로 숨긴다. 뜻은 title 에 있다.
+  return <small className="git-action-term" aria-hidden="true">{term}</small>;
+}
+
+/** 원격 동기화 버튼 설명서. 본문은 mermaid 그림을 담은 마크다운 한 벌이다(`gitSyncHelp`). */
+function GitSyncHelpModal({ onClose }: { onClose: () => void }) {
+  const { text } = useI18n();
+  const source = useMemo(() => phraseText(GIT_SYNC_HELP, text), [text]);
+  return (
+    <Modal title={text("원격 동기화 버튼 도움말", "Sync buttons help")} onClose={onClose} size="wide">
+      <div className="git-sync-help">
+        <MarkdownPreview source={source} />
+      </div>
+    </Modal>
   );
 }
 
@@ -743,7 +1011,7 @@ function ChangesSection({ status, locked, git }: { status: GitStatus | null; loc
           {view === "list" ? (
             <ul className="git-change-list">
               {groups[id].map((entry) => (
-                <ChangeRow key={`${id}:${entry.path}`} entry={entry} group={id} locked={locked} selected={git.selectedDiff?.commit === null && git.selectedDiff.path === entry.path && git.selectedDiff.staged === (id === "staged")} onToggle={(checked) => (checked ? stage(entryPaths(entry)) : unstage(entryPaths(entry)))} onSelect={() => git.selectDiff({ path: entry.path, staged: id === "staged", originalPath: entry.originalPath, commit: null })} />
+                <ChangeRow key={`${id}:${entry.path}`} entry={entry} group={id} locked={locked} selected={git.selectedDiff?.commit === null && !git.selectedDiff.worktreePath && git.selectedDiff.path === entry.path && git.selectedDiff.staged === (id === "staged")} onToggle={(checked) => (checked ? stage(entryPaths(entry)) : unstage(entryPaths(entry)))} onSelect={() => git.selectDiff({ path: entry.path, staged: id === "staged", originalPath: entry.originalPath, commit: null })} />
               ))}
             </ul>
           ) : (
@@ -794,7 +1062,7 @@ function GitChangeTree({ nodes, group, locked, collapsed, onToggleFolder, select
           {!isCollapsed(node.path) && <GitChangeTree nodes={node.children} group={group} locked={locked} collapsed={collapsed} onToggleFolder={onToggleFolder} selectedDiff={selectedDiff} onToggleEntry={onToggleEntry} onSelectEntry={onSelectEntry} depth={depth + 1} />}
         </li>
       ) : (
-        <ChangeRow key={`${node.item.originalPath ?? ""}:${node.item.path}`} entry={node.item} displayName={node.label} depth={depth} group={group} locked={locked} selected={selectedDiff?.commit === null && selectedDiff.path === node.item.path && selectedDiff.staged === (group === "staged")} onToggle={(checked) => onToggleEntry(node.item, checked)} onSelect={() => onSelectEntry(node.item)} />
+        <ChangeRow key={`${node.item.originalPath ?? ""}:${node.item.path}`} entry={node.item} displayName={node.label} depth={depth} group={group} locked={locked} selected={selectedDiff?.commit === null && !selectedDiff.worktreePath && selectedDiff.path === node.item.path && selectedDiff.staged === (group === "staged")} onToggle={(checked) => onToggleEntry(node.item, checked)} onSelect={() => onSelectEntry(node.item)} />
       ))}
     </ul>
   );
@@ -917,79 +1185,159 @@ function BranchComparisonSection({ repository, git }: { repository: GitRepositor
     () => repository.localBranches.find((entry) => entry.name === branch)?.upstream ?? null,
     [repository.localBranches, branch],
   );
-  const [comparison, setComparison] = useState<GitBranchComparison | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // 결과는 그것을 물은 (프로젝트, 브랜치, upstream)과 함께 둔다. 값만 두면 브랜치를 바꾼
+  // 뒤 새 답이 오기 전까지 이전 브랜치의 수신·송신 목록이 새 이름 아래 그대로 보이고,
+  // 그 파일을 누르면 새 브랜치 범위로 엉뚱한 diff를 연다. 같은 브랜치에서 HEAD만 움직인
+  // 새로 읽기는 열쇠가 같아 이전 결과를 계속 보여 주므로 깜빡이지 않는다.
+  const requestKey = `${projectPath}\n${branch ?? ""}\n${upstream ?? ""}`;
+  const [loaded, setLoaded] = useState<{ key: string; comparison: GitBranchComparison | null; error: string | null } | null>(null);
+  const current = loaded?.key === requestKey ? loaded : null;
+  const comparison = current?.comparison ?? null;
+  const error = current?.error ?? null;
 
   useEffect(() => {
-    if (!branch || !upstream) {
-      setComparison(null);
-      setError(null);
-      return;
-    }
+    if (!branch || !upstream) return;
     let live = true;
     getProjectBranchComparison({ projectPath, branch, upstream })
-      .then((next) => { if (live) { setComparison(next); setError(null); } })
-      .catch((cause: unknown) => { if (live) { setComparison(null); setError(cause instanceof Error ? cause.message : String(cause)); } });
+      .then((next) => { if (live) setLoaded({ key: requestKey, comparison: next, error: null }); })
+      .catch((cause: unknown) => {
+        if (live) setLoaded({ key: requestKey, comparison: null, error: cause instanceof Error ? cause.message : String(cause) });
+      });
     return () => { live = false; };
-  }, [projectPath, branch, upstream, repository.head.sha]);
+  }, [projectPath, branch, upstream, requestKey, repository.head.sha]);
+
+  // 펼침은 저장소마다 기억한다. 기본은 접힘 — 요약 바의 수신·송신 수와 갈라짐 표시만으로
+  // 대부분 충분하고, 목록이 늘 펼쳐져 있으면 아래 이력이 화면 밖으로 밀린다.
+  const bodyId = useId();
+  const [open, setOpen] = useState(() => readComparisonOpen(projectPath));
+  useEffect(() => { setOpen(readComparisonOpen(projectPath)); }, [projectPath]);
+  const toggleOpen = () => {
+    setOpen(!open);
+    writeComparisonOpen(projectPath, !open);
+  };
 
   if (!branch || !upstream) return null;
 
+  const differs = comparison !== null && (comparison.incomingCount > 0 || comparison.outgoingCount > 0);
+  const expanded = open && differs;
+
   return (
-    <section className="git-branch-comparison settings-subsection">
+    <section className={`git-branch-comparison settings-subsection${expanded ? " expanded" : ""}`}>
       <header>
-        <div>
+        <button
+          type="button"
+          className="git-comparison-toggle"
+          aria-expanded={differs ? expanded : undefined}
+          aria-controls={expanded ? bodyId : undefined}
+          disabled={!differs}
+          onClick={toggleOpen}
+        >
+          {differs ? (expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />) : <GitCompareArrows size={14} />}
           <strong>{text("upstream과 비교", "Compared with upstream")}</strong>
-          <small>
-            {branch} ↔ {upstream} · {text("마지막 fetch 기준", "As of last fetch")}
-            {comparison?.lastFetchedAt != null && ` (${formatDate(comparison.lastFetchedAt * 1000)})`}
-          </small>
-        </div>
+          {comparison === null && !error && <span className="git-comparison-chip">{text("비교를 읽고 있습니다…", "Reading comparison…")}</span>}
+          {comparison !== null && !differs && <span className="git-comparison-chip same">{text("upstream과 같습니다.", "Up to date with upstream.")}</span>}
+          {differs && (
+            <>
+              <span className="git-comparison-chip incoming" title={text("가져오면 들어오는 변경", "Lands here when you pull")}>
+                <ArrowDown size={12} />{text("수신", "Incoming")} {comparison.incomingCount}
+              </span>
+              <span className="git-comparison-chip outgoing" title={text("보내면 나가는 변경", "Leaves here when you push")}>
+                <ArrowUp size={12} />{text("송신", "Outgoing")} {comparison.outgoingCount}
+              </span>
+            </>
+          )}
+          {comparison?.diverged && (
+            <span className="git-comparison-chip diverged" title={text("양쪽 모두 커밋이 있어 fast-forward로 정리되지 않습니다.", "Both sides have commits — this will not fast-forward.")}>
+              <TriangleAlert size={12} />{text("갈라짐", "Diverged")}
+            </span>
+          )}
+        </button>
+        <small className="git-comparison-meta" title={comparison?.lastFetchedAt != null ? formatDate(comparison.lastFetchedAt * 1000) : undefined}>
+          {branch} ↔ {upstream} · {text("마지막 fetch 기준", "As of last fetch")}
+          {comparison?.lastFetchedAt != null && ` (${formatRelative(comparison.lastFetchedAt * 1000)})`}
+        </small>
       </header>
       {error && <ErrorBanner message={error} />}
-      {comparison === null && !error && <p className="git-commit-files-note">{text("비교를 읽고 있습니다…", "Reading comparison…")}</p>}
-      {comparison !== null && comparison.incomingCount === 0 && comparison.outgoingCount === 0 && (
-        <p className="git-commit-files-note">{text("upstream과 같습니다.", "Up to date with upstream.")}</p>
-      )}
-      {comparison !== null && (comparison.incomingCount > 0 || comparison.outgoingCount > 0) && (
-        <div className="git-comparison-sides">
-          <ComparisonSide
-            title={text("수신", "Incoming")}
-            hint={text("가져오면 들어오는 변경", "Lands here when you pull")}
-            count={comparison.incomingCount}
-            commits={comparison.incoming}
-            commitsTruncated={comparison.incomingTruncated}
-            files={comparison.incomingFiles}
-            filesTruncated={comparison.incomingFilesTruncated}
-            rangeFrom={branch}
-            rangeTo={upstream}
-            selectDiff={git.selectDiff}
-            selected={git.selectedDiff}
-          />
-          <ComparisonSide
-            title={text("송신", "Outgoing")}
-            hint={text("보내면 나가는 변경", "Leaves here when you push")}
-            count={comparison.outgoingCount}
-            commits={comparison.outgoing}
-            commitsTruncated={comparison.outgoingTruncated}
-            files={comparison.outgoingFiles}
-            filesTruncated={comparison.outgoingFilesTruncated}
-            rangeFrom={upstream}
-            rangeTo={branch}
-            selectDiff={git.selectDiff}
-            selected={git.selectedDiff}
-          />
+      {expanded && (
+        <div className="git-comparison-body" id={bodyId}>
+          {comparison.diverged && (
+            <p className="git-comparison-note">{text("양쪽 모두 커밋이 있어 fast-forward로 정리되지 않습니다.", "Both sides have commits — this will not fast-forward.")}</p>
+          )}
+          <div className="git-comparison-sides">
+            <ComparisonSide
+              direction="incoming"
+              title={text("수신", "Incoming")}
+              hint={text("가져오면 들어오는 변경", "Lands here when you pull")}
+              count={comparison.incomingCount}
+              commits={comparison.incoming}
+              commitsTruncated={comparison.incomingTruncated}
+              files={comparison.incomingFiles}
+              filesTruncated={comparison.incomingFilesTruncated}
+              rangeFrom={branch}
+              rangeTo={upstream}
+              selectDiff={git.selectDiff}
+              selected={git.selectedDiff}
+            />
+            <ComparisonSide
+              direction="outgoing"
+              title={text("송신", "Outgoing")}
+              hint={text("보내면 나가는 변경", "Leaves here when you push")}
+              count={comparison.outgoingCount}
+              commits={comparison.outgoing}
+              commitsTruncated={comparison.outgoingTruncated}
+              files={comparison.outgoingFiles}
+              filesTruncated={comparison.outgoingFilesTruncated}
+              rangeFrom={upstream}
+              rangeTo={branch}
+              selectDiff={git.selectDiff}
+              selected={git.selectedDiff}
+            />
+          </div>
         </div>
-      )}
-      {comparison?.diverged && (
-        <p className="git-commit-files-note">{text("양쪽 모두 커밋이 있어 fast-forward로 정리되지 않습니다.", "Both sides have commits — this will not fast-forward.")}</p>
       )}
     </section>
   );
 }
 
-/** 한 방향. 커밋 목록과 파일 요약을 같은 칸에 두되 서로 섞지 않는다. */
-function ComparisonSide({ title, hint, count, commits, commitsTruncated, files, filesTruncated, rangeFrom, rangeTo, selectDiff, selected }: {
+/** 비교 칸을 펼쳐 둔 저장소. 화면 설정이므로 읽기·쓰기 실패는 모두 삼킨다. */
+const COMPARISON_OPEN_KEY = "agent-manager.git-comparison-open.v1";
+
+function readComparisonOpen(projectPath: string): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(COMPARISON_OPEN_KEY) ?? "{}");
+    return parsed !== null && typeof parsed === "object" && (parsed as Record<string, unknown>)[projectPath] === true;
+  } catch {
+    return false;
+  }
+}
+
+function writeComparisonOpen(projectPath: string, open: boolean): void {
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(COMPARISON_OPEN_KEY) ?? "{}");
+    const all = parsed !== null && typeof parsed === "object" ? { ...(parsed as Record<string, unknown>) } : {};
+    if (open) all[projectPath] = true;
+    else delete all[projectPath];
+    window.localStorage.setItem(COMPARISON_OPEN_KEY, JSON.stringify(all));
+  } catch {
+    // 저장소를 쓸 수 없어도 이번 실행의 펼침은 그대로 둔다.
+  }
+}
+
+/** 경로를 폴더(흐리게)와 파일 이름(진하게)으로 가른다. 긴 경로에서 이름이 먼저 읽히게 한다. */
+function ComparisonPath({ path }: { path: string }) {
+  const slash = path.lastIndexOf("/");
+  return slash < 0 ? <span className="git-comparison-name">{path}</span> : (
+    <>
+      <span className="git-comparison-dir">{path.slice(0, slash + 1)}</span>
+      <span className="git-comparison-name">{path.slice(slash + 1)}</span>
+    </>
+  );
+}
+
+/** 한 방향. 커밋 목록과 파일 요약을 같은 칸에 두되 소제목으로 갈라 서로 섞지 않는다. */
+function ComparisonSide({ direction, title, hint, count, commits, commitsTruncated, files, filesTruncated, rangeFrom, rangeTo, selectDiff, selected }: {
+  direction: "incoming" | "outgoing";
   title: string;
   hint: string;
   count: number;
@@ -1004,43 +1352,55 @@ function ComparisonSide({ title, hint, count, commits, commitsTruncated, files, 
   selected: DiffSelection | null;
 }) {
   const { text } = useI18n();
+  const partial = <span className="git-comparison-partial">{text("일부", "Partial")}</span>;
   return (
-    <div className="git-comparison-side">
+    <div className="git-comparison-side" data-direction={direction}>
       <header>
-        <strong>{title} {count}</strong>
+        <strong>{direction === "incoming" ? <ArrowDown size={13} /> : <ArrowUp size={13} />}{title} {count}</strong>
         <small>{hint}</small>
       </header>
       {count === 0 ? (
-        <p className="git-commit-files-note">{text("없음", "None")}</p>
+        <p className="git-comparison-note">{text("없음", "None")}</p>
       ) : (
         <>
-          <ul className="git-comparison-commits">
-            {commits.map((commit) => (
-              <li key={commit.sha}>
-                <code>{commit.shortSha}</code> <span title={commit.subject}>{commit.subject}</span>
-              </li>
-            ))}
-          </ul>
-          {commitsTruncated && <p className="git-commit-files-note">{text("커밋이 많아 일부만 보입니다.", "Too many commits; only some are shown.")}</p>}
-          <ul className="git-commit-files">
-            {files.map((file) => (
-              <li className="git-commit-file" key={`${file.originalPath ?? ""}→${file.path}`}>
-                <code className="git-change-code" title={changeKindLabels(text)[gitChangeLabelKey(file.status)]}>{gitChangeKindCode(file.status)}</code>
-                {/* 요약은 merge-base부터 끝점까지 한 범위라 커밋 하나의 diff로는 열 수 없다. 그래서
-                    같은 세 점 범위(`<from>...<to>`)를 그대로 열는다(B9) — 목록과 본문이 한 범위다. */}
-                <button
-                  type="button"
-                  className={`git-change-path git-change-path-button${selected?.rangeFrom === rangeFrom && selected?.rangeTo === rangeTo && selected.path === file.path ? " selected" : ""}`}
-                  title={file.path}
-                  onClick={() => selectDiff({ path: file.path, originalPath: file.originalPath, staged: false, commit: null, rangeFrom, rangeTo })}
-                >
-                  {file.originalPath && <><span className="git-change-origin">{file.originalPath}</span> → </>}
-                  {file.path}
-                </button>
-              </li>
-            ))}
-          </ul>
-          {filesTruncated && <p className="git-commit-files-note">{text("파일이 많아 일부만 보입니다.", "Too many files; only some are shown.")}</p>}
+          <div className="git-comparison-group">
+            <h4 title={commitsTruncated ? text("커밋이 많아 일부만 보입니다.", "Too many commits; only some are shown.") : undefined}>
+              {text("커밋", "Commits")} <span>{count}</span>{commitsTruncated && partial}
+            </h4>
+            <ul className="git-comparison-commits">
+              {commits.map((commit) => (
+                <li key={commit.sha}>
+                  <code>{commit.shortSha}</code>
+                  <span title={commit.subject}>{commit.subject}</span>
+                  <small>{formatRelative(commit.committedAt * 1000)}</small>
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div className="git-comparison-group">
+            <h4 title={filesTruncated ? text("파일이 많아 일부만 보입니다.", "Too many files; only some are shown.") : undefined}>
+              {text("바뀐 파일", "Changed files")} <span>{files.length}</span>{filesTruncated && partial}
+            </h4>
+            <ul className="git-commit-files">
+              {files.map((file) => (
+                <li className="git-commit-file" key={`${file.originalPath ?? ""}→${file.path}`}>
+                  <code className="git-change-code" data-kind={file.status} title={changeKindLabels(text)[gitChangeLabelKey(file.status)]}>{gitChangeKindCode(file.status)}</code>
+                  {/* 요약은 merge-base부터 끝점까지 한 범위라 커밋 하나의 diff로는 열 수 없다. 그래서
+                      같은 세 점 범위(`<from>...<to>`)를 그대로 열는다(B9) — 목록과 본문이 한 범위다. */}
+                  <button
+                    type="button"
+                    className={`git-change-path git-change-path-button${selected?.rangeFrom === rangeFrom && selected?.rangeTo === rangeTo && selected.path === file.path ? " selected" : ""}`}
+                    title={file.originalPath ? `${file.originalPath} → ${file.path}` : file.path}
+                    onClick={() => selectDiff({ path: file.path, originalPath: file.originalPath, staged: false, commit: null, rangeFrom, rangeTo })}
+                  >
+                    {/* 새 이름을 앞에 둔다. 옛 경로가 앞이면 좁은 폭에서 그것만 보이고 새 이름이 잘린다. */}
+                    <ComparisonPath path={file.path} />
+                    {file.originalPath && <span className="git-change-origin"> ← {file.originalPath}</span>}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
         </>
       )}
     </div>
@@ -1180,6 +1540,8 @@ function BranchesSection({ repository, locked, confirm, git }: {
    */
   const branchRow = (leaf: GitBranchTreeLeaf, isRemote: boolean, depth: number) => {
     const { branch } = leaf;
+    // 현재 브랜치는 기준이 비어 있을 때(HEAD) 보이는 것이다.
+    const viewing = git.logReference === null ? branch.isHead && !isRemote : git.logReference === branchLogRef(branch.name, isRemote);
     const incoming = branch.behind;
     const outgoing = branch.ahead;
     const diverged = incoming > 0 && outgoing > 0;
@@ -1194,7 +1556,7 @@ function BranchesSection({ repository, locked, confirm, git }: {
     ].filter((part): part is string => part !== null).join(" · ");
     return (
       <li
-        className={`git-branch-row${branch.isHead ? " current" : ""}`}
+        className={`git-branch-row${branch.isHead ? " current" : ""}${viewing ? " viewing" : ""}`}
         key={`${isRemote ? "r" : "l"}:${branch.name}`}
         style={{ paddingLeft: `${12 + depth * 14}px` }}
         onContextMenu={(event) => {
@@ -1205,7 +1567,16 @@ function BranchesSection({ repository, locked, confirm, git }: {
           setContextMenu({ branch, remote: isRemote, x: Math.min(x, window.innerWidth - 246), y: Math.min(y, window.innerHeight - 230) });
         }}
       >
-        <div className="git-branch-main">
+        <button
+          className="git-branch-main"
+          type="button"
+          aria-pressed={viewing}
+          aria-label={text(`${branch.name} 이력 보기`, `Show ${branch.name} history`)}
+          title={branch.isHead
+            ? text("현재 브랜치의 이력을 봅니다.", "Show the current branch's history.")
+            : text(`${branch.name}의 이력을 봅니다. 브랜치는 전환하지 않습니다.`, `Show ${branch.name}'s history without switching.`)}
+          onClick={() => git.setLogReference(branch.isHead && !isRemote ? null : branchLogRef(branch.name, isRemote))}
+        >
           <strong title={branch.name}>
             {branch.upstream !== null && (
               <Link2
@@ -1223,7 +1594,7 @@ function BranchesSection({ repository, locked, confirm, git }: {
             {branch.committedAt > 0 && ` · ${formatRelative(branch.committedAt * 1000)}`}
           </small>
           {branch.subject && <small className="git-branch-subject" title={branch.subject}>{branch.subject}</small>}
-        </div>
+        </button>
         {branch.upstream !== null && (incoming > 0 || outgoing > 0) && (
           <span className={`git-branch-track${diverged ? " diverged" : ""}`} title={trackTitle}>
             {incoming > 0 && <span className="git-track-in"><ArrowDown size={11} />{incoming}</span>}
@@ -1359,20 +1730,20 @@ function BranchesSection({ repository, locked, confirm, git }: {
               <button
                 type="button"
                 role="menuitem"
-                title={!contextMenu.branch.isHead ? text("Pull하려면 먼저 이 브랜치로 전환하세요.", "Switch to this branch before pulling.") : contextMenu.branch.upstream === null ? text("upstream이 있는 브랜치만 Pull할 수 있습니다.", "Only branches with an upstream can be pulled.") : undefined}
+                title={!contextMenu.branch.isHead ? text("받아서 합치려면 먼저 이 브랜치로 전환하세요.", "Switch to this branch before pulling.") : contextMenu.branch.upstream === null ? text("따라가는 원격 브랜치(upstream)가 있어야 받아서 합칠 수 있습니다.", "Only branches with an upstream can be pulled.") : undefined}
                 disabled={locked || !contextMenu.branch.isHead || contextMenu.branch.upstream === null || contextMenu.branch.gone || repository.inProgress !== null}
                 onClick={() => { setContextMenu(null); void pullCurrent("ffOnly"); }}
               >
-                <Download size={14} />{text("이 브랜치 Pull", "Pull this branch")}
+                <ArrowDownToLine size={14} />{text("받아서 합치기 · 빨리감기만", "Pull this branch")}
               </button>
               <button
                 type="button"
                 role="menuitem"
-                title={!contextMenu.branch.isHead ? text("Pull하려면 먼저 이 브랜치로 전환하세요.", "Switch to this branch before pulling.") : contextMenu.branch.upstream === null ? text("upstream이 있는 브랜치만 Pull할 수 있습니다.", "Only branches with an upstream can be pulled.") : undefined}
+                title={!contextMenu.branch.isHead ? text("받아서 합치려면 먼저 이 브랜치로 전환하세요.", "Switch to this branch before pulling.") : contextMenu.branch.upstream === null ? text("따라가는 원격 브랜치(upstream)가 있어야 받아서 합칠 수 있습니다.", "Only branches with an upstream can be pulled.") : undefined}
                 disabled={locked || !contextMenu.branch.isHead || contextMenu.branch.upstream === null || contextMenu.branch.gone || repository.inProgress !== null}
                 onClick={() => { setContextMenu(null); void pullCurrent("rebase"); }}
               >
-                <GitCompareArrows size={14} />{text("Pull 후 리베이스", "Pull with rebase")}
+                <GitCompareArrows size={14} />{text("받아서 합치기 · 내 커밋 재배치", "Pull with rebase")}
               </button>
             </>
           )}
@@ -1383,7 +1754,7 @@ function BranchesSection({ repository, locked, confirm, git }: {
               disabled={locked || remoteFor(contextMenu.branch) === null}
               onClick={() => { const target = contextMenu.branch; setContextMenu(null); void fetchRemote(target); }}
             >
-              <Download size={14} />{text("이 원격 가져오기", "Fetch this remote")}
+              <CloudDownload size={14} />{text("이 원격 확인 (fetch)", "Fetch this remote")}
             </button>
           )}
           <button
@@ -1392,7 +1763,7 @@ function BranchesSection({ repository, locked, confirm, git }: {
             disabled={locked || repository.head.unborn || repository.head.detached || repository.inProgress !== null || contextMenu.branch.isHead}
             onClick={() => { const target = contextMenu.branch; setContextMenu(null); void rebaseOnto(target); }}
           >
-            <GitCompareArrows size={14} />{text("이 브랜치 위로 리베이스", "Rebase onto this branch")}
+            <GitCompareArrows size={14} />{text("이 브랜치 위로 옮기기 (rebase)", "Rebase onto this branch")}
           </button>
         </div>
       )}
@@ -1403,7 +1774,13 @@ function BranchesSection({ repository, locked, confirm, git }: {
 // ---------------------------------------------------------------------------
 // 워크트리
 
-function WorktreesSection({ worktrees }: { worktrees: GitWorktree[] }) {
+/**
+ * 연결 워크트리 목록. 현재가 아닌 워크트리는 펼쳐서 그 작업 트리의 변경 파일을 보고, 파일을
+ * 누르면 같은 diff 모달로 연다 — 에이전트가 `git worktree`로 따로 고치는 파일은 프로젝트
+ * 자신의 변경 목록에 나오지 않기 때문이다. 여기서는 읽기만 한다. 스테이지·커밋은 그
+ * 워크트리를 작업하는 쪽의 일이다.
+ */
+function WorktreesSection({ worktrees, git }: { worktrees: GitWorktree[]; git: ProjectGitState }) {
   const { text } = useI18n();
   if (worktrees.length === 0) return null;
   const flags = (worktree: GitWorktree) => [
@@ -1416,17 +1793,67 @@ function WorktreesSection({ worktrees }: { worktrees: GitWorktree[] }) {
     <section className="git-worktrees settings-subsection">
       <header><div><strong>{text("워크트리", "Worktrees")}</strong></div></header>
       <ul className="git-worktree-list">
-        {worktrees.map((worktree) => (
-          <li className="git-worktree-row" key={worktree.path}>
-            <code title={worktree.path}>{displayPath(worktree.path)}</code>
-            <small>
-              {worktree.branch ?? (worktree.detached ? `${text("분리됨", "detached")} ${worktree.head?.slice(0, 7) ?? ""}` : worktree.head?.slice(0, 7) ?? "")}
-              {flags(worktree).length > 0 && ` · ${flags(worktree).join(", ")}`}
-            </small>
-          </li>
-        ))}
+        {worktrees.map((worktree) => {
+          const viewable = !worktree.isCurrent && !worktree.bare && !worktree.prunable;
+          const open = viewable && git.openWorktree === worktree.path;
+          return (
+            <li className="git-worktree-row" key={worktree.path}>
+              <div className="git-worktree-head">
+                <code title={worktree.path}>{displayPath(worktree.path)}</code>
+                {viewable && (
+                  <button
+                    className="button compact"
+                    type="button"
+                    aria-expanded={open}
+                    onClick={() => git.setOpenWorktree(open ? null : worktree.path)}
+                  >
+                    {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                    {text("변경 보기", "Changes")}
+                  </button>
+                )}
+              </div>
+              <small>
+                {worktree.branch ?? (worktree.detached ? `${text("분리됨", "detached")} ${worktree.head?.slice(0, 7) ?? ""}` : worktree.head?.slice(0, 7) ?? "")}
+                {flags(worktree).length > 0 && ` · ${flags(worktree).join(", ")}`}
+              </small>
+              {open && <WorktreeChanges worktreePath={worktree.path} git={git} />}
+            </li>
+          );
+        })}
       </ul>
     </section>
+  );
+}
+
+function WorktreeChanges({ worktreePath, git }: { worktreePath: string; git: ProjectGitState }) {
+  const { text } = useI18n();
+  const { worktreeStatus: status, worktreeError: error } = git;
+  if (error) return <p className="git-worktree-note error">{error}</p>;
+  if (status === null) return <p className="git-worktree-note">{text("변경을 읽고 있습니다", "Reading changes")}</p>;
+  if (status.entries.length === 0) return <p className="git-worktree-note">{text("변경 없음", "No changes")}</p>;
+  return (
+    <ul className="git-change-list git-worktree-changes">
+      {status.entries.map((entry) => {
+        // 작업 트리 쪽 변경이 있으면 그쪽을, 스테이지만 된 파일은 인덱스 쪽을 연다.
+        const staged = entry.worktreeStatus === "unmodified";
+        const selected = git.selectedDiff?.worktreePath === worktreePath && git.selectedDiff.path === entry.path && git.selectedDiff.staged === staged;
+        return (
+          <li className={`git-change-row${selected ? " selected" : ""}`} key={`${entry.originalPath ?? ""}:${entry.path}`}>
+            <code className="git-change-code">{gitChangeCode(entry, staged ? "index" : "worktree")}</code>
+            <button
+              className="git-change-path"
+              type="button"
+              title={text("변경 내용 보기", "Show diff")}
+              onClick={() => git.selectDiff({ path: entry.path, staged, originalPath: entry.originalPath, commit: null, worktreePath })}
+            >
+              {entry.originalPath && <><span className="git-change-origin">{entry.originalPath}</span> → </>}
+              <span>{entry.path}</span>
+            </button>
+          </li>
+        );
+      })}
+      {status.truncated && <li className="git-worktree-note">{text("변경이 많아 일부만 보입니다.", "Too many changes; only some are shown.")}</li>}
+    </ul>
   );
 }
 
@@ -1662,12 +2089,13 @@ function CommitFilesList({ commit, git }: { commit: GitCommit; git: ProjectGitSt
 
 function LogSection({ git, onRequestAiaPrompt }: { git: ProjectGitState; onRequestAiaPrompt: (prompt: string) => void }) {
   const { text } = useI18n();
-  const { log, logError, logLoading, projectPath } = git;
+  const { log, logError, logLoading, projectPath, logReference } = git;
   const [expanded, setExpanded] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   /** 고른 커밋의 SHA를 **고른 순서대로** 담는다. Set 을 쓰면 그 순서가 사라진다. */
   const [picked, setPicked] = useState<readonly string[]>([]);
-  useEffect(() => { setQuery(""); setExpanded(null); setPicked([]); }, [projectPath]);
+  // 다른 브랜치를 보러 가면 앞 브랜치에서 펼친 커밋·고른 커밋·검색어는 뜻이 없다.
+  useEffect(() => { setQuery(""); setExpanded(null); setPicked([]); }, [projectPath, logReference]);
   const visibleCommits = useMemo(() => filterGitCommits(log?.commits ?? [], query), [log?.commits, query]);
   const graph = useMemo(() => {
     // 검색으로 감춘 부모까지 선을 이어 그리면 화면 밖 커밋으로 향하는 꼬리만 남는다.
@@ -1697,7 +2125,19 @@ function LogSection({ git, onRequestAiaPrompt }: { git: ProjectGitState; onReque
   return (
     <section className="git-log settings-subsection">
       <header>
-        <div><strong>{text("이력", "History")}</strong></div>
+        <div className="git-log-title">
+          <strong>{text("이력", "History")}</strong>
+          {logReference !== null && (
+            <>
+              <span className="git-log-viewing" title={text(`전환하지 않고 ${branchLogLabel(logReference)}의 이력만 보고 있습니다.`, `Viewing ${branchLogLabel(logReference)}'s history without switching.`)}>
+                <History size={12} /><span>{branchLogLabel(logReference)}</span>
+              </span>
+              <button className="button compact" type="button" onClick={() => git.setLogReference(null)}>
+                {text("현재 브랜치 이력으로", "Back to current branch")}
+              </button>
+            </>
+          )}
+        </div>
         {picked.length > 0 && (
           <span className="git-row-actions">
             <small>

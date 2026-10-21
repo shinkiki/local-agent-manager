@@ -1,5 +1,5 @@
 import { FolderTree, GitBranch, Layers, Settings } from "lucide-react";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { errorText } from "../lib/errorText";
 import { useI18n } from "../lib/i18n";
 import { getProjectRegistry } from "../lib/ipc";
@@ -8,11 +8,12 @@ import { readStoredText, writeStoredText } from "../lib/storedText";
 import type { TabRequest } from "../lib/uiGuide";
 import type { ProjectRegistryEntry } from "../types";
 import { ProjectFilesPanel } from "./ProjectFilesPanel";
+import { ProjectGitAuthCard } from "./ProjectGitAuthCard";
 import { ProjectGitPanel } from "./ProjectGitPanel";
 import { ProjectOverlayPanel } from "./ProjectOverlayPanel";
 import { ProjectRegistryCard } from "./ProjectRegistryCard";
 import { SettingsSubTabPanel, SettingsSubTabs, type SettingsSubTab } from "./SettingsSubTabs";
-import { EmptyState, ErrorBanner, LoadingState } from "./Shared";
+import { EmptyState, ErrorBanner, LoadingState, Modal } from "./Shared";
 import { useStoredChoice } from "./SkillLibraryPanel";
 
 export type ProjectsTabId = "files" | "git" | "overlay" | "settings";
@@ -69,21 +70,46 @@ export function ProjectsView({ active, tabRequest = null, registryRevision, onRe
   };
 
   const needsProject = tab === "files" || tab === "git" || tab === "overlay";
+  // C16-11. git 원격 인증은 형상관리 탭의 프로젝트 목록 오른쪽 톱니바퀴로 연다(사용자 결정,
+  // 2026-10-20). 저장하면 형상관리 패널이 개요를 다시 읽어 올리기 막힘 여부를 새로 매긴다.
+  const [gitAuthOpen, setGitAuthOpen] = useState(false);
+  const [gitAuthRevision, setGitAuthRevision] = useState(0);
+  const openGitAuth = useCallback(() => setGitAuthOpen(true), []);
+  const gitAuthChanged = useCallback(() => setGitAuthRevision((revision) => revision + 1), []);
   return (
     // 파일·형상관리 탭은 창 높이를 채우고 안에서 스크롤하지만, 설정 탭은 카드가 흐르며
     // 바깥 패널이 스크롤한다 — 높이를 고정하면 설정 탭의 긴 목록이 잘린다.
     <div className={`settings-subtab-view projects-view${needsProject ? " projects-view-fill" : ""}`}>
       <SettingsSubTabs idPrefix="projects" tabs={projectsTabs} value={tab} onChange={setTab} label={text("프로젝트 화면 탭", "Projects view tabs")} />
       {needsProject && selectedPath !== null ? (
-        <label className="projects-selector" data-ui-anchor="projects.selector">
-          <span>{text("프로젝트", "Project")}</span>
-          <select aria-label={text("프로젝트 선택", "Select project")} value={selectedPath} onChange={(event) => selectProject(event.target.value)}>
-            {activeProjects.map((project) => (
-              <option value={project.path} key={project.path}>{project.name} · {project.path}</option>
-            ))}
-          </select>
-        </label>
+        <div className="projects-selector-row">
+          <label className="projects-selector" data-ui-anchor="projects.selector">
+            <span>{text("프로젝트", "Project")}</span>
+            <select aria-label={text("프로젝트 선택", "Select project")} value={selectedPath} onChange={(event) => selectProject(event.target.value)}>
+              {activeProjects.map((project) => (
+                <option value={project.path} key={project.path}>{project.name} · {project.path}</option>
+              ))}
+            </select>
+          </label>
+          {tab === "git" && (
+            <button
+              className="icon-button projects-git-auth-button"
+              type="button"
+              data-ui-anchor="projects.git.remoteAuth"
+              onClick={openGitAuth}
+              aria-label={text("git 원격 인증 설정", "Git remote auth settings")}
+              title={text("git 원격 인증 설정 — HTTPS 원격에 쓸 토큰(저장된 비밀값)을 호스트마다 고릅니다", "Git remote auth settings — pick the token (saved secret) for each HTTPS remote host")}
+            >
+              <Settings size={15} />
+            </button>
+          )}
+        </div>
       ) : null}
+      {gitAuthOpen && selectedPath !== null && (
+        <Modal title={text("git 원격 인증", "Git remote auth")} size="wide" onClose={() => setGitAuthOpen(false)}>
+          <ProjectGitAuthCard key={selectedPath} projectPath={selectedPath} onChanged={gitAuthChanged} />
+        </Modal>
+      )}
       <SettingsSubTabPanel idPrefix="projects" id="files" active={tab === "files"}>
         <ProjectPanelBody registry={registry} selectedPath={selectedPath} onOpenSettings={() => setTab("settings")}>
           {(path) => <ProjectFilesPanel key={path} projectPath={path} active={active && tab === "files"} />}
@@ -91,7 +117,7 @@ export function ProjectsView({ active, tabRequest = null, registryRevision, onRe
       </SettingsSubTabPanel>
       <SettingsSubTabPanel idPrefix="projects" id="git" active={tab === "git"}>
         <ProjectPanelBody registry={registry} selectedPath={selectedPath} onOpenSettings={() => setTab("settings")}>
-          {(path) => <ProjectGitPanel key={path} projectPath={path} active={active && tab === "git"} onRequestAiaPrompt={onRequestAiaPrompt} />}
+          {(path) => <ProjectGitPanel key={path} projectPath={path} active={active && tab === "git"} onRequestAiaPrompt={onRequestAiaPrompt} authRevision={gitAuthRevision} onOpenRemoteAuth={openGitAuth} />}
         </ProjectPanelBody>
       </SettingsSubTabPanel>
       <SettingsSubTabPanel idPrefix="projects" id="overlay" active={tab === "overlay"}>

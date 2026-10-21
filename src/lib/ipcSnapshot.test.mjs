@@ -25,6 +25,7 @@ test("세션 메타의 빠진 필드를 기본값으로 채운다", () => {
     origin: null,
     handoffOrigin: null,
     handoffTargets: [],
+    linkedProjectPaths: [],
   });
   // 백엔드가 실어 보낸 출처·인계 값은 그대로 남아야 한다. 떨어뜨리면 세션 목록의 반복
   // 요청 필터와 인계 기록 구역이 값을 못 본다.
@@ -35,6 +36,8 @@ test("세션 메타의 빠진 필드를 기본값으로 채운다", () => {
   assert.deepEqual(sessionMetaWithDefaults({ favorite: true, folderIds: ["a"] }).folderIds, ["a"]);
   // 배열이 아닌 값이 저장돼 있어도 목록 렌더가 깨지지 않도록 빈 배열로 떨어진다.
   assert.deepEqual(sessionMetaWithDefaults({ folderIds: "a" }).folderIds, []);
+  // 직접 이어 둔 프로젝트는 통째 교체 패치라, 떨어뜨리면 다음 연결이 저장된 연결을 지운다.
+  assert.deepEqual(sessionMetaWithDefaults({ linkedProjectPaths: ["/repo/app"] }).linkedProjectPaths, ["/repo/app"]);
 });
 
 test("공급자별 집계는 빠진 공급자를 0으로 둔다", () => {

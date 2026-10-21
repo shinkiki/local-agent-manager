@@ -181,7 +181,17 @@ fn plan_user_directory_paths(app_data_dir: &Path, raw: &str) -> Result<Directory
             .ok_or_else(|| CoreError::InvalidInput("최상위 경로는 만들 수 없습니다".to_owned()))?;
         names.push(name.to_owned());
         if fs::symlink_metadata(parent).is_ok() {
-            break resolve_existing_directory_path(parent)?;
+            // 항목은 있는데 정규화가 "없음"이면 끊어진 링크다. 그 아래로는 만들 수 없으니
+            // 접두사 없는 거절로 답한다 — 접두사가 붙으면 화면이 만들기를 다시 묻는다(C6-4).
+            break match resolve_existing_directory_path(parent) {
+                Err(CoreError::NotFound(_)) => {
+                    return Err(CoreError::InvalidInput(format!(
+                        "경로 중간의 링크가 없는 곳을 가리킵니다: {}",
+                        shown(parent)
+                    )));
+                }
+                resolved => resolved?,
+            };
         }
         if names.len() >= MAX_NEW_DIRECTORY_SEGMENTS {
             return Err(CoreError::InvalidInput(format!(
@@ -475,6 +485,28 @@ mod tests {
         assert!(matches!(error, CoreError::InvalidInput(_)), "{error}");
         assert!(error.to_string().contains("3칸"), "{error}");
         assert!(!temp.path().join("a").exists(), "아무것도 만들지 않는다");
+    }
+
+    /// 끊어진 링크가 중간 칸에 있으면 그 아래로는 만들 수 없다. 이때 "없음" 접두사로
+    /// 답하면 화면이 같은 자리를 다시 만들자고 묻는 고리에 빠진다(C6-4).
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_on_the_path_is_refused_without_the_missing_prefix() {
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        let app_data = temp.path().join("app-data");
+        fs::create_dir(&app_data).expect("app data");
+        let link = temp.path().join("dangling");
+        std::os::unix::fs::symlink(temp.path().join("gone"), &link).expect("symlink");
+        let target = link.join("new");
+
+        let error = create_user_directory(&app_data, &target.to_string_lossy())
+            .expect_err("dangling parent");
+        assert!(matches!(error, CoreError::InvalidInput(_)), "{error}");
+        assert!(
+            !error.to_string().starts_with(MISSING_DIRECTORY_PREFIX),
+            "{error}"
+        );
+        assert!(!temp.path().join("gone").exists(), "아무것도 만들지 않는다");
     }
 
     #[test]

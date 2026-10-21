@@ -193,16 +193,14 @@ fn strip_inline_markup(text: &str) -> String {
                     None => index += run,
                 }
             }
-            '*' | '~' => index += marker_run(&chars, index, current),
-            '_' => {
-                let run = marker_run(&chars, index, '_');
-                // `_`는 식별자에 흔해 한 개는 글자로 남기고, 두 개 이상만 표기로 본다.
-                if run >= 2 {
-                    index += run;
-                } else {
-                    out.push('_');
-                    index += 1;
+            '*' | '~' | '_' => {
+                let run = marker_run(&chars, index, current);
+                // `_`는 식별자에 흔해 한 개는 글자로 남긴다. 양옆이 공백인 뭉치는 `2 * 3`처럼
+                // 강조를 열지도 닫지도 못한다(CommonMark flanking). 둘 다 표기가 아니라 글자다.
+                if (current == '_' && run < 2) || is_unflanked_run(&chars, index, run) {
+                    out.extend(chars[index..index + run].iter());
                 }
+                index += run;
             }
             // 이미지는 대체 텍스트만, 링크는 라벨만 남기고 주소는 버린다.
             '!' if chars.get(index + 1) == Some(&'[') => {
@@ -235,6 +233,13 @@ fn marker_run(chars: &[char], index: usize, marker: char) -> usize {
         .iter()
         .take_while(|value| **value == marker)
         .count()
+}
+
+/// 뭉치 앞뒤가 모두 공백(또는 줄 끝)이라 강조 표기가 될 수 없는지.
+fn is_unflanked_run(chars: &[char], index: usize, run: usize) -> bool {
+    let before = index.checked_sub(1).map(|at| chars[at]);
+    let after = chars.get(index + run).copied();
+    before.is_none_or(char::is_whitespace) && after.is_none_or(char::is_whitespace)
 }
 
 /// `from` 이후에서 길이가 정확히 `len`인 마커 뭉치의 시작 위치.
@@ -371,5 +376,12 @@ mod tests {
         assert_eq!(markdown_plain_text("\\*별표\\*는 글자"), "*별표*는 글자");
         assert_eq!(markdown_plain_text("버전 1.5 확인"), "버전 1.5 확인");
         assert_eq!(markdown_plain_text("완료 [링크 아님"), "완료 [링크 아님");
+        assert_eq!(markdown_plain_text("2 * 3 = 6"), "2 * 3 = 6");
+        assert_eq!(markdown_plain_text("끝 *"), "끝 *");
+        assert_eq!(markdown_plain_text("*a * b*"), "a * b");
+        assert_eq!(
+            markdown_plain_text("약 ~ 30초, a __ b"),
+            "약 ~ 30초, a __ b"
+        );
     }
 }

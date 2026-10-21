@@ -134,12 +134,18 @@ pub(crate) fn rollback_serve(identity: &TailscaleIdentity, previous_target: Opti
 }
 
 pub(crate) fn validate_tailscale_host(host: &str) -> Result<(), String> {
-    if host.ends_with(".ts.net")
-        && host.len() <= 253
-        && host
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
-    {
+    // Every label must be a DNS label (RFC 1123): 1–63 alphanumerics or inner
+    // hyphens. A byte filter alone accepted `.ts.net` and `a..ts.net`, which no
+    // tailnet issues and which would then be compared against `Origin` as-is.
+    let is_label = |label: &str| {
+        (1..=63).contains(&label.len())
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    };
+    if host.ends_with(".ts.net") && host.len() <= 253 && host.split('.').all(is_label) {
         Ok(())
     } else {
         Err("--tailscale-host는 스킴과 경로가 없는 정확한 *.ts.net 호스트여야 합니다".to_owned())
@@ -261,8 +267,15 @@ mod tests {
     #[test]
     fn validates_exact_tailnet_host() {
         assert!(validate_tailscale_host("device.example.ts.net").is_ok());
+        assert!(validate_tailscale_host("my-device.ts.net").is_ok());
         assert!(validate_tailscale_host("https://device.example.ts.net").is_err());
         assert!(validate_tailscale_host("example.com").is_err());
+        assert!(validate_tailscale_host(".ts.net").is_err());
+        assert!(validate_tailscale_host("..ts.net").is_err());
+        assert!(validate_tailscale_host("device..ts.net").is_err());
+        assert!(validate_tailscale_host("-device.example.ts.net").is_err());
+        assert!(validate_tailscale_host("device-.example.ts.net").is_err());
+        assert!(validate_tailscale_host(&format!("{}.ts.net", "a".repeat(64))).is_err());
     }
 
     #[test]

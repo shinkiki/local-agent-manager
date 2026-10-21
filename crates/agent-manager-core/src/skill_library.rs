@@ -2415,8 +2415,10 @@ fn preserve_executable_bit(path: &Path, executable: bool) -> Result<(), CoreErro
     let metadata = fs::metadata(path)?;
     let mut permissions = metadata.permissions();
     let mode = permissions.mode();
+    // 읽을 수 있는 자리에만 실행 비트를 더한다. `fs::copy`가 원본 권한을 이미 옮겼으므로
+    // `0o700` 스크립트가 게시되며 `0o755`로 넓어지지 않는다.
     let next = if executable {
-        mode | 0o755 & 0o7777
+        mode | ((mode & 0o444) >> 2)
     } else {
         mode & !0o111
     };
@@ -3888,6 +3890,26 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_bit_never_widens_a_private_script() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temp");
+        let path = temp.path().join("run.sh");
+        fs::write(&path, "#!/bin/sh\n").expect("script");
+        let mode_after = |start: u32, executable: bool| {
+            fs::set_permissions(&path, fs::Permissions::from_mode(start)).expect("chmod");
+            preserve_executable_bit(&path, executable).expect("preserve");
+            fs::metadata(&path).expect("meta").permissions().mode() & 0o777
+        };
+        assert_eq!(mode_after(0o700, true), 0o700);
+        assert_eq!(mode_after(0o600, true), 0o700);
+        assert_eq!(mode_after(0o640, true), 0o750);
+        assert_eq!(mode_after(0o644, true), 0o755);
+        assert_eq!(mode_after(0o755, false), 0o644);
+    }
 
     fn write_skill(directory: &Path, name: &str, description: &str) {
         fs::create_dir_all(directory).expect("create skill dir");

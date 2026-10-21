@@ -501,6 +501,11 @@ fn folder_subtree(folders: &[SessionFolder], id: &str) -> FolderSubtree {
 }
 
 /// 저장본의 상위 폴더 참조가 사라졌거나 순환이면 최상위로 되돌려 트리를 항상 그릴 수 있게 한다.
+///
+/// 되돌리는 것은 순환을 이루는 폴더뿐이다. 순환 아래에 매달린 폴더는 상위를 따라가다
+/// 순환에 갇힐 뿐 자기 자신으로 돌아오지 않으므로, 순환이 끊긴 뒤에는 원래 상위 밑에
+/// 그대로 그려진다. 예전에는 "따라가다 같은 폴더를 다시 만나면" 순환으로 보아 그 하위
+/// 폴더까지 최상위로 흩어 놓았다.
 fn sanitize_folder_parents(folders: &mut [SessionFolder]) {
     let known = folders
         .iter()
@@ -528,8 +533,12 @@ fn sanitize_folder_parents(folders: &mut [SessionFolder]) {
             let mut seen = HashSet::from([folder.id.clone()]);
             let mut cursor = folder.parent_id.clone();
             while let Some(current) = cursor {
-                if !seen.insert(current.clone()) {
+                if current == folder.id {
                     return true;
+                }
+                if !seen.insert(current.clone()) {
+                    // 자기 자신이 아닌 다른 순환에 갇혔다 — 이 폴더는 그 순환의 하위다.
+                    return false;
                 }
                 cursor = parents.get(&current).cloned();
             }
@@ -591,5 +600,50 @@ fn new_folder_id(metadata: &AppMetadata) -> String {
             return candidate;
         }
         suffix += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn folder(id: &str, parent: Option<&str>) -> SessionFolder {
+        SessionFolder {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            color: "#51e97d".to_owned(),
+            sort_order: 0,
+            parent_id: parent.map(str::to_owned),
+            hidden: false,
+            depth: 0,
+            session_count: 0,
+            total_session_count: 0,
+        }
+    }
+
+    #[test]
+    fn sanitize_lifts_only_cycle_members_and_keeps_their_descendants_nested() {
+        let mut folders = vec![
+            folder("a", Some("b")),
+            folder("b", Some("a")),
+            folder("c", Some("b")),
+            folder("d", Some("c")),
+            folder("e", Some("gone")),
+        ];
+        sanitize_folder_parents(&mut folders);
+        let parents = folders
+            .iter()
+            .map(|folder| (folder.id.as_str(), folder.parent_id.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parents,
+            vec![
+                ("a", None),
+                ("b", None),
+                ("c", Some("b")),
+                ("d", Some("c")),
+                ("e", None),
+            ]
+        );
     }
 }

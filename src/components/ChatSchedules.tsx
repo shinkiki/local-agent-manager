@@ -179,14 +179,23 @@ export function SchedulesPanel({ providers, accounts, projects, models, sessions
   }, []);
   useEffect(() => { void loadWorkflows(); }, [loadWorkflows]);
   const editorRef = useRef<HTMLDivElement>(null);
+  // 편집기 열기의 차례. 카드 A·B 의 편집을 연달아 누르거나 새 요청·취소로 넘어간 뒤 늦게 온
+  // 앞선 상세 응답이 지금 연 편집기를 덮거나 닫은 편집기를 다시 여는 일을 막는다.
+  const editorRequestRef = useRef(0);
+  const showEditor = useCallback((next: ScheduledRequest | "new" | null) => {
+    editorRequestRef.current += 1;
+    setEditing(next);
+  }, []);
   // 스냅샷의 프롬프트는 미리보기다. 편집기에는 전문이 필요하므로 열 때 상세를 받는다.
   const openEditor = useCallback(async (schedule: ScheduledRequest) => {
+    const request = ++editorRequestRef.current;
     setError(null);
     try {
       void loadWorkflows();
-      setEditing(await getScheduledRequestDetail(schedule.id));
+      const detail = await getScheduledRequestDetail(schedule.id);
+      if (request === editorRequestRef.current) setEditing(detail);
     } catch (cause) {
-      setError(errorText(cause));
+      if (request === editorRequestRef.current) setError(errorText(cause));
     }
   }, [loadWorkflows]);
   useEffect(() => {
@@ -205,11 +214,11 @@ export function SchedulesPanel({ providers, accounts, projects, models, sessions
   const pacedHiddenCount = (snapshot?.schedules.length ?? 0) - visibleSchedules.length;
   return (
     <section className="schedules-panel">
-      <header><div><h2>{text("반복 요청", "Recurring Schedules")}</h2><p>{text("로그인 후 백그라운드에서 에이전트 요청을 실행합니다.", "Runs agent requests in the background after login.")}</p></div><div>{snapshot && <button className={snapshot.paused ? "button primary" : "button"} type="button" onClick={() => toggleSchedulesPaused(!snapshot.paused)}>{snapshot.paused ? text("전체 재개", "Resume All") : text("전체 일시정지", "Pause All")}</button>}<button className="button primary" type="button" onClick={() => { void loadWorkflows(); setEditing("new"); }}>{text("새 반복 요청", "New Schedule")}</button></div></header>
+      <header><div><h2>{text("반복 요청", "Recurring Schedules")}</h2><p>{text("로그인 후 백그라운드에서 에이전트 요청을 실행합니다.", "Runs agent requests in the background after login.")}</p></div><div>{snapshot && <button className={snapshot.paused ? "button primary" : "button"} type="button" onClick={() => toggleSchedulesPaused(!snapshot.paused)}>{snapshot.paused ? text("전체 재개", "Resume All") : text("전체 일시정지", "Pause All")}</button>}<button className="button primary" type="button" onClick={() => { void loadWorkflows(); showEditor("new"); }}>{text("새 반복 요청", "New Schedule")}</button></div></header>
       {error && <ErrorBanner message={error} />}
       {snapshot && !snapshot.runnerActive && <div className="warning-banner">{text("다른 Agent Manager 프로세스가 반복 실행을 담당하고 있습니다.", "Another Agent Manager process is handling schedule runs.")}</div>}
       {snapshot?.paused && <div className="warning-banner">{text("전체 일시정지 중입니다. 예약 실행만 멈추고 지금 실행은 그대로 나갑니다.", "All schedules are paused. Scheduled triggers are paused, but Run Now requests will still execute.")}</div>}
-      {editing && <div className="schedule-editor-anchor" ref={editorRef}><ScheduleEditor key={editing === "new" ? "new" : editing.id} providers={providers} accounts={accounts} projects={projects} models={models} workflows={workflows} currentSession={currentSession} initialPrompt={currentPrompt} schedule={editing === "new" ? undefined : editing} onSaved={() => { setEditing(null); void refresh(); }} onCancel={() => setEditing(null)} /></div>}
+      {editing && <div className="schedule-editor-anchor" ref={editorRef}><ScheduleEditor key={editing === "new" ? "new" : editing.id} providers={providers} accounts={accounts} projects={projects} models={models} workflows={workflows} currentSession={currentSession} initialPrompt={currentPrompt} schedule={editing === "new" ? undefined : editing} onSaved={() => { showEditor(null); void refresh(); }} onCancel={() => showEditor(null)} /></div>}
       {pacedHiddenCount > 0 && <p className="schedules-paced-note">{text(`페이싱 회차 ${pacedHiddenCount}건은 워크플로 화면의 워크플로 페이싱 탭에서 관리합니다.`, `${pacedHiddenCount} paced runs are managed in the Workflow Pacing tab on the Workflows page.`)}</p>}
       {!snapshot ? <div className="state-panel"><span className="spinner" /><p>{text("반복 요청을 읽고 있습니다.", "Loading recurring schedules…")}</p></div> : visibleSchedules.length === 0 ? (pacedHiddenCount > 0 ? null : <EmptyState title={text("등록된 반복 요청이 없습니다", "No recurring schedules registered")} detail={text("이 탭에서 새 반복 작업을 만드세요.", "Create a new recurring task in this tab.")} />) : (
         <div className="schedule-list">{visibleSchedules.map((schedule) => (

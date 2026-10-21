@@ -18,6 +18,7 @@ import type { ActivityFilter } from "../lib/activityFilter";
  */
 export function useChatTranscriptHistory({
   session,
+  previewItems,
   turns,
   limit,
   onLimitChange,
@@ -25,8 +26,10 @@ export function useChatTranscriptHistory({
   activityFilter,
   scrollContainerRef,
   onOpenLocalLink,
+  onEditMessage,
 }: {
   session: ChatSessionInfo | null;
+  previewItems?: TranscriptItem[];
   turns: ChatTurn[];
   limit: SessionTranscriptLimit;
   onLimitChange: (limit: SessionTranscriptLimit) => void;
@@ -36,6 +39,7 @@ export function useChatTranscriptHistory({
   /** 이전 구간을 붙인 뒤 읽던 자리를 되돌릴 때 쓸 스크롤 컨테이너. */
   scrollContainerRef: RefObject<HTMLElement | null>;
   onOpenLocalLink: (href: string) => void;
+  onEditMessage?: (item: TranscriptItem, text: string, sendImmediately?: boolean) => Promise<void>;
 }): {
   /** 잘라내기 전 파일 원문 전체. 다른 에이전트로 넘길 때 인계 문맥으로 쓴다. */
   items: TranscriptItem[];
@@ -45,9 +49,9 @@ export function useChatTranscriptHistory({
 } {
   /**
    * 라이브 스트림이 대화의 처음부터를 담고 있으면 파일 원문을 읽을 이유가 없다. 리플레이
-   * 버퍼가 앞부분을 밀어냈거나(재접속·긴 대화) 기존 세션을 이어 시작한 채팅만 원문을 읽는다.
+   * 버퍼가 앞부분을 밀어냈거나(재접속·긴 대화) 기존 세션을 이어 시작하거나 분기한 채팅은 원문을 읽는다.
    */
-  const missesHistory = Boolean(session && (session.replayTruncated || session.resuming));
+  const missesHistory = Boolean(session && (session.replayTruncated || session.resuming || session.forked));
   /**
    * 세션 파일에 남은 원문을 스트림 위에 붙이고, 라이브가 이미 담당하는 구간은 세션 상세와
    * 같은 경계 계산으로 잘라내 같은 턴이 두 번 보이지 않게 한다.
@@ -60,13 +64,13 @@ export function useChatTranscriptHistory({
   });
   const liveStreamBoundary = useMemo(() => liveStreamBoundaryMs(turns), [turns]);
   const visible = useMemo(
-    () => transcriptBeforeLiveStream(transcript.detail?.transcript ?? [], liveStreamBoundary),
-    [transcript.detail, liveStreamBoundary],
+    () => transcriptBeforeLiveStream(transcript.detail?.transcript.length ? transcript.detail.transcript : previewItems ?? [], liveStreamBoundary),
+    [transcript.detail, liveStreamBoundary, previewItems],
   );
 
   // 잘라낸 결과가 비어도 더 불러올 앞 구간이 남아 있으면 머리말과 '이전 대화 더보기'는 남긴다.
   // 파일에 1,000개가 있고 최신 100개를 라이브가 전부 담당하는 채팅이 그 경우다.
-  const history = session && (visible.length > 0 || transcript.earlierLoadCount > 0) ? (
+  const history = session && (visible.length > 0 || transcript.earlierLoadCount > 0 || transcript.error) ? (
     <div className="chat-transcript-history">
       <div className="chat-transcript-history-head">
         <div><strong>이전 대화 내역</strong><small>{transcript.detail?.skippedLines ? `읽지 못한 줄 ${transcript.detail.skippedLines.toLocaleString()}개` : "현재 연결 이전 기록"}</small></div>
@@ -77,7 +81,7 @@ export function useChatTranscriptHistory({
           onChange={onLimitChange}
         />
       </div>
-      {transcript.error && <ErrorBanner message={transcript.error} />}
+      {transcript.error && !previewItems && <ErrorBanner message={transcript.error} />}
       <TranscriptLoadEarlier
         count={transcript.earlierLoadCount}
         loading={transcript.loadingEarlier}
@@ -85,6 +89,7 @@ export function useChatTranscriptHistory({
         onLoad={() => void transcript.loadEarlier()}
       />
       <TranscriptTurns
+        onEditMessage={onEditMessage}
         items={visible}
         mode={mode}
         activityFilter={activityFilter}
@@ -98,5 +103,5 @@ export function useChatTranscriptHistory({
     </div>
   ) : null;
 
-  return { items: transcript.detail?.transcript ?? [], loaded: Boolean(transcript.detail), history };
+  return { items: transcript.detail?.transcript.length ? transcript.detail.transcript : previewItems ?? [], loaded: Boolean(transcript.detail) || previewItems !== undefined, history };
 }

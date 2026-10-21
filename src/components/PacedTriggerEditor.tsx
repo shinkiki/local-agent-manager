@@ -3,6 +3,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { useI18n, type UiText } from "../lib/i18n";
 import { createScheduledRequest, updateScheduledRequest } from "../lib/ipc";
 import { describeQuietHours, WEEKDAY_NAMES } from "../lib/pacingSummary";
+import { clampScheduleNumber, INTERVAL_HOURS, RUN_HOUR, RUN_MINUTE, type ScheduleNumberBounds } from "../lib/scheduleNumber";
 import {
   buildWorkflowArguments,
   validateScheduleWorkflowDraft,
@@ -46,18 +47,22 @@ export function useWorkflowModelCatalogs(): Partial<Record<ProviderId, readonly 
 const MIN_PARALLEL_RUNS = 2;
 const normalizeParallelRuns = (value: number) => Math.max(MIN_PARALLEL_RUNS, Math.round(value) || MIN_PARALLEL_RUNS);
 
+/**
+ * 간격·시·분은 문자열 초안이다. 숫자로 들고 있으면 칸을 비우는 순간 0이 끼어들고, 범위 밖
+ * 시각이 그대로 저장으로 간다. 칸을 떠날 때와 저장할 때만 `clampScheduleNumber`로 자른다.
+ */
 interface PacedRecurrenceDraft {
   frequency: ScheduleFrequency;
-  interval: number;
-  hour: number;
-  minute: number;
+  interval: string;
+  hour: string;
+  minute: string;
   weekday: number;
   cron: string;
 }
 
 /**
  * 페이싱 회차에 맞는 반복 주기 입력을 정규화해 조립한다.
- * 간격 입력을 비웠거나(0) 자동 주기처럼 간격을 쓰지 않는 상태여도 저장이 막히지 않게 유효 범위로 눌러 보낸다.
+ * 칸을 비웠거나 범위를 벗어났어도, 자동 주기처럼 간격을 쓰지 않는 상태여도 저장이 막히지 않게 유효 범위로 눌러 보낸다.
  */
 function buildPacedRecurrence({
   frequency,
@@ -70,9 +75,9 @@ function buildPacedRecurrence({
 }: PacedRecurrenceDraft & { timezone: string }) {
   return {
     frequency,
-    interval: Math.min(168, Math.max(1, Math.round(interval) || 1)),
-    hour,
-    minute,
+    interval: clampScheduleNumber(interval, INTERVAL_HOURS),
+    hour: clampScheduleNumber(hour, RUN_HOUR),
+    minute: clampScheduleNumber(minute, RUN_MINUTE),
     weekday,
     cron: frequency === "cron" ? cron : null,
     timezone,
@@ -159,9 +164,9 @@ function usePacedTriggerDraft({ workflows, schedule, initialWorkflowId, onSaved 
   // 새 회차는 자동 주기(가드 창 간격)로 시작한다 — 페이싱 회차의 기본 의도다.
   const [recurrenceDraft, setRecurrenceDraft] = useState<PacedRecurrenceDraft>(() => ({
     frequency: schedule?.recurrence.frequency ?? "auto",
-    interval: schedule?.recurrence.interval ?? 5,
-    hour: schedule?.recurrence.hour ?? 9,
-    minute: schedule?.recurrence.minute ?? 0,
+    interval: String(schedule?.recurrence.interval ?? 5),
+    hour: String(schedule?.recurrence.hour ?? 9),
+    minute: String(schedule?.recurrence.minute ?? 0),
     weekday: schedule?.recurrence.weekday ?? 1,
     cron: schedule?.recurrence.cron ?? "0 9 * * 1-5",
   }));
@@ -405,13 +410,27 @@ function PacedAutoCadenceNote({ autoLabel, quietSummary }: { autoLabel: string; 
 }
 
 /** 시간 단위 반복 간격(시간) 입력 필드 */
-function PacedHourlyCadenceField({ interval, onChange }: { interval: number; onChange: (interval: number) => void }) {
+function PacedHourlyCadenceField({ interval, onChange }: { interval: string; onChange: (interval: string) => void }) {
   const { text } = useI18n();
   return (
     <label>
       <span>{text("간격(시간)", "Interval (h)")}</span>
-      <input type="number" min={1} max={168} value={interval} onChange={(event) => onChange(Number(event.target.value))} />
+      <ClampedNumberInput value={interval} bounds={INTERVAL_HOURS} onChange={onChange} />
     </label>
+  );
+}
+
+/** 치는 동안은 글자 그대로 두고, 칸을 떠날 때 범위 안 정수로 되돌리는 숫자 칸. */
+function ClampedNumberInput({ value, bounds, onChange }: { value: string; bounds: ScheduleNumberBounds; onChange: (value: string) => void }) {
+  return (
+    <input
+      type="number"
+      min={bounds.min}
+      max={bounds.max}
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      onBlur={() => onChange(String(clampScheduleNumber(value, bounds)))}
+    />
   );
 }
 
@@ -421,18 +440,18 @@ function PacedTimeFields({
   minute,
   onChange,
 }: {
-  hour: number;
-  minute: number;
-  onChange: (patch: { hour?: number; minute?: number }) => void;
+  hour: string;
+  minute: string;
+  onChange: (patch: { hour?: string; minute?: string }) => void;
 }) {
   const { text } = useI18n();
   return (
     <label>
       <span>{text("실행 시각", "Time")}</span>
       <div className="time-fields">
-        <input type="number" min={0} max={23} value={hour} onChange={(event) => onChange({ hour: Number(event.target.value) })} />
+        <ClampedNumberInput value={hour} bounds={RUN_HOUR} onChange={(next) => onChange({ hour: next })} />
         <b>:</b>
-        <input type="number" min={0} max={59} value={minute} onChange={(event) => onChange({ minute: Number(event.target.value) })} />
+        <ClampedNumberInput value={minute} bounds={RUN_MINUTE} onChange={(next) => onChange({ minute: next })} />
       </div>
     </label>
   );

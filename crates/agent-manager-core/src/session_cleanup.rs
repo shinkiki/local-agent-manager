@@ -135,7 +135,7 @@ fn root_spec(kind: CleanupRootKind) -> &'static CleanupRootSpec {
         .expect("모든 정리 루트 종류는 allowlist에 등록되어 있다")
 }
 
-/// 정리 루트의 정규 경로. 앱 데이터 디렉터리 밖으로 벗어나면 거부한다(`C11-2`).
+/// 정리 루트의 정규 경로. 앱 데이터 디렉터리 밖으로 벗어나거나 앱 데이터 자신이면 거부한다(`C11-2`).
 fn cleanup_root(app_data_dir: &Path, spec: &CleanupRootSpec) -> Result<Option<PathBuf>, CoreError> {
     let root = app_data_dir.join(spec.app_data_relative);
     let canonical_root = match fs::canonicalize(&root) {
@@ -144,7 +144,7 @@ fn cleanup_root(app_data_dir: &Path, spec: &CleanupRootSpec) -> Result<Option<Pa
         Err(error) => return Err(error.into()),
     };
     let canonical_app_data = fs::canonicalize(app_data_dir)?;
-    if !canonical_root.starts_with(&canonical_app_data) {
+    if canonical_root == canonical_app_data || !canonical_root.starts_with(&canonical_app_data) {
         return Err(CoreError::InvalidInput(format!(
             "{} 정리 루트가 앱 데이터 디렉터리를 벗어났습니다: {}",
             spec.label,
@@ -192,7 +192,9 @@ fn removable_under(
     let (Some(root), Ok(canonical)) = (root, fs::canonicalize(path)) else {
         return false;
     };
-    canonical.starts_with(root) && has_transcript_shape(spec, provider, &canonical)
+    canonical != root
+        && canonical.starts_with(root)
+        && has_transcript_shape(spec, provider, &canonical)
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,7 +1074,7 @@ fn move_to_trash(
         ));
     }
     let canonical = fs::canonicalize(target)?;
-    if !canonical.starts_with(root) {
+    if canonical == root || !canonical.starts_with(root) {
         return Err(CoreError::InvalidInput(
             "정리 대상이 허용된 루트를 벗어났습니다".to_owned(),
         ));
@@ -1515,6 +1517,7 @@ mod tests {
             model: None,
             git_branch: None,
             is_subagent: false,
+            parent_session_id: None,
             aia_workspace: false,
             aia_chat: false,
             aia_chat_opens_as_standard: false,
@@ -1525,6 +1528,8 @@ mod tests {
             file_path: format!("/tmp/{id}.jsonl"),
             meta: SessionMeta::default(),
             last_failure: None,
+            related_projects: Vec::new(),
+            written_dirs: Vec::new(),
         }
     }
 
@@ -1725,12 +1730,12 @@ mod tests {
         // 계정 프로필 루트에는 대화 기록만 있는 것이 아니다. `auth.json`(계정 자격증명)과
         // `models_cache.json`·`installation_id`가 같이 산다. 담긴 자리만 보고 지우면 세션
         // 경로가 한 번만 잘못 들어와도 자격증명을 휴지통에 넣는다(`C11-3`).
-        let base = std::env::temp_dir().join("agent-manager-session-cleanup-shape");
-        let _ = fs::remove_dir_all(&base);
+        let temp = tempfile::tempdir().expect("temp directory");
+        let base = temp.path();
         let profile = base.join("credential-profiles/codex/codex-test/sessions");
         fs::create_dir_all(&profile).expect("profile");
         let spec = root_spec(CleanupRootKind::ProviderTranscript);
-        let root = cleanup_root(&base, spec)
+        let root = cleanup_root(base, spec)
             .expect("root")
             .expect("root exists");
 
@@ -1742,10 +1747,47 @@ mod tests {
             Some(ProviderId::Codex),
             &transcript
         ));
+        assert!(!removable_under(
+            Some(&root),
+            spec,
+            Some(ProviderId::Codex),
+            &root
+        ));
+        let error = move_to_trash(
+            base,
+            &root,
+            spec,
+            Some(ProviderId::Codex),
+            &root,
+            "codex:test",
+            "group",
+        )
+        .expect_err("루트 자신은 옮기지 않는다");
+        assert!(matches!(error, CoreError::InvalidInput(_)));
+
+        // 첨부 루트는 모양을 따지지 않으므로 루트 자신을 막는 것은 위 경계 하나뿐이다.
+        let chat_root = base.join("chat-inputs");
+        fs::create_dir_all(&chat_root).expect("chat inputs");
+        let chat_spec = root_spec(CleanupRootKind::ChatAttachment);
+        let chat_root = cleanup_root(base, chat_spec)
+            .expect("chat root")
+            .expect("chat root exists");
+        assert!(!removable_under(
+            Some(&chat_root),
+            chat_spec,
+            None,
+            &chat_root
+        ));
+        assert!(matches!(
+            move_to_trash(base, &chat_root, chat_spec, None, &chat_root, "chat", "group"),
+            Err(CoreError::InvalidInput(_))
+        ));
+        assert!(chat_root.is_dir());
+
         // 모양이 맞는 기록은 실제로 휴지통으로 넘어간다 — 모양 검사가 정상 경로까지
         // 막아 버리면 이 기능은 아무것도 회수하지 못한다.
         let moved = move_to_trash(
-            &base,
+            base,
             &root,
             spec,
             Some(ProviderId::Codex),
@@ -1759,7 +1801,7 @@ mod tests {
         // 돌아도 뒤엣것이 하지 않은 일을 회수로 세지 않는다.
         assert_eq!(
             move_to_trash(
-                &base,
+                base,
                 &root,
                 spec,
                 Some(ProviderId::Codex),
@@ -1790,7 +1832,7 @@ mod tests {
             );
             // 판정을 건너뛰고 실행으로 바로 들어와도 마지막 문에서 막힌다.
             let error = move_to_trash(
-                &base,
+                base,
                 &root,
                 spec,
                 Some(ProviderId::Codex),
@@ -1802,7 +1844,6 @@ mod tests {
             assert!(matches!(error, CoreError::InvalidInput(_)), "{neighbour}");
             assert!(path.is_file(), "{neighbour}가 그대로 있어야 한다");
         }
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1852,10 +1893,9 @@ mod tests {
 
     #[test]
     fn a_cleanup_root_outside_app_data_is_refused() {
-        let base = std::env::temp_dir().join("agent-manager-session-cleanup-root");
-        let _ = fs::remove_dir_all(&base);
-        let app_data = base.join("app-data");
-        let outside = base.join("outside");
+        let temp = tempfile::tempdir().expect("temp directory");
+        let app_data = temp.path().join("app-data");
+        let outside = temp.path().join("outside");
         fs::create_dir_all(&outside).expect("bait root");
         fs::create_dir_all(&app_data).expect("app data");
 
@@ -1866,8 +1906,14 @@ mod tests {
             let spec = root_spec(CleanupRootKind::ProviderTranscript);
             let error = cleanup_root(&app_data, spec).expect_err("루트 탈출은 거부한다");
             assert!(matches!(error, CoreError::InvalidInput(_)));
+
+            // C11-2 / G10: 앱 데이터 자신을 가리키는 심볼릭 링크도 거부한다.
+            std::os::unix::fs::symlink(&app_data, app_data.join("chat-inputs"))
+                .expect("symlink to self");
+            let chat_spec = root_spec(CleanupRootKind::ChatAttachment);
+            let error = cleanup_root(&app_data, chat_spec).expect_err("앱 데이터 자신은 거부한다");
+            assert!(matches!(error, CoreError::InvalidInput(_)));
         }
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -30,6 +30,7 @@ use crate::chat::{ChatSessionInfo, ReasoningEffort};
 use crate::clock::now_ms;
 use crate::domain::{ProviderId, TokenUsage};
 use crate::quiet_hours::QuietSchedule;
+use crate::rounds::{RoundOutcome, RoundReport};
 use crate::scheduler::{ScheduledRequest, ScheduledRequestInput};
 use crate::store_lock;
 use crate::usage_budget::{self, Claim, ConsumerDemand, PlanPoint, RunSpan};
@@ -755,6 +756,87 @@ struct PacingInputs<'a> {
     /// 실제 페이싱 대상 워크플로. 공개 진입점은 레지스트리에서 채우고, 산술 단위 시험은
     /// `None`으로 두어 전달한 워크플로 회차를 모두 대상으로 삼는다.
     pub pacing_workflow_ids: Option<&'a BTreeSet<String>>,
+    /// 회차 보고. 공급자별 연속 실패 쿨다운([`recent_provider_failures`])의 근거다. 공개
+    /// 진입점만 채우고 산술 단위 시험은 `None`으로 두어 쿨다운 없이 계산한다.
+    pub round_reports: Option<&'a [RoundReport]>,
+}
+
+/// 같은 공급자의 회차 보고가 이 수만큼 연이어 `fail`이면 그 공급자를 잠시 후보에서 뺀다.
+const PROVIDER_FAILURE_STREAK: usize = 3;
+/// 마지막 실패로부터 이만큼 지나면 한 회는 다시 후보가 된다. 그것도 실패하면 연속 수가
+/// 그대로라 다시 빠지므로 따로 백오프를 두지 않는다.
+const PROVIDER_FAILURE_COOLDOWN_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// 쿨다운 중인 공급자 하나. `until`이 지나면 후보로 돌아온다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderCooldown {
+    streak: usize,
+    until: i64,
+}
+
+/// 이 소비자의 회차 보고에서 공급자별 연속 실패를 세어 쿨다운 중인 공급자를 돌려준다.
+///
+/// 계정 순위는 사용량만 보므로, 금방 실패해 사용률이 오르지 않는 공급자는 오히려 싸 보여
+/// 계속 다시 뽑혔다(2026-10-19~21 Antigravity). 보고를 소비자에 잇는 기준은 보고의
+/// `session_id`가 그 소비자 실행의 공급자 세션 id와 같거나 `schedule_id`가 소비자 id인 것이다.
+/// `source`가 없거나 공급자로 읽히지 않는 보고는 세지 않는다.
+fn recent_provider_failures(
+    reports: &[RoundReport],
+    runs: &[RunRecord],
+    consumer_id: &str,
+    now: i64,
+) -> BTreeMap<ProviderId, ProviderCooldown> {
+    // 실행에 이어진 보고는 그 실행의 공급자를 쓴다. `source`는 에이전트가 적는 글이라
+    // 대소문자·별칭이 섞이거나 비어 있을 수 있다.
+    let sessions: BTreeMap<&str, ProviderId> = runs
+        .iter()
+        .filter(|run| run.consumer_id == consumer_id)
+        .filter_map(|run| Some((run.provider_session_id.as_deref()?, run.provider)))
+        .collect();
+    let mut by_provider: BTreeMap<ProviderId, Vec<&RoundReport>> = BTreeMap::new();
+    for report in reports {
+        let run_provider = report
+            .session_id
+            .as_deref()
+            .and_then(|id| sessions.get(id).copied());
+        let provider = match run_provider {
+            Some(provider) => provider,
+            None if report.schedule_id.as_deref() == Some(consumer_id) => {
+                let Some(provider) = report.source.as_deref().and_then(|source| {
+                    ProviderId::ALL
+                        .into_iter()
+                        .find(|provider| provider.as_str().eq_ignore_ascii_case(source.trim()))
+                }) else {
+                    continue;
+                };
+                provider
+            }
+            None => continue,
+        };
+        by_provider.entry(provider).or_default().push(report);
+    }
+    let mut cooldowns = BTreeMap::new();
+    for (provider, mut reports) in by_provider {
+        reports.sort_by_key(|report| std::cmp::Reverse(report.recorded_at));
+        let streak = reports
+            .iter()
+            .take_while(|report| report.outcome == RoundOutcome::Fail)
+            .count();
+        if streak < PROVIDER_FAILURE_STREAK {
+            continue;
+        }
+        let until = reports[0].recorded_at + PROVIDER_FAILURE_COOLDOWN_MS;
+        if now < until {
+            cooldowns.insert(provider, ProviderCooldown { streak, until });
+        }
+    }
+    cooldowns
+}
+
+fn clock_label(at_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(at_ms)
+        .map(|at| at.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_else(|| at_ms.to_string())
 }
 
 /// 가드 창 하나의 예약 기준선. `used_percent`·`resets_at`은 예약 시점의 창 상태, `cost`는 그
@@ -2112,24 +2194,24 @@ fn scoped_guard_label(
 }
 
 /// 이번 회차에서 이 계정을 제외해야 하는 이유. 제외하지 않으면 None.
+///
+/// 앞부분은 실행 게이트 판정([`crate::accounts::account_view_readiness`])을 그대로 쓴다. 회차의
+/// 실행은 모두 계정을 고정해 띄우고(`pinAccount`), 고정은 게이트가 `Ready`가 아니면 무엇이든
+/// 거부한다(`ChatSupervisor::validate_account_pin`). 계획이 조건을 따로 적어 두면 사본이 갈라져
+/// 거부될 계정에 자리를 배정하고, 남은 일감이 적어 상한이 1~2건으로 줄어든 회차는 그 자리
+/// 하나로 아무것도 띄우지 못한다(2026-10-21 공통양식 TC 회차 44건 실패).
+///
+/// 토큰 갱신 제한은 사용량 조회만 막고 실행에는 지장이 없다 — 인증이 살아 있으면 게이트도
+/// 통과시키므로 여기서도 제외되지 않는다.
 fn skip_reason(
     account: &ProviderAccountView,
+    model: Option<&str>,
     now: i64,
     guards: &[&crate::accounts::AccountUsageWindow],
     guard_percent: Option<f64>,
 ) -> Option<String> {
-    if account.disabled {
-        return Some("비활성 계정".to_owned());
-    }
-    if account.usage.rate_limited && account.usage.retry_at.is_some_and(|retry| retry > now) {
-        return Some("공급자 재시도 대기".to_owned());
-    }
-    // 토큰 갱신 제한은 사용량 조회만 막고 실행에는 지장이 없다. 제외 사유로 쓰면
-    // 조회가 막힌 계정을 영구히 쉬게 만든다.
-    if account.auth_status != crate::accounts::AccountAuthStatus::Ready
-        && !account.usage.token_refresh_limited
-    {
-        return Some("인증 상태 확인 필요".to_owned());
+    if let Some(reason) = run_gate_skip_reason(account, model, now) {
+        return Some(reason.to_owned());
     }
     if let Some(limit) = guard_percent {
         if let Some(window) = guards.iter().find(|window| window.used_percent >= limit) {
@@ -2137,6 +2219,39 @@ fn skip_reason(
         }
     }
     None
+}
+
+/// 실행 게이트가 이 계정의 고정을 거부할 이유를 계획의 제외 사유 문구로 옮긴다. 게이트가
+/// 통과시키면 None.
+fn run_gate_skip_reason(
+    account: &ProviderAccountView,
+    model: Option<&str>,
+    now: i64,
+) -> Option<&'static str> {
+    use crate::accounts::RunReadiness;
+    match crate::accounts::account_view_readiness(account, model, now) {
+        RunReadiness::Ready => None,
+        RunReadiness::Disabled => Some("비활성 계정"),
+        RunReadiness::NeedsReauthentication => Some("인증 상태 확인 필요"),
+        RunReadiness::AuthUnverified { .. } => Some("인증 확인 대기(토큰 갱신 제한)"),
+        RunReadiness::UsageExhausted { .. }
+            if account.usage.rate_limited && !account.usage.token_refresh_limited =>
+        {
+            Some("공급자 재시도 대기")
+        }
+        RunReadiness::UsageExhausted { .. } => Some("실행 게이트 기준 사용량 소진"),
+    }
+}
+
+/// 이 공급자 계정으로 띄울 실행의 모델. 계획 행(`PlannedRun.model`)과 계획의 게이트 판정이 같은
+/// 값을 써야 게이트가 보는 모델군 창이 갈리지 않는다. 로컬은 계정이 없어 배분표에 오르지 않는다.
+fn run_model(request: &UsagePacedRunsRequest, provider: ProviderId) -> Option<&str> {
+    match provider {
+        ProviderId::Claude => request.claude_model.as_deref(),
+        ProviderId::Codex => request.codex_model.as_deref(),
+        ProviderId::Antigravity => request.antigravity_model.as_deref(),
+        ProviderId::Local => None,
+    }
 }
 
 /// 이번 호출의 소비자 id. 반복 요청 하나가 이 워크플로를 돌리면 그 반복 요청이
@@ -2644,6 +2759,7 @@ fn validate_plan_request(request: &UsagePacedRunsRequest) -> Result<PlanLimits, 
 fn select_candidate_accounts<'a>(
     request: &UsagePacedRunsRequest,
     inputs: &PacingInputs<'a>,
+    cooldowns: &BTreeMap<ProviderId, ProviderCooldown>,
     reasoning: &mut Vec<String>,
 ) -> Result<Vec<&'a ProviderAccountView>, CoreError> {
     let policy = inputs.policy;
@@ -2667,7 +2783,7 @@ fn select_candidate_accounts<'a>(
                 .as_ref()
                 .is_none_or(|providers| providers.contains(&account.provider))
         })
-        // Antigravity 쿼터는 모델군 두 개다. 모델을 선언하지 않은 기존 회차는 이 공급자를
+        // Antigravity 쿼터는 모델군별로 갈린다. 모델을 선언하지 않은 기존 회차는 이 공급자를
         // 전혀 보지 않고, 선언한 회차는 등록 계정을 그대로 후보로 넣되 **그 모델군 창**으로
         // 계획한다([`account_window_labels`]).
         //
@@ -2735,6 +2851,44 @@ fn select_candidate_accounts<'a>(
         }
         None => candidates,
     };
+    // 최근 회차가 연이어 실패한 공급자는 쿨다운 동안 뺀다. 빼서 후보가 비면 빼지 않는다 —
+    // 회차가 계정 없음으로 멈추는 것보다 한 번 더 시도하는 편이 낫다.
+    let candidates: Vec<&ProviderAccountView> = if cooldowns.is_empty() {
+        candidates
+    } else {
+        let kept: Vec<&ProviderAccountView> = candidates
+            .iter()
+            .copied()
+            .filter(|account| !cooldowns.contains_key(&account.provider))
+            .collect();
+        let affected: Vec<String> = cooldowns
+            .iter()
+            .filter(|(provider, _)| {
+                candidates
+                    .iter()
+                    .any(|account| account.provider == **provider)
+            })
+            .map(|(provider, cooldown)| {
+                format!(
+                    "{} 최근 회차 {}회 연속 실패 — {} 까지 후보에서 뺍니다",
+                    provider.as_str(),
+                    cooldown.streak,
+                    clock_label(cooldown.until)
+                )
+            })
+            .collect();
+        if affected.is_empty() {
+            candidates
+        } else if kept.is_empty() && request.local_models.is_empty() {
+            for note in affected {
+                reasoning.push(format!("{note}(남는 계정이 없어 이번에는 빼지 않습니다)"));
+            }
+            candidates
+        } else {
+            reasoning.extend(affected);
+            kept
+        }
+    };
     // 로컬 모델만 고른 회차는 계정이 하나도 없어도 성립한다. 로컬은 계정도 창도 없이
     // 상한 밖에서 서므로, 여기서 막으면 그 회차가 시작조차 못 한다.
     if candidates.is_empty() && request.local_models.is_empty() {
@@ -2747,7 +2901,7 @@ fn select_candidate_accounts<'a>(
 
 /// 회차 창과 다른 창을 채우는 계정의 계획 창 라벨(계정 id → 라벨).
 ///
-/// Antigravity 계정 하나는 모델군 두 개의 쿼터를 따로 들고 있고 계정 대표 창은 그중 빡빡한
+/// Antigravity 계정 하나는 모델군 여럿의 쿼터를 따로 들고 있고 계정 대표 창은 그중 빡빡한
 /// 쪽이라, 이번 회차 모델이 쓰는 모델군 창을 따로 봐야 한다. 다른 공급자는 회차 창 그대로라
 /// 표에 담지 않는다 — 비어 있으면 종전과 완전히 같은 계산이다.
 ///
@@ -3482,14 +3636,9 @@ fn fill_planned_runs(
             planned.push(PlannedRun {
                 account_id: account_id.clone(),
                 source: *provider,
-                model: match provider {
-                    ProviderId::Claude => request.claude_model.clone(),
-                    ProviderId::Codex => request.codex_model.clone(),
-                    ProviderId::Antigravity => request.antigravity_model.clone(),
-                    // 로컬은 계정이 없어 이 배분표에 오르지 않는다. 별도로
-                    // [`local_planned_runs`]가 상한 밖에서 덧붙인다.
-                    ProviderId::Local => None,
-                },
+                // 로컬은 계정이 없어 이 배분표에 오르지 않는다. 별도로
+                // [`local_planned_runs`]가 상한 밖에서 덧붙인다.
+                model: run_model(request, *provider).map(str::to_owned),
                 reasoning_effort: account_efforts.get(account_id).cloned(),
                 reasoning_effort_source: account_effort_basis
                     .get(account_id)
@@ -4215,7 +4364,15 @@ fn compute_plan(
     let policy = inputs.policy;
     let cadence = resolve_cadence(store, request, inputs, &mut reasoning)?;
 
-    let candidates = select_candidate_accounts(request, inputs, &mut reasoning)?;
+    let cooldowns = inputs.round_reports.map_or_else(BTreeMap::new, |reports| {
+        recent_provider_failures(
+            reports,
+            &store.runs,
+            &resolve_consumer_id(request, inputs.schedules),
+            inputs.now,
+        )
+    });
+    let candidates = select_candidate_accounts(request, inputs, &cooldowns, &mut reasoning)?;
 
     let account_ids: Vec<String> = candidates
         .iter()
@@ -4695,7 +4852,7 @@ struct AccountClaimState {
 
 /// 이 실행이 그 계획 창의 쿼터를 채우는지.
 ///
-/// Antigravity 계정 하나는 모델군 두 개의 쿼터를 따로 들고 있고 페이싱은 이번 회차 모델이
+/// Antigravity 계정 하나는 모델군 여럿의 쿼터를 따로 들고 있고 페이싱은 이번 회차 모델이
 /// 쓰는 모델군 창으로 계획한다([`account_window_labels`]). 실행 점유를 계정 단위로 보면
 /// Gemini 회차가 도는 동안 같은 계정의 Claude/GPT 창은 여유가 100%여도 실측 없는 가드에서
 /// 한 건도 감당하지 못하는 것으로 읽혀([`project_guard_windows`]), 그 창은 첫 기동을 받지
@@ -4954,7 +5111,13 @@ fn plan_account(account: &ProviderAccountView, input: &AccountPlanInput<'_>) -> 
             .or_else(|| policy.and_then(|policy| policy.defaults.guard_window_label.as_deref())),
     );
     let guards = guard_windows(&account.usage, window_label, account_guard_label.as_deref());
-    let reason = skip_reason(account, inputs.now, &guards, guard_percent);
+    let reason = skip_reason(
+        account,
+        run_model(request, account.provider),
+        inputs.now,
+        &guards,
+        guard_percent,
+    );
     let account_cost = consumer_costs
         .get(&account.provider)
         .map(|(cost, _)| *cost)
@@ -5511,6 +5674,7 @@ struct PreparedPlan {
     policy: Option<UsageBudgetPolicy>,
     pacing_workflow_ids: BTreeSet<String>,
     request: UsagePacedRunsRequest,
+    round_reports: Vec<RoundReport>,
 }
 
 impl PreparedPlan {
@@ -5519,10 +5683,14 @@ impl PreparedPlan {
         let pacing_workflow_ids =
             crate::remote::pacing_workflow_ids(app_data_dir, policy.as_ref())?;
         let request = fill_from_policy(request, policy.as_ref());
+        // 보고를 읽지 못하면 쿨다운 없이 계획한다 — 보조 판단 때문에 회차를 멈추지 않는다.
+        let round_reports =
+            crate::rounds::list_round_reports(app_data_dir, Default::default()).unwrap_or_default();
         Ok(Self {
             policy,
             pacing_workflow_ids,
             request,
+            round_reports,
         })
     }
 
@@ -5539,6 +5707,7 @@ impl PreparedPlan {
             chats,
             policy: self.policy.as_ref(),
             pacing_workflow_ids: Some(&self.pacing_workflow_ids),
+            round_reports: Some(&self.round_reports),
         }
     }
 }
@@ -6334,6 +6503,7 @@ mod tests {
             source: ProviderId::Claude,
             account_id: Some("claude-a".to_owned()),
             resuming: false,
+            forked: false,
             provider_session_id: Some(format!("session-{chat_id}")),
             cwd: cwd.to_owned(),
             model: None,
@@ -6398,6 +6568,7 @@ mod tests {
             chats,
             policy: None,
             pacing_workflow_ids: None,
+            round_reports: None,
         }
     }
 
@@ -6627,7 +6798,7 @@ mod tests {
         );
     }
 
-    /// 계정 하나가 모델군 두 개의 쿼터를 따로 들고 있으므로, 진행 중 실행의 점유도 그 실행이
+    /// 계정 하나가 모델군 여럿의 쿼터를 따로 들고 있으므로, 진행 중 실행의 점유도 그 실행이
     /// 채우는 창에만 걸린다. 점유를 계정 단위로 보던 동안 Gemini 회차가 5분 간격으로 계정을
     /// 채워, 같은 계정의 Claude/GPT 창은 여유가 100%인 채 첫 기동을 한 번도 받지 못했다.
     #[test]
@@ -6645,7 +6816,7 @@ mod tests {
         }
         let accounts = vec![account(
             "antigravity-acd",
-            "tester-freshin@example.com",
+            "tester-ag@example.com",
             ProviderId::Antigravity,
             view,
         )];
@@ -7187,6 +7358,7 @@ mod tests {
             chats: &[],
             policy: Some(&policy),
             pacing_workflow_ids: None,
+            round_reports: None,
         };
         let block_start =
             compute_plan(&store, &request("7일", 92.0), &at(NOW + 7 * HOUR)).expect("plan");
@@ -7245,6 +7417,7 @@ mod tests {
                     chats: &[],
                     policy: Some(policy),
                     pacing_workflow_ids: None,
+                    round_reports: None,
                 },
             )
             .expect("plan")
@@ -7285,6 +7458,7 @@ mod tests {
                     chats: &[],
                     policy: Some(&policy),
                     pacing_workflow_ids: None,
+                    round_reports: None,
                 },
             )
             .expect("plan")
@@ -7320,6 +7494,7 @@ mod tests {
                     chats: &[],
                     policy: Some(policy),
                     pacing_workflow_ids: None,
+                    round_reports: None,
                 },
             )
             .expect("plan")
@@ -7369,6 +7544,7 @@ mod tests {
                     chats: &[],
                     policy: Some(policy),
                     pacing_workflow_ids: None,
+                    round_reports: None,
                 },
             )
             .expect("plan")
@@ -7493,6 +7669,7 @@ mod tests {
                     chats: &[],
                     policy: Some(policy),
                     pacing_workflow_ids: None,
+                    round_reports: None,
                 },
             )
             .expect("plan")
@@ -7538,6 +7715,7 @@ mod tests {
                     chats: &[],
                     policy: Some(&policy),
                     pacing_workflow_ids: None,
+                    round_reports: None,
                 },
             )
             .expect("plan")
@@ -8344,6 +8522,201 @@ mod tests {
         assert!(plan.planned.is_empty());
     }
 
+    fn failure_report(session: &str, source: &str, outcome: RoundOutcome, at: i64) -> RoundReport {
+        RoundReport {
+            id: format!("r-{session}-{at}"),
+            goal_id: None,
+            schedule_id: None,
+            run_id: None,
+            session_id: Some(session.to_owned()),
+            source: Some(source.to_owned()),
+            title: "회차".to_owned(),
+            outcome,
+            summary: String::new(),
+            measures: Vec::new(),
+            failure_kinds: Vec::new(),
+            fixes: Vec::new(),
+            commits: Vec::new(),
+            reverted: Vec::new(),
+            decisions: Vec::new(),
+            next: Vec::new(),
+            recorded_at: at,
+        }
+    }
+
+    fn consumer_run(consumer: &str, session: &str, provider: ProviderId) -> RunRecord {
+        RunRecord {
+            chat_id: format!("chat-{session}"),
+            execution_id: None,
+            consumer_id: consumer.to_owned(),
+            workflow_id: None,
+            account_id: "acct".to_owned(),
+            provider,
+            started_at: NOW - 10 * HOUR,
+            ended_at: None,
+            provider_session_id: Some(session.to_owned()),
+            tokens: None,
+            reasoning_effort: None,
+            model: None,
+        }
+    }
+
+    fn agy_fail_streak(count: usize, last_at: i64) -> (Vec<RoundReport>, Vec<RunRecord>) {
+        let mut reports = Vec::new();
+        let mut runs = Vec::new();
+        for index in 0..count {
+            let session = format!("agy-{index}");
+            runs.push(consumer_run("s-on", &session, ProviderId::Antigravity));
+            reports.push(failure_report(
+                &session,
+                "antigravity",
+                RoundOutcome::Fail,
+                last_at - index as i64 * HOUR,
+            ));
+        }
+        (reports, runs)
+    }
+
+    #[test]
+    fn provider_failure_streak_cools_down_that_provider() {
+        let (reports, runs) = agy_fail_streak(3, NOW - HOUR);
+        let cooldowns = recent_provider_failures(&reports, &runs, "s-on", NOW);
+        assert_eq!(
+            cooldowns.get(&ProviderId::Antigravity),
+            Some(&ProviderCooldown {
+                streak: 3,
+                until: NOW - HOUR + PROVIDER_FAILURE_COOLDOWN_MS
+            })
+        );
+        let accounts = vec![
+            account(
+                "claude-a",
+                "tester-a@example.com",
+                ProviderId::Claude,
+                usage(vec![("7일", 10.0, Some(NOW + 50 * HOUR))]),
+            ),
+            account(
+                "agy-a",
+                "tester-b@example.com",
+                ProviderId::Antigravity,
+                usage(vec![("7일", 10.0, Some(NOW + 50 * HOUR))]),
+            ),
+        ];
+        let mut req = request("7일", 92.0);
+        req.antigravity_model = Some("gemini-3.1-pro".to_owned());
+        let mut reasoning = Vec::new();
+        let picked = select_candidate_accounts(
+            &req,
+            &inputs(&accounts, &[], &[]),
+            &cooldowns,
+            &mut reasoning,
+        )
+        .expect("candidates");
+        assert!(picked
+            .iter()
+            .all(|account| account.provider != ProviderId::Antigravity));
+        assert!(picked.iter().any(|account| account.id == "claude-a"));
+    }
+
+    #[test]
+    fn provider_failure_needs_three_consecutive_recent_fails() {
+        let (reports, runs) = agy_fail_streak(2, NOW - HOUR);
+        assert!(recent_provider_failures(&reports, &runs, "s-on", NOW).is_empty());
+        // 사이에 pass 가 끼면 끊긴다.
+        let (mut reports, mut runs) = agy_fail_streak(3, NOW - HOUR);
+        runs.push(consumer_run("s-on", "agy-pass", ProviderId::Antigravity));
+        reports.push(failure_report(
+            "agy-pass",
+            "antigravity",
+            RoundOutcome::Pass,
+            NOW - HOUR - 30 * 60_000,
+        ));
+        assert!(recent_provider_failures(&reports, &runs, "s-on", NOW).is_empty());
+        // 6시간이 지나면 다시 후보다.
+        let (reports, runs) = agy_fail_streak(3, NOW - PROVIDER_FAILURE_COOLDOWN_MS - 1);
+        assert!(recent_provider_failures(&reports, &runs, "s-on", NOW).is_empty());
+        // 다른 소비자의 보고는 세지 않는다.
+        let (reports, mut runs) = agy_fail_streak(3, NOW - HOUR);
+        for run in &mut runs {
+            run.consumer_id = "s-other".to_owned();
+        }
+        assert!(recent_provider_failures(&reports, &runs, "s-on", NOW).is_empty());
+    }
+
+    #[test]
+    fn provider_cooldown_is_skipped_when_it_would_empty_the_candidates() {
+        let (reports, runs) = agy_fail_streak(3, NOW - HOUR);
+        let cooldowns = recent_provider_failures(&reports, &runs, "s-on", NOW);
+        let accounts = vec![account(
+            "agy-a",
+            "tester-b@example.com",
+            ProviderId::Antigravity,
+            usage(vec![("7일", 10.0, Some(NOW + 50 * HOUR))]),
+        )];
+        let mut req = request("7일", 92.0);
+        req.antigravity_model = Some("gemini-3.1-pro".to_owned());
+        let mut reasoning = Vec::new();
+        let result = select_candidate_accounts(
+            &req,
+            &inputs(&accounts, &[], &[]),
+            &cooldowns,
+            &mut reasoning,
+        );
+        if let Ok(picked) = result {
+            assert_eq!(picked.len(), 1);
+            assert!(
+                reasoning.iter().any(|note| note.contains("빼지 않습니다")),
+                "{reasoning:?}"
+            );
+        } else {
+            panic!("antigravity model not accepted: {result:?}");
+        }
+    }
+
+    #[test]
+    fn provider_cooldown_still_applies_when_local_models_can_run() {
+        let (reports, runs) = agy_fail_streak(3, NOW - HOUR);
+        let cooldowns = recent_provider_failures(&reports, &runs, "s-on", NOW);
+        let accounts = vec![account(
+            "agy-a",
+            "tester-b@example.com",
+            ProviderId::Antigravity,
+            usage(vec![("7일", 10.0, Some(NOW + 50 * HOUR))]),
+        )];
+        let mut req = request("7일", 92.0);
+        req.antigravity_model = Some("gemini-3.1-pro".to_owned());
+        req.local_models = vec!["local-qwen".to_owned()];
+        let mut reasoning = Vec::new();
+        let picked = select_candidate_accounts(
+            &req,
+            &inputs(&accounts, &[], &[]),
+            &cooldowns,
+            &mut reasoning,
+        )
+        .expect("local models keep the round alive");
+        assert!(picked.is_empty());
+    }
+
+    #[test]
+    fn provider_failure_uses_the_run_provider_and_schedule_link() {
+        // 실행에 이어진 보고는 source 글자와 무관하게 실행의 공급자로 센다.
+        let (mut reports, runs) = agy_fail_streak(3, NOW - HOUR);
+        for report in &mut reports {
+            report.source = None;
+        }
+        assert!(recent_provider_failures(&reports, &runs, "s-on", NOW)
+            .contains_key(&ProviderId::Antigravity));
+        // 실행 기록이 없어도 schedule_id 로 이어진 보고는 source 를 대소문자 없이 읽는다.
+        let (mut reports, _) = agy_fail_streak(3, NOW - HOUR);
+        for report in &mut reports {
+            report.session_id = None;
+            report.schedule_id = Some("s-on".to_owned());
+            report.source = Some("Antigravity".to_owned());
+        }
+        assert!(recent_provider_failures(&reports, &[], "s-on", NOW)
+            .contains_key(&ProviderId::Antigravity));
+    }
+
     #[test]
     fn plan_excludes_an_account_over_the_guard_window() {
         let accounts = vec![account(
@@ -8819,19 +9192,25 @@ mod tests {
     #[test]
     fn plan_keeps_an_account_whose_usage_lookup_is_throttled() {
         // 토큰 갱신 제한은 조회만 막고 실행에는 지장이 없다. 제외 사유로 쓰면 그 계정이
-        // 영구히 쉬게 된다.
+        // 영구히 쉬게 된다. 갱신 429는 `rate_limited`와 재시도 시각을 함께 남기지만
+        // (`token_refresh_limited_usage_result`) 게이트는 그것을 한도로 보지 않는다.
         let mut throttled = usage(vec![
             ("7일", 20.0, Some(NOW + 50 * HOUR)),
             ("5시간", 5.0, None),
         ]);
         throttled.token_refresh_limited = true;
-        let mut view = account(
+        throttled.rate_limited = true;
+        throttled.retry_at = Some(NOW + HOUR);
+        let view = account(
             "claude-a",
             "tester-a@example.com",
             ProviderId::Claude,
             throttled,
         );
-        view.auth_status = AccountAuthStatus::Error;
+        assert_eq!(
+            crate::accounts::account_view_readiness(&view, Some("claude-opus-5"), NOW),
+            crate::accounts::RunReadiness::Ready
+        );
         let schedules = vec![workflow_schedule("s-on", "wf-qa", 5, true)];
         let plan = compute_plan(
             &PacingStore::default(),
@@ -8840,6 +9219,137 @@ mod tests {
         )
         .expect("plan");
         assert!(!plan.planned.is_empty());
+    }
+
+    /// 계획과 실행 게이트가 같은 판정을 쓰는지 본다. 게이트가 고정을 거부할 계정에 계획이
+    /// 자리를 주면 그 건은 기동에서 "사용량이 소진된 계정은 고정할 수 없습니다"로 실패하고,
+    /// 상한이 1건으로 줄어든 회차는 아무것도 띄우지 못한다(2026-10-21).
+    #[test]
+    fn plan_skips_an_account_the_run_gate_would_refuse_to_pin() {
+        // 에이전트 세션이 한도 응답을 받으면 재시도 시각 없이 `rate_limited`만 선다
+        // (`report_agent_usage_limit`). 창 수치는 아직 여유가 있어 보인다.
+        let mut limited = usage(vec![
+            ("7일", 20.0, Some(NOW + 50 * HOUR)),
+            ("5시간", 5.0, Some(NOW + 2 * HOUR)),
+        ]);
+        limited.rate_limited = true;
+        limited.retry_at = None;
+        // 인증 오류에 갱신 제한이 겹친 계정은 게이트가 `AuthUnverified`로 고정을 거부한다.
+        let mut unverified_usage = usage(vec![
+            ("7일", 20.0, Some(NOW + 50 * HOUR)),
+            ("5시간", 5.0, Some(NOW + 2 * HOUR)),
+        ]);
+        unverified_usage.token_refresh_limited = true;
+        let mut unverified = account(
+            "claude-b",
+            "tester-b@example.com",
+            ProviderId::Claude,
+            unverified_usage,
+        );
+        unverified.auth_status = AccountAuthStatus::Error;
+        let accounts = vec![
+            account(
+                "claude-a",
+                "tester-a@example.com",
+                ProviderId::Claude,
+                limited,
+            ),
+            unverified,
+            account(
+                "claude-c",
+                "tester-c@example.com",
+                ProviderId::Claude,
+                usage(vec![
+                    ("7일", 20.0, Some(NOW + 50 * HOUR)),
+                    ("5시간", 5.0, Some(NOW + 2 * HOUR)),
+                ]),
+            ),
+        ];
+        for view in &accounts {
+            let refused = crate::accounts::account_view_readiness(view, Some("claude-opus-5"), NOW)
+                != crate::accounts::RunReadiness::Ready;
+            assert_eq!(refused, view.id != "claude-c", "{}", view.id);
+        }
+        let schedules = vec![workflow_schedule("s-on", "wf-qa", 5, true)];
+        let plan = compute_plan(
+            &PacingStore::default(),
+            &request("7일", 92.0),
+            &inputs(&accounts, &schedules, &[]),
+        )
+        .expect("plan");
+        assert!(!plan.planned.is_empty());
+        assert!(plan.planned.iter().all(|run| run.account_id == "claude-c"));
+        assert_eq!(
+            account_view(&plan, "claude-a")["skipReason"],
+            "공급자 재시도 대기"
+        );
+        assert_eq!(
+            account_view(&plan, "claude-b")["skipReason"],
+            "인증 확인 대기(토큰 갱신 제한)"
+        );
+    }
+
+    /// 2026-10-21 회차가 44번 실패한 계정의 사용량 모양: Gemini Models 7일은 30%대인데 계정
+    /// 대표 7일과 `Gemini 4 Argon` 7일이 100%다. Flash 회차는 Gemini Models 창으로 계획하고
+    /// 게이트도 같은 창을 봐야 하며, Argon 회차는 계획에서 빠져야 한다 — 어느 쪽이든 계획과
+    /// 게이트가 같은 답을 낸다.
+    #[test]
+    fn antigravity_plan_and_run_gate_agree_when_a_model_line_window_is_full() {
+        let mut overnight = usage(vec![
+            ("5시간", 0.0, None),
+            ("7일", 100.0, Some(NOW + 120 * HOUR)),
+            ("Gemini Models · 5시간", 4.4, Some(NOW + HOUR)),
+            ("Gemini Models · 7일", 33.4, Some(NOW + 78 * HOUR)),
+            ("Claude and GPT models · 5시간", 0.0, None),
+            ("Claude and GPT models · 7일", 0.0, None),
+            ("Gemini 4 Argon · 7일", 100.0, Some(NOW + 120 * HOUR)),
+        ]);
+        for window in &mut overnight.windows {
+            window.model_scoped = window.label.contains(" · ");
+            window.aggregate = !window.model_scoped;
+        }
+        let accounts = vec![account(
+            "antigravity-3e8",
+            "tester-ag@example.com",
+            ProviderId::Antigravity,
+            overnight,
+        )];
+        let schedules = vec![workflow_schedule("s-on", "wf-qa", 5, true)];
+        let inputs = inputs(&accounts, &schedules, &[]);
+
+        let flash = "gemini-3.8-flash-high";
+        assert_eq!(
+            crate::accounts::account_view_readiness(&accounts[0], Some(flash), NOW),
+            crate::accounts::RunReadiness::Ready
+        );
+        let plan = compute_plan(
+            &PacingStore::default(),
+            &antigravity_request(flash),
+            &inputs,
+        )
+        .expect("flash plan");
+        assert_eq!(plan.planned.len(), 1);
+        assert_eq!(
+            plan.accounts[0]["windowLabel"].as_str(),
+            Some("Gemini Models · 7일")
+        );
+
+        let argon = "gemini-4-argon-high";
+        assert!(matches!(
+            crate::accounts::account_view_readiness(&accounts[0], Some(argon), NOW),
+            crate::accounts::RunReadiness::UsageExhausted { .. }
+        ));
+        let plan = compute_plan(
+            &PacingStore::default(),
+            &antigravity_request(argon),
+            &inputs,
+        )
+        .expect("argon plan");
+        assert!(plan.planned.is_empty());
+        assert_eq!(
+            plan.accounts[0]["skipReason"],
+            "실행 게이트 기준 사용량 소진"
+        );
     }
 
     #[test]
@@ -10886,6 +11396,7 @@ mod tests {
             chats: &[],
             policy: Some(policy),
             pacing_workflow_ids: None,
+            round_reports: None,
         }
     }
 

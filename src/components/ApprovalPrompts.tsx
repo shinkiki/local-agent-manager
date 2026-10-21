@@ -82,14 +82,15 @@ export function ChatApprovalDock({ className = "chat-approval-dock", label, titl
           <ChevronDown size={13} aria-hidden="true" />
         </button>
       </header>
-      {collapsed
-        ? <p className="approval-dock-summary">{prompts.map((prompt) => runtimeCatalogText(prompt.title)).join(" · ")}</p>
-        : prompts.map((prompt) => <ChatApprovalCard prompt={prompt} onDecision={onDecision} key={prompt.id} />)}
+      {collapsed && <p className="approval-dock-summary">{prompts.map((prompt) => runtimeCatalogText(prompt.title)).join(" · ")}</p>}
+      {/* 접어도 카드는 숨기기만 한다. 언마운트하면 고른 답·입력한 비밀번호가 펼칠 때 사라지고
+          질문지는 추천값으로 되돌아가, 사용자가 고른 적 없는 답을 그대로 보내게 된다. */}
+      {prompts.map((prompt) => <ChatApprovalCard prompt={prompt} onDecision={onDecision} hidden={collapsed} key={prompt.id} />)}
     </div>
   );
 }
 
-export function ChatApprovalCard({ prompt, onDecision }: { prompt: ChatApprovalPrompt; onDecision: ChatApprovalDecider }) {
+export function ChatApprovalCard({ prompt, onDecision, hidden = false }: { prompt: ChatApprovalPrompt; onDecision: ChatApprovalDecider; hidden?: boolean }) {
   const { text } = useI18n();
   // 계획 검토는 승인할 권한이 아니라 읽어야 할 문서라, 요청 JSON 대신 계획 본문을 그대로 그린다.
   const plan = prompt.kind === "plan";
@@ -124,7 +125,7 @@ export function ChatApprovalCard({ prompt, onDecision }: { prompt: ChatApprovalP
     ? <ChatApprovalActions prompt={prompt} questions={questions} picks={picks} secret={secret} saveSecret={saveSecret} onDecide={decide} />
     : null;
   return (
-    <article className={`chat-approval${pending ? " chat-approval-pending" : ""}`} role={pending ? "alert" : undefined}>
+    <article className={`chat-approval${pending ? " chat-approval-pending" : ""}`} role={pending ? "alert" : undefined} hidden={hidden}>
       <header className="chat-approval-head">
         <strong>{runtimeCatalogText(prompt.title)}</strong>
         {plan && prompt.detail && (

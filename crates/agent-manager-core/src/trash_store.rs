@@ -162,21 +162,65 @@ pub(crate) enum RestoreTarget {
     Ready,
     /// 원래 경로에 이미 무언가 있어 덮어쓰지 않는다.
     Occupied,
+    /// 상위 폴더의 실제 위치가 그 항목의 대상 루트 밖이다(G10, C5-8). 아무것도 만들지 않았다.
+    OutsideRoot,
     /// 상위 폴더를 만들지 못했다.
     ParentFailed(String),
 }
 
 /// 복구 대상 자리를 확인하고 상위 폴더를 만든다. 이미 있는 항목은 덮어쓰지 않는다.
-pub(crate) fn prepare_restore_target(original: &Path) -> RestoreTarget {
+///
+/// `root`는 그 항목이 놓일 수 있는 루트다(배포 루트, 설치 루트, 저장소 폴더). 삭제 뒤
+/// 상위 폴더나 그 조상 자리에 루트 밖을 가리키는 링크가 놓이면 복구 내용이 루트 밖으로
+/// 나가므로, 상위 폴더의 실제 위치(없는 꼬리는 존재하는 가장 깊은 조상 기준)가 루트의
+/// 실제 위치 안일 때만 진행한다. 루트도 같이 정규화하므로 루트 자체가 링크를 거치는
+/// 정상 구성(`/home` → `/var/home`)은 통과한다. 폴더는 판정을 통과한 뒤에만 만든다.
+pub(crate) fn prepare_restore_target(original: &Path, root: &Path) -> RestoreTarget {
     if fs::symlink_metadata(original).is_ok() {
         return RestoreTarget::Occupied;
     }
-    if let Some(parent) = original.parent() {
-        if let Err(error) = fs::create_dir_all(parent) {
-            return RestoreTarget::ParentFailed(error.to_string());
-        }
+    let Some(parent) = original.parent() else {
+        return RestoreTarget::OutsideRoot;
+    };
+    let lexical = |path: &Path| {
+        path.components()
+            .all(|component| !matches!(component, std::path::Component::ParentDir))
+    };
+    if !lexical(parent) || !lexical(root) || !parent.starts_with(root) {
+        return RestoreTarget::OutsideRoot;
+    }
+    match (
+        resolve_existing_prefix(root),
+        resolve_existing_prefix(parent),
+    ) {
+        (Ok(real_root), Ok(real_parent)) if real_parent.starts_with(&real_root) => {}
+        (Err(error), _) | (_, Err(error)) => return RestoreTarget::ParentFailed(error.to_string()),
+        _ => return RestoreTarget::OutsideRoot,
+    }
+    if let Err(error) = fs::create_dir_all(parent) {
+        return RestoreTarget::ParentFailed(error.to_string());
     }
     RestoreTarget::Ready
+}
+
+/// 존재하는 가장 깊은 조상을 정규화하고 아직 없는 꼬리를 그대로 붙인다.
+fn resolve_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
+    let mut existing = path;
+    let mut tail = Vec::new();
+    loop {
+        if fs::symlink_metadata(existing).is_ok() {
+            let mut resolved = fs::canonicalize(existing)?;
+            resolved.extend(tail.iter().rev());
+            return Ok(resolved);
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return Ok(path.to_path_buf()),
+        }
+    }
 }
 
 /// 휴지통 비우기. `id`가 있으면 해당 항목만, 없으면 전체를 지운다. 지운 항목 수를
@@ -498,15 +542,54 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let original = directory.path().join("nested").join("item");
         assert!(matches!(
-            prepare_restore_target(&original),
+            prepare_restore_target(&original, directory.path()),
             RestoreTarget::Ready
         ));
         assert!(original.parent().expect("parent").is_dir());
 
         fs::write(&original, b"occupying").expect("occupying file");
         assert!(matches!(
-            prepare_restore_target(&original),
+            prepare_restore_target(&original, directory.path()),
             RestoreTarget::Occupied
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_restore_target_refuses_a_parent_linked_outside_the_root() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("project");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, root.join("docs")).expect("link");
+
+        let original = root.join("docs").join("nested").join("guide.md");
+        assert!(matches!(
+            prepare_restore_target(&original, &root),
+            RestoreTarget::OutsideRoot
+        ));
+        assert!(!outside.join("nested").exists(), "nothing created outside");
+        assert!(matches!(
+            prepare_restore_target(&directory.path().join("elsewhere/x"), &root),
+            RestoreTarget::OutsideRoot
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_restore_target_accepts_a_root_reached_through_a_link() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let real = directory.path().join("real-home");
+        fs::create_dir_all(&real).expect("real");
+        let linked = directory.path().join("home");
+        std::os::unix::fs::symlink(&real, &linked).expect("link");
+
+        let original = linked.join("project").join("docs").join("guide.md");
+        assert!(matches!(
+            prepare_restore_target(&original, &linked.join("project")),
+            RestoreTarget::Ready
+        ));
+        assert!(real.join("project/docs").is_dir());
     }
 }

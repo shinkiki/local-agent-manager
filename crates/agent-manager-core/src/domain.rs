@@ -417,6 +417,12 @@ pub struct SessionMeta {
     /// 이 대화에 남긴 읽던 자리. 만든 순서를 그대로 둔다 — 목록에서 시간순으로 읽힌다.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bookmarks: Vec<SessionBookmark>,
+    /// 사용자나 AIA가 이 대화에 직접 이어 둔 프로젝트 경로. 작업 경로(`cwd`)는 실행 당시
+    /// 한 곳으로 정해지지만, AIA처럼 자기 작업공간에서 다른 프로젝트를 고치는 대화는 그
+    /// 프로젝트 필터에 잡히지 않는다. 파일 수정에서 자동으로 찾는 관련 프로젝트가 셸 명령으로
+    /// 고친 경우를 놓치므로 이 자리로 메운다. 스냅샷마다 등록 프로젝트에 다시 맞춘다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_project_paths: Vec<String>,
 }
 
 /// 세션 정리폴더. `parent_id`로 상하위 트리를 이루며, 목록은 항상 트리 순서(부모 →
@@ -466,6 +472,11 @@ pub struct SessionSummary {
     pub model: Option<String>,
     pub git_branch: Option<String>,
     pub is_subagent: bool,
+    /// 이 서브에이전트를 띄운 부모 세션의 id. 공급자 색인이 부모를 알려 줄 때만 채운다
+    /// (Antigravity `parent_conversation_id`). 서브에이전트는 Agent Manager 채팅이 띄운
+    /// 실행이 아니라 자기 실행 경로 기록이 없으므로, 부모의 기록으로 작업 경로를 메운다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
     /// AIA 전용 작업공간(`<app data>/aia-workspace`)에서 오간 대화. 카탈로그 저장본이
     /// 아니라 스냅샷을 만들 때 앱 데이터 경로로 다시 판정하므로, 저장본에 남은 값은 읽지 않는다.
     #[serde(default)]
@@ -498,6 +509,15 @@ pub struct SessionSummary {
     /// `task_complete.error`)과 Agent Manager가 따로 남긴 실행 실패를 함께 본다.
     #[serde(default)]
     pub last_failure: Option<SessionLastFailure>,
+    /// 이 대화가 작업 경로 밖에서 손댄 등록 프로젝트(그 프로젝트 세션들이 쓰는 `cwd` 문자열).
+    /// 파일 수정 도구가 쓴 경로와 `meta.linked_project_paths`를 스냅샷마다 등록 프로젝트에
+    /// 맞춰 얻는다. 목록의 프로젝트 필터가 `cwd`와 함께 이 값을 본다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_projects: Vec<String>,
+    /// 원문에서 파일 수정 도구가 쓴 파일들의 상위 폴더. `related_projects`를 맞추는 재료일
+    /// 뿐이라 화면으로 보내지 않는다(세션마다 수백 개가 될 수 있다).
+    #[serde(skip)]
+    pub written_dirs: Vec<String>,
 }
 
 /// 세션 마지막 실패의 갈래. 목록 태그의 설명과 색을 가른다.
@@ -1378,6 +1398,7 @@ impl SystemAgentRuntime {
     /// 저장할 내용이 없는 실행설정. 이런 항목은 저장하지 않고 지운다.
     pub fn is_empty(&self) -> bool {
         self.model.is_none()
+            && self.local_connection_id.is_none()
             && self.reasoning_effort.is_none()
             && self.mode.is_none()
             && self.approval_mode.is_none()
@@ -1632,12 +1653,20 @@ pub struct SessionCatalogUpdate {
     pub changed: bool,
 }
 
+fn default_doc_root_agent_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocRoot {
     pub id: String,
     pub name: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default = "default_doc_root_agent_enabled")]
+    pub agent_enabled: bool,
     #[serde(default)]
     pub agent_data: bool,
 }
@@ -1729,6 +1758,8 @@ pub struct SessionMetaPatch {
     /// 읽던 자리 목록. `folder_ids`와 같은 통째 교체다 — 추가·이름변경·삭제가 모두
     /// 목록 하나를 다시 보내는 일이라, 낱개 명령을 셋 두는 대신 이 한 자리로 모은다.
     pub bookmarks: Option<Vec<SessionBookmark>>,
+    /// 직접 이어 둔 프로젝트 경로 목록. `folder_ids`처럼 통째 교체이며 빈 목록이면 모두 푼다.
+    pub linked_project_paths: Option<Vec<String>>,
 }
 
 /// `Option<Option<T>>`는 기본 역직렬화로는 `null`과 미지정을 구분할 수 없어 둘 다
@@ -1860,6 +1891,16 @@ mod tests {
         assert_eq!(codex.decision_policy, AiaDecisionPolicy::Ask);
         assert_eq!(codex.reasoning_effort, Some(ReasoningEffort::Medium));
         assert!(codex.settings.is_empty());
+    }
+
+    #[test]
+    fn system_agent_runtime_with_only_a_local_connection_is_not_empty() {
+        assert!(SystemAgentRuntime::default().is_empty());
+        let runtime = SystemAgentRuntime {
+            local_connection_id: Some("lan-box".to_owned()),
+            ..SystemAgentRuntime::default()
+        };
+        assert!(!runtime.is_empty());
     }
 
     #[test]

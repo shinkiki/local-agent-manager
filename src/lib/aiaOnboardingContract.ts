@@ -207,13 +207,18 @@ export function buildWorkflowContract(
     version: null,
     paced,
     chatRuntime: { ...CONTRACT_CHAT_RUNTIME },
+    // 네 출처가 같은 키를 낼 수 있다 — 사용자가 절차 스킬 칸에 팩이 이미 거는 스킬이나
+    // 레인 절차 이름을 적으면 그렇다. 등록은 같은 키가 두 번 있는 계약을 통째로 거절하므로
+    // (`validate_required_skills`) 처음 나온 자리만 남긴다.
     requiredSkills: [
-      ...template.requiredSkills.filter((key) => key.trim().length > 0),
-      ...selectedSkills,
-      // 이 워크플로 전용 절차 스킬. 만들기가 같은 이름으로 만든다.
-      ...(template.procedure ? [id] : []),
-      // 레인 절차를 따르게 하는 의존이다. 화면이 미설치를 경고할 수 있도록 계약에 남긴다.
-      ...(parallel ? [LANE_SKILL_KEY] : []),
+      ...new Set([
+        ...template.requiredSkills.filter((key) => key.trim().length > 0),
+        ...selectedSkills,
+        // 이 워크플로 전용 절차 스킬. 만들기가 같은 이름으로 만든다.
+        ...(template.procedure ? [id] : []),
+        // 레인 절차를 따르게 하는 의존이다. 화면이 미설치를 경고할 수 있도록 계약에 남긴다.
+        ...(parallel ? [LANE_SKILL_KEY] : []),
+      ]),
     ],
   };
 }

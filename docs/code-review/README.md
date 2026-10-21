@@ -88,6 +88,9 @@ node --experimental-strip-types scripts/code-review-queue.mjs --json     # 큐 �
 node --experimental-strip-types scripts/code-review-queue.mjs --write    # queue.json 갱신
 ```
 
+세는 가지는 `--branch <ref>` 로 정하고, 없으면 현재 가지의 upstream 을 센다. upstream 이 없는 가지
+(레인 가지 등)에서는 짐작하지 않고 종료 코드 2로 멈추니 `--branch` 를 붙인다.
+
 커밋은 **최신부터** 큐에 오르고 `--window` 일(기본 7)보다 오래된 미리뷰 커밋은 떨어진다.
 작업브랜치에 하루 백 건 가까이 착지하므로, 오래된 것부터 돌면 새 결함을 영영 보지 못한다.
 창 밖으로 밀려난 코드는 모듈 전수 리뷰가 그물로 받는다 — 그래서 두 종류를 함께 돌린다.

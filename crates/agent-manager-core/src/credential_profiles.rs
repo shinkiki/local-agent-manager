@@ -195,6 +195,8 @@ pub(crate) fn profile_dir(
 ) -> Result<PathBuf, CoreError> {
     let account_id = account_id.trim();
     if account_id.is_empty()
+        // C4-1 / G10: `.` names the provider root, not one account's profile.
+        || account_id == "."
         || account_id.contains('/')
         || account_id.contains('\\')
         || account_id.contains("..")
@@ -813,6 +815,36 @@ mod tests {
             profile_dir(root, ProviderId::Claude, "claude-1234").unwrap(),
             root.join(PROFILE_ROOT).join("claude").join("claude-1234")
         );
+    }
+
+    #[test]
+    fn c4_1_g10_dot_account_cannot_create_or_remove_the_provider_root() {
+        let data = tempfile::tempdir().unwrap();
+        for provider in [
+            ProviderId::Claude,
+            ProviderId::Codex,
+            ProviderId::Antigravity,
+        ] {
+            let profile = ensure_profile_dir(data.path(), provider, "account-a").unwrap();
+            let marker = profile.join("keep.txt");
+            fs::write(&marker, "keep this account").unwrap();
+
+            for account_id in [".", " . "] {
+                assert!(matches!(
+                    profile_dir(data.path(), provider, account_id),
+                    Err(CoreError::InvalidInput(_))
+                ));
+                assert!(matches!(
+                    ensure_profile_dir(data.path(), provider, account_id),
+                    Err(CoreError::InvalidInput(_))
+                ));
+                assert!(matches!(
+                    remove_profile(data.path(), provider, account_id),
+                    Err(CoreError::InvalidInput(_))
+                ));
+                assert_eq!(fs::read_to_string(&marker).unwrap(), "keep this account");
+            }
+        }
     }
 
     #[test]

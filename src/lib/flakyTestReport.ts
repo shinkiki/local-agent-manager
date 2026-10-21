@@ -172,9 +172,13 @@ const LOOPBACK_PORT = /(\b127\.0\.0\.1|\[::1\]|\blocalhost):\d+/g;
  * 전혀 다른 원인이었고, 그 구분이 지문에 남아야 한다.
  */
 export function diagnosticSignature(diagnostic: string): string {
-  const body = diagnostic.replace(/\r\n/g, '\n').replace(PANIC_HEAD, '');
-  const osError = OS_ERROR.exec(body);
+  const text = diagnostic.replace(/\r\n/g, '\n');
+  const osError = OS_ERROR.exec(text);
   if (osError) return `Io(os error ${osError[1]} · ${osError[2]})`;
+  // 시험이 panic 전에 찍은 표준 출력이 진단 블록 앞에 함께 잡힌다. 그 줄을 지문으로 쓰면
+  // 같은 출력을 내는 시험의 서로 다른 실패가 한 지문으로 묶인다 — panic 머리 뒤부터 읽는다.
+  const panic = PANIC_HEAD.exec(text);
+  const body = panic ? text.slice(panic.index + panic[0].length) : text;
   const first = body
     .split('\n')
     .map((line) => line.trim())

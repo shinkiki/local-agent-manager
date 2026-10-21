@@ -795,6 +795,7 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 @media (prefers-reduced-motion: reduce) { .manager-shell.busy::after { background: rgba(var(--accent-rgb), .45); animation: none; } }
 /* 팝아웃 창은 대상 화면 하나만 담당한다. 메뉴 이동과 AIA·알림 트리거는 본 창에 남기고,
    화면 제목은 창 제목이 대신하므로 상단 바 없이 내용이 창을 가득 채운다. */
+.manager-shell.popout:not(.aia-popout) { grid-template-columns: minmax(0, 1fr); }
 .manager-shell.popout .app-sidebar, .manager-shell.popout .topbar, .manager-shell.popout .app-statusbar { display: none; }
 .manager-shell.popout .view-panel { overflow: hidden; padding: 0; }
 .manager-shell.aia-popout:not(.aia-open) .topbar, .manager-shell.aia-popout:not(.aia-open) .app-sidebar { display: flex; }
@@ -1068,7 +1069,8 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .navigation-fixed-label { cursor: default; }
 .navigation-preference-row.fixed-menu > em { padding: 4px 8px; border-radius: 999px; background: rgba(var(--accent-rgb), .1); color: var(--green); font-size: var(--ui-font-7); font-style: normal; }
 .help-hint { display: inline-flex; flex: none; align-items: center; margin-left: 3px; vertical-align: -3px; }
-.help-hint-trigger { display: grid; width: 18px; height: 18px; place-items: center; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--faint); cursor: pointer; }
+/* 누르는 자리는 24px(WCAG 2.5.8)이고, -3px 여백으로 배치 폭은 예전 18px 그대로 둔다. */
+.help-hint-trigger { display: grid; width: 24px; height: 24px; margin: -3px; place-items: center; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--faint); cursor: pointer; }
 .help-hint-trigger:hover, .help-hint-trigger:focus-visible, .help-hint-trigger[aria-expanded="true"] { color: var(--green); outline: none; }
 .help-hint-trigger:focus-visible { box-shadow: 0 0 0 2px rgba(var(--accent-rgb), .38); }
 /* 팝오버는 body로 포털돼 뷰포트 기준으로 뜬다. top/left는 트리거 위치를 재서 인라인으로 넣는다. */
@@ -1210,6 +1212,32 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .ssh-key-reveal-head .copy-action { flex: none; }
 .ssh-key-reveal > small { color: var(--faint); font-size: var(--ui-font-7); line-height: 1.5; }
 .ssh-key-body { margin: 0; padding: 10px 11px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--x101923); color: var(--xd3dde7); font-size: var(--ui-font-7); line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+/* C9-21. 연결 서버는 키와 따로 저장되는 목록이라 키 목록 아래에 제 머리줄을 둔다. */
+.ssh-server-section { border-top: 1px solid var(--border-soft); }
+.ssh-section-head { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 14px; padding: 16px 18px 12px; }
+.ssh-section-head > span { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.ssh-section-head strong { color: var(--xd8e1ea); font-size: var(--ui-font-10); }
+.ssh-section-head small { color: var(--faint); font-size: var(--ui-font-8); line-height: 1.5; }
+.ssh-section-head > .button { flex: none; }
+.ssh-server-new { margin: 0 18px 16px; }
+.ssh-server-new .ssh-key-endpoint-form { margin-top: 0; }
+.ssh-server-key, .ssh-key-servers { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; color: var(--x8190a2) !important; }
+.ssh-server-key > svg, .ssh-key-servers > svg { flex: none; color: var(--green); }
+.ssh-server-warning { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; color: var(--xe9be5d) !important; line-height: 1.5; }
+.ssh-server-warning > svg { flex: none; }
+.ssh-server-warning code { color: var(--muted); font-size: var(--ui-font-6); overflow-wrap: anywhere; }
+.ssh-server-no-key { display: flex; grid-column: 2; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ssh-server-form .form-row > small { grid-column: 2; }
+.ssh-key-badge { display: inline-flex; align-items: center; gap: 3px; padding: 1px 7px; border: 1px solid rgba(var(--accent-rgb), .35); border-radius: 99px; background: rgba(var(--accent-rgb), .1); color: var(--green); font-size: var(--ui-font-6); font-style: normal; font-weight: 750; }
+.ssh-server-empty { margin-bottom: 16px; }
+.ssh-server-empty > i { background: rgba(var(--accent-rgb), .09); color: var(--green); }
+.ssh-server-empty > .button { flex: none; margin-left: auto; }
+.ssh-key-passphrase-form { display: flex; grid-column: 2 / -1; flex-direction: column; gap: 6px; margin-top: 4px; padding: 10px 11px; border: 1px solid rgba(var(--accent-rgb), .24); border-radius: 8px; background: rgba(var(--accent-rgb), .055); }
+.ssh-key-passphrase-form label { color: var(--faint); font-size: var(--ui-font-7); }
+.ssh-key-passphrase-form .form-actions { flex-wrap: wrap; align-items: center; gap: 8px; }
+.ssh-key-passphrase-form .form-actions small { margin-right: auto; color: var(--faint); font-size: var(--ui-font-6); line-height: 1.5; }
+.ssh-key-passphrase-form input { width: 100%; padding: 7px 9px; border: 1px solid var(--x3a4c60); border-radius: 7px; background: var(--x101923); color: var(--xd8e1ea); font-family: inherit; font-size: var(--ui-font-8); }
+.ssh-key-comment-field > small.ssh-key-passphrase-mismatch { color: var(--danger); text-align: left; }
 .plugin-status { display: flex; align-items: center; gap: 5px; width: fit-content; color: var(--muted); font-size: var(--ui-font-7); }
 .plugin-status > i { width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; }
 .plugin-status.ok { color: var(--green); }
@@ -1510,7 +1538,7 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .storage-secrets-note { margin: 0; color: var(--faint); font-size: var(--ui-font-8); line-height: 1.6; }
 .storage-secrets-toolbar { display: flex; flex: none; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; }
 .storage-secrets-toolbar > small { color: var(--faint); font-size: var(--ui-font-8); white-space: nowrap; }
-.storage-secrets-group { display: flex; flex-direction: column; overflow: hidden; }
+.storage-secrets-group { display: flex; flex-direction: column; overflow: hidden; container-type: inline-size; }
 .storage-secrets-group-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border-soft); }
 .storage-secrets-group-title { display: flex; min-width: 0; align-items: center; gap: 8px; color: var(--xefd183); }
 .storage-secrets-group-title > svg { flex: none; }
@@ -1556,6 +1584,28 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .storage-secrets-form-actions { display: flex; grid-column: 1 / -1; align-items: center; justify-content: flex-end; gap: 8px; }
 .storage-secrets-error { min-width: 0; flex: 1; overflow: hidden; color: var(--xf3a09a); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 720px) { .storage-secrets-form { grid-template-columns: 1fr; } }
+/* 여섯 칸 표는 좁은 카드에서 이름·값·동작 칸(nowrap)이 폭을 다 먹고, 남은 용도 칸이 한 글자씩
+   꺾여 행이 화면 높이만큼 늘어난다. 오른쪽 칸은 카드의 overflow에 잘린다. 카드 폭이 모자라면
+   머리줄을 숨기고 행마다 이름 → 값 → 용도 → (출처·사용 | 남은 시간·마지막 사용) → 동작 순으로
+   쌓는다. 머리줄 대신 칸마다 data-label을 앞에 붙인다. */
+@container (max-width: 680px) {
+  .storage-secrets-group-head { flex-wrap: wrap; }
+  .storage-saved-secrets > .storage-secrets-group-head > .storage-secrets-toolbar { margin-left: auto; }
+  .storage-secrets-table, .storage-secrets-table tbody { display: block; }
+  .storage-secrets-table thead { display: none; }
+  .storage-secrets-table tbody > tr:not(.storage-secrets-edit-row) { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px 12px; padding: 12px 16px; border-bottom: 1px solid var(--border-soft); }
+  .storage-secrets-table tbody > tr:last-child { border-bottom: 0; }
+  .storage-secrets-table tbody > tr.is-editing { border-bottom-color: transparent; background: rgba(239, 196, 95, .05); }
+  .storage-secrets-table tbody > tr > td { min-width: 0; padding: 0; border-bottom: 0; background: none; }
+  .storage-secrets-table tbody > tr > td:nth-child(-n + 3), .storage-secrets-table tbody > tr > td.storage-secrets-actions { grid-column: 1 / -1; }
+  .storage-secrets-table td > code { overflow-wrap: anywhere; }
+  .storage-secrets-table td[data-label]::before { content: attr(data-label); display: block; margin-bottom: 3px; color: var(--faint); font-size: var(--ui-font-7); font-weight: 700; letter-spacing: .04em; }
+  .storage-secrets-value { display: flex; min-width: 0; align-items: center; }
+  .storage-secrets-value > .storage-secrets-plain { min-width: 0; }
+  .storage-secrets-actions { width: auto; white-space: normal; }
+  .storage-secrets-table tbody > tr.storage-secrets-edit-row { display: block; }
+  .storage-secrets-table tbody > tr.storage-secrets-edit-row > td { display: block; padding: 0 16px 12px; }
+}
 .panel { min-width: 0; border: 1px solid var(--border); border-radius: 12px; background: var(--t-panel-glass); box-shadow: 0 12px 30px var(--t-shadow-panel); }
 .chart-panel { min-height: 300px; }
 .panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 16px 18px 12px; border-bottom: 1px solid var(--border-soft); }
@@ -1645,6 +1695,16 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .project-registry-collapse:focus-visible { outline: 2px solid rgba(var(--accent-rgb), .72); outline-offset: 2px; }
 .project-registry-collapse strong { color: var(--xd8e1ea); font-size: var(--ui-font-8); font-weight: 750; }
 .project-registry-collapse small { margin-left: auto; color: var(--faint); font-size: var(--ui-font-7); }
+/* C16-11. 프로젝트 설정의 git 원격 인증. 호스트마다 저장된 비밀값 하나와 사용자 이름을 고른다. */
+.project-git-auth-list { margin-top: 0; }
+.project-git-auth-controls { display: inline-flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; }
+.project-git-auth-controls select { max-width: 220px; }
+.project-git-auth-controls .search-input { width: 140px; }
+.project-git-auth-row .project-registry-meta.warning { color: var(--warning, #e0a040); }
+@media (max-width: 640px) {
+  .project-git-auth-row { grid-template-columns: minmax(0, 1fr); }
+  .project-git-auth-controls { justify-content: flex-start; }
+}
 /* 새 프로젝트 감지 모달. 항목마다 활성 유지/제외를 바로 고른다. */
 .new-projects-intro { margin: 0 0 12px; color: var(--muted); font-size: var(--ui-font-8); line-height: 1.5; }
 .new-projects-list { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; list-style: none; }
@@ -1911,6 +1971,10 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .projects-view-fill { height: 100%; }
 .projects-view-fill > [role="tabpanel"]:not([hidden]) { flex: 1; min-height: 0; overflow: auto; }
 .projects-selector { display: flex; flex: none; align-items: center; gap: 9px; }
+/* C16-11. 프로젝트 목록 오른쪽 톱니바퀴(형상관리 탭의 git 원격 인증). 목록이 남는 폭을 다 쓴다. */
+.projects-selector-row { display: flex; flex: none; align-items: center; gap: 8px; }
+.projects-selector-row > .projects-selector { min-width: 0; flex: 1; }
+.git-remote-auth > button { align-self: flex-start; }
 .projects-selector > span { color: var(--muted); font-size: var(--ui-font-8); font-weight: 700; white-space: nowrap; }
 .projects-selector > select { min-width: 0; max-width: 100%; flex: 1; }
 .projects-empty { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 24px 0; }
@@ -1920,7 +1984,7 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .project-files-layout > .docs-sidebar { z-index: 51; }
 .project-files-layout > .docs-sidebar-backdrop { border-radius: inherit; }
 .project-file-readonly { color: var(--faint); font-size: var(--ui-font-7); white-space: nowrap; }
-.docs-layout { position: relative; display: flex; width: 100%; height: 100%; }.docs-sidebar { z-index: 51; display: flex; width: 310px; flex: none; flex-direction: column; border-right: 1px solid var(--border); background: var(--x0d141d); }.docs-sidebar-backdrop { display: none; }.docs-sidebar-head { display: flex; min-height: var(--secondary-pane-header-height); align-items: center; justify-content: space-between; padding: 0 12px; border-bottom: 1px solid var(--border-soft); }.docs-sidebar-head > div:first-child { display: flex; align-items: baseline; gap: 7px; }.docs-sidebar-head strong { font-size: var(--ui-font-11); }.docs-sidebar-head span { color: var(--faint); font-size: var(--ui-font-8); }.secondary-pane-header-actions { display: flex; flex: none; align-items: center; gap: 5px; }.secondary-pane-toggle { display: grid; width: 31px; height: 31px; flex: none; padding: 0; place-items: center; border: 1px solid var(--border); border-radius: 8px; background: var(--x111a24); color: var(--muted); cursor: pointer; }.secondary-pane-toggle:hover { border-color: var(--x40536a); color: var(--text); }.secondary-pane-restore { display: inline-flex; min-width: 0; min-height: 30px; flex: none; align-items: center; gap: 6px; padding: 0 8px; border: 1px solid rgba(var(--accent-rgb), .22); border-radius: 7px; background: rgba(var(--accent-rgb), .06); color: var(--muted); font: inherit; font-size: var(--ui-font-8); font-weight: 700; cursor: pointer; }.secondary-pane-restore > span { overflow: hidden; max-width: 120px; text-overflow: ellipsis; white-space: nowrap; }.secondary-pane-restore:hover { border-color: rgba(var(--accent-rgb), .42); color: var(--text); }.root-form { display: flex; flex-direction: column; gap: 6px; padding: 9px; border-bottom: 1px solid var(--border); background: var(--x101924); }.root-form input { min-height: 29px; padding: 0 8px; font-size: var(--ui-font-8); }.root-form .button { align-self: flex-end; }.root-list { max-height: 190px; overflow: auto; padding: 6px; border-bottom: 1px solid var(--border-soft); }.root-row { display: flex; align-items: center; border-radius: 7px; }.root-row.active { background: var(--x182432); }.root-row > button:first-child { display: flex; min-width: 0; flex: 1; align-items: center; gap: 8px; padding: 7px; border: 0; background: transparent; text-align: left; cursor: pointer; }.root-row > button:first-child > span { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }.root-row strong { font-size: var(--ui-font-9); }.root-row code { overflow: hidden; color: var(--faint); font-size: var(--ui-font-6-5); text-overflow: ellipsis; white-space: nowrap; }.remove-root { width: 23px; border: 0; background: transparent; color: var(--faint); cursor: pointer; }.remove-root:hover { color: var(--danger); }
+.docs-layout { position: relative; display: flex; width: 100%; height: 100%; }.docs-sidebar { z-index: 51; display: flex; width: 310px; flex: none; flex-direction: column; border-right: 1px solid var(--border); background: var(--x0d141d); }.docs-sidebar-backdrop { display: none; }.docs-sidebar-head { display: flex; min-height: var(--secondary-pane-header-height); align-items: center; justify-content: space-between; padding: 0 12px; border-bottom: 1px solid var(--border-soft); }.docs-sidebar-head > div:first-child { display: flex; align-items: baseline; gap: 7px; }.docs-sidebar-head strong { font-size: var(--ui-font-11); }.docs-sidebar-head span { color: var(--faint); font-size: var(--ui-font-8); }.secondary-pane-header-actions { display: flex; flex: none; align-items: center; gap: 5px; }.secondary-pane-toggle { display: grid; width: 31px; height: 31px; flex: none; padding: 0; place-items: center; border: 1px solid var(--border); border-radius: 8px; background: var(--x111a24); color: var(--muted); cursor: pointer; }.secondary-pane-toggle:hover { border-color: var(--x40536a); color: var(--text); }.secondary-pane-restore { display: inline-flex; min-width: 0; min-height: 30px; flex: none; align-items: center; gap: 6px; padding: 0 8px; border: 1px solid rgba(var(--accent-rgb), .22); border-radius: 7px; background: rgba(var(--accent-rgb), .06); color: var(--muted); font: inherit; font-size: var(--ui-font-8); font-weight: 700; cursor: pointer; }.secondary-pane-restore > span { overflow: hidden; max-width: 120px; text-overflow: ellipsis; white-space: nowrap; }.secondary-pane-restore:hover { border-color: rgba(var(--accent-rgb), .42); color: var(--text); }.root-form { display: flex; flex-direction: column; gap: 6px; padding: 9px; border-bottom: 1px solid var(--border); background: var(--x101924); }.root-form input { min-height: 29px; padding: 0 8px; font-size: var(--ui-font-8); }.root-form .button { align-self: flex-end; }.root-list { max-height: 190px; overflow: auto; padding: 6px; border-bottom: 1px solid var(--border-soft); }.root-list.has-editor { max-height: 380px; }.root-item { display: flex; flex-direction: column; border-radius: 7px; }.root-item.editing { margin: 2px 0; border: 1px solid var(--border); background: var(--x101924); }.root-row { display: flex; align-items: center; border-radius: 7px; }.root-row.active { background: var(--x182432); }.root-row > button:first-child { display: flex; min-width: 0; flex: 1; align-items: center; gap: 8px; padding: 7px; border: 0; background: transparent; text-align: left; cursor: pointer; }.root-row > button:first-child > span { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }.root-row-heading { display: flex; min-width: 0; align-items: center; gap: 6px; }.root-row strong { overflow: hidden; font-size: var(--ui-font-9); text-overflow: ellipsis; white-space: nowrap; }.root-agent-badge { flex: none; padding: 1px 5px; border-radius: 999px; font-size: var(--ui-font-6); font-weight: 700; line-height: 1.3; }.root-agent-badge.off { border: 1px solid rgba(255, 202, 76, 0.3); background: rgba(255, 202, 76, 0.08); color: var(--xdcb958); }.root-row code { overflow: hidden; color: var(--faint); font-size: var(--ui-font-6-5); text-overflow: ellipsis; white-space: nowrap; }.root-note { overflow: hidden; color: var(--muted); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }.root-row-actions { display: flex; flex: none; align-items: center; gap: 2px; padding-right: 4px; }.edit-root, .remove-root { display: grid; width: 24px; height: 24px; padding: 0; place-items: center; border: 0; border-radius: 5px; background: transparent; color: var(--faint); cursor: pointer; }.edit-root:hover, .edit-root.active { background: rgba(var(--accent-rgb), .12); color: var(--green); }.remove-root:hover { color: var(--danger); }.root-settings-form { display: flex; flex-direction: column; gap: 7px; padding: 8px 9px 9px; border-top: 1px solid var(--border-soft); }.root-settings-field { display: flex; flex-direction: column; gap: 3px; color: var(--muted); font-size: var(--ui-font-7); font-weight: 700; }.root-settings-field input { min-height: 28px; padding: 0 8px; font-size: var(--ui-font-8); font-weight: 400; }.root-settings-toggle { display: flex; align-items: center; gap: 7px; padding: 2px 0; color: var(--text); font-size: var(--ui-font-8); cursor: pointer; }.root-settings-toggle input { width: 14px; height: 14px; margin: 0; accent-color: var(--green); }.root-settings-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 2px; }.root-settings-actions .button { min-height: 27px; padding: 0 10px; font-size: var(--ui-font-7-5); }
 .doc-tree-panel { display: flex; min-height: 0; flex: 1; flex-direction: column; padding: 7px; }.doc-tree-panel > input { min-height: 29px; padding: 0 8px; font-size: var(--ui-font-8); }.new-doc-row { display: flex; gap: 4px; margin-top: 5px; }.new-doc-row input { min-width: 0; min-height: 27px; flex: 1; padding: 0 7px; font-size: var(--ui-font-8); }.new-doc-row button { width: 28px; border: 1px solid var(--border); border-radius: 7px; background: var(--x14202b); cursor: pointer; }.new-doc-row button:disabled { opacity: 0.4; }.doc-tree { min-height: 0; overflow: auto; margin-top: 7px; }.tree-row { display: flex; width: 100%; align-items: center; gap: 5px; min-height: 25px; border: 0; border-radius: 5px; background: transparent; color: var(--x93a2b4); text-align: left; cursor: pointer; }.tree-row:hover, .tree-row.active { background: var(--x182431); color: var(--text); }.tree-row strong { overflow: hidden; font-size: var(--ui-font-8); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }.tree-row > span { color: var(--faint); font-size: var(--ui-font-8); }.tree-row.file.active { box-shadow: inset 2px 0 var(--green); }.tree-empty { color: var(--faint); font-size: var(--ui-font-8); text-align: center; }
 .doc-workspace { display: flex; min-width: 0; flex: 1; flex-direction: column; overflow: auto; background: var(--x080d13); }.doc-workspace > .empty-state { margin: auto; }.doc-workspace > .error-banner { margin: 12px 16px 0; }.doc-workspace > .markdown-preview { flex-shrink: 0; }.doc-header { display: flex; min-height: var(--secondary-pane-header-height); flex: none; align-items: center; justify-content: space-between; gap: 14px; padding: 0 17px; border-bottom: 1px solid var(--border-soft); background: var(--x0d141d); }.doc-header-empty { justify-content: flex-start; }.doc-header-leading { display: flex; min-width: 0; align-items: center; gap: 9px; }.doc-header-title { display: flex; min-width: 0; flex-direction: column; gap: 3px; }.doc-header strong { overflow: hidden; font-size: var(--ui-font-11); text-overflow: ellipsis; white-space: nowrap; }.doc-header span { color: var(--faint); font-size: var(--ui-font-7); }.doc-header-actions { display: flex; flex: none; gap: 6px; }.warning-banner { padding: 8px 17px; border-bottom: 1px solid rgba(255, 202, 76, 0.18); background: rgba(255, 202, 76, 0.06); color: var(--xdcb958); font-size: var(--ui-font-8); }.doc-editor { width: 100%; min-height: 0; flex: 1; padding: 20px; border: 0; border-radius: 0; background: var(--x090f16); color: var(--xc2cedb); font: var(--ui-font-10)/1.7 ui-monospace, SFMono-Regular, Menlo, monospace; resize: none; }.markdown-preview { width: min(940px, 100%); min-height: 100%; margin: 0 auto; padding: 30px clamp(24px, 5vw, 58px) 70px; color: var(--xc9d4df); font-size: var(--ui-font-10); line-height: 1.78; word-break: keep-all; overflow-wrap: anywhere; }.markdown-preview-embedded { width: 100%; min-height: 0; padding: 5px 1px 14px; }.markdown-preview h1, .markdown-preview h2, .markdown-preview h3, .markdown-preview h4, .markdown-preview h5, .markdown-preview h6 { color: var(--xedf3f8); line-height: 1.35; letter-spacing: -.02em; }.markdown-preview h1 { margin: 0 0 24px; padding-bottom: 12px; border-bottom: 1px solid var(--border); font-size: 25px; }.markdown-preview h2 { margin: 34px 0 14px; padding-bottom: 7px; border-bottom: 1px solid var(--border-soft); font-size: 20px; }.markdown-preview h3 { margin: 27px 0 11px; font-size: 17px; }.markdown-preview h4, .markdown-preview h5, .markdown-preview h6 { margin: 22px 0 9px; font-size: var(--ui-font-12); }.markdown-preview-embedded h1 { font-size: 21px; }.markdown-preview-embedded h2 { font-size: 18px; }.markdown-preview p { margin: 0 0 16px; }.markdown-preview ul, .markdown-preview ol { margin: 0 0 18px; padding-left: 25px; }.markdown-preview li { margin: 5px 0; padding-left: 3px; }.markdown-preview .markdown-task { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px; margin-left: -21px; list-style: none; }.markdown-preview .markdown-task > ul, .markdown-preview .markdown-task > ol { flex-basis: 100%; margin: 0; padding-left: 46px; }.markdown-preview li > ul, .markdown-preview li > ol { margin: 5px 0 0; }.markdown-task input { width: 15px; height: 15px; margin-top: 6px; accent-color: var(--green); }.markdown-preview strong { color: var(--xe5ecf3); }.markdown-preview code { padding: 2px 5px; border: 1px solid var(--x293949); border-radius: 5px; background: var(--x101923); color: var(--xbdc9d5); color: color-mix(in srgb, var(--accent) 30%, var(--xbdc9d5)); font: .92em/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }.markdown-code-block { overflow: auto; margin: 18px 0; padding: 15px 17px; border: 1px solid var(--border); border-radius: 9px; background: var(--x080e14); }.markdown-code-block code { padding: 0; border: 0; background: transparent; color: var(--xbdc9d5); font-size: var(--ui-font-9); white-space: pre; }.markdown-preview blockquote { margin: 17px 0; padding: 9px 14px; border-left: 3px solid rgba(var(--accent-rgb), 0.55); background: rgba(var(--accent-rgb), .045); color: var(--xaebdca); }.markdown-preview hr { margin: 28px 0; border: 0; border-top: 1px solid var(--border); }.markdown-preview a { color: var(--x8ebcff); text-decoration-color: rgba(142, 188, 255, .45); text-underline-offset: 3px; }.markdown-table-wrap { overflow-x: auto; margin: 18px 0 24px; border: 1px solid var(--border); border-radius: 9px; }.markdown-preview table { width: 100%; border-collapse: collapse; background: var(--x0b1219); }.markdown-preview th, .markdown-preview td { min-width: 110px; padding: 10px 12px; border-right: 1px solid var(--border-soft); border-bottom: 1px solid var(--border-soft); vertical-align: top; }.markdown-preview th { background: var(--x111c27); color: var(--xe1e9f1); font-size: var(--ui-font-9); }.markdown-preview tr:last-child td { border-bottom: 0; }.markdown-preview th:last-child, .markdown-preview td:last-child { border-right: 0; }.markdown-empty { color: var(--faint); text-align: center; }
 
@@ -2542,6 +2606,18 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 
 .chat-tool summary, .chat-tool-summary { display: grid; min-height: 39px; grid-template-columns: 7px minmax(0, 1fr) auto; align-items: center; justify-content: initial; gap: 9px; padding: 6px 11px; }
 .chat-tool-compact .chat-tool-summary { cursor: default; }
+/* 파일 변경 카드. 행은 skill-diff 규칙을 쓰고, 바꾸기 조각은 줄 번호 칸을 뺀다. */
+.chat-tool-edits { display: flex; flex-direction: column; gap: 8px; padding: 8px 11px 10px; border-top: 1px solid var(--border-soft); }
+.chat-tool-edits-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--faint); font-size: var(--ui-font-7); }
+.chat-tool-edits > .chat-tool-truncated { padding: 0; border-top: 0; }
+.chat-tool .chat-tool-edits pre { border-top: 0; }
+.chat-tool-edit { display: flex; min-width: 0; flex-direction: column; gap: 5px; }
+.chat-tool-edit header { display: flex; min-width: 0; align-items: center; gap: 7px; }
+.chat-tool-edit header code { overflow: hidden; min-width: 0; flex: 1; color: var(--xe4ebf3); font-size: var(--ui-font-8); text-overflow: ellipsis; white-space: nowrap; }
+.chat-tool-edit header small { flex: none; color: var(--faint); font-size: var(--ui-font-7); }
+.chat-tool .skill-diff.chat-tool-diff { max-height: 420px; padding: 6px 0; border: 1px solid var(--border); white-space: normal; word-break: normal; }
+.skill-diff.chat-tool-diff .meta { display: block; padding: 0 10px; color: var(--faint); }
+.skill-diff.chat-tool-diff.no-line-numbers > div:not(.skip):not(.meta) { grid-template-columns: 1.6em 1fr; }
 .chat-tool summary::marker { color: var(--x58697b); }
 .chat-tool-title { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
 .chat-tool-title b { font-size: var(--ui-font-9); font-weight: 650; }
@@ -2624,6 +2700,11 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .session-folder-chips { display: flex; max-width: 100%; flex-wrap: wrap; gap: 3px; margin-top: 4px; }.session-folder-chips > span { overflow: hidden; max-width: 112px; padding: 2px 5px; border: 1px solid color-mix(in srgb, var(--folder-color) 38%, transparent); border-radius: 999px; background: color-mix(in srgb, var(--folder-color) 9%, transparent); color: color-mix(in srgb, var(--folder-color) 72%, var(--chip-mix)); font-size: var(--ui-font-6); line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; }
 .session-folder-picker { padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }.session-folder-picker > span { display: block; margin-bottom: 8px; color: var(--muted); font-size: var(--ui-font-9); }.session-folder-picker > div { display: flex; flex-wrap: wrap; gap: 5px; }.session-folder-picker button { display: flex; min-height: 27px; align-items: center; gap: 5px; padding: 0 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--x0d151e); color: var(--x96a5b6); font-size: var(--ui-font-8); cursor: pointer; }.session-folder-picker button i { width: 7px; height: 7px; border-radius: 50%; background: var(--folder-color); }.session-folder-picker button.assigned { border-color: color-mix(in srgb, var(--folder-color) 48%, var(--border)); background: color-mix(in srgb, var(--folder-color) 10%, var(--x0d151e)); color: var(--text); }.session-folder-picker button:disabled { opacity: .5; cursor: wait; }.session-folder-picker small { color: var(--faint); font-size: var(--ui-font-8); }.folder-pill-path { overflow: hidden; max-width: 120px; color: var(--faint); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
 
+/* 관련 프로젝트: 작업 경로 밖에서 손댄 프로젝트. 목록 행에는 개수 칩만, 세션 설정에는 자동·직접 연결 칩과 추가 선택. */
+.session-related-chip { margin-left: 6px; padding: 1px 5px; border: 1px solid var(--x314154); border-radius: 999px; color: var(--muted); font-size: var(--ui-font-6); letter-spacing: .02em; vertical-align: 1px; cursor: help; }
+.session-related-projects button small { color: var(--faint); font-size: var(--ui-font-7); }
+.session-related-projects button.auto:disabled { opacity: 1; cursor: default; }
+.session-related-projects select { width: auto; min-width: 140px; min-height: 27px; padding: 0 26px 0 8px; border-radius: 999px; font-size: var(--ui-font-8); }
 .schedule-editor-grid .check-filter input { width: 16px; min-width: 16px; height: 16px; min-height: 16px; margin-top: 2px; padding: 0; }
 /* 반복 요청의 워크플로 구분: 계약 입력 폼과 승인 버전 안내를 편집기 그리드 폭에 맞춘다. */
 .schedule-editor-grid > .wide { grid-column: 1 / -1; }
@@ -2837,6 +2918,11 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
   .session-read-grid { grid-template-columns: minmax(0, 1fr); }.session-read-grid > label.wide, .session-read-grid > fieldset.wide { grid-column: auto; }.session-read-project-list { grid-template-columns: minmax(0, 1fr); }.session-read-project-toolbar { align-items: flex-start; flex-direction: column; }
   .schedule-editor-grid { grid-template-columns: minmax(0, 1fr); }.schedule-editor-grid > label.wide, .schedule-editor-grid > .runtime-settings { grid-column: auto; }
   .sessions-layout { grid-template-columns: 1fr; }
+  /* 공급자 다섯 탭은 좁은 툴바에서도 한 행을 온전히 차지한다. 다른 필터와 같은 flex 줄에서
+     줄어들게 두면 짧은 "전체"가 글자 단위로 접히고, 최소 폭이 긴 Ollama 쪽이 카드 밖으로
+     밀려난다. 탭 자체의 글꼴·안쪽 여백도 조금 줄여 다섯 이름을 스크롤 없이 보존한다. */
+  .session-list-toolbar > .source-tabs { width: 100%; min-width: 0; flex: 1 0 100%; gap: 3px; }
+  .session-list-toolbar > .source-tabs button { overflow: hidden; min-width: 0; flex: 1 1 auto; padding-inline: 4px; font-size: var(--ui-font-8); text-overflow: ellipsis; white-space: nowrap; }
   .drag-grip { padding: 10px 8px; margin: -10px -8px; }
   .session-folders { position: static; max-height: 250px; }
   .settings-card > header { align-items: flex-start; flex-direction: column; }.settings-card > header p { text-align: left; }.settings-choice-list { grid-template-columns: 1fr; }
@@ -4082,7 +4168,8 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .round-auto-decision-toggle > span { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
 .round-auto-decision-toggle strong { color: var(--xd8e1ea); font-size: var(--ui-font-9); }
 .round-auto-decision-toggle small, .round-auto-decision-notice { color: var(--faint); font-size: var(--ui-font-7); line-height: 1.5; }
-.round-auto-decision-toggle input { flex: none; width: 16px; height: 16px; accent-color: rgb(var(--accent-rgb)); cursor: pointer; }
+.round-auto-decision-toggle select { flex: none; max-width: 46%; }
+.round-decision-human { margin-right: 6px; border-color: rgba(var(--accent-rgb), .34); color: rgb(var(--accent-rgb)); }
 .round-auto-decision-notice { padding: 0 3px 4px; color: var(--green); }
 .round-report-details { border: 1px solid var(--border-soft); border-radius: 9px; padding: 8px 10px; }
 .round-report-details > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; cursor: pointer; list-style: none; }
@@ -4121,6 +4208,12 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .git-repo-root { color: var(--faint); font-size: var(--ui-font-7); }
 .git-repo-root code { color: var(--faint); }
 .git-overview-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.git-overview-actions .button { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.git-overview-actions .git-action-group { flex-wrap: wrap; }
+.git-overview-actions .button > svg { flex: none; }
+/* 한국어 버튼 이름 옆의 git 용어. 이름보다 한 단계 흐리고 작게. */
+.git-action-term { color: var(--faint); font-size: var(--ui-font-6); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.git-sync-help-button { margin-left: auto; }
 .git-action-group { display: inline-flex; align-items: center; gap: 4px; }
 .git-action-group select, .git-inline-form select, .git-inline-form input[type="text"] { min-height: 28px; padding: 3px 7px; font-size: var(--ui-font-7); }
 .git-inline-form { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 0 12px 10px; }
@@ -4175,6 +4268,12 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .git-branch-row.current { background: rgba(var(--accent-rgb), .08); }
 .git-branch-row.current strong { color: var(--green); }
 .git-branch-main { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 1px; }
+/* 브랜치 이름 칸은 누르면 그 브랜치의 이력을 보여 주는 버튼이다(체크아웃하지 않는다). */
+button.git-branch-main { margin: 0; padding: 2px 4px; border: 0; border-radius: 6px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+button.git-branch-main:hover { background: rgba(255, 255, 255, .05); }
+button.git-branch-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.git-branch-row.viewing { box-shadow: inset 2px 0 0 var(--accent); }
+.git-branch-row.viewing:not(.current) { background: rgba(var(--accent-rgb), .05); }
 .git-branch-main strong { overflow: hidden; color: var(--xe4ebf3); font-size: var(--ui-font-8); text-overflow: ellipsis; white-space: nowrap; }
 .git-branch-main small { overflow: hidden; color: var(--faint); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
 /* 브랜치 트리(B4). 이름의 `/`를 폴더로 읽어 접고 펴는 줄과, upstream을 따르는 브랜치의
@@ -4223,10 +4322,19 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .git-branch-context-menu > button:disabled { cursor: not-allowed; opacity: .45; }
 .git-branch-context-menu > button > svg { flex: none; color: var(--faint); }
 .git-worktree-row { flex-direction: column; align-items: flex-start; gap: 1px; }
-.git-worktree-row code { overflow: hidden; max-width: 100%; color: var(--xe4ebf3); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
+.git-worktree-head code { overflow: hidden; max-width: 100%; color: var(--xe4ebf3); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
+.git-worktree-head { display: flex; width: 100%; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }
+.git-worktree-head .button { display: inline-flex; flex: none; align-items: center; gap: 3px; }
+.git-worktree-changes { width: 100%; margin-top: 4px; }
+.git-worktree-note { margin: 4px 0 0; color: var(--faint); font-size: var(--ui-font-7); }
+.git-worktree-note.error { color: var(--danger); }
 .git-worktree-row small { color: var(--faint); font-size: var(--ui-font-7); }
 .git-row-actions { display: inline-flex; flex: none; gap: 4px; }
 .git-log { container-type: inline-size; }
+.settings-subsection > header > .git-log-title { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; }
+.git-log-viewing { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%; padding: 1px 7px; border: 1px solid rgba(var(--accent-rgb), .45); border-radius: 999px; color: var(--accent); font-size: var(--ui-font-7); white-space: nowrap; }
+.git-log-viewing > svg { flex: none; }
+.git-log-viewing > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .git-log-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 12px 10px; }
 .git-log-toolbar > small { flex: none; color: var(--faint); font-size: var(--ui-font-7); font-variant-numeric: tabular-nums; }
 .git-log-search { display: flex; min-width: 180px; max-width: 440px; flex: 1; align-items: center; gap: 6px; padding: 0 7px; border: 1px solid var(--border); border-radius: 7px; background: var(--x080e14); color: var(--faint); }
@@ -4425,14 +4533,56 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 
 /* B8. upstream 비교 — 수신과 송신을 좌우로 갈라 둔다. 한 칸에 겹쳐 두면 "3건"이 어느
    방향인지 다시 읽어야 하고, 그 모호함을 없애려고 이 화면을 만들었다. */
-.git-branch-comparison .git-comparison-sides { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
-.git-branch-comparison .git-comparison-side { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; min-width: 0; }
-.git-branch-comparison .git-comparison-side > header { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
-.git-branch-comparison .git-comparison-commits { display: flex; flex-direction: column; gap: 2px; margin: 0 0 6px; padding: 0; list-style: none; font-size: 12px; }
-.git-branch-comparison .git-comparison-commits li { display: flex; gap: 6px; min-width: 0; }
-.git-branch-comparison .git-comparison-commits span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.git-branch-comparison .git-commit-files { margin-left: 0; padding-left: 0; }
-.git-branch-comparison .git-change-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* upstream 비교. 접힌 모습은 요약 바 한 줄 — 칩이 수신·송신 수와 갈라짐을 말하고, 펼치면
+   방향마다 커밋·바뀐 파일을 소제목으로 갈라 목록마다 제 높이 안에서 스크롤한다. */
+.git-panel .git-branch-comparison > header { flex-wrap: wrap; justify-content: flex-start; gap: 4px 10px; padding: 6px 8px; }
+.git-comparison-toggle { display: inline-flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 6px; padding: 4px 6px; border: 0; border-radius: 6px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.git-comparison-toggle:hover:not(:disabled) { background: rgba(var(--accent-rgb), .05); }
+.git-comparison-toggle:focus-visible { outline: 1px solid rgba(var(--accent-rgb), .5); outline-offset: -1px; }
+.git-comparison-toggle:disabled { cursor: default; opacity: 1; }
+.git-comparison-toggle > svg { flex: none; color: var(--faint); }
+.git-branch-comparison .git-comparison-toggle > strong { color: var(--xd8e1ea); font-size: var(--ui-font-9); white-space: nowrap; }
+.git-comparison-chip { display: inline-flex; flex: none; align-items: center; gap: 3px; padding: 1px 7px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: var(--ui-font-7); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.git-comparison-chip.incoming { border-color: color-mix(in srgb, var(--blue) 40%, transparent); color: var(--blue); }
+.git-comparison-chip.outgoing { border-color: color-mix(in srgb, var(--green) 40%, transparent); color: var(--green); }
+.git-comparison-chip.diverged { border-color: color-mix(in srgb, var(--xefd183) 45%, transparent); color: var(--xefd183); }
+.git-comparison-chip.same { border-style: dashed; }
+.git-branch-comparison .git-comparison-meta { margin-left: auto; overflow: hidden; min-width: 0; color: var(--faint); font-size: var(--ui-font-7); text-overflow: ellipsis; white-space: nowrap; }
+.git-comparison-body { display: flex; flex-direction: column; gap: 8px; padding: 0 12px 12px; }
+.git-comparison-note { margin: 0; color: var(--faint); font-size: var(--ui-font-7); }
+.git-comparison-body > .git-comparison-note { display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-left: 2px solid var(--xefd183); border-radius: 4px; background: color-mix(in srgb, var(--xefd183) 8%, transparent); color: var(--muted); }
+.git-branch-comparison .git-comparison-sides { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); align-items: start; gap: 10px; }
+.git-branch-comparison .git-comparison-side { display: flex; min-width: 0; flex-direction: column; gap: 8px; padding: 8px 10px; border: 1px solid var(--border-soft); border-radius: 8px; background: color-mix(in srgb, var(--text) 2%, transparent); }
+.git-branch-comparison .git-comparison-side > header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; }
+.git-branch-comparison .git-comparison-side > header strong { display: inline-flex; align-items: center; gap: 4px; font-size: var(--ui-font-8); font-variant-numeric: tabular-nums; }
+.git-branch-comparison .git-comparison-side[data-direction="incoming"] > header strong { color: var(--blue); }
+.git-branch-comparison .git-comparison-side[data-direction="outgoing"] > header strong { color: var(--green); }
+.git-branch-comparison .git-comparison-side > header small { color: var(--faint); font-size: var(--ui-font-7); }
+.git-comparison-group { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.git-comparison-group + .git-comparison-group { padding-top: 8px; border-top: 1px solid var(--border-soft); }
+.git-comparison-group > h4 { display: flex; align-items: center; gap: 5px; margin: 0; color: var(--muted); font-size: var(--ui-font-7); font-weight: 650; }
+.git-comparison-group > h4 > span:first-child { color: var(--faint); font-variant-numeric: tabular-nums; }
+.git-comparison-partial { padding: 0 5px; border: 1px solid var(--border); border-radius: 999px; color: var(--faint); font-size: var(--ui-font-6); font-weight: 500; }
+.git-branch-comparison .git-comparison-commits, .git-branch-comparison .git-commit-files { display: flex; max-height: 180px; flex-direction: column; gap: 1px; margin: 0; padding: 0; overflow-y: auto; list-style: none; }
+.git-branch-comparison .git-comparison-commits li { display: flex; min-width: 0; align-items: baseline; gap: 8px; padding: 2px 4px; border-radius: 4px; font-size: var(--ui-font-7); }
+.git-branch-comparison .git-comparison-commits li:hover { background: rgba(var(--accent-rgb), .04); }
+.git-branch-comparison .git-comparison-commits code { flex: none; padding: 0 5px; border-radius: 4px; background: color-mix(in srgb, var(--text) 7%, transparent); color: var(--faint); font-size: var(--ui-font-6); }
+.git-branch-comparison .git-comparison-commits span { min-width: 0; flex: 1; overflow: hidden; color: var(--xc6d1dc); text-overflow: ellipsis; white-space: nowrap; }
+.git-branch-comparison .git-comparison-commits small { flex: none; color: var(--faint); font-size: var(--ui-font-6); white-space: nowrap; }
+.git-branch-comparison .git-commit-file { padding: 0 4px; }
+/* 폴더·옛 경로가 먼저 줄고 파일 이름은 가장 늦게 준다 — 좁은 폭에서도 이름이 읽힌다. */
+.git-branch-comparison .git-change-path { display: flex; overflow: hidden; white-space: nowrap; }
+.git-branch-comparison .git-change-path > span { overflow: hidden; min-width: 0; text-overflow: ellipsis; }
+.git-branch-comparison .git-comparison-dir { flex: 0 1000 auto; }
+.git-branch-comparison .git-change-path > .git-change-origin { flex: 0 100 auto; white-space: pre; }
+.git-branch-comparison .git-comparison-name { flex: none; max-width: 100%; }
+.git-branch-comparison .git-change-code[data-kind="added"] { color: var(--green); }
+.git-branch-comparison .git-change-code[data-kind="deleted"] { color: var(--danger); }
+.git-branch-comparison .git-change-code[data-kind="modified"], .git-branch-comparison .git-change-code[data-kind="typeChanged"] { color: var(--xefd183); }
+.git-branch-comparison .git-change-code[data-kind="renamed"], .git-branch-comparison .git-change-code[data-kind="copied"] { color: var(--blue); }
+.git-comparison-dir { color: var(--faint); }
+.git-comparison-name { color: var(--xc6d1dc); }
+.git-change-path-button.selected .git-comparison-name { color: inherit; }
 /* B9. 비교 요약의 파일은 같은 세 점 범위의 diff 를 연다 — 작업 트리 목록과 같은 눌림 표시를 쓴다. */
 .git-change-path-button:hover { text-decoration: underline; }
 .git-change-path-button.selected { color: var(--accent); font-weight: 600; }
@@ -4482,4 +4632,39 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
   .login-otp-qr { grid-row: auto; justify-content: center; }
   .login-settings-row { flex-direction: column; }
   .login-settings-actions { justify-content: flex-start; }
+}
+
+/* Window-local conversation navigation and edit controls. */
+.message-edit-form { display: grid; gap: 8px; width: 100%; min-width: 0; margin-block: 8px; }
+.message-edit-form textarea { width: 100%; box-sizing: border-box; resize: vertical; min-height: 100px; }
+.message-edit-form > p { margin: 0; font-size: 12px; line-height: 1.6; }
+.message-edit-form > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.message-edit-form [role="alert"] { color: var(--danger, #b42318); }
+
+.message-edit-action { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; opacity: 1; }
+.message-edit-action:hover, .message-edit-action:focus-visible { color: var(--text); opacity: 1; }
+.message-edit-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Shared user message presentation across transcript, chat and AIA. */
+.message-user, .conversation-turn > .chat-message-user, .aia-turn > .chat-message-user, .session-continuation-stream > .chat-message-user { box-sizing: border-box; width: min(92%, 860px); max-width: 92%; align-self: flex-end; padding: 12px 14px; border-radius: 10px; border-color: color-mix(in srgb, var(--blue) 48%, var(--border)); border-right: 3px solid var(--blue); border-bottom-right-radius: 4px; background: var(--t-user-bubble); text-align: left; }
+.message > .user-message-header, .chat-message > .user-message-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; min-height: 26px; }
+.message > .user-message-header > strong, .chat-message > .user-message-header > strong { flex: none; padding: 3px 7px; border-radius: 999px; background: color-mix(in srgb, var(--blue) 13%, transparent); color: var(--blue); font-size: var(--ui-font-8); letter-spacing: .02em; }
+.user-message-header > time { margin-left: auto; color: var(--faint); font-size: var(--ui-font-7); text-align: right; }
+.message-user .text-block, .chat-message-user > .chat-message-markdown { color: var(--text); font-size: var(--ui-font-10); line-height: 1.65; text-align: left; }
+
+.aia-context-bar { flex: none; padding: 5px 13px; }
+.chat-context-meter .context-unknown { opacity: .45; }
+
+.message-edit-popup { position: absolute; z-index: 3; right: 8px; top: 50%; transform: translateY(-50%); display: flex; padding: 3px; border: 1px solid var(--border); border-radius: 8px; background: var(--x111a24); box-shadow: 0 4px 12px rgba(0, 0, 0, .18); }
+.message-user[tabindex]:focus-visible, .chat-message-user[tabindex]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.message-edit-popup { gap: 3px; }
+.message-edit-popup .message-edit-action { flex: none; width: 30px; height: 30px; }
+.message-edit-popup .message-action-error { position: absolute; top: 100%; right: 0; width: min(260px, 70vw); margin-top: 6px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--x111a24); color: var(--danger); font-size: var(--ui-font-8); }
+
+/* 등록 폴더 목록에는 예외 상태가 아니라 명시적으로 허용한 폴더만 긍정 배지로 표시한다. */
+.root-agent-badge { border: 1px solid rgba(var(--accent-rgb), .3); background: rgba(var(--accent-rgb), .08); color: var(--green); }
+@media (pointer: coarse), (max-width: 640px) {
+  .message-edit-popup .message-edit-action { width: 44px; min-width: 44px; height: 44px; min-height: 44px; }
+  .message-edit-popup .message-edit-action > svg { width: 18px; height: 18px; }
 }

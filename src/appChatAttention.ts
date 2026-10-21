@@ -14,6 +14,7 @@ import type { ChatViewAttentionTarget } from "./components/ChatView";
 import type { SessionAttentionTarget } from "./components/SessionsView";
 import type { SettingsTabId } from "./components/SettingsView";
 import type { WorkflowsTabId } from "./components/WorkflowsView";
+import { roundDecisionGoalId } from "./lib/attentionGroups";
 import { adoptFoundSession, resolveAttentionRoute } from "./lib/attentionRoute";
 import {
   clearReadAttentionLocally,
@@ -55,7 +56,7 @@ export function useChatAttentionCenter({ popoutRequest, snapshotRef, activateVie
   snapshotRef: MutableRefObject<ManagerSnapshot | null>;
   activateView: (view: ViewId) => void;
   requestSettingsTab: (tab: SettingsTabId) => void;
-  requestWorkflowsTab: (tab: WorkflowsTabId) => void;
+  requestWorkflowsTab: (tab: WorkflowsTabId, openGoalId?: string) => void;
   syncSessionCatalog: (source: ProviderId, id: string) => Promise<void>;
   setSelectedSession: Dispatch<SetStateAction<SessionSummary | null>>;
   setError: (message: string | null) => void;
@@ -86,23 +87,19 @@ export function useChatAttentionCenter({ popoutRequest, snapshotRef, activateVie
   const attentionPending = useRef(0);
   const handledAttentionRequests = useRef(new Set<number>());
 
+  // 조회가 실패하면 그대로 던진다. 현재 알림 목록은 유지되고 폴링 루프(`usePoll`)만 백오프한다.
   const pollAttention = useCallback(async () => {
-    try {
-      const revision = attentionRevision.current;
-      const next = await getChatAttentionSnapshot();
-      // 이 응답을 기다리는 사이 사용자가 읽음·삭제를 눌렀으면, 서버가 그 요청을 반영하기
-      // 전에 뜬 목록이다. 그대로 올리면 방금 사라진 알림이 되살아나 깜빡인다. 버리고
-      // 다음 폴링을 기다린다.
-      if (attentionPending.current > 0 || attentionRevision.current !== revision) return;
-      setChatAttention(keepIfSame(next));
-      setAttentionLoaded(true);
-      // AIA는 일반 인앱 알림창에서만 분리한다. 기기 알림은 모든 프로필을 알려야 한다.
-      // 중복 알림을 막기 위해 팝아웃 창은 표출하지 않는다(본 창이 대표로 보낸다).
-      if (!popoutRequest) void notifyNewAttention(next.items, snapshotRef.current?.sessions ?? []);
-    } catch (cause) {
-      // 현재 알림 목록은 유지한 채, 폴링 루프만 백오프한다.
-      throw cause;
-    }
+    const revision = attentionRevision.current;
+    const next = await getChatAttentionSnapshot();
+    // 이 응답을 기다리는 사이 사용자가 읽음·삭제를 눌렀으면, 서버가 그 요청을 반영하기
+    // 전에 뜬 목록이다. 그대로 올리면 방금 사라진 알림이 되살아나 깜빡인다. 버리고
+    // 다음 폴링을 기다린다.
+    if (attentionPending.current > 0 || attentionRevision.current !== revision) return;
+    setChatAttention(keepIfSame(next));
+    setAttentionLoaded(true);
+    // AIA는 일반 인앱 알림창에서만 분리한다. 기기 알림은 모든 프로필을 알려야 한다.
+    // 중복 알림을 막기 위해 팝아웃 창은 표출하지 않는다(본 창이 대표로 보낸다).
+    if (!popoutRequest) void notifyNewAttention(next.items, snapshotRef.current?.sessions ?? []);
   }, [popoutRequest]);
   usePoll(pollAttention, 2_000);
 
@@ -306,6 +303,13 @@ export function useChatAttentionCenter({ popoutRequest, snapshotRef, activateVie
       activateView("workflows");
       return;
     }
+    if (item.kind === "roundDecision") {
+      // 회차 결정 대기 역시 채팅이 없다. 목표 카드와 회차 상세 모달이 있는 워크플로 자동화 탭으로 연다.
+      void markAttentionRead(item.id);
+      requestWorkflowsTab("automation", roundDecisionGoalId(item.id) ?? undefined);
+      activateView("workflows");
+      return;
+    }
     // AIA 프로필이어도 **이 창이 소유한** 대화일 때만 팝업으로 연다. 소유 판정은 클릭하는
     // 그 순간 저장소에서 읽는다 — 팝업이 다른 대화에 붙은 직후에도 어긋나지 않아야 한다.
     // 소유하지 않은 AIA 대화(세션 화면에서 재개한 세션, ↻ 로 떼어 두고 계속 도는 대화)는
@@ -340,12 +344,25 @@ export function useChatAttentionCenter({ popoutRequest, snapshotRef, activateVie
       openAttentionItem(item);
       return;
     }
+    // 회차 결정 알림은 새 보고가 쌓이면 id 꼬리가 바뀌고, 결정이 끝나면 목록에서 빠진다.
+    // 어느 쪽이든 목표 ID로 현재 알림이나 목표 상세 모달을 연다.
+    const goalId = roundDecisionGoalId(notificationOpen.attentionId);
+    if (goalId) {
+      const liveItem = chatAttention.items.find((entry) => entry.kind === "roundDecision" && roundDecisionGoalId(entry.id) === goalId);
+      if (liveItem) {
+        openAttentionItem(liveItem);
+        return;
+      }
+      requestWorkflowsTab("automation", goalId);
+      activateView("workflows");
+      return;
+    }
     // 채팅이 없는 알림(계정 전환)이 그새 지워졌으면 앱을 앞으로 가져온 것으로 충분하다.
     if (!notificationOpen.chatId) return;
     attentionRequestId.current += 1;
     setChatViewAttentionTarget({ chatId: notificationOpen.chatId, attentionId: "", markRead: false, requestId: attentionRequestId.current });
     activateView("chat");
-  }, [notificationOpen, attentionLoaded, chatAttention.items, openAttentionItem, activateView]);
+  }, [notificationOpen, attentionLoaded, chatAttention.items, openAttentionItem, requestWorkflowsTab, activateView]);
 
   // 세션·AIA·채팅 뷰 세 곳의 알림 타깃 해제는 같은 절차다. 같은 요청을 두 번 처리하지
   // 않도록 requestId를 기록하고, 그사이 새 타깃이 들어왔으면 지우지 않으며, 실제로 열렸을

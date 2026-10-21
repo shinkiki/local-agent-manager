@@ -32,7 +32,10 @@ pub(crate) const RESETS_AT_JITTER_MS: i64 = 60_000;
 /// 이어 붙일 근거가 없어 다른 창으로 본다.
 pub(crate) fn same_window(before_used: f64, before: Option<i64>, after: Option<i64>) -> bool {
     match (before, after) {
-        (Some(before), Some(after)) => (after - before).abs() <= RESETS_AT_JITTER_MS,
+        // 리셋 시각은 공급자 JSON에서 온 값이라 `i64::MIN`·`i64::MAX`까지 올 수 있다
+        // (`usage_window`가 큰 수를 포화시킨다). 뺄셈은 넘쳐 디버그에서 패닉, 릴리스에서
+        // 감겨 다른 창을 같은 창으로 볼 수 있으므로 차이는 부호 없이 잰다.
+        (Some(before), Some(after)) => after.abs_diff(before) <= RESETS_AT_JITTER_MS.unsigned_abs(),
         (None, None) => true,
         (None, Some(_)) => before_used <= 0.0,
         (Some(_), None) => false,
@@ -458,6 +461,17 @@ mod tests {
         assert!(open_claims(&claims, NOW, &window(41.0, Some(NOW + 160 * HOUR))).is_empty());
         // 사용률이 기준선 아래로 내려감
         assert!(open_claims(&claims, NOW, &window(3.0, Some(NOW + 50 * HOUR))).is_empty());
+    }
+
+    #[test]
+    fn same_window_does_not_overflow_on_extreme_reset_times() {
+        assert!(!same_window(10.0, Some(i64::MIN), Some(i64::MAX)));
+        assert!(!same_window(10.0, Some(i64::MAX), Some(i64::MIN)));
+        assert!(same_window(10.0, Some(i64::MAX), Some(i64::MAX - 1_000)));
+        assert!(same_window(10.0, Some(i64::MIN), Some(i64::MIN)));
+        // 오차 경계는 그대로다.
+        assert!(same_window(10.0, Some(0), Some(RESETS_AT_JITTER_MS)));
+        assert!(!same_window(10.0, Some(0), Some(RESETS_AT_JITTER_MS + 1)));
     }
 
     #[test]

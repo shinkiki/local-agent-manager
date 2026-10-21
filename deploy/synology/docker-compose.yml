@@ -88,6 +88,11 @@ services:
       # IS_SANDBOX=1은 더 이상 필요 없다(2026-10-10 실측으로 들어갔던 줄을 L13이 걷어냈다).
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
+      # 에이전트 CLI(claude·codex·agy)는 아래 HOME 볼륨의 `.local`에 있고 앱의 CLI 업데이트
+      # 버튼이 올린다. 재생성해도 올린 버전이 남는다. 업데이트가 깨졌을 때만 `.env`에
+      # AGENT_MANAGER_RESEED_CLI=1을 적고 `up -d`해 이미지 씨앗 버전으로 되돌린 뒤, 그 줄을
+      # 지우고 다시 `up -d`한다 — 남겨 두면 기동할 때마다 앱에서 올린 버전을 덮는다.
+      AGENT_MANAGER_RESEED_CLI: ${AGENT_MANAGER_RESEED_CLI:-}
     volumes:
       - ./data/agent-manager:/data
       # HOME 전체. 자격증명 볼트(.local/share/keyrings)와 공급자 홈(.claude·.codex)이 여기

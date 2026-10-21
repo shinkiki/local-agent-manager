@@ -14,7 +14,7 @@ import { LoginSettingsCard } from "./LoginSettingsCard";
 import { accountNoteDraftState, submitAccountNote, ACCOUNT_NOTE_MAX_CHARS } from "../lib/accountNote";
 import { accountLabelDraftState, submitAccountLabel, ACCOUNT_LABEL_MAX_CHARS } from "../lib/accountLabel";
 import { accountToolBadges, accountToolsFor, homeToolsFor, DEFAULT_ACCOUNT_TOOL_BADGE_LIMIT, type AccountToolBadgeSource, type AccountToolIconName } from "../lib/accountTools";
-import { cacheAwaitsNewerCliRelease, canCheckCliUpdate, canClearModelCaches, canRunCliUpdate, cliUpdateAlert, cliUpdateBadge, cliUpdateBlockedReason, hasCliUpdateAlert, isHeadlessImageUpdateBlock, modelCacheBlockedReason, shouldShowManualUpdateHint, runtimeStopConfirmationCount, shouldShowCliUpdatePanel, type CliActionAccess, type CliUpdateAlert } from "../lib/cliUpdate";
+import { cacheAwaitsNewerCliRelease, canCheckCliUpdate, canClearModelCaches, canRunCliUpdate, cliUpdateAlert, cliUpdateBadge, cliUpdateBlockedReason, hasCliUpdateAlert, modelCacheBlockedReason, shouldShowManualUpdateHint, runtimeStopConfirmationCount, shouldShowCliUpdatePanel, type CliActionAccess, type CliUpdateAlert } from "../lib/cliUpdate";
 import type { AccountLoginSessionView, CodexLoginMethod, AccountSnapshot, AccountToolsSnapshot, AccountToolsView, AccentColor, AppLocale, AutoSwitchEventView, AutoSwitchPolicy, ChatApprovalMode, ChatMode, ChatProviderOptions, CliUpdateReceipt, CredentialVaultRecoveryStatus, MessageDisplayMode, ModelCacheCleanupReceipt, ModelOption, ProviderAccountView, ProviderCliUpdateStatus, ProviderId, ProviderRuntimeCounts, ProviderStatus, ProviderRuntimeStopSummary, ResumeAccountPolicy, SystemAutomationSettings, SystemAutomationSnapshot, ThemeMode, TranslationLanguage, TranslationMenu } from "../types";
 import { aiaRuntimeProvider, aiaRuntimeSettings, canRunSystemAgent, sameAiaRuntimeSettings, systemAgentRuntimePatch, type AiaRuntimeSettings } from "../lib/aiaRuntime";
 import { cachedProviderOptions, reasoningOptionsFor, refreshProviderOptions, subscribeProviderOptions, useProviderOptions } from "../lib/providerOptions";
@@ -1699,10 +1699,17 @@ function cacheCleanupMessage(receipt: ModelCacheCleanupReceipt): string {
     return `${runtimeText("모델 캐시를 정리하지 않았습니다.", "Did not clean model cache.")} ${skipped.join(" · ")}`;
   }
   const removed = receipt.entries.filter((entry) => entry.removed);
-  const currentText = runtimeText("현재", "current");
-  return `${runtimeText("모델 캐시를 삭제했습니다.", "Deleted model cache.")} (${receipt.removedCount} items: ${removed
+  const count = runtimeText(`${receipt.removedCount}개`, `${receipt.removedCount} item${receipt.removedCount === 1 ? "" : "s"}`);
+  const labels = removed
     .map((entry) => `${entry.label}${entry.previousCacheClientVersion ? ` ${entry.previousCacheClientVersion}` : ""}`)
-    .join(", ")}). ${runtimeText("다음 실행에서 다시 생성됩니다.", "Will be recreated on next run based on version")} ${receipt.status.currentVersion ?? currentText}.`;
+    .join(", ");
+  // 버전 꼬리는 문장 안에 넣는다. 문장 밖에 붙이면 한국어 화면에 "…생성됩니다. 0.47."처럼
+  // 주어 없는 숫자만 남았다.
+  const version = receipt.status.currentVersion;
+  const recreated = version
+    ? runtimeText(`다음 실행에서 버전 ${version} 기준으로 다시 생성됩니다.`, `Will be recreated on next run based on version ${version}.`)
+    : runtimeText("다음 실행에서 현재 버전 기준으로 다시 생성됩니다.", "Will be recreated on next run based on the current version.");
+  return `${runtimeText("모델 캐시를 삭제했습니다.", "Deleted model cache.")} (${count}: ${labels}). ${recreated}`;
 }
 
 function stopSummaryText(stopped: ProviderRuntimeStopSummary): string {
@@ -1803,12 +1810,9 @@ function ProviderCliUpdatePanel({ status, access, busyKey, pending, notices, err
     checkUnsupported: text("최신 버전 확인 미지원", "Version check unsupported"),
     unchecked: text("확인 전", "Not checked"),
   }[badge];
-  const updateBlocked = cliUpdateBlockedReason(status, access);
-  // 헤드리스 사유만 이 화면이 직접 쓰는 문장이라 영어 짝을 가진다. 나머지는 백엔드가 준
-  // 문장을 그대로 싣는다. 본문과 버튼 툴팁이 같은 변수를 보게 해 한쪽만 영어가 되지 않게 한다.
-  const updateBlockedLabel = isHeadlessImageUpdateBlock(status, access)
-    ? text("컨테이너 이미지에 포함된 CLI입니다. 이미지를 다시 빌드해 갱신하세요.", "This CLI ships inside the container image. Rebuild the image to update it.")
-    : updateBlocked;
+  // 막힌 사유는 백엔드가 준 문장을 그대로 싣는다(헤드리스의 옛 이미지 사유도 백엔드가 낸다).
+  // 본문과 버튼 툴팁이 같은 변수를 본다.
+  const updateBlockedLabel = cliUpdateBlockedReason(status, access);
   const cacheBlocked = modelCacheBlockedReason(status, access);
   const checking = busyKey === cliTaskKey("check", status.provider);
   const updating = busyKey === cliTaskKey("update", status.provider);

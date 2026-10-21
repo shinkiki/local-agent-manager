@@ -8,7 +8,7 @@ export type PopoutRequest =
   | { kind: "aia"; windowId: string }
   | { kind: "chat"; chatId: string }
   | { kind: "session"; source: ProviderId; sessionId: string }
-  | { kind: "gitDiff"; projectPath: string; path: string; originalPath: string | null; staged: boolean; commit: string | null };
+  | { kind: "gitDiff"; projectPath: string; path: string; originalPath: string | null; staged: boolean; commit: string | null; worktreePath?: string | null };
 
 type PopoutKind = PopoutRequest["kind"];
 
@@ -81,10 +81,11 @@ const POPOUT_SPECS: { [K in PopoutKind]: PopoutKindSpec<Extract<PopoutRequest, {
   // 싣고 새 창이 다시 읽는다. 같은 파일·같은 대상을 다시 열면 기존 창이 앞으로 온다.
   gitDiff: {
     defaultTitle: { ko: "변경 내용", en: "Diff" },
-    targetId: (request) => `${request.commit ?? (request.staged ? "staged" : "worktree")}-${request.path}`,
+    targetId: (request) => `${request.worktreePath ? `${request.worktreePath}-` : ""}${request.commit ?? (request.staged ? "staged" : "worktree")}-${request.path}`,
     populateParams: (request, params) => {
       params.set("project", request.projectPath);
       params.set("path", request.path);
+      if (request.worktreePath) params.set("wt", request.worktreePath);
       if (request.originalPath) params.set("orig", request.originalPath);
       if (request.commit) params.set("commit", request.commit);
       else if (request.staged) params.set("staged", "1");
@@ -95,6 +96,7 @@ const POPOUT_SPECS: { [K in PopoutKind]: PopoutKindSpec<Extract<PopoutRequest, {
       if (!projectPath || !path) return null;
       const commit = params.get("commit")?.trim() || null;
       if (commit && !/^[0-9a-fA-F]{4,64}$/.test(commit)) return null;
+      const worktreePath = params.get("wt")?.trim();
       return {
         kind: "gitDiff",
         projectPath,
@@ -102,6 +104,7 @@ const POPOUT_SPECS: { [K in PopoutKind]: PopoutKindSpec<Extract<PopoutRequest, {
         originalPath: params.get("orig")?.trim() || null,
         staged: commit === null && params.get("staged") === "1",
         commit,
+        ...(worktreePath ? { worktreePath } : {}),
       };
     },
   },

@@ -16,6 +16,7 @@
 //! 읽는 변수는 홈 해석에 필요한 `HOME`·`USERPROFILE` 두 개뿐이다(G8).
 
 use std::env;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::CoreError;
@@ -24,10 +25,14 @@ use crate::CoreError;
 ///
 /// 홈이 없어도 조회 자체는 성공해야 하는 호출부(도구 목록, 금지 경계 계산)가 쓴다.
 pub(crate) fn optional_home_dir() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
+    home_dir_from_values(env::var_os("HOME"), env::var_os("USERPROFILE"))
+}
+
+fn home_dir_from_values(home: Option<OsString>, user_profile: Option<OsString>) -> Option<PathBuf> {
+    // G8/C6-1: 빈 HOME도 미설정과 같게 보고 다음 홈 후보를 확인한다.
+    home.filter(|value| !value.is_empty())
+        .or_else(|| user_profile.filter(|value| !value.is_empty()))
         .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
 }
 
 /// 사용자 홈을 읽고, 없으면 `HomeDirectoryUnavailable`로 실패한다.
@@ -41,6 +46,34 @@ pub(crate) fn home_dir() -> Result<PathBuf, CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c6_1_empty_or_missing_home_falls_back_to_user_profile() {
+        for home in [None, Some(OsString::new())] {
+            let profile = PathBuf::from("user-profile");
+            assert_eq!(
+                home_dir_from_values(home, Some(profile.clone().into_os_string())),
+                Some(profile)
+            );
+        }
+    }
+
+    #[test]
+    fn c6_1_nonempty_home_keeps_precedence() {
+        assert_eq!(
+            home_dir_from_values(Some("home".into()), Some("user-profile".into())),
+            Some(PathBuf::from("home"))
+        );
+    }
+
+    #[test]
+    fn c6_1_no_nonempty_candidate_has_no_home() {
+        for home in [None, Some(OsString::new())] {
+            for profile in [None, Some(OsString::new())] {
+                assert_eq!(home_dir_from_values(home.clone(), profile), None);
+            }
+        }
+    }
 
     /// 두 함수는 같은 값을 봐야 한다. 한쪽만 변수를 더 보게 되면 홈이 있는데도 실패하는
     /// 경로가 생긴다.

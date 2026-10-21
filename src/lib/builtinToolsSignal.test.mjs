@@ -44,7 +44,7 @@ test("거절된 요청은 아무것도 바꾸지 않았으므로 알리지 않�
  */
 const NOTIFYING = {
   "src/lib/ipcCypress.ts": ["set_cypress_enabled"],
-  "src/lib/ipcSshKeys.ts": ["set_ssh_key_endpoint", "delete_ssh_key"],
+  "src/lib/ipcSshKeys.ts": ["save_ssh_server", "delete_ssh_server", "delete_ssh_key"],
   "src/lib/ipcDbConnections.ts": [
     "set_db_connection", "set_db_connection_enabled", "remove_db_connection",
   ],
@@ -61,7 +61,9 @@ const SILENT = {
     "get_cypress_registry", "add_cypress_workspace", "remove_cypress_workspace",
     "set_cypress_workspace_options", "run_cypress_spec",
   ],
-  "src/lib/ipcSshKeys.ts": ["get_ssh_keys", "generate_ssh_key", "set_ssh_key_note", "check_ssh_endpoint"],
+  "src/lib/ipcSshKeys.ts": [
+    "get_ssh_keys", "generate_ssh_key", "set_ssh_key_note", "set_ssh_key_passphrase", "check_ssh_endpoint",
+  ],
   "src/lib/ipcDbConnections.ts": ["get_db_connections", "check_db_connection"],
   "src/lib/ipcExternalPlugins.ts": [
     "get_external_plugins", "set_external_plugin_tool_policy",

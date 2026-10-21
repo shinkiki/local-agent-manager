@@ -287,3 +287,15 @@ test("길이가 0인 창은 주기로 쓸 수 없으므로 주간 창도 아니�
   // 누적 소비율에서는 빠지는 창이 생긴다.
   assert.equal(isWeeklyUsageWindow("0일"), false);
 });
+
+test("백엔드 u32 분 상한을 넘는 창은 백엔드처럼 창으로 세지 않는다", () => {
+  // `window_label_minutes`는 `u32` 분으로 읽어 넘치면 None이다.
+  assert.equal(usageWindowLengthMs("4294967295분"), 4_294_967_295 * 60_000);
+  assert.equal(usageWindowLengthMs("4294967296분"), null);
+  assert.equal(usageWindowLengthMs("2982616일"), 2_982_616 * DAY);
+  assert.equal(usageWindowLengthMs("2982617일"), null);
+  assert.equal(isWeeklyUsageWindow("2982617일"), false);
+  assert.equal(usageWindowLengthMs("426088주"), 426_088 * WEEK);
+  assert.equal(isWeeklyUsageWindow("426089주"), false);
+  assert.equal(usageWindowLengthMs("99999999999999999999시간"), null);
+});

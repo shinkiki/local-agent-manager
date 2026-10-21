@@ -1,7 +1,7 @@
 {
   "name": "agent-manager-tauri",
   "private": true,
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Local-first desktop manager for Claude Code, OpenAI Codex, and Google Antigravity sessions",
   "author": "shinkiki",
   "license": "MIT OR Apache-2.0",

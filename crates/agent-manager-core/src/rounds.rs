@@ -65,8 +65,13 @@ pub enum RoundGoalStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum RoundDecisionMode {
+    /// 다음 회차는 어떤 결정에도 답하지 않는다.
     #[default]
     Manual,
+    /// 추천적용: `requires_human` 이 아니고 추천안이 있는 결정만 다음 회차가 추천안으로
+    /// 답하고, 사람이 정해야 할 결정은 남긴다.
+    Recommended,
+    /// 완전자동: 다음 회차가 모든 미답 결정을 분석해 답한다.
     Automatic,
 }
 
@@ -207,6 +212,10 @@ pub struct RoundDecision {
     /// 사용자가 고른 답. 비어 있으면 대기 중.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved: Option<String>,
+    /// 되돌리기 어렵거나 밖으로 나가는 영향, 보안 트레이드오프, 제품·화면 정책처럼 사람이
+    /// 꼭 정해야 하는 결정. 추천적용 모드에서도 자동으로 답하지 않는다. 옛 기록은 false.
+    #[serde(default)]
+    pub requires_human: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -333,7 +342,10 @@ fn new_id(prefix: &str) -> String {
 }
 
 fn clean_text(value: &str, max: usize, what: &str) -> Result<String, CoreError> {
-    let value = value.trim();
+    // A report written on Windows carries CRLF (or a lone CR); refusing it as a control character
+    // loses the whole report, so line endings are normalized before the check.
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    let value = normalized.trim();
     if value
         .chars()
         .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
@@ -561,6 +573,7 @@ pub fn record_round_report(
                 .transpose()?
                 .filter(|value| !value.is_empty()),
             resolved: None,
+            requires_human: decision.requires_human,
         });
     }
     let mut measures = Vec::new();
@@ -655,11 +668,13 @@ pub fn get_round_report(app_data_dir: &Path, id: &str) -> Result<RoundReport, Co
 pub struct RoundDecisionAutomationBrief {
     pub goal_id: String,
     pub goal_title: String,
+    /// 자동 답의 범위. `Recommended` 면 `pending_count` 는 추천안으로 답할 결정만 센다.
+    pub mode: RoundDecisionMode,
     pub pending_count: usize,
 }
 
 /// 반복 요청 id가 있으면 그것을 우선하고, 수동 실행이면 워크플로 id로 목표를 찾는다.
-/// 자동 모드인 목표가 아니면 안내를 만들지 않는다.
+/// 수동 모드인 목표에는 안내를 만들지 않고, 추천적용 모드는 답할 결정이 없으면 만들지 않는다.
 pub fn round_decision_automation_brief(
     app_data_dir: &Path,
     schedule_id: Option<&str>,
@@ -676,10 +691,11 @@ pub fn round_decision_automation_brief(
         }),
     };
     let Some(goal) = goal.filter(|goal| {
-        goal.status == RoundGoalStatus::Active && goal.decision_mode == RoundDecisionMode::Automatic
+        goal.status == RoundGoalStatus::Active && goal.decision_mode != RoundDecisionMode::Manual
     }) else {
         return Ok(None);
     };
+    let mode = goal.decision_mode;
     let pending_count = list_round_reports(
         app_data_dir,
         RoundReportQuery {
@@ -694,12 +710,22 @@ pub fn round_decision_automation_brief(
             .decisions
             .iter()
             .filter(|decision| decision.resolved.is_none())
+            .filter(|decision| match mode {
+                RoundDecisionMode::Recommended => {
+                    !decision.requires_human && decision.recommendation.is_some()
+                }
+                _ => true,
+            })
             .count()
     })
     .sum();
+    if mode == RoundDecisionMode::Recommended && pending_count == 0 {
+        return Ok(None);
+    }
     Ok(Some(RoundDecisionAutomationBrief {
         goal_id: goal.id,
         goal_title: goal.title,
+        mode,
         pending_count,
     }))
 }
@@ -868,6 +894,7 @@ mod tests {
                     options: vec!["바꾼다".to_owned(), "둔다".to_owned()],
                     recommendation: Some("둔다".to_owned()),
                     resolved: Some("무시된다".to_owned()),
+                    requires_human: true,
                 }],
                 ..Default::default()
             },
@@ -875,6 +902,8 @@ mod tests {
         .unwrap();
         // 보고가 들고 온 resolved 는 버린다 — 결정은 사람이 적는다.
         assert!(report.decisions[0].resolved.is_none());
+        // requiresHuman 은 회차가 판단해 올린 값이라 그대로 남는다.
+        assert!(report.decisions[0].requires_human);
         let pending = list_round_reports(
             dir.path(),
             RoundReportQuery {
@@ -932,6 +961,44 @@ mod tests {
     }
 
     #[test]
+    fn decision_mode_and_requires_human_round_trip_and_default_for_old_records() {
+        // 옛 기록에는 두 칸이 없다 — 수동, 사람 결정 아님으로 읽혀야 한다.
+        let old: RoundDecision = serde_json::from_str(r#"{"question":"q"}"#).unwrap();
+        assert!(!old.requires_human);
+        let decision: RoundDecision =
+            serde_json::from_str(r#"{"question":"q","requiresHuman":true}"#).unwrap();
+        assert!(decision.requires_human);
+        assert_eq!(
+            serde_json::to_value(&decision).unwrap()["requiresHuman"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            serde_json::to_value(RoundDecisionMode::Recommended).unwrap(),
+            serde_json::json!("recommended")
+        );
+        assert_eq!(
+            serde_json::from_str::<RoundDecisionMode>(r#""recommended""#).unwrap(),
+            RoundDecisionMode::Recommended
+        );
+        let dir = temp_dir();
+        let goal = create_round_goal(dir.path(), goal_input()).unwrap();
+        let updated = update_round_goal(
+            dir.path(),
+            &goal.id,
+            RoundGoalPatch {
+                decision_mode: Some(RoundDecisionMode::Recommended),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.decision_mode, RoundDecisionMode::Recommended);
+        assert_eq!(
+            get_round_goal(dir.path(), &goal.id).unwrap().decision_mode,
+            RoundDecisionMode::Recommended
+        );
+    }
+
+    #[test]
     fn automatic_decision_brief_matches_the_owned_schedule_and_counts_pending_questions() {
         let dir = temp_dir();
         let goal = create_round_goal(dir.path(), goal_input()).unwrap();
@@ -958,12 +1025,14 @@ mod tests {
                         options: vec!["A".to_owned()],
                         recommendation: Some("A".to_owned()),
                         resolved: None,
+                        requires_human: false,
                     },
                     RoundDecision {
                         question: "둘째".to_owned(),
                         options: vec![],
                         recommendation: None,
                         resolved: None,
+                        requires_human: false,
                     },
                 ],
                 ..Default::default()
@@ -976,6 +1045,7 @@ mod tests {
                 .unwrap()
                 .expect("automatic brief");
         assert_eq!(scheduled.goal_id, goal.id);
+        assert_eq!(scheduled.mode, RoundDecisionMode::Automatic);
         assert_eq!(scheduled.pending_count, 2);
         assert!(round_decision_automation_brief(
             dir.path(),
@@ -989,6 +1059,61 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_recommended_brief_counts_only_answerable_decisions_and_is_absent_without_them() {
+        let dir = temp_dir();
+        let goal = create_round_goal(dir.path(), goal_input()).unwrap();
+        update_round_goal(
+            dir.path(),
+            &goal.id,
+            RoundGoalPatch {
+                status: Some(RoundGoalStatus::Active),
+                decision_mode: Some(RoundDecisionMode::Recommended),
+                schedule_id: Some(Some("schedule-r".to_owned())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let decision = |recommendation: Option<&str>, requires_human: bool| RoundDecision {
+            question: "질문".to_owned(),
+            options: vec!["A".to_owned()],
+            recommendation: recommendation.map(str::to_owned),
+            resolved: None,
+            requires_human,
+        };
+        record_round_report(
+            dir.path(),
+            RoundReportInput {
+                goal_id: Some(goal.id.clone()),
+                title: "사람 몫만".to_owned(),
+                decisions: vec![decision(Some("A"), true), decision(None, false)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            round_decision_automation_brief(dir.path(), Some("schedule-r"), "w")
+                .unwrap()
+                .is_none()
+        );
+        record_round_report(
+            dir.path(),
+            RoundReportInput {
+                goal_id: Some(goal.id.clone()),
+                title: "추천 가능".to_owned(),
+                decisions: vec![decision(Some("A"), false)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let brief = round_decision_automation_brief(dir.path(), Some("schedule-r"), "w")
+            .unwrap()
+            .expect("recommended brief");
+        assert_eq!(brief.mode, RoundDecisionMode::Recommended);
+        assert_eq!(brief.pending_count, 1);
+        assert_eq!(serde_json::json!(brief)["mode"], "recommended");
     }
 
     #[test]
@@ -1016,5 +1141,35 @@ mod tests {
             listed.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(),
             vec!["r2", "r1"]
         );
+    }
+
+    #[test]
+    fn clean_text_accepts_and_normalizes_crlf_and_cr() {
+        let dir = temp_dir();
+        let report = record_round_report(
+            dir.path(),
+            RoundReportInput {
+                title: "CRLF 테스트\r\n".to_string(),
+                summary: "줄1\r\n줄2\r줄3\n".to_string(),
+                fixes: vec!["수정1\r\n".to_string()],
+                ..Default::default()
+            },
+        )
+        .expect("crlf text should be accepted and normalized");
+
+        assert_eq!(report.title, "CRLF 테스트");
+        assert_eq!(report.summary, "줄1\n줄2\n줄3");
+        assert_eq!(report.fixes, vec!["수정1".to_string()]);
+
+        let err = record_round_report(
+            dir.path(),
+            RoundReportInput {
+                title: "정상 제목".to_string(),
+                summary: "제어문자\x00포함".to_string(),
+                ..Default::default()
+            },
+        )
+        .expect_err("null char must be rejected");
+        assert!(matches!(err, CoreError::InvalidInput(_)));
     }
 }

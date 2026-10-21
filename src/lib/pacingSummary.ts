@@ -150,10 +150,11 @@ function runCostOf(consumer: UsageBudgetConsumer, provider: ProviderId): RunCost
 /**
  * 이 공급자로 더 돌 수 있는 회차 수. %p 실측이 없거나 0 이하면 나눌 근거가 없으므로
  * null이고, 호출부는 그 공급자를 합계에서 통째로 뺀다(0으로 세지 않는다).
+ * 순여유가 음수이면(한도 초과 등) 더 돌 수 없으므로 0으로 바닥을 친다.
  */
 function providerRemainingRuns(cost: RunCost, headroom: number): number | null {
   if (cost.percentPerRun === null || cost.percentPerRun <= 0) return null;
-  return Math.floor(headroom / cost.percentPerRun);
+  return Math.max(0, Math.floor(headroom / cost.percentPerRun));
 }
 
 /**

@@ -13,6 +13,7 @@ import { canClearTombstones, canRunCleanup, cleanupBlockedReason, formatBytes, h
 import type { SessionCleanupPolicy, SessionCleanupPreview, SessionCleanupReceipt, SessionCleanupStatus } from "../types";
 import { AppToggle, ErrorBanner, useConfirm } from "./Shared";
 import { errorText } from "../lib/errorText";
+import { createLatestGate } from "../lib/latestRequest";
 
 import { formatDateTime } from "../lib/format";
 /*
@@ -203,18 +204,30 @@ export function SessionCleanupCard({ active }: { active: boolean }) {
   const [status, setStatus] = useState<SessionCleanupStatus | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const { busy, error, setError, run: runCleanupTask } = useCardTask<"save" | "run" | "clear">(() => setNotice(null));
+  // 상태를 고치는 응답은 마지막에 시작한 요청 것만 반영한다. 탭에 들어올 때 띄운 조회가
+  // 그 사이 끝난 저장보다 늦게 오면 저장 전 정책을 다시 펴고, 다음 조건 수정이 그 낡은
+  // 정책을 바탕으로 저장돼 앞선 수정을 조용히 되돌린다.
+  const [statusGate] = useState(createLatestGate);
+  /** 요청을 시작하며 앞선 요청을 무효로 하고, 이 요청이 여전히 마지막일 때만 반영한다. */
+  const applyLatest = useCallback(async (request: Promise<SessionCleanupStatus>) => {
+    const isCurrent = statusGate.begin();
+    const next = await request;
+    if (isCurrent()) setStatus(next);
+  }, [statusGate]);
 
   const loadStatus = useCallback((forget: () => void) => {
     setError(null);
+    const isCurrent = statusGate.begin();
     return getSessionCleanupStatus()
-      .then(setStatus)
+      .then((next) => { if (isCurrent()) setStatus(next); })
       .catch((cause: unknown) => {
+        if (!isCurrent()) return;
         setError(errorText(cause));
         // 실패한 조회는 "읽었다"로 치지 않는다. 그대로 두면 탭을 벗어났다 돌아오기
         // 전까지 다시 시도하지 않아, 한 번 실패한 카드가 계속 비어 있다.
         forget();
       });
-  }, []);
+  }, [statusGate]);
 
   const forgetStatus = useLoadOnActiveEntry(active, (forget) => { void loadStatus(forget); });
 
@@ -247,19 +260,17 @@ export function SessionCleanupCard({ active }: { active: boolean }) {
   const blocked = cleanupBlockedReason(status, cleanupAccess);
 
   /** 작업이 바꾼 결과를 다시 펴는 자리. 정책 저장은 응답 자체가 최신 상태라 여기를 거치지 않는다. */
-  const reloadStatus = async () => { setStatus(await getSessionCleanupStatus()); };
+  const reloadStatus = () => applyLatest(getSessionCleanupStatus());
 
   const savePolicy = (next: SessionCleanupPolicy) =>
-    runCleanupTask("save", async () => { setStatus(await setSessionCleanupPolicy(next)); });
+    runCleanupTask("save", () => applyLatest(setSessionCleanupPolicy(next)));
 
   // 조건을 고칠 때마다 저장한다. 저장이 미리보기를 다시 계산해 돌려주므로, 켠 조건이 몇
   // 건을 잡는지 그 자리에서 보인다.
   const patchPolicy = (patch: Partial<SessionCleanupPolicy>) => void savePolicy({ ...policy, ...patch });
 
   // 켜기는 되돌리기 어려운 결정이라 지금 조건이 무엇을 지울지 한 번 보여 준다.
-  const toggleEnabled = (enabled: boolean) => runCleanupTask("save", async () => {
-    setStatus(await setSessionCleanupPolicy({ ...policy, enabled }));
-  }, {
+  const toggleEnabled = (enabled: boolean) => runCleanupTask("save", () => applyLatest(setSessionCleanupPolicy({ ...policy, enabled })), {
     confirm: enabled ? () => confirm({
       title: text("세션 자동정리를 켤까요?", "Turn on automatic session cleanup?"),
       message: text(

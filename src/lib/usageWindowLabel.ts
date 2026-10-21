@@ -33,6 +33,12 @@ export const USAGE_WINDOW_UNIT_MS = {
 
 type UsageWindowUnit = keyof typeof USAGE_WINDOW_UNIT_MS;
 
+/**
+ * 백엔드는 창 길이를 `u32` 분으로 읽고(`parse`·`checked_mul`), 넘치면 창으로 세지 않는다.
+ * 여기서 그 상한을 두지 않으면 `3000000일` 같은 라벨이 프런트에서만 창이 된다.
+ */
+const MAX_WINDOW_MINUTES = 0xffff_ffff;
+
 /** 하루 단위로 리셋되는 창의 단위. 5시간 창은 여기서 빠진다. */
 const DAY_SCALE_UNITS: readonly UsageWindowUnit[] = ["일", "주"];
 
@@ -46,7 +52,9 @@ function parseUsageWindowLabel(label: string): { count: number; unit: UsageWindo
   if (!match) return null;
   const count = Number(match[1]);
   if (!Number.isFinite(count) || count <= 0) return null;
-  return { count, unit: match[2] as UsageWindowUnit };
+  const unit = match[2] as UsageWindowUnit;
+  if (count * (USAGE_WINDOW_UNIT_MS[unit] / 60_000) > MAX_WINDOW_MINUTES) return null;
+  return { count, unit };
 }
 
 /** 일 단위로 초기화되는 사용량 창인지. 5시간 창은 여기서 빠진다. */

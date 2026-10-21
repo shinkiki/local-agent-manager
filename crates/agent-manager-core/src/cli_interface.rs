@@ -452,33 +452,6 @@ pub(crate) fn run_capped_with_env(
     )
 }
 
-/// C9-19. 자식 stdin으로 한 번 써 넣고 닫는 변형. sudo 비밀번호처럼 **명령줄에 실을 수
-/// 없는** 입력이 지나는 유일한 통로다 — 인자·환경변수는 같은 호스트의 다른 프로세스가
-/// `ps`로 읽을 수 있고 명령 문자열은 승인 카드·영수증·감사 기록에 그대로 남지만, 이
-/// 통로의 값은 부모와 자식 사이에서만 오간다.
-///
-/// `input`이 `None`이면 stdin은 기존대로 닫힌 채(`Stdio::null()`) 돌아간다. 입력을 주는
-/// 쪽은 자식이 그것을 읽지 않을 수 있다는 것을 전제해야 한다 — 읽지 않아도 쓰기는
-/// 실패하지 않고, 파이프가 먼저 닫히면 `BrokenPipe`가 나지만 그것은 실행 실패가 아니다.
-pub(crate) fn run_capped_with_input(
-    executable: &Path,
-    args: &[&str],
-    timeout: Duration,
-    input: Option<&str>,
-) -> Result<CommandOutcome, CoreError> {
-    // `sudo -S`는 개행까지 읽어야 한 줄로 판단하므로 개행을 함께 보낸다.
-    let line = input.map(|value| format!("{value}\n"));
-    run_capped_with(
-        executable,
-        args,
-        timeout,
-        &CappedOptions {
-            input: line.as_deref().map(str::as_bytes),
-            ..CappedOptions::default()
-        },
-    )
-}
-
 /// 위 셋과 git 실행기가 공유하는 본체. 자식을 띄우고 제한 시간까지 지켜보는 절차는 한 벌만 둔다.
 pub(crate) fn run_capped_with(
     executable: &Path,

@@ -26,10 +26,12 @@ export function GitDiffWindow({ request }: { request: GitDiffRequest }) {
     setLoading(true);
     getProjectGitDiff({
       projectPath: request.projectPath,
+      worktreePath: request.worktreePath ?? null,
       path: request.path,
       originalPath: request.originalPath,
       staged: request.staged,
       commit: request.commit,
+      fullContext: true,
     })
       .then((next) => { setDiff(next); setError(null); })
       .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)))

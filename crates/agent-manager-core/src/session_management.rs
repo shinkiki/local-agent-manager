@@ -290,6 +290,10 @@ pub struct ManagedSessionSummary {
     /// 따로 묻게 하면 245개 세션에 245번 왕복이다.
     #[serde(default)]
     pub folder_ids: Vec<String>,
+    /// 작업 경로 밖에서 손댄 등록 프로젝트(`SessionSummary::related_projects`). 단수 `cwd`
+    /// 필터는 이 값도 본다 — AIA가 자기 작업공간에서 고친 프로젝트 작업도 그 프로젝트로 찾힌다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_projects: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1648,6 +1652,7 @@ fn auto_switch_resume_request(
         resume_session_id: session_id,
         handoff_origin: None,
         fork_session_id: None,
+        edit_message: None,
         origin: None,
         capture_id: None,
         unattended: false,
@@ -1945,6 +1950,7 @@ fn managed_summary_from_session(
         status: live.map_or_else(|| persisted_status(session), live_status),
         last_turn_status: live.and_then(|chat| chat.last_turn_status.clone()),
         folder_ids: session.meta.folder_ids.clone(),
+        related_projects: session.related_projects.clone(),
     }
 }
 
@@ -1967,6 +1973,7 @@ fn managed_summary_from_chat(chat: &ChatSessionInfo) -> ManagedSessionSummary {
         status: live_status(chat),
         last_turn_status: chat.last_turn_status.clone(),
         folder_ids: Vec::new(),
+        related_projects: Vec::new(),
     }
 }
 
@@ -2050,10 +2057,16 @@ impl SessionFilterScope {
         scope.source.is_none_or(|source| item.source == source)
             && (scope.sources.is_empty() || scope.sources.contains(&item.source))
             && (scope.statuses.is_empty() || scope.statuses.contains(&item.status))
+            // 정책 범위인 다중 `cwds`는 실행 경로만 본다. 관련 프로젝트는 대화 기록에서 추정한
+            // 값이라, 세션 읽기 권한의 경계를 넓히는 데 쓰지 않는다.
             && self.canonical_cwd.as_deref().is_none_or(|cwd| {
                 item.cwd
                     .as_deref()
                     .is_some_and(|item_cwd| same_cwd(item_cwd, cwd))
+                    || item
+                        .related_projects
+                        .iter()
+                        .any(|related| same_cwd(related, cwd))
             })
             && matches_any_cwd(item.cwd.as_deref(), &self.canonical_cwds)
             && self.range.contains(session_time(item))
@@ -2510,7 +2523,7 @@ fn same_cwd(value: &str, canonical: &Path) -> bool {
 /// 여러 프로젝트 필터를 한 번에 정규화한다. 실체가 없는 경로는 거부하지 않고 버린다.
 /// 세션 컨텍스트 정책은 등록 프로젝트만 넘기는데, 그 사이 폴더가 사라졌다고 조회 전체가
 /// 실패하면 부분 보고조차 못 하게 된다.
-fn canonical_filter_paths(paths: &[String]) -> Vec<PathBuf> {
+pub(crate) fn canonical_filter_paths(paths: &[String]) -> Vec<PathBuf> {
     let mut canonical = Vec::with_capacity(paths.len());
     for path in paths {
         let trimmed = path.trim();
@@ -2528,7 +2541,7 @@ fn canonical_filter_paths(paths: &[String]) -> Vec<PathBuf> {
 
 /// 다중 프로젝트 필터. 비어 있으면 제약이 없고, 그렇지 않으면 정규화 결과가 목록에
 /// 정확히 있어야 한다. 세션 경로를 한 번만 정규화해 N×M 비교를 피한다.
-fn matches_any_cwd(value: Option<&str>, canonical: &[PathBuf]) -> bool {
+pub(crate) fn matches_any_cwd(value: Option<&str>, canonical: &[PathBuf]) -> bool {
     if canonical.is_empty() {
         return true;
     }
@@ -2807,6 +2820,7 @@ mod tests {
             source: ProviderId::Codex,
             account_id: Some("exhausted".to_owned()),
             resuming: false,
+            forked: false,
             provider_session_id: Some("session-1".to_owned()),
             cwd: "/tmp/aia".to_owned(),
             model: aia_runtime.model.clone(),
@@ -3159,6 +3173,7 @@ mod tests {
             status: SessionManagementStatus::Completed,
             last_turn_status: None,
             folder_ids: folders.iter().map(|f| (*f).to_owned()).collect(),
+            related_projects: Vec::new(),
         };
         let mut items = vec![
             summary("filed", &["folder-a"]),
@@ -3270,7 +3285,38 @@ mod tests {
             status: SessionManagementStatus::Completed,
             last_turn_status: None,
             folder_ids: Vec::new(),
+            related_projects: Vec::new(),
         }
+    }
+
+    #[test]
+    fn cwd_filter_also_finds_sessions_that_touched_the_project_outside_their_working_path() {
+        let root = tempfile::tempdir().expect("temp");
+        let app = root.path().join("app");
+        let aia = root.path().join("aia-workspace");
+        fs::create_dir_all(&app).expect("app");
+        fs::create_dir_all(&aia).expect("aia");
+        let app_text = app.to_string_lossy().into_owned();
+        let mut related = searchable_summary("aia-session", None);
+        related.cwd = Some(aia.to_string_lossy().into_owned());
+        related.related_projects = vec![app_text.clone()];
+        let unrelated = SessionScopeFilters {
+            cwd: Some(app_text.clone()),
+            ..SessionScopeFilters::default()
+        };
+        let scope = SessionFilterScope::resolve(unrelated.applied(None, None)).expect("scope");
+        assert!(scope.matches(&related));
+        related.related_projects.clear();
+        assert!(!scope.matches(&related));
+
+        // 정책 범위(다중 cwds)는 실행 경로만 본다 — 추정한 관련 프로젝트로 읽기 범위를 넓히지 않는다.
+        related.related_projects = vec![app_text.clone()];
+        let policy = SessionScopeFilters {
+            cwds: vec![app_text],
+            ..SessionScopeFilters::default()
+        };
+        let scope = SessionFilterScope::resolve(policy.applied(None, None)).expect("scope");
+        assert!(!scope.matches(&related));
     }
 
     fn matches_search(item: &ManagedSessionSummary, needle: &str) -> bool {

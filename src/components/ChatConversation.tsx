@@ -1,5 +1,9 @@
+import { UserMessageHeader } from "./UserMessageHeader";
+import { MessageEdit } from "./MessageEdit";
 import {
   Fragment,
+  createContext,
+  useContext,
   useCallback,
   useEffect,
   useRef,
@@ -45,6 +49,7 @@ export { applyChatEvent } from "./ChatEventStream";
  * 하나로 모은다.
  */
 export interface ChatEntryActions {
+  onEditMessage?: (entry: Extract<ChatEntry, { type: "message" }>, text: string, sendImmediately?: boolean) => Promise<void>;
   onDecision: (id: string, decision: ChatApprovalDecision) => void;
   onOpenLocalLink: (href: string) => void;
 }
@@ -184,21 +189,24 @@ export function ChatScrollControls({ targetRef, leading, onScrollAwayFromLatest,
   const leadingContent = leading?.(state.scrollable) ?? null;
   // 스크롤할 것도 없고 위에 세울 것도 없으면 아무것도 그리지 않는다.
   if (!state.scrollable && !leadingContent) return null;
-  const scroll = (top: number, destination: "top" | "bottom", immediate = false) => {
+  const scroll = (destination: "top" | "bottom", immediate = false) => {
     const target = targetRef.current;
     if (!target) return;
+    // 맨 아래 자리는 누르는 순간에 잰다. 그린 시점의 scrollHeight 를 쥐고 있으면 응답이 흘러드는
+    // 사이 늘어난 만큼 모자란 곳에 멈춘다.
+    const top = destination === "top" ? 0 : target.scrollHeight;
     if (destination === "top") onScrollAwayFromLatest?.();
     else onScrollToLatest?.();
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     target.scrollTo({ top, behavior: immediate || reduceMotion ? "auto" : "smooth" });
   };
-  const scrollOnPointerDown = (event: ReactPointerEvent<HTMLButtonElement>, top: number, destination: "top" | "bottom") => {
+  const scrollOnPointerDown = (event: ReactPointerEvent<HTMLButtonElement>, destination: "top" | "bottom") => {
     if (event.button !== 0) return;
     event.preventDefault();
-    scroll(top, destination, true);
+    scroll(destination, true);
   };
-  const scrollOnClick = (event: ReactMouseEvent<HTMLButtonElement>, top: number, destination: "top" | "bottom") => {
-    if (event.detail === 0) scroll(top, destination);
+  const scrollOnClick = (event: ReactMouseEvent<HTMLButtonElement>, destination: "top" | "bottom") => {
+    if (event.detail === 0) scroll(destination);
   };
   const scrollActions = [
     {
@@ -206,7 +214,6 @@ export function ChatScrollControls({ targetRef, leading, onScrollAwayFromLatest,
       label: text("대화 맨 위로 이동", "Go to the top of the conversation"),
       title: text("맨 위", "Top"),
       disabled: state.atTop,
-      top: 0,
       icon: ChevronsUp,
     },
     {
@@ -214,13 +221,12 @@ export function ChatScrollControls({ targetRef, leading, onScrollAwayFromLatest,
       label: text("대화 맨 아래로 이동", "Go to the bottom of the conversation"),
       title: text("맨 아래", "Bottom"),
       disabled: state.atBottom,
-      top: targetRef.current?.scrollHeight ?? 0,
       icon: ChevronsDown,
     },
   ];
   return <nav className="chat-scroll-controls" aria-label={text("대화 위치 이동", "Move within the conversation")}>
     {leadingContent}
-    {state.scrollable && scrollActions.map(({ target, label, title, disabled, top, icon: Icon }) => (
+    {state.scrollable && scrollActions.map(({ target, label, title, disabled, icon: Icon }) => (
       <button
         key={target}
         className={state.activeTarget === target ? "is-active" : undefined}
@@ -228,8 +234,8 @@ export function ChatScrollControls({ targetRef, leading, onScrollAwayFromLatest,
         aria-label={label}
         title={title}
         disabled={disabled}
-        onPointerDown={(event) => scrollOnPointerDown(event, top, target)}
-        onClick={(event) => scrollOnClick(event, top, target)}
+        onPointerDown={(event) => scrollOnPointerDown(event, target)}
+        onClick={(event) => scrollOnClick(event, target)}
       >
         <Icon size={16} strokeWidth={2.2} aria-hidden="true" />
       </button>
@@ -336,6 +342,8 @@ function chatTurnLayout(turn: ChatTurn): ChatTurnLayout {
 }
 
 /** 항목 하나를 세울 때 턴 전체를 봐야 정해지는 값들. 두 화면이 같은 판정을 쓴다. */
+const MessageTurnTime = createContext<number | null>(null);
+
 interface ChatEntrySegmentContext {
   /** 복사·읽어주기를 눌러도 되는 상태. 스트리밍 중에는 본문이 계속 자란다. */
   copyReady: boolean;
@@ -375,7 +383,7 @@ export function ChatTurnSegments({ turn, className, renderEntry, describeActivit
 }) {
   const { segments, running, lastAssistantMessage, lastActivityIndex } = chatTurnLayout(turn);
   return (
-    <section className={className}>
+    <MessageTurnTime.Provider value={turn.startedAt}><section className={className}>
       {segments.map((segment, index) => {
         if (segment.type === "entry") {
           const finalAssistantMessage = segment.entry === lastAssistantMessage;
@@ -398,11 +406,11 @@ export function ChatTurnSegments({ turn, className, renderEntry, describeActivit
           renderEntry={(entry) => renderActivityEntry(entry, context)}
         /></Fragment>;
       })}
-    </section>
+    </section></MessageTurnTime.Provider>
   );
 }
 
-export function ChatConversationTurn({ turn, chatId, className = "", onDecision, onOpenLocalLink }: {
+export function ChatConversationTurn({ turn, chatId, className = "", onDecision, onOpenLocalLink, onEditMessage }: {
   turn: ChatTurn;
   chatId: string | null;
   className?: string;
@@ -412,7 +420,7 @@ export function ChatConversationTurn({ turn, chatId, className = "", onDecision,
       turn={turn}
       className={`conversation-turn${className ? ` ${className}` : ""}`}
       renderEntry={(entry, { copyReady, speechReady }) =>
-        <ChatEntryView entry={entry} chatId={chatId} copyReady={copyReady} speechReady={speechReady} onDecision={onDecision} onOpenLocalLink={onOpenLocalLink} />}
+        <ChatEntryView entry={entry} chatId={chatId} copyReady={copyReady} speechReady={speechReady} onDecision={onDecision} onOpenLocalLink={onOpenLocalLink} onEditMessage={onEditMessage} />}
       // 머리줄은 턴 상태 사다리를 따르고 마지막 구간에만 진행 시간을 붙인다.
       describeActivity={(logged, { active, isLastActivity, running }) => {
         const status = active
@@ -428,7 +436,7 @@ export function ChatConversationTurn({ turn, chatId, className = "", onDecision,
         };
       }}
       renderActivityEntry={(entry, { running }) =>
-        <ChatEntryView entry={entry} chatId={chatId} copyReady={!running} onDecision={onDecision} onOpenLocalLink={onOpenLocalLink} />}
+        <ChatEntryView entry={entry} chatId={chatId} copyReady={!running} onDecision={onDecision} onOpenLocalLink={onOpenLocalLink} onEditMessage={onEditMessage} />}
     />
   );
 }
@@ -463,6 +471,7 @@ export function ChatMessageArticle({
   meta,
   onOpenLocalLink,
   onInsertPrompt,
+  onEditMessage,
 }: {
   entry: Extract<ChatEntry, { type: "message" }>;
   chatId: string | null;
@@ -474,18 +483,24 @@ export function ChatMessageArticle({
   messageKey?: string;
   meta?: ReactNode;
   onInsertPrompt?: (prompt: string) => void;
-} & Pick<ChatEntryActions, "onOpenLocalLink">) {
+} & Pick<ChatEntryActions, "onOpenLocalLink" | "onEditMessage">) {
+  const timestamp = useContext(MessageTurnTime);
+  const [editMessageContainer, setEditMessageContainer] = useState<HTMLElement | null>(null);
+  const canEdit = entry.role === "user" && entry.kind === "message" && onEditMessage && !(entry.attachments?.length);
   const copyable = entry.role === "assistant" && entry.kind === "message" && Boolean(text);
   return (
     <article
       className={`chat-message chat-message-${entry.role} chat-message-${entry.kind}`}
+      ref={canEdit ? setEditMessageContainer : undefined}
+      tabIndex={canEdit ? 0 : undefined}
       data-message-key={messageKey}
     >
-      <strong>{label}</strong>
+      {entry.role === "user" ? <UserMessageHeader timestamp={timestamp} live /> : <strong>{label}</strong>}
       {copyable && speechReady && <SpeechPlaybackAction responseId={`${speechIdPrefix}${chatId ?? "chat"}:${entry.id}`} text={text} />}
       {copyable && <CopyAction value={text} kind="response" className="message-copy-action" disabled={!copyReady} />}
       {text && <div className="chat-message-markdown"><MarkdownPreview source={text} compact copyable={copyable && copyReady} onOpenLocalLink={onOpenLocalLink} onInsertPrompt={entry.role === "assistant" ? onInsertPrompt : undefined} /></div>}
       {meta}
+      {entry.role === "user" && entry.kind === "message" && onEditMessage && !(entry.attachments?.length) && <MessageEdit messageContainer={editMessageContainer} text={entry.text} onSend={(value, sendImmediately) => onEditMessage(entry, value, sendImmediately)} />}
       <ChatAttachmentList chatId={chatId} files={entry.attachments} />
     </article>
   );
@@ -498,12 +513,13 @@ function ChatMessageEntryView({
   copyReady,
   speechReady,
   onOpenLocalLink,
+  onEditMessage,
 }: {
   entry: Extract<ChatEntry, { type: "message" }>;
   chatId: string | null;
   copyReady: boolean;
   speechReady: boolean;
-} & Pick<ChatEntryActions, "onOpenLocalLink">) {
+} & Pick<ChatEntryActions, "onOpenLocalLink" | "onEditMessage">) {
   // 공급자가 붙인 메타 블록은 본문이 아니다. 복사와 읽어주기도 걷어낸 본문만 쓴다.
   const { text, meta } = splitAgentMessageMeta(entry.text);
   return (
@@ -517,18 +533,19 @@ function ChatMessageEntryView({
       messageKey={liveMessageKey(entry.id, entry.kind)}
       meta={<AgentMessageMetaList meta={meta} />}
       onOpenLocalLink={onOpenLocalLink}
+      onEditMessage={onEditMessage}
     />
   );
 }
 
-export function ChatEntryView({ entry, chatId, copyReady = true, speechReady = false, onDecision, onOpenLocalLink }: {
+export function ChatEntryView({ entry, chatId, copyReady = true, speechReady = false, onDecision, onOpenLocalLink, onEditMessage }: {
   entry: ChatEntry;
   chatId: string | null;
   copyReady?: boolean;
   speechReady?: boolean;
 } & ChatEntryActions) {
   if (entry.type === "message") {
-    return <ChatMessageEntryView entry={entry} chatId={chatId} copyReady={copyReady} speechReady={speechReady} onOpenLocalLink={onOpenLocalLink} />;
+    return <ChatMessageEntryView entry={entry} chatId={chatId} copyReady={copyReady} speechReady={speechReady} onOpenLocalLink={onOpenLocalLink} onEditMessage={onEditMessage} />;
   }
   if (entry.type === "tool") {
     return <ChatToolCard name={entry.name} status={entry.status} detail={entry.detail} output={entry.output} />;

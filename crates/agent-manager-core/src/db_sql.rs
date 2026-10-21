@@ -10,6 +10,7 @@
 //! 어떤 경우에도 대신 실행하지 않는 문장인가. 스키마 범위 대조는 이름을 훑는 **좁힘**이지
 //! 파서가 아니다 — 서버에서 강제되는 제한이 아니라는 점은 SSH 명령 목록(C9-16)과 같다.
 
+use crate::db_connections::DbEngineKind;
 use crate::CoreError;
 
 /// 한 문장의 상한. 규칙과 맞춰 보는 값이지만 SQL은 명령줄보다 길다.
@@ -157,16 +158,35 @@ struct SqlScanner<'a> {
     words: Vec<String>,
     current: String,
     terminator: Option<usize>,
+    engine: DbEngineKind,
 }
 
 impl<'a> SqlScanner<'a> {
-    fn new(characters: &'a [char]) -> Self {
+    fn new(characters: &'a [char], engine: DbEngineKind) -> Self {
         Self {
             characters,
             index: 0,
             words: Vec::new(),
             current: String::new(),
             terminator: None,
+            engine,
+        }
+    }
+
+    /// 이 따옴표 리터럴 안에서 역슬래시가 다음 글자를 감추는가. 엔진마다 다르다 —
+    /// MySQL·MariaDB는 기본값에서 그렇고, PostgreSQL은 `E'…'` 문자열에서만, SQLite는 어디서도
+    /// 그렇지 않다. 엔진이 리터럴을 끝내는 자리와 이 검사가 끝내는 자리가 어긋나면
+    /// `SELECT '\'; COMMIT; DELETE …`가 한 문장 읽기로 분류된다(C10-8).
+    fn backslash_escapes(&self, quote: char) -> bool {
+        match self.engine {
+            DbEngineKind::Mysql | DbEngineKind::Mariadb => quote != '`',
+            DbEngineKind::Postgres => {
+                quote == '\''
+                    && self.index > 0
+                    && matches!(self.characters[self.index - 1], 'e' | 'E')
+                    && self.words.last().is_some_and(|word| word == "E")
+            }
+            DbEngineKind::Sqlite => false,
         }
     }
 
@@ -180,6 +200,7 @@ impl<'a> SqlScanner<'a> {
 
     /// 따옴표 리터럴 안을 건너뛴다.
     fn skip_quoted(&mut self, quote: char) -> Result<(), CoreError> {
+        let escapes = self.backslash_escapes(quote);
         self.index += 1;
         loop {
             let Some(&inner) = self.characters.get(self.index) else {
@@ -187,8 +208,8 @@ impl<'a> SqlScanner<'a> {
                     "따옴표가 닫히지 않았습니다".to_owned(),
                 ));
             };
-            if inner == '\\' && quote != '`' {
-                // MySQL 계열의 역슬래시 이스케이프. 다음 글자는 그대로 넘긴다.
+            if inner == '\\' && escapes {
+                // 역슬래시 이스케이프. 다음 글자는 그대로 넘긴다.
                 self.index += 2;
                 continue;
             }
@@ -202,6 +223,43 @@ impl<'a> SqlScanner<'a> {
             }
             self.index += 1;
         }
+    }
+
+    /// PostgreSQL 달러 인용(`$$…$$`, `$tag$…$tag$`)의 여는 꼬리표 길이. 낱말 중간의 `$`와
+    /// `$1` 같은 자리표시자는 꼬리표가 아니다.
+    fn dollar_tag_len(&self) -> Option<usize> {
+        if self.engine != DbEngineKind::Postgres || !self.current.is_empty() {
+            return None;
+        }
+        let rest = &self.characters[self.index + 1..];
+        let mut length = 0;
+        while let Some(&character) = rest.get(length) {
+            if character == '$' {
+                return Some(length + 2);
+            }
+            let valid = character == '_'
+                || character.is_alphabetic()
+                || (length > 0 && character.is_ascii_digit());
+            if !valid {
+                return None;
+            }
+            length += 1;
+        }
+        None
+    }
+
+    /// 달러 인용 본문을 같은 꼬리표가 다시 나올 때까지 건너뛴다. 이것을 낱말로 읽으면
+    /// `SELECT $$'$$; COMMIT; DELETE …`의 `'`가 리터럴을 여는 것으로 잘못 읽힌다(C10-8).
+    fn skip_dollar_quoted(&mut self, tag_len: usize) -> Result<(), CoreError> {
+        let tag = &self.characters[self.index..self.index + tag_len];
+        let body = &self.characters[self.index + tag_len..];
+        let Some(end) = body.windows(tag_len).position(|window| window == tag) else {
+            return Err(CoreError::InvalidInput(
+                "따옴표가 닫히지 않았습니다".to_owned(),
+            ));
+        };
+        self.index += tag_len * 2 + end;
+        Ok(())
     }
 
     /// 한 줄 주석(`--` 또는 `#`)을 개행까지 건너뛴다.
@@ -253,6 +311,10 @@ impl<'a> SqlScanner<'a> {
             match character {
                 '\'' | '"' | '`' => {
                     self.skip_quoted(character)?;
+                }
+                '$' if self.dollar_tag_len().is_some() => {
+                    let tag_len = self.dollar_tag_len().unwrap_or(1);
+                    self.skip_dollar_quoted(tag_len)?;
                 }
                 '-' if next == Some('-') => {
                     self.skip_line_comment();
@@ -328,10 +390,11 @@ fn validate_statement_policy(words: &[String]) -> Result<(&str, DbStatementKind)
 }
 
 /// SQL 한 문장을 읽는다. 문장이 둘 이상이거나 대신 실행하지 않는 문장이면 거절한다.
-pub(crate) fn parse_sql(raw: &str) -> Result<ParsedSql, CoreError> {
+/// 리터럴의 끝은 엔진 문법을 따르므로 실행할 엔진을 받는다.
+pub(crate) fn parse_sql(raw: &str, engine: DbEngineKind) -> Result<ParsedSql, CoreError> {
     let trimmed = validate_sql_text(raw)?;
     let characters: Vec<char> = trimmed.chars().collect();
-    let (words, normalized) = SqlScanner::new(&characters).scan(trimmed)?;
+    let (words, normalized) = SqlScanner::new(&characters, engine).scan(trimmed)?;
     let (_head, kind) = validate_statement_policy(&words)?;
 
     Ok(ParsedSql {
@@ -409,24 +472,29 @@ mod tests {
 
     #[test]
     fn c10_8_only_one_statement_passes() {
-        let parsed = parse_sql("SELECT 1;").expect("single");
+        let parsed = parse_sql("SELECT 1;", DbEngineKind::Mysql).expect("single");
         assert_eq!(parsed.normalized, "SELECT 1");
         assert_eq!(parsed.kind, DbStatementKind::Read);
-        let error = parse_sql("SELECT 1; DROP TABLE t").expect_err("two");
+        let error = parse_sql("SELECT 1; DROP TABLE t", DbEngineKind::Mysql).expect_err("two");
         assert!(matches!(error, CoreError::InvalidInput(_)));
     }
 
     #[test]
     fn c10_8_a_semicolon_inside_a_literal_is_not_a_terminator() {
-        let parsed = parse_sql("SELECT * FROM t WHERE a = 'x; y'").expect("literal");
+        let parsed =
+            parse_sql("SELECT * FROM t WHERE a = 'x; y'", DbEngineKind::Mysql).expect("literal");
         assert_eq!(parsed.kind, DbStatementKind::Read);
         assert!(parsed.normalized.ends_with("'x; y'"));
     }
 
     #[test]
     fn c10_8_comments_cannot_hide_a_second_statement() {
-        parse_sql("SELECT 1 -- ; DROP TABLE t").expect("comment only");
-        let error = parse_sql("SELECT 1; /* gap */ UPDATE t SET a = 1").expect_err("two");
+        parse_sql("SELECT 1 -- ; DROP TABLE t", DbEngineKind::Mysql).expect("comment only");
+        let error = parse_sql(
+            "SELECT 1; /* gap */ UPDATE t SET a = 1",
+            DbEngineKind::Mysql,
+        )
+        .expect_err("two");
         assert!(matches!(error, CoreError::InvalidInput(_)));
     }
 
@@ -434,10 +502,12 @@ mod tests {
     fn c10_9_a_cte_that_writes_is_classified_as_a_write() {
         let parsed = parse_sql(
             "WITH doomed AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM doomed)",
+            DbEngineKind::Mysql,
         )
         .expect("cte");
         assert_eq!(parsed.kind, DbStatementKind::Dml);
-        let read = parse_sql("WITH x AS (SELECT 1) SELECT * FROM x").expect("read cte");
+        let read = parse_sql("WITH x AS (SELECT 1) SELECT * FROM x", DbEngineKind::Mysql)
+            .expect("read cte");
         assert_eq!(read.kind, DbStatementKind::Read);
     }
 
@@ -454,15 +524,18 @@ mod tests {
             "SELECT load_file('/etc/passwd')",
             "BEGIN",
         ] {
-            let error = parse_sql(sql).expect_err(sql);
+            let error = parse_sql(sql, DbEngineKind::Mysql).expect_err(sql);
             assert!(matches!(error, CoreError::InvalidInput(_)), "{sql}");
         }
     }
 
     #[test]
     fn c10_10_scope_is_matched_against_referenced_names() {
-        let parsed =
-            parse_sql("SELECT * FROM TB_MENU_BAS m JOIN TB_PGM_BAS p ON 1 = 1").expect("read");
+        let parsed = parse_sql(
+            "SELECT * FROM TB_MENU_BAS m JOIN TB_PGM_BAS p ON 1 = 1",
+            DbEngineKind::Mysql,
+        )
+        .expect("read");
         assert_eq!(parsed.references, vec!["TB_MENU_BAS", "TB_PGM_BAS"]);
         ensure_scope(&parsed, &["tb_".to_owned()]).expect("in scope");
         let error = ensure_scope(&parsed, &["APRV".to_owned()]).expect_err("out of scope");
@@ -473,7 +546,44 @@ mod tests {
 
     #[test]
     fn c10_8_client_side_backslash_commands_are_refused() {
-        let error = parse_sql("\\! rm -rf /").expect_err("shell escape");
+        let error = parse_sql("\\! rm -rf /", DbEngineKind::Mysql).expect_err("shell escape");
         assert!(matches!(error, CoreError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn c10_8_backslash_escapes_follow_the_engine() {
+        // PostgreSQL(표준 문자열)과 SQLite에서 `'\'`는 닫힌 리터럴이다. 뒤의 문장을 놓치면 안 된다.
+        let smuggled = "SELECT '\\'; COMMIT; DELETE FROM t; --'";
+        for engine in [DbEngineKind::Postgres, DbEngineKind::Sqlite] {
+            let error = parse_sql(smuggled, engine).expect_err("second statement");
+            assert!(matches!(error, CoreError::InvalidInput(_)), "{engine:?}");
+        }
+        // MySQL 계열에서는 같은 글자가 이스케이프라 리터럴 하나다.
+        for engine in [DbEngineKind::Mysql, DbEngineKind::Mariadb] {
+            let parsed = parse_sql("SELECT 'it\\'s; fine'", engine).expect("escaped quote");
+            assert_eq!(parsed.kind, DbStatementKind::Read);
+        }
+        // PostgreSQL의 E 문자열은 역슬래시 이스케이프를 쓴다.
+        parse_sql("SELECT E'it\\'s; fine'", DbEngineKind::Postgres).expect("E string");
+        // 이름 끝의 e는 E 접두가 아니다.
+        parse_sql("SELECT name'\\'; DELETE FROM t", DbEngineKind::Postgres).expect_err("not E");
+    }
+
+    #[test]
+    fn c10_8_postgres_dollar_quotes_are_literals() {
+        for sql in [
+            "SELECT $$'$$; COMMIT; DELETE FROM t; --'",
+            "SELECT $q$'$q$; COMMIT; DELETE FROM t; --'",
+        ] {
+            let error = parse_sql(sql, DbEngineKind::Postgres).expect_err(sql);
+            assert!(matches!(error, CoreError::InvalidInput(_)), "{sql}");
+        }
+        let parsed = parse_sql(
+            "SELECT $tag$a; b$tag$ FROM t WHERE id = $1",
+            DbEngineKind::Postgres,
+        )
+        .expect("dollar body and placeholder");
+        assert_eq!(parsed.references, vec!["T"]);
+        parse_sql("SELECT $$never closed", DbEngineKind::Postgres).expect_err("unclosed");
     }
 }

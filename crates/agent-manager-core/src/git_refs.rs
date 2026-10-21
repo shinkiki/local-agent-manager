@@ -207,10 +207,10 @@ mod tests {
         let root = tempdir().expect("temp");
         let repo = root.path().join("repo");
         fs::create_dir_all(repo.join(".git")).expect("git dir");
-        fs::write(repo.join(".git/HEAD"), "ref: refs/heads/dev-history\n").expect("head");
+        fs::write(repo.join(".git/HEAD"), "ref: refs/heads/develop\n").expect("head");
         assert_eq!(
             head_branch(&repo),
-            Some("dev-history".to_owned()),
+            Some("develop".to_owned()),
             "폴더 .git에서 브랜치를 읽는다"
         );
 

@@ -3,7 +3,7 @@ import { Check, Copy, TriangleAlert } from "lucide-react";
 import { writeClipboardText } from "../lib/clipboard";
 import { useI18n } from "../lib/i18n";
 
-type CopyKind = "response" | "section" | "code" | "path" | "link";
+type CopyKind = "message" | "response" | "section" | "code" | "path" | "link";
 type CopyState = "idle" | "copying" | "copied" | "failed";
 
 export function CopyAction({
@@ -11,6 +11,7 @@ export function CopyAction({
   kind,
   className = "",
   disabled = false,
+  iconOnly = false,
 }: {
   /**
    * 문자열이거나, 누를 때 값을 만드는 함수. 함수형은 렌더 시점에 값을 만들지 않으므로
@@ -20,11 +21,12 @@ export function CopyAction({
   kind: CopyKind;
   className?: string;
   disabled?: boolean;
+  iconOnly?: boolean;
 }) {
   const { text } = useI18n();
   const [state, setState] = useState<CopyState>("idle");
   const resetTimerRef = useRef<number | null>(null);
-  const baseLabel = kind === "response"
+  const baseLabel = kind === "message" ? text("메시지 복사", "Copy message") : kind === "response"
     ? text("응답 복사", "Copy response")
     : kind === "section"
       ? text("섹션 복사", "Copy section")
@@ -75,7 +77,7 @@ export function CopyAction({
       onClick={() => void copy()}
     >
       <Icon size={13} aria-hidden="true" />
-      <span className="copy-action-label" aria-hidden="true">{stateLabel}</span>
+      {!iconOnly && <span className="copy-action-label" aria-hidden="true">{stateLabel}</span>}
       <span className="copy-action-announcement" role="status" aria-live="polite">{state === "idle" ? "" : stateLabel}</span>
     </button>
   );

@@ -8,12 +8,12 @@
 //   node --experimental-strip-types scripts/code-review-queue.mjs            # 요약만
 //   node --experimental-strip-types scripts/code-review-queue.mjs --json     # 큐 전체
 //   node --experimental-strip-types scripts/code-review-queue.mjs --write    # queue.json 갱신
-//   node --experimental-strip-types scripts/code-review-queue.mjs --branch origin/dev-history --window 7
+//   node --experimental-strip-types scripts/code-review-queue.mjs --branch origin/main --window 7
 //
 // 장부는 항목당 파일 하나(docs/code-review/reviewed/<항목id>.json)다. 한 파일에 몰아 적으면
 // 레인 열 개가 같은 줄을 고쳐 rebase 마다 충돌한다.
 //
-// 종료 코드: 장부에 중복 리뷰가 적혀 있으면 1, 그 밖에는 0.
+// 종료 코드: 장부에 중복 리뷰가 적혀 있으면 1, --branch 없이 upstream 도 없으면 2, 그 밖에는 0.
 
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -35,8 +35,23 @@ const flag = (name, fallback) => {
 };
 const asJson = argv.includes('--json');
 const shouldWrite = argv.includes('--write');
-const branch = flag('--branch', 'origin/dev-history');
+const branch = flag('--branch', null) ?? upstreamBranch();
 const windowDays = Number(flag('--window', '7'));
+
+// --branch 가 없으면 현재 가지의 upstream 을 센다. upstream 도 없으면 어느 선을 셀지 정할 수
+// 없으니 짐작하지 않고 멈춘다.
+function upstreamBranch() {
+  try {
+    return execFileSync('git', ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    console.error('현재 가지에 upstream 이 없습니다. --branch <ref> 로 셀 가지를 지정하세요.');
+    process.exit(2);
+  }
+}
 
 function readCommits() {
   // 커밋 제목에 파이프가 들어와도 앞 두 칸만 고정으로 끊어 읽는다.

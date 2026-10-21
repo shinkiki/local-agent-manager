@@ -91,6 +91,31 @@ pub(crate) fn read_linked_file(root: &Path, href: &str) -> Result<LinkedFile, Co
     read_linked_file_from(root, root, href)
 }
 
+/// 채팅의 현재 권한으로 읽는다. 문서·지침·과거 세션의 작업공간 제한은 별도로 유지한다.
+pub(crate) fn read_chat_linked_file(
+    root: &Path,
+    href: &str,
+    allow_external: bool,
+) -> Result<LinkedFile, CoreError> {
+    resolve_linked_file_with_access(root, root, href, MAX_LINKED_FILE_BYTES, allow_external)?
+        .into_preview()
+}
+
+pub(crate) fn read_chat_linked_file_download(
+    root: &Path,
+    href: &str,
+    allow_external: bool,
+) -> Result<LinkedFileDownload, CoreError> {
+    resolve_linked_file_with_access(
+        root,
+        root,
+        href,
+        MAX_LINKED_FILE_DOWNLOAD_BYTES,
+        allow_external,
+    )?
+    .into_download()
+}
+
 pub(crate) fn read_linked_file_from(
     root: &Path,
     base: &Path,
@@ -289,9 +314,19 @@ fn resolve_linked_file(
     href: &str,
     max_bytes: u64,
 ) -> Result<ResolvedLinkedFile, CoreError> {
+    resolve_linked_file_with_access(root, base, href, max_bytes, false)
+}
+
+fn resolve_linked_file_with_access(
+    root: &Path,
+    base: &Path,
+    href: &str,
+    max_bytes: u64,
+    allow_external: bool,
+) -> Result<ResolvedLinkedFile, CoreError> {
     let (root, base) = resolve_link_workspace(root, base)?;
     let (path_text, target_line) = parse_link_target(href)?;
-    let path = resolve_link_target(&root, &base, &path_text)?;
+    let path = resolve_link_target(&root, &base, &path_text, allow_external)?;
     let metadata = fs::metadata(&path)?;
     if !metadata.is_file() {
         return Err(CoreError::InvalidInput(
@@ -300,9 +335,10 @@ fn resolve_linked_file(
     }
     ensure_within_limit(&metadata, max_bytes)?;
 
+    // 외부 파일은 절대 경로로 표시해 다른 프로젝트의 동명 파일과 구분한다.
     let relative_path = path
         .strip_prefix(&root)
-        .map_err(|_| CoreError::InvalidInput("작업 경로 밖의 파일은 열 수 없습니다".to_owned()))?
+        .unwrap_or(&path)
         .to_string_lossy()
         .replace('\\', "/");
 
@@ -331,8 +367,13 @@ fn resolve_link_workspace(root: &Path, base: &Path) -> Result<(PathBuf, PathBuf)
     Ok((root, base))
 }
 
-/// 링크 문자열에서 얻은 경로를 기준 폴더에 붙여 정규화하고 작업공간 안으로 제한한다.
-fn resolve_link_target(root: &Path, base: &Path, path_text: &str) -> Result<PathBuf, CoreError> {
+/// 전체 접근 채팅만 작업공간 밖의 정규화된 파일 경로를 허용한다.
+fn resolve_link_target(
+    root: &Path,
+    base: &Path,
+    path_text: &str,
+    allow_external: bool,
+) -> Result<PathBuf, CoreError> {
     let requested = PathBuf::from(path_text);
     let joined = if requested.is_absolute() {
         requested
@@ -347,7 +388,7 @@ fn resolve_link_target(root: &Path, base: &Path, path_text: &str) -> Result<Path
         }
     })?;
 
-    if path == root || !path.starts_with(root) {
+    if !allow_external && (path == root || !path.starts_with(root)) {
         return Err(CoreError::InvalidInput(
             "작업 경로 밖의 파일은 열 수 없습니다".to_owned(),
         ));
@@ -491,6 +532,20 @@ mod tests {
             read_linked_file(&root, "linked.txt"),
             Err(CoreError::InvalidInput(_))
         ));
+        assert!(read_chat_linked_file(&root, "linked.txt", false).is_err());
+        assert!(read_chat_linked_file_download(&root, "linked.txt", false).is_err());
+        assert_eq!(
+            read_chat_linked_file(&root, "linked.txt", true)
+                .expect("full access symlink")
+                .content,
+            "secret"
+        );
+        assert_eq!(
+            read_chat_linked_file_download(&root, "linked.txt", true)
+                .expect("full access download")
+                .bytes,
+            b"secret"
+        );
     }
 
     #[test]
@@ -517,6 +572,50 @@ mod tests {
         assert!(matches!(
             read_linked_file(&root, "large.txt"),
             Err(CoreError::TooLarge(MAX_LINKED_FILE_BYTES))
+        ));
+    }
+
+    #[test]
+    fn full_access_keeps_file_type_size_and_link_validation() {
+        let temp = tempdir().expect("temp directory");
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).expect("workspace");
+        fs::write(temp.path().join("binary.bin"), [0xff, 0xfe]).expect("binary");
+        let large = File::create(temp.path().join("large.txt")).expect("large");
+        large
+            .set_len(MAX_LINKED_FILE_BYTES + 1)
+            .expect("preview size");
+        assert!(matches!(
+            read_chat_linked_file(&root, "../binary.bin", true),
+            Err(CoreError::InvalidInput(_))
+        ));
+        assert_eq!(
+            read_chat_linked_file_download(&root, "../binary.bin", true)
+                .expect("binary download")
+                .bytes,
+            [0xff, 0xfe]
+        );
+        assert!(matches!(
+            read_chat_linked_file(&root, "../large.txt", true),
+            Err(CoreError::TooLarge(MAX_LINKED_FILE_BYTES))
+        ));
+        large
+            .set_len(MAX_LINKED_FILE_DOWNLOAD_BYTES + 1)
+            .expect("download size");
+        assert!(matches!(
+            read_chat_linked_file_download(&root, "../large.txt", true),
+            Err(CoreError::TooLarge(MAX_LINKED_FILE_DOWNLOAD_BYTES))
+        ));
+        for href in ["..", "https://example.com/file", "file:///etc/passwd"] {
+            assert!(read_chat_linked_file(&root, href, true).is_err(), "{href}");
+            assert!(
+                read_chat_linked_file_download(&root, href, true).is_err(),
+                "{href}"
+            );
+        }
+        assert!(matches!(
+            read_chat_linked_file(&root, "../missing.txt", true),
+            Err(CoreError::NotFound(_))
         ));
     }
 

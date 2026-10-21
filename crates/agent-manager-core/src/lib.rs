@@ -85,6 +85,7 @@ mod skill_library;
 mod skill_meta;
 mod skill_trash;
 mod ssh_approvals;
+mod ssh_askpass;
 mod ssh_command_line;
 mod ssh_command_policy;
 mod ssh_endpoints;
@@ -169,9 +170,9 @@ pub use chat::{
     ChatProviderOptions, ChatReasoningOption, ChatRejectionCode, ChatSecretValueView,
     ChatSecretsGroup, ChatSecretsOverview, ChatSessionInfo, ChatSettingField, ChatSettingFieldKind,
     ChatSettingOption, ChatSshApprovalGate, ChatStartRequest, ChatSupervisor,
-    LocalConnectionOptions, ReasoningEffort, ShutdownImpact, StopChatFailure, StopChatReceipt,
-    StopProviderChatsReport, MAX_CHAT_INPUT_FILES, MAX_CHAT_INPUT_FILE_BYTES,
-    MAX_CHAT_INPUT_IMAGE_BYTES,
+    LocalConnectionOptions, ReasoningEffort, RoundDecisionAttention, ShutdownImpact,
+    StopChatFailure, StopChatReceipt, StopProviderChatsReport, MAX_CHAT_INPUT_FILES,
+    MAX_CHAT_INPUT_FILE_BYTES, MAX_CHAT_INPUT_IMAGE_BYTES,
 };
 pub use chat_secret_cli::run_chat_secret_cli;
 pub use chat_secrets::{
@@ -284,19 +285,21 @@ pub use project_files::{
 };
 pub use project_git::{
     commit_project_git, fetch_project_git, get_project_branch_comparison,
-    list_project_branch_follows, project_git_commit_files, project_git_diff, project_git_log,
-    project_git_overview, project_git_status, pull_project_git, push_project_git,
-    rebase_project_git, set_project_branch_follow, stage_project_git_paths, stash_project_git,
-    switch_project_git_branch, unstage_project_git_paths, GitActionReceipt, GitBranch,
-    GitBranchComparison, GitChangeKind, GitCommit, GitCommitFile, GitCommitFiles, GitDiff,
-    GitDiffKind, GitHead, GitInProgress, GitInProgressKind, GitLog, GitOutcome, GitOverview,
-    GitPullMode, GitRebaseAction, GitRemote, GitRepositoryInfo, GitStash, GitStashAction,
-    GitStatus, GitStatusEntry, GitUnavailableReason, GitUpstream, GitWorktree, ProjectBranchFollow,
-    ProjectBranchFollows, ProjectGitCommitFilesRequest, ProjectGitCommitRequest,
-    ProjectGitComparisonRequest, ProjectGitDiffRequest, ProjectGitFetchRequest,
-    ProjectGitLogRequest, ProjectGitPathsRequest, ProjectGitPullRequest, ProjectGitPushRequest,
-    ProjectGitRebaseRequest, ProjectGitStashRequest, ProjectGitSwitchRequest, ProjectGitTarget,
-    SetProjectBranchFollowRequest,
+    list_project_branch_follows, list_project_git_remote_tokens, project_git_commit_files,
+    project_git_diff, project_git_log, project_git_overview, project_git_status, pull_project_git,
+    push_project_git, rebase_project_git, set_project_branch_follow, set_project_git_remote_token,
+    stage_project_git_paths, stash_project_git, switch_project_git_branch,
+    unstage_project_git_paths, GitActionReceipt, GitBranch, GitBranchComparison, GitChangeKind,
+    GitCommit, GitCommitFile, GitCommitFiles, GitDiff, GitDiffKind, GitHead, GitInProgress,
+    GitInProgressKind, GitLog, GitOutcome, GitOverview, GitPullMode, GitRebaseAction, GitRemote,
+    GitRepositoryInfo, GitStash, GitStashAction, GitStatus, GitStatusEntry, GitUnavailableReason,
+    GitUpstream, GitWorktree, ProjectBranchFollow, ProjectBranchFollows,
+    ProjectGitCommitFilesRequest, ProjectGitCommitRequest, ProjectGitComparisonRequest,
+    ProjectGitDiffRequest, ProjectGitFetchRequest, ProjectGitLogRequest, ProjectGitPathsRequest,
+    ProjectGitPullRequest, ProjectGitPushRequest, ProjectGitRebaseRequest,
+    ProjectGitRemoteTokenView, ProjectGitRemoteTokens, ProjectGitStashRequest,
+    ProjectGitStatusRequest, ProjectGitSwitchRequest, ProjectGitTarget,
+    SetProjectBranchFollowRequest, SetProjectGitRemoteTokenRequest,
 };
 pub use project_instructions::{
     attach_project_instruction_deployment, check_project_instruction_delete,
@@ -431,12 +434,13 @@ pub use ssh_approvals::{
     SshApprovalCard, SshApprovalConsume, SshApprovalDecision, SshApprovalGate, SshApprovalOpen,
     SshApprovalScope, SshApprovalStore, SshApprovalTicket, SSH_APPROVAL_TTL_MS,
 };
+pub use ssh_askpass::exit_if_invoked_as_ssh_askpass;
 pub use ssh_endpoints::{
-    check_ssh_endpoint, command_policy_defaults, list_agent_ssh_endpoints, run_ssh_endpoint_cli,
-    set_ssh_key_endpoint, ssh_key_install_launch, ssh_terminal_launch, AgentSshEndpointSkip,
-    AgentSshEndpointView, AgentSshEndpointsView, SetSshKeyEndpointRequest,
+    check_ssh_endpoint, command_policy_defaults, delete_ssh_server, list_agent_ssh_endpoints,
+    run_ssh_endpoint_cli, save_ssh_server, ssh_key_install_launch, ssh_terminal_launch,
+    AgentSshEndpointSkip, AgentSshEndpointView, AgentSshEndpointsView, SaveSshServerRequest,
     SshCommandPolicyDefaults, SshCommandPolicyMode, SshEndpointCheckReceipt, SshEndpointView,
-    SshTerminalLaunch, RELAY_CHAT_ID_ENV,
+    SshServerRef, SshTerminalLaunch, RELAY_CHAT_ID_ENV,
 };
 pub use ssh_exec::{
     allow_ssh_command_permanently, download_ssh_file, execute_ssh_command, upload_ssh_file,
@@ -446,17 +450,20 @@ pub use ssh_exec::{
 };
 pub use ssh_keys::{
     delete_ssh_key, generate_ssh_key, get_ssh_keys, read_ssh_public_key, set_ssh_key_note,
-    GenerateSshKeyRequest, SetSshKeyNoteRequest, SshKeyDeletionReceipt, SshKeyIssue, SshKeyRef,
-    SshKeyView, SshKeysSnapshot, SshPublicKeyView,
+    set_ssh_key_passphrase, GenerateSshKeyRequest, SetSshKeyNoteRequest,
+    SetSshKeyPassphraseRequest, SshKeyDeletionReceipt, SshKeyIssue, SshKeyKind, SshKeyRef,
+    SshKeyTypeOption, SshKeyView, SshKeysSnapshot, SshPublicKeyView,
 };
 pub use storage_reset::prepare_account_management_storage;
 pub use store::{
     add_doc_root, create_doc, create_session_folder, delete_session_folder, doc_root_paths,
-    list_doc_roots, list_doc_tree, list_document_entries, list_session_folders, read_doc,
-    read_doc_linked_file, read_doc_linked_file_download, read_doc_linked_file_source,
-    read_document_file, read_document_file_download, read_document_file_source, remove_doc_root,
-    reorder_session_folder, save_doc, search_document_entries, session_meta, set_project_active,
-    update_session_folder, update_session_meta, FolderMoveDirection, MAX_SESSION_FOLDER_DEPTH,
+    ensure_doc_root_agent_enabled, list_doc_roots, list_doc_tree, list_document_entries,
+    list_session_folders, read_doc, read_doc_linked_file, read_doc_linked_file_download,
+    read_doc_linked_file_source, read_document_file, read_document_file_download,
+    read_document_file_source, remove_doc_root, reorder_session_folder, save_doc,
+    search_document_entries, session_meta, set_project_active, update_doc_root,
+    update_session_folder, update_session_meta, FolderMoveDirection, UpdateDocRootRequest,
+    MAX_SESSION_FOLDER_DEPTH,
 };
 pub use system_mcp::SystemMcpServer;
 pub use terminal::{

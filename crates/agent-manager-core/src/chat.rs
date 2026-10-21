@@ -151,7 +151,11 @@ pub(crate) const ANTIGRAVITY_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
 /// Antigravity print 모드의 기본 제한(5분)은 리팩토링·QA 같은 무인 회차가 검증과
 /// 커밋까지 마치고도 최종 응답 직전에 끊기기 쉽다. 화면에서 기다리는 일반 채팅은
 /// 공급자 기본값을 유지하고, 결과를 회수할 화면이 없는 무인 턴만 충분히 늘린다.
-const ANTIGRAVITY_UNATTENDED_PRINT_TIMEOUT: &str = "20m";
+/// 20분이던 값은 2026-10-15~17 무인 회차 7건이 모두 시작 후 정확히 20분에 도구 실행이
+/// 취소되며 보고 없이 끝나 60분으로 늘렸다 — 회차는 기준선 5~9분, 수정 3~15분, 변이·검증
+/// 5~8분에 리뷰·커밋·보고가 더해진다. 실행 중인 무인 런타임은 다음 회차의 정리 대상이
+/// 아니므로(`select_stale_runs`는 끝난 것만 고른다) 늘려도 회차가 겹쳐 끊기지 않는다.
+const ANTIGRAVITY_UNATTENDED_PRINT_TIMEOUT: &str = "60m";
 const AIA_DEVELOPER_INSTRUCTIONS: &str = r#"Your name is AIA. You are a system-specialized agent that understands and operates Agent Manager itself.
 
 - Use the aia_system MCP tools to check facts about Agent Manager: status, settings, sessions, live chats, notifications, provider accounts and usage, skill sources and install locations, documents, and recurring requests.
@@ -696,6 +700,8 @@ pub struct ChatStartRequest {
     /// `resume_session_id`·`handoff_origin`과 함께 쓸 수 없다([`validate_fork_request`]).
     #[serde(default)]
     pub fork_session_id: Option<String>,
+    #[serde(default)]
+    pub edit_message: Option<ChatEditMessage>,
     /// 이 채팅을 누가 시작했는지. 클라이언트가 보낼 수 없고 실행 컨텍스트(워크플로 실행기·
     /// 스케줄러·디스패처)만 채운다 — 사용량 페이싱이 런타임을 소비자에 귀속하는 근거라
     /// 위조되면 안 된다.
@@ -742,6 +748,14 @@ pub struct ChatStartRequest {
     pub settings: BTreeMap<String, String>,
     #[serde(default, skip_deserializing, skip_serializing)]
     pub startup_cancel: Option<Arc<AtomicBool>>,
+}
+
+/// A read-only transcript identity; the provider performs the bounded fork (G1-G3).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatEditMessage {
+    pub index: usize,
+    pub expected_text: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -816,6 +830,8 @@ pub struct ChatSecretsOverview {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatSessionInfo {
+    /// Forks inherit transcript history without resuming the original session.
+    pub forked: bool,
     pub chat_id: String,
     pub started_at: i64,
     pub source: ProviderId,
@@ -1447,6 +1463,9 @@ pub enum ChatAttentionKind {
     /// `chat_id`·`cwd`가 비어 있고, 화면은 워크플로 페이싱 탭을 연다. 알림은 관측 결과를
     /// 사람에게 올릴 뿐이고 설정 변경은 사용자가 그 탭에서 직접 한다.
     PacingSuggestion,
+    /// 회차 목표에 사람이 답할 결정이 남았다. 목표 하나에 항목 하나이고 채팅에 묶이지
+    /// 않는다. 답하거나 결정 방식이 바뀌어 남은 건수가 0이 되면 사라진다.
+    RoundDecision,
 }
 
 impl ChatAttentionKind {
@@ -1462,7 +1481,7 @@ impl ChatAttentionKind {
     /// 하나 늘 때 한쪽만 고치면 열려 있는 알림이 조용히 밀려난다. 판정을 여기 두고
     /// 버리는 쪽은 여집합으로 본다.
     fn is_open(self) -> bool {
-        matches!(self, Self::Running | Self::Approval)
+        matches!(self, Self::Running | Self::Approval | Self::RoundDecision)
     }
 }
 
@@ -1473,6 +1492,7 @@ chat_string_enum!(ChatAttentionKind, "알 수 없는 채팅 알림 종류입니�
     Failed => "failed",
     AccountSwitch => "accountSwitch",
     PacingSuggestion => "pacingSuggestion",
+    RoundDecision => "roundDecision",
 });
 
 /// 알림을 말풍선으로 띄울 때 쓰는 대화 미리보기. 전체 대화가 아니라 마지막 요청과
@@ -1693,6 +1713,30 @@ impl ChatAttentionItem {
         )
     }
 
+    /// 회차 결정 알림 항목. 목표 id가 앞자리를 정하고 꼬리는 페이싱 제안과 같은 이유로
+    /// 매번 다르다 — 건수가 바뀌어 다시 올린 알림이 기기 알림으로 다시 떠야 한다.
+    /// 공급자 칸은 의미가 없지만 비울 수 없어 기본 공급자를 적는다.
+    fn from_round_decision(goal_id: &str, title: String, detail: String) -> Self {
+        let created_at = now_ms();
+        Self::new(
+            ChatAttentionSubject::provider_only(ProviderId::Claude),
+            format!(
+                "{}{created_at}-{}",
+                round_decision_id_prefix(goal_id),
+                Uuid::new_v4().simple()
+            ),
+            None,
+            ChatAttentionFacts {
+                kind: ChatAttentionKind::RoundDecision,
+                title,
+                detail: Some(detail),
+                approval_id: None,
+                needs_secret: false,
+                created_at,
+            },
+        )
+    }
+
     /// 계정 자동전환 알림 항목. 대화가 아니라 공급자에 묶인 갈래다.
     fn from_account_switch(source: ProviderId, detail: String) -> Self {
         let created_at = now_ms();
@@ -1856,6 +1900,7 @@ struct ChatRuntime {
     /// fork 원본 공급자 세션. 첫 기동에서만 쓰인다 — Codex는 `thread/fork`의 `threadId`,
     /// Claude는 `--resume <원본> --fork-session`. 새 세션 ID는 `provider_session_id`가 든다.
     fork_source_session_id: Option<String>,
+    edit_boundary: Option<crate::catalog::MessageEditBoundary>,
     origin: Option<ChatOrigin>,
     app_data_dir: Option<PathBuf>,
     attention: Arc<ChatAttentionStore>,
@@ -1998,6 +2043,10 @@ struct RuntimeState {
     /// Claude가 지금 스트리밍하는 메인 메시지의 id. `message_start`에만 실려 오므로 여기 두고
     /// 텍스트 델타에 붙인다. 같은 id로 묶여야 한 말풍선이 되고, 바뀌어야 새 메시지가 된다.
     claude_message_id: Option<String>,
+    /// 이번 Antigravity 턴에서 도구 호출이 권한 확인에 걸려 자동 거절됐는가. print 모드는
+    /// 승인 채널이 없어 거절된 뒤 답 없이 턴을 끝내는 일이 잦으므로, 결과 이벤트에서 이 값으로
+    /// 왜 멈췄는지를 알린다. 턴을 띄울 때마다 지운다.
+    antigravity_permission_denied: bool,
     turn_count: u64,
     last_turn_status: Option<String>,
     /// 이 런타임이 마지막으로 움직인 시각(ms). 턴 경계와 단계 전이뿐 아니라 턴 안의 공급자
@@ -2155,6 +2204,7 @@ impl RuntimeState {
             replay_truncated: false,
             active_turn_started_at: None,
             claude_message_id: None,
+            antigravity_permission_denied: false,
             assistant_output: String::new(),
             assistant_output_message_id: None,
             assistant_output_seq: 0,
@@ -2594,6 +2644,22 @@ fn pacing_suggestion_id_prefix(source: ProviderId, key: &str) -> String {
     format!("pacing-suggestion:{source}:{key}:")
 }
 
+fn round_decision_id_prefix(goal_id: &str) -> String {
+    format!("round-decision:{goal_id}:")
+}
+
+/// 회차 결정 알림 하나. `pending`은 사람이 답할 미결 결정 수다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoundDecisionAttention {
+    pub goal_id: String,
+    pub goal_title: String,
+    pub pending: usize,
+}
+
+fn round_decision_detail(entry: &RoundDecisionAttention) -> String {
+    format!("사람이 답할 결정 {}건", entry.pending)
+}
+
 fn replace_attention_item(items: &mut VecDeque<ChatAttentionItem>, item: ChatAttentionItem) {
     items.retain(|existing| existing.id != item.id);
     items.push_front(item);
@@ -2710,6 +2776,13 @@ impl ChatAttentionStore {
                     "승인 대기 알림은 개별 삭제할 수 없습니다".to_owned(),
                 ));
             }
+            // 회차 결정 알림은 결정에 답해야 사라진다. 지워도 다음 동기화가 새 id로 다시
+            // 올려 기기 알림이 또 뜰 뿐이라 지우기를 받지 않는다.
+            if items[index].kind == ChatAttentionKind::RoundDecision {
+                return Err(CoreError::InvalidInput(
+                    "회차 결정 알림은 결정에 답하면 사라집니다".to_owned(),
+                ));
+            }
             items.remove(index);
             Ok(())
         })
@@ -2821,6 +2894,38 @@ impl ChatAttentionStore {
         items.push_front(ChatAttentionItem::from_pacing_suggestion(
             source, key, title, detail,
         ));
+        prune_attention_items(&mut items);
+    }
+
+    /// 회차 결정 알림을 `entries`와 같게 맞춘다. 목록에 없거나 건수가 0인 목표의 항목은
+    /// 지우고, 문구가 그대로인 항목은 읽음 상태째 남긴다 — 다른 목표의 보고만 바뀌었는데
+    /// 이미 본 알림이 다시 뜨면 안 된다. 문구가 바뀐 항목만 새 id로 교체한다.
+    fn sync_round_decisions(&self, entries: &[RoundDecisionAttention]) {
+        let Some(mut items) = self.locked_items() else {
+            return;
+        };
+        items.retain(|item| {
+            item.kind != ChatAttentionKind::RoundDecision || {
+                entries.iter().any(|entry| {
+                    entry.pending > 0
+                        && item
+                            .id
+                            .starts_with(&round_decision_id_prefix(&entry.goal_id))
+                        && item.detail.as_deref() == Some(round_decision_detail(entry).as_str())
+                })
+            }
+        });
+        for entry in entries.iter().filter(|entry| entry.pending > 0) {
+            let prefix = round_decision_id_prefix(&entry.goal_id);
+            if items.iter().any(|item| item.id.starts_with(&prefix)) {
+                continue;
+            }
+            items.push_front(ChatAttentionItem::from_round_decision(
+                &entry.goal_id,
+                format!("회차 결정 대기: {}", entry.goal_title),
+                round_decision_detail(entry),
+            ));
+        }
         prune_attention_items(&mut items);
     }
 
@@ -3445,6 +3550,11 @@ fn validate_handoff_origin(
 /// 원본은 공급자가 시작 단계에서 거절한다.
 fn validate_fork_request(request: &ChatStartRequest) -> Result<(), CoreError> {
     let Some(session_id) = request.fork_session_id.as_deref() else {
+        if request.edit_message.is_some() {
+            return Err(CoreError::InvalidInput(
+                "메시지 편집에는 원본 세션이 필요합니다".to_owned(),
+            ));
+        }
         return Ok(());
     };
     crate::identifier::validate_identifier(session_id)?;
@@ -3761,7 +3871,27 @@ impl ChatRuntime {
 impl ChatSupervisor {
     /// 내장 스키마 + 저장된 디스커버리 오버라이드가 합쳐진 provider 실행설정 카탈로그.
     pub fn chat_provider_options(&self, source: ProviderId) -> ChatProviderOptions {
-        load_chat_provider_options(source, self.inner.app_data_dir.as_deref())
+        let catalog_env = self.model_catalog_env(source);
+        load_chat_provider_options(source, self.inner.app_data_dir.as_deref(), &catalog_env)
+    }
+
+    /// 모델 목록을 묻는 CLI에 얹을 활성 계정의 자격증명 환경. Antigravity만 해당한다 —
+    /// Codex는 app-server가 공유 홈으로 목록을 주고, Claude는 CLI에 묻지 않는다.
+    /// 준비에 실패하면 지금까지처럼 환경 없이 묻고, 실패 사유는 목록 오류로 드러난다.
+    fn model_catalog_env(&self, source: ProviderId) -> Vec<(String, String)> {
+        let Some(accounts) = self.inner.accounts.as_ref() else {
+            return Vec::new();
+        };
+        if source != ProviderId::Antigravity {
+            return Vec::new();
+        }
+        match accounts.antigravity_model_catalog_env() {
+            Ok(env) => env.unwrap_or_default(),
+            Err(error) => {
+                eprintln!("[model-catalog] Antigravity 계정 홈을 준비하지 못했습니다: {error}");
+                Vec::new()
+            }
+        }
     }
 
     /// AIA 디스커버리가 조사한 최신 인터페이스 스키마와 모델·추론 카탈로그를 반영한다.
@@ -4512,6 +4642,34 @@ impl ChatSupervisor {
         // 취소 플래그는 `request`가 부분 이동된 뒤에도 봐야 하므로 먼저 떼어 둔다.
         let startup_cancel = request.startup_cancel.clone();
         let session_catalog = self.check_start_preconditions(&request)?;
+        let edit_boundary = if let Some(edit) = &request.edit_message {
+            let session_id = request.fork_session_id.as_deref().expect("validated fork");
+            for runtime in lock(&self.inner.chats)?.values() {
+                let state = lock(&runtime.state)?;
+                if runtime.source == request.source
+                    && state.provider_session_id.as_deref() == Some(session_id)
+                    && (state.phase.is_active() || !state.queue.is_empty())
+                {
+                    return Err(CoreError::Busy(
+                        "원본 대화의 응답과 대기 메시지가 끝난 뒤 편집해 주세요".to_owned(),
+                    ));
+                }
+            }
+            let app_data = self
+                .inner
+                .app_data_dir
+                .as_deref()
+                .ok_or_else(|| CoreError::InvalidInput("세션 저장소가 없습니다".to_owned()))?;
+            Some(crate::catalog::resolve_message_edit_boundary(
+                app_data,
+                request.source,
+                session_id,
+                edit.index,
+                &edit.expected_text,
+            )?)
+        } else {
+            None
+        };
         let profile = effective_chat_profile(&request, self.inner.app_data_dir.as_ref())?;
         let chat_id = Uuid::new_v4().to_string();
         let resume_key = request
@@ -4612,6 +4770,7 @@ impl ChatSupervisor {
             capture_id: request.capture_id,
             handoff_origin: request.handoff_origin,
             fork_source_session_id: request.fork_session_id,
+            edit_boundary,
             origin: request.origin,
             app_data_dir: self.inner.app_data_dir.clone(),
             attention: Arc::clone(&self.inner.attention),
@@ -5019,6 +5178,12 @@ impl ChatSupervisor {
         self.inner
             .attention
             .record_pacing_suggestion(source, key, title, detail);
+    }
+
+    /// 회차 목표별 사람이 답할 결정 수로 회차 결정 알림을 맞춘다. 저장소가 메모리라
+    /// 기동 때와 보고·답·목표 변경 뒤에 부르는 쪽이 전체 목록을 다시 세어 넘긴다.
+    pub fn sync_round_decision_attention(&self, entries: &[RoundDecisionAttention]) {
+        self.inner.attention.sync_round_decisions(entries);
     }
 
     pub fn dismiss_attention(&self, id: &str) -> Result<ChatAttentionSnapshot, CoreError> {
@@ -5434,7 +5599,7 @@ impl ChatSupervisor {
                     if let Some(secret) = secret.filter(|value| !value.is_empty()) {
                         self.inner
                             .ssh_secrets
-                            .store(chat_id, &outcome.fingerprint, secret)?;
+                            .store(chat_id, &outcome.server_id, secret)?;
                     }
                 }
             }
@@ -5672,7 +5837,7 @@ impl ChatSupervisor {
 
     pub fn linked_file(&self, chat_id: &str, href: &str) -> Result<LinkedFile, CoreError> {
         let runtime = self.runtime(chat_id)?;
-        linked_file::read_linked_file(&runtime.cwd, href)
+        linked_file::read_chat_linked_file(&runtime.cwd, href, runtime.mode == ChatMode::FullAccess)
     }
 
     pub fn linked_file_download(
@@ -5681,7 +5846,11 @@ impl ChatSupervisor {
         href: &str,
     ) -> Result<LinkedFileDownload, CoreError> {
         let runtime = self.runtime(chat_id)?;
-        linked_file::read_linked_file_download(&runtime.cwd, href)
+        linked_file::read_chat_linked_file_download(
+            &runtime.cwd,
+            href,
+            runtime.mode == ChatMode::FullAccess,
+        )
     }
 
     /// 무인 채팅의 마지막 턴 출력. 자기가 띄운 무인 작업의 결과를 회수하는 경로다.
@@ -5891,31 +6060,31 @@ impl SshApprovalGate for ChatSshApprovalGate<'_> {
     }
 
     /// C9-19. 값을 묻지 않고 있는지만 묻는다. 이 답으로 승인 카드에 입력칸을 띄울지 갈린다.
-    fn holds_sudo_secret(&self, fingerprint: &str) -> bool {
+    fn holds_sudo_secret(&self, server_id: &str) -> bool {
         self.supervisor
             .inner
             .ssh_secrets
-            .holds(self.chat_id, fingerprint)
+            .holds(self.chat_id, server_id)
     }
 
     /// C9-19. 실행 직전에 값을 꺼낸다. 소모 여부를 여기서 정하지 않는다 — 한 작업이 여러
     /// sudo 명령으로 이어지는 동안 다시 묻지 않는 것이 이 저장소의 목적이고, 수명은 TTL과
     /// 대화 종료가 정한다.
-    fn take_sudo_secret(&self, fingerprint: &str) -> Option<Zeroizing<String>> {
+    fn take_sudo_secret(&self, server_id: &str) -> Option<Zeroizing<String>> {
         // 실행 직전에 대화가 아직 이 백엔드의 AIA 대화인지 다시 확인한다. 대화가 사라졌으면
         // 그 맥락에서 받은 비밀번호도 쓸 자리가 없다.
         self.supervisor.aia_runtime_for(self.chat_id).ok()?;
         self.supervisor
             .inner
             .ssh_secrets
-            .peek(self.chat_id, fingerprint)
+            .peek(self.chat_id, server_id)
     }
 
-    fn discard_sudo_secret(&self, fingerprint: &str) {
+    fn discard_sudo_secret(&self, server_id: &str) {
         self.supervisor
             .inner
             .ssh_secrets
-            .discard(self.chat_id, fingerprint);
+            .discard(self.chat_id, server_id);
     }
 
     fn consume_ssh_approval(&self, request: SshApprovalConsume<'_>) -> Result<(), CoreError> {
@@ -7925,6 +8094,7 @@ impl ChatRuntime {
             source: self.source,
             account_id: self.account_id.clone(),
             resuming: self.resuming,
+            forked: self.fork_source_session_id.is_some(),
             provider_session_id: state.provider_session_id.clone(),
             cwd: self.cwd.to_string_lossy().into_owned(),
             model: self.model.clone(),
@@ -8768,9 +8938,6 @@ fn runtime_failure_code(status: &str, message: &str) -> &'static str {
     }
 }
 
-/// 회수 중인 어시스턴트 출력에 델타를 상한까지만 덧붙인다. 상한 규칙 자체는
-/// [`crate::process_output`]가 자식 프로세스 출력에 쓰는 것과 같아 그쪽에 둔다 —
-/// 여기서는 이 회수에 쓰는 상한만 정한다.
 /// 확정된 어시스턴트 본문의 **마지막 비어 있지 않은 줄**이 페이싱 완료 표식이면 그 뒤의 근거를
 /// 돌려준다. 봉투가 "마지막 줄에 정확히"라고 요청했으므로 다른 자리의 같은 글자(인용·설명)는
 /// 완료로 읽지 않는다. 마크다운 강조나 코드 표시(`` ` ``·`*`)로 감싼 경우는 벗겨서 본다.
@@ -8785,6 +8952,9 @@ fn pacing_complete_note(text: &str) -> Option<String> {
     Some(rest.trim().trim_matches('`').trim().to_owned())
 }
 
+/// 회수 중인 어시스턴트 출력에 델타를 상한까지만 덧붙인다. 상한 규칙 자체는
+/// [`crate::process_output`]가 자식 프로세스 출력에 쓰는 것과 같아 그쪽에 둔다 —
+/// 여기서는 이 회수에 쓰는 상한만 정한다.
 fn append_captured_output(output: &mut String, delta: &str) {
     crate::process_output::append_capped_str(output, delta, MAX_CAPTURED_ASSISTANT_OUTPUT_BYTES);
 }
@@ -9353,11 +9523,31 @@ fn opencode_guarded_path(
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| CoreError::InvalidInput("경로가 없습니다".to_owned()))?;
+    guard_workspace_path(raw, &runtime.cwd, &chat_workspace_roots(runtime))
+}
+
+/// `opencode_guarded_path` 의 판정부. 채팅 런타임 없이 시험할 수 있게 떼어 냈다.
+fn guard_workspace_path(
+    raw: &str,
+    cwd: &std::path::Path,
+    roots: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, CoreError> {
     let path = std::path::Path::new(raw);
+    // C14-5, G10. 아래 검사는 존재하는 가장 깊은 조상만 정규화하므로 `<cwd>/없음/../../x`
+    // 는 조상 탐색이 <cwd> 에서 멈춰 통과하고, 쓰기는 `없음` 을 만든 뒤 작업 공간 밖에
+    // 닿는다. `..` 를 품은 경로는 정규화 전에 거절한다.
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(CoreError::InvalidInput(format!(
+            "`..` 가 들어간 경로는 받지 않습니다: {raw}"
+        )));
+    }
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        runtime.cwd.join(path)
+        cwd.join(path)
     };
     // 존재하지 않는 파일도 쓰기 대상이 될 수 있어, 있는 조상까지만 정규화해 견준다.
     let probe = path
@@ -9365,7 +9555,6 @@ fn opencode_guarded_path(
         .find(|candidate| candidate.exists())
         .unwrap_or(&path);
     let canonical = std::fs::canonicalize(probe).unwrap_or_else(|_| probe.to_path_buf());
-    let roots = chat_workspace_roots(runtime);
     let allowed = roots.iter().any(|root| {
         std::fs::canonicalize(root)
             .unwrap_or_else(|_| root.clone())
@@ -9738,6 +9927,7 @@ fn codex_startup_handshake(
             error
         }
     })?;
+    verify_codex_edit_fork(runtime, &result)?;
     let thread_id = result
         .pointer("/thread/id")
         .and_then(Value::as_str)
@@ -9828,6 +10018,40 @@ fn codex_thread_params(runtime: &ChatRuntime) -> Result<Value, CoreError> {
     Ok(params)
 }
 
+/// Older app-servers may ignore unknown beforeTurnId. Verify the *actual* fork
+/// before any user input; absence of turns is not proof of an empty prefix (G3).
+fn verify_codex_edit_fork(runtime: &ChatRuntime, result: &Value) -> Result<(), CoreError> {
+    if runtime.resuming {
+        return Ok(());
+    }
+    let Some(crate::catalog::MessageEditBoundary::CodexBeforeTurn {
+        prefix_turn_ids, ..
+    }) = &runtime.edit_boundary
+    else {
+        return Ok(());
+    };
+    let returned_ids = result
+        .pointer("/thread/turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| {
+            turns
+                .iter()
+                .map(|turn| turn.get("id").and_then(Value::as_str))
+                .collect::<Option<Vec<_>>>()
+        });
+    let expected: Vec<_> = prefix_turn_ids.iter().map(String::as_str).collect();
+    if returned_ids.as_ref() != Some(&expected) {
+        return Err(CoreError::Runtime("Codex가 편집 위치 이전의 대화만 분기했는지 확인하지 못했습니다. 변경 메시지는 전송하지 않았습니다. CLI 업데이트 후 다시 시도해 주세요".to_owned()));
+    }
+    let new_id = result.pointer("/thread/id").and_then(Value::as_str);
+    if new_id.is_none() || new_id == runtime.fork_source_session_id.as_deref() {
+        return Err(CoreError::Runtime(
+            "Codex가 독립된 편집 세션을 반환하지 않았습니다".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn codex_thread_request(
     runtime: &ChatRuntime,
     mut params: Value,
@@ -9838,6 +10062,12 @@ fn codex_thread_request(
             // 이유도 재개와 같다.
             params["threadId"] = Value::String(source_id.clone());
             params["excludeTurns"] = Value::Bool(true);
+            if let Some(crate::catalog::MessageEditBoundary::CodexBeforeTurn { id, .. }) =
+                &runtime.edit_boundary
+            {
+                params["beforeTurnId"] = Value::String(id.clone());
+                params["excludeTurns"] = Value::Bool(false);
+            }
             return Ok(("thread/fork", params));
         }
         return Ok(("thread/start", params));
@@ -11057,7 +11287,11 @@ fn spawn_stream_cli(
     runtime: &Arc<ChatRuntime>,
     message: &PendingChatMessage,
 ) -> Result<(), CoreError> {
-    let provider_session_id = lock(&runtime.state)?.provider_session_id.clone();
+    let provider_session_id = {
+        let mut state = lock(&runtime.state)?;
+        begin_antigravity_turn(&mut state);
+        state.provider_session_id.clone()
+    };
     let prompt = prompt_with_attachment_paths(message, true);
     let args = antigravity_stream_cli_args(runtime, &prompt, provider_session_id.as_deref());
     let mut child = spawn_managed_chat_child(
@@ -11176,8 +11410,18 @@ fn claude_stream_cli_args(runtime: &ChatRuntime, resume: bool) -> Vec<String> {
         // `resume`이 참이 되어 새 세션 자신을 이어간다.
         if !resume {
             if let Some(source_id) = &runtime.fork_source_session_id {
-                push_flag(&mut args, "--resume", source_id.clone());
-                args.push("--fork-session".to_owned());
+                if !matches!(
+                    runtime.edit_boundary,
+                    Some(crate::catalog::MessageEditBoundary::Fresh)
+                ) {
+                    push_flag(&mut args, "--resume", source_id.clone());
+                    args.push("--fork-session".to_owned());
+                    if let Some(crate::catalog::MessageEditBoundary::ClaudeAfterMessage(id)) =
+                        &runtime.edit_boundary
+                    {
+                        args.push(format!("--resume-session-at={id}"));
+                    }
+                }
             }
         }
         push_flag(
@@ -12093,14 +12337,39 @@ fn update_claude_context_window(runtime: &Arc<ChatRuntime>, value: &Value) {
 /// 필요한 요청을 사용자에게 묻지 않고 거절하고 그 턴 전체를 응답 없이 끝낸다. 원문만
 /// 보여 주면 오지 않을 승인 화면을 기다리게 되므로 실제로 필요한 선택을 덧붙인다.
 fn antigravity_error_message(message: String) -> String {
-    let normalized = message.to_ascii_lowercase();
-    if !normalized.contains("permission check failed") && !normalized.contains("denied permission")
-    {
+    if !is_antigravity_permission_denial(&message) {
         return message;
     }
-    format!(
-        "{message}\n\nAntigravity CLI는 print 모드에서 승인 요청을 사용자에게 묻지 않고 자동으로 거절하며, 그 턴은 응답 없이 끝납니다. 작업 경로 밖을 읽어야 하면 실행 모드를 '권한 요청 자동 승인'(전체 접근)으로 바꾸거나, 필요한 경로에서 대화를 시작하세요."
-    )
+    format!("{message}\n\n{ANTIGRAVITY_PERMISSION_DENIED_GUIDANCE}")
+}
+
+/// 자동 거절이 무엇을 막는지와 사용자가 고를 수 있는 길. 전체 접근이 아닌 모드(`accept-edits`)는
+/// 편집만 자동 승인하므로, 작업 경로 밖 접근뿐 아니라 작업 경로 안의 터미널 명령(`rg`·`cargo
+/// test`)도 모두 이 거절에 걸린다(2026-10-19 `1e550496`: 첫 `rg`부터 마지막 검증까지 거절).
+const ANTIGRAVITY_PERMISSION_DENIED_GUIDANCE: &str = "Antigravity CLI는 print 모드에서 승인 요청을 사용자에게 묻지 않고 자동으로 거절하며, 그 뒤 턴이 응답 없이 끝날 수 있습니다. 전체 접근이 아닌 실행 모드에서는 작업 경로 밖 접근뿐 아니라 터미널 명령 실행도 이렇게 거절됩니다. 명령 실행이 필요하면 실행 모드를 '권한 요청 자동 승인'(전체 접근)으로 바꾸세요.";
+
+fn is_antigravity_permission_denial(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("permission check failed") || normalized.contains("denied permission")
+}
+
+/// 도구 단계 하나가 권한 거절로 끝났는가. 성공한 도구의 출력은 거절 문구가 맨 앞에 올
+/// 때만 거절로 본다 — 이 저장소를 `rg "denied permission"`으로 훑은 결과처럼 출력 본문에
+/// 그 문구가 섞인 것만으로 거절 안내를 붙이면 안 된다.
+fn antigravity_tool_was_denied(status: &str, output: &str) -> bool {
+    match status {
+        "failed" => is_antigravity_permission_denial(output),
+        "completed" => output
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("permission check failed"),
+        _ => false,
+    }
+}
+
+/// 새 Antigravity 턴을 띄우기 전에 앞 턴의 관찰을 지운다.
+fn begin_antigravity_turn(state: &mut RuntimeState) {
+    state.antigravity_permission_denied = false;
 }
 
 fn handle_antigravity_stream_message(runtime: &Arc<ChatRuntime>, value: &Value) {
@@ -12136,6 +12405,12 @@ fn handle_antigravity_step_update(runtime: &Arc<ChatRuntime>, value: &Value) {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         });
+    if output
+        .as_deref()
+        .is_some_and(|output| antigravity_tool_was_denied(status, output))
+    {
+        runtime.with_state(|state| state.antigravity_permission_denied = true);
+    }
     ToolCard::running(
         format!("antigravity-tool-{turn}-{index}"),
         step.get("tool_name")
@@ -12158,12 +12433,24 @@ fn handle_antigravity_result(runtime: &Arc<ChatRuntime>, value: &Value) {
         .map(str::trim)
         .filter(|text| !text.is_empty());
     if succeeded {
+        let turn = runtime.with_state(|state| state.turn_count).unwrap_or(0);
         if let Some(response) = response {
-            let turn = runtime.with_state(|state| state.turn_count).unwrap_or(0);
             runtime.emit_assistant_delta(
                 format!("antigravity-response-{turn}"),
                 "message",
                 response,
+            );
+        } else if runtime
+            .with_state(|state| state.antigravity_permission_denied)
+            .unwrap_or(false)
+        {
+            // 거절된 도구 카드만 남고 답이 없으면 사용자는 응답이 끊긴 것으로 본다. 실패로
+            // 적지는 않는다 — CLI는 정상 종료를 보고했다. 왜 멈췄는지만 그 자리에 남긴다.
+            runtime.emit_message_delta(
+                format!("antigravity-permission-denied-{turn}"),
+                "system",
+                "message",
+                ANTIGRAVITY_PERMISSION_DENIED_GUIDANCE,
             );
         }
     } else {
@@ -13031,6 +13318,28 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, CoreError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn c14_5_a_parent_dir_through_a_missing_folder_cannot_leave_the_workspace() {
+        let root = tempfile::tempdir().expect("workspace");
+        let cwd = std::fs::canonicalize(root.path()).expect("canonical");
+        let roots = vec![cwd.clone()];
+        for raw in [
+            "nope/../../../tmp/x",
+            "nope/../inside.txt",
+            &format!("{}/nope/../../x", cwd.display()),
+        ] {
+            assert!(
+                guard_workspace_path(raw, &cwd, &roots).is_err(),
+                "{raw} must be refused"
+            );
+        }
+        assert_eq!(
+            guard_workspace_path("sub/new.txt", &cwd, &roots).expect("inside"),
+            cwd.join("sub/new.txt")
+        );
+        assert!(guard_workspace_path("/etc/passwd", &cwd, &roots).is_err());
+    }
+
     /// 화면은 이 이벤트의 필드를 camelCase로 읽는다(`src/types.ts`의 `ChatEvent`). 열거형의
     /// `rename_all`은 변형 이름만 바꾸므로 여러 낱말로 된 필드는 `rename_all_fields`가
     /// 없으면 snake_case인 채로 나가고, 화면은 그 값을 못 본다 — 비밀값 요청 카드가
@@ -13598,9 +13907,90 @@ mod tests {
     }
 
     #[test]
+    fn g3_message_edit_fork_verifies_actual_prefix_before_input() {
+        let mut runtime = fixture_runtime(ProviderId::Codex);
+        runtime.fork_source_session_id = Some("original".to_owned());
+        runtime.edit_boundary = Some(crate::catalog::MessageEditBoundary::CodexBeforeTurn {
+            id: "target".to_owned(),
+            prefix_turn_ids: vec!["previous".to_owned()],
+        });
+        assert!(verify_codex_edit_fork(
+            &runtime,
+            &json!({"thread":{"id":"new","turns":[{"id":"previous"}]}})
+        )
+        .is_ok());
+        for turns in [
+            json!([{"id":"previous"},{"id":"target"}]),
+            json!([]),
+            json!([{}]),
+            json!([{"id":"wrong"}]),
+        ] {
+            assert!(verify_codex_edit_fork(
+                &runtime,
+                &json!({"thread":{"id":"new","turns":turns}})
+            )
+            .is_err());
+        }
+        assert!(verify_codex_edit_fork(
+            &runtime,
+            &json!({"thread":{"id":"original","turns":[{"id":"previous"}]}})
+        )
+        .is_err());
+        runtime.edit_boundary = Some(crate::catalog::MessageEditBoundary::CodexBeforeTurn {
+            id: "target".to_owned(),
+            prefix_turn_ids: vec![],
+        });
+        assert!(verify_codex_edit_fork(&runtime, &json!({"thread":{"id":"new"}})).is_err());
+        assert!(
+            verify_codex_edit_fork(&runtime, &json!({"thread":{"id":"new","turns":[]}})).is_ok()
+        );
+        let (_, params) = codex_thread_request(&runtime, json!({})).unwrap();
+        assert_eq!(params["excludeTurns"], false);
+    }
+
+    #[test]
+    fn g3_message_edit_cutoff_only_applies_to_initial_fork() {
+        let mut runtime = fixture_runtime(ProviderId::Codex);
+        runtime.fork_source_session_id = Some("source".to_owned());
+        runtime.edit_boundary = Some(crate::catalog::MessageEditBoundary::CodexBeforeTurn {
+            id: "turn-a".to_owned(),
+            prefix_turn_ids: vec![],
+        });
+        let (method, params) = codex_thread_request(&runtime, json!({})).unwrap();
+        assert_eq!(method, "thread/fork");
+        assert_eq!(params["beforeTurnId"], "turn-a");
+        runtime.resuming = true;
+        runtime.state.lock().unwrap().provider_session_id = Some("new".to_owned());
+        let (method, params) = codex_thread_request(&runtime, json!({})).unwrap();
+        assert_eq!(method, "thread/resume");
+        assert!(params.get("beforeTurnId").is_none());
+
+        let mut claude = fixture_runtime(ProviderId::Claude);
+        claude.fork_source_session_id = Some("source".to_owned());
+        claude.state.lock().unwrap().provider_session_id = Some("new".to_owned());
+        claude.edit_boundary = Some(crate::catalog::MessageEditBoundary::ClaudeAfterMessage(
+            "previous".to_owned(),
+        ));
+        assert!(claude_stream_cli_args(&claude, false)
+            .contains(&"--resume-session-at=previous".to_owned()));
+        assert!(!claude_stream_cli_args(&claude, true)
+            .iter()
+            .any(|a| a.starts_with("--resume-session-at")));
+        claude.edit_boundary = Some(crate::catalog::MessageEditBoundary::Fresh);
+        assert!(!claude_stream_cli_args(&claude, false).contains(&"--fork-session".to_owned()));
+    }
+
+    #[test]
     fn codex_fork_asks_app_server_for_a_new_thread_from_the_source() {
         let mut runtime = fixture_runtime(ProviderId::Codex);
         runtime.fork_source_session_id = Some("source-thread".to_owned());
+        let info = runtime.info_from(&runtime.state.lock().expect("runtime state"));
+        assert!(info.forked);
+        assert!(!info.resuming);
+        assert_eq!(
+            serde_json::to_value(info).expect("snapshot")["forked"],
+            true
+        );
         let (method, params) =
             codex_thread_request(&runtime, json!({"cwd": "/tmp"})).expect("fork request");
         assert_eq!(method, "thread/fork");
@@ -14742,6 +15132,8 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|args| { args == ["--print-timeout", ANTIGRAVITY_UNATTENDED_PRINT_TIMEOUT,] }));
+        // 20분은 무인 회차가 커밋·보고 전에 끊기던 값이다(2026-10-15~17 실측).
+        assert_eq!(ANTIGRAVITY_UNATTENDED_PRINT_TIMEOUT, "60m");
     }
 
     #[test]
@@ -15693,6 +16085,50 @@ mod tests {
         assert!(cleared.items.is_empty());
     }
 
+    /// 회차 결정 알림은 목표 하나에 하나다. 건수가 그대로면 읽음 상태째 남고, 건수가 바뀌면
+    /// 새 id로 교체되며, 0건이 되거나 목표가 목록에서 빠지면 사라진다.
+    #[test]
+    fn round_decision_attention_is_one_per_goal_and_follows_the_pending_count() {
+        let store = ChatAttentionStore::default();
+        let entry = |goal: &str, pending| RoundDecisionAttention {
+            goal_id: goal.to_owned(),
+            goal_title: format!("목표 {goal}"),
+            pending,
+        };
+        store.sync_round_decisions(&[entry("g1", 2), entry("g2", 0)]);
+        let first = store.snapshot().unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].kind, ChatAttentionKind::RoundDecision);
+        assert_eq!(
+            first.items[0].detail.as_deref(),
+            Some("사람이 답할 결정 2건")
+        );
+        let first_id = first.items[0].id.clone();
+        store.mark_read(&first_id).unwrap();
+
+        assert!(store.dismiss(&first_id).is_err());
+        assert_eq!(store.clear_read().unwrap().items.len(), 1);
+        store.sync_round_decisions(&[entry("g1", 2)]);
+        let same = store.snapshot().unwrap();
+        assert_eq!(same.items[0].id, first_id);
+        assert!(same.items[0].read);
+
+        store.sync_round_decisions(&[entry("g1", 1)]);
+        let changed = store.snapshot().unwrap();
+        assert_eq!(changed.items.len(), 1);
+        assert_ne!(changed.items[0].id, first_id);
+        assert_eq!(
+            changed.items[0].detail.as_deref(),
+            Some("사람이 답할 결정 1건")
+        );
+
+        store.sync_round_decisions(&[entry("g1", 0)]);
+        assert!(store.snapshot().unwrap().items.is_empty());
+        store.sync_round_decisions(&[entry("g1", 3)]);
+        store.sync_round_decisions(&[]);
+        assert!(store.snapshot().unwrap().items.is_empty());
+    }
+
     /// 같은 제안을 다시 올리면 목록에는 하나만 남아야 하고(회차마다 쌓이면 알림창을 메운다),
     /// id는 달라져야 한다. id를 고정하면 기기 알림의 새것 판정이 이미 본 것으로 취급해
     /// 수치가 나빠져 다시 올린 것을 사용자가 못 본다.
@@ -16229,7 +16665,7 @@ mod tests {
         let ticket = supervisor
             .ssh_approval_gate("aia")
             .open_ssh_approval(SshApprovalOpen {
-                fingerprint: "SHA256:aaaa",
+                server_id: "srv-aaaa",
                 destination: "deploy@build.example.com:2222",
                 command: "docker ps",
                 scope: SshApprovalScope::OneShot,
@@ -16346,7 +16782,7 @@ mod tests {
         supervisor
             .ssh_approval_gate("aia")
             .open_ssh_approval(SshApprovalOpen {
-                fingerprint: "SHA256:aaaa",
+                server_id: "srv-aaaa",
                 destination: "deploy@build.example.com:2222",
                 command: "docker logs",
                 scope: SshApprovalScope::OneShot,
@@ -16376,7 +16812,7 @@ mod tests {
         let ticket = supervisor
             .ssh_approval_gate("aia")
             .open_ssh_approval(SshApprovalOpen {
-                fingerprint: "SHA256:aaaa",
+                server_id: "srv-aaaa",
                 destination: "deploy@build.example.com:2222",
                 command: "docker ps",
                 scope: SshApprovalScope::OneShot,
@@ -17838,6 +18274,102 @@ mod tests {
         ));
     }
 
+    /// 거절된 도구만 남기고 답 없이 끝난 턴은 왜 멈췄는지 알린다. 답이 있으면 덧붙이지 않는다.
+    #[test]
+    fn antigravity_silent_turn_after_permission_denial_explains_the_stop() {
+        let denied_step = json!({
+            "event":"step_update",
+            "step_update":{
+                "step_index":2,
+                "state":"ERROR",
+                "step_type":"tool",
+                "tool_name":"run_command",
+                "tool_info":{
+                    "parameters":{"CommandLine":"rg -n file src/"},
+                    "error":{"message":"permission check failed for unsandboxed \"rg -n file src/\": user denied permission to run command"}
+                }
+            }
+        });
+        let guidance_notes =
+            |runtime: &Arc<ChatRuntime>| {
+                runtime
+                .test_state()
+                .replay
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ChatEvent::MessageDelta { role, delta, .. }
+                        if role == "system" && delta == ANTIGRAVITY_PERMISSION_DENIED_GUIDANCE
+                ))
+                .count()
+            };
+
+        let silent = Arc::new(fixture_runtime(ProviderId::Antigravity));
+        {
+            let mut state = silent.test_state();
+            state.phase = ChatPhase::Running;
+            state.turn_count = 1;
+        }
+        handle_stream_cli_message(&silent, denied_step.clone());
+        handle_stream_cli_message(
+            &silent,
+            json!({"event":"result","result":{"status":"SUCCESS","response":""}}),
+        );
+        assert_eq!(guidance_notes(&silent), 1);
+        assert!(replay_has!(
+            silent.test_state().replay,
+            ChatEvent::Turn { status, .. } if status == "completed"
+        ));
+
+        let answered = Arc::new(fixture_runtime(ProviderId::Antigravity));
+        {
+            let mut state = answered.test_state();
+            state.phase = ChatPhase::Running;
+            state.turn_count = 1;
+        }
+        handle_stream_cli_message(&answered, denied_step);
+        handle_stream_cli_message(
+            &answered,
+            json!({"event":"result","result":{"status":"SUCCESS","response":"명령이 막혀 읽기만 했습니다"}}),
+        );
+        assert_eq!(guidance_notes(&answered), 0);
+
+        // 앞 턴의 거절은 다음 턴으로 넘어가지 않는다.
+        let next_turn = Arc::new(fixture_runtime(ProviderId::Antigravity));
+        {
+            let mut state = next_turn.test_state();
+            state.phase = ChatPhase::Running;
+            state.turn_count = 2;
+            state.antigravity_permission_denied = true;
+            begin_antigravity_turn(&mut state);
+        }
+        handle_stream_cli_message(
+            &next_turn,
+            json!({"event":"result","result":{"status":"SUCCESS","response":""}}),
+        );
+        assert_eq!(guidance_notes(&next_turn), 0);
+    }
+
+    #[test]
+    fn antigravity_denial_is_not_read_from_successful_output_that_mentions_it() {
+        assert!(antigravity_tool_was_denied(
+            "failed",
+            "permission check failed for unsandboxed \"pwd\": user denied permission"
+        ));
+        assert!(antigravity_tool_was_denied(
+            "completed",
+            "Permission check failed for read_file \"/tmp/x\": user denied permission"
+        ));
+        assert!(!antigravity_tool_was_denied(
+            "completed",
+            "src/chat.rs:12229: normalized.contains(\"denied permission\")"
+        ));
+        assert!(!antigravity_tool_was_denied(
+            "running",
+            "permission check failed for unsandboxed \"pwd\""
+        ));
+    }
+
     #[test]
     fn approval_decisions_match_codex_protocol() {
         assert_eq!(ChatApprovalDecision::Accept.codex_value(), "accept");
@@ -18516,6 +19048,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn linked_files_follow_current_chat_mode_for_preview_and_download() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).expect("workspace");
+        let outside = temp.path().join("DocViewerService.java");
+        fs::write(&outside, "first\nsecond\n").expect("external source");
+        fs::write(root.join("inside.txt"), "inside").expect("internal source");
+        let supervisor =
+            ChatSupervisor::with_app_data_dir(temp.path().join("app-data")).expect("supervisor");
+
+        for profile in [ChatProfile::Standard, ChatProfile::Aia] {
+            for mode in [
+                ChatMode::FullAccess,
+                ChatMode::Workspace,
+                ChatMode::Plan,
+                ChatMode::Auto,
+                ChatMode::DontAsk,
+                ChatMode::Manual,
+            ] {
+                let mut runtime = fixture_runtime_with_mode(ProviderId::Codex, mode);
+                runtime.cwd = root.clone();
+                runtime.profile = profile;
+                let runtime = Arc::new(runtime);
+                supervisor.register_test_chat(&runtime);
+                // 같은 채팅 ID를 교체해 이전 전체 접근 권한이 남지 않는지도 확인한다.
+                for href in [
+                    format!("{}:2", outside.display()),
+                    "../DocViewerService.java#L2".into(),
+                ] {
+                    let preview = supervisor.linked_file(&runtime.chat_id, &href);
+                    let download = supervisor.linked_file_download(&runtime.chat_id, &href);
+                    if mode == ChatMode::FullAccess {
+                        let preview = preview.expect("full access preview");
+                        assert_eq!(preview.target_line, Some(2));
+                        assert_eq!(preview.content, "first\nsecond\n");
+                        assert!(Path::new(&preview.relative_path).is_absolute());
+                        assert_eq!(
+                            download.expect("full access download").bytes,
+                            b"first\nsecond\n"
+                        );
+                    } else {
+                        assert!(
+                            matches!(preview, Err(CoreError::InvalidInput(_))),
+                            "{profile:?} {mode:?}"
+                        );
+                        assert!(
+                            matches!(download, Err(CoreError::InvalidInput(_))),
+                            "{profile:?} {mode:?}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    supervisor
+                        .linked_file(&runtime.chat_id, "inside.txt")
+                        .expect("internal preview")
+                        .relative_path,
+                    "inside.txt"
+                );
+                assert_eq!(
+                    supervisor
+                        .linked_file_download(&runtime.chat_id, "inside.txt")
+                        .expect("internal download")
+                        .bytes,
+                    b"inside"
+                );
+            }
+        }
+    }
+
     fn fixture_runtime(source: ProviderId) -> ChatRuntime {
         fixture_runtime_with_mode(source, ChatMode::Workspace)
     }
@@ -18984,6 +19586,7 @@ mod tests {
             capture_id: None,
             handoff_origin: None,
             fork_source_session_id: None,
+            edit_boundary: None,
             origin: None,
             app_data_dir: None,
             attention: Arc::new(ChatAttentionStore::default()),
@@ -19222,6 +19825,7 @@ mod tests {
                 folder_ids: None,
                 pinned_account_id: Some(Some(b.clone())),
                 bookmarks: None,
+                linked_project_paths: None,
             },
         )
         .expect("고정 저장");
@@ -19284,6 +19888,7 @@ mod tests {
                 folder_ids: None,
                 pinned_account_id: Some(Some(a.clone())),
                 bookmarks: None,
+                linked_project_paths: None,
             },
         )
         .expect("고정 저장");
@@ -19833,6 +20438,7 @@ mod tests {
             resume_session_id: None,
             handoff_origin: None,
             fork_session_id: None,
+            edit_message: None,
             origin: None,
             unattended: false,
             pin_account: false,
@@ -19895,6 +20501,7 @@ mod tests {
             model: None,
             git_branch: None,
             is_subagent: false,
+            parent_session_id: None,
             aia_workspace: false,
             aia_chat: false,
             aia_chat_opens_as_standard: false,
@@ -19904,6 +20511,8 @@ mod tests {
             size_bytes: None,
             file_path: String::new(),
             last_failure: None,
+            related_projects: Vec::new(),
+            written_dirs: Vec::new(),
             meta: crate::domain::SessionMeta {
                 hidden,
                 ..crate::domain::SessionMeta::default()
@@ -20187,6 +20796,7 @@ mod tests {
                 ChatAttentionKind::Failed,
                 ChatAttentionKind::AccountSwitch,
                 ChatAttentionKind::PacingSuggestion,
+                ChatAttentionKind::RoundDecision,
             ]
         );
 

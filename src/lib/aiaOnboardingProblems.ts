@@ -199,9 +199,12 @@ export function notionDatabaseId(value: string): string | null {
   return runs[runs.length - 1].slice(-32).toLowerCase();
 }
 
-/** 지라 프로젝트 키. 대문자로 시작하는 대문자·숫자 2~10자다. */
+/**
+ * 지라 프로젝트 키. 대문자로 시작하는 대문자·숫자·밑줄 2~10자다. 밑줄은 지라 기본 키
+ * 규칙(`[A-Z][A-Z_0-9]+`)이 허용하므로, 빼면 실제로 있는 프로젝트(`QA_WEB`)를 막는다.
+ */
 export function isJiraProjectKey(value: string): boolean {
-  return /^[A-Z][A-Z0-9]{1,9}$/.test(value.trim());
+  return /^[A-Z][A-Z0-9_]{1,9}$/.test(value.trim());
 }
 
 /**
@@ -226,8 +229,8 @@ export function pastedTargetProblems(card: AiaOnboardingCard, values: Onboarding
       }
       if (PROJECT_KEY_FIELDS.has(field.key) && !isJiraProjectKey(value)) {
         problems.push(`${label}: ${runtimeText(
-          "지라 프로젝트 키는 대문자로 시작하는 2~10자입니다(예: QA).",
-          "A Jira project key is 2-10 characters starting with an uppercase letter (for example, QA).",
+          "지라 프로젝트 키는 대문자로 시작하는 대문자·숫자·밑줄 2~10자입니다(예: QA).",
+          "A Jira project key is 2-10 uppercase letters, digits or underscores starting with a letter (for example, QA).",
         )}`);
       }
     }

@@ -4586,6 +4586,7 @@ mod tests {
             model: None,
             git_branch: None,
             is_subagent: false,
+            parent_session_id: None,
             aia_workspace,
             aia_chat: false,
             aia_chat_opens_as_standard: false,
@@ -4599,6 +4600,8 @@ mod tests {
                 ..SessionMeta::default()
             },
             last_failure: None,
+            related_projects: Vec::new(),
+            written_dirs: Vec::new(),
         }
     }
 

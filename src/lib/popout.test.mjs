@@ -115,6 +115,10 @@ test("git diff 팝아웃은 프로젝트·경로·대상(스테이지/커밋)을
   assert.deepEqual(parsePopoutRequest(popoutSearch(commit)), commit);
   assert.notEqual(popoutWindowName(worktree), popoutWindowName(staged));
   assert.notEqual(popoutWindowName(staged), popoutWindowName(commit));
+  // 연결 워크트리에서 연 파일은 그 경로까지 오가고, 같은 파일이라도 프로젝트 쪽 창과 따로 선다.
+  const linked = { ...worktree, worktreePath: "/tmp/p/.rounds/wt-R01" };
+  assert.deepEqual(parsePopoutRequest(popoutSearch(linked)), linked);
+  assert.notEqual(popoutWindowName(linked), popoutWindowName(worktree));
   assert.match(popoutWindowName(commit), /^popout-gitDiff-[0-9A-Za-z_-]+$/);
   assert.equal(parsePopoutRequest("?popout=gitDiff&project=/tmp/p"), null);
   assert.equal(parsePopoutRequest("?popout=gitDiff&project=/tmp/p&path=a&commit=not-a-sha"), null);

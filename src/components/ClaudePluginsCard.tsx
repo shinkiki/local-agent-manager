@@ -79,6 +79,10 @@ function useClaudePluginsData(active: boolean) {
     if (loadedRef.current) return;
     loadedRef.current = true;
     void (async () => {
+      // 오류는 읽기를 시작할 때 한 번만 지운다. 브랜치 규칙은 따로 날아가 프로젝트별 상태보다
+      // 먼저 실패할 수 있는데, 끝에서 지우면 그 실패 배너가 뒤늦은 성공에 지워져 규칙 칸이
+      // 아무 안내 없이 비어 보인다.
+      setError(null);
       try {
         // C20: 로그인한 채널은 호스트와 같은 권한이라 접근 상태는 읽지 않는다. 토글을 잠그는
         // 것은 플러그인 자체의 잠금(C8-1 정책·사용자 지정 값)과 진행 중인 쓰기뿐이다.
@@ -94,7 +98,6 @@ function useClaudePluginsData(active: boolean) {
         void getClaudePluginBranchRules().then(setBranchRules).catch((cause) => setError(errorText(cause)));
         const projectResults = await Promise.all(activeProjects.map(async (project) => [project.path, await getClaudeSettingsStates(project.path)] as const));
         setProjectSnapshots(Object.fromEntries(projectResults));
-        setError(null);
       } catch (cause) {
         setError(errorText(cause));
       }

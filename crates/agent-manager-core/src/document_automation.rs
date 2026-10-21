@@ -817,7 +817,11 @@ impl DocumentAutomationSupervisor {
             }
             let snapshot = scan_root(Path::new(&root.root.path))?;
             let previous = load_root_snapshot(&self.inner.app_data_dir, &root.root.id)?;
-            if root_has_baseline(&self.inner.app_data_dir, &root.root.id)? {
+            // 꺼져 있는 동안 등록 폴더 설정에서 경로가 바뀌었으면 옛 폴더 기록과 견주지 않고
+            // 새 경로로 다시 기록만 한다. 견주면 두 폴더의 차이가 통째로 변경으로 잡힌다.
+            if baseline_root_path(&self.inner.app_data_dir, &root.root.id)?.as_deref()
+                == Some(root.root.path.as_str())
+            {
                 let changes = compare_snapshots(&previous, &snapshot);
                 if !changes.is_empty() {
                     offline_batches.push(change_batch(
@@ -876,7 +880,25 @@ impl DocumentAutomationSupervisor {
                 continue;
             }
             let current = scan_root(Path::new(&root.root.path))?;
-            if !root_has_baseline(&self.inner.app_data_dir, &root.root.id)? {
+            let Some(baseline_path) = baseline_root_path(&self.inner.app_data_dir, &root.root.id)?
+            else {
+                replace_root_snapshot(
+                    &self.inner.app_data_dir,
+                    &root.root.id,
+                    &root.root.path,
+                    &current,
+                )?;
+                continue;
+            };
+            if baseline_path != root.root.path {
+                // 등록 폴더 설정에서 경로가 바뀌었다. ID는 그대로라 옛 폴더 기록과 견주면
+                // 두 폴더의 차이가 통째로 변경으로 잡혀 트리거가 터진다. 옛 경로에서 쌓이던
+                // 대기 변경도 새 경로와 섞이지 않게 버리고, 새 경로로 다시 기록만 한다.
+                let mut runtime = lock_runtime(&self.inner)?;
+                if runtime.pending_roots.remove(&root.root.id).is_some() {
+                    save_pending_state(&self.inner.app_data_dir, &runtime)?;
+                }
+                drop(runtime);
                 replace_root_snapshot(
                     &self.inner.app_data_dir,
                     &root.root.id,
@@ -1203,12 +1225,10 @@ fn scan_root(root: &Path) -> Result<BTreeMap<String, FileState>, CoreError> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                if error.io_error().is_some_and(|io| {
-                    matches!(
-                        io.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                    )
-                }) {
+                if error
+                    .io_error()
+                    .is_some_and(|io| is_skippable_scan_error(io.kind()))
+                {
                     continue;
                 }
                 return Err(CoreError::Runtime(format!(
@@ -1219,25 +1239,43 @@ fn scan_root(root: &Path) -> Result<BTreeMap<String, FileState>, CoreError> {
         if entry.depth() == 0 || !entry.file_type().is_file() {
             continue;
         }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        let Some(state) = regular_file_state(entry.path())? else {
             continue;
-        }
+        };
         let relative_path = entry
             .path()
             .strip_prefix(&canonical)
             .map_err(|_| CoreError::InvalidInput("허용된 경로를 벗어났습니다".to_owned()))?
             .to_string_lossy()
             .replace('\\', "/");
-        snapshot.insert(
-            relative_path,
-            FileState {
-                size_bytes: metadata.len(),
-                modified_ns: modified_ns(&metadata),
-            },
-        );
+        snapshot.insert(relative_path, state);
     }
     Ok(snapshot)
+}
+
+/// 순회와 상태 조회 사이에 지워졌거나 권한이 바뀐 파일은 순회 오류와 같은 규칙으로 건너뛴다.
+/// 감시 중인 폴더는 편집 중인 폴더라 이 틈이 흔하고, 여기서 `?`로 실패하면 그 폴더 하나가
+/// 아니라 그 회차의 모든 등록 폴더 폴링이 멈춘다. 일반 파일이 아니면 `None`.
+fn regular_file_state(path: &Path) -> Result<Option<FileState>, CoreError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if is_skippable_scan_error(error.kind()) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    Ok(Some(FileState {
+        size_bytes: metadata.len(),
+        modified_ns: modified_ns(&metadata),
+    }))
+}
+
+fn is_skippable_scan_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    )
 }
 
 fn modified_ns(metadata: &fs::Metadata) -> i64 {
@@ -1761,15 +1799,15 @@ fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentTriggerRun>
     })
 }
 
-fn root_has_baseline(app_data_dir: &Path, root_id: &str) -> Result<bool, CoreError> {
+/// 이 등록 폴더의 기록이 어느 경로에서 떠졌는지. 기록이 없으면 `None`.
+fn baseline_root_path(app_data_dir: &Path, root_id: &str) -> Result<Option<String>, CoreError> {
     let connection = open_database(app_data_dir)?;
-    Ok(query_optional(
+    query_optional(
         &connection,
-        "SELECT 1 FROM root_baselines WHERE root_id = ?1",
+        "SELECT root_path FROM root_baselines WHERE root_id = ?1",
         params![root_id],
-        |_| Ok(()),
-    )?
-    .is_some())
+        |row| row.get(0),
+    )
 }
 
 fn load_root_snapshot(
@@ -2113,6 +2151,23 @@ mod tests {
     }
 
     #[test]
+    fn a_file_removed_between_walk_and_stat_is_skipped_not_fatal() {
+        let temp = tempfile::tempdir().expect("temp");
+        let present = temp.path().join("present.md");
+        fs::write(&present, "x").expect("file");
+        assert_eq!(
+            regular_file_state(&present)
+                .expect("present")
+                .map(|s| s.size_bytes),
+            Some(1)
+        );
+        assert!(regular_file_state(&temp.path().join("gone.md"))
+            .expect("missing file must not fail the scan")
+            .is_none());
+        assert!(regular_file_state(temp.path()).expect("dir").is_none());
+    }
+
+    #[test]
     fn enabling_a_trigger_requires_the_action_to_be_reapproved() {
         let temp = tempfile::tempdir().expect("temp");
         let app_data = temp.path().join("app-data");
@@ -2218,6 +2273,64 @@ mod tests {
             .expect("one action");
         assert_eq!(context.batch.total_count, 1);
         assert_eq!(context.batch.changes[0].relative_path, "note.md");
+    }
+
+    #[test]
+    fn moving_a_root_to_another_path_rebaselines_without_dispatching() {
+        let temp = tempfile::tempdir().expect("temp");
+        let app_data = temp.path().join("app-data");
+        let root = temp.path().join("docs");
+        let moved = temp.path().join("moved");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(&moved).expect("moved");
+        fs::write(root.join("old.md"), "old").expect("old file");
+        fs::write(moved.join("new.md"), "new").expect("new file");
+        let root_id = register_root(&app_data, &root);
+        let (executor, receiver) = executor();
+        let supervisor =
+            DocumentAutomationSupervisor::new_without_background_runner(app_data.clone(), executor)
+                .expect("supervisor");
+        supervisor
+            .create_trigger(trigger_input(root_id.clone()))
+            .expect("trigger");
+        let start = now_ms();
+        // 옛 경로에서 쌓이던 대기 변경도 경로가 바뀌면 버려야 한다.
+        fs::write(root.join("pending.md"), "pending").expect("pending change");
+        supervisor.poll_once_for_test(start).expect("pending poll");
+
+        crate::update_doc_root(
+            &app_data,
+            crate::UpdateDocRootRequest {
+                id: root_id,
+                name: "docs".to_owned(),
+                path: moved.to_string_lossy().into_owned(),
+                note: None,
+                agent_enabled: true,
+                create_if_missing: false,
+            },
+        )
+        .expect("move root");
+        supervisor
+            .poll_once_for_test(start + 1)
+            .expect("rebaseline poll");
+        supervisor
+            .poll_once_for_test(start + DEFAULT_DEBOUNCE_MS + 2)
+            .expect("quiet poll");
+        assert!(receiver.try_recv().is_err());
+
+        // 다시 기록한 뒤에는 새 경로의 변경이 그대로 트리거된다.
+        fs::write(moved.join("after.md"), "after").expect("change after move");
+        supervisor
+            .poll_once_for_test(start + DEFAULT_DEBOUNCE_MS + 3)
+            .expect("change poll");
+        supervisor
+            .poll_once_for_test(start + 2 * DEFAULT_DEBOUNCE_MS + 4)
+            .expect("debounced poll");
+        let context = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("one action");
+        assert_eq!(context.batch.total_count, 1);
+        assert_eq!(context.batch.changes[0].relative_path, "after.md");
     }
 
     #[test]

@@ -42,6 +42,7 @@ import { AppToggle, ErrorBanner, NoticeBanner, PathField, useConfirm, type Confi
 import { errorText } from "../lib/errorText";
 import { codeLanguageForPath } from "../lib/codeHighlight";
 import { displayPath } from "../lib/displayPath";
+import { createLatestGate } from "../lib/latestRequest";
 import { HighlightedCodeBlock } from "./LinkedFilePreview";
 import { MarkdownPreview } from "./MarkdownPreview";
 
@@ -241,19 +242,26 @@ function useCypressFileEditor({ workspace, runBusy, confirm, onNotice }: {
     if (file.masked) setMaskedPaths(withPath(path));
   }, []);
 
+  // 작업공간 전환 효과와 다시 읽기 버튼이 같은 읽기를 부른다. 앞서 고른 작업공간의 목록이
+  // 늦게 도착하면 지금 작업공간의 목록·활성 경로를 덮어써, 그 경로를 다른 작업공간에서
+  // 읽고 저장하게 되므로 마지막 호출의 응답만 반영한다.
+  const [loadGate] = useState(createLatestGate);
+
   const loadFiles = useCallback(async (target: CypressWorkspace) => {
+    const current = loadGate.begin();
+    const stillCurrent = () => alive() && current();
     resetEditorState();
     try {
       const listed = await listCypressWorkspaceFiles(target.id);
-      if (!alive()) return;
+      if (!stillCurrent()) return;
       setFiles(listed.files);
       setTruncated(listed.truncated);
       const first = PREFERRED_FIRST_FILES.find((name) => listed.files.some((file) => file.path === name)) ?? listed.files[0]?.path ?? null;
       setActivePath(first);
     } catch (cause) {
-      if (alive()) setFileError(errorText(cause));
+      if (stillCurrent()) setFileError(errorText(cause));
     }
-  }, [resetEditorState, alive]);
+  }, [resetEditorState, alive, loadGate]);
 
   // 작업공간을 바꾸면 파일 목록을 그 작업공간 기준으로 다시 읽는다.
   useEffect(() => {

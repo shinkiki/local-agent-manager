@@ -521,6 +521,9 @@ pub struct AutoSwitchEventView {
     pub sessions_to_account_id: Option<String>,
 }
 
+/// Antigravity CLI에 한 계정으로 묻기 위한 프로필 홈과 그 자식에 얹을 환경변수.
+type AntigravityQueryHome = (PathBuf, Vec<(String, String)>);
+
 /// 채팅 런타임에 주입할 계정별 자격증명 프로필. 공급자 홈은 공유한 채 자격증명만
 /// 갈라내므로, 서로 다른 계정에 묶인 세션이 같은 트랜스크립트·스킬 위에서 동시에
 /// 요청을 보낼 수 있다.
@@ -3041,18 +3044,52 @@ impl AccountSupervisor {
         self.snapshot()
     }
 
-    /// Codex 공식 app-server가 제공하는 `account/rateLimits/read`로 사용량을 읽는다.
-    /// app-server가 액세스 토큰을 갱신하면 C4 프로필에 기록된 새 사슬을 Vault로 다시
-    /// 채택한다. 공식 API가 없는 구버전 CLI에서만 기존 읽기 전용 HTTP 조회로 폴백한다.
     /// 이 계정의 홈으로 `/usage`를 묻는다. Antigravity에는 계정을 인자로 받는 조회가 없어
     /// 홈을 바꾸는 것이 곧 계정을 고르는 일이다(C12-7).
-    ///
-    /// 프로필을 준비하지 않는다. 준비 경로는 프로브로 CLI를 한 번 더 띄우는데, 그 프로브가
-    /// 쓰는 명령이 바로 이 `/usage`라 조회 한 번이 두 번이 된다. 자리만 계산해 넘긴다.
     fn fetch_antigravity_usage(
         &self,
         account: &AccountRecord,
     ) -> Result<(AccountUsageView, bool), CoreError> {
+        // 토큰이 없으면 CLI가 브라우저 로그인 창을 띄우고 기다린다. 조회 실패가 아니라
+        // 자격증명 문제로 알려, 계정 카드가 재인증을 안내하게 한다.
+        let Some((home, env)) = self.antigravity_query_home(account, "사용량 조회")? else {
+            return Ok((
+                usage_error_result(CoreError::Runtime(
+                    "Antigravity 계정 홈에 로그인 토큰이 없습니다".to_owned(),
+                )),
+                true,
+            ));
+        };
+        Ok((crate::antigravity_usage::account_usage(&home, &env), false))
+    }
+
+    /// 활성 Antigravity 계정 홈으로 `agy models`를 띄울 환경변수. 모델 목록 조회도
+    /// 계정을 인자로 받지 않아, 홈을 주지 않으면 로그인된 계정이 있어도 공유 홈을 보고
+    /// "로그인 필요"로 실패한다. 활성 계정이 없거나 그 홈에 토큰이 없으면 `None`이다.
+    pub(crate) fn antigravity_model_catalog_env(
+        &self,
+    ) -> Result<Option<Vec<(String, String)>>, CoreError> {
+        let Some(account_id) = self.active_account_id(ProviderId::Antigravity)? else {
+            return Ok(None);
+        };
+        let account = self.account_record(&account_id)?;
+        // 프로필과 볼트를 맞추는 일은 사용량 갱신과 같은 계정 잠금 안에서 한다. 갱신이
+        // 회전한 토큰을 이쪽이 옛 값으로 되돌리지 않게 한다.
+        let usage_lock = self.usage_refresh_lock(&account.id)?;
+        let _usage_refresh = lock(&usage_lock, "계정 사용량 갱신")?;
+        Ok(self
+            .antigravity_query_home(&account, "모델 목록 조회")?
+            .map(|(_, env)| env))
+    }
+
+    /// 이 계정으로 Antigravity CLI에 한 번 묻기 위한 홈과 환경변수. 프로브를 띄우는
+    /// `runtime_credential_profile`과 달리 자리만 세우고 자격증명을 맞춘다 — 조회 하나가
+    /// CLI 두 번이 되지 않게 한다. 홈에 로그인 토큰이 없으면 `None`이다.
+    fn antigravity_query_home(
+        &self,
+        account: &AccountRecord,
+        stage: &str,
+    ) -> Result<Option<AntigravityQueryHome>, CoreError> {
         // 조회만 하러 와도 프로필을 먼저 세운다. 자리가 없으면 자격증명이 볼트에 멀쩡히
         // 있는데도 "토큰 없음"으로 판정돼 계정 카드가 재인증을 요구한다.
         let home = credential_profiles::ensure_profile_dir(
@@ -3067,27 +3104,23 @@ impl AccountSupervisor {
         )?;
         ensure_profile_keychain(&home)?;
         self.sync_profile_credential(account, &home)?;
-        // 토큰이 없으면 CLI가 브라우저 로그인 창을 띄우고 기다린다. 조회 실패가 아니라
-        // 자격증명 문제로 알려, 계정 카드가 재인증을 안내하게 한다.
         if !antigravity_credentials_present(&home) {
-            return Ok((
-                usage_error_result(CoreError::Runtime(
-                    "Antigravity 계정 홈에 로그인 토큰이 없습니다".to_owned(),
-                )),
-                true,
-            ));
+            return Ok(None);
         }
         let env = credential_profiles::profile_env(
             ProviderId::Antigravity,
             &home,
             self.provider_root(ProviderId::Antigravity)?,
         )?;
-        // C12-11 2단계. 사용량 조회도 프로필 HOME으로 뜨는 실행이다. 항목을 비우지 않으면 CLI가
+        // C12-11 2단계. 조회도 프로필 HOME으로 뜨는 실행이다. 항목을 비우지 않으면 CLI가
         // 그 항목의 계정으로 답해 카드가 다른 로그인의 잔량을 보인다(C12-5가 기록한 증상).
-        self.clear_antigravity_global_login_for_start("사용량 조회")?;
-        Ok((crate::antigravity_usage::account_usage(&home, &env), false))
+        self.clear_antigravity_global_login_for_start(stage)?;
+        Ok(Some((home, env)))
     }
 
+    /// Codex 공식 app-server가 제공하는 `account/rateLimits/read`로 사용량을 읽는다.
+    /// app-server가 액세스 토큰을 갱신하면 C4 프로필에 기록된 새 사슬을 Vault로 다시
+    /// 채택한다. 공식 API가 없는 구버전 CLI에서만 기존 읽기 전용 HTTP 조회로 폴백한다.
     fn fetch_codex_usage_with_cli(
         &self,
         account: &AccountRecord,
@@ -3105,7 +3138,8 @@ impl AccountSupervisor {
             return direct();
         };
 
-        let response = request_codex_usage_from_app_server(&executable, &profile.env);
+        let may_refresh = self.account_runtime_count(&account.id)? == 0;
+        let response = request_codex_usage_from_app_server(&executable, &profile.env, may_refresh);
         // 공식 CLI가 성공 응답 전 토큰을 회전했을 수도 있으므로 성공·실패와 무관하게
         // 프로필을 다시 읽는다. 값은 Rust Core 안에서만 다루고 프론트로 내보내지 않는다(G4).
         self.sync_profile_credential(account, &profile.dir)?;
@@ -3117,6 +3151,12 @@ impl AccountSupervisor {
                     "Codex 공식 CLI가 자격증명을 갱신하지 못했습니다. 이 계정을 다시 인증해 주세요",
                 ),
                 true,
+            )),
+            CodexCliUsageResponse::RefreshDeferred => Ok((
+                usage_retry_soon(
+                    "실행 중인 Codex 세션이 이 계정 자격증명을 쥐고 있어 토큰 갱신을 미룹니다",
+                ),
+                false,
             )),
         }
     }
@@ -6403,9 +6443,15 @@ enum CodexCliUsageResponse {
     Usage(AccountUsageView),
     /// `account/rateLimits/read`가 아직 없는 구버전 CLI. 이때만 직접 조회를 유지한다.
     Unsupported,
-    /// 공식 CLI가 자체 갱신까지 시도한 뒤 인증 거부를 확정했다.
+    /// 공식 갱신 요청까지 거친 뒤에도 인증이 거부됐다.
     CredentialRejected,
+    /// 조회가 거부됐지만 이 계정으로 도는 Codex가 있어 갱신을 그 CLI에 맡겼다.
+    RefreshDeferred,
 }
+
+/// 강제 갱신은 서버가 리프레시 토큰을 회전한 뒤 Codex가 프로필에 새 사슬을 쓰기 전에
+/// 끊기면 옛 토큰은 소비되고 새 토큰은 사라진다. 조회보다 넉넉히 기다린다(실측 2.3초).
+const CODEX_TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 struct CodexRpcError {
@@ -6425,6 +6471,7 @@ fn codex_app_server_request(
     what: &str,
     method: &str,
     params: Value,
+    timeout: Duration,
 ) -> Result<Result<Value, CodexRpcError>, CoreError> {
     let mut command = Command::new(executable);
     command
@@ -6483,11 +6530,11 @@ fn codex_app_server_request(
         let _ = sender.send(result);
     });
 
-    let result = match receiver.recv_timeout(USAGE_TIMEOUT) {
+    let result = match receiver.recv_timeout(timeout) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => Err(CoreError::Runtime(format!(
             "Codex 공식 {what}이(가) {}초를 초과했습니다",
-            USAGE_TIMEOUT.as_secs()
+            timeout.as_secs()
         ))),
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(CoreError::Runtime(format!(
             "Codex 공식 {what} 작업이 예기치 않게 종료되었습니다"
@@ -6499,7 +6546,60 @@ fn codex_app_server_request(
     result
 }
 
+/// 사용량을 묻고, 인증 거부면 공식 갱신을 한 번 거친 뒤 다시 묻는다.
+///
+/// 서버는 JWT 만료 전에도 토큰을 `token_expired`로 만료시킨다 — 2026-10-20 워크스페이스
+/// 플랜이 바뀐 순간 그 소속 계정 셋이 한꺼번에 그랬다. `account/rateLimits/read`는 이 401을
+/// 스스로 갱신으로 넘기지 않고 바로 돌려줘서, 리프레시 사슬이 멀쩡한데도 계정이 재인증으로
+/// 내려갔다. 갱신 요청이 거부되거나 갱신 뒤에도 거부될 때만 재인증 판정을 남긴다.
+///
+/// `may_refresh`가 거짓이면(이 계정으로 도는 Codex가 있으면) 갱신하지 않는다. 같은 프로필의
+/// 리프레시 토큰은 한 번만 쓸 수 있어, 그 CLI와 동시에 회전하면 진 쪽이 끊기거나 이긴 회전을
+/// 거부로 오판한다. Claude 경로의 `claude_refresh_deferred`와 같은 원칙이다.
 fn request_codex_usage_from_app_server(
+    executable: &Path,
+    env: &[(String, String)],
+    may_refresh: bool,
+) -> Result<CodexCliUsageResponse, CoreError> {
+    match read_codex_usage_from_app_server(executable, env)? {
+        CodexCliUsageResponse::CredentialRejected => {}
+        response => return Ok(response),
+    }
+    if !may_refresh {
+        return Ok(CodexCliUsageResponse::RefreshDeferred);
+    }
+    if !refresh_codex_token_with_app_server(executable, env)? {
+        return Ok(CodexCliUsageResponse::CredentialRejected);
+    }
+    read_codex_usage_from_app_server(executable, env)
+}
+
+/// 공식 `account/read`의 `refreshToken`으로 사슬을 회전시킨다. 새 토큰은 Codex가 프로필에
+/// 직접 쓰고, 호출부가 그 프로필을 Vault로 다시 채택한다.
+///
+/// 거짓은 갱신이 인증으로 거부됐거나, 구버전 CLI라 갱신 요청을 모르는 경우다 — 후자는 이
+/// 경로가 생기기 전과 같은 재인증 판정으로 둔다. 프로세스 종료·네트워크 같은 그 밖의 실패는
+/// 일시 오류로 올려 재인증으로 내리지 않는다.
+fn refresh_codex_token_with_app_server(
+    executable: &Path,
+    env: &[(String, String)],
+) -> Result<bool, CoreError> {
+    match codex_app_server_request(
+        executable,
+        env,
+        "토큰 갱신",
+        "account/read",
+        serde_json::json!({"refreshToken": true}),
+        CODEX_TOKEN_REFRESH_TIMEOUT,
+    )? {
+        Ok(_) => Ok(true),
+        Err(error) if matches!(error.code, -32601 | -32602) => Ok(false),
+        Err(error) if codex_rpc_rejects_credential(&error) => Ok(false),
+        Err(error) => Err(codex_rpc_core_error(error)),
+    }
+}
+
+fn read_codex_usage_from_app_server(
     executable: &Path,
     env: &[(String, String)],
 ) -> Result<CodexCliUsageResponse, CoreError> {
@@ -6509,6 +6609,7 @@ fn request_codex_usage_from_app_server(
         "사용량 조회",
         "account/rateLimits/read",
         Value::Null,
+        USAGE_TIMEOUT,
     )? {
         Ok(result) => {
             let limits = result.get("rateLimits").ok_or_else(|| {
@@ -6570,6 +6671,7 @@ fn consume_codex_reset_credit_from_app_server(
         "한도 리셋",
         "account/rateLimitResetCredit/consume",
         serde_json::json!({"idempotencyKey": idempotency_key}),
+        USAGE_TIMEOUT,
     )?
     .map_err(codex_rpc_core_error)?;
     result
@@ -7147,7 +7249,7 @@ fn usage_indicates_exhaustion(usage: &AccountUsageView) -> bool {
 /// 모든 모델군 창이 갈린다. 구분자가 없는 모델 한정 창(Claude의 `Fable 7일`)은 라벨 전체가
 /// 그룹이 되어 저 혼자 한 그룹을 이룬다.
 fn model_group_of(label: &str) -> &str {
-    label.split_once(" · ").map_or(label, |(group, _)| group)
+    crate::antigravity_usage::group_of_label(label)
 }
 
 /// 이 계정을 **통째로** 막는 소진인지. `full`은 창 하나가 다 찼는지 보는 규칙이며, 부르는
@@ -7335,20 +7437,13 @@ fn model_scoped_windows<'a>(
     let (ProviderId::Antigravity, Some(model)) = (provider, model) else {
         return Vec::new();
     };
-    // 모델군을 가릴 수 없는 이름은 계정 전체 판정에 맡긴다. `model_consumes_window`는
+    // 모델군을 가릴 수 없는 이름은 계정 전체 판정에 맡긴다(빈 목록). `model_consumes_window`는
     // 모르는 모델을 모든 창에 걸리게 하는데(점유를 셀 때는 그래야 겹쳐 띄우지 않는다),
     // 게이트에서 그대로 쓰면 한 모델군만 차도 막혀 모델을 아예 밝히지 않은 실행보다
-    // 엄격해진다 — 모델을 적었다고 더 막히는 것은 뒤집힌 결과다.
-    if crate::antigravity_usage::pacing_resource_id_for_model(model).is_err() {
-        return Vec::new();
-    }
-    windows
-        .iter()
-        .filter(|window| {
-            window.model_scoped
-                && crate::antigravity_usage::model_consumes_window(model, &window.label)
-        })
-        .collect()
+    // 엄격해진다 — 모델을 적었다고 더 막히는 것은 뒤집힌 결과다. 같은 이유로 게이트는 계열
+    // 키워드가 아니라 이 모델이 실제로 쓰는 모델군 하나의 창만 본다 — Argon 쿼터가 찼다고
+    // 같은 계열의 Flash까지 막지 않는다. 페이싱 계획 창과 같은 판정이다.
+    crate::antigravity_usage::model_group_windows(model, windows)
 }
 
 /// 한도에 걸린 계정을 다시 시도해 볼 만한 가장 이른 시각. 캐시된 백오프와 소진된
@@ -7893,16 +7988,62 @@ fn account_readiness(
     model: Option<&str>,
     now: i64,
 ) -> RunReadiness {
-    if account.provider != provider || account.disabled {
+    if account.provider != provider {
         return RunReadiness::Disabled;
     }
-    if let Some(readiness) = auth_readiness(account.auth_status, &account.usage) {
+    readiness_from_state(
+        provider,
+        account.disabled,
+        account.auth_status,
+        &account.usage,
+        model,
+        now,
+    )
+}
+
+/// 페이싱 계획이 보는 계정 보기로 실행 게이트와 **같은** 판정을 낸다.
+///
+/// 계획은 레지스트리 레코드가 아니라 화면용 보기(`ProviderAccountView`)를 받으므로 게이트
+/// 함수를 그대로 부를 수 없었고, 계획 쪽(`usage_pacing::skip_reason`)이 조건을 따로 적었다.
+/// 그 사본이 갈라졌다 — 에이전트가 보고한 한도(`rate_limited`, 재시도 시각 없음)와 갱신 제한
+/// 중인 인증 오류를 계획은 통과시키고 게이트(`validate_account_pin`)는 거부해, 회차가 그 계정에
+/// 자리를 배정하고 기동에서 "사용량이 소진된 계정은 고정할 수 없습니다"로 실패했다
+/// (2026-10-21). 같은 재료로 같은 함수를 부르게 해 두 판정이 다시 갈리지 않게 한다.
+pub(crate) fn account_view_readiness(
+    account: &ProviderAccountView,
+    model: Option<&str>,
+    now: i64,
+) -> RunReadiness {
+    readiness_from_state(
+        account.provider,
+        account.disabled,
+        account.auth_status,
+        &account.usage,
+        model,
+        now,
+    )
+}
+
+/// [`account_readiness`]와 [`account_view_readiness`]가 공유하는 본체. 사용 중지 → 인증 →
+/// 사용량(이번 실행의 모델군 창, 모르면 계정 전체) 순으로 본다.
+fn readiness_from_state(
+    provider: ProviderId,
+    disabled: bool,
+    auth_status: AccountAuthStatus,
+    usage: &AccountUsageView,
+    model: Option<&str>,
+    now: i64,
+) -> RunReadiness {
+    if disabled {
+        return RunReadiness::Disabled;
+    }
+    if let Some(readiness) = auth_readiness(auth_status, usage) {
         return readiness;
     }
-    let model_windows = model_scoped_windows(provider, model, &account.usage.windows);
-    if usage_blocks_run(&account.usage, &model_windows, now) {
+    let model_windows = model_scoped_windows(provider, model, &usage.windows);
+    if usage_blocks_run(usage, &model_windows, now) {
         return RunReadiness::UsageExhausted {
-            resume_at: usage_resume_at(&account.usage, &model_windows, now),
+            resume_at: usage_resume_at(usage, &model_windows, now),
         };
     }
     RunReadiness::Ready
@@ -8757,6 +8898,126 @@ mod tests {
             code: -32603,
             message: "network unavailable".to_owned(),
         }));
+    }
+
+    /// 갱신 전까지 사용량 조회를 `token_expired`로 거부하는 app-server. 2026-10-20 실측
+    /// 그대로다 — 조회 자체는 갱신하지 않고, `account/read`의 `refreshToken`만 사슬을 돌린다.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum FakeCodexRefresh {
+        /// 사슬을 회전시켜 다음 조회가 통과한다.
+        Rotates,
+        /// 리프레시 토큰이 이미 소비돼 갱신이 거부된다.
+        Rejected,
+        /// 인자를 모르는 구버전처럼 성공만 돌려주고 회전하지 않는다.
+        Ignored,
+    }
+
+    #[cfg(unix)]
+    fn fake_codex_app_server(dir: &Path, refresh: FakeCodexRefresh) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fresh = dir.join("fresh");
+        let log = dir.join("calls");
+        let ok = r#"echo '{"id":2,"result":{"account":null}}'"#;
+        let refresh = match refresh {
+            FakeCodexRefresh::Rotates => format!("touch '{}'; {ok}", fresh.display()),
+            FakeCodexRefresh::Rejected => {
+                r#"echo '{"id":2,"error":{"code":-32603,"message":"refresh token was already used"}}'"#
+                    .to_owned()
+            }
+            FakeCodexRefresh::Ignored => ok.to_owned(),
+        };
+        let script = format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) echo '{{"id":1,"result":{{}}}}' ;;
+    *'"account/read"'*'"refreshToken":true'*) echo refresh >> '{log}'; {refresh} ;;
+    *'"account/read"'*) echo read-without-refresh >> '{log}' ;;
+    *'"account/rateLimits/read"'*)
+      echo read >> '{log}'
+      if [ -f '{fresh}' ]; then
+        echo '{{"id":2,"result":{{"rateLimits":{{"primary":{{"usedPercent":7,"windowDurationMins":300,"resetsAt":1792476503}}}}}}}}'
+      else
+        echo '{{"id":2,"error":{{"code":-32603,"message":"unexpected status 401 Unauthorized, auth error code: token_expired"}}}}'
+      fi ;;
+  esac
+done
+"#,
+            log = log.display(),
+            fresh = fresh.display(),
+        );
+        let path = dir.join("codex");
+        fs::write(&path, script).expect("fake codex");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+
+    #[cfg(unix)]
+    fn fake_codex_calls(dir: &Path) -> String {
+        fs::read_to_string(dir.join("calls")).unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_usage_survives_server_side_token_expiry_through_official_refresh() {
+        let dir = tempfile::tempdir().expect("dir");
+        let executable = fake_codex_app_server(dir.path(), FakeCodexRefresh::Rotates);
+
+        let response = request_codex_usage_from_app_server(&executable, &[], true).expect("usage");
+
+        let CodexCliUsageResponse::Usage(usage) = response else {
+            panic!("갱신 뒤 재조회가 사용량을 돌려줘야 한다");
+        };
+        assert_eq!(usage.windows[0].used_percent, 7.0);
+        assert_eq!(fake_codex_calls(dir.path()), "read\nrefresh\nread\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_usage_requires_reauthentication_when_official_refresh_is_rejected() {
+        let dir = tempfile::tempdir().expect("dir");
+        let executable = fake_codex_app_server(dir.path(), FakeCodexRefresh::Rejected);
+
+        let response = request_codex_usage_from_app_server(&executable, &[], true).expect("usage");
+
+        assert!(matches!(
+            response,
+            CodexCliUsageResponse::CredentialRejected
+        ));
+        // 갱신이 거부되면 같은 토큰으로 다시 묻지 않는다.
+        assert_eq!(fake_codex_calls(dir.path()), "read\nrefresh\n");
+    }
+
+    /// 갱신 인자를 무시하는 CLI에서는 재조회도 거부된다. 이 경로가 생기기 전과 같은
+    /// 재인증 판정으로 끝나야 한다.
+    #[cfg(unix)]
+    #[test]
+    fn codex_usage_requires_reauthentication_when_refresh_does_not_rotate() {
+        let dir = tempfile::tempdir().expect("dir");
+        let executable = fake_codex_app_server(dir.path(), FakeCodexRefresh::Ignored);
+
+        let response = request_codex_usage_from_app_server(&executable, &[], true).expect("usage");
+
+        assert!(matches!(
+            response,
+            CodexCliUsageResponse::CredentialRejected
+        ));
+        assert_eq!(fake_codex_calls(dir.path()), "read\nrefresh\nread\n");
+    }
+
+    /// 이 계정으로 도는 Codex가 있으면 그 CLI가 회전 주인이다. 앱이 같은 리프레시 토큰을
+    /// 쓰지 않고, 재인증 대신 대기로 둔다.
+    #[cfg(unix)]
+    #[test]
+    fn codex_usage_leaves_token_refresh_to_a_running_session() {
+        let dir = tempfile::tempdir().expect("dir");
+        let executable = fake_codex_app_server(dir.path(), FakeCodexRefresh::Rotates);
+
+        let response = request_codex_usage_from_app_server(&executable, &[], false).expect("usage");
+
+        assert!(matches!(response, CodexCliUsageResponse::RefreshDeferred));
+        assert_eq!(fake_codex_calls(dir.path()), "read\n");
     }
 
     #[test]
@@ -9785,6 +10046,47 @@ mod tests {
                 .is_empty()
         );
         assert!(model_scoped_windows(ProviderId::Antigravity, None, &usage.windows).is_empty());
+    }
+
+    /// 같은 계열에 특정 모델 줄의 모델군이 따로 쿼터를 들면(2026-10-19 `Gemini 4 Argon`) 게이트는
+    /// 그 줄의 모델에만 그 창을 건다. 계열 키워드로 묶으면 Argon이 찼다고 Flash까지 막혀,
+    /// Gemini Models 창으로 세운 계획이 실행 직전에 "소진된 계정"으로 거부된다.
+    #[test]
+    fn a_model_line_group_gates_only_its_own_models() {
+        let now = 1_000_000;
+        let argon_reset = now + 100 * HOUR_MS;
+        let mut usage = model_group_usage(9.7, 0.0, now + 50 * HOUR_MS);
+        usage.windows.push(AccountUsageWindow {
+            label: "Gemini 4 Argon · 7일".to_owned(),
+            used_percent: 100.0,
+            resets_at: Some(argon_reset),
+            model_scoped: true,
+            aggregate: false,
+        });
+        let of = |model| model_scoped_windows(ProviderId::Antigravity, Some(model), &usage.windows);
+        let labels = |model| -> Vec<String> {
+            of(model)
+                .iter()
+                .map(|window| window.label.clone())
+                .collect()
+        };
+
+        assert_eq!(labels("gemini-3.8-flash-high"), ["Gemini Models · 7일"]);
+        assert!(!usage_blocks_run(&usage, &of("gemini-3.8-flash-high"), now));
+
+        assert_eq!(labels("gemini-4-argon-high"), ["Gemini 4 Argon · 7일"]);
+        assert!(usage_blocks_run(&usage, &of("gemini-4-argon-high"), now));
+        assert_eq!(
+            usage_resume_at(&usage, &of("gemini-4-argon-high"), now),
+            Some(argon_reset)
+        );
+
+        assert_eq!(
+            labels("claude-opus-4-6-thinking"),
+            ["Claude and GPT models · 7일"]
+        );
+        // 계정 전체로는 아직 열려 있다 — Argon 하나가 찼을 뿐이다.
+        assert!(!usage_blocks_run(&usage, &[], now));
     }
 
     #[test]

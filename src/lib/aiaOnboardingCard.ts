@@ -29,12 +29,8 @@ import { parallelFields, supportsParallel } from "./aiaOnboardingParallel.ts";
  */
 export function cardSteps(card: AiaOnboardingCard): AiaOnboardingStep[] {
   if (!supportsParallel(card)) return card.steps;
-  const projectPathField = card.actions.reduce<string>(
-    (found, action) => (action.kind === "registerWorkflow" ? action.workflow.projectPathField : found),
-    "projectPath",
-  );
   return card.steps.map((step, index) => (index === card.steps.length - 1
-    ? { ...step, fields: [...step.fields, ...parallelFields(projectPathField)] }
+    ? { ...step, fields: [...step.fields, ...parallelFields()] }
     : step));
 }
 

@@ -25,6 +25,8 @@ import type {
   ProjectFileView,
   ProjectFileSearchPage,
   ProjectBranchFollows,
+  ProjectGitRemoteTokens,
+  SetProjectGitRemoteTokenRequest,
   ProjectFileSearchRequest,
   ProjectOverlayReapply,
   ProjectOverlayReceipt,
@@ -76,8 +78,9 @@ export function getProjectGitOverview(projectPath: string): Promise<GitOverview>
   return call<GitOverview>("get_project_git_overview", { request: { projectPath } });
 }
 
-export function getProjectGitStatus(projectPath: string): Promise<GitStatus> {
-  return call<GitStatus>("get_project_git_status", { request: { projectPath } });
+/** `worktreePath`를 주면 프로젝트 저장소에 연결된 그 워크트리를 읽는다(읽기 전용). */
+export function getProjectGitStatus(projectPath: string, worktreePath: string | null = null): Promise<GitStatus> {
+  return call<GitStatus>("get_project_git_status", { request: { projectPath, worktreePath } });
 }
 
 export function getProjectGitDiff(request: ProjectGitDiffRequest): Promise<GitDiff> {
@@ -111,6 +114,21 @@ export function setProjectBranchFollow(
   request: SetProjectBranchFollowRequest,
 ): Promise<ProjectBranchFollows> {
   return call<ProjectBranchFollows>("set_project_branch_follow", { request });
+}
+
+/**
+ * C16-11. 이 프로젝트가 HTTPS 원격 호스트마다 고른 git 원격용 토큰(저장된 비밀값 이름)과
+ * 고를 수 있는 이름 목록. 값은 실리지 않는다.
+ */
+export function listProjectGitRemoteTokens(projectPath: string): Promise<ProjectGitRemoteTokens> {
+  return call<ProjectGitRemoteTokens>("list_project_git_remote_tokens", { request: { projectPath } });
+}
+
+/** C16-11. 한 호스트에 저장된 비밀값 하나를 고르거나, `secretName`을 null로 보내 해제한다. */
+export function setProjectGitRemoteToken(
+  request: SetProjectGitRemoteTokenRequest,
+): Promise<ProjectGitRemoteTokens> {
+  return call<ProjectGitRemoteTokens>("set_project_git_remote_token", { request });
 }
 
 /** 커밋 하나가 바꾼 파일 목록. 파일별 내용은 `getProjectGitDiff`에 `commit`을 주어 읽는다. */
@@ -150,7 +168,10 @@ export function pullProjectGit(request: ProjectGitPullRequest): Promise<GitActio
   return call<GitActionReceipt>("pull_project_git", { request });
 }
 
-/** 호스트 화면 전용. 원격 UI에서는 백엔드가 거절한다. */
+/**
+ * `push <remote> HEAD`. 로그인을 통과한 모든 채널에서 열린다(C16-7 2026-10-10, G11).
+ * 실행은 비대화형이라 호스트가 이미 가진 자격증명만 쓰고, 없으면 `authFailed` 영수증으로 끝난다.
+ */
 export function pushProjectGit(request: ProjectGitPushRequest): Promise<GitActionReceipt> {
   return call<GitActionReceipt>("push_project_git", { request });
 }
@@ -209,9 +230,10 @@ export function reapplyProjectOverlays(
 }
 
 /**
- * overlay 세트를 만들거나 고친다. `setId`를 비우면 새 세트다. 민감 경로가 하나라도 걸리면
- * 영수증의 `outcome`이 `rejected`이고 **아무것도 저장되지 않는다** — 일부만 담으면 사용자가
- * 고른 파일이 전부 들어갔다고 믿은 채 브랜치를 옮기게 된다(C19-2).
+ * overlay 세트를 만들거나 고친다. `setId`를 비우면 새 세트다. 담을 수 없는 경로(C16-5 검증 — `.git` 성분·
+ * pathspec 매직·저장소 밖 탈출 등)가 하나라도 있으면 영수증의 `outcome`이 `rejected`이고
+ * **아무것도 저장되지 않는다** — 일부만 담으면 사용자가 고른 파일이 전부 들어갔다고 믿은 채
+ * 브랜치를 옮기게 된다. `.env` 같은 민감 경로는 거절하지 않는다(C19-2).
  */
 export function saveProjectOverlaySet(
   request: SaveProjectOverlaySetRequest,
@@ -219,7 +241,6 @@ export function saveProjectOverlaySet(
   return call<ProjectOverlayReceipt>("save_project_overlay_set", { request });
 }
 
-/** 세트를 앱 소유 휴지통으로 옮긴다. 지우지 않으므로 되돌릴 자리가 남는다(C19-5). */
 /**
  * 저장해 둔 overlay patch를 작업 트리에 되돌려 넣는다(C19-3). `git apply --check`가 먼저
  * 돌고, 통과하지 못하면 아무것도 적용하지 않은 채 `outcome: "overlayNeedsResolution"`과
@@ -245,6 +266,7 @@ export function excludeProjectOverlayPaths(
   return call<ProjectOverlayReceipt>("exclude_project_overlay_paths", { request });
 }
 
+/** 세트를 앱 소유 휴지통으로 옮긴다. 지우지 않으므로 되돌릴 자리가 남는다(C19-5). */
 export function deleteProjectOverlaySet(
   request: DeleteProjectOverlaySetRequest,
 ): Promise<ProjectOverlayReceipt> {

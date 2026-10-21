@@ -156,6 +156,11 @@ pub struct CypressRunSummary {
     pub specs: Vec<CypressRunSpec>,
     #[serde(default)]
     pub screenshots: Vec<String>,
+    /// 실제로 돈 브라우저 이름과 버전(`edge 155.0.4283.62`). 지정한 값이 아니라 Cypress가
+    /// 띄운 것이라 QA 증적의 실행 환경으로 그대로 옮겨 적을 수 있다. 옛 요약과 격리
+    /// 하네스 요약에는 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<String>,
     /// Cypress가 뜨지 못했을 때 러너가 남기는 사유.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -213,6 +218,8 @@ impl From<IsolatedE2eSummary> for CypressRunSummary {
             duration_ms: value.total_duration,
             specs,
             screenshots,
+            // 하네스 요약에는 브라우저 기록이 없다.
+            browser: None,
             error: value.error,
         }
     }
@@ -632,6 +639,8 @@ struct RunnerPayloadArgs<'a> {
     project: &'a Path,
     spec: Option<&'a Path>,
     config_file: Option<&'a Path>,
+    /// `validate_browser`를 통과한 브라우저 이름. 없으면 러너 기본값(Electron)이다.
+    browser: Option<&'a str>,
     run_dir: &'a Path,
     run_relative: &'a str,
     extra_env: BTreeMap<String, String>,
@@ -645,6 +654,7 @@ fn runner_payload(args: RunnerPayloadArgs<'_>) -> Value {
         project,
         spec,
         config_file,
+        browser,
         run_dir,
         run_relative,
         extra_env,
@@ -681,6 +691,9 @@ fn runner_payload(args: RunnerPayloadArgs<'_>) -> Value {
         // 지정한 설정 파일은 러너가 `cypress.run({ configFile })`로 넘긴다. 위 `config`
         // 덮어쓰기는 그대로 이겨, 레인 설정이 증적 폴더를 다시 흩뜨리지 않는다.
         "configFile": config_file,
+        // 러너가 `cypress.run({ browser })`로 넘긴다. 비어 있으면 러너가 Electron을 고른다 —
+        // 지금까지 돌던 회차는 값을 보내지 않으므로 그대로 Electron으로 돈다.
+        "browser": browser,
         "env": env,
         // 창을 띄우는 실행은 사용자가 작업공간마다 켠다. 기본은 헤드리스다 — 무인 회차에서
         // 창이 떠 버리면 화면을 가리고, 화면 없는 호스트에서는 실행 자체가 못 뜬다.
@@ -979,6 +992,31 @@ fn validate_config_file(
     .map(Some)
 }
 
+/// 실행 브라우저는 Cypress가 찾아 둔 브라우저의 **이름**만 받는다(`chrome`, `edge`,
+/// `firefox`, `electron`, 채널을 붙인 `edge:beta` 따위). 경로는 받지 않는다 — 호출 인자로
+/// 임의의 실행 파일을 띄우게 되기 때문이다. 시스템에 없는 버전을 써야 하면 레인 설정 파일의
+/// `setupNodeEvents`에서 `config.browsers`에 등록하고 그 이름을 고르면 된다. 이름이 실제로
+/// 있는지는 Cypress가 판정해 요약의 `error`로 돌려준다.
+fn validate_browser(browser: Option<&str>) -> Result<Option<String>, CoreError> {
+    let Some(raw) = browser.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let (name, channel) = raw.split_once(':').unwrap_or((raw, ""));
+    let word = |part: &str, allow_empty: bool| {
+        (allow_empty || !part.is_empty())
+            && part.len() <= 32
+            && part
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    };
+    if !word(name, false) || !word(channel, true) || (raw.contains(':') && channel.is_empty()) {
+        return Err(CoreError::InvalidInput(format!(
+            "브라우저는 이름(chrome, edge, firefox, electron 또는 edge:beta 같은 채널)으로만 지정합니다: {raw}"
+        )));
+    }
+    Ok(Some(raw.to_owned()))
+}
+
 fn validate_env(env: &BTreeMap<String, String>) -> Result<(), CoreError> {
     if env.len() > 50 {
         return Err(CoreError::InvalidInput(
@@ -1048,6 +1086,7 @@ impl CypressRuns {
         workspace: &CypressWorkspace,
         spec: Option<&str>,
         config_file: Option<&str>,
+        browser: Option<&str>,
         extra_env: BTreeMap<String, String>,
     ) -> Result<CypressRunStatus, CoreError> {
         self.launch(
@@ -1056,6 +1095,7 @@ impl CypressRuns {
             workspace,
             spec,
             config_file,
+            browser,
             extra_env,
         )
     }
@@ -1085,6 +1125,8 @@ impl CypressRuns {
             workspace,
             None,
             config_file,
+            // 런처에서는 사람이 브라우저를 고른다.
+            None,
             extra_env,
         )
     }
@@ -1118,6 +1160,7 @@ impl CypressRuns {
             .is_some())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn launch(
         &self,
         mode: CypressRunMode,
@@ -1125,9 +1168,18 @@ impl CypressRuns {
         workspace: &CypressWorkspace,
         spec: Option<&str>,
         config_file: Option<&str>,
+        browser: Option<&str>,
         extra_env: BTreeMap<String, String>,
     ) -> Result<CypressRunStatus, CoreError> {
-        let plan = prepare_launch(mode, app_data_dir, workspace, spec, config_file, extra_env)?;
+        let plan = prepare_launch(
+            mode,
+            app_data_dir,
+            workspace,
+            spec,
+            config_file,
+            browser,
+            extra_env,
+        )?;
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let record = self.push(CypressRunStatus::running(
@@ -1180,6 +1232,7 @@ fn prepare_launch(
     workspace: &CypressWorkspace,
     spec: Option<&str>,
     config_file: Option<&str>,
+    browser: Option<&str>,
     extra_env: BTreeMap<String, String>,
 ) -> Result<LaunchPlan, CoreError> {
     // 여기서 접두어를 벗겨 두면 아래 스펙·설정·실행 폴더·요약 경로가 전부 그 모양을 따른다.
@@ -1203,6 +1256,14 @@ fn prepare_launch(
             "격리 실행은 설정 파일을 지정할 수 없습니다 — 하네스가 설정을 직접 만듭니다".to_owned(),
         ));
     }
+    let browser = validate_browser(browser)?;
+    // 하네스 잡 계약(C7-5a)에는 브라우저 자리가 없다. 설정 파일과 같은 이유로 조용히 버리지 않는다.
+    if browser.is_some() && workspace.execution_type == CypressExecutionType::AgentManagerIsolated {
+        return Err(CoreError::InvalidInput(
+            "격리 실행은 브라우저를 지정할 수 없습니다 — 하네스가 Cypress를 직접 부릅니다"
+                .to_owned(),
+        ));
+    }
     validate_env(&extra_env)?;
     let node = crate::providers::resolve_named_executable(&["node"])?;
     let job_id = Uuid::new_v4().simple().to_string();
@@ -1222,6 +1283,7 @@ fn prepare_launch(
                 project: &project,
                 spec: spec_path.as_deref(),
                 config_file: config_path.as_deref(),
+                browser: browser.as_deref(),
                 run_dir: &run_dir,
                 run_relative: &run_relative,
                 extra_env,
@@ -1531,6 +1593,7 @@ mod tests {
                 project,
                 spec: None,
                 config_file: None,
+                browser: None,
                 run_dir: &run_dir,
                 run_relative: "artifacts/runs/job1",
                 extra_env: BTreeMap::new(),
@@ -1678,6 +1741,7 @@ mod tests {
             project: &root,
             spec: None,
             config_file: Some(&root.join("cypress.lane.config.js")),
+            browser: None,
             run_dir: &run_dir,
             run_relative: "artifacts/runs/job1",
             extra_env: BTreeMap::new(),
@@ -1697,11 +1761,101 @@ mod tests {
             project: &root,
             spec: None,
             config_file: None,
+            browser: None,
             run_dir: &run_dir,
             run_relative: "artifacts/runs/job1",
             extra_env: BTreeMap::new(),
         });
         assert_eq!(default_config["configFile"], Value::Null);
+    }
+
+    /// 브라우저는 Cypress가 아는 이름만 받아 러너 잡에 싣는다. 경로·셸 문자는 거절하고,
+    /// 지정하지 않은 실행은 키가 비어 러너 기본값(Electron)으로 돈다.
+    #[test]
+    fn a_run_can_pick_a_browser_by_name_only() {
+        assert_eq!(validate_browser(None).unwrap(), None);
+        assert_eq!(validate_browser(Some("  ")).unwrap(), None);
+        for name in [
+            "edge",
+            "chrome",
+            "electron",
+            "firefox",
+            "edge:beta",
+            "edge-112",
+        ] {
+            assert_eq!(validate_browser(Some(name)).unwrap().as_deref(), Some(name));
+        }
+        for bad in [
+            "/Applications/Microsoft Edge.app",
+            "../edge",
+            "Edge",
+            "edge:",
+            ":beta",
+            "edge;rm",
+            "edge:beta:x",
+        ] {
+            assert!(
+                matches!(validate_browser(Some(bad)), Err(CoreError::InvalidInput(_))),
+                "{bad}"
+            );
+        }
+
+        let workspace = standard_workspace();
+        let project = Path::new("/tmp/w");
+        let run_dir = project.join("artifacts/runs/job1");
+        let payload = |browser| {
+            runner_payload(RunnerPayloadArgs {
+                mode: CypressRunMode::Run,
+                workspace: &workspace,
+                project,
+                spec: None,
+                config_file: None,
+                browser,
+                run_dir: &run_dir,
+                run_relative: "artifacts/runs/job1",
+                extra_env: BTreeMap::new(),
+            })
+        };
+        assert_eq!(payload(Some("edge"))["browser"], json!("edge"));
+        assert_eq!(payload(None)["browser"], Value::Null);
+    }
+
+    /// 격리 하네스는 브라우저 자리가 없는 계약이라, 지정하면 시작 전에 거절한다.
+    #[test]
+    fn an_isolated_run_refuses_a_browser() {
+        let data = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        fs::create_dir_all(project.path().join("node_modules/cypress")).unwrap();
+        fs::write(
+            project.path().join("node_modules/cypress/package.json"),
+            r#"{"version":"15.21.1"}"#,
+        )
+        .unwrap();
+        let mut workspace = standard_workspace();
+        workspace.path = project.path().to_string_lossy().into_owned();
+        workspace.execution_type = CypressExecutionType::AgentManagerIsolated;
+        let refused = prepare_launch(
+            CypressRunMode::Run,
+            data.path(),
+            &workspace,
+            None,
+            None,
+            Some("edge"),
+            BTreeMap::new(),
+        );
+        assert!(
+            matches!(refused, Err(CoreError::InvalidInput(message)) if message.contains("브라우저"))
+        );
+    }
+
+    /// 러너가 남긴 실행 브라우저는 요약에 그대로 남고, 옛 요약에는 없어도 읽힌다.
+    #[test]
+    fn the_summary_carries_the_browser_that_actually_ran() {
+        let summary: CypressRunSummary =
+            serde_json::from_str(r#"{"passed":1,"browser":"edge 155.0.4283.62"}"#).unwrap();
+        assert_eq!(summary.browser.as_deref(), Some("edge 155.0.4283.62"));
+        let old: CypressRunSummary = serde_json::from_str(r#"{"passed":1}"#).unwrap();
+        assert!(old.browser.is_none());
     }
 
     #[test]
@@ -1719,7 +1873,7 @@ mod tests {
             created_at: 0,
         };
         let error = runs()
-            .start(data.path(), &workspace, None, None, BTreeMap::new())
+            .start(data.path(), &workspace, None, None, None, BTreeMap::new())
             .expect_err("no module installed");
         assert!(matches!(error, CoreError::InvalidInput(_)));
         let runner = ensure_runner(data.path()).unwrap();
@@ -1794,7 +1948,7 @@ exports.run = async (options) => {
             created_at: 0,
         };
         let started = runs()
-            .start(data.path(), &workspace, None, None, BTreeMap::new())
+            .start(data.path(), &workspace, None, None, None, BTreeMap::new())
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let finished = loop {
@@ -1875,6 +2029,7 @@ fs.writeFileSync(job.summaryPath, JSON.stringify({
                 &workspace,
                 Some("cypress/e2e/one.cy.ts"),
                 None,
+                None,
                 env,
             )
             .unwrap();
@@ -1952,6 +2107,7 @@ fs.writeFileSync(job.summaryPath, JSON.stringify({
                 project,
                 spec: None,
                 config_file: None,
+                browser: None,
                 run_dir: &run_dir,
                 run_relative: "artifacts/runs/job1",
                 extra_env: BTreeMap::new(),
@@ -2250,6 +2406,7 @@ fs.writeFileSync(job.summaryPath, JSON.stringify({
             duration_ms: 10,
             specs: Vec::new(),
             screenshots: Vec::new(),
+            browser: None,
             error: error.map(str::to_owned),
         }
     }

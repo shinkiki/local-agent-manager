@@ -454,6 +454,29 @@ mod tests {
     }
 
     #[test]
+    fn longer_pattern_wins_and_ties_ignore_storage_order() {
+        let cwd = Path::new("/repo");
+        let rules = [
+            rule("/repo", "f*", "demo@official", true),
+            rule("/repo", "*login", "demo@official", false),
+        ];
+        // 패턴끼리는 `*`를 뺀 글자가 많은 쪽이 사전순 비교보다 먼저 이긴다.
+        assert_eq!(
+            resolve_overrides(&rules, cwd, Some("feature/login")),
+            BTreeMap::from([("demo@official".to_owned(), false)])
+        );
+        // 글자 수가 같은 두 패턴은 브랜치 이름이 사전순으로 큰 쪽이 저장 순서와 무관하게 이긴다.
+        let tied = [
+            rule("/repo", "a*", "demo@official", false),
+            rule("/repo", "*b", "demo@official", true),
+        ];
+        let reversed = [tied[1].clone(), tied[0].clone()];
+        let expected = BTreeMap::from([("demo@official".to_owned(), false)]);
+        assert_eq!(resolve_overrides(&tied, cwd, Some("ab")), expected);
+        assert_eq!(resolve_overrides(&reversed, cwd, Some("ab")), expected);
+    }
+
+    #[test]
     fn rules_outside_the_working_folder_are_ignored() {
         let rules = [rule("/repo/app", "main", "demo@official", true)];
         assert!(resolve_overrides(&rules, Path::new("/repo/apple"), Some("main")).is_empty());
