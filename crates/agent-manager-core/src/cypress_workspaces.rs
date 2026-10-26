@@ -4,9 +4,10 @@
 //! 등록하고 파일을 편집한다. 실행은 `cypress_runs`가 맡는다. 웹 테스트뿐 아니라 정보 조회·
 //! 크롤링·매크로처럼 브라우저로 하는 일을 스크립트로 적어 두는 자리다.
 //!
-//! 비밀은 `cypress.env.json` 하나에만 있다(0600). 이 파일의 원문은 호스트 UI 전용 명령
-//! (`read_cypress_env_file`·`write_cypress_env_file`)으로만 오가고, 일반 파일 읽기·AIA·원격은
-//! 문자열 값이 가려진 사본만 받는다(AGENTS.md C7). 백엔드는 실행 때도 이 값을 만지지 않는다 —
+//! 비밀은 `cypress.env.json` 하나에만 있다(0600). 이 파일의 원문은 AIA 카탈로그에 없는 화면 전용
+//! 명령(`read_cypress_env_file`·`write_cypress_env_file`)으로만 오가고 — 로그인 요구를 채운 접속
+//! 채널이면 원격 화면도 쓴다(G11, C20) — 일반 파일 읽기·AIA는 문자열 값이 가려진 사본만 받는다
+//! (AGENTS.md C7). 백엔드는 실행 때도 이 값을 만지지 않는다 —
 //! Cypress가 프로젝트 루트의 파일을 직접 읽는다.
 
 use std::collections::BTreeSet;

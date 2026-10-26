@@ -22,6 +22,7 @@ export {
   workflowInputEntries,
   workflowInputsFromArguments,
   workflowModelInputChoices,
+  workflowModelInputIsLadder,
   workflowModelInputIsMultiple,
 } from "./scheduleWorkflowInputs.ts";
 

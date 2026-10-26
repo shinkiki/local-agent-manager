@@ -1,5 +1,5 @@
 import { ExternalLink, Maximize2, Minimize2 } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useI18n } from "../lib/i18n";
 import type { UiText } from "../lib/i18nLocale";
 import { getProjectGitDiff } from "../lib/ipc";
@@ -68,14 +68,20 @@ export function GitDiffModal({ target, diff, error, loading, onClose }: {
   const [full, setFull] = useState(false);
   const [fullDiff, setFullDiff] = useState<GitDiff | null>(null);
   const [fullError, setFullError] = useState<string | null>(null);
-  const [fullLoading, setFullLoading] = useState(false);
   const label = gitDiffTargetLabel(target, text);
+  const targetKey = JSON.stringify([target.projectPath, target.worktreePath ?? null, target.path, target.originalPath, target.staged, target.commit, target.rangeFrom ?? null, target.rangeTo ?? null]);
+  const fullKey = useRef<string | null>(null);
+  // 전체 보기도 기본 diff를 따라간다. 작업 트리 대상은 패널이 상태를 다시 읽어 내용이 바뀌면
+  // `diff`를 새 객체로 바꾸므로(같으면 그대로 둔다), 그때 전체 문맥도 다시 읽어야 기본 보기와
+  // 다른 낡은 내용이 남지 않는다. 같은 대상을 다시 읽는 동안은 앞 내용을 그대로 보여 깜박이지 않는다.
   useEffect(() => {
-    if (!full) return;
+    if (!full) { fullKey.current = null; return; }
     let live = true;
-    setFullDiff(null);
-    setFullError(null);
-    setFullLoading(true);
+    if (fullKey.current !== targetKey) {
+      fullKey.current = targetKey;
+      setFullDiff(null);
+      setFullError(null);
+    }
     getProjectGitDiff({
       ...target,
       worktreePath: target.worktreePath ?? null,
@@ -83,15 +89,14 @@ export function GitDiffModal({ target, diff, error, loading, onClose }: {
       rangeTo: target.rangeTo ?? null,
       fullContext: true,
     })
-      .then((next) => { if (live) setFullDiff(next); })
-      .catch((cause: unknown) => { if (live) setFullError(cause instanceof Error ? cause.message : String(cause)); })
-      .finally(() => { if (live) setFullLoading(false); });
+      .then((next) => { if (live) { setFullDiff(next); setFullError(null); } })
+      .catch((cause: unknown) => { if (live) setFullError(cause instanceof Error ? cause.message : String(cause)); });
     return () => { live = false; };
-  }, [full, target.projectPath, target.worktreePath, target.path, target.originalPath, target.staged, target.commit, target.rangeFrom, target.rangeTo]);
+  }, [full, targetKey, diff]);
   let body: ReactNode;
   if (full) {
     if (fullError) body = <ErrorBanner message={fullError} />;
-    else if (fullDiff === null || fullLoading) body = <LoadingState label={text("파일 전체 내용과 변경 내용을 읽고 있습니다", "Reading the full file and its changes")} />;
+    else if (fullDiff === null) body = <LoadingState label={text("파일 전체 내용과 변경 내용을 읽고 있습니다", "Reading the full file and its changes")} />;
     else body = <GitDiffBody diff={fullDiff} />;
   } else if (error) body = <ErrorBanner message={error} />;
   else if (diff === null || (loading && diff.path !== target.path)) body = <LoadingState label={text("차이를 읽고 있습니다", "Reading the diff")} />;

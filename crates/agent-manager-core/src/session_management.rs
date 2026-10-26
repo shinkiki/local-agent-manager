@@ -252,6 +252,10 @@ impl SessionScopeFilters {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionListRequest {
+    /// `search`를 대화 본문(사용자 질문·답변, 메모)에도 맞춘다. 도구 기록은 색인하지 않는다. 기본은 꺼져 있어
+    /// `search`를 제목·ID 필터로 쓰던 호출(세션 폴더 자동 배정 등)의 결과가 넓어지지 않는다.
+    #[serde(default)]
+    pub include_content: bool,
     #[serde(flatten)]
     pub scope: SessionScopeFilters,
     #[serde(default)]
@@ -299,6 +303,8 @@ pub struct ManagedSessionSummary {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionListResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_search: Option<crate::SessionSearchResponse>,
     pub items: Vec<ManagedSessionSummary>,
     pub next_cursor: Option<String>,
     pub total: usize,
@@ -767,6 +773,7 @@ pub fn list_sessions(
             ("statuses", json!(request.scope.statuses)),
             ("status", json!(request.status)),
             ("search", json!(scope.applied.search)),
+            ("includeContent", json!(request.include_content)),
             ("sort", json!(request.sort)),
             ("direction", json!(request.direction)),
             ("unfiled", json!(request.unfiled)),
@@ -776,13 +783,64 @@ pub fn list_sessions(
             limit,
         },
     )?;
-    let mut items = scope.collect_matching(catalog, chats)?;
-    if request.unfiled {
-        retain_unfiled(&mut items);
-    }
+    let (mut items, mut content_search) = match scope
+        .applied
+        .search
+        .as_ref()
+        .filter(|_| request.include_content)
+    {
+        Some(query) => {
+            // 본문 검색은 검색어 외의 축으로 좁힌 후보 안에서만 돈다. 메타데이터로 맞은
+            // 세션과 본문으로 맞은 세션을 합쳐야 하므로 검색어 축만 뺀 범위로 먼저 모은다.
+            // 색인은 끝까지 마친다. 덜 끝난 채로 자르면 커서가 쪽마다 다른 집합을 자른다.
+            // 본문 검색을 직접 켠 호출이므로 실패는 숨기지 않고 오류로 돌려준다.
+            let mut candidates = scope.without_search().collect_matching(catalog, chats)?;
+            // 폴더 밖 세션만 볼 때는 색인 전에 거른다. 어차피 버릴 세션을 파싱하지 않고,
+            // 검사·부분·실패 수도 실제로 돌려줄 후보만 센다.
+            if request.unfiled {
+                retain_unfiled(&mut candidates);
+            }
+            let result = catalog.search_sessions_with(
+                crate::SessionSearchRequest {
+                    query: query.clone(),
+                    sessions: Some(
+                        candidates
+                            .iter()
+                            .map(|s| crate::domain::SessionRef {
+                                source: s.source,
+                                id: s.session_id.clone(),
+                            })
+                            .collect(),
+                    ),
+                },
+                crate::session_search::IndexBudget::Complete,
+            )?;
+            retain_search_hits(&mut candidates, &scope, &result);
+            (candidates, Some(result))
+        }
+        None => {
+            let mut items = scope.collect_matching(catalog, chats)?;
+            if request.unfiled {
+                retain_unfiled(&mut items);
+            }
+            (items, None)
+        }
+    };
     sort_sessions(&mut items, request.sort, request.direction);
-    let (items, next_cursor, total) = pager.cut(items, identity)?;
+    let (items, mut next_cursor, total) = pager.cut(items, identity)?;
+    // 색인이 상한 안에 끝나지 않았으면 다음 쪽 커서를 주지 않는다. 다음 쪽은 색인이 더
+    // 진행된 다른 집합을 자르게 되므로, 처음부터 다시 물어야 한다(`pendingSessions`).
+    if content_search
+        .as_ref()
+        .is_some_and(|result| result.pending_sessions > 0)
+    {
+        next_cursor = None;
+    }
+    if let Some(result) = content_search.as_mut() {
+        trim_matches_to_page(result, &items);
+    }
     Ok(SessionListResponse {
+        content_search,
         items,
         next_cursor,
         total,
@@ -1024,13 +1082,15 @@ fn scheduled_request_matches(
         && range.contains(item.next_run_at)
         && canonical_cwd.is_none_or(|cwd| same_cwd(&item.input.cwd, cwd))
         && search.is_none_or(|needle| {
-            searchable(&[
-                &item.id,
-                &item.input.name,
-                &item.input.cwd,
-                &item.input.account_id,
-            ])
-            .contains(needle)
+            crate::session_search::literal_match(
+                &[
+                    &item.id,
+                    &item.input.name,
+                    &item.input.cwd,
+                    &item.input.account_id,
+                ],
+                needle,
+            )
         })
 }
 
@@ -2009,6 +2069,7 @@ fn live_status(chat: &ChatSessionInfo) -> SessionManagementStatus {
 /// 목록과 통계가 같은 필터 축을 각자 해석하던 것을 한 자리로 모은다. 정규화한 경로는
 /// 걸러내기와 지문 계산에 그대로 쓰고, 응답에 실을 적용 필터는 정규화 결과를 반영한
 /// 한 벌만 남긴다.
+#[derive(Clone)]
 struct SessionFilterScope {
     applied: SessionAppliedFilters,
     range: InclusiveRange<i64>,
@@ -2041,6 +2102,13 @@ impl SessionFilterScope {
         })
     }
 
+    /// 검색어 축만 뺀 같은 범위.
+    fn without_search(&self) -> Self {
+        let mut scope = self.clone();
+        scope.applied.search = None;
+        scope
+    }
+
     fn collect_matching(
         &self,
         catalog: &SessionCatalog,
@@ -2071,18 +2139,25 @@ impl SessionFilterScope {
             && matches_any_cwd(item.cwd.as_deref(), &self.canonical_cwds)
             && self.range.contains(session_time(item))
             && filters.status.is_none_or(|status| item.status == status)
+            // 비교 규칙은 화면 목록·본문 검색과 같은 `literal_match`이고, 칸 구성은 다르다.
+            // 공급자 이름은 `search="codex"`로 공급자 세션을 고르던 기존 호출 때문에 남긴다
+            // (화면과 본문 검색은 공급자 필터가 따로 있어 보지 않는다). 메모는 이 요약에
+            // 없어 `includeContent`의 본문 검색이 함께 본다.
+            // 검색어는 창구가 `normalized_search`로 맞춰 넘긴 값이라 그대로 견준다.
             && filters.search.as_deref().is_none_or(|needle| {
-                searchable(&[
-                    &item.session_id,
-                    // 목록이 chatId를 같이 돌려주므로 그 값으로도 되찾을 수 있어야 한다.
-                    // 살아 있는 채팅에만 붙는 값이라, 실행이 끝나면 이 축은 자연히 빠진다.
-                    item.chat_id.as_deref().unwrap_or(""),
-                    &item.title,
-                    item.project.as_deref().unwrap_or(""),
-                    item.cwd.as_deref().unwrap_or(""),
-                    item.source.as_str(),
-                ])
-                .contains(needle)
+                crate::session_search::literal_match(
+                    &[
+                        &item.session_id,
+                        // 목록이 chatId를 같이 돌려주므로 그 값으로도 되찾을 수 있어야 한다.
+                        // 살아 있는 채팅에만 붙는 값이라, 실행이 끝나면 이 축은 자연히 빠진다.
+                        item.chat_id.as_deref().unwrap_or(""),
+                        &item.title,
+                        item.project.as_deref().unwrap_or(""),
+                        item.cwd.as_deref().unwrap_or(""),
+                        item.source.as_str(),
+                    ],
+                    needle,
+                )
             })
     }
 }
@@ -2550,15 +2625,39 @@ pub(crate) fn matches_any_cwd(value: Option<&str>, canonical: &[PathBuf]) -> boo
         .is_some_and(|value| canonical.contains(&value))
 }
 
+/// 검색어 외의 축을 통과한 후보 중 메타데이터나 본문 검색이 맞힌 세션만 남긴다.
+fn retain_search_hits(
+    candidates: &mut Vec<ManagedSessionSummary>,
+    scope: &SessionFilterScope,
+    result: &crate::SessionSearchResponse,
+) {
+    let found: HashSet<_> = result
+        .matches
+        .iter()
+        .map(|hit| (hit.source, hit.id.as_str()))
+        .collect();
+    candidates.retain(|s| scope.matches(s) || found.contains(&(s.source, s.session_id.as_str())));
+}
+
+/// 일치 문장은 이 쪽에 실린 세션 것만 싣는다. 전체를 매 쪽마다 실으면 응답이 쪽 크기와
+/// 무관하게 일치 건수만큼 커진다.
+fn trim_matches_to_page(result: &mut crate::SessionSearchResponse, page: &[ManagedSessionSummary]) {
+    let page: HashSet<_> = page
+        .iter()
+        .map(|item| (item.source, item.session_id.as_str()))
+        .collect();
+    result
+        .matches
+        .retain(|hit| page.contains(&(hit.source, hit.id.as_str())));
+}
+
+/// 검색어와 견줄 칸은 같은 규칙(`session_search::normalize`: NFC·글자별 소문자)으로
+/// 맞춘다. 문자열 단위 `to_lowercase`는 어말 Σ를 ς로 바꿔, 글자별로 바꾼 칸과 어긋난다.
 fn normalized_search(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| value.to_lowercase())
-}
-
-fn searchable(values: &[&str]) -> String {
-    values.join("\n").to_lowercase()
+        .map(crate::session_search::normalize)
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
@@ -2662,7 +2761,7 @@ pub(crate) fn hash_text(value: &str) -> String {
 fn hash_bytes(value: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value);
-    format!("{:x}", hasher.finalize())
+    crate::identifier::lower_hex(&hasher.finalize())
 }
 
 fn encode_cursor(kind: &str, fingerprint: &str, offset: usize) -> Result<String, CoreError> {
@@ -2821,6 +2920,7 @@ mod tests {
             account_id: Some("exhausted".to_owned()),
             resuming: false,
             forked: false,
+            fork_source_session_id: None,
             provider_session_id: Some("session-1".to_owned()),
             cwd: "/tmp/aia".to_owned(),
             model: aia_runtime.model.clone(),
@@ -3324,6 +3424,51 @@ mod tests {
         SessionFilterScope::resolve(applied)
             .expect("필터를 세울 수 있어야 한다")
             .matches(item)
+    }
+
+    #[test]
+    fn content_search_hits_join_metadata_hits_and_page_trims_matches() {
+        let scope = SessionFilterScope::resolve(SessionScopeFilters::default().applied(
+            Some(SessionManagementStatus::Completed),
+            normalized_search(Some("needle")),
+        ))
+        .expect("scope");
+        let unsearched = scope.without_search();
+        assert!(unsearched.applied.search.is_none());
+        assert_eq!(
+            unsearched.applied.status,
+            Some(SessionManagementStatus::Completed)
+        );
+
+        let mut titled = searchable_summary("titled", None);
+        titled.title = "Needle in title".into();
+        let content = searchable_summary("content", None);
+        let neither = searchable_summary("neither", None);
+        let hit = |id: &str| crate::SessionSearchMatch {
+            source: ProviderId::Claude,
+            id: id.to_owned(),
+            index: Some(3),
+            snippet: "…needle…".into(),
+        };
+        let mut result = crate::SessionSearchResponse {
+            matches: vec![hit("content"), hit("titled")],
+            ..crate::SessionSearchResponse::default()
+        };
+        let mut candidates = vec![titled.clone(), content.clone(), neither];
+        retain_search_hits(&mut candidates, &scope, &result);
+        let kept: Vec<_> = candidates.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(kept, ["titled", "content"]);
+
+        trim_matches_to_page(&mut result, &[content]);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].id, "content");
+    }
+
+    #[test]
+    fn list_search_folds_case_the_same_way_as_the_fields() {
+        let mut greek = searchable_summary("greek", None);
+        greek.title = "ΟΔΟΣ".into();
+        assert!(matches_search(&greek, "ΟΔΟΣ"));
     }
 
     /// 목록이 chatId를 같이 돌려주는 이상 그 값으로도 되찾을 수 있어야 한다. AIA와 알림은

@@ -58,5 +58,10 @@
     "name": "여는 괄호 뒤 가져오기 표기도 링크로 본다",
     "source": "규칙(@context/rules.md)을 본다.\n",
     "links": ["context/rules.md"]
+  },
+  {
+    "name": "주소 앞뒤 공백은 자바스크립트 trim과 같은 문자만 걷어낸다",
+    "source": "[BOM](\ufeffdoc.md) [NEL](\u0085next.md)\n",
+    "links": ["doc.md", "\u0085next.md"]
   }
 ]

@@ -189,8 +189,9 @@ fn plan(
     actions
 }
 
-/// 전역 설정의 서버 목록. 파일이 없으면 빈 목록이고, 읽었는데 해석하지 못하면 오류다 —
-/// 그 상태로 `agy`를 돌리면 사용자 파일을 무엇으로 덮을지 앱이 알 수 없다.
+/// 전역 설정의 서버 목록. 파일이 없거나 비어 있으면(공백뿐 포함) 빈 목록이고, 읽었는데
+/// 해석하지 못하면 오류다 — 그 상태로 `agy`를 돌리면 사용자 파일을 무엇으로 덮을지 앱이 알 수
+/// 없다. 빈 파일은 덮을 내용이 없으니 없는 파일과 같다(0바이트 파일이 동기화를 영영 막았다).
 pub(crate) fn read_config(home: &Path) -> Result<BTreeMap<String, ConfigEntry>, CoreError> {
     let path = config_path(home);
     let metadata = match std::fs::metadata(&path) {
@@ -201,7 +202,11 @@ pub(crate) fn read_config(home: &Path) -> Result<BTreeMap<String, ConfigEntry>, 
     if metadata.len() > MAX_CONFIG_BYTES {
         return Err(CoreError::TooLarge(MAX_CONFIG_BYTES));
     }
-    let config: Value = serde_json::from_slice(&std::fs::read(&path)?).map_err(|error| {
+    let bytes = std::fs::read(&path)?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(BTreeMap::new());
+    }
+    let config: Value = serde_json::from_slice(&bytes).map_err(|error| {
         CoreError::InvalidInput(format!(
             "Antigravity MCP 설정({})을 해석하지 못했습니다: {error}",
             path.display()
@@ -749,6 +754,60 @@ mod tests {
         );
         std::fs::write(config_path(home.path()), "{not json").expect("write");
         assert!(read_config(home.path()).is_err());
+    }
+
+    #[test]
+    fn p12_treats_an_empty_config_as_no_servers() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".gemini/config")).expect("dir");
+        for body in ["", " \n\t\r\n"] {
+            std::fs::write(config_path(home.path()), body).expect("write");
+            assert_eq!(
+                read_config(home.path()).expect("empty config"),
+                BTreeMap::new(),
+                "{body:?}"
+            );
+        }
+    }
+
+    /// 0바이트 설정에서도 동기화는 원하는 서버를 `agy mcp add`로 등록한다.
+    #[cfg(unix)]
+    #[test]
+    fn p12_sync_registers_into_an_empty_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let app_data = tempfile::tempdir().expect("app data");
+        let home = tempfile::tempdir().expect("home");
+        crate::external_plugins::ExternalPluginRegistry::new(app_data.path().to_path_buf())
+            .register(crate::ExternalPluginManifestRequest {
+                id: "mock".to_owned(),
+                display_name: "Mock".to_owned(),
+                names: None,
+                url: Some("http://127.0.0.1:3000/mcp".to_owned()),
+                auth: crate::external_plugins::PluginAuthKind::None,
+                token: None,
+                client_id: None,
+                client_secret: None,
+                scope: None,
+            })
+            .expect("register");
+        std::fs::create_dir_all(home.path().join(".gemini/config")).expect("config dir");
+        std::fs::write(config_path(home.path()), "").expect("config");
+        let bin = tempfile::tempdir().expect("bin");
+        let log = bin.path().join("argv.log");
+        let fake = bin.path().join("agy");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .expect("script");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        sync_with(app_data.path(), home.path(), &fake, BASE, None).expect("sync");
+        let argv = std::fs::read_to_string(&log).expect("log");
+        assert!(argv.contains(&format!(
+            "mcp add --type http mock {}",
+            plugin_url(BASE, "mock")
+        )));
     }
 
     #[test]

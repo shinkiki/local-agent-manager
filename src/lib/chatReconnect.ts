@@ -60,6 +60,22 @@ export function chatReconnectDecision(cause: unknown): ChatReconnectDecision {
 }
 
 /**
+ * 재연결 직전 인스턴스 확인이 끝난 뒤 다음 걸음. 확인은 최대 10초를 기다리므로 그 사이
+ * 화면이 연결을 스스로 끊을 수 있다. 그때 attach를 보내면 아무도 닫지 않는 소켓이 남아
+ * 이미 떠난 화면 몫으로 백엔드 구독을 붙잡고 있으므로, 끊긴 연결은 다른 판단보다 먼저
+ * 그만둔다.
+ */
+export function chatReconnectPrecheckStep(
+  detached: boolean,
+  expectedInstanceId: string,
+  currentInstanceId: string,
+): "abandon" | "restarted" | "attach" {
+  if (detached) return "abandon";
+  if (currentInstanceId !== expectedInstanceId) return "restarted";
+  return "attach";
+}
+
+/**
  * 일시적 실패를 사용자에게 알릴 차례인지. 첫 안내 한 번으로 끝내면 몇 분째 끊긴 화면이
  * 조용해지므로, 시도가 이어지는 동안 같은 간격으로 다시 알린다.
  */

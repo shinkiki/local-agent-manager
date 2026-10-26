@@ -32,8 +32,12 @@ const MEASURED_AT_OPTIONS: Intl.DateTimeFormatOptions = { hour: "2-digit", minut
  * 저장소 측정의 폴링과 마지막 성공값을 한 벌로 관리한다. 갱신 실패를 다시 던지는 것은
  * `usePoll`의 기존 실패 처리 계약을 지키면서, 화면에는 마지막 성공값과 오류를 함께 남기기
  * 위해서다(QA #47).
+ *
+ * `active`가 꺼지면 폴링을 멈춘다. App은 한 번 연 화면을 숨긴 채 마운트해 두므로, 이것이
+ * 없으면 저장소 화면을 한 번 연 뒤로는 다른 화면에 있는 내내 공급자 홈 전체를 30초마다 다시
+ * 잰다. 다시 보이면 루프가 새로 시작하며 곧바로 한 번 잰다(비밀정보 탭과 같은 방식).
  */
-function useStorageMeasurement() {
+function useStorageMeasurement(active: boolean) {
   // 마지막으로 성공한 측정과 그 시각을 한 짝으로 든다. 갱신이 실패해도 옛 수치는 남기되,
   // 그 수치가 어느 시점 것인지와 갱신이 멈췄음을 화면 위쪽에서 바로 알린다(QA #47).
   const [measured, setMeasured] = useState<{ overview: StorageOverview; at: number } | null>(null);
@@ -49,7 +53,7 @@ function useStorageMeasurement() {
       throw cause;
     }
   }, []);
-  usePoll(load, 30_000);
+  usePoll(load, 30_000, { enabled: active });
 
   return { measured, error };
 }
@@ -119,15 +123,15 @@ export function StorageView({ active = true, tabRequest = null, automation = nul
 function StorageDataTab({ active }: { active: boolean }) {
   return (
     <div className="view-stack storage-data">
-      <StorageUsageSection />
+      <StorageUsageSection active={active} />
       <SessionCleanupCard active={active} />
     </div>
   );
 }
 
-function StorageUsageSection() {
+function StorageUsageSection({ active }: { active: boolean }) {
   const { text } = useI18n();
-  const { measured, error } = useStorageMeasurement();
+  const { measured, error } = useStorageMeasurement(active);
 
   if (!measured && !error) return <LoadingState label={text("로컬 저장소 사용량을 계산하고 있습니다", "Calculating local storage usage…")} />;
   if (!measured) return <ErrorBanner message={error ?? text("저장소 사용량을 읽지 못했습니다", "Failed to read storage usage.")} />;

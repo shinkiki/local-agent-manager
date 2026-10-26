@@ -832,6 +832,11 @@ pub struct ChatSecretsOverview {
 pub struct ChatSessionInfo {
     /// Forks inherit transcript history without resuming the original session.
     pub forked: bool,
+    /// 메시지 편집이 아닌 fork의 원본 세션 id. Claude fork는 새 세션 id를 미리 정하지만 그
+    /// 기록 파일은 첫 메시지를 보낼 때에야 생기므로, 그 전에는 화면이 이 원본에서 이전
+    /// 대화를 읽는다. 편집 fork는 원본의 앞부분만 이어받으므로 원본 전체를 보이면 안 돼 싣지 않는다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_source_session_id: Option<String>,
     pub chat_id: String,
     pub started_at: i64,
     pub source: ProviderId,
@@ -3853,6 +3858,21 @@ impl ChatRuntime {
             .provider_tool_blocks
             .remove(&index)
             .map(|tool| tool.name)
+    }
+
+    /// 지금 턴(마지막 턴 시작 뒤)의 리플레이에 이 id 의 도구 카드가 있는가.
+    fn turn_shows_tool(&self, id: &str) -> bool {
+        self.with_state(|state| {
+            for event in state.replay.iter().rev() {
+                match event {
+                    ChatEvent::Tool { id: tool_id, .. } if tool_id == id => return true,
+                    ChatEvent::Turn { status, .. } if status == "started" => return false,
+                    _ => {}
+                }
+            }
+            false
+        })
+        .unwrap_or(false)
     }
 
     /// 턴이 끝났을 때 남은 블록을 모두 거둬 간다.
@@ -8095,6 +8115,10 @@ impl ChatRuntime {
             account_id: self.account_id.clone(),
             resuming: self.resuming,
             forked: self.fork_source_session_id.is_some(),
+            fork_source_session_id: self
+                .fork_source_session_id
+                .clone()
+                .filter(|_| self.edit_boundary.is_none()),
             provider_session_id: state.provider_session_id.clone(),
             cwd: self.cwd.to_string_lossy().into_owned(),
             model: self.model.clone(),
@@ -8657,8 +8681,11 @@ fn pending_runtime_failure(
 
 fn codex_turn_input(message: &PendingChatMessage) -> Vec<Value> {
     let mut input = Vec::new();
-    if !message.text.is_empty() {
-        input.push(json!({"type": "text", "text": message.text, "text_elements": []}));
+    // mention은 모델 본문에 파일 경로가 남는 것을 보장하지 않는다.
+    // 일반 파일은 이름과 경로도 텍스트로 전달하고, 이미지는 네이티브 입력을 유지한다.
+    let text = prompt_with_attachment_paths(message, false);
+    if !text.is_empty() {
+        input.push(json!({"type": "text", "text": text, "text_elements": []}));
     }
     for attachment in &message.attachments {
         let path = attachment.path.to_string_lossy();
@@ -12270,11 +12297,34 @@ fn handle_claude_result(runtime: &Arc<ChatRuntime>, value: &Value) {
 
 /// CLI가 스스로 거절한 권한 요청을 상호작용 없는 승인 카드로 알린다. 하나라도 있었으면
 /// 턴 상태가 `completedWithDenials`가 되므로 그 여부를 돌려준다.
+///
+/// CLI는 거절 목록을 턴을 닫는 result 에만 싣는다. 그래서 기록 카드는 턴 끝(마지막 답 뒤)에
+/// 서고, 실제로 막힌 도구 카드는 턴 중간에 '실패'로만 남아 무엇이 언제 막혔는지 이어 보기
+/// 어려웠다(2026-10-25 AIA 대화). 거절에 `tool_use_id` 가 있으면 그 도구 카드의 상태를
+/// `denied` 로 바꿔 제자리에 '자동 거절'이 보이게 한다. 내용·출력은 그대로 둔다.
+/// 이번 턴에 그 카드가 없으면(리플레이에서 밀려났거나 앞선 턴의 거절) 빈 카드를 새로 세우지
+/// 않는다. 공급자 세션 기록에서 다시 지은 화면에는 이 상태가 없다 — 실시간·리플레이 화면만.
 fn emit_claude_permission_denials(runtime: &Arc<ChatRuntime>, value: &Value) -> bool {
     let Some(denials) = value.array_field("permission_denials") else {
         return false;
     };
     for denial in denials {
+        if let Some(tool_id) = denial.str_field("tool_use_id").filter(|id| !id.is_empty()) {
+            // 결과가 오지 않은 블록이 장부에 남아 있으면 뒤이은 finish_anthropic_tools 가
+            // 같은 카드를 턴 상태로 덮어쓴다 — 여기서 먼저 뺀다.
+            let ledger_name = runtime.take_tool_block_name(tool_id);
+            if runtime.turn_shows_tool(tool_id) {
+                // 이름이 없으면 빈 이름을 보내 화면이 카드의 원래 이름을 지키게 한다.
+                let name = denial
+                    .str_field("tool_name")
+                    .map(str::to_owned)
+                    .or(ledger_name)
+                    .unwrap_or_default();
+                ToolCard::running(tool_id.to_owned(), name)
+                    .status("denied")
+                    .emit(runtime);
+            }
+        }
         ApprovalEvent::settled(
             format!("denied-{}", Uuid::new_v4()),
             "permission",
@@ -12692,7 +12742,7 @@ fn capture_managed_process_identity(pid: u32) -> Result<Option<ManagedProcessIde
     Ok(Some(ManagedProcessIdentity {
         pid,
         process_started,
-        command_digest: format!("{:x}", Sha256::digest(command.as_bytes())),
+        command_digest: crate::identifier::lower_hex(&Sha256::digest(command.as_bytes())),
     }))
 }
 
@@ -13981,6 +14031,26 @@ mod tests {
     }
 
     #[test]
+    fn plain_fork_tells_the_screen_where_the_inherited_history_lives() {
+        // Claude fork의 새 세션 기록은 첫 메시지 전에는 없다. 화면이 그동안 원본에서 이전
+        // 대화를 읽도록 원본 id를 싣고, 편집 fork(원본 앞부분만 이어받음)와 fork가 아닌
+        // 채팅에는 싣지 않는다.
+        let mut runtime = fixture_runtime(ProviderId::Claude);
+        let snapshot = |runtime: &ChatRuntime| {
+            serde_json::to_value(runtime.info_from(&runtime.state.lock().expect("state")))
+                .expect("snapshot")
+        };
+        assert!(snapshot(&runtime).get("forkSourceSessionId").is_none());
+        runtime.fork_source_session_id = Some("source".to_owned());
+        assert_eq!(snapshot(&runtime)["forkSourceSessionId"], "source");
+        runtime.edit_boundary = Some(crate::catalog::MessageEditBoundary::ClaudeAfterMessage(
+            "previous".to_owned(),
+        ));
+        assert!(snapshot(&runtime).get("forkSourceSessionId").is_none());
+        assert_eq!(snapshot(&runtime)["forked"], true);
+    }
+
+    #[test]
     fn codex_fork_asks_app_server_for_a_new_thread_from_the_source() {
         let mut runtime = fixture_runtime(ProviderId::Codex);
         runtime.fork_source_session_id = Some("source-thread".to_owned());
@@ -15237,6 +15307,11 @@ mod tests {
         };
 
         let codex = codex_turn_input(&message);
+        let text = codex[0]["text"].as_str().expect("attachment text");
+        assert!(text.starts_with("검토해줘\n\n"));
+        assert!(text.contains("요구사항.txt"));
+        assert!(text.contains(file_path.to_string_lossy().as_ref()));
+        assert!(!text.contains(image_path.to_string_lossy().as_ref()));
         assert_eq!(codex[1]["type"], "localImage");
         assert_eq!(codex[1]["path"], image_path.to_string_lossy().as_ref());
         assert_eq!(codex[2]["type"], "mention");
@@ -15251,6 +15326,89 @@ mod tests {
             .contains("요구사항.txt"));
         assert_eq!(content[1]["type"], "image");
         assert_eq!(content[1]["source"]["media_type"], "image/png");
+
+        let runtime = fixture_runtime(ProviderId::Antigravity);
+        let prompt = prompt_with_attachment_paths(&message, true);
+        for session in [None, Some("conversation-1")] {
+            let args = antigravity_stream_cli_args(&runtime, &prompt, session);
+            for path in [&image_path, &file_path] {
+                assert!(args[1].contains(path.to_string_lossy().as_ref()));
+            }
+            assert!(args[1].contains("화면.png"));
+            assert!(args[1].contains("요구사항.txt"));
+        }
+    }
+
+    #[test]
+    fn provider_inputs_keep_pdf_paths_without_user_text() {
+        let data = tempfile::tempdir().expect("files");
+        let file_path = data.path().join("invoice with spaces.upload");
+        let message = PendingChatMessage {
+            id: "pdf-message".to_owned(),
+            text: String::new(),
+            attachments: vec![StoredChatInputFile {
+                file: ChatInputFile {
+                    id: "pdf".to_owned(),
+                    name: "청구서 \"10월\".pdf".to_owned(),
+                    media_type: "application/pdf".to_owned(),
+                    size_bytes: 5,
+                    kind: ChatInputFileKind::File,
+                },
+                path: file_path.clone(),
+                used: true,
+            }],
+        };
+        let named_path = format!(
+            "- {}: {}",
+            serde_json::to_string(&message.attachments[0].file.name).expect("name"),
+            serde_json::to_string(&file_path.to_string_lossy()).expect("path"),
+        );
+        let codex = codex_turn_input(&message);
+        assert_eq!(codex[0]["type"], "text");
+        assert!(codex[0]["text"]
+            .as_str()
+            .expect("text")
+            .contains(&named_path));
+        assert_eq!(codex[1]["type"], "mention");
+
+        let runtime = fixture_runtime(ProviderId::Antigravity);
+        let prompt = prompt_with_attachment_paths(&message, true);
+        for session in [None, Some("conversation-1")] {
+            let args = antigravity_stream_cli_args(&runtime, &prompt, session);
+            assert_eq!(args[0], "--print");
+            assert!(args[1].contains(&named_path));
+            assert_eq!(
+                args.iter().any(|arg| arg == "--conversation"),
+                session.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn codex_inputs_preserve_text_and_native_image_only_messages() {
+        let mut message = PendingChatMessage {
+            id: "plain-message".to_owned(),
+            text: "hello".to_owned(),
+            attachments: Vec::new(),
+        };
+        let input = codex_turn_input(&message);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["text"], "hello");
+        message.text.clear();
+        message.attachments.push(StoredChatInputFile {
+            file: ChatInputFile {
+                id: "image".to_owned(),
+                name: "화면.png".to_owned(),
+                media_type: "image/png".to_owned(),
+                size_bytes: 5,
+                kind: ChatInputFileKind::Image,
+            },
+            path: PathBuf::from("/tmp/image.upload"),
+            used: true,
+        });
+        let input = codex_turn_input(&message);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "localImage");
     }
 
     #[test]
@@ -17760,6 +17918,8 @@ mod tests {
 
         let state = runtime.test_state();
         assert_eq!(state.phase, ChatPhase::Ready);
+        // tool_use_id 가 없는 거절은 도구 카드를 건드리지 않는다.
+        assert!(!replay_has!(state.replay, ChatEvent::Tool { status, .. } if status == "denied"));
         assert!(replay_has!(
                 state.replay,
                 ChatEvent::Approval { title, interactive: false, ..
@@ -17770,6 +17930,59 @@ mod tests {
             state.replay,
             ChatEvent::Turn { status, .. } if status == "completedWithDenials"
         ));
+    }
+
+    #[test]
+    fn claude_denial_marks_the_denied_tool_card_in_place() {
+        // 2026-10-25: 거절 기록 카드만 턴 끝에 서고 막힌 Bash 카드는 '실패'로만 남았다.
+        let runtime = Arc::new(fixture_runtime(ProviderId::Claude));
+        runtime.set_test_phase(ChatPhase::Ready);
+        handle_stream_cli_message(
+            &runtime,
+            json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_denied", "name": "Bash", "input": {"command": "rm -rf /tmp/x"}}
+            ]}}),
+        );
+        handle_stream_cli_message(
+            &runtime,
+            json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_denied", "is_error": true, "content": "denied by policy"}
+            ]}}),
+        );
+        handle_stream_cli_message(
+            &runtime,
+            json!({
+                "type": "result",
+                "is_error": false,
+                "permission_denials": [
+                    {"tool_name": "Bash", "tool_use_id": "toolu_denied", "tool_input": {"command": "rm -rf /tmp/x"}},
+                    // 이번 턴에 카드가 없는 거절은 빈 카드를 새로 세우지 않는다.
+                    {"tool_name": "Edit", "tool_use_id": "toolu_elsewhere", "tool_input": {}}
+                ]
+            }),
+        );
+
+        let state = runtime.test_state();
+        let last_status = state.replay.iter().rev().find_map(|event| match event {
+            ChatEvent::Tool { id, status, .. } if id == "toolu_denied" => Some(status.clone()),
+            _ => None,
+        });
+        assert_eq!(last_status.as_deref(), Some("denied"));
+        // 거절 갱신은 내용·출력을 다시 보내지 않는다(화면이 원래 입력과 오류 출력을 지킨다).
+        assert!(replay_has!(
+            state.replay,
+            ChatEvent::Tool { id, name, status, detail: None, output: None, append: false, .. }
+                if id == "toolu_denied" && name == "Bash" && status == "denied"
+        ));
+        assert!(!replay_has!(state.replay, ChatEvent::Tool { id, .. } if id == "toolu_elsewhere"));
+        assert_eq!(
+            state
+                .replay
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::Approval { title, .. } if title == "CLI 권한 자동 거절"))
+                .count(),
+            2
+        );
     }
 
     #[test]

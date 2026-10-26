@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canonicalSourceText, sendableUiCatalogSource, staticEnglishFallback } from "./staticUiText.ts";
+import { canonicalSourceText, isPlainLatinText, sendableUiCatalogSource, staticEnglishFallback } from "./staticUiText.ts";
 
 const staticKoreanByEnglish = new Map([
   ["", "개"],
@@ -93,4 +93,22 @@ test("고유명사는 역방향 표에 걸려도 되짚지 않는다", () => {
   assert.equal(canonicalSourceText("Claude", { "클로드": "Claude" }, new Map()), "Claude");
   // 고유명사가 아닌 문구는 지금까지처럼 되짚는다.
   assert.equal(canonicalSourceText("Permission mode", {}, withProperNouns), "권한 모드");
+});
+
+test("plain Latin text is left alone on the English screen", () => {
+  // 컴포넌트가 영어로 그린 값 — 되짚으면 다른 원문의 번역("Pause" → "Paused")으로 바뀐다.
+  assert.equal(isPlainLatinText("Pause"), true);
+  assert.equal(isPlainLatinText("Active 0 / 0 total"), true);
+  assert.equal(isPlainLatinText("Café — 3 items, 50%"), true);
+  assert.equal(isPlainLatinText(" "), true);
+  assert.equal(isPlainLatinText(""), true);
+});
+
+test("Korean literals and third-language text are still restated", () => {
+  assert.equal(isPlainLatinText("일시정지"), false);
+  assert.equal(isPlainLatinText("Active 0 / 0 개"), false);
+  assert.equal(isPlainLatinText("設定"), false);
+  assert.equal(isPlainLatinText("ひらがな"), false);
+  assert.equal(isPlainLatinText("カタカナ"), false);
+  assert.equal(isPlainLatinText("Настройки"), false);
 });

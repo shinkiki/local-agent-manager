@@ -2,7 +2,8 @@
  * Cypress 자동화 작업공간 기본도구 명령 묶음. 갈라 둔 이유는 `ipcDbConnections.ts`
  * 머리말에 적는다.
  *
- * 등록·설치·실행·민감 파일 쓰기는 호스트 전용이라 원격 접속에서는 403이 난다.
+ * 등록·설치·실행·민감 파일 읽기·쓰기는 쓰기 명령이다. 로그인 요구를 채운 접속 채널이면
+ * 원격에서도 데스크톱과 같은 권한으로 열린다(G11, C20, C7-1) — 호스트 전용 명령은 없다.
  *
  * 여기 있는 이름은 `ipc.ts`가 그대로 다시 내보낸다. 화면 쪽 import 경로는 예전 그대로
  * `lib/ipc`다.
@@ -76,12 +77,12 @@ export function writeCypressWorkspaceFile(id: string, path: string, content: str
   return call<CypressWorkspaceFile>("write_cypress_workspace_file", { id, path, content });
 }
 
-/** cypress.env.json 원문(호스트 전용). 원격 접속은 403이 나므로 마스킹본을 대신 보인다. */
+/** cypress.env.json 원문. 이 읽기가 실패하면 화면은 마스킹본(`readCypressWorkspaceFile`)을 대신 보인다(C7-2). */
 export function readCypressEnvFile(id: string): Promise<CypressWorkspaceFileContent> {
   return call<CypressWorkspaceFileContent>("read_cypress_env_file", { id });
 }
 
-/** cypress.env.json 저장(호스트 전용). */
+/** cypress.env.json 저장. 비밀값을 담는 유일한 파일이라 0600으로 쓴다(C7-2). */
 export function writeCypressEnvFile(id: string, content: string): Promise<CypressWorkspaceFile> {
   return call<CypressWorkspaceFile>("write_cypress_env_file", { id, content });
 }
@@ -95,7 +96,7 @@ export function runCypressSpec(id: string, spec: string | null = null, env: Reco
 }
 
 /**
- * Cypress 런처를 띄운다(호스트 전용). 스펙 고르기와 단계별 진행은 런처 안에서 사람이 하므로
+ * Cypress 런처를 띄운다. 창은 호스트 화면에 뜬다(C7-8). 스펙 고르기와 단계별 진행은 런처 안에서 사람이 하므로
  * 스펙은 넘기지 않는다. 창을 닫으면 실행이 `closed`로 끝난다.
  */
 export function openCypressRunner(id: string, env: Record<string, string> | null = null): Promise<CypressRunStatus> {

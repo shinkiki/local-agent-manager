@@ -79,7 +79,8 @@ const KEYCHAIN_SERVICE: &str = "Agent Manager External Plugins";
 
 pub const MAX_PLUGINS: usize = 16;
 /// 프록시가 원격에서 받아 CLI로 넘기는 응답 본문 상한. Notion 페이지 본문은 수백 KB가
-/// 흔해 AIA 인터페이스(512 KB)보다 넉넉히 잡는다.
+/// 흔해 AIA가 이 프록시를 거쳐 읽는 본문 상한(`mcp_registry::MAX_REMOTE_BODY_BYTES`,
+/// 6.5 MiB)보다 넉넉히 잡는다. 길이 선언이 없는 본문도 읽는 동안 이 크기에서 끊는다.
 pub const MAX_PROXY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROXY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -973,12 +974,7 @@ impl ExternalPluginRegistry {
             })?;
         ensure_aia_tool_access(tool, require_read_only)?;
         let result = session.call_tool(&request.tool, request.arguments)?;
-        Ok(json!({
-            "pluginId": plugin.id,
-            "tool": request.tool,
-            "result": crate::mcp_registry::bounded_remote_result(result),
-            "contentTrust": "untrusted"
-        }))
+        Ok(plugin_tool_envelope(&plugin.id, &request.tool, result))
     }
 
     pub fn register(
@@ -2297,7 +2293,17 @@ fn ensure_aia_tool_access(
     }))
 }
 
-/// 저장소에 없는 id로 들어온 요청의 공통 오류. 조회·수정 경로가 같은 문구를 쓰게 한다.
+/// AIA에 돌려주는 외부 플러그인 도구 결과의 봉투. 결과는 노출 상한으로 묶고, 받는 쪽이
+/// 지시로 읽지 않도록 신뢰하지 않는 데이터라고 표시한다.
+pub(crate) fn plugin_tool_envelope(plugin_id: &str, tool: &str, result: Value) -> Value {
+    json!({
+        "pluginId": plugin_id,
+        "tool": tool,
+        "result": crate::mcp_registry::bounded_remote_result(result),
+        "contentTrust": "untrusted"
+    })
+}
+
 /// 프록시 주소를 지나 이 플러그인의 상류 MCP에 붙고 도구 목록까지 읽는다. AIA 도구
 /// 카탈로그·도구 호출·연결 확인이 같은 세 걸음을 각자 적고 있었다. 프록시를 그대로
 /// 지나는 것이 요점이라(여기서 성공하면 채팅에서도 붙는다) 주소 조립도 함께 둔다.
@@ -2311,6 +2317,7 @@ fn connect_through_proxy(
     Ok((session, initialize, tools))
 }
 
+/// 저장소에 없는 id로 들어온 요청의 공통 오류. 조회·수정 경로가 같은 문구를 쓰게 한다.
 fn plugin_not_found() -> CoreError {
     CoreError::NotFound("등록된 외부 플러그인을 찾을 수 없습니다".to_owned())
 }
@@ -3945,12 +3952,6 @@ fn send_proxy_request(
             "플러그인 서버가 리디렉션을 돌려주었습니다. 최종 주소를 등록해 주세요".to_owned(),
         ));
     }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_PROXY_RESPONSE_BYTES as u64)
-    {
-        return Err(CoreError::TooLarge(MAX_PROXY_RESPONSE_BYTES as u64));
-    }
     let status = response.status().as_u16();
     let content_type = response
         .headers()
@@ -3962,17 +3963,16 @@ fn send_proxy_request(
         .get("mcp-session-id")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let body = response.bytes().map_err(|error| {
-        CoreError::Runtime(format!("플러그인 서버 응답을 읽지 못했습니다: {error}"))
-    })?;
-    if body.len() > MAX_PROXY_RESPONSE_BYTES {
-        return Err(CoreError::TooLarge(MAX_PROXY_RESPONSE_BYTES as u64));
-    }
+    let body = crate::mcp_registry::read_capped_body(
+        response,
+        MAX_PROXY_RESPONSE_BYTES,
+        "플러그인 서버 응답을 읽지 못했습니다",
+    )?;
     Ok(ProxyResponse {
         status,
         content_type,
         session_id,
-        body: body.to_vec(),
+        body,
     })
 }
 

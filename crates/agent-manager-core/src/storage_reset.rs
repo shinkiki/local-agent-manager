@@ -27,8 +27,17 @@ struct ResetMarker {
 pub fn prepare_account_management_storage(app_data_dir: &Path) -> Result<(), CoreError> {
     fs::create_dir_all(app_data_dir)?;
     let marker_path = app_data_dir.join(RESET_MARKER);
-    if marker_path.is_file() {
-        return Ok(());
+    // S1: 잘못 놓인 완료 표시나 조회 오류를 "아직 초기화하지 않음"으로 취급하면
+    // 구형 파일을 지운 뒤 표시 기록에서 실패한다. 삭제 전에 표시 상태부터 확인한다.
+    match fs::metadata(&marker_path) {
+        Ok(metadata) if metadata.is_file() => return Ok(()),
+        Ok(_) => {
+            return Err(CoreError::InvalidInput(
+                "저장소 초기화 완료 표시가 일반 파일이 아닙니다".to_owned(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let mut removed = Vec::new();
     for file_name in LEGACY_FILES {
@@ -49,6 +58,34 @@ pub fn prepare_account_management_storage(app_data_dir: &Path) -> Result<(), Cor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s1_invalid_marker_preserves_legacy_files_and_allows_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path();
+        let marker_path = app_data.join(RESET_MARKER);
+        fs::create_dir(&marker_path).unwrap();
+        for name in LEGACY_FILES {
+            fs::write(app_data.join(name), b"legacy").unwrap();
+        }
+
+        assert!(matches!(
+            prepare_account_management_storage(app_data),
+            Err(CoreError::InvalidInput(_))
+        ));
+        for name in LEGACY_FILES {
+            assert_eq!(fs::read(app_data.join(name)).unwrap(), b"legacy");
+        }
+        assert!(marker_path.is_dir());
+
+        // 완료 표시 경로만 복구하면 같은 저장소로 안전하게 다시 시도할 수 있다.
+        fs::remove_dir(&marker_path).unwrap();
+        prepare_account_management_storage(app_data).unwrap();
+        for name in LEGACY_FILES {
+            assert!(!app_data.join(name).exists());
+        }
+        assert!(marker_path.is_file());
+    }
 
     #[test]
     fn removes_only_allowlisted_agent_manager_data_once() {

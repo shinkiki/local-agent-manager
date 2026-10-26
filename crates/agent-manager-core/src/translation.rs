@@ -3690,7 +3690,7 @@ fn artifact_resource_id(root_name: &str, conversation_id: &str, name: &str) -> S
 }
 
 fn hash_text(text: &str) -> String {
-    format!("{:x}", Sha256::digest(text.as_bytes()))
+    crate::identifier::lower_hex(&Sha256::digest(text.as_bytes()))
 }
 
 fn field_source_hash(source: &TranslationFieldSource) -> String {

@@ -31,6 +31,8 @@ export function GitDiffWindow({ request }: { request: GitDiffRequest }) {
       originalPath: request.originalPath,
       staged: request.staged,
       commit: request.commit,
+      rangeFrom: request.rangeFrom ?? null,
+      rangeTo: request.rangeTo ?? null,
       fullContext: true,
     })
       .then((next) => { setDiff(next); setError(null); })

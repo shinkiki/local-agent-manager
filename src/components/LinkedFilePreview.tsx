@@ -113,15 +113,30 @@ export function LinkedFilePreview({
  * 진행 표시와 실패 문구를 다루던 열 줄은 앱 공용 봉투(`useBusyAction`)와 같은 모양이라 그
  * 한 벌을 쓴다. 이 훅에 남는 것은 그 봉투가 일부러 맡지 않는 두 가지 — 돌고 있는 동안 다시
  * 누르는 것을 막는 일과, 보는 링크가 바뀌면 앞 링크의 실패 문구를 지우는 일뿐이다.
+ *
+ * 지우는 일은 링크가 바뀌는 순간 한 번뿐이라, 그 뒤에 도착한 앞 링크의 실패는 다시 배너를
+ * 세웠다 — 미리보기 안의 링크로 넘어간 새 문서 위에 앞 문서의 실패가 붙었다. 그래서 실패는
+ * 시작한 링크가 아직 보는 링크일 때만 문구로 남긴다.
  */
 function useLinkedFileDownload(href: string, onDownload: (href: string) => Promise<void>) {
   const { busy, error, setError, run } = useBusyAction();
+  const currentHref = useRef(href);
 
-  useEffect(() => setError(null), [href, setError]);
+  useEffect(() => {
+    currentHref.current = href;
+    setError(null);
+  }, [href, setError]);
 
   const start = async () => {
     if (busy) return;
-    await run("download", () => onDownload(href));
+    const requested = href;
+    await run("download", async () => {
+      try {
+        await onDownload(requested);
+      } catch (cause) {
+        if (currentHref.current === requested) throw cause;
+      }
+    });
   };
 
   return { downloading: busy !== null, error, run: start };

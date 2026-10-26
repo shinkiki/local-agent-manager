@@ -4,41 +4,16 @@ import { copyDiagramPng, saveDiagramPng, saveDiagramSvg } from "../lib/diagramIm
 import { diagramLinkAt } from "../lib/mermaidSvg";
 import { useI18n } from "../lib/i18n";
 import { useDiagramSvg } from "../lib/useDiagramSvg";
+import { fitScaleFor, IDENTITY, scaledAround, wheelZoomFactor, type ViewTransform } from "../lib/diagramViewTransform";
 import { openDiagramLink } from "../lib/diagramLinkOpener";
 import { DiagramCanvas, useDiagramNotice } from "./DiagramCanvas";
 import { ErrorBanner, LoadingState } from "./Shared";
 
-const MIN_SCALE = 0.2;
-const MAX_SCALE = 8;
 /** 버튼 한 번의 배율 변화. 휠·핀치는 손의 움직임에 비례하므로 이 값을 쓰지 않는다. */
 const SCALE_STEP = 1.25;
 
-/**
- * 휠 한 칸이 얼마나 확대할지. 배율은 곱으로 움직이므로 `exp(-delta/거리)`를 쓴다 —
- * 칸 단위로 딱딱 끊기는 마우스 휠(한 번에 100px 남짓)과 픽셀 단위로 잘게 오는 트랙패드가
- * **같은 손놀림에 같은 만큼** 확대돼야 한다. 고정 배수를 쓰면 트랙패드에서 이벤트가 수십 번
- * 쏟아지며 순식간에 최대 배율까지 튄다.
- */
-const WHEEL_ZOOM_DISTANCE = 400;
-
-/** 줄 단위로 오는 휠(deltaMode 1)을 픽셀로 환산하는 값. */
-const WHEEL_LINE_HEIGHT = 16;
-
-interface ViewTransform {
-  scale: number;
-  x: number;
-  y: number;
-}
-
-const IDENTITY: ViewTransform = { scale: 1, x: 0, y: 0 };
-
 /** 맞춤 배율을 잴 때 프레임 가장자리에 남기는 여백. 상자가 테두리에 붙어 잘려 보이지 않게 한다. */
 const FIT_MARGIN = 16;
-
-/** 배율은 늘 이 범위 안이다. 버튼·휠·핀치가 저마다 자르면 한 곳만 고쳐도 나머지가 남는다. */
-function clampScale(scale: number): number {
-  return Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale));
-}
 
 /**
  * 그림을 원문이 정한 크기로 고정한다.
@@ -68,29 +43,7 @@ function fitScale(frame: HTMLDivElement): number {
   // 배율은 변환(transform)으로 걸리므로 레이아웃 크기(offset*)를 재야 배율이 섞이지 않는다.
   const width = canvas?.offsetWidth ?? 0;
   const height = canvas?.offsetHeight ?? 0;
-  const frameWidth = frame.clientWidth - FIT_MARGIN;
-  const frameHeight = frame.clientHeight - FIT_MARGIN;
-  if (width <= 0 || height <= 0 || frameWidth <= 0 || frameHeight <= 0) return 1;
-  return clampScale(Math.min(1, frameWidth / width, frameHeight / height));
-}
-
-/**
- * `anchor` 아래에 있던 그림이 `to` 자리에 머문 채 배율만 `nextScale`로 바뀐 변환. 이 보정이
- * 없으면 확대할 때마다 그림이 중앙으로 끌려가 손가락·커서가 가리키던 곳을 놓친다.
- *
- * 버튼(기준점 = 프레임 중심)·휠(기준점 = 커서)·핀치(기준점이 두 손가락 중점과 함께 움직여
- * `to`가 갈린다)가 같은 식을 쓴다. 셋이 따로 적혀 있으면 한 조작에서만 어긋나는 확대가
- * 생기고, 그건 손으로 만져 보기 전까지 드러나지 않는다.
- */
-function scaledAround(view: ViewTransform, nextScale: number, anchor: { x: number; y: number }, to = anchor): ViewTransform {
-  const scale = clampScale(nextScale);
-  if (scale === view.scale && to.x === anchor.x && to.y === anchor.y) return view;
-  const ratio = scale / view.scale;
-  return {
-    scale,
-    x: to.x - (anchor.x - view.x) * ratio,
-    y: to.y - (anchor.y - view.y) * ratio,
-  };
+  return fitScaleFor(width, height, frame.clientWidth - FIT_MARGIN, frame.clientHeight - FIT_MARGIN);
 }
 
 /** 진행 중인 손짓. 손가락 하나면 이동, 둘이면 확대다. 시작 시점의 상태를 함께 들고 있어야 누적 오차가 없다. */
@@ -135,11 +88,10 @@ function useDiagramView() {
     const onWheel = (event: WheelEvent) => {
       if (event.deltaY === 0) return;
       event.preventDefault();
-      const delta = event.deltaMode === 1 ? event.deltaY * WHEEL_LINE_HEIGHT : event.deltaY;
       // 기준점은 갱신자 밖에서 읽는다 — setView 갱신자는 같은 값으로 두 번 불릴 수 있어
       // 그 안에서 프레임 위치를 재는 것은 순수하지 않다.
       const anchor = framePoint(event.clientX, event.clientY);
-      setView((current) => scaledAround(current, current.scale * Math.exp(-delta / WHEEL_ZOOM_DISTANCE), anchor));
+      setView((current) => scaledAround(current, current.scale * wheelZoomFactor(event.deltaY, event.deltaMode), anchor));
     };
     frame.addEventListener("wheel", onWheel, { passive: false });
     return () => frame.removeEventListener("wheel", onWheel);

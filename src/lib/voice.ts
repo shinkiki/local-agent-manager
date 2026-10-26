@@ -14,8 +14,11 @@ export {
   type SpeechRecognitionLike,
 } from "./speechRecognition.ts";
 export {
+  RECOGNITION_UNSUPPORTED_TEXT,
   speechRecognitionErrorText,
+  voiceButtonState,
   voiceStatusText,
+  type VoicePlaybackState,
   type VoiceStatus,
   type VoiceText,
 } from "./voiceText.ts";

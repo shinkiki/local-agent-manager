@@ -2,6 +2,7 @@ import { RotateCcw, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import { displayPath } from "../lib/displayPath";
 import { useI18n, type UiText } from "../lib/i18n";
+import { PROVIDER_IDS } from "../lib/providerIds";
 import type {
   ProjectOption,
   ProviderId,
@@ -27,7 +28,8 @@ import {
   sessionStatusLabel,
 } from "../lib/sessionReadPolicy";
 
-const PROVIDERS: ProviderId[] = ["codex", "claude", "antigravity"];
+// 공급자 칩은 정본 목록을 그대로 쓴다. 손으로 적은 사본은 local 이 생겼을 때 따라가지 않았다.
+const PROVIDERS = PROVIDER_IDS;
 
 /** 상태 필터로 실제 쓸 만한 값만 고른다. 나머지는 비워 둔 전체 상태로 덮인다. */
 const STATUSES: SessionManagementStatus[] = [

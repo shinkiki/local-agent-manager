@@ -768,7 +768,7 @@ fn digest_effective_packs(packs: &[AiaSuggestionEffectivePack]) -> Result<String
     let encoded = serde_json::to_vec(&effective_content)?;
     let mut hasher = Sha256::new();
     hasher.update(encoded);
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::identifier::lower_hex(&hasher.finalize()))
 }
 
 fn cache_key(home: &Path, skill_key: &str) -> String {

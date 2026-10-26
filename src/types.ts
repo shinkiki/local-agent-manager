@@ -2977,6 +2977,11 @@ export interface ShutdownImpact {
 export interface ChatSessionInfo {
   /** A fork inherits transcript history even though it starts a new provider session. */
   forked?: boolean;
+  /**
+   * Source session of a plain fork (not a message edit). A Claude fork's new session file only
+   * appears with the first message, so until then the earlier conversation is read from here.
+   */
+  forkSourceSessionId?: string | null;
   chatId: string;
   startedAt: number;
   source: ProviderId;

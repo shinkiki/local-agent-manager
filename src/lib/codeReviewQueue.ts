@@ -160,11 +160,11 @@ export function buildQueue(input: BuildQueueInput): QueueReport {
   for (const commit of commits) {
     const itemId = commitItemId(commit.hash);
     if (reviewed.has(itemId) || seen.has(itemId)) continue;
+    seen.add(itemId);
     if (Number(commit.timestamp) < floor) {
       expired += 1;
       continue;
     }
-    seen.add(itemId);
     items.push({
       itemId,
       kind: 'commit',

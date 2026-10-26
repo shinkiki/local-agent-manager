@@ -172,6 +172,16 @@ function sidebarMeter(
   density: SidebarUsageDensity,
 ): SidebarUsageMeter {
   const accountLabel = sidebarAccountLabel(source, labels);
+  // 무제한 공급자는 창을 그리지 않으므로 눈금을 만들기 전에 끝낸다.
+  if (source.unlimited) {
+    return {
+      key: source.key,
+      accountLabel,
+      windows: [],
+      unavailableValue: labels.unlimited,
+      title: `${accountLabel} · ${labels.unlimited}`,
+    };
+  }
   const allWindows = displayUsageWindows(source.usage.windows, now);
   const detailed = allWindows.map((window) => (
     sidebarWindowMeter(source.usage, window, accountLabel, labels, now)
@@ -183,15 +193,6 @@ function sidebarMeter(
   const windows = density === "compact" && governing.size > 0
     ? detailed.filter((_meter, index) => governing.has(allWindows[index]))
     : detailed;
-  if (source.unlimited) {
-    return {
-      key: source.key,
-      accountLabel,
-      windows: [],
-      unavailableValue: labels.unlimited,
-      title: `${accountLabel} · ${labels.unlimited}`,
-    };
-  }
   return {
     key: source.key,
     accountLabel,

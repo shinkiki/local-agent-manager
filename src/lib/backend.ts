@@ -174,7 +174,11 @@ function resolveBackendUrl(
 /** WebSocket과 자산 GET에만 `?session=`을 붙인다. 기존 쿼리는 그대로 둔다. */
 function withSessionQuery(path: string, scheme: BackendScheme, sessionToken: string | null): string {
   if (!sessionToken) return path;
-  const [pathname, query = ""] = path.split("?", 2);
+  // 첫 `?`에서만 가른다. `split("?", 2)`는 셋째 조각부터 버려서, 값에 `?`가 든 쿼리
+  // (`?q=a?b`)의 뒷부분이 토큰을 붙이는 순간 사라졌다.
+  const queryStart = path.indexOf("?");
+  const pathname = queryStart < 0 ? path : path.slice(0, queryStart);
+  const query = queryStart < 0 ? "" : path.slice(queryStart + 1);
   const wantsQuery = scheme === WEB_SOCKET_SCHEME
     || SESSION_QUERY_PATHS.some((prefix) => pathname.startsWith(prefix));
   if (!wantsQuery) return path;

@@ -9,6 +9,7 @@ import {
   validateScheduleWorkflowDraft,
   validateWorkflowModelInputs,
   workflowModelInputChoices,
+  workflowModelInputIsLadder,
   workflowModelInputIsMultiple,
   workflowInputDefaults,
   workflowInputEntries,
@@ -189,6 +190,13 @@ function usePacedTriggerDraft({ workflows, schedule, initialWorkflowId, onSaved 
   const modelCatalogs = useWorkflowModelCatalogs();
 
   // 계약이 선언한 기본값을 먼저 깔고, 저장된 워크플로를 고른 동안만 저장 값을 덮는다.
+  //
+  // 다시 채우는 때는 **내용**이 바뀔 때뿐이다 — 고른 워크플로, 그 계약의 입력 선언, 저장된 인자.
+  // 페이싱 화면은 30초마다 회차·워크플로 목록을 다시 읽어 내용이 같은 새 객체를 넘기는데, 객체가
+  // 바뀔 때마다 다시 채우면 고르던 값이 저장 전에 저장값으로 되돌아가고, 그대로 저장을 누르면 옛
+  // 값이 저장된다(2026-10-26 사용자 보고: 레인 모델을 골라 저장했는데 다시 열면 그대로).
+  const savedKey = JSON.stringify([saved?.workflowId ?? null, saved?.arguments ?? null]);
+  const schemaKey = JSON.stringify([selected?.id ?? null, selected?.inputSchema ?? null]);
   useEffect(() => {
     if (!selected) return;
     const entries = workflowInputEntries(selected);
@@ -196,13 +204,15 @@ function usePacedTriggerDraft({ workflows, schedule, initialWorkflowId, onSaved 
     setInputs(selected.id === saved?.workflowId
       ? { ...defaults, ...workflowInputsFromArguments(entries, saved.arguments) }
       : defaults);
-  }, [saved, selected]);
+    // 객체가 아니라 내용 키로 다시 채운다(위 주석). 키가 같으면 saved·selected 의 내용도 같다.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [savedKey, schemaKey]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const problems = [
       ...validateScheduleWorkflowDraft({ workflow: selected, inputs }),
-      ...validateWorkflowModelInputs(schema, inputs, modelCatalogs),
+      ...validateWorkflowModelInputs(schema, inputs, modelCatalogs, { ladder: paced }),
     ];
     if (problems.length > 0) {
       setError(problems.join(" "));
@@ -351,7 +361,8 @@ export function PacedTriggerEditor({ workflows, schedule, initialWorkflowId, gua
                 value={inputs[fieldName] ?? ""}
                 onChange={(next) => changeInput(fieldName, next)}
                 choices={workflowModelInputChoices(fieldName, modelCatalogs)}
-                multiple={workflowModelInputIsMultiple(fieldName)}
+                multiple={workflowModelInputIsMultiple(fieldName) || (paced && workflowModelInputIsLadder(fieldName))}
+                hint={paced && workflowModelInputIsLadder(fieldName) ? ladderHint(fieldName, text) : undefined}
               />
             ))}
           </div>
@@ -378,6 +389,29 @@ export function PacedTriggerEditor({ workflows, schedule, initialWorkflowId, gua
         </button>
       </footer>
     </form>
+  );
+}
+
+/**
+ * 페이싱 회차의 모델 사다리 칸 안내. 공급자마다 여러 모델을 고른 뜻이 다르다 — Claude는 모델 전용
+ * 주간 한도(Fable)를 먼저 쓰고, Antigravity는 모델군 쿼터가 따로라 함께 돌리고, Codex는 앞 모델부터다.
+ */
+function ladderHint(fieldName: string, text: UiText): string {
+  if (fieldName === "antigravityModel") {
+    return text(
+      "여러 모델군을 고르면 모델군마다 따로인 한도를 같은 회차에 함께 씁니다. 자리가 모자라면 리셋이 급한 모델군부터 받습니다.",
+      "Pick several model groups to spend each group's separate quota in the same round. When slots run short, the group closest to its reset goes first.",
+    );
+  }
+  if (fieldName === "claudeModel") {
+    return text(
+      "여러 개를 고르면 모델 전용 주간 한도(예: Fable)가 남은 동안 그 모델을 먼저 쓰고, 다 차면 다른 모델로 계정 한도를 채웁니다.",
+      "Pick several to use a model's own weekly limit (e.g. Fable) first while it lasts, then fill the account limit with the other models.",
+    );
+  }
+  return text(
+    "여러 개를 고르면 계정마다 한도가 남은 모델을 앞에서부터 씁니다.",
+    "Pick several and each account uses the first model that still has quota.",
   );
 }
 

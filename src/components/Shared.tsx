@@ -291,7 +291,7 @@ export function DialogCloseButton({ label, onClose, autoFocus = false }: { label
  * - `panel`: 팝아웃 창처럼 이 상세가 화면 전체인 경우. 덮는 배경도 모달 의미도 없으므로
  *   배경 클릭 닫기와 `aria-modal`, Esc 닫기를 두지 않는다.
  */
-export function Drawer({ title, actions, headerContent, onClose, bodyRef, bodyOverlay, footer, dropZone, variant = "overlay", children }: PropsWithChildren<{ title: ReactNode; actions?: ReactNode; headerContent?: ReactNode; onClose: () => void; bodyRef?: Ref<HTMLDivElement>; bodyOverlay?: ReactNode; footer?: ReactNode; dropZone?: FileDropZone; variant?: "overlay" | "panel" }>) {
+export function Drawer({ title, actions, headerContent, onClose, bodyRef, bodyClassName, bodyBusy, bodyOverlay, footer, dropZone, variant = "overlay", children }: PropsWithChildren<{ title: ReactNode; actions?: ReactNode; headerContent?: ReactNode; onClose: () => void; bodyRef?: Ref<HTMLDivElement>; bodyClassName?: string; bodyBusy?: boolean; bodyOverlay?: ReactNode; footer?: ReactNode; dropZone?: FileDropZone; variant?: "overlay" | "panel" }>) {
   const { text } = useI18n();
   const panel = variant === "panel";
   useEscapeToClose(onClose, !panel);
@@ -315,7 +315,7 @@ export function Drawer({ title, actions, headerContent, onClose, bodyRef, bodyOv
         {headerContent && <div className="drawer-header-content">{headerContent}</div>}
       </div>
       <div className="drawer-body-shell">
-        <div className="drawer-body" ref={bodyRef}>{children}</div>
+        <div className={`drawer-body${bodyClassName ? ` ${bodyClassName}` : ""}`} ref={bodyRef} aria-busy={bodyBusy || undefined}>{children}</div>
         {bodyOverlay}
       </div>
       {footer && <div className="drawer-footer">{footer}</div>}
@@ -714,7 +714,7 @@ export function AppToggle({ checked, disabled = false, label, onChange }: {
  * 워크플로 계약이 선언한 입력 하나를 그리는 컨트롤. 워크플로 화면의 즉시 실행과 반복
  * 요청 편집기가 같은 폼을 써야 저장한 값이 실행 화면과 다르게 보이지 않는다.
  */
-export function WorkflowInputControl({ name, field, value, onChange, invalid = false, choices, multiple = false }: {
+export function WorkflowInputControl({ name, field, value, onChange, invalid = false, choices, multiple = false, hint }: {
   name: string;
   field: WorkflowInputField;
   value: string;
@@ -725,6 +725,8 @@ export function WorkflowInputControl({ name, field, value, onChange, invalid = f
   choices?: { value: string; label: string }[] | null;
   /** 선택지에서 여럿을 고르는 칸. 값은 쉼표로 이어 붙인 한 문자열로 오간다. */
   multiple?: boolean;
+  /** 여럿을 고르는 칸에서 고른 모델들을 어떻게 쓰는지 알리는 한 줄. */
+  hint?: string;
 }) {
   const { text } = useI18n();
   // 계약이 표시 이름을 주면 그것을 제목으로 쓰고 키는 함께 작게 남긴다. 키는 AIA와
@@ -740,7 +742,10 @@ export function WorkflowInputControl({ name, field, value, onChange, invalid = f
     {field.label?.trim() && <small className="workflow-input-key">{name}</small>}
     {field.description && <small>{field.description}</small>}
   </>;
-  const missingChoice = choices != null && value !== "" && !choices.some((choice) => choice.value === value);
+  // 여럿을 고르는 칸은 값이 쉼표 목록이라 고른 값마다 본다. 목록 전체를 선택지 하나와
+  // 견주면 둘 이상 고른 정상 값이 늘 "목록에 없는 값"으로 붉게 표시된다.
+  const savedValues = multiple ? value.split(",").map((item) => item.trim()).filter(Boolean) : [value];
+  const missingChoice = choices != null && savedValues.some((saved) => saved !== "" && !choices.some((choice) => choice.value === saved));
   const className = invalid || missingChoice ? "workflow-input-invalid" : undefined;
   // 선택지를 넘겨받은 입력과 계약이 enum으로 선언한 입력은 같은 select를 그린다. 빈 칸의
   // 안내 문구와 목록만 다르므로 그 둘만 갈라 두고, 나머지(라벨·필수 표시·유효성 속성)는
@@ -751,7 +756,7 @@ export function WorkflowInputControl({ name, field, value, onChange, invalid = f
   // 여럿을 고르는 칸은 select 대신 체크박스 무리를 그린다. select multiple은 화면에서
   // 몇 개를 골랐는지 읽기 어렵고, 고르는 수가 두셋뿐이라 펼쳐 두는 편이 낫다.
   if (multiple && selectChoices) {
-    const picked = value.split(",").map((item) => item.trim()).filter(Boolean);
+    const picked = savedValues;
     const toggle = (model: string, on: boolean) => {
       // 고른 순서가 아니라 선택지 순서로 저장한다. 같은 조합이 늘 같은 문자열이 되어야
       // 저장본을 견줄 때 순서만 다른 값이 바뀐 것으로 읽히지 않는다.
@@ -762,6 +767,7 @@ export function WorkflowInputControl({ name, field, value, onChange, invalid = f
     };
     return <fieldset className={`workflow-input-multi${className ? ` ${className}` : ""}`}>
       <legend>{label}</legend>
+      {hint && <small className="workflow-input-hint">{hint}</small>}
       {selectChoices.length === 0
         ? <small>{text("고를 모델이 없습니다. 연결을 켜고 주소를 저장하세요.", "No models to choose. Turn the connection on and save its address.")}</small>
         : selectChoices.map((choice) => <label className="workflow-input-boolean" key={choice.value}>

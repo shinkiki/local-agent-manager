@@ -123,6 +123,9 @@ export function AppStatusbar({ sources, providers, platform, architecture, densi
         "aria-controls": "statusbar-usage-details",
         onClick: toggleDensity,
         onKeyDown: (event: KeyboardEvent<HTMLElement>) => {
+          // 새로고침 버튼에서 올라온 Enter·Space는 버튼 자신의 누름이다. 여기서 막으면
+          // preventDefault가 버튼 활성화를 지워 키보드로는 새로고침이 되지 않고 밀도만 뒤집힌다.
+          if (event.target instanceof Element && event.target.closest("button")) return;
           if (event.key !== "Enter" && event.key !== " ") return;
           event.preventDefault();
           toggleDensity();

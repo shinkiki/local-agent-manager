@@ -28,6 +28,11 @@ export function ProjectFilesPanel({ projectPath, active }: { projectPath: string
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const generation = useRequestGeneration();
+  // 검색은 본문 읽기와 세대를 나눠 쓴다. 한 세대를 함께 쓰면 본문을 읽는 사이 검색어를 한 글자
+  // 더 치는 것만으로 그 읽기가 낡은 요청이 되어 결과도 `onSettled`도 버려지고, 효과의 의존성은
+  // 그대로라 다시 읽지도 않아 "파일을 읽고 있습니다"에서 멈췄다. 반대로 파일을 고르면 진행 중인
+  // 검색이 버려져 `searching`이 켜진 채 남았다.
+  const searchGeneration = useRequestGeneration();
   const [sidebarOpen, setSidebarOpen] = useState(() => readSecondaryPaneOpen(PROJECT_FILES_SIDEBAR_OPEN_KEY));
   const [sidebarIsOverlay, setSidebarIsOverlay] = useState(() => window.matchMedia(SECONDARY_PANE_COLLAPSE_MEDIA_QUERY).matches);
   const sidebarCloseRef = useRef<HTMLButtonElement>(null);
@@ -69,25 +74,35 @@ export function ProjectFilesPanel({ projectPath, active }: { projectPath: string
   const [searchContents, setSearchContents] = useState(false);
   const [results, setResults] = useState<ProjectFileSearchPage | null>(null);
   const [searching, setSearching] = useState(false);
+  // 검색 실패는 검색 창에만 둔다. 본문 오류와 한 칸을 쓰면 검색 실패가 읽는 중인 파일을 실패로
+  // 보이게 하고, 파일을 고르는 것이 아직 유효한 검색 실패를 지운다.
+  const [searchError, setSearchError] = useState<string | null>(null);
 
   const trimmed = query.trim();
   useEffect(() => {
     const request = buildProjectFileSearchRequest({ projectPath, query: trimmed, searchContents });
     if (request === null) {
+      // 진행 중이던 검색이 비운 뒤에 도착해 목록을 되살리지 않도록 세대를 넘긴다.
+      searchGeneration.open();
       setResults(null);
+      setSearchError(null);
+      setSearching(false);
       return;
     }
     // 입력마다 트리를 통째로 훑지 않도록 잠깐 기다린다. 늦게 도착한 응답은
-    // `generation`이 가린다.
-    const requestId = generation.open();
+    // `searchGeneration`이 가린다.
+    const requestId = searchGeneration.open();
     const timer = setTimeout(() => {
       setSearching(true);
-      void generation.latest(
+      void searchGeneration.latest(
         requestId,
         () => searchProjectFiles(request),
         {
-          onResult: setResults,
-          onError: setError,
+          onResult: (page) => {
+            setResults(page);
+            setSearchError(null);
+          },
+          onError: setSearchError,
           onSettled: () => setSearching(false),
         },
       );
@@ -95,7 +110,7 @@ export function ProjectFilesPanel({ projectPath, active }: { projectPath: string
     return () => clearTimeout(timer);
     // 요청은 효과 안에서 만든다 — 렌더마다 새 객체인 값을 의존성에 걸면 효과가 매번 돈다.
     // `searchContents` 가 의존성에 있어야 스위치를 켠 순간 같은 질의로 다시 검색한다.
-  }, [generation, projectPath, trimmed, searchContents]);
+  }, [searchGeneration, projectPath, trimmed, searchContents]);
 
   const selectedPath = selected?.relativePath ?? null;
   useEffect(() => {
@@ -173,6 +188,7 @@ export function ProjectFilesPanel({ projectPath, active }: { projectPath: string
             />
             <span>{text("파일 본문도 검색", "Search file contents too")}</span>
           </label>
+          {trimmed.length > 0 && searchError && <ErrorBanner message={searchError} />}
           {trimmed.length > 0
             ? <ProjectFileSearchResults
                 page={results}

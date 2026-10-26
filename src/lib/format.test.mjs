@@ -60,6 +60,12 @@ test("formatTokens는 토큰 수를 축약한다", () => {
   assert.equal(formatTokens(2_500_000), "2.5M");
 });
 
+test("formatTokens는 반올림 시 상위 단위 1000.0이 되지 않고 상위 단위 1.0으로 올린다", () => {
+  assert.equal(formatTokens(999_949), "999.9K");
+  assert.equal(formatTokens(999_950), "1.0M");
+  assert.equal(formatTokens(999_999), "1.0M");
+});
+
 test("sourceName은 공급자 이름을 반환한다", () => {
   assert.equal(sourceName("claude"), "Claude");
   assert.equal(sourceName("codex"), "Codex");

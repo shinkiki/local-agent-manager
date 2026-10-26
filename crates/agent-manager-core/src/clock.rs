@@ -7,18 +7,21 @@
 //! 실제로는 없는 차이지만 "지금이 무엇인가"를 모듈마다 다시 정하고 있다는 뜻이라
 //! 여기 하나로 모았다.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 지금을 에포크 밀리초로 읽는다.
 ///
-/// 시스템 시계가 에포크 이전이면 `0`, `i64`를 넘기면 `i64::MAX`로 붙잡는다. 절단해서
-/// 시간이 거꾸로 가는 값을 내놓지 않으므로, 이 값을 정렬·비교에 쓰는 호출부가 시계
-/// 이상을 만나도 순서가 뒤집히지 않는다.
+/// 시스템 시계가 에포크 이전이면 `0`, `i64`를 넘기면 `i64::MAX`로 붙잡는다.
+/// 넘침에 의한 역행은 막지만 시스템 시계 보정에 따른 역행은 그대로 반영한다.
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis().min(i64::MAX as u128) as i64)
+        .map(epoch_duration_ms)
         .unwrap_or(0)
+}
+
+fn epoch_duration_ms(elapsed: Duration) -> i64 {
+    elapsed.as_millis().min(i64::MAX as u128) as i64
 }
 
 #[cfg(test)]
@@ -35,9 +38,34 @@ mod tests {
     }
 
     #[test]
-    fn now_ms_does_not_go_backwards() {
-        let first = now_ms();
-        let second = now_ms();
-        assert!(second >= first, "{second} < {first}");
+    fn epoch_duration_ms_uses_epoch_milliseconds() {
+        // V2: 변환 규칙은 실제 벽시계 대신 고정된 시각으로 검사한다.
+        let elapsed = Duration::new(1_577_836_800, 123_456_789);
+        assert_eq!(epoch_duration_ms(elapsed), YEAR_2020_MS + 123);
+    }
+
+    #[test]
+    fn epoch_duration_ms_truncates_submillisecond_precision() {
+        for (elapsed, expected) in [
+            (Duration::ZERO, 0),
+            (Duration::from_nanos(999_999), 0),
+            (Duration::from_nanos(1_000_000), 1),
+            (Duration::from_nanos(1_999_999), 1),
+        ] {
+            assert_eq!(epoch_duration_ms(elapsed), expected, "{elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn epoch_duration_ms_saturates_at_i64_max() {
+        let max_ms = i64::MAX as u64;
+        for (elapsed, expected) in [
+            (Duration::from_millis(max_ms - 1), i64::MAX - 1),
+            (Duration::from_millis(max_ms), i64::MAX),
+            (Duration::from_millis(max_ms + 1), i64::MAX),
+            (Duration::MAX, i64::MAX),
+        ] {
+            assert_eq!(epoch_duration_ms(elapsed), expected, "{elapsed:?}");
+        }
     }
 }

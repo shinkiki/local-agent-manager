@@ -147,6 +147,12 @@ impl HealthState {
         }
     }
 
+    /// 조정을 시작하지도 못한 실패. 진행 중 카운터는 건드리지 않고 마지막 오류만 남긴다 —
+    /// `finish_reconcile`을 대신 부르면 짝 없는 감소가 다른 조정의 진행 중 표시를 지운다.
+    pub(crate) fn note_reconcile_error(&mut self, message: String) {
+        self.last_reconcile_error = Some(message);
+    }
+
     pub(crate) fn note_resource_scan(&mut self, now: i64, revision: u64) {
         self.resource_revision = revision;
         self.last_resource_scan_at = Some(now);
@@ -213,6 +219,10 @@ pub(crate) fn finish_reconcile(outcome: Result<u64, String>) {
     update_state(|state| state.finish_reconcile(now, outcome));
 }
 
+pub(crate) fn note_reconcile_error(message: String) {
+    update_state(|state| state.note_reconcile_error(message));
+}
+
 pub(crate) fn note_resource_scan(revision: u64) {
     let now = now_ms();
     update_state(|state| state.note_resource_scan(now, revision));
@@ -241,6 +251,20 @@ mod tests {
     use super::*;
 
     const START: i64 = 1_000_000;
+
+    #[test]
+    fn a_reconcile_that_never_started_keeps_the_in_flight_marker_of_another() {
+        let mut state = HealthState::new(START);
+        state.begin_reconcile();
+        state.note_reconcile_error("스레드를 시작하지 못했습니다".to_owned());
+        let view = state.view(START + 1);
+        assert!(view.reconcile_in_flight);
+        assert_eq!(
+            view.last_reconcile_error.as_deref(),
+            Some("스레드를 시작하지 못했습니다")
+        );
+        assert_eq!(view.last_reconciled_at, None);
+    }
 
     #[test]
     fn a_fresh_state_is_stale_once_the_process_runs_without_a_successful_reconcile() {

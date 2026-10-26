@@ -9,6 +9,7 @@ import {
   workflowInputEntries,
   workflowInputsFromArguments,
   workflowModelInputChoices,
+  workflowModelInputIsLadder,
   workflowModelInputIsMultiple,
 } from "./scheduleWorkflow.ts";
 // 이 이름은 예약 쪽 창구에 없다 — 입력 어휘를 직접 묻는 유일한 호출부라 제 모듈에서 가져온다.
@@ -157,4 +158,67 @@ test("paced model inputs use provider catalogs and store model IDs instead of di
   assert.deepEqual(buildWorkflowArguments(schema, {
     antigravityModel: "gemini-3.8-flash-high",
   }), { antigravityModel: "gemini-3.8-flash-high" });
+});
+
+
+test("V2/V4: localModels validates each selected ID using the backend list format", () => {
+  const schema = [["localModels", { ...field("string", false), label: "로컬 모델" }]];
+  const catalogs = { local: [
+    { model: "qwen3.5-gpu", displayName: "Qwen GPU" },
+    { model: "gpt-oss-cpu-low", displayName: "GPT OSS CPU" },
+  ] };
+  for (const localModels of [
+    "qwen3.5-gpu",
+    "qwen3.5-gpu,gpt-oss-cpu-low",
+    " qwen3.5-gpu, , gpt-oss-cpu-low, ",
+    "",
+    "   ",
+    ", ,",
+  ]) {
+    assert.deepEqual(validateWorkflowModelInputs(schema, { localModels }, catalogs), [], localModels);
+    assert.deepEqual(buildWorkflowArguments(schema, { localModels }),
+      localModels.trim() ? { localModels } : {});
+  }
+  for (const localModels of ["qwen3.5-gpu,removed-model", "Qwen GPU,gpt-oss-cpu-low"]) {
+    assert.deepEqual(validateWorkflowModelInputs(schema, { localModels }, catalogs), [
+      "모델 목록에서 다시 선택하세요: 로컬 모델.",
+    ]);
+  }
+  assert.deepEqual(validateWorkflowModelInputs(schema, { localModels: "qwen3.5-gpu" }, {}), [
+    "모델 목록에서 다시 선택하세요: 로컬 모델.",
+  ]);
+});
+
+test("V4: singular model inputs still reject a list or surrounding whitespace", () => {
+  const schema = [["localModel", { ...field("string", false), label: "로컬 모델" }]];
+  const catalogs = { local: [{ model: "qwen3.5-gpu", displayName: "Qwen GPU" }] };
+  for (const localModel of [" qwen3.5-gpu ", "qwen3.5-gpu,qwen3.5-gpu"]) {
+    assert.deepEqual(validateWorkflowModelInputs(schema, { localModel }, catalogs), [
+      "모델 목록에서 다시 선택하세요: 로컬 모델.",
+    ]);
+  }
+  assert.deepEqual(validateWorkflowModelInputs(schema, { localModel: "qwen3.5-gpu" }, catalogs), []);
+});
+
+test("paced provider model inputs accept a model ladder and validate each ID", () => {
+  for (const name of ["claudeModel", "codexModel", "antigravityModel"]) {
+    assert.equal(workflowModelInputIsLadder(name), true, name);
+  }
+  assert.equal(workflowModelInputIsLadder("localModels"), false);
+  assert.equal(workflowModelInputIsLadder("message"), false);
+  const schema = [["claudeModel", { ...field("string", false), label: "Claude 모델" }]];
+  const catalogs = { claude: [
+    { model: "claude-fable-5-1", displayName: "Fable 5.1" },
+    { model: "claude-opus-5-5", displayName: "Opus 5.5" },
+  ] };
+  for (const claudeModel of ["claude-opus-5-5", "claude-fable-5-1,claude-opus-5-5", " claude-fable-5-1 , claude-opus-5-5 "]) {
+    assert.deepEqual(validateWorkflowModelInputs(schema, { claudeModel }, catalogs, { ladder: true }), [], claudeModel);
+  }
+  assert.deepEqual(validateWorkflowModelInputs(schema, { claudeModel: "claude-fable-5-1,removed" }, catalogs, { ladder: true }), [
+    "모델 목록에서 다시 선택하세요: Claude 모델.",
+  ]);
+  // 페이싱이 아닌 계약은 입력을 그대로 모델로 넘기므로 목록을 받지 않는다.
+  assert.deepEqual(validateWorkflowModelInputs(schema, { claudeModel: "claude-fable-5-1,claude-opus-5-5" }, catalogs), [
+    "모델 목록에서 다시 선택하세요: Claude 모델.",
+  ]);
 });

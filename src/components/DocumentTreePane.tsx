@@ -218,7 +218,9 @@ function useDocumentEntryTree(
   const toggleFolder = (entry: DocumentEntry) => {
     const willExpand = !expanded.has(entry.relativePath);
     setExpanded((current) => withSetMember(current, entry.relativePath, willExpand));
-    if (willExpand && !cache.has(entry.relativePath)) {
+    // 이미 읽는 중인 폴더를 접었다 다시 펼치면 새로 부르지 않는다. 같은 첫 쪽을 두 번 부르면
+    // 앞 요청의 뒷정리가 뒤 요청이 도는 중에 진행 표시를 꺼 버리고, 응답도 두 번 덮어쓴다.
+    if (willExpand && !cache.has(entry.relativePath) && !loadingParents.has(entry.relativePath)) {
       void fetchFolder(entry.relativePath, null, generation.current());
     }
   };

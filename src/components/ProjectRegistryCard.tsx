@@ -224,7 +224,9 @@ export function ProjectRegistryCard({ onChanged }: {
           </header>
           {error && <ErrorBanner message={error} />}
           {!projects ? (
-            <p className="settings-storage-note">{text("프로젝트 목록을 불러오는 중…", "Loading projects…")}</p>
+            // 첫 조회가 실패하면 목록은 끝내 오지 않는다. 배너 아래 "불러오는 중"을 남기면
+            // 아직 기다리면 되는 것처럼 읽히므로, 그때는 배너만 둔다.
+            !error && <p className="settings-storage-note">{text("프로젝트 목록을 불러오는 중…", "Loading projects…")}</p>
           ) : (
             <ProjectRegistryResults
               projectCount={projects.length}

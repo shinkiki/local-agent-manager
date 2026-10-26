@@ -1916,7 +1916,7 @@ fn deployed_set_digest(deployment: &ProjectInstructionDeployment, directory: &Pa
         );
         hasher.update([0]);
     }
-    format!("{:x}", hasher.finalize())
+    crate::identifier::lower_hex(&hasher.finalize())
 }
 
 fn installed_deployment_status(
@@ -2081,7 +2081,7 @@ fn read_instruction_content(directory: &Path) -> Result<InstructionContent, Core
         hasher.update(fs::read(directory.join(&file.relative))?);
     }
     Ok(InstructionContent {
-        digest: format!("{:x}", hasher.finalize()),
+        digest: crate::identifier::lower_hex(&hasher.finalize()),
         files,
         symlinks,
         total_bytes,
@@ -2383,7 +2383,9 @@ fn missing_archived_source_for_update(key: &str) -> String {
 fn digest_file(path: &Path) -> Result<String, CoreError> {
     let metadata = regular_file_metadata(path, "지침은 심볼릭 링크가 아닌 일반 파일이어야 합니다")?;
     ensure_within_limit(&metadata, MAX_INSTRUCTION_FILE_BYTES)?;
-    Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
+    Ok(crate::identifier::lower_hex(&Sha256::digest(fs::read(
+        path,
+    )?)))
 }
 
 fn instruction_file_name(provider: ProviderId) -> &'static str {

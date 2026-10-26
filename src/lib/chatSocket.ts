@@ -2,7 +2,11 @@ import type { ChatEvent, ChatSessionInfo } from "../types";
 import { backendWebSocketUrl } from "./backend.ts";
 import { assertRemoteChatAccess } from "./chatAccess.ts";
 import { createChatEventBatch } from "./chatEventBatch.ts";
-import { BACKEND_RESTARTED_MESSAGE, chatReconnectDecision } from "./chatReconnect.ts";
+import {
+  BACKEND_RESTARTED_MESSAGE,
+  chatReconnectDecision,
+  chatReconnectPrecheckStep,
+} from "./chatReconnect.ts";
 import { createChatReconnectWatch } from "./chatReconnectWatch.ts";
 import {
   haltChatReconnect,
@@ -205,7 +209,13 @@ async function reconnectChatSocket(runtime: ChatSocketRuntime, chatId: string): 
     // attach를 보내기 전에 프로세스가 그대로인지 확인한다. 교체된 뒤에는 attach가
     // 영원히 실패하므로, 재기동을 연결 장애로 오해하고 무한히 두드리지 않는다.
     const current = await getWebAccessStatus({ timeoutMs: RECONNECT_PRECHECK_TIMEOUT_MS });
-    if (current.instanceId !== runtime.backendInstanceId) {
+    const step = chatReconnectPrecheckStep(
+      runtime.detached,
+      runtime.backendInstanceId,
+      current.instanceId,
+    );
+    if (step === "abandon") return;
+    if (step === "restarted") {
       stopReconnecting(runtime, BACKEND_RESTARTED_MESSAGE);
       return;
     }

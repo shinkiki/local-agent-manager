@@ -1653,7 +1653,7 @@ fn digest_file(path: &Path) -> Result<String, CoreError> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::identifier::lower_hex(&hasher.finalize()))
 }
 
 #[cfg(test)]

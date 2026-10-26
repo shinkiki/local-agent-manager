@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -29,8 +29,24 @@ const STORE: JsonStore = JsonStore {
 const AUDIT_FILE: &str = "aia-mcp-audit.jsonl";
 const PREVIOUS_AUDIT_FILE: &str = "aia-mcp-audit.previous.jsonl";
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
-const MAX_REMOTE_BODY_BYTES: usize = 512 * 1024;
-const MAX_EXPOSED_RESULT_BYTES: usize = 256 * 1024;
+/// 원격 MCP 응답 본문(HTTP) 상한. 읽는 동안 이 크기에서 끊어 메모리도 함께 묶는다.
+///
+/// 노출 상한 안의 결과가 본문에서 먼저 끊기지 않도록 그 세 배에 여유를 더한다. 본문은
+/// 우리가 다시 직렬화한 결과보다 클 수 있다 — JSON-RPC 봉투가 붙고, 비ASCII 글자를
+/// `\uXXXX`로 내보내는 서버면 한글(3바이트)은 6바이트로 두 배, 키릴·그리스 문자나
+/// 악센트 붙은 라틴 문자(2바이트)는 6바이트로, BMP 밖 이모지(4바이트)는 서로게이트 쌍
+/// 12바이트로 세 배가 된다. 외부 플러그인 프록시(`MAX_PROXY_RESPONSE_BYTES`, 8 MiB)보다는
+/// 작아서 프록시를 지난 본문이 여기서 처음으로 묶인다. 이 상한을 넘은 `tools/call`
+/// 응답은 오류 대신 생략 안내로 바꾼다([`oversized_body_result`]).
+const MAX_REMOTE_BODY_BYTES: usize = 3 * MAX_EXPOSED_RESULT_BYTES + 512 * 1024;
+/// 도구 결과를 에이전트에 그대로 넘기는 직렬화 크기 상한. 넘으면 본문을 통째로 빼고
+/// 생략 안내와 `_meta.originalBytes`만 남긴다. 256 KB였을 때 노션 기획서 한 페이지
+/// (`notion-fetch`, 직렬화 270,480바이트)가 잘려 기획 회차 4번이 연달아 실패했다
+/// (2026-10-25). 노션 페이지는 수백 KB가 흔하고 문서는 자라므로 그 여덟 배쯤으로 둔다.
+/// 큰 결과는 받는 쪽이 감당한다 — Claude Code는 큰 MCP 출력을 파일로 빼고, Codex
+/// 회차는 결과를 프로그램으로 읽는다. 이 결과를 싣는 aia_system 응답은 외부 도구
+/// 작업에만 이 상한에 봉투 몫을 더한 상한을 따로 쓴다(`system_mcp::remote_tool_success`).
+pub(crate) const MAX_EXPOSED_RESULT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_AUDIT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_INTERFACES: usize = 32;
 const MAX_ENABLED_TOOLS: usize = 64;
@@ -426,16 +442,14 @@ impl McpInterfaceRegistry {
             Ok(result) => {
                 let remote_error = result.get("isError").and_then(Value::as_bool) == Some(true);
                 let result = bounded_remote_result(result);
+                // 상한 때문에 결과를 받지 못한 호출은 성공·원격 오류로 남기지 않는다.
+                let outcome = match remote_result_omission(&result) {
+                    Some(omission) => omission.audit_outcome(),
+                    None if remote_error => "remoteError",
+                    None => "succeeded",
+                };
                 let audit_recorded = self
-                    .record_invoke(
-                        &request.id,
-                        &request.tool,
-                        if remote_error {
-                            "remoteError"
-                        } else {
-                            "succeeded"
-                        },
-                    )
+                    .record_invoke(&request.id, &request.tool, outcome)
                     .is_ok();
                 Ok(json!({
                     "interfaceId": request.id,
@@ -604,8 +618,15 @@ impl McpHttpSession {
         self.rpc("tools/list", json!({}))
     }
 
+    /// 도구를 호출한다. 응답 본문이 [`MAX_REMOTE_BODY_BYTES`]를 넘으면 오류 대신
+    /// [`oversized_body_result`]를 돌려준다 — 노출 상한을 넘은 결과처럼 `_meta.truncated`
+    /// 생략 안내라 받는 쪽은 결과가 커서 빠졌다는 것을 같은 표시로 본다(본문을 끝까지
+    /// 읽지 않았으므로 원래 크기 대신 `bodyLimitBytes`가 실린다).
     pub(crate) fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, CoreError> {
-        self.rpc("tools/call", json!({"name": name, "arguments": arguments}))
+        match self.rpc("tools/call", json!({"name": name, "arguments": arguments})) {
+            Err(CoreError::TooLarge(limit)) => Ok(oversized_body_result(limit)),
+            other => other,
+        }
     }
 
     fn rpc(&mut self, method: &str, params: Value) -> Result<Value, CoreError> {
@@ -617,7 +638,7 @@ impl McpHttpSession {
             "method": method,
             "params": params
         }))?;
-        let value = response
+        let mut value = response
             .ok_or_else(|| CoreError::Runtime(format!("MCP {method} 응답이 비어 있습니다")))?;
         if let Some(error) = value.get("error") {
             let message = error
@@ -629,9 +650,10 @@ impl McpHttpSession {
                 text_limit::truncate_chars(message, 300)
             )));
         }
+        // 결과는 수 MiB일 수 있어 복사하지 않고 응답에서 떼어 낸다.
         value
-            .get("result")
-            .cloned()
+            .as_object_mut()
+            .and_then(|object| object.remove("result"))
             .ok_or_else(|| CoreError::Runtime(format!("MCP {method} 응답에 result가 없습니다")))
     }
 
@@ -800,24 +822,17 @@ fn parse_http_response(response: Response) -> Result<Option<Value>, CoreError> {
             status.as_u16()
         )));
     }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_REMOTE_BODY_BYTES as u64)
-    {
-        return Err(CoreError::TooLarge(MAX_REMOTE_BODY_BYTES as u64));
-    }
     let content_type = response
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_owned();
-    let body = response
-        .bytes()
-        .map_err(|error| CoreError::Runtime(format!("MCP 서버 응답을 읽지 못했습니다: {error}")))?;
-    if body.len() > MAX_REMOTE_BODY_BYTES {
-        return Err(CoreError::TooLarge(MAX_REMOTE_BODY_BYTES as u64));
-    }
+    let body = read_capped_body(
+        response,
+        MAX_REMOTE_BODY_BYTES,
+        "MCP 서버 응답을 읽지 못했습니다",
+    )?;
     if body.is_empty() {
         return Ok(None);
     }
@@ -829,6 +844,32 @@ fn parse_http_response(response: Response) -> Result<Option<Value>, CoreError> {
     serde_json::from_slice(&body)
         .map(Some)
         .map_err(CoreError::Json)
+}
+
+/// 응답 본문을 `limit` 안에서 읽는다. 선언된 길이가 상한을 넘으면 읽기 전에 거절하고,
+/// 길이 선언이 없는 chunked·SSE 본문은 상한보다 한 바이트 더까지만 읽어 넘었는지 본다 —
+/// 다 받은 뒤에 재면 상한이 메모리를 지켜 주지 못한다(`system_mcp::read_limited_body`와
+/// 같은 규칙). 외부 플러그인 프록시도 이 함수로 읽는다.
+pub(crate) fn read_capped_body(
+    response: Response,
+    limit: usize,
+    unreadable: &str,
+) -> Result<Vec<u8>, CoreError> {
+    let declared = response.content_length();
+    if declared.is_some_and(|length| length > limit as u64) {
+        return Err(CoreError::TooLarge(limit as u64));
+    }
+    // 선언된 길이만큼 미리 잡아 read_to_end가 버퍼를 두 배씩 늘리며 상한의 두 배 가까이
+    // 쥐지 않게 한다. 선언이 없으면 늘려 가며 읽되 상한+1에서 끊긴다.
+    let mut body = Vec::with_capacity(declared.map_or(0, |length| length as usize));
+    response
+        .take(limit as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| CoreError::Runtime(format!("{unreadable}: {error}")))?;
+    if body.len() > limit {
+        return Err(CoreError::TooLarge(limit as u64));
+    }
+    Ok(body)
 }
 
 /// 응답이 SSE 인지. 미디어 타입은 대소문자를 가리지 않고(RFC 9110 8.3.1) `;` 뒤 매개변수는
@@ -859,9 +900,84 @@ fn parse_sse_json(text: &str) -> Result<Value, CoreError> {
     ))
 }
 
+/// 쓰인 바이트 수만 센다. 수 MiB 결과의 크기를 재려고 그만한 버퍼를 또 만들지 않는다.
+struct ByteCounter(usize);
+
+impl Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 원격 응답 본문이 [`MAX_REMOTE_BODY_BYTES`]를 넘어 받지 못한 `tools/call`의 결과.
+/// 본문을 끝까지 읽지 않았으므로 원래 크기는 모르고, 도구가 성공했는지도 알 수 없어
+/// `isError`로 둔다.
+fn oversized_body_result(limit: u64) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": "외부 MCP 응답이 Agent Manager가 받는 본문 상한을 넘어 결과를 받지 못했습니다. 도구가 실행됐는지와 그 결과는 확인할 수 없습니다. 더 좁은 조회 조건을 사용하세요."
+        }],
+        "isError": true,
+        "_meta": {"truncated": true, "bodyLimitBytes": limit}
+    })
+}
+
+/// 원격 도구 결과가 Agent Manager의 상한 때문에 빠진 까닭.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteResultOmission {
+    /// 응답 본문이 [`MAX_REMOTE_BODY_BYTES`]를 넘어 읽지 않았다. 도구가 실행됐는지도 모른다.
+    BodyLimitExceeded,
+    /// 결과는 받았지만 [`MAX_EXPOSED_RESULT_BYTES`]를 넘어 본문을 뺐다.
+    Truncated,
+}
+
+impl RemoteResultOmission {
+    /// 감사 기록에 남기는 결과 이름. 평범한 성공(`succeeded`)과 갈라 둔다.
+    pub(crate) fn audit_outcome(self) -> &'static str {
+        match self {
+            Self::BodyLimitExceeded => "bodyLimitExceeded",
+            Self::Truncated => "truncated",
+        }
+    }
+
+    /// 시스템 감사의 실패 까닭 문구.
+    pub(crate) fn audit_reason(self) -> &'static str {
+        match self {
+            Self::BodyLimitExceeded => {
+                "bodyLimitExceeded: 외부 MCP 응답 본문이 받는 상한을 넘어 실행 결과를 확인하지 못했습니다"
+            }
+            Self::Truncated => {
+                "truncated: 외부 MCP 결과가 노출 상한을 넘어 본문을 생략했습니다"
+            }
+        }
+    }
+}
+
+/// [`bounded_remote_result`]·[`oversized_body_result`]를 거친 결과에서 상한 때문에 빠진
+/// 것을 알아본다. 감사 기록이 이런 호출을 성공으로 남기지 않게 하는 자리라, 원격 서버가
+/// 스스로 `_meta.truncated`를 달아 보내도 보수적으로 생략으로 본다.
+pub(crate) fn remote_result_omission(result: &Value) -> Option<RemoteResultOmission> {
+    let meta = result.get("_meta")?;
+    if meta.get("truncated").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    Some(if meta.get("bodyLimitBytes").is_some() {
+        RemoteResultOmission::BodyLimitExceeded
+    } else {
+        RemoteResultOmission::Truncated
+    })
+}
+
 pub(crate) fn bounded_remote_result(result: Value) -> Value {
-    let serialized_bytes = serde_json::to_vec(&result)
-        .map(|bytes| bytes.len())
+    let mut counter = ByteCounter(0);
+    let serialized_bytes = serde_json::to_writer(&mut counter, &result)
+        .map(|()| counter.0)
         .unwrap_or(MAX_EXPOSED_RESULT_BYTES + 1);
     if serialized_bytes <= MAX_EXPOSED_RESULT_BYTES {
         result
@@ -1179,13 +1295,39 @@ mod tests {
     }
 
     fn spawn_mock_mcp(request_count: usize) -> (String, thread::JoinHandle<()>) {
+        spawn_mock_mcp_with_call_result(
+            request_count,
+            json!({
+                "content": [{"type": "text", "text": "approved result"}],
+                "isError": false
+            }),
+            MockBody::default(),
+        )
+    }
+
+    /// 모의 서버가 응답 본문을 내보내는 방식.
+    #[derive(Clone, Copy, Default)]
+    struct MockBody {
+        /// 비ASCII 글자를 `\uXXXX`로 내보내 본문이 직렬화 결과보다 크게 오는 서버.
+        ascii_only: bool,
+        /// `Content-Length` 없이 연결을 닫아 본문 끝을 알리는 서버(chunked·SSE처럼 길이를
+        /// 미리 모르는 본문).
+        undeclared_length: bool,
+    }
+
+    /// `tools/call`이 `call_result`를 돌려주는 모의 서버.
+    fn spawn_mock_mcp_with_call_result(
+        request_count: usize,
+        call_result: Value,
+        body: MockBody,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
             for _ in 0..request_count {
                 let (mut stream, _) = listener.accept().unwrap();
-                let body = read_http_body(&mut stream);
-                let payload: Value = serde_json::from_slice(&body).unwrap();
+                let request = read_http_body(&mut stream);
+                let payload: Value = serde_json::from_slice(&request).unwrap();
                 let method = payload["method"].as_str().unwrap();
                 if method == "notifications/initialized" {
                     stream
@@ -1209,28 +1351,279 @@ mod tests {
                         "inputSchema": {"type": "object"},
                         "annotations": {"readOnlyHint": true, "destructiveHint": false}
                     }]}),
-                    "tools/call" => json!({
-                        "content": [{"type": "text", "text": "approved result"}],
-                        "isError": false
-                    }),
+                    "tools/call" => call_result.clone(),
                     other => panic!("unexpected MCP method: {other}"),
                 };
-                let response = serde_json::to_vec(&json!({
+                let response = serde_json::to_string(&json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": result
                 }))
                 .unwrap();
+                let response = if body.ascii_only {
+                    escape_non_ascii(&response)
+                } else {
+                    response
+                }
+                .into_bytes();
+                let length = if body.undeclared_length {
+                    String::new()
+                } else {
+                    format!("Content-Length: {}\r\n", response.len())
+                };
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: mock-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    response.len()
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: mock-session\r\n{length}Connection: close\r\n\r\n",
                 )
                 .unwrap();
-                stream.write_all(&response).unwrap();
+                // 상한을 넘는 본문은 받는 쪽이 중간에 끊고 닫으므로 쓰기 실패는 정상이다.
+                // 받는 쪽 판정은 각 시험이 결과로 확인한다.
+                let _ = stream.write_all(&response);
             }
         });
         (format!("http://{address}/mcp"), handle)
+    }
+
+    /// serde가 낸 JSON 글의 비ASCII 글자를 `\uXXXX`(BMP 밖은 서로게이트 쌍)로 바꾼다.
+    /// 비ASCII 글자는 문자열 값 안에만 있으므로 결과도 같은 값의 올바른 JSON이다.
+    fn escape_non_ascii(text: &str) -> String {
+        let mut escaped = String::with_capacity(text.len() * 2);
+        for character in text.chars() {
+            if character.is_ascii() {
+                escaped.push(character);
+            } else {
+                let mut units = [0_u16; 2];
+                for unit in character.encode_utf16(&mut units) {
+                    escaped.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+        }
+        escaped
+    }
+
+    /// 노션 `notion-fetch`처럼 생긴 도구 결과. `content[0].text`가 다시 JSON 글이고, 그
+    /// 안의 본문이 따옴표·줄바꿈·역슬래시·이모지가 섞인 한글 마크다운이다. 직렬화 크기가
+    /// `target_bytes` 이상이 될 때까지 문단을 늘린다.
+    fn notion_like_result(target_bytes: usize) -> Value {
+        notion_like_result_with(target_bytes, KOREAN_PARAGRAPH)
+    }
+
+    const KOREAN_PARAGRAPH: &str = "## 3장. 생존 루프 \"밤의 습격\"\n\
+            > 좀비 무리가 \"쿼터뷰\" 시야 밖에서 몰려온다 — 플레이어는 바리케이드(\\방어선\\)를 \
+            세우고\t탄약을 아낀다. 🧟‍♂️🔦\n\
+            - 규칙: {\"wave\": 3, \"spawn\": [\"walker\", \"runner\"]}\n\
+            - 메모: 줄바꿈\r\n과 '작은따옴표', `코드`, <태그>, &amp; 도 그대로 둔다.\n\n";
+
+    /// 키릴 문자(UTF-8 2바이트)는 `\uXXXX`로 오면 세 배가 된다 — 한글(두 배)보다 본문이
+    /// 더 크게 불어나는 경우다.
+    const CYRILLIC_PARAGRAPH: &str = "Глава 3. «Ночной штурм» — зомби идут волной; \
+        баррикада держится, патроны на исходе. Ёжик в тумане сказал: «держись»\n";
+
+    fn notion_like_result_with(target_bytes: usize, paragraph: &str) -> Value {
+        let build = |markdown: &str| {
+            let page = serde_json::to_string(&json!({
+                "metadata": {"type": "page"},
+                "title": "데드 루트 기획서",
+                "url": "https://www.notion.so/deadroute",
+                "text": format!("<page url=\"https://www.notion.so/deadroute\">\n{markdown}</page>")
+            }))
+            .unwrap();
+            json!({"content": [{"type": "text", "text": page}], "isError": false})
+        };
+        // 문단 하나가 늘리는 직렬화 크기는 일정하므로 한 번 재서 필요한 개수를 셈한다.
+        let size = |markdown: &str| serde_json::to_vec(&build(markdown)).unwrap().len();
+        let base = size("");
+        let step = size(paragraph) - base;
+        let count = target_bytes.saturating_sub(base).div_ceil(step);
+        let result = build(&paragraph.repeat(count));
+        assert!(serde_json::to_vec(&result).unwrap().len() >= target_bytes);
+        result
+    }
+
+    #[test]
+    fn notion_sized_tool_result_reaches_agent_intact() {
+        // 2026-10-25: 직렬화 270,480바이트 노션 페이지가 256 KB 상한에서 잘렸다.
+        // 1.5 MiB(그 다섯 배 남짓)는 원격 본문·노출 상한을 모두 그대로 지나야 한다.
+        let expected = notion_like_result(1536 * 1024);
+        let serialized_bytes = serde_json::to_vec(&expected).unwrap().len();
+        assert!(serialized_bytes < MAX_EXPOSED_RESULT_BYTES);
+
+        // 서버가 한글을 \uXXXX로 보내면 본문은 결과보다 훨씬 커서 노출 상한도 넘는다 —
+        // 그래도 본문 상한 안이라 여기서 끊기지 않는다.
+        let body_bytes = escape_non_ascii(&serde_json::to_string(&expected).unwrap()).len();
+        assert!(body_bytes > MAX_EXPOSED_RESULT_BYTES && body_bytes < MAX_REMOTE_BODY_BYTES);
+        let (url, server) = spawn_mock_mcp_with_call_result(
+            3,
+            expected.clone(),
+            MockBody {
+                ascii_only: true,
+                ..MockBody::default()
+            },
+        );
+        let (mut session, _) = McpHttpSession::connect(&url).unwrap();
+        let result = session
+            .call_tool("notion-fetch", json!({"id": "deadroute"}))
+            .unwrap();
+        server.join().unwrap();
+
+        let exposed = bounded_remote_result(result);
+        assert!(exposed.get("_meta").is_none(), "결과가 생략되면 안 된다");
+        assert_eq!(exposed, expected);
+        let page: Value =
+            serde_json::from_str(exposed["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(page["text"]
+            .as_str()
+            .unwrap()
+            .contains("바리케이드(\\방어선\\)"));
+    }
+
+    #[test]
+    fn tool_result_over_exposed_cap_is_replaced_with_notice() {
+        // isError를 true로 바꾸면 한 바이트 줄어드니 상한보다 조금 더 크게 만든다.
+        let mut oversized = notion_like_result(MAX_EXPOSED_RESULT_BYTES + 16);
+        oversized["isError"] = json!(true);
+        let serialized_bytes = serde_json::to_vec(&oversized).unwrap().len();
+        assert!(serialized_bytes > MAX_EXPOSED_RESULT_BYTES);
+
+        // 본문 상한(4 MiB)은 지나고, 노출 상한에서 생략된다.
+        let (url, server) = spawn_mock_mcp_with_call_result(3, oversized, MockBody::default());
+        let (mut session, _) = McpHttpSession::connect(&url).unwrap();
+        let result = session
+            .call_tool("notion-fetch", json!({"id": "deadroute"}))
+            .unwrap();
+        server.join().unwrap();
+
+        let bounded = bounded_remote_result(result);
+        assert_eq!(bounded["_meta"]["truncated"], true);
+        assert_eq!(bounded["_meta"]["originalBytes"], serialized_bytes);
+        assert_eq!(bounded["isError"], true);
+        assert!(bounded["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("본문을 생략"));
+        assert!(serde_json::to_vec(&bounded).unwrap().len() < 1024);
+    }
+
+    /// 노출 상한 바로 아래의 결과가 세 배로 불어난 본문으로 와도 본문 상한에서 먼저
+    /// 끊기지 않아야 한다(본문 상한이 노출 상한의 두 배이던 때는 TooLarge 오류였다).
+    #[test]
+    fn escaped_cyrillic_result_just_under_exposed_cap_passes_body_cap() {
+        let expected = notion_like_result_with(MAX_EXPOSED_RESULT_BYTES - 4096, CYRILLIC_PARAGRAPH);
+        let serialized_bytes = serde_json::to_vec(&expected).unwrap().len();
+        assert!(serialized_bytes <= MAX_EXPOSED_RESULT_BYTES);
+        let body_bytes = escape_non_ascii(&serde_json::to_string(&expected).unwrap()).len();
+        assert!(body_bytes > 2 * MAX_EXPOSED_RESULT_BYTES && body_bytes < MAX_REMOTE_BODY_BYTES);
+
+        let (url, server) = spawn_mock_mcp_with_call_result(
+            3,
+            expected.clone(),
+            MockBody {
+                ascii_only: true,
+                undeclared_length: true,
+            },
+        );
+        let (mut session, _) = McpHttpSession::connect(&url).unwrap();
+        let result = session
+            .call_tool("notion-fetch", json!({"id": "cyrillic"}))
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(bounded_remote_result(result), expected);
+    }
+
+    /// 본문 상한을 넘은 `tools/call` 응답은 오류가 아니라 생략 안내다. 길이를 선언한
+    /// 본문은 읽기 전에, 선언하지 않은 본문은 상한까지만 읽고 끊는다.
+    #[test]
+    fn tool_call_body_over_body_cap_becomes_omitted_notice() {
+        let oversized = notion_like_result(MAX_REMOTE_BODY_BYTES + 1024);
+        for undeclared_length in [false, true] {
+            let (url, server) = spawn_mock_mcp_with_call_result(
+                3,
+                oversized.clone(),
+                MockBody {
+                    ascii_only: false,
+                    undeclared_length,
+                },
+            );
+            let (mut session, _) = McpHttpSession::connect(&url).unwrap();
+            let result = session
+                .call_tool("notion-fetch", json!({"id": "huge"}))
+                .unwrap();
+            server.join().unwrap();
+            let bounded = bounded_remote_result(result);
+            assert_eq!(bounded["_meta"]["truncated"], true, "{undeclared_length}");
+            assert_eq!(
+                bounded["_meta"]["bodyLimitBytes"],
+                MAX_REMOTE_BODY_BYTES as u64
+            );
+            assert_eq!(bounded["isError"], true);
+            assert!(bounded["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("본문 상한"));
+        }
+    }
+
+    #[test]
+    fn omitted_results_are_told_apart_for_the_audit() {
+        assert_eq!(
+            remote_result_omission(&oversized_body_result(7)),
+            Some(RemoteResultOmission::BodyLimitExceeded)
+        );
+        let truncated = bounded_remote_result(json!({
+            "content": [{"type": "text", "text": "x".repeat(MAX_EXPOSED_RESULT_BYTES)}],
+            "isError": false
+        }));
+        assert_eq!(
+            remote_result_omission(&truncated),
+            Some(RemoteResultOmission::Truncated)
+        );
+        let intact = bounded_remote_result(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "_meta": {"truncated": false},
+            "isError": false
+        }));
+        assert_eq!(remote_result_omission(&intact), None);
+    }
+
+    /// 본문 상한을 넘은 호출은 생략 안내로 돌아오지만 감사에는 `remoteError`나 성공이
+    /// 아니라 `bodyLimitExceeded`로 남는다.
+    #[test]
+    fn interface_call_over_body_cap_is_audited_as_body_limit_exceeded() {
+        let oversized = notion_like_result(MAX_REMOTE_BODY_BYTES + 1024);
+        // probe 3 + register 3 + call_read 4(연결 2, 도구 목록 1, 호출 1)
+        let (url, server) = spawn_mock_mcp_with_call_result(10, oversized, MockBody::default());
+        let temp = tempfile::tempdir().unwrap();
+        let registry = McpInterfaceRegistry::new(temp.path().to_path_buf());
+        let probe = registry
+            .probe(McpInterfaceProbeRequest { url: url.clone() })
+            .unwrap();
+        registry
+            .register(McpInterfaceRegisterRequest {
+                id: "mock".to_owned(),
+                display_name: "Mock MCP".to_owned(),
+                url,
+                expected_identity: probe["identityHash"].as_str().unwrap().to_owned(),
+                enabled_tools: vec!["search".to_owned()],
+                grant_expires_at: None,
+            })
+            .unwrap();
+        let result = registry
+            .call_read(McpInterfaceCallRequest {
+                id: "mock".to_owned(),
+                tool: "search".to_owned(),
+                arguments: json!({}),
+            })
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(result["result"]["_meta"]["truncated"], true);
+        let audit = registry.catalog().unwrap()["recentAudit"].clone();
+        let invoke = audit
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["action"] == "invoke")
+            .expect("호출 감사");
+        assert_eq!(invoke["outcome"], "bodyLimitExceeded");
     }
 
     fn read_http_body(stream: &mut std::net::TcpStream) -> Vec<u8> {

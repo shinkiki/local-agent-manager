@@ -17,7 +17,8 @@ export function MessageEdit({ text: original, onSend, messageContainer }: { text
     if (!messageContainer || editing) return;
     const select = (event: MouseEvent) => {
       const target = event.target;
-      if (!(target instanceof Element) || target.closest("button, a, input, textarea, select, summary, [contenteditable=true]")) return;
+      // 작업 막대는 메시지 안에 그려지므로, 그 안의 빈 자리나 오류 문구를 누른 것은 메시지 선택이 아니다.
+      if (!(target instanceof Element) || target.closest("button, a, input, textarea, select, summary, [contenteditable=true], .message-edit-popup")) return;
       if (!messageContainer.ownerDocument.getSelection()?.isCollapsed) return;
       setSelected((value) => !value);
     };

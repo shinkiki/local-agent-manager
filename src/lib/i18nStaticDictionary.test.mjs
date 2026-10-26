@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { runtimeCatalogText, runtimeLocale, setRuntimeLocale } from "./i18nRuntime.ts";
 
 import { GENERATED_UI_EN } from "./i18nGeneratedUiCatalog.ts";
 import {
@@ -76,4 +77,25 @@ test("되짚기 표는 한 표 안의 같은 영어에서 뒤 항목을 고른�
 test("되짚기 표는 다시 옮겨도 같은 영어가 나오는 원문을 고른다", () => {
   assert.equal(staticUiEnglish(staticUiKoreanByEnglish.get("Reasoning")), "Reasoning");
   assert.equal(staticUiEnglish(staticUiKoreanByEnglish.get("Conversation")), "Conversation");
+});
+
+test("V4: 번역표에 없는 객체 속성 이름도 런타임 라벨에서 문자열로 유지한다", () => {
+  const previous = runtimeLocale();
+  try {
+    for (const locale of ["en", "ja"]) {
+      setRuntimeLocale(locale, {});
+      for (const source of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+        assert.equal(staticUiEnglish(source), source);
+        assert.equal(runtimeCatalogText(source), source);
+      }
+      assert.equal(runtimeCatalogText("대시보드"), "Dashboard");
+    }
+  } finally {
+    setRuntimeLocale(previous.locale, previous.messages);
+  }
+});
+
+test("V4: 객체 속성 이름과 같은 등록 번역도 상속된 속성에 가려지지 않는다", () => {
+  registerUiEnglish("__defineGetter__", "Registered label");
+  assert.equal(staticUiEnglish("__defineGetter__"), "Registered label");
 });

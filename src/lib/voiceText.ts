@@ -79,3 +79,51 @@ export function voiceStatusText(status: VoiceStatus, error: VoiceText | null = n
   if (status === "error") return error ?? VOICE_UNAVAILABLE_TEXT;
   return VOICE_STATUS_TEXTS[status];
 }
+
+/**
+ * 전사를 지원하지 않는 환경에서 버튼 설명과 상태 문구가 함께 쓰는 안내. 두 자리에
+ * 손으로 적어 두면 한쪽만 고쳐져 같은 상황을 두 문장으로 알리게 된다.
+ */
+export const RECOGNITION_UNSUPPORTED_TEXT: VoiceText = (text) => text(
+  "이 브라우저 또는 WebView는 음성 전사를 지원하지 않습니다. 텍스트 입력을 사용해 주세요.",
+  "This browser or WebView does not support speech transcription. Use text input instead.",
+);
+
+/** 버튼 상태를 고를 때 읽는 답변 재생 쪽 사정. 재생 상태 전체가 아니라 이 판정에 필요한 부분만. */
+export interface VoicePlaybackState {
+  status: "idle" | "playing" | "error";
+  error: VoiceText | null;
+}
+
+/**
+ * 마이크 버튼 한 짝이 보여 줄 상태와 그때의 오류. 마이크 입력과 답변 재생은 서로 다른
+ * 상태를 들고 있지만 버튼과 상태 문구는 하나뿐이라, 둘 중 무엇을 보일지 고르는 우선순위가
+ * 필요하다.
+ *
+ * 예전에는 그 우선순위를 상태 한 벌, 오류 한 벌로 따로 풀었다. 두 사다리는 가지가 서로
+ * 달라(상태는 재생 중·미지원·재생 실패 순, 오류는 입력 실패·미지원·재생 실패 순) 같은
+ * 판정을 두 모양으로 적어 둔 셈이었고, 한쪽에 갈래를 더하면 다른 쪽이 조용히 어긋난다 —
+ * 이를테면 상태만 error로 올리고 오류를 빠뜨리면 "음성을 쓸 수 없습니다"라는 기본 문구가
+ * 대신 나가 무엇이 막혔는지 알 수 없게 된다.
+ *
+ * 그래서 갈래마다 상태와 오류를 한 번에 짝지어 돌려준다. 오류 문구는 상태가 error일 때만
+ * 화면에 닿으므로(`voiceStatusText`), 나머지 갈래는 null로 둔다. 컴포넌트 파일 안에
+ * 있던 동안에는 이 우선순위를 붙잡는 시험이 설 자리가 없어 여기로 옮겼다.
+ */
+export function voiceButtonState(
+  inputStatus: Exclude<VoiceStatus, "playing">,
+  inputError: VoiceText | null,
+  playback: VoicePlaybackState,
+  recognitionSupported: boolean,
+): { status: VoiceStatus; error: VoiceText | null } {
+  // 재생 중은 다른 무엇보다 먼저다. 이 버튼이 그때 하는 일(누르면 녹음이 재생을 끊는다)이
+  // 다른 상태와 다르기 때문이다.
+  if (playback.status === "playing") return { status: "playing", error: null };
+  // 내 입력이 진행·실패 중이면 그것이 사용자가 방금 한 일이므로 재생 쪽 사정보다 앞선다.
+  if (inputStatus === "error") return { status: "error", error: inputError };
+  if (inputStatus !== "idle") return { status: inputStatus, error: null };
+  // 아무것도 하지 않는 동안에만 환경 제약과 지난 재생 실패가 드러난다.
+  if (!recognitionSupported) return { status: "error", error: RECOGNITION_UNSUPPORTED_TEXT };
+  if (playback.status === "error") return { status: "error", error: playback.error };
+  return { status: "idle", error: null };
+}

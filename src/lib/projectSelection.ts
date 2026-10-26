@@ -13,3 +13,12 @@ export function resolveSelectedProjectPath(
   if (stored !== null && active.some((project) => project.path === stored)) return stored;
   return active[0]?.path ?? null;
 }
+
+/**
+ * 선택 박스에 올릴 수 있는 프로젝트. 설정에서 제외했거나(`active: false`) 폴더가 사라진
+ * (`exists: false`) 프로젝트는 파일·형상관리·Overlay 탭이 읽을 곳이 없으므로 고를 수 없다.
+ * 등록부의 순서는 그대로 두어 `resolveSelectedProjectPath`의 "첫 프로젝트"가 화면과 같다.
+ */
+export function selectableProjects<T extends { active: boolean; exists: boolean }>(entries: readonly T[] | null): T[] {
+  return (entries ?? []).filter((entry) => entry.active && entry.exists);
+}

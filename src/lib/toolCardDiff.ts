@@ -143,17 +143,18 @@ function codexChangeMap(map: Record<string, unknown>): ToolCardFileEdit[] | null
     if (typeof type !== "string") {
       // 옛 모양은 종류가 키 하나다.
       const keys = Object.keys(change);
-      if (keys.length !== 1 || !PATCH_CHANGES.has(keys[0])) return null;
+      if (keys.length !== 1) return null;
       type = keys[0];
       const inner = change[keys[0]];
       if (inner === null || typeof inner !== "object") return null;
       change = inner as Record<string, unknown>;
     }
-    if (!PATCH_CHANGES.has(type as string)) return null;
-    const body = type === "update" ? change.unified_diff : change.content;
+    // 배열과 맵이 변경 종류·이동 경로를 같은 규칙으로 읽는다.
+    const kind = patchKind({ type, move_path: change.move_path });
+    if (kind === null) return null;
+    const body = kind.type === "update" ? change.unified_diff : change.content;
     if (typeof body !== "string") return null;
-    const movePath = typeof change.move_path === "string" && change.move_path !== "" ? change.move_path : null;
-    edits.push({ kind: "patch", path, change: type as "add" | "delete" | "update", movePath, body });
+    edits.push({ kind: "patch", path, change: kind.type, movePath: kind.movePath, body });
   }
   return edits;
 }

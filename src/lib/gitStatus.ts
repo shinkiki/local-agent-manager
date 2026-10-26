@@ -37,7 +37,7 @@ export function gitChangeKindCode(kind: GitChangeKind): string {
 export function gitChangeCode(entry: GitStatusEntry, side: GitStatusSide): string {
   if (isConflicted(entry)) return "U";
   const kind = side === "index" ? entry.indexStatus : entry.worktreeStatus;
-  return CHANGE_CODES[kind] ?? " ";
+  return gitChangeKindCode(kind);
 }
 
 export function isConflicted(entry: GitStatusEntry): boolean {

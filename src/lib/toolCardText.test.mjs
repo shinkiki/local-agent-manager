@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  boundToolCardDiffRows,
   boundToolCardText,
   formatCharCount,
   MAX_TOOL_CARD_TEXT_CHARS,
@@ -31,4 +32,12 @@ test("character counts read in 만 above ten thousand", () => {
   assert.equal(formatCharCount(950), "950");
   assert.equal(formatCharCount(32_000), "3.2만");
   assert.equal(formatCharCount(498_110), "50만");
+});
+
+test("the diff row limit is spent across files in order", () => {
+  const files = [[1, 2, 3], [4, 5, 6], [7, 8]];
+  assert.deepEqual(boundToolCardDiffRows(files, 4), { visible: [[1, 2, 3], [4], []], hidden: 4 });
+  assert.deepEqual(boundToolCardDiffRows(files, 3), { visible: [[1, 2, 3], [], []], hidden: 5 });
+  assert.deepEqual(boundToolCardDiffRows(files, Number.POSITIVE_INFINITY), { visible: files, hidden: 0 });
+  assert.deepEqual(boundToolCardDiffRows([[], [1]], 0), { visible: [[], []], hidden: 1 });
 });

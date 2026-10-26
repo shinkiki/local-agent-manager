@@ -1,7 +1,7 @@
 import { memo, useMemo, useState } from "react";
 import { runtimeText } from "../lib/i18nRuntime";
 import { fileEditRows, parseToolCardJson, toolCardDiffStats, toolCardEditPreview, toolCardFileEdits, type ToolCardDiffRow, type ToolCardFileEdit } from "../lib/toolCardDiff";
-import { boundToolCardText, formatCharCount, MAX_TOOL_CARD_DIFF_ROWS, toolCardPreviewSource } from "../lib/toolCardText";
+import { boundToolCardDiffRows, boundToolCardText, formatCharCount, MAX_TOOL_CARD_DIFF_ROWS, toolCardPreviewSource } from "../lib/toolCardText";
 
 interface ChatToolCardProps {
   name: string;
@@ -20,6 +20,8 @@ const TOOL_STATUS_LABELS: Record<string, string> = {
   completed: "완료",
   success: "완료",
   completedWithDenials: "권한 제한",
+  // CLI가 정책으로 막은 도구. 거절 목록은 턴 끝에야 오므로 그때 이 카드의 상태를 바꾼다(chat.rs emit_claude_permission_denials).
+  denied: "자동 거절",
   interrupted: "중단됨",
   failed: "실패",
   error: "실패",
@@ -112,14 +114,9 @@ function ChatToolEdits({ edits, raw, running, onToggleRaw }: {
     const rows = fileEditRows(edit);
     return { edit, rows, stats: toolCardDiffStats(rows) };
   }), [edits]);
-  let budget = showAll ? Number.POSITIVE_INFINITY : MAX_TOOL_CARD_DIFF_ROWS;
-  let hidden = 0;
-  const shown = files.map((file) => {
-    const visible = file.rows.slice(0, Math.max(0, budget));
-    budget -= visible.length;
-    hidden += file.rows.length - visible.length;
-    return { ...file, visible };
-  });
+  const bounded = boundToolCardDiffRows(files.map((file) => file.rows), showAll ? Number.POSITIVE_INFINITY : MAX_TOOL_CARD_DIFF_ROWS);
+  const hidden = bounded.hidden;
+  const shown = files.map((file, index) => ({ ...file, visible: bounded.visible[index] }));
   return <div className="chat-tool-edits">
     <div className="chat-tool-edits-bar">
       <span>{runtimeText(`파일 ${edits.length}개`, `${edits.length} file(s)`)}</span>

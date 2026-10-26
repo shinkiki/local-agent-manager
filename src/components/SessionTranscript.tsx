@@ -9,6 +9,7 @@ import {
   readSessionTranscriptImage,
 } from "../lib/ipc";
 import { formatBytes, formatDate, formatTokens } from "../lib/format";
+import { downloadRatio, type DownloadProgress } from "../lib/responsePayload";
 import { displayPath } from "../lib/displayPath";
 import type {
   ContentBlock,
@@ -76,6 +77,11 @@ export interface SessionTranscriptState {
   loadEarlier: () => Promise<void>;
   /** 같은 세션의 공급자 원문과 Agent Manager 실행 실패 기록을 다시 읽는다. */
   refresh: () => void;
+  /**
+   * 원문을 받는 동안 받은 비율(0~1). 받기 전·받은 뒤, 그리고 전체 크기를 모르는 응답이면 null이다 —
+   * 그때 진행 막은 실제 비율 대신 흘러가는 막대를 보인다.
+   */
+  loadRatio: number | null;
 }
 
 /**
@@ -126,8 +132,18 @@ export function useSessionTranscript({
   limit: SessionTranscriptLimit;
   scrollContainerRef: RefObject<HTMLElement | null>;
 }): SessionTranscriptState {
-  const [detail, setDetail] = useState<SessionDetail | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // 받은 원문과 오류는 어느 요청(세션·한도) 몫인지와 함께 둔다. 세션이나 한도가 바뀐 렌더에서
+  // 정리 효과가 돌기 전까지 앞 세션의 원문이 새 세션 것처럼 읽히면, 그 원문으로 자리를 잡거나
+  // 인계 문맥을 만든다. 지금 요청과 다른 몫은 처음부터 없는 것으로 돌려준다.
+  const requestKey = source && sessionId ? `${source}\u0000${sessionId}\u0000${limit}` : null;
+  const [received, setReceived] = useState<{ key: string; detail: SessionDetail } | null>(null);
+  const [failure, setFailure] = useState<{ key: string; message: string } | null>(null);
+  const detail = received && received.key === requestKey ? received.detail : null;
+  const error = failure && failure.key === requestKey ? failure.message : null;
+  // 받는 중인 원문의 비율. 받은 원문과 같이 요청 몫으로 둔다. 조각마다 다시 그리지 않도록
+  // 백분율이 바뀔 때만 적되, 값은 깎지 않은 비율 그대로 둔다(막이 백분율로 한 번만 내린다).
+  const [download, setDownload] = useState<{ key: string; ratio: number | null } | null>(null);
+  const loadRatio = !detail && download && download.key === requestKey ? download.ratio : null;
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [earlierError, setEarlierError] = useState<string | null>(null);
   const [refreshRevision, setRefreshRevision] = useState(0);
@@ -140,17 +156,26 @@ export function useSessionTranscript({
   useEffect(() => {
     let active = true;
     generationRef.current += 1;
-    setDetail(null);
-    setError(null);
+    setReceived(null);
+    setFailure(null);
+    setDownload(null);
     setLoadingEarlier(false);
     setEarlierError(null);
     forget();
-    if (!source || !sessionId) return () => { active = false; };
-    getSessionDetail(source, sessionId, limit)
-      .then((value) => active && setDetail(value))
-      .catch((cause: unknown) => active && setError(errorText(cause)));
+    if (!source || !sessionId || !requestKey) return () => { active = false; };
+    let lastPercent: number | null | undefined;
+    const onDownloadProgress = (progress: DownloadProgress) => {
+      const ratio = downloadRatio(progress);
+      const percent = ratio === null ? null : Math.floor(ratio * 100);
+      if (!active || percent === lastPercent) return;
+      lastPercent = percent;
+      setDownload({ key: requestKey, ratio });
+    };
+    getSessionDetail(source, sessionId, limit, undefined, onDownloadProgress)
+      .then((value) => active && setReceived({ key: requestKey, detail: value }))
+      .catch((cause: unknown) => active && setFailure({ key: requestKey, message: errorText(cause) }));
     return () => { active = false; };
-  }, [forget, source, sessionId, limit, refreshRevision]);
+  }, [forget, source, sessionId, limit, requestKey, refreshRevision]);
 
   // 이전 구간 조회용 커서. tail 파싱에서는 항목 순번이 아니라 원본 파일의
   // 바이트 오프셋이므로 개수처럼 표시하면 안 된다. 0이면 앞선 항목이 없다.
@@ -173,10 +198,13 @@ export function useSessionTranscript({
     try {
       const page = await getSessionDetail(source, sessionId, limit, oldestTranscriptIndex);
       if (generation !== generationRef.current) return;
-      setDetail((prev) => prev && {
-        ...prev,
-        transcript: [...page.transcript, ...prev.transcript],
-        truncated: page.transcript.length > 0 ? page.truncated : false,
+      setReceived((prev) => prev && {
+        key: prev.key,
+        detail: {
+          ...prev.detail,
+          transcript: [...page.transcript, ...prev.detail.transcript],
+          truncated: page.transcript.length > 0 ? page.truncated : false,
+        },
       });
     } catch (cause) {
       if (generation !== generationRef.current) return;
@@ -188,10 +216,13 @@ export function useSessionTranscript({
     }
   }, [earlierLoadCount, forget, limit, loadingEarlier, measure, oldestTranscriptIndex, sessionId, source]);
 
+  // 요청이 바뀐 렌더에서는 원문이 곧바로 비므로(위 몫 판정), 앞 요청에서 재 둔 높이를 그 비운
+  // 본문에 적용하기 전에 버린다. 정리 효과(forget)는 그리기 뒤에 돌아 이 보정보다 늦다.
+  useLayoutEffect(forget, [requestKey, forget]);
   // 이전 구간을 위쪽에 붙인 뒤에도 보고 있던 위치가 유지되도록 스크롤을 보정한다.
   useLayoutEffect(restore, [detail, restore]);
 
-  return { detail, error, loadingEarlier, earlierError, earlierLoadCount, loadEarlier, refresh };
+  return { detail, error, loadingEarlier, earlierError, earlierLoadCount, loadEarlier, refresh, loadRatio };
 }
 
 /** 트랜스크립트 위쪽의 '이전 대화 더보기'. 더 불러올 구간이 없으면 아무것도 그리지 않는다. */

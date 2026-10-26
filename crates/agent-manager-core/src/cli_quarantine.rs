@@ -127,8 +127,16 @@ fn release_in(
     remove_quarantine: impl Fn(&Path) -> Result<(), String>,
 ) -> ReleaseOutcome {
     let mut outcome = ReleaseOutcome::default();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return outcome;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            // C18-4: 조회 실패를 완료로 기억하면 다음 실행에서도 다시 확인하지 않는다.
+            outcome.refused.push((
+                dir.to_path_buf(),
+                format!("격리 속성을 확인할 폴더를 읽지 못했습니다: {error}"),
+            ));
+            return outcome;
+        }
     };
     let mut candidates = entries
         .filter_map(Result::ok)
@@ -293,6 +301,46 @@ mod tests {
         assert_eq!(cask_target(&root.join("bin/codex")), None);
         assert_eq!(cask_target(&root.join("Caskroom/codex/codex")), None);
         assert_eq!(cask_target(&root.join("Cellar/codex/1.0/bin/codex")), None);
+    }
+
+    #[test]
+    fn c18_4_directory_read_failure_is_reported_without_visiting_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let file = temp.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        for dir in [&missing, &file] {
+            let outcome = release_in(
+                dir,
+                "2DC432GLL2",
+                |_| panic!("폴더 조회 실패 뒤 속성을 읽으면 안 된다"),
+                |_, _| panic!("폴더 조회 실패 뒤 서명을 검사하면 안 된다"),
+                |_| panic!("폴더 조회 실패 뒤 속성을 지우면 안 된다"),
+            );
+            assert!(outcome.released.is_empty());
+            assert_eq!(outcome.refused.len(), 1);
+            assert_eq!(&outcome.refused[0].0, dir);
+            assert!(outcome.refused[0]
+                .1
+                .starts_with("격리 속성을 확인할 폴더를 읽지 못했습니다:"));
+        }
+    }
+
+    #[test]
+    fn c18_4_unreadable_folder_is_retried_after_it_becomes_available() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("Caskroom/codex/1.2.3/bin");
+        let executable = bin.join("codex");
+
+        release_cask_quarantine(&executable);
+        let settled_after_failure = settled_dirs().lock().unwrap().contains(&bin);
+        // 실패는 호출자를 막지 않고 다음 실행에서 다시 확인한다.
+        assert!(!settled_after_failure);
+
+        fs::create_dir_all(&bin).unwrap();
+        release_cask_quarantine(&executable);
+        let settled_after_recovery = settled_dirs().lock().unwrap().remove(&bin);
+        assert!(settled_after_recovery);
     }
 
     #[test]

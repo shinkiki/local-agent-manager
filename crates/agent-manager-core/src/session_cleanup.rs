@@ -1411,6 +1411,9 @@ pub fn run_session_cleanup(
 
     let tombstoned_count = store::record_cleaned_sessions(app_data_dir, &tombstones)?;
     tally.bytes_freed += store::prune_supplements_for(app_data_dir, &tombstones)?;
+    // 본문 검색 색인은 다시 만들 수 있는 파생 저장소다. 지우지 못해도(잠금 등) 정리 결과를
+    // 실패로 돌리지 않는다. 다음 검색이 카탈로그에서 빠진 세션의 행을 지운다.
+    let _ = crate::session_search::forget_sessions(app_data_dir, &tombstones);
     let trash_purged_count = purge_expired_trash(app_data_dir, &policy, started_at);
     catalog.refresh_metadata()?;
 

@@ -60,6 +60,34 @@ mod tests {
         let _ = FileExt::unlock(&contender);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn acquire_refuses_symlinked_lock_files_g10() {
+        let app_data_dir = tempfile::tempdir().expect("app data directory");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let existing = outside.path().join("existing");
+        let missing = outside.path().join("missing");
+        fs::write(&existing, b"outside app data").expect("outside file");
+
+        // G7/G10: lock acquisition must not open or create a file outside app data.
+        for (name, target) in [("existing.lock", &existing), ("dangling.lock", &missing)] {
+            std::os::unix::fs::symlink(target, app_data_dir.path().join(name))
+                .expect("planted lock symlink");
+            assert!(matches!(
+                acquire(app_data_dir.path(), name, "test store"),
+                Err(CoreError::Io(ref error)) if error.raw_os_error() == Some(libc::ELOOP)
+            ));
+        }
+        assert_eq!(
+            fs::read(&existing).expect("outside contents"),
+            b"outside app data"
+        );
+        assert!(
+            !missing.exists(),
+            "a dangling link must not create its target"
+        );
+    }
+
     #[test]
     fn acquire_releases_when_the_guarded_work_returns_early() {
         let directory = tempfile::tempdir().expect("temporary directory");

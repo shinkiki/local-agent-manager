@@ -14,11 +14,17 @@ function canMarkAttentionReadLocally(item: Pick<ChatAttentionItem, "read" | "kin
 }
 
 /**
- * 읽은 알림 정리 시 유지할 알림인지 확인한다.
- * 읽지 않은 알림, 실행 중인 알림, 승인 대기 알림은 읽음 표시와 무관하게 보존한다.
+ * 아직 열려 있어 읽은 알림 정리에서 걷어내면 안 되는 종류인지. 백엔드
+ * `ChatAttentionKind::is_open`과 같은 셋이어야 한다 — 회차 결정을 빠뜨리면 낙관 갱신이
+ * 답할 결정을 지웠다가 서버 응답이 오면 다시 그린다.
  */
+function isOpenAttention(item: Pick<ChatAttentionItem, "kind">): boolean {
+  return item.kind === "running" || item.kind === "roundDecision" || isApprovalAttention(item);
+}
+
+/** 읽은 알림 정리 시 유지할 알림인지 확인한다. 읽지 않았거나 열려 있는 알림은 보존한다. */
 function shouldKeepOnClearRead(item: Pick<ChatAttentionItem, "read" | "kind">): boolean {
-  return !item.read || item.kind === "running" || isApprovalAttention(item);
+  return !item.read || isOpenAttention(item);
 }
 
 /**
@@ -98,7 +104,7 @@ export function markAllAttentionReadLocally(
 }
 
 /**
- * 읽은 종료 알림만 지운다. 실행 중과 승인 대기는 읽음 표시와 무관하게 남긴다.
+ * 읽은 종료 알림만 지운다. 실행 중·승인 대기·회차 결정은 읽음 표시와 무관하게 남긴다.
  * 서버 `clear_read_chat_attention`과 같은 규칙이다.
  */
 export function clearReadAttentionLocally(snapshot: ChatAttentionSnapshot): ChatAttentionSnapshot {

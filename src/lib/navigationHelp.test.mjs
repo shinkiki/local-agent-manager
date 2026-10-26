@@ -27,3 +27,18 @@ test("the files view warns that registered folders join every chat workspace", (
   assert.match(english, /every chat's workspace/);
   assert.equal(navigationHelpEmphasis("storage", (ko) => ko), null);
 });
+
+test("settings view help explains channel login authority instead of obsolete remote read-only mode", () => {
+  // G11·C20: 로그인 요구가 충족되면 모든 채널이 데스크톱과 같은 권한을 가지므로,
+  // 낡은 원격 읽기 전용 안내가 없어야 하고 로그인 설정과 동등 권한을 안내해야 한다.
+  const korean = navigationHelpParagraphs("settings", (ko) => ko).join("\n");
+  const english = navigationHelpParagraphs("settings", (_ko, en) => en).join("\n");
+
+  assert.doesNotMatch(korean, /읽기 전용으로 표시/);
+  assert.doesNotMatch(english, /read-only according to host permissions/);
+
+  assert.match(korean, /로그인 설정/);
+  assert.match(korean, /이 기기와 같은 권한/);
+  assert.match(english, /Sign-in settings/);
+  assert.match(english, /same (?:permissions|authority)/);
+});

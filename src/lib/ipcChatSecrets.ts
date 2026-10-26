@@ -18,7 +18,7 @@ export function listAllChatSecrets(): Promise<ChatSecretsOverview> {
   return call<ChatSecretsOverview>("list_all_chat_secrets", {});
 }
 
-/** 호스트 전용 쓰기. 같은 이름이 있으면 덮어쓴다. */
+/** 쓰기(C15-7, 로그인한 채널 모두). 같은 이름이 있으면 덮어쓴다. */
 export function setChatSecret(input: { chatId: string; name: string; purpose: string; value: string }): Promise<ChatSecretsSnapshot> {
   return call<ChatSecretsSnapshot>("set_chat_secret", input);
 }
@@ -28,15 +28,15 @@ export function removeChatSecret(input: { chatId: string; name: string }): Promi
 }
 
 /**
- * 값을 그대로 돌려주는 유일한 명령. 저장소 → 비밀정보 탭의 눈 아이콘만 부르며 호스트 화면
- * 전용이다. 받은 값은 화면 상태에만 잠시 두고 숨기는 즉시 지운다.
+ * 값을 그대로 돌려주는 유일한 명령. 저장소 → 비밀정보 탭의 눈 아이콘만 부르며 AIA 카탈로그에는
+ * 없다(C15-1). 받은 값은 화면 상태에만 잠시 두고 숨기는 즉시 지운다.
  */
 export function readChatSecretValue(input: { chatId: string; name: string }): Promise<ChatSecretValueView> {
   return call<ChatSecretValueView>("read_chat_secret_value", input);
 }
 
 // ---------------------------------------------------------------------------
-// C16. 저장된 비밀값. 대화가 끝나도 남고, 에이전트가 이름을 요청하면 자동으로 실린다.
+// C17. 저장된 비밀값. 대화가 끝나도 남고, 에이전트가 이름을 요청하면 자동으로 실린다.
 // 값은 OS 보안 저장소에만 있고, 값을 돌려주는 것은 readSavedSecretValue 하나다.
 // ---------------------------------------------------------------------------
 
@@ -44,7 +44,7 @@ export function listSavedSecrets(): Promise<SavedSecretsSnapshot> {
   return call<SavedSecretsSnapshot>("list_saved_secrets", {});
 }
 
-/** 호스트 전용 쓰기. 같은 이름이 있으면 값과 용도를 덮어쓴다. */
+/** 쓰기(C17-7, 로그인한 채널 모두). 같은 이름이 있으면 값과 용도를 덮어쓴다. */
 export function saveSecret(input: { name: string; purpose: string; value: string }): Promise<SavedSecretsSnapshot> {
   return call<SavedSecretsSnapshot>("save_secret", input);
 }

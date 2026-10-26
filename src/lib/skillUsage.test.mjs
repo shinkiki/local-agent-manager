@@ -182,3 +182,50 @@ test("코드 속 템플릿 경로는 스킬 이름으로 잡지 않는다", () =
   ]);
   assert.deepEqual(usages, []);
 });
+
+test("V4: 주입된 스킬 본문은 실패한 실행의 상태와 지시를 보존한다", () => {
+  const usages = collectTranscriptSkillUsages([
+    { index: 10, blocks: [{ kind: "tool_use", name: "Skill", inputJson: '{"skill":"review","args":"변경 검토"}' }] },
+    { index: 11, blocks: [{ kind: "tool_result", text: "Launching skill: review", isError: true }] },
+    { index: 12, blocks: [{
+      kind: "context",
+      label: "사용 스킬 · review",
+      text: "Base directory for this skill: /skills/review\n\n# 검토\n본문",
+    }] },
+  ]);
+
+  assert.deepEqual(usages, [{
+    id: "10:review",
+    name: "review",
+    args: "변경 검토",
+    status: "failed",
+    directory: "/skills/review",
+    body: "# 검토\n본문",
+    detection: "tool",
+  }]);
+});
+
+test("V4: 주입된 스킬 본문은 경로로 찾은 실행을 전용 도구 실행으로 바꾸지 않는다", () => {
+  const usages = collectTranscriptSkillUsages([
+    { index: 20, blocks: [{
+      kind: "tool_use",
+      name: "shell",
+      inputJson: '{"command":"cat /home/developer/.codex/skills/review/SKILL.md"}',
+    }] },
+    { index: 21, blocks: [{
+      kind: "context",
+      label: "사용 스킬 · review",
+      text: "Base directory for this skill: /home/developer/.codex/skills/review\n\n# 검토",
+    }] },
+  ]);
+
+  assert.deepEqual(usages, [{
+    id: "20:review",
+    name: "review",
+    args: "",
+    status: "completed",
+    directory: "/home/developer/.codex/skills/review",
+    body: "# 검토",
+    detection: "path",
+  }]);
+});

@@ -36,6 +36,14 @@ function expiredReauthGuidance(provider: ProviderId, text: UiText): string {
       "Run claude in a terminal and sign in again with /login to verify it. The Claude desktop app keeps a separate sign-in.",
     );
   }
+  if (provider === "antigravity") {
+    // 백엔드는 토큰에도 CLI 로그에도 신원이 없을 때 이 상태로 둔다. 공식 CLI로 다시
+    // 로그인하면 로그에 계정 이메일이 남아 다음 관측에서 확인된다. ChatGPT 앱은 무관하다.
+    return text(
+      "터미널에서 agy를 실행해 다시 로그인하면 확인됩니다.",
+      "Run agy in a terminal and sign in again to verify it.",
+    );
+  }
   return text(
     "ChatGPT 데스크탑 앱을 쓰거나 터미널에서 다시 로그인하면 확인됩니다.",
     "Use the ChatGPT desktop app or sign in again from a terminal to verify it.",

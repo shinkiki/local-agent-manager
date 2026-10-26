@@ -122,5 +122,13 @@ test("git diff 팝아웃은 프로젝트·경로·대상(스테이지/커밋)을
   assert.match(popoutWindowName(commit), /^popout-gitDiff-[0-9A-Za-z_-]+$/);
   assert.equal(parsePopoutRequest("?popout=gitDiff&project=/tmp/p"), null);
   assert.equal(parsePopoutRequest("?popout=gitDiff&project=/tmp/p&path=a&commit=not-a-sha"), null);
+  // B9 비교 요약에서 연 범위 diff 는 두 끝을 함께 오가고, 같은 파일의 작업 트리 창과 따로 선다.
+  const range = { ...worktree, rangeFrom: "origin/develop", rangeTo: "HEAD" };
+  assert.deepEqual(parsePopoutRequest(popoutSearch(range)), range);
+  assert.notEqual(popoutWindowName(range), popoutWindowName(worktree));
+  assert.equal(parsePopoutRequest("?popout=gitDiff&project=/tmp/p&path=a&from=main"), null);
+  assert.equal(parsePopoutRequest("?popout=gitDiff&project=/tmp/p&path=a&to=HEAD"), null);
+  assert.equal(parsePopoutRequest("?popout=gitDiff&project=/tmp/p&path=a&from=main&to=HEAD&commit=abc1234"), null);
+  assert.equal(parsePopoutRequest("?popout=gitDiff&project=/tmp/p&path=a&from=main&to=HEAD&staged=1")?.staged, false);
   assert.equal(phraseText(popoutDefaultTitle(commit), (_ko, en) => en ?? _ko), "Diff");
 });

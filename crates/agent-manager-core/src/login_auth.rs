@@ -282,10 +282,42 @@ impl OtpSecretStore {
             Err(error) if crate::os_keychain::is_keychain_unavailable(&error) => {}
             Err(error) => return Err(error),
         }
-        if !self.file_path.is_file() {
+        let metadata = match std::fs::symlink_metadata(&self.file_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(CoreError::InvalidInput(
+                "OTP 비밀 파일은 심볼릭 링크일 수 없습니다".to_owned(),
+            ));
+        }
+        if !metadata.is_file() {
             return Ok(None);
         }
-        let bytes = Zeroizing::new(std::fs::read(&self.file_path)?);
+        // G10·C20-8: 검사 뒤 링크로 바뀌어도 폴백 비밀을 다른 파일에서 읽지 않는다.
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            );
+        }
+        let mut file = options.open(&self.file_path)?;
+        if !file.metadata()?.is_file() {
+            return Err(CoreError::InvalidInput(
+                "OTP 비밀 파일은 일반 파일이어야 합니다".to_owned(),
+            ));
+        }
+        let mut bytes = Zeroizing::new(Vec::new());
+        std::io::Read::read_to_end(&mut file, &mut bytes)?;
         let text = String::from_utf8(bytes.to_vec())
             .map_err(|_| CoreError::Runtime("OTP 비밀 파일을 읽지 못했습니다".to_owned()))?;
         Ok(Some((
@@ -1171,6 +1203,84 @@ mod tests {
             ),
             "LOGIN_USER_ID_INVALID"
         );
+    }
+
+    #[test]
+    fn c20_8_otp_fallback_reads_only_a_present_regular_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = OtpSecretStore {
+            file_path: directory.path().join(LOGIN_OTP_SECRET_FILE_NAME),
+            keychain: KeychainMode::Unavailable,
+        };
+        assert!(store.read().expect("absent file").is_none());
+        fs::create_dir(&store.file_path).expect("directory at secret path");
+        assert!(store
+            .read()
+            .expect("directory is not a stored secret")
+            .is_none());
+        fs::remove_dir(&store.file_path).expect("remove directory");
+
+        store.write("JBSWY3DPEHPK3PXP\n").expect("write fixture");
+        let (secret, storage) = store.read().expect("read fixture").expect("stored secret");
+        assert_eq!(secret.as_str(), "JBSWY3DPEHPK3PXP");
+        assert_eq!(storage, OtpSecretStorage::File);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_c20_8_otp_fallback_refuses_existing_and_dangling_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let target = outside.path().join("fixture");
+        fs::write(&target, "JBSWY3DPEHPK3PXP").expect("outside fixture");
+        let store = OtpSecretStore {
+            file_path: directory.path().join(LOGIN_OTP_SECRET_FILE_NAME),
+            keychain: KeychainMode::Unavailable,
+        };
+        for destination in [&target, &outside.path().join("absent")] {
+            symlink(destination, &store.file_path).expect("plant symlink");
+            assert!(matches!(store.read(), Err(CoreError::InvalidInput(_))));
+            assert!(fs::symlink_metadata(&store.file_path)
+                .expect("link stays in place")
+                .file_type()
+                .is_symlink());
+            fs::remove_file(&store.file_path).expect("remove link");
+        }
+        assert_eq!(
+            fs::read_to_string(target).expect("outside unchanged"),
+            "JBSWY3DPEHPK3PXP"
+        );
+        assert!(!outside.path().join("absent").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_c20_8_a_symlinked_otp_fallback_cannot_authenticate_or_report_storage() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let auth = open(directory.path());
+        let secret = enroll_otp(&auth, &Reauth::default());
+        auth.set_channel_requirement(LoginChannel::Remote, LoginMethod::Otp, true)
+            .expect("require otp");
+        let path = directory.path().join(LOGIN_OTP_SECRET_FILE_NAME);
+        let target = outside.path().join("fixture");
+        fs::rename(&path, &target).expect("move fixture outside app data");
+        std::os::unix::fs::symlink(&target, &path).expect("plant symlink");
+
+        let later = NOW + 120_000;
+        let step = login_totp::current_step((later / 1000) as u64);
+        let otp = format!("{:06}", login_totp::totp_code(&secret, step));
+        assert!(matches!(
+            auth.settings_view(),
+            Err(CoreError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            auth.authenticate_at(LoginChannel::Remote, None, None, Some(&otp), "", later),
+            Err(CoreError::InvalidInput(_))
+        ));
+        assert!(auth.list_sessions(None).is_empty());
     }
 
     #[test]

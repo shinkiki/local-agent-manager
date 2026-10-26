@@ -4,7 +4,7 @@
 //! [`crate::store`]에 함께 있던 동안에는 두 저장소의 상수·잠금·정리 규칙이 한 파일에서
 //! 섞여 있었다. 호출부가 쓰던 `store::` 경로는 그쪽의 재내보내기가 그대로 유지한다.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -79,6 +79,24 @@ pub(crate) fn captured_turns_for(
         .collect::<Vec<_>>();
     turns.sort_by_key(|turn| turn.completed_at);
     Ok(turns)
+}
+
+/// 세션 키(`store::session_key`)별 보완 응답. 여러 세션을 훑는 호출이 세션마다 저장소를
+/// 다시 읽고 파싱하지 않도록 한 번에 묶는다. 세션 안의 순서는 [`captured_turns_for`]와 같다.
+pub(crate) fn captured_turns_by_session(
+    app_data_dir: &Path,
+) -> Result<HashMap<String, Vec<CapturedTranscriptTurn>>, CoreError> {
+    let mut grouped: HashMap<String, Vec<CapturedTranscriptTurn>> = HashMap::new();
+    for turn in load_supplement_store(app_data_dir)?.turns {
+        grouped
+            .entry(session_key(turn.source, &turn.session_id))
+            .or_default()
+            .push(turn);
+    }
+    for turns in grouped.values_mut() {
+        turns.sort_by_key(|turn| turn.completed_at);
+    }
+    Ok(grouped)
 }
 
 pub(crate) fn supplement_storage_stats(
@@ -201,6 +219,11 @@ fn persist_captured_turn_inner(
 
 fn load_supplement_store(app_data_dir: &Path) -> Result<SupplementStore, CoreError> {
     read_private_json_or_default(&app_data_dir.join(SUPPLEMENT_STORE_FILE_NAME))
+}
+
+/// 보완 저장소 파일 위치. 저장소를 읽은 결과를 캐시하는 쪽이 파일 변경을 알아보는 데 쓴다.
+pub(crate) fn supplement_store_path(app_data_dir: &Path) -> std::path::PathBuf {
+    app_data_dir.join(SUPPLEMENT_STORE_FILE_NAME)
 }
 
 fn supplement_store_size(app_data_dir: &Path) -> u64 {

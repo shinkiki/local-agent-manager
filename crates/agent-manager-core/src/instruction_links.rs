@@ -162,7 +162,9 @@ fn collect_markdown_links(segment: &str, links: &mut Vec<String>, seen: &mut BTr
             index = after_open;
             continue;
         };
-        let href = segment[target_start..target_end].trim();
+        // 프런트의 `String.prototype.trim`과 같은 문자만 걷어낸다. `str::trim`은 U+0085를
+        // 지우고 U+FEFF를 남겨, 화면 트리와 보관 세트가 같은 링크를 다르게 읽었다(C5-7).
+        let href = segment[target_start..target_end].trim_matches(is_js_space);
         index = target_end + 1;
         if target_end == target_start {
             continue;
@@ -214,7 +216,7 @@ fn is_safe_href(href: &str) -> bool {
     !href.is_empty() && !href.contains(':')
 }
 
-/// 자바스크립트 정규식의 `\s`. 유니코드 White_Space와 미세하게 다르므로 프런트
+/// 자바스크립트 정규식의 `\s`(= `trim`이 걷는 문자). 유니코드 White_Space와 미세하게 다르므로 프런트
 /// 규칙을 그대로 옮긴다.
 fn is_js_space(value: char) -> bool {
     matches!(

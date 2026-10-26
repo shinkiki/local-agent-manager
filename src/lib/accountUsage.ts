@@ -183,12 +183,17 @@ export function governingUsageWindows(windows: DisplayUsageWindow[]): DisplayUsa
  * 어긋남이 생긴다. 대표 창뿐인 계정은 **모든 모델군이 찼을 때만** 막힌 것이다.
  */
 export function accountExhaustionWindows(windows: DisplayUsageWindow[]): DisplayUsageWindow[] {
+  return exhaustedGroups(windows).flat();
+}
+
+/** 소진 판정과 재개 시각이 함께 쓰는 소진 창 묶음. 계정이 열려 있으면 빈 목록이다. */
+function exhaustedGroups(windows: DisplayUsageWindow[]): DisplayUsageWindow[][] {
   const full = (window: DisplayUsageWindow) => window.usedPercent >= 100;
   const exhausted = exhaustionGroups(windows).map((group) => group.filter(full));
   // 묶음이 하나도 없는 계정(창을 읽지 못했거나 모델군을 모르는 계정)은 소진이 아니다 —
   // 모르는 것과 다 쓴 것은 다르므로 빈 묶음 목록은 아래 `every`에서 빈 결과가 된다.
   if (exhausted.length === 0) return [];
-  return exhausted.every((group) => group.length > 0) ? exhausted.flat() : [];
+  return exhausted.every((group) => group.length > 0) ? exhausted : [];
 }
 
 /**
@@ -213,10 +218,9 @@ function modelGroups(windows: DisplayUsageWindow[]): DisplayUsageWindow[][] {
   return [...groups.values()];
 }
 
-/** 이 창들이 **모두** 풀리는 시각. 시각을 모르는 창은 셈에서 빠진다. */
+/** 이 소진 창들이 **모두** 풀리는 시각. 시각을 모르는 창은 셈에서 빠진다. */
 function windowsClearAt(windows: DisplayUsageWindow[]): number | null {
   const resets = windows
-    .filter((window) => window.usedPercent >= 100)
     .map((window) => window.resetsAt)
     .filter((value): value is number => value !== null);
   return resets.length > 0 ? Math.max(...resets) : null;
@@ -230,8 +234,9 @@ function windowsClearAt(windows: DisplayUsageWindow[]): number | null {
  * 창을 뭉뚱그려 가장 이른 시각을 말하면 아직 거부되는 시각을 "그때 풀린다"고 알리게 된다.
  */
 export function accountExhaustionResetAt(windows: DisplayUsageWindow[]): number | null {
-  if (accountExhaustionWindows(windows).length === 0) return null;
-  const clearAt = exhaustionGroups(windows)
+  const exhausted = exhaustedGroups(windows);
+  if (exhausted.length === 0) return null;
+  const clearAt = exhausted
     .map(windowsClearAt)
     .filter((value): value is number => value !== null);
   return clearAt.length > 0 ? Math.min(...clearAt) : 0;

@@ -596,7 +596,7 @@ function completedChatActivityStatus(entries: ChatActivityEntry[]): string {
   const statuses = entries.flatMap((entry) => entry.type === "tool" ? [entry.status] : []);
   if (statuses.some((status) => status === "failed" || status === "error")) return "failed";
   if (statuses.includes("interrupted")) return "interrupted";
-  if (statuses.includes("completedWithDenials")) return "completedWithDenials";
+  if (statuses.includes("completedWithDenials") || statuses.includes("denied")) return "completedWithDenials";
   return "completed";
 }
 

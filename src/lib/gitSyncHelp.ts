@@ -39,7 +39,7 @@ flowchart LR
 | 올리기 | \`git push\` | 내 브랜치의 새 커밋을 원격에 올립니다. upstream이 없으면 원격에 같은 이름으로 새로 만들고 따라가도록 설정합니다. | 그대로 | **바뀜** |
 | 브랜치 위로 옮기기… | \`git rebase <대상>\` | 내 브랜치에만 있는 커밋을 고른 브랜치의 끝 위에 다시 쌓습니다. | **바뀜** | 그대로 |
 
-원격과 통신하는 버튼(원격 확인·받아서 합치기·올리기)은 설정에서 git용으로 켜 둔 SSH 키가 있으면 그 키로 인증합니다.
+원격과 통신하는 버튼(원격 확인·받아서 합치기·올리기)은 SSH 원격이면 애드온 → SSH에서 git용으로 켜 둔 서버의 키로, HTTPS 원격이면 프로젝트 목록 옆 톱니바퀴(git 원격 인증)에서 그 호스트에 골라 둔 저장된 비밀값(토큰)으로 인증합니다. 둘 다 없으면 git이 스스로 쓰는 자격 증명(credential helper 등)을 씁니다.
 
 ## 받아서 합치기: 두 가지 방식
 
@@ -153,7 +153,7 @@ flowchart LR
 | Push | \`git push\` | Uploads your branch's new commits. With no upstream, creates the branch on the remote and tracks it. | unchanged | **changed** |
 | Rebase onto… | \`git rebase <target>\` | Replays the commits only your branch has on top of the branch you pick. | **changed** | unchanged |
 
-Buttons that talk to the remote (Fetch, Pull, Push) authenticate with the SSH key enabled for git in settings, if any.
+Buttons that talk to the remote (Fetch, Pull, Push) authenticate with the key of the server enabled for git under Add-ons → SSH for SSH remotes, and with the saved secret (token) chosen for that host under Git remote auth (the gear next to the project list) for HTTPS remotes. Without either, git falls back to its own credentials (a credential helper and the like).
 
 ## Pull: two modes
 

@@ -101,16 +101,19 @@ function deriveByKey<K extends keyof KeyedFolderData>(
  * 경로 문구는 저장된 상위 참조를 그대로 읽는다. 한 벌만 두면 둘 중 하나의 규칙이 바뀐다.
  */
 type FolderCache = {
-  input: readonly SessionFolder[];
   tree: FolderTree | null;
   rawById: Map<string, SessionFolder> | null;
 };
 
-let cache: FolderCache | null = null;
+const treeCache = new WeakMap<readonly SessionFolder[], FolderCache>();
 
-function cacheFor(folders: SessionFolder[]): FolderCache {
-  if (!cache || cache.input !== folders) cache = { input: folders, tree: null, rawById: null };
-  return cache;
+function cacheFor(folders: readonly SessionFolder[]): FolderCache {
+  let entry = treeCache.get(folders);
+  if (!entry) {
+    entry = { tree: null, rawById: null };
+    treeCache.set(folders, entry);
+  }
+  return entry;
 }
 
 export function folderTree(folders: SessionFolder[]): FolderTree {
@@ -214,6 +217,7 @@ export function visibleSubtreeIds(tree: FolderTree, id: string): Set<string> {
 }
 
 function collectSubtree(tree: FolderTree, id: string, stopAtHidden: boolean): Set<string> {
+  if (!tree.byId.has(id)) return new Set<string>();
   const collected = new Set<string>([id]);
   const frontier = [id];
   while (frontier.length > 0) {

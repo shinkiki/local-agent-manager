@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveSelectedProjectPath } from "./projectSelection.ts";
+import { resolveSelectedProjectPath, selectableProjects } from "./projectSelection.ts";
 
 const active = [{ path: "/tmp/amproj/alpha" }, { path: "/tmp/amproj/beta" }];
 
@@ -21,4 +21,20 @@ test("no stored path selects the first project", () => {
 test("no active project resolves to nothing regardless of the stored path", () => {
   assert.equal(resolveSelectedProjectPath([], "/tmp/amproj/alpha"), null);
   assert.equal(resolveSelectedProjectPath([], null), null);
+});
+
+test("only active projects whose folder exists are selectable, in registry order", () => {
+  const entries = [
+    { path: "/tmp/amproj/excluded", active: false, exists: true },
+    { path: "/tmp/amproj/beta", active: true, exists: true },
+    { path: "/tmp/amproj/missing", active: true, exists: false },
+    { path: "/tmp/amproj/alpha", active: true, exists: true },
+  ];
+  assert.deepEqual(selectableProjects(entries).map((entry) => entry.path), ["/tmp/amproj/beta", "/tmp/amproj/alpha"]);
+  // 첫 선택도 걸러진 목록 기준이다 — 제외된 첫 줄로 떨어지지 않는다.
+  assert.equal(resolveSelectedProjectPath(selectableProjects(entries), null), "/tmp/amproj/beta");
+});
+
+test("a registry that has not loaded yet has nothing selectable", () => {
+  assert.deepEqual(selectableProjects(null), []);
 });

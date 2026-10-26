@@ -109,6 +109,11 @@ test("C20: the session token rides only on WebSocket and asset URLs, as a query 
     resolveBackendHttpUrl("/api/chat-attachment/c1/a1", false, location, undefined, token),
     "https://manager.example.ts.net/api/chat-attachment/c1/a1?session=abc.def_GHI",
   );
+  // 쿼리 값에 든 `?`는 쿼리의 일부다 — 첫 `?` 뒤를 통째로 보존한다.
+  assert.equal(
+    resolveBackendWebSocketUrl("/api/chat?q=a?b", false, location, undefined, token),
+    "wss://manager.example.ts.net/api/chat?q=a%3Fb&session=abc.def_GHI",
+  );
   // 토큰이 없으면 아무것도 붙지 않는다.
   assert.equal(
     resolveBackendWebSocketUrl("/api/terminal", false, location),

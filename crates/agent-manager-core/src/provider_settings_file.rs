@@ -257,4 +257,89 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o600);
     }
+
+    #[test]
+    fn ensure_parent_creates_one_private_directory_c8_3() {
+        let root = tempfile::tempdir().expect("임시 디렉터리");
+        let parent = root.path().join("provider");
+        let target = parent.join("settings.json");
+
+        GUARD.ensure_parent(&target).expect("설정 폴더 생성");
+
+        assert!(parent.is_dir());
+        assert!(!target.exists());
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o750)).unwrap();
+        GUARD.ensure_parent(&target).expect("기존 폴더 재사용");
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+    }
+
+    #[test]
+    fn ensure_parent_refuses_multiple_missing_directories_c8_3() {
+        let root = tempfile::tempdir().expect("임시 디렉터리");
+        let missing = root.path().join("missing");
+        let target = missing.join("provider/settings.json");
+
+        assert!(GUARD.ensure_parent(&target).is_err());
+        assert!(
+            !missing.exists(),
+            "허용 범위 밖의 상위 폴더를 만들면 안 된다"
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn ensure_parent_refuses_symlinked_parent_c8_2_c13_5() {
+        let root = tempfile::tempdir().expect("임시 디렉터리");
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let original = outside.join("settings.json");
+        fs::write(&original, b"original").unwrap();
+        let link = root.path().join("provider");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let target = link.join("settings.json");
+
+        let result = GUARD
+            .ensure_parent(&target)
+            .and_then(|()| GUARD.atomic_write(&target, b"changed"));
+
+        assert!(matches!(result, Err(CoreError::InvalidInput(_))));
+        assert_eq!(fs::read(&original).unwrap(), b"original");
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn ensure_parent_refuses_symlinked_grandparent_c8_2_c13_5() {
+        let root = tempfile::tempdir().expect("임시 디렉터리");
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let marker = outside.join("keep.txt");
+        fs::write(&marker, b"original").unwrap();
+        let link = root.path().join("home");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let target = link.join("provider/settings.json");
+
+        let result = GUARD
+            .ensure_parent(&target)
+            .and_then(|()| GUARD.atomic_write(&target, b"changed"));
+
+        assert!(matches!(result, Err(CoreError::InvalidInput(_))));
+        assert!(!outside.join("provider").exists());
+        assert_eq!(fs::read(&marker).unwrap(), b"original");
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+    }
 }

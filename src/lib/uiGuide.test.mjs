@@ -69,3 +69,26 @@ test("anchor selectors escape quotes", () => {
   assert.equal(uiGuideAnchorSelector("nav.settings"), '[data-ui-anchor="nav.settings"]');
   assert.equal(uiGuideAnchorSelector('a"b'), '[data-ui-anchor="a\\"b"]');
 });
+
+test("blank or whitespace-only ids and fields are rejected with ordered label", () => {
+  const blankEntries = [
+    { id: "", view: null, anchor: "a", description: "empty id" },
+    { id: "   ", view: null, anchor: "b", description: "whitespace id" },
+    { id: "valid", view: null, anchor: "   ", description: "whitespace anchor" },
+    { id: "valid2", view: null, anchor: "c", description: "   " },
+  ];
+  const problems = uiGuideTargetProblems(blankEntries);
+  assert.ok(problems.includes("#0: id가 없습니다"));
+  assert.ok(problems.includes("#1: id가 없습니다"));
+  assert.ok(problems.includes("valid: anchor가 없습니다"));
+  assert.ok(problems.includes("valid2: description이 없습니다"));
+  assert.deepEqual(normalizeUiGuideTargets(blankEntries), []);
+
+  const padded = [
+    { id: "trimmed", view: null, anchor: "  anchor.padded  ", description: "  description text  " },
+  ];
+  const normalized = normalizeUiGuideTargets(padded);
+  assert.equal(normalized.length, 1);
+  assert.equal(normalized[0].anchor, "anchor.padded");
+  assert.equal(normalized[0].description, "description text");
+});

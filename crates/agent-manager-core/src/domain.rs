@@ -1179,7 +1179,7 @@ pub struct ManagerSnapshot {
 }
 
 /// 세션 하나를 가리키는 키. 델타가 "이 세션은 목록에서 빠졌다"를 알릴 때 쓴다.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRef {
     pub source: ProviderId,

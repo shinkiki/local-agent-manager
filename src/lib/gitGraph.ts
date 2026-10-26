@@ -33,6 +33,9 @@ export interface GitGraphLayout {
  * 이미 활성인 부모로 합류할 때는 레인을 하나로 접어 GitLens 같은 합류선을 만든다.
  */
 export function layoutGitGraph(commits: readonly Pick<GitCommit, "sha" | "parents">[]): GitGraphLayout {
+  if (commits.length === 0) {
+    return { rows: [], columns: 0 };
+  }
   let nextColor = 0;
   let lanes: ActiveLane[] = [];
   let columns = 1;
@@ -63,7 +66,10 @@ export function layoutGitGraph(commits: readonly Pick<GitCommit, "sha" | "parent
       const to = after.findIndex((candidate) => candidate.sha === active.sha);
       if (to >= 0) segments.push({ from, to, start: "top", color: active.color });
     });
+    const seenParents = new Set<string>();
     commit.parents.forEach((parent) => {
+      if (seenParents.has(parent)) return;
+      seenParents.add(parent);
       const to = after.findIndex((active) => active.sha === parent);
       // 합류선은 도착 레인의 색을 쓴다. 원류(현재 커밋) 색으로 그리면 이미 다른 색으로
       // 이어지고 있던 레인이 합류 지점에서만 색이 바뀌어 다른 갈래처럼 보인다.

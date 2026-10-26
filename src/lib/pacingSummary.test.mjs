@@ -264,6 +264,18 @@ test("순여유가 음수이면 잔여 회차는 0이고 다른 공급자의 잔
   assert.equal(mixed.remainingRuns, 3);
 });
 
+test("같은 공급자 안에서 한도를 넘긴 계정은 다른 계정의 여유를 깎지 않는다", () => {
+  const summary = (headrooms) =>
+    consumerSummary(
+      consumer({ costs: costs({ claude: 5 }) }),
+      headrooms.map((h, i) => account(`a${i}`, { provider: "claude", overview: { netHeadroomPercent: h } })),
+    ).remainingRuns;
+  // 10 + max(0, -5) = 10 → 10/5 = 2회. 음수를 그대로 더하면 1회로 줄어든다.
+  assert.equal(summary([10, -5]), 2);
+  assert.equal(summary([0, 0]), 0);
+  assert.equal(summary([-5]), 0);
+});
+
 /**
  * 사용량 한도가 없는 공급자는 창도 리셋도 없어 소진율을 잴 수 없다. 목록에 남으면 0%로
  * 읽혀 "여유가 가장 많은 계정"으로 뽑히고, 레인 폴백에서는 고를 수도 없는 칸이 생긴다.

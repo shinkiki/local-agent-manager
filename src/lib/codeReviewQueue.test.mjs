@@ -123,6 +123,20 @@ test("a commit older than the window drops out of the queue and is counted as ex
   assert.equal(report.remaining, 1);
 });
 
+test("duplicate commits older than the window are counted as expired only once", () => {
+  const report = buildQueue({
+    now: NOW,
+    commitWindowDays: 7,
+    commits: [
+      { hash: "dddddddddddd4444", timestamp: hoursAgo(24 * 8) },
+      { hash: "DDDDDDDDDDDD4444", timestamp: hoursAgo(24 * 8) },
+      { hash: "dddddddddddd4444", timestamp: hoursAgo(24 * 9) },
+    ],
+  });
+  assert.equal(report.counts.expired, 1);
+  assert.equal(report.remaining, 0);
+});
+
 test("picking skips what another lane already holds", () => {
   const items = [
     { itemId: "C-aaaaaaaaaaaa", kind: "commit", ref: "a", title: "a" },

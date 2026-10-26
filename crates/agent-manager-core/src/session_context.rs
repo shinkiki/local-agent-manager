@@ -1293,8 +1293,15 @@ fn cli_untrusted_text(text: &str, cap: usize, policy: &ResolvedSessionRead) -> S
 
 fn cli_parse_source(value: &str) -> Result<ProviderId, CoreError> {
     value.parse::<ProviderId>().map_err(|_| {
+        // 받는 값 목록은 ProviderId::ALL 에서 만든다. 손으로 적어 둔 목록은 local 이
+        // 추가될 때 따라가지 않아, 받아 주는 값을 안내에서 빠뜨렸다.
+        let accepted = ProviderId::ALL
+            .iter()
+            .map(|provider| provider.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
         CoreError::InvalidInput(format!(
-            "알 수 없는 공급자입니다: {value}. claude|codex|antigravity 중 하나를 쓰세요"
+            "알 수 없는 공급자입니다: {value}. {accepted} 중 하나를 쓰세요"
         ))
     })
 }
@@ -1510,6 +1517,7 @@ fn cli_list(
         catalog,
         chats,
         SessionListRequest {
+            include_content: false,
             scope: policy_scope_filters(policy),
             status: None,
             search: None,
@@ -2292,10 +2300,11 @@ mod tests {
             cli_parse_source("antigravity").unwrap(),
             ProviderId::Antigravity
         );
+        assert_eq!(cli_parse_source("local").unwrap(), ProviderId::Local);
 
         let error = cli_parse_source("unknown").unwrap_err();
         assert!(matches!(error, CoreError::InvalidInput(message) if message
-            == "알 수 없는 공급자입니다: unknown. claude|codex|antigravity 중 하나를 쓰세요"));
+            == "알 수 없는 공급자입니다: unknown. claude|codex|antigravity|local 중 하나를 쓰세요"));
     }
 
     #[test]

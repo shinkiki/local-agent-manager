@@ -47,6 +47,22 @@ export function boundToolCardText(text: string, keep: "head" | "tail", limit = M
   return { text: kept, omitted: total - limit, total };
 }
 
+/**
+ * 파일별 diff 행에 카드 전체의 행 상한을 앞 파일부터 나눠 준다. 상한을 다 쓴 뒤의 파일은
+ * 빈 목록을 받아 머리줄만 그려지고, `hidden`은 그리지 않은 행의 합이다.
+ */
+export function boundToolCardDiffRows<T>(files: readonly (readonly T[])[], limit: number = MAX_TOOL_CARD_DIFF_ROWS): { visible: T[][]; hidden: number } {
+  let budget = limit;
+  let hidden = 0;
+  const visible = files.map((rows) => {
+    const kept = rows.slice(0, Math.max(0, budget));
+    budget -= kept.length;
+    hidden += rows.length - kept.length;
+    return kept;
+  });
+  return { visible, hidden };
+}
+
 /** 미리보기 정규식이 읽을 앞부분. 짧은 글은 그대로다. */
 export function toolCardPreviewSource(text: string): string {
   return text.length <= TOOL_CARD_PREVIEW_SOURCE_CHARS ? text : text.slice(0, TOOL_CARD_PREVIEW_SOURCE_CHARS);

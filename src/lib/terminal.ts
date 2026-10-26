@@ -30,30 +30,25 @@ type TerminalConnector<T> = (
 ) => Promise<TerminalConnection>;
 
 /**
- * 터미널 갈래. 요청 본문은 갈래마다 다르지만 연결 절차는 같고, 다른 것은 원격 화면에서
- * 열 수 있는지 하나뿐이다. 그 판정을 요청 본문의 필드 유무로 되짚지 않고 갈래를 그대로
- * 받는다 — 필드로 되짚으면 요청 타입에 필드가 하나 늘어나는 것만으로 호스트 전용
- * 터미널이 조용히 원격에 열린다.
+ * 요청 종류마다 이름과 요청 타입만 따로 두고, 연결 절차는 한 벌만 쓴다. 예전에는 갈래
+ * 이름을 함께 넘겨 원격 화면에서 열 수 있는지 갈랐지만, 로그인 뒤에는 모든 채널이 같아져
+ * (C20) 그 이름을 읽는 곳이 남지 않았다.
  */
-type TerminalKind = "session" | "setup" | "accountLogin" | "ssh";
-
-/** 호출부가 요청 종류를 잘못 섞지 않도록 이름과 요청 타입만 따로 두고, 절차는 한 벌만 쓴다. */
-function terminalConnector<T extends TerminalRequest>(kind: TerminalKind): TerminalConnector<T> {
-  return (request, onEvent) => connectWebSocket(kind, request, onEvent);
+function terminalConnector<T extends TerminalRequest>(): TerminalConnector<T> {
+  return (request, onEvent) => connectWebSocket(request, onEvent);
 }
 
-export const connectTerminal = terminalConnector<TerminalOpenRequest>("session");
-export const connectSetupTerminal = terminalConnector<TerminalSetupRequest>("setup");
-export const connectAccountLoginTerminal = terminalConnector<TerminalAccountLoginRequest>("accountLogin");
+export const connectTerminal = terminalConnector<TerminalOpenRequest>();
+export const connectSetupTerminal = terminalConnector<TerminalSetupRequest>();
+export const connectAccountLoginTerminal = terminalConnector<TerminalAccountLoginRequest>();
 // C9-19/C9-20: both user-driven SSH modes open on every signed-in channel (C20).
-export const connectSshTerminal = terminalConnector<TerminalSshRequest>("ssh");
+export const connectSshTerminal = terminalConnector<TerminalSshRequest>();
 
 /**
  * 소켓을 열기 전에 백엔드 악수를 확인한다. 채널별 제한은 더 이상 없다 — 로그인 뒤에는
- * 모든 채널이 같고(C20), 로그인이 없으면 악수가 게이트를 띄운다. 갈래 이름은 백엔드
- * 거절 문구를 읽는 호출부를 위해 남긴다.
+ * 모든 채널이 같고(C20), 로그인이 없으면 악수가 게이트를 띄운다.
  */
-async function assertTerminalAllowed(_kind: TerminalKind): Promise<void> {
+async function assertTerminalAllowed(): Promise<void> {
   await getWebAccessStatus();
 }
 
@@ -134,15 +129,14 @@ function terminalConnection(socket: WebSocket, info: TerminalSessionInfo): Termi
 }
 
 /**
- * 터미널 한 벌을 연다. 절차는 갈래와 무관하게 셋으로 나뉜다 — 이 화면에서 열어도 되는지,
+ * 터미널 한 벌을 연다. 절차는 요청 종류와 무관하게 셋으로 나뉜다 — 이 화면에서 열어도 되는지,
  * 소켓을 열어 세션이 성립할 때까지 기다리기, 성립한 세션의 손잡이 만들기.
  */
 async function connectWebSocket(
-  kind: TerminalKind,
   request: TerminalRequest,
   onEvent: (event: TerminalEvent) => void,
 ): Promise<TerminalConnection> {
-  await assertTerminalAllowed(kind);
+  await assertTerminalAllowed();
   const socket = new WebSocket(backendWebSocketUrl("/api/terminal"));
   socket.binaryType = "arraybuffer";
   const info = await terminalHandshake(socket, request, onEvent);

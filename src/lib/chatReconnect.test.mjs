@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   BACKEND_RESTARTED_MESSAGE,
   chatReconnectDecision,
+  chatReconnectPrecheckStep,
   ChatRejectedError,
   reconnectNoticeMessage,
   shouldNoticeReconnectAttempt,
@@ -61,4 +62,11 @@ test("재시도 안내에는 실패 횟수와 실제 사유가 함께 들어간�
 
 test("재기동 안내는 부재로 분류되도록 '찾을 수 없습니다'를 유지한다", () => {
   assert.match(BACKEND_RESTARTED_MESSAGE, /찾을 수 없습니다/);
+});
+
+test("인스턴스 확인을 기다리는 사이 화면이 끊은 연결은 attach하지 않는다", () => {
+  assert.equal(chatReconnectPrecheckStep(true, "a", "a"), "abandon");
+  assert.equal(chatReconnectPrecheckStep(true, "a", "b"), "abandon");
+  assert.equal(chatReconnectPrecheckStep(false, "a", "b"), "restarted");
+  assert.equal(chatReconnectPrecheckStep(false, "a", "a"), "attach");
 });

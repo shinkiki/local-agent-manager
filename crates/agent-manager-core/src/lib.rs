@@ -81,6 +81,8 @@ mod session_cleanup;
 mod session_context;
 mod session_folders;
 mod session_management;
+mod session_search;
+pub use session_search::{SessionSearchMatch, SessionSearchRequest, SessionSearchResponse};
 mod skill_library;
 mod skill_meta;
 mod skill_trash;

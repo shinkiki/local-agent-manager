@@ -141,7 +141,7 @@ pub struct SystemSkillStatus {
 fn digest(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
+    crate::identifier::lower_hex(&hasher.finalize())
 }
 
 /// SKILL.md와 참고 파일 전체를 한 값으로 묶는다. 경로도 함께 넣어, 내용이 같은 파일의
@@ -153,7 +153,7 @@ fn bundle_digest(skill: &SystemSkill) -> String {
         hasher.update(extra.path.as_bytes());
         hasher.update(extra.content.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    crate::identifier::lower_hex(&hasher.finalize())
 }
 
 /// 공급자 설치본에 새로 깔리거나 갱신된 스킬 한 줄. 사용자에게 "무엇이 더 깔렸는지"를
@@ -589,6 +589,24 @@ mod tests {
         ] {
             assert!(body.contains(operation), "{operation} 안내가 없습니다");
         }
+    }
+
+    /// 회차 보고와 채팅 글은 사람이 화면에서 그대로 읽고 결정을 고른다. 설계 스킬이 이 규칙을
+    /// 잃으면 새로 설계한 회차가 다시 id·JSON 으로 선택지를 적고, 추천이 선택지 원문과 달라
+    /// 화면이 추천 버튼을 강조하지 못한다(사용자 지적 2026-10-24).
+    #[test]
+    fn bundled_round_designer_keeps_the_human_readable_report_rule() {
+        let designer = SYSTEM_SKILLS
+            .iter()
+            .find(|skill| skill.key == "round-designer")
+            .expect("round-designer 가 번들 목록에 없습니다");
+        let body = designer.skill_md;
+        assert!(body.contains("## 4-1. 사람에게 보이는 글"));
+        // 결정 질문은 백엔드가 400자에서 자른다(rounds.rs MAX_ITEM_CHARS) — 넘기면 보고 전체가 거절된다.
+        assert!(body.contains("400자 안쪽"));
+        assert!(body.contains("원문 그대로"));
+        assert!(body.contains("\"recommendation\":\"<추천 선택지 원문>\""));
+        assert!(!body.contains("\"question\":\"<사람이 정할 것>\""));
     }
 
     #[cfg(unix)]

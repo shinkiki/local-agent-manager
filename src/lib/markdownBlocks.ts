@@ -44,3 +44,5 @@ export {
   type MarkdownFence,
   type MarkdownChunkSplit,
 } from "./markdownChunks.ts";
+
+export { startsMarkdownTable, splitMarkdownTableRow, markdownTableAlignment } from "./markdownTable.ts";

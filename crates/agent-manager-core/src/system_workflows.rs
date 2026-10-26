@@ -1117,6 +1117,7 @@ impl SystemWorkflowRegistry {
             source,
             &inputs,
             &project_path,
+            None,
         ));
         self.execute(request, invoker)
     }
@@ -1692,30 +1693,43 @@ fn manual_paced_run(
     if account_id.is_empty() || source.is_empty() {
         return None;
     }
+    // 계산이 이 계정에 고른 모델(모델 사다리)을 그대로 쓴다. 없으면 입력의 첫 모델이다.
+    let model = account["model"]
+        .as_str()
+        .filter(|model| !model.trim().is_empty());
     Some(paced_run_for_account(
         account_id,
         source,
         inputs,
         project_path,
+        model,
     ))
 }
 
-/// 계약이 `$run`으로 받는 이번 건의 값. 계정과 공급자는 호출부가 정하고, 모델은 그 공급자의
-/// 계약 입력에서 고른다.
+/// 계약이 `$run`으로 받는 이번 건의 값. 계정과 공급자는 호출부가 정하고, 모델은 호출부가 준
+/// 것이 없으면 그 공급자의 계약 입력에서 고른다. 입력은 모델 사다리(쉼표 목록)일 수 있어
+/// 첫 모델만 쓴다 — 목록 문자열을 그대로 넘기면 CLI가 모르는 모델로 거절한다.
 fn paced_run_for_account(
     account_id: &str,
     source: &str,
     inputs: &BTreeMap<String, Value>,
     project_path: &str,
+    model: Option<&str>,
 ) -> Value {
-    let model = match source {
+    let input = match source {
         "claude" => inputs.get("claudeModel"),
         "codex" => inputs.get("codexModel"),
         "antigravity" => inputs.get("antigravityModel"),
         _ => None,
-    }
-    .cloned()
-    .unwrap_or(Value::Null);
+    };
+    let model = match (model, input) {
+        (Some(model), _) => Value::from(model),
+        (None, Some(Value::String(ladder))) => {
+            crate::usage_pacing::first_ladder_model(ladder).map_or(Value::Null, Value::from)
+        }
+        (None, Some(other)) => other.clone(),
+        (None, None) => Value::Null,
+    };
     // 여력 판정을 거치지 않은 실행이므로 추론수준도 판단 불가일 때의 기본 수준이다.
     let reasoning_effort = crate::domain::ProviderId::ALL
         .into_iter()
@@ -6468,5 +6482,27 @@ mod tests {
         assert_eq!(seen[1].0, "get_live_chats");
         // 같은 실행의 모든 단계가 같은 실행 id를 받는다.
         assert_eq!(seen[0].2, seen[1].2);
+    }
+
+    /// 계산이 0건을 낸 수동 회차의 한 건도 계산이 그 계정에 고른 모델을 쓴다. 고른 모델이
+    /// 없으면 입력 사다리의 첫 모델이다 — 쉼표 목록을 그대로 모델로 넘기지 않는다.
+    #[test]
+    fn manual_paced_run_uses_the_planned_model_or_the_first_ladder_model() {
+        let inputs: BTreeMap<String, Value> = [(
+            "claudeModel".to_owned(),
+            json!("claude-fable-5-1, claude-opus-5-5"),
+        )]
+        .into_iter()
+        .collect();
+        let planned = json!({"accounts": [
+            {"accountId": "claude-a", "provider": "claude", "model": "claude-opus-5-5"}
+        ]});
+        let run = manual_paced_run(&planned, &inputs, "/tmp/project").expect("run");
+        assert_eq!(run["model"], "claude-opus-5-5");
+        let unplanned = json!({"accounts": [{"accountId": "claude-a", "provider": "claude"}]});
+        let run = manual_paced_run(&unplanned, &inputs, "/tmp/project").expect("run");
+        assert_eq!(run["model"], "claude-fable-5-1");
+        let run = paced_run_for_account("codex-a", "codex", &inputs, "/tmp/project", None);
+        assert_eq!(run["model"], Value::Null);
     }
 }

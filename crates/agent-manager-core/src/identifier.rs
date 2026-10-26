@@ -22,6 +22,18 @@ pub(crate) fn is_slug_body(value: &str) -> bool {
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+/// 바이트열을 소문자 16진 문자열로(바이트당 두 글자). SHA-256 digest 를 저장·비교하는
+/// 모든 자리가 이 한 함수로 같은 글자를 만든다 — sha2 0.10 의 `{:x}` 서식에 기대면
+/// digest 0.11 에서 그 서식이 사라질 때 자리마다 따로 깨진다.
+pub(crate) fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// 식별자 길이가 비어 있지 않은 `1..=max_len` 범위인지.
 fn is_within_length_limit(value: &str, max_len: usize) -> bool {
     !value.is_empty() && value.len() <= max_len
@@ -59,6 +71,17 @@ pub(crate) fn validate_identifier(value: &str) -> Result<(), CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lower_hex_matches_known_digests() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(super::lower_hex(&[]), "");
+        assert_eq!(super::lower_hex(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
+        assert_eq!(
+            super::lower_hex(&Sha256::digest(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn slug_body_accepts_only_alphanumeric_dash_underscore() {

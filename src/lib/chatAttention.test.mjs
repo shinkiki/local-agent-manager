@@ -103,6 +103,17 @@ test("clearing read keeps unread, running and approval items", () => {
   assert.equal(clearReadAttentionLocally(next), next);
 });
 
+test("clearing read keeps a read round decision like the server does", () => {
+  // 서버 clear_read 는 열린 종류(running·approval·roundDecision)를 남긴다. 화면이 먼저
+  // 걷어내면 답할 결정이 응답이 올 때까지 사라졌다가 다시 나타난다.
+  const next = clearReadAttentionLocally(snapshot([
+    attention("read-decision", "standard", "roundDecision", true, ""),
+    attention("read-switch", "standard", "accountSwitch", true, ""),
+  ]));
+
+  assert.deepEqual(next.items.map((item) => item.id), ["read-decision"]);
+});
+
 test("dismiss removes one item but refuses approvals and unknown ids", () => {
   const current = snapshot([
     attention("completed", "standard", "completed"),

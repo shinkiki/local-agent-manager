@@ -50,6 +50,20 @@ export function workflowModelInputIsMultiple(name: string): boolean {
   return MULTIPLE_MODEL_INPUTS.has(name);
 }
 
+/**
+ * 페이싱 회차에서 모델 사다리(여러 모델)를 받는 공급자 모델 입력. 계정마다 한도가 남은
+ * 모델을 계산이 고른다 — 모델 전용 한도(Claude Fable 주간 한도)를 먼저 쓰고, Antigravity는
+ * 리셋이 급한 모델군부터 쓴다. 모델 하나에만 걸린 한도는 그 모델을 쓰는 실행만 채울 수 있어,
+ * 회차가 모델 하나로 고정되면 그 한도가 매주 버려진다. 저장 모양은 `localModels`와 같은
+ * 쉼표 목록이고, 한 개만 고르면 종전과 같다.
+ */
+const LADDER_MODEL_INPUTS = new Set(["claudeModel", "codexModel", "antigravityModel"]);
+
+/** 이 입력이 페이싱 회차에서 모델을 여러 개(사다리) 받을 수 있는 칸인지. */
+export function workflowModelInputIsLadder(name: string): boolean {
+  return LADDER_MODEL_INPUTS.has(name);
+}
+
 /** 페이싱 계약에서 공급자 모델 ID를 받는 예약 입력 이름. */
 export function workflowModelInputProvider(name: string): ProviderId | null {
   return WORKFLOW_MODEL_INPUT_PROVIDERS[name] ?? null;
@@ -93,13 +107,22 @@ export function validateWorkflowModelInputs(
   schema: WorkflowInputEntries,
   inputs: Record<string, string>,
   catalogs: WorkflowModelCatalogs,
+  /** 페이싱 회차라 공급자 모델 입력이 모델 사다리(쉼표 목록)를 받는지. */
+  { ladder = false }: { ladder?: boolean } = {},
 ): string[] {
   const problems: string[] = [];
   for (const [name, field] of schema) {
     const catalog = workflowModelCatalog(name, catalogs);
     const value = inputs[name] ?? "";
     if (!catalog || !value.trim()) continue;
-    if (!catalog.some((option) => option.model === value)) {
+    // 복수 선택은 UI와 Rust 파서처럼 쉼표로 나눠 각 ID를 검사한다(V2/V4).
+    // 연결값 전체를 ID 하나와 비교하면 유효한 두 모델도 저장할 수 없다.
+    // 페이싱 회차의 사다리 입력도 같은 모양이다. 페이싱이 아닌 계약은 입력을 그대로 모델로
+    // 넘기므로 쉼표 목록을 통과시키면 CLI가 모르는 모델로 거절한다.
+    const models = workflowModelInputIsMultiple(name) || (ladder && workflowModelInputIsLadder(name))
+      ? value.split(",").map((model) => model.trim()).filter(Boolean)
+      : [value];
+    if (models.some((model) => !catalog.some((option) => option.model === model))) {
       problems.push(`모델 목록에서 다시 선택하세요: ${field.label?.trim() || name}.`);
     }
   }

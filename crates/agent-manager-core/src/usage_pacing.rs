@@ -145,6 +145,10 @@ struct PlanRecordEntry {
     /// 계획 창 예약만 있는 것으로 읽는다.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     guards: BTreeMap<String, WindowClaim>,
+    /// 이 항목의 기동이 쓴 모델. 같은 계정에 모델군이 다른 항목이 함께 있을 때 기동 실패를
+    /// 항목마다 정산하는 근거다([`settle_unlaunched_claims`]). 옛 기록에는 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
 }
 
 /// 계획 창이 아닌 창 하나에 남긴 예약. `PlanRecordEntry`의 계획 창 필드와 같은 뜻이다.
@@ -187,6 +191,11 @@ struct PlanRecord {
     /// 끝나고 표본이 뒤따르면 예약이 정확히 정산된다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     execution_id: Option<String>,
+    /// 모델군마다 쿼터가 따로인 계정(Antigravity)에서 이 소비자의 모델 사다리가 닿는 모델군
+    /// 창들(계정 id → 라벨). 자동 주기의 수요는 이 창들의 여유만 센다 — 사다리에 없는 모델군의
+    /// 여유를 쫓아 주기를 좁히면 쓰지도 못할 회차만 늘어난다. 없는 옛 기록은 계정 대표 창으로 잰다.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    demand_labels: BTreeMap<String, Vec<String>>,
 }
 
 /// 출처가 있는 무인 런타임 하나의 생명주기. 시작·종료 시각으로 사용량 표본을 괄호 쳐
@@ -519,22 +528,48 @@ pub(crate) fn settle_unlaunched_claims(app_data_dir: &Path, execution_id: &str) 
         app_data_dir,
         || format!("실행 {execution_id}의 예약을 정산하지 못했습니다"),
         |store| {
-            let launched = |account_id: &str| {
+            // 같은 계정에 모델군이 다른 항목이 함께 있으면 항목의 모델로 갈라 센다 — 계정 합계로
+            // 견주면 한 모델군의 기동 실패가 다른 모델군의 성공 건수에 가려 예약이 남는다.
+            // 모델을 남기지 않은 옛 항목·실행은 종전처럼 계정 단위다.
+            let launched = |account_id: &str, model: Option<&str>| {
                 store
                     .runs
                     .iter()
                     .filter(|run| {
                         run.execution_id.as_deref() == Some(execution_id)
                             && run.account_id == account_id
+                            && model.is_none_or(|model| {
+                                run.model.as_deref().is_none_or(|ran| ran == model)
+                            })
                     })
                     .count()
             };
-            let counts: BTreeMap<String, usize> = store
+            // 계정당 항목이 하나뿐이면 모델로 가르지 않는다 — 계약이 `$run` 모델 대신 고정
+            // 모델로 띄우거나 채팅이 다른 id로 남기면, 뜬 실행이 0건으로 읽혀 예약이 지워진다.
+            let mut entries_per_account: BTreeMap<&str, usize> = BTreeMap::new();
+            for entry in store
                 .plans
                 .iter()
                 .filter(|plan| plan.execution_id.as_deref() == Some(execution_id))
                 .flat_map(|plan| plan.entries.iter())
-                .map(|entry| (entry.account_id.clone(), launched(&entry.account_id)))
+            {
+                *entries_per_account.entry(&entry.account_id).or_default() += 1;
+            }
+            let counts: BTreeMap<(String, Option<String>), usize> = store
+                .plans
+                .iter()
+                .filter(|plan| plan.execution_id.as_deref() == Some(execution_id))
+                .flat_map(|plan| plan.entries.iter())
+                .map(|entry| {
+                    let shared = entries_per_account
+                        .get(entry.account_id.as_str())
+                        .is_some_and(|count| *count > 1);
+                    let model = entry.model.as_deref().filter(|_| shared);
+                    (
+                        (entry.account_id.clone(), entry.model.clone()),
+                        launched(&entry.account_id, model),
+                    )
+                })
                 .collect();
             let mut changed = false;
             for plan in store
@@ -543,7 +578,10 @@ pub(crate) fn settle_unlaunched_claims(app_data_dir: &Path, execution_id: &str) 
                 .filter(|plan| plan.execution_id.as_deref() == Some(execution_id))
             {
                 for entry in plan.entries.iter_mut() {
-                    let launched = counts.get(&entry.account_id).copied().unwrap_or(0);
+                    let launched = counts
+                        .get(&(entry.account_id.clone(), entry.model.clone()))
+                        .copied()
+                        .unwrap_or(0);
                     if entry.count <= launched {
                         continue;
                     }
@@ -1097,6 +1135,20 @@ struct PacingPlan {
     pub blocked: bool,
     /// 회당 소비 상한을 넘어 억제됐는지(enforce). 존재 기록은 남긴다.
     pub over_ceiling: Option<String>,
+    /// 계정마다 사다리 모델을 해 볼 순서. [`compute_plan`]이 자리를 못 받은 계정에 다음 모델을
+    /// 써 보는 근거다.
+    pub model_rankings: BTreeMap<String, Vec<String>>,
+    /// 계정마다 사다리가 닿는 모델군 창(Antigravity). 기록에 실려 자동 주기의 수요가 된다.
+    pub demand_labels: BTreeMap<String, Vec<String>>,
+    /// 이번 회차의 동시 기동 상한(병렬 설정·진행 중 실행·남은 일감을 다 적용한 값).
+    pub launch_limit: usize,
+    /// `planned` 앞쪽에서 이 계획 자신의 예약 항목으로 기록할 건수. 뒤쪽은 같은 계정에 덧붙인
+    /// 다른 모델군의 기동이고 그 예약은 `extra_entries`에 따로 있다.
+    pub recorded_runs: usize,
+    /// 같은 계정에 덧붙인 다른 모델군의 예약 항목(그 모델군 창 기준).
+    pub extra_entries: Vec<PlanRecordEntry>,
+    /// 덧붙인 모델군 계획마다의 공급자별 계획 창. 절감 기준선을 그 창에서 붙박는다.
+    pub extra_provider_labels: Vec<BTreeMap<ProviderId, String>>,
 }
 
 /// 이 워크플로를 돌리는 활성 반복 요청의 주기를 분으로 환산한다. 여러 개가 걸려
@@ -1218,6 +1270,14 @@ fn measure_window_cost_per_run(
                 .filter(|entry| {
                     entry_window_label(entry, &plan.window_label)
                         == plan_label_of(&entry.account_id)
+                })
+                // 모델 한정 창(Claude `Fable 7일`)은 그 모델로 띄운 항목만 채운다. 그 항목은
+                // 이 창에 가드 예약을 남겼으므로 예약이 없는 항목(다른 모델)은 분모에서 뺀다.
+                .filter(|entry| {
+                    series_label.is_none_or(|label| {
+                        crate::accounts::model_limit_scope(label).is_none()
+                            || entry.guards.contains_key(label)
+                    })
                 })
                 .map(|entry| (entry.account_id.clone(), entry.count))
                 .collect(),
@@ -1413,11 +1473,8 @@ fn resolved_window_label(
 /// 한 계정의 최신 표본이 말하는 남은 여유(%p)와 리셋까지 열린 시간(분). 표본이 없거나
 /// 둘 중 하나라도 0 이하면 이 계정은 속도에 보탤 것이 없으므로 `None`이다.
 ///
-/// 여기서는 계정 대표 창을 본다. 자동 주기 계산은 워크플로 단위라 이번 회차가 어느 모델을
-/// 쓰는지 모르고(계획 단계에서야 정해진다), 모델을 모르는 채 모델군 창을 고르면 남의 모델군
-/// 여유를 이 회차의 속도로 세게 된다. 그래서 한 모델군이 다 찬 Antigravity 계정은 다른
-/// 모델군이 비어 있어도 속도에 0을 보태고, 주기는 기준값 쪽으로 남는다 — 목표를 넘기는
-/// 방향이 아니라 천천히 도는 방향의 오차라 계획 단계의 건수 판정이 흡수한다.
+/// 창 하나만 본다. 모델군마다 쿼터가 따로인 계정은 [`account_demand_labels`]가 모델군 창마다
+/// 이 함수를 불러 더한다.
 fn account_headroom_window(
     store: &PacingStore,
     policy: &UsageBudgetPolicy,
@@ -1439,6 +1496,81 @@ fn account_headroom_window(
     (headroom > 0.0 && remaining_minutes > 0.0).then_some((headroom, remaining_minutes))
 }
 
+/// 계정 하나의 수요를 잴 창들. 모델군마다 쿼터가 따로인 계정(Antigravity)은 소비자의 모델
+/// 사다리가 닿는 모델군 창들이고(계획 기록의 `demand_labels`), 그런 기록이 없으면 회차 창
+/// 하나다.
+///
+/// 계정 대표 창은 모델군 중 가장 빡빡한 쪽을 복사한 것이라, 한 모델군(예: Argon)이 다 차면
+/// 회차가 쓰는 모델군이 비어 있어도 그 계정이 속도에 0을 보탰다. 반대로 계정의 모델군을 모두
+/// 더하면 Gemini만 쓰는 회차가 쓰지도 못할 Claude/GPT 여유를 쫓아 주기를 좁힌다. 그래서
+/// 소비자가 실제로 닿는 모델군만 센다. `workflow_id`가 있으면 그 워크플로의 마지막 계획을,
+/// 없으면(풀 전체) 워크플로마다 마지막 계획을 합쳐 본다. 지나간 모델군 창은 리셋 시각이 지나
+/// [`account_headroom_window`]에서 빠진다.
+fn account_demand_labels(
+    store: &PacingStore,
+    account_id: &str,
+    window_label: &str,
+    workflow_id: Option<&str>,
+) -> Vec<String> {
+    let mut latest: BTreeMap<Option<&str>, &PlanRecord> = BTreeMap::new();
+    // 창 길이가 다른 회차(`5시간` 계획)의 모델군 창은 이 창의 수요가 아니다 — 섞으면 짧은
+    // 창의 분당 속도가 수십 배라 주기가 쓸데없이 좁아진다.
+    for plan in store
+        .plans
+        .iter()
+        .filter(|plan| plan.window_label == window_label)
+    {
+        let key = plan.workflow_id.as_deref();
+        if workflow_id.is_none_or(|workflow_id| key == Some(workflow_id)) {
+            latest.insert(key, plan);
+        }
+    }
+    let mut labels: Vec<String> = Vec::new();
+    for plan in latest.values() {
+        for label in plan.demand_labels.get(account_id).into_iter().flatten() {
+            if !labels.contains(label) {
+                labels.push(label.clone());
+            }
+        }
+    }
+    if labels.is_empty() {
+        labels.push(window_label.to_owned());
+    }
+    labels
+}
+
+/// 계정 하나의 수요를 재는 창(`DemandScope`)과 그 창들의 (여유 %p, 남은 분).
+struct DemandScope<'a> {
+    window_label: &'a str,
+    workflow_id: Option<&'a str>,
+    target: f64,
+    now: i64,
+    quiet: Option<&'a QuietSchedule>,
+}
+
+/// 계정 하나가 리셋까지 내야 할 사용률 속도의 창별 목록 (여유 %p, 남은 분).
+fn account_demand_windows(
+    store: &PacingStore,
+    policy: &UsageBudgetPolicy,
+    account_id: &str,
+    scope: &DemandScope<'_>,
+) -> Vec<(f64, f64)> {
+    account_demand_labels(store, account_id, scope.window_label, scope.workflow_id)
+        .iter()
+        .filter_map(|label| {
+            account_headroom_window(
+                store,
+                policy,
+                account_id,
+                label,
+                scope.target,
+                scope.now,
+                scope.quiet,
+            )
+        })
+        .collect()
+}
+
 /// 계정 집합 전체가 리셋까지 내야 할 사용률 속도. 회당 비용과 무관한 값이라 처리량 판정은
 /// 특정 워크플로의 수요를 대표로 쓰지 않고 이 합계를 직접 계산한다.
 fn percent_demand_for_accounts(
@@ -1451,20 +1583,17 @@ fn percent_demand_for_accounts(
     let policy = policy?;
     let target = policy.defaults.target_percent?;
     let window_label = resolved_window_label(store, policy, None);
+    let scope = DemandScope {
+        window_label: &window_label,
+        workflow_id: None,
+        target,
+        now,
+        quiet,
+    };
     let percent_per_minute: f64 = account_ids
         .iter()
-        .filter_map(|account_id| {
-            let (headroom, remaining_minutes) = account_headroom_window(
-                store,
-                policy,
-                account_id,
-                &window_label,
-                target,
-                now,
-                quiet,
-            )?;
-            Some(headroom / remaining_minutes)
-        })
+        .flat_map(|account_id| account_demand_windows(store, policy, account_id, &scope))
+        .map(|(headroom, remaining_minutes)| headroom / remaining_minutes)
         .sum();
     (percent_per_minute > 0.0).then_some(percent_per_minute)
 }
@@ -1553,20 +1682,26 @@ fn pool_demand(
     // 속도로 환산해야 창이 짧은 계정이 제 몫을 받는다.
     let mut runs_per_minute = 0.0;
     let mut percent_per_minute = 0.0;
+    let scope = DemandScope {
+        window_label: &window_label,
+        workflow_id: Some(workflow_id),
+        target,
+        now,
+        quiet,
+    };
     for account_id in &account_ids {
-        let Some((account_headroom, remaining_minutes)) =
-            account_headroom_window(store, policy, account_id, &window_label, target, now, quiet)
-        else {
-            continue;
-        };
         // 이 계정의 공급자 실측이 있으면 그것으로, 아직 돈 적이 없으면 전역 평균으로 센다.
         let account_cost = provider_of
             .get(account_id.as_str())
             .and_then(|provider| provider_costs.get(provider))
             .copied()
             .unwrap_or(cost);
-        runs_per_minute += account_headroom / account_cost / remaining_minutes;
-        percent_per_minute += account_headroom / remaining_minutes;
+        for (account_headroom, remaining_minutes) in
+            account_demand_windows(store, policy, account_id, &scope)
+        {
+            runs_per_minute += account_headroom / account_cost / remaining_minutes;
+            percent_per_minute += account_headroom / remaining_minutes;
+        }
     }
     if runs_per_minute <= 0.0 {
         return None;
@@ -2193,6 +2328,16 @@ fn scoped_guard_label(
         .then_some(scoped)
 }
 
+/// 이 계정에서 이번 실행의 모델에만 걸린 한도 창(Claude `Fable 7일`). 계정 창과 함께(AND)
+/// 걸리므로 가드로 지킨다. 실행 게이트([`crate::accounts::account_view_readiness`])도 같은
+/// 창을 보므로 계획이 배정한 자리를 게이트가 거부하지 않는다.
+fn model_limit_guards<'a>(
+    account: &'a ProviderAccountView,
+    model: Option<&str>,
+) -> Vec<&'a crate::accounts::AccountUsageWindow> {
+    crate::accounts::model_limit_windows(account.provider, model, &account.usage.windows)
+}
+
 /// 이번 회차에서 이 계정을 제외해야 하는 이유. 제외하지 않으면 None.
 ///
 /// 앞부분은 실행 게이트 판정([`crate::accounts::account_view_readiness`])을 그대로 쓴다. 회차의
@@ -2246,12 +2391,247 @@ fn run_gate_skip_reason(
 /// 이 공급자 계정으로 띄울 실행의 모델. 계획 행(`PlannedRun.model`)과 계획의 게이트 판정이 같은
 /// 값을 써야 게이트가 보는 모델군 창이 갈리지 않는다. 로컬은 계정이 없어 배분표에 오르지 않는다.
 fn run_model(request: &UsagePacedRunsRequest, provider: ProviderId) -> Option<&str> {
-    match provider {
+    model_ladder_of(request, provider).first().copied()
+}
+
+/// 계약의 모델 입력 하나를 우선순위 목록(모델 사다리)으로 읽는다. 쉼표로 이어 적으면
+/// (`claude-fable-5-1,claude-opus-5-5`) 앞의 모델부터 그 모델의 한도가 남은 동안 쓰고, 한 개만
+/// 적으면 종전과 같다. 빈 칸은 "선언하지 않음"이다.
+///
+/// 모델 한정 한도(Claude `Fable 7일`)나 모델군 쿼터(Antigravity 세 모델군)는 그 모델을 쓰는
+/// 실행만 채울 수 있다. 회차가 공급자마다 모델 하나로 고정되면 그 한도는 매주 통째로 버려진다.
+pub(crate) fn model_ladder(value: Option<&str>) -> Vec<&str> {
+    let mut ladder: Vec<&str> = Vec::new();
+    for model in value.unwrap_or_default().split(',').map(str::trim) {
+        if !model.is_empty() && !ladder.contains(&model) {
+            ladder.push(model);
+        }
+    }
+    ladder
+}
+
+/// 사다리의 첫 모델. 계획을 거치지 않고 한 건을 띄우는 자리(수동 회차의 대체 실행)가 쓴다 —
+/// 목록 문자열을 그대로 모델로 넘기면 CLI가 모르는 모델로 거절한다.
+pub(crate) fn first_ladder_model(value: &str) -> Option<&str> {
+    model_ladder(Some(value)).first().copied()
+}
+
+fn model_ladder_of(request: &UsagePacedRunsRequest, provider: ProviderId) -> Vec<&str> {
+    model_ladder(match provider {
         ProviderId::Claude => request.claude_model.as_deref(),
         ProviderId::Codex => request.codex_model.as_deref(),
         ProviderId::Antigravity => request.antigravity_model.as_deref(),
         ProviderId::Local => None,
+    })
+}
+
+/// 계정마다 이번 회차에 쓸 모델(계정 id → 모델). 사다리가 비어 있는 공급자의 계정은 없다.
+type AccountModels = BTreeMap<String, String>;
+
+/// 이 계정이 채울 모델. 표에 없으면 사다리의 첫 모델이다.
+fn account_model<'a>(
+    models: &'a AccountModels,
+    request: &'a UsagePacedRunsRequest,
+    account: &ProviderAccountView,
+) -> Option<&'a str> {
+    models
+        .get(&account.id)
+        .map(String::as_str)
+        .or_else(|| run_model(request, account.provider))
+}
+
+/// 계정마다 사다리에서 이번 회차의 모델을 고른다.
+///
+/// 계정 전체 창 위에 모델 한정 창이 얹힌 공급자(Claude `Fable 7일`)는 **모델 한정 창이 있는
+/// 모델을 먼저**, 그 창이 가드 아래인 동안 쓴다. 모델 한정 창은 계정 창의 부분집합이라(Fable
+/// 실행은 `7일`도 채운다) 남겨 둘 까닭이 없고, 다 차면 사다리의 다른 모델이 계정 창의 나머지를
+/// 채운다. 그 밖에는 사다리 순서다.
+///
+/// 모델군마다 쿼터가 따로인 공급자(Antigravity)는 열린 모델군 중 **리셋까지 남은 시간 대비
+/// 여유가 가장 큰** 모델군을 고른다. 모델군들이 서로 독립이라 앞에서부터 채우면 뒤 모델군이
+/// 리셋 전에 다 쓰이지 못한다. 같으면 사다리 순서다.
+///
+/// 열린 모델이 없으면 첫 모델이다 — 계획이 그 모델로 제외 사유를 보여 준다.
+///
+/// 여기서 고르는 것은 **먼저 해 볼** 모델이다. 고른 모델이 이번 회차에 자리를 못 받으면
+/// (가드 여유가 회당 소비보다 작음·진행 중 실행 때문에 첫 측정을 못 함 등) [`compute_plan`]이
+/// 순위의 다음 모델로 다시 계획해 본다 — 열려 보이는 것과 실제로 건수가 나오는 것은 다르다.
+/// `overrides`는 그렇게 바꿔 본 모델이다.
+fn choose_account_models(
+    request: &UsagePacedRunsRequest,
+    candidates: &[&ProviderAccountView],
+    policy: Option<&UsageBudgetPolicy>,
+    requested_target: f64,
+    now: i64,
+    overrides: &AccountModels,
+    reasoning: &mut Vec<String>,
+) -> Result<ModelChoices, CoreError> {
+    let mut choices = ModelChoices::default();
+    let mut chosen_lines: Vec<String> = Vec::new();
+    for account in candidates {
+        let ladder = model_ladder_of(request, account.provider);
+        if ladder.is_empty() {
+            continue;
+        }
+        let limits = account_limits(
+            account,
+            policy,
+            requested_target,
+            request.guard_percent,
+            false,
+        );
+        let ranked = rank_account_models(account, &ladder, &request.window_label, &limits, now)?;
+        let chosen = overrides
+            .get(&account.id)
+            .filter(|model| ranked.contains(&model.as_str()))
+            .map_or(ranked[0], String::as_str)
+            .to_owned();
+        if ladder.len() > 1 {
+            chosen_lines.push(format!(
+                "{} {chosen}",
+                account.email.as_deref().unwrap_or(&account.id)
+            ));
+        }
+        choices.rankings.insert(
+            account.id.clone(),
+            ranked.iter().map(|model| (*model).to_owned()).collect(),
+        );
+        choices.chosen.insert(account.id.clone(), chosen);
     }
+    if !chosen_lines.is_empty() {
+        reasoning.push(format!(
+            "모델 사다리에서 계정마다 고른 모델: {}",
+            chosen_lines.join(", ")
+        ));
+    }
+    Ok(choices)
+}
+
+/// 계정마다 고른 모델과, 자리를 못 받았을 때 다시 해 볼 순위.
+#[derive(Default)]
+struct ModelChoices {
+    chosen: AccountModels,
+    /// 계정 → 사다리 모델을 해 볼 순서(첫 항목이 기본 선택). 사다리가 한 칸이면 그 하나.
+    rankings: BTreeMap<String, Vec<String>>,
+}
+
+/// 계정 하나에서 사다리 모델을 해 볼 순서. 사다리의 모든 모델이 한 번씩 든다 — 열려
+/// 보이는 모델이 앞이고, 닫혀 보이는 모델은 사다리 순서로 뒤에 선다.
+fn rank_account_models<'a>(
+    account: &ProviderAccountView,
+    ladder: &[&'a str],
+    round_label: &str,
+    limits: &AccountLimits,
+    now: i64,
+) -> Result<Vec<&'a str>, CoreError> {
+    let mut ranked: Vec<&str> = Vec::with_capacity(ladder.len());
+    if crate::antigravity_usage::is_pacing_resource_id(&account.id) {
+        // 모델군을 계정처럼 낸 옛 자원 행은 모델군 하나뿐이다. 그 모델군의 모델만 맞다.
+        ranked.extend(ladder.iter().copied().filter(|model| {
+            crate::antigravity_usage::pacing_resource_id_for_model(model)
+                .is_ok_and(|resource| resource == account.id)
+        }));
+    } else if ladder.len() > 1 && account.provider == ProviderId::Antigravity {
+        let mut open: Vec<(f64, usize, &str)> = Vec::new();
+        for (index, model) in ladder.iter().copied().enumerate() {
+            if let Some(urgency) = model_group_urgency(account, model, round_label, limits, now)? {
+                open.push((urgency, index, model));
+            }
+        }
+        // 긴급도가 큰 쪽부터, 같으면 사다리 순서.
+        open.sort_by(|left, right| {
+            right
+                .0
+                .partial_cmp(&left.0)
+                .unwrap_or(Ordering::Equal)
+                .then(left.1.cmp(&right.1))
+        });
+        ranked.extend(open.into_iter().map(|(_, _, model)| model));
+    } else if ladder.len() > 1 {
+        // 모델 전용 한도가 걸린 모델을 먼저 본다. 화면은 고른 순서가 아니라 선택지 순서로
+        // 저장하므로 순서에 기대면 Opus가 앞에 와 Fable 한도가 놀 수 있다.
+        let dedicated = |model: &str| {
+            !crate::accounts::model_limit_windows(
+                account.provider,
+                Some(model),
+                &account.usage.windows,
+            )
+            .is_empty()
+        };
+        let open: Vec<&str> = ladder
+            .iter()
+            .copied()
+            .filter(|model| model_limit_open(account, model, limits, now))
+            .collect();
+        ranked.extend(open.iter().copied().filter(|model| dedicated(model)));
+        ranked.extend(open.iter().copied().filter(|model| !dedicated(model)));
+    }
+    // 옛 자원 행은 모델군 하나뿐이라 다른 모델군의 모델을 순위에 넣지 않는다 — 넣으면 다시
+    // 계획하는 길에 그 행의 창으로 남의 모델군 쿼터를 쓰는 실행을 세울 수 있다.
+    if !crate::antigravity_usage::is_pacing_resource_id(&account.id) || ranked.is_empty() {
+        for model in ladder {
+            if !ranked.contains(model) {
+                ranked.push(model);
+            }
+        }
+    }
+    Ok(ranked)
+}
+
+/// 이 모델의 실행이 지금 이 계정에서 돌 수 있고, 그 모델에만 걸린 창이 가드 아래인지.
+/// 가드가 없으면 창이 다 찼는지만 본다.
+fn model_limit_open(
+    account: &ProviderAccountView,
+    model: &str,
+    limits: &AccountLimits,
+    now: i64,
+) -> bool {
+    if run_gate_skip_reason(account, Some(model), now).is_some() {
+        return false;
+    }
+    let limit = limits.guard_percent.unwrap_or(DRAIN_TARGET_PERCENT);
+    crate::accounts::model_limit_windows(account.provider, Some(model), &account.usage.windows)
+        .iter()
+        .all(|window| window.used_percent < limit)
+}
+
+/// Antigravity 모델군 하나의 긴급도 — 목표까지 남은 여유(%p)를 리셋까지 남은 시간(시)으로
+/// 나눈 값. 그 모델군이 지금 못 돌거나(게이트·가드) 여유가 없으면 `None`이다. 리셋 시각을
+/// 모르는 창(아직 쓰지 않은 창)은 창 길이 전체가 남은 것으로 본다.
+fn model_group_urgency(
+    account: &ProviderAccountView,
+    model: &str,
+    round_label: &str,
+    limits: &AccountLimits,
+    now: i64,
+) -> Result<Option<f64>, CoreError> {
+    if run_gate_skip_reason(account, Some(model), now).is_some() {
+        return Ok(None);
+    }
+    let plan_label =
+        crate::antigravity_usage::model_window_label(&account.usage, model, round_label)?;
+    let Some(window) = window_of(&account.usage, &plan_label) else {
+        return Ok(None);
+    };
+    if let Some(guard) = limits.guard_percent {
+        let guarded = guard_windows(&account.usage, &plan_label, None)
+            .iter()
+            .any(|window| window.used_percent >= guard);
+        if guarded {
+            return Ok(None);
+        }
+    }
+    let headroom = limits.target_percent - window.used_percent;
+    if headroom <= 0.0 {
+        return Ok(None);
+    }
+    let remaining_ms = window
+        .resets_at
+        .map(|resets_at| resets_at - now)
+        .or_else(|| crate::usage_budget_policy::window_label_length_ms(&plan_label))
+        .unwrap_or(FALLBACK_CADENCE_MS)
+        .max(60_000);
+    Ok(Some(headroom / (remaining_ms as f64 / 3_600_000.0)))
 }
 
 /// 이번 호출의 소비자 id. 반복 요청 하나가 이 워크플로를 돌리면 그 반복 요청이
@@ -2296,7 +2676,11 @@ fn claim_settled_by_runs(
         .runs
         .iter()
         .filter(|run| {
-            run.execution_id.as_deref() == Some(execution_id) && run.account_id == account_id
+            run.execution_id.as_deref() == Some(execution_id)
+                && run.account_id == account_id
+                // 이 창을 채우는 실행만 본다. 같은 계정에 함께 띄운 다른 모델군의 실행이 아직
+                // 돌고 있다고 이미 끝난 이 모델군의 예약을 붙잡아 두지 않는다.
+                && run_consumes_window(store, run, window_label)
         })
         .collect();
     if runs.is_empty() {
@@ -2344,13 +2728,11 @@ fn claims_for_account(
         .filter_map(|plan| {
             let consumer_id = plan.consumer_id.clone()?;
             let cadence_ms = plan.cadence_ms?;
-            let entry = plan
-                .entries
-                .iter()
-                .find(|entry| entry.account_id == account_id)?;
-            if entry_window_label(entry, &plan.window_label) != plan_label {
-                return None;
-            }
+            // 한 계획에 같은 계정의 항목이 모델군마다 따로 있을 수 있다(같은 회차에 모델군 여럿).
+            let entry = plan.entries.iter().find(|entry| {
+                entry.account_id == account_id
+                    && entry_window_label(entry, &plan.window_label) == plan_label
+            })?;
             let (expected_cost_percent, used_percent_at_claim, resets_at_at_claim) =
                 if claim_label == plan_label {
                     (
@@ -2377,6 +2759,7 @@ fn claims_for_account(
                         && run.account_id == account_id
                         && run.ended_at.is_none()
                         && live_chat_ids.contains(run.chat_id.as_str())
+                        && run_consumes_window(store, run, claim_label)
                 })
             });
             Some(Claim {
@@ -2424,17 +2807,21 @@ fn consumer_observations(
     window_label: &str,
 ) -> Vec<RunObservation> {
     let mut observations = Vec::new();
-    for run in store
+    // 이 창을 채우는 실행을 한 번만 가린다. 겹침을 찾는 안쪽 순회에서 실행마다 다시 가리면
+    // 실행 수의 제곱만큼 판정이 돈다(실행 기록은 최대 256건).
+    let consuming: Vec<&RunRecord> = store
         .runs
         .iter()
+        .filter(|run| run_consumes_window(store, run, window_label))
+        .collect();
+    for run in consuming
+        .iter()
+        .copied()
         .filter(|run| run.consumer_id == consumer_id && run.provider == provider)
     {
         let Some(ended_at) = run.ended_at else {
             continue;
         };
-        if !run_consumes_window(run, window_label) {
-            continue;
-        }
         let Some(series) = store.series.get(&series_key(&run.account_id, window_label)) else {
             continue;
         };
@@ -2442,14 +2829,9 @@ fn consumer_observations(
             start: run.started_at,
             end: ended_at,
         };
-        let others: Vec<RunSpan> = store
-            .runs
+        let others: Vec<RunSpan> = consuming
             .iter()
-            .filter(|other| {
-                other.chat_id != run.chat_id
-                    && other.account_id == run.account_id
-                    && run_consumes_window(other, window_label)
-            })
+            .filter(|other| other.chat_id != run.chat_id && other.account_id == run.account_id)
             .map(|other| RunSpan {
                 start: other.started_at,
                 end: other.ended_at.unwrap_or(ended_at),
@@ -2767,13 +3149,13 @@ fn select_candidate_accounts<'a>(
     // 빈 문자열은 "선언하지 않음"이다. 화면이 만든 계약은 모델 칸을 비워도 `Some("")`을
     // 싣기 때문에, 이것을 걸러 내지 않으면 분류기가 빈 이름을 가르려다 실패하고 계획
     // 전체가 죽는다 — Antigravity 계정이 풀에 있는 모든 회차가 그렇게 멈춘다(2026-09-25).
-    let antigravity_resource_id = request
-        .antigravity_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
+    //
+    // 사다리의 모델마다 모델군 자원이 하나씩이다. 모르는 모델이 하나라도 있으면 종전처럼
+    // 계획 전체를 거절한다 — 엉뚱한 모델군의 쿼터를 쓰는 것보다 낫다.
+    let antigravity_resource_ids = model_ladder_of(request, ProviderId::Antigravity)
+        .into_iter()
         .map(crate::antigravity_usage::pacing_resource_id_for_model)
-        .transpose()?;
+        .collect::<Result<BTreeSet<_>, _>>()?;
     let candidates: Vec<&ProviderAccountView> = inputs
         .accounts
         .iter()
@@ -2793,10 +3175,9 @@ fn select_candidate_accounts<'a>(
         // 등록하는 순간 Antigravity를 통째로 후보에서 떨어뜨렸다.
         .filter(|account| {
             account.provider != ProviderId::Antigravity
-                || antigravity_resource_id.is_some_and(|resource_id| {
-                    !crate::antigravity_usage::is_pacing_resource_id(&account.id)
-                        || account.id == resource_id
-                })
+                || (!antigravity_resource_ids.is_empty()
+                    && (!crate::antigravity_usage::is_pacing_resource_id(&account.id)
+                        || antigravity_resource_ids.contains(account.id.as_str())))
         })
         // 이메일 접두사는 계정을 가리는 인자다. 이메일이 없는 것은 모델군 자원 행뿐이라 그
         // 행만 지나간다 — 등록 계정까지 공급자 이름으로 면제하면 접두사로 계정 하나를 집은
@@ -2914,32 +3295,66 @@ type AccountWindowLabels = BTreeMap<String, String>;
 fn account_window_labels(
     request: &UsagePacedRunsRequest,
     candidates: &[&ProviderAccountView],
+    account_models: &AccountModels,
     reasoning: &mut Vec<String>,
 ) -> Result<AccountWindowLabels, CoreError> {
-    let Some(model) = request.antigravity_model.as_deref() else {
-        return Ok(AccountWindowLabels::new());
-    };
     let mut labels = AccountWindowLabels::new();
+    let mut described: BTreeSet<(&str, String)> = BTreeSet::new();
     for account in candidates.iter().filter(|account| {
         account.provider == ProviderId::Antigravity
             && !crate::antigravity_usage::is_pacing_resource_id(&account.id)
     }) {
+        // 계정마다 사다리에서 고른 모델이 다를 수 있다(모델군 여유가 계정마다 다르다).
+        let Some(model) = account_model(account_models, request, account) else {
+            continue;
+        };
         let label = crate::antigravity_usage::model_window_label(
             &account.usage,
             model,
             &request.window_label,
         )?;
         if label != request.window_label {
+            described.insert((model, label.clone()));
             labels.insert(account.id.clone(), label);
         }
     }
-    let distinct: BTreeSet<&str> = labels.values().map(String::as_str).collect();
-    if !distinct.is_empty() {
+    if !described.is_empty() {
         reasoning.push(format!(
-            "Antigravity 계정은 모델 {model}이 쓰는 모델군 창({})으로 계획합니다",
-            distinct.into_iter().collect::<Vec<_>>().join(", ")
+            "Antigravity 계정은 모델이 쓰는 모델군 창으로 계획합니다: {}",
+            described
+                .into_iter()
+                .map(|(model, label)| format!("{model} → {label}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
+    Ok(labels)
+}
+
+/// 계정마다 이번 소비자의 모델 사다리가 닿는 모델군 창(Antigravity 등록 계정만). 자동 주기의
+/// 수요가 이 창들만 세도록 계획 기록에 싣는다([`account_demand_labels`]).
+fn ladder_demand_labels(
+    request: &UsagePacedRunsRequest,
+    candidates: &[&ProviderAccountView],
+) -> Result<BTreeMap<String, Vec<String>>, CoreError> {
+    let mut labels: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for account in candidates.iter().filter(|account| {
+        account.provider == ProviderId::Antigravity
+            && !crate::antigravity_usage::is_pacing_resource_id(&account.id)
+    }) {
+        for model in model_ladder_of(request, account.provider) {
+            let label = crate::antigravity_usage::model_window_label(
+                &account.usage,
+                model,
+                &request.window_label,
+            )?;
+            let entry = labels.entry(account.id.clone()).or_default();
+            if label != request.window_label && !entry.contains(&label) {
+                entry.push(label);
+            }
+        }
+    }
+    labels.retain(|_, labels| !labels.is_empty());
     Ok(labels)
 }
 
@@ -3102,6 +3517,8 @@ struct CostBasis<'a> {
     cadence_ms: i64,
     /// 회당 소비의 하한.
     min_cost_percent_per_run: f64,
+    /// 계정마다 사다리에서 고른 모델. 그 모델에만 걸린 창(Claude `Fable 7일`)도 잴 대상이다.
+    account_models: &'a AccountModels,
 }
 
 /// 후보 계정에 등장하는 공급자마다 이 소비자의 `label` 창 회당 소비를 잰다. 표본이 없는
@@ -3192,11 +3609,16 @@ fn measure_guard_costs(
     let guard_labels: BTreeSet<String> = candidates
         .iter()
         .flat_map(|account| {
-            guard_windows(
+            let mut windows = guard_windows(
                 &account.usage,
                 account_window_label(window_labels, &account.id, &request.window_label),
                 named_guard_label,
-            )
+            );
+            windows.extend(model_limit_guards(
+                account,
+                account_model(basis.account_models, request, account),
+            ));
+            windows
         })
         .map(|window| window.label.clone())
         .collect();
@@ -3392,9 +3814,19 @@ fn project_guard_windows(store: &PacingStore, input: &GuardProjectionInput<'_>) 
             continue;
         };
         let guard_headroom = guard_limit - guard.used_percent - guard_outstanding;
+        // 실측 없는 창의 첫 측정은 **이 창을 채우는** 실행이 돌고 있지 않을 때만 한다. 계정
+        // 단위로 보면 같은 계정의 Opus 실행이 Fable 창의 첫 측정을 계속 막아, 계정이 바쁘면
+        // Fable은 영영 첫 기동을 받지 못한다. 계정 전체 창은 모든 실행이 채우므로 종전과 같다.
+        let guard_running = input.account_running
+            && store.runs.iter().any(|run| {
+                run.account_id == input.account_id
+                    && run.ended_at.is_none()
+                    && input.live_chat_ids.contains(run.chat_id.as_str())
+                    && run_consumes_window(store, run, &guard.label)
+            });
         let affordable = match cost {
             Some(cost) if cost > 0.0 => (guard_headroom / cost).floor().max(0.0) as usize,
-            _ => usize::from(guard_headroom > 0.0 && !input.account_running),
+            _ => usize::from(guard_headroom > 0.0 && !guard_running),
         };
         if let Some(cost) = cost.filter(|cost| *cost > 0.0) {
             // 가드 창의 여력도 계획 창과 같은 단위(리셋까지 남은 회차당 감당 건수)로
@@ -3611,6 +4043,7 @@ fn fill_planned_runs(
     allowances: &mut [(String, ProviderId, usize, f64)],
     limit: usize,
     request: &UsagePacedRunsRequest,
+    account_models: &AccountModels,
     account_efforts: &BTreeMap<String, ReasoningEffort>,
     account_effort_basis: &BTreeMap<String, (&'static str, Option<f64>)>,
 ) -> Vec<PlannedRun> {
@@ -3638,7 +4071,10 @@ fn fill_planned_runs(
                 source: *provider,
                 // 로컬은 계정이 없어 이 배분표에 오르지 않는다. 별도로
                 // [`local_planned_runs`]가 상한 밖에서 덧붙인다.
-                model: run_model(request, *provider).map(str::to_owned),
+                model: account_models
+                    .get(account_id)
+                    .cloned()
+                    .or_else(|| run_model(request, *provider).map(str::to_owned)),
                 reasoning_effort: account_efforts.get(account_id).cloned(),
                 reasoning_effort_source: account_effort_basis
                     .get(account_id)
@@ -4068,7 +4504,7 @@ fn apply_guard_cap(
             Some(cost) => format!(
                 "{label} 창 여유 {headroom:.1}%p가 회당 소비 {cost:.1}%p보다 작아 이번 회차는 쉼(미정산 예약 {guard_outstanding:.1}%p 포함)"
             ),
-            None if account_running => format!(
+            None if account_running && headroom > 0.0 => format!(
                 "{label} 창의 회당 소비를 아직 실측하지 못했고 이 계정에 진행 중 실행이 있어 이번 회차는 쉼"
             ),
             None => format!(
@@ -4350,10 +4786,200 @@ fn push_allocation_reasoning(
     }
 }
 
+/// 사다리 모델을 바꿔 다시 계획해 보는 최대 횟수. 사다리는 공급자마다 모델 몇 개뿐이라
+/// 한 계정이 순위를 다 돌아도 이 안에서 끝난다.
+const MAX_LADDER_FALLBACKS: usize = 4;
+
+/// 회차 계획. 계정마다 사다리의 첫 순위 모델로 계획하고, 그 모델로 자리를 못 받은 계정은
+/// 순위의 다음 모델로 다시 계획해 본다. 다시 해 본 모델이 자리를 받으면 그 모델로 바꾼다.
+///
+/// 모델을 고를 때 "열려 보이는지"만 보면 실제로 건수를 자르는 판정(가드 여유 ÷ 회당 소비,
+/// 진행 중 실행이 막는 첫 측정, 균등 목표)과 어긋난다. Fable 창이 가드 바로 아래면 매 회차
+/// Fable을 골라 0건으로 쉬고, 같은 계정의 `7일` 여유는 Fable이 리셋될 때까지 논다. 계정마다
+/// 계산이 따로라(계정 사이 순서 의존 없음) 한 계정의 모델을 바꿔도 다른 계정의 배분은 그대로다.
 fn compute_plan(
     store: &PacingStore,
     request: &UsagePacedRunsRequest,
     inputs: &PacingInputs<'_>,
+) -> Result<PacingPlan, CoreError> {
+    let mut overrides = AccountModels::new();
+    let mut plan = compute_plan_with(store, request, inputs, &overrides)?;
+    if plan.blocked {
+        return Ok(plan);
+    }
+    let mut tried: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut fallbacks: Vec<String> = Vec::new();
+    for _ in 0..MAX_LADDER_FALLBACKS {
+        let mut trial = overrides.clone();
+        let mut trying: Vec<(String, String, String)> = Vec::new();
+        for view in &plan.accounts {
+            if view["allowedRuns"].as_u64().unwrap_or(0) > 0 {
+                continue;
+            }
+            let (Some(account_id), Some(current)) =
+                (view["accountId"].as_str(), view["model"].as_str())
+            else {
+                continue;
+            };
+            let Some(ranking) = plan.model_rankings.get(account_id) else {
+                continue;
+            };
+            let seen = tried.entry(account_id.to_owned()).or_default();
+            seen.insert(current.to_owned());
+            if let Some(next) = ranking.iter().find(|model| !seen.contains(*model)) {
+                seen.insert(next.clone());
+                trial.insert(account_id.to_owned(), next.clone());
+                trying.push((account_id.to_owned(), current.to_owned(), next.clone()));
+            }
+        }
+        if trying.is_empty() {
+            break;
+        }
+        let alternative = compute_plan_with(store, request, inputs, &trial)?;
+        let mut adopted = false;
+        for (account_id, from, to) in trying {
+            let got_runs = alternative.accounts.iter().any(|view| {
+                view["accountId"] == account_id.as_str()
+                    && view["allowedRuns"].as_u64().unwrap_or(0) > 0
+            });
+            if got_runs {
+                fallbacks.push(format!("{account_id} {from} → {to}"));
+                overrides.insert(account_id, to);
+                adopted = true;
+            }
+        }
+        if adopted {
+            plan = compute_plan_with(store, request, inputs, &overrides)?;
+        }
+    }
+    if !fallbacks.is_empty() {
+        plan.reasoning.push(format!(
+            "첫 순위 모델로는 이번 회차에 자리가 없어 사다리의 다음 모델로 돌립니다: {}",
+            fallbacks.join(", ")
+        ));
+    }
+    add_parallel_model_groups(store, request, inputs, &mut plan)?;
+    Ok(plan)
+}
+
+/// 모델군마다 쿼터가 따로인 계정(Antigravity)에 사다리의 **다른 모델군**도 같은 회차에 배정한다.
+///
+/// 본 계획은 계정마다 모델 하나(가장 급한 모델군)로 짠다. 모델군 쿼터는 서로 독립이라 같은
+/// 계정에서 함께 돌려도 서로를 깎지 않는데, 한 모델군만 쓰면 나머지는 회차를 번갈아 기다린다.
+/// 그래서 본 계획이 남긴 기동 자리 안에서, 아직 이 계정에 쓰지 않은 모델군마다 그 모델 하나로
+/// 다시 계획해(그 모델군 창의 균등 목표·가드·예약으로) 받은 건수를 덧붙인다. 순서는 계정의
+/// 사다리 순위(긴급도)다. 계정당 동시 실행 상한은 따로 두지 않는다 — 회차 병렬 설정과 모델군
+/// 여력이 건수를 정한다.
+///
+/// 덧붙인 기동의 예약은 그 모델군 창의 항목으로 따로 남겨([`PacingPlan::extra_entries`]) 다음
+/// 회차의 정산·회당 소비 실측이 모델군마다 갈린다.
+fn add_parallel_model_groups(
+    store: &PacingStore,
+    request: &UsagePacedRunsRequest,
+    inputs: &PacingInputs<'_>,
+    plan: &mut PacingPlan,
+) -> Result<(), CoreError> {
+    if plan.blocked || model_ladder_of(request, ProviderId::Antigravity).len() < 2 {
+        return Ok(());
+    }
+    // 이 계정에 이미 쓴 모델군 창. 본 계획이 고른 창은 0건이어도 다시 계획하지 않는다 — 같은
+    // 창으로 다시 짜면 같은 답이 나온다.
+    let mut used: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for view in &plan.accounts {
+        let (Some(account_id), Some(label)) =
+            (view["accountId"].as_str(), view["windowLabel"].as_str())
+        else {
+            continue;
+        };
+        if view["provider"] != "antigravity" {
+            continue;
+        }
+        used.entry(account_id.to_owned())
+            .or_default()
+            .insert(label.to_owned());
+        for model in plan.model_rankings.get(account_id).into_iter().flatten() {
+            if !order.contains(model) {
+                order.push(model.clone());
+            }
+        }
+    }
+    let local_runs = plan
+        .planned
+        .iter()
+        .filter(|run| run.source == ProviderId::Local)
+        .count();
+    let mut remaining = plan
+        .launch_limit
+        .saturating_sub(plan.planned.len() - local_runs);
+    let mut added: Vec<String> = Vec::new();
+    for model in order {
+        if remaining == 0 {
+            break;
+        }
+        // 이 모델의 모델군을 아직 쓰지 않은 등록 계정만.
+        let mut accounts: Vec<ProviderAccountView> = Vec::new();
+        let mut labels: BTreeMap<String, String> = BTreeMap::new();
+        for account in inputs.accounts.iter().filter(|account| {
+            account.provider == ProviderId::Antigravity
+                && !crate::antigravity_usage::is_pacing_resource_id(&account.id)
+                && used.contains_key(&account.id)
+        }) {
+            let label = crate::antigravity_usage::model_window_label(
+                &account.usage,
+                &model,
+                &request.window_label,
+            )?;
+            if used[&account.id].contains(&label) {
+                continue;
+            }
+            labels.insert(account.id.clone(), label);
+            accounts.push(account.clone());
+        }
+        if accounts.is_empty() {
+            continue;
+        }
+        let mut group_request = request.clone();
+        group_request.providers = Some(vec![ProviderId::Antigravity]);
+        group_request.antigravity_model = Some(model.clone());
+        group_request.local_models = Vec::new();
+        group_request.remaining_work = Some(remaining);
+        let group_inputs = PacingInputs {
+            accounts: &accounts,
+            ..*inputs
+        };
+        let group = compute_plan_with(store, &group_request, &group_inputs, &AccountModels::new())?;
+        for (account_id, label) in labels {
+            used.entry(account_id).or_default().insert(label);
+        }
+        if group.blocked || group.planned.is_empty() {
+            continue;
+        }
+        let runs = group.planned.len().min(remaining);
+        remaining -= runs;
+        plan.extra_entries
+            .extend(record_entries(&group, &group.planned[..runs]));
+        plan.extra_provider_labels
+            .push(group.provider_window_labels.clone());
+        added.push(format!("{model} {runs}건"));
+        plan.planned.extend(group.planned.into_iter().take(runs));
+        plan.accounts.extend(group.accounts);
+    }
+    if !added.is_empty() {
+        plan.reasoning.push(format!(
+            "같은 Antigravity 계정에 다른 모델군도 함께 배정했습니다: {}",
+            added.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// [`compute_plan`]의 한 번 계산. `overrides`는 사다리의 첫 순위 대신 써 볼 계정별 모델이다.
+fn compute_plan_with(
+    store: &PacingStore,
+    request: &UsagePacedRunsRequest,
+    inputs: &PacingInputs<'_>,
+    overrides: &AccountModels,
 ) -> Result<PacingPlan, CoreError> {
     let PlanLimits {
         requested_target,
@@ -4379,8 +5005,23 @@ fn compute_plan(
         .map(|account| account.id.clone())
         .collect();
     let cadence_ms = cadence.minutes as i64 * 60_000;
+    // 계정마다 이번 회차의 모델. 사다리가 한 칸이면 종전과 같다.
+    let ModelChoices {
+        chosen: account_models,
+        rankings: model_rankings,
+    } = choose_account_models(
+        request,
+        &candidates,
+        policy,
+        requested_target,
+        inputs.now,
+        overrides,
+        &mut reasoning,
+    )?;
     // 계정마다 채울 창. Antigravity만 회차 창과 다르고, 나머지는 빈 표라 종전과 같다.
-    let window_labels = account_window_labels(request, &candidates, &mut reasoning)?;
+    let window_labels =
+        account_window_labels(request, &candidates, &account_models, &mut reasoning)?;
+    let demand_labels = ladder_demand_labels(request, &candidates)?;
     let provider_labels = provider_window_labels(&candidates, &window_labels);
     let ConsumerGate {
         consumer_id,
@@ -4403,6 +5044,7 @@ fn compute_plan(
         cost_windows,
         cadence_ms,
         min_cost_percent_per_run,
+        account_models: &account_models,
     };
     let GlobalCost {
         cost_percent_per_run,
@@ -4485,6 +5127,8 @@ fn compute_plan(
         store,
         request,
         window_labels: &window_labels,
+        account_models: &account_models,
+        provider_labels: &provider_labels,
         inputs,
         policy,
         cadence: &cadence,
@@ -4516,6 +5160,7 @@ fn compute_plan(
         &mut totals.allowances,
         limit,
         request,
+        &account_models,
         &totals.efforts,
         &totals.effort_basis,
     );
@@ -4544,6 +5189,7 @@ fn compute_plan(
         ));
     }
 
+    let recorded_runs = planned.len();
     Ok(PacingPlan {
         cadence_minutes: cadence.minutes,
         cadence_source: cadence.source,
@@ -4571,6 +5217,12 @@ fn compute_plan(
         account_window_labels: window_labels,
         blocked,
         over_ceiling,
+        model_rankings,
+        demand_labels,
+        launch_limit: limit,
+        recorded_runs,
+        extra_entries: Vec::new(),
+        extra_provider_labels: Vec::new(),
     })
 }
 
@@ -4581,6 +5233,10 @@ struct AccountPlanInput<'a> {
     request: &'a UsagePacedRunsRequest,
     /// 회차 창과 다른 창을 채우는 계정의 라벨표(Antigravity 모델군 창).
     window_labels: &'a AccountWindowLabels,
+    /// 계정마다 사다리에서 고른 모델.
+    account_models: &'a AccountModels,
+    /// 공급자별 대표 계획 창. 공급자별 회당 소비가 이 창으로 잰 값이다.
+    provider_labels: &'a BTreeMap<ProviderId, String>,
     inputs: &'a PacingInputs<'a>,
     policy: Option<&'a UsageBudgetPolicy>,
     cadence: &'a CadenceDecision,
@@ -4860,13 +5516,53 @@ struct AccountClaimState {
 /// 단위로 본다.
 ///
 /// 모델을 남기지 않은 옛 기록은 종전처럼 계정의 모든 창을 점유한 것으로 본다.
-fn run_consumes_window(run: &RunRecord, plan_label: &str) -> bool {
+///
+/// 다른 공급자도 모델 한정 창(Claude `Fable 7일`)은 그 모델 실행만 채운다. Opus 실행을 Fable
+/// 창의 관측·겹침으로 세면 Fable 회당 소비가 깎이고 Fable 가드가 실제보다 많이 띄운다.
+fn run_consumes_window(store: &PacingStore, run: &RunRecord, plan_label: &str) -> bool {
     if run.provider != ProviderId::Antigravity {
+        let Some(scope) = crate::accounts::model_limit_scope(plan_label) else {
+            return true;
+        };
+        return run
+            .model
+            .as_deref()
+            .is_none_or(|model| crate::accounts::model_uses_limit_scope(model, scope));
+    }
+    let Some(model) = run.model.as_deref() else {
+        return true;
+    };
+    if !crate::antigravity_usage::model_consumes_window(model, plan_label) {
+        return false;
+    }
+    // 계열 전체 모델군 창(`Gemini Models`)이라도 그 계정이 이 모델 줄만의 모델군
+    // (`Gemini 4 Argon`)을 보고하면 이 실행은 그쪽 쿼터를 쓴다. 같은 계정에서 Argon과 Gemini가
+    // 함께 도는 회차에서 Argon 실행을 Gemini 창의 겹침·점유로 세면 Gemini 회당 소비가 깎이고
+    // 첫 측정이 막힌다.
+    let group = crate::antigravity_usage::group_of_label(plan_label);
+    // 모델군 창이 아니거나 모델 줄 모델군 자체의 창이면 위 판정으로 끝이다 — 줄 이름이 겹치는
+    // 모델군(`Gemini 4 Argon`·`Gemini 4 Argon Pro`)을 여기서 다시 가르면 긴 줄의 실행이 자기
+    // 창을 안 쓰는 것으로 읽힌다.
+    if group == plan_label || crate::antigravity_usage::is_model_line_group(group) {
         return true;
     }
-    run.model
-        .as_deref()
-        .is_none_or(|model| crate::antigravity_usage::model_consumes_window(model, plan_label))
+    // 그 계정이 **지금** 보고하는 모델군만 본다. 표본 시계열은 지워지지 않아, 공급자가 모델
+    // 줄을 계열로 다시 합친 뒤에도 옛 줄 이름이 남아 그 모델 실행을 계열 창에서 빼게 된다.
+    // 한 번의 사용량 조회는 모든 창을 같은 시각으로 남기므로 가장 최근 시각의 창이 지금 창이다.
+    let prefix = series_key(&run.account_id, "");
+    let current: Vec<(&str, i64)> = store
+        .series
+        .range(prefix.clone()..)
+        .take_while(|(key, _)| key.starts_with(&prefix))
+        .filter_map(|(key, series)| Some((&key[prefix.len()..], series.last()?.at)))
+        .collect();
+    let latest = current.iter().map(|(_, at)| *at).max().unwrap_or(i64::MIN);
+    let groups = current
+        .iter()
+        .filter(|(_, at)| *at == latest)
+        .map(|(label, _)| crate::antigravity_usage::group_of_label(label))
+        .filter(|candidate| *candidate != group);
+    !crate::antigravity_usage::model_has_own_line(model, groups)
 }
 
 /// 아직 표본에 보이지 않는 모든 소비자의 미정산 예약을 모은다. 여유와 현재 시점의 몫에서
@@ -4904,7 +5600,7 @@ fn account_claim_state(
         run.account_id == account_id
             && run.ended_at.is_none()
             && live_chat_ids.contains(run.chat_id.as_str())
-            && run_consumes_window(run, plan_label)
+            && run_consumes_window(store, run, plan_label)
     });
     AccountClaimState {
         open,
@@ -5049,6 +5745,8 @@ fn plan_account(account: &ProviderAccountView, input: &AccountPlanInput<'_>) -> 
         store,
         request,
         window_labels,
+        account_models,
+        provider_labels,
         inputs,
         policy,
         cadence,
@@ -5110,16 +5808,25 @@ fn plan_account(account: &ProviderAccountView, input: &AccountPlanInput<'_>) -> 
         guard_label
             .or_else(|| policy.and_then(|policy| policy.defaults.guard_window_label.as_deref())),
     );
-    let guards = guard_windows(&account.usage, window_label, account_guard_label.as_deref());
-    let reason = skip_reason(
-        account,
-        run_model(request, account.provider),
-        inputs.now,
-        &guards,
-        guard_percent,
-    );
+    let model = account_model(account_models, request, account);
+    let mut guards = guard_windows(&account.usage, window_label, account_guard_label.as_deref());
+    // 이 모델에만 걸린 한도(Claude `Fable 7일`)도 함께 지킨다. 계정 창으로 계획해도 이 창이
+    // 먼저 차면 실행은 공급자 한도에 걸린다.
+    for window in model_limit_guards(account, model) {
+        if !guards.iter().any(|guard| guard.label == window.label) {
+            guards.push(window);
+        }
+    }
+    let reason = skip_reason(account, model, inputs.now, &guards, guard_percent);
+    // 공급자별 실측은 그 공급자의 대표 계획 창 하나로 잰 값이다. 사다리로 계정마다 다른
+    // 모델군을 채우면(Antigravity) 다른 모델군 계정에 그 값을 쓰면 쿼터 크기가 달라 과·과소
+    // 배정된다 — 그 계정은 전역 회당 소비로 센다.
+    let provider_cost_applies = provider_labels
+        .get(&account.provider)
+        .is_none_or(|label| label == window_label);
     let account_cost = consumer_costs
         .get(&account.provider)
+        .filter(|_| provider_cost_applies)
         .map(|(cost, _)| *cost)
         .unwrap_or(cost_percent_per_run);
     let AccountClaimState {
@@ -5175,7 +5882,8 @@ fn plan_account(account: &ProviderAccountView, input: &AccountPlanInput<'_>) -> 
         outstanding,
     );
     let claim_baseline = window.map(|window| (window.used_percent, window.resets_at));
-    let cost_measured = cost_measured_globally || consumer_costs.contains_key(&account.provider);
+    let cost_measured = cost_measured_globally
+        || (provider_cost_applies && consumer_costs.contains_key(&account.provider));
     // 이 계정 자신의 실측. 전역·공급자 실측(`cost_measured`)은 등급 판정의 근거로는 충분하지만
     // 병렬 기동의 근거로는 부족하다 — 같은 공급자라도 플랜이 다르면 창 크기가 달라 회당 %p가
     // 다르고, 그 차이가 첫 회차에서 창을 비운다([`limit_account_runs`]).
@@ -5208,7 +5916,9 @@ fn plan_account(account: &ProviderAccountView, input: &AccountPlanInput<'_>) -> 
         lane_efforts.get(&account.provider),
         headroom_runs_per_round,
         ceiling_pressure,
-        effort_costs.get(&account.provider),
+        effort_costs
+            .get(&account.provider)
+            .filter(|_| provider_cost_applies),
         net_headroom,
         remaining_runs,
         max_runs,
@@ -5286,6 +5996,8 @@ fn plan_account(account: &ProviderAccountView, input: &AccountPlanInput<'_>) -> 
         "accountId": account.id,
         "email": account.email,
         "provider": account.provider,
+        // 이 계정에 쓸 모델(사다리에서 고른 것).
+        "model": model,
         // 이 계정이 실제로 채운 창. 회차 창과 다를 수 있다(Antigravity 모델군 창).
         "windowLabel": window_label,
         "usedPercent": used_percent,
@@ -5472,6 +6184,65 @@ fn select_stale_runs(
         .collect()
 }
 
+/// 계획 한 벌의 기동을 계정별 예약 항목으로 만든다. 항목은 그 계획이 계정마다 채운 창과
+/// 기준선·기대 소비를 싣는다.
+fn record_entries(plan: &PacingPlan, runs: &[PlannedRun]) -> Vec<PlanRecordEntry> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut models: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for run in runs {
+        *counts.entry(run.account_id.clone()).or_default() += 1;
+        models
+            .entry(run.account_id.clone())
+            .or_insert_with(|| run.model.clone());
+    }
+    counts
+        .into_iter()
+        .map(|(account_id, count)| {
+            let (used, resets) = plan
+                .claim_baselines
+                .get(&account_id)
+                .map(|(used, resets)| (Some(*used), *resets))
+                .unwrap_or((None, None));
+            let cost = plan
+                .account_costs
+                .get(&account_id)
+                .copied()
+                .unwrap_or(plan.cost_percent_per_run);
+            let guards = plan
+                .guard_baselines
+                .get(&account_id)
+                .map(|baselines| {
+                    baselines
+                        .iter()
+                        .map(|(label, baseline)| {
+                            (
+                                label.clone(),
+                                WindowClaim {
+                                    expected_cost_percent: baseline
+                                        .cost_percent_per_run
+                                        .map(|cost| count as f64 * cost),
+                                    used_percent_at_claim: Some(baseline.used_percent),
+                                    resets_at_at_claim: baseline.resets_at,
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            PlanRecordEntry {
+                window_label: plan.account_window_labels.get(&account_id).cloned(),
+                model: models.get(&account_id).cloned().flatten(),
+                expected_cost_percent: Some(count as f64 * cost),
+                used_percent_at_claim: used,
+                resets_at_at_claim: resets,
+                guards,
+                account_id,
+                count,
+            }
+        })
+        .collect()
+}
+
 /// 계획을 계산하고 그 회차를 예약으로 기록한 뒤 응답을 만든다. 기록은 다음 회차의
 /// 회당 비용 실측 근거이자 다른 소비자가 차감할 미정산 예약이므로 계획과 같은 잠금
 /// 안에서 남긴다.
@@ -5487,56 +6258,10 @@ fn plan_and_record(
             return Ok(plan);
         }
         // 기동이 없어도 기록한다 — 이 소비자가 이 창을 쓰고 있다는 표시라 다른 소비자의
-        // 배분에 들어간다. 기대 소비가 없으니 예약으로는 세지 않는다.
-        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for run in &plan.planned {
-            *counts.entry(run.account_id.clone()).or_default() += 1;
-        }
-        let entries = counts
-            .into_iter()
-            .map(|(account_id, count)| {
-                let (used, resets) = plan
-                    .claim_baselines
-                    .get(&account_id)
-                    .map(|(used, resets)| (Some(*used), *resets))
-                    .unwrap_or((None, None));
-                let cost = plan
-                    .account_costs
-                    .get(&account_id)
-                    .copied()
-                    .unwrap_or(plan.cost_percent_per_run);
-                let guards = plan
-                    .guard_baselines
-                    .get(&account_id)
-                    .map(|baselines| {
-                        baselines
-                            .iter()
-                            .map(|(label, baseline)| {
-                                (
-                                    label.clone(),
-                                    WindowClaim {
-                                        expected_cost_percent: baseline
-                                            .cost_percent_per_run
-                                            .map(|cost| count as f64 * cost),
-                                        used_percent_at_claim: Some(baseline.used_percent),
-                                        resets_at_at_claim: baseline.resets_at,
-                                    },
-                                )
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                PlanRecordEntry {
-                    window_label: plan.account_window_labels.get(&account_id).cloned(),
-                    expected_cost_percent: Some(count as f64 * cost),
-                    used_percent_at_claim: used,
-                    resets_at_at_claim: resets,
-                    guards,
-                    account_id,
-                    count,
-                }
-            })
-            .collect();
+        // 배분에 들어간다. 기대 소비가 없으니 예약으로는 세지 않는다. 같은 계정에 덧붙인 다른
+        // 모델군의 몫은 그 모델군 창의 항목으로 따로 남는다([`add_parallel_model_groups`]).
+        let mut entries = record_entries(&plan, &plan.planned[..plan.recorded_runs]);
+        entries.extend(plan.extra_entries.iter().cloned());
         // 이번 회차로 기준선이 다 모였으면 여기서 붙박는다. 계획을 쓰는 자리라 이미
         // 저장소를 다시 쓰는 중이고, 정책의 기준선 회차 수와 창 라벨이 둘 다 여기 있다.
         freeze_ready_baselines(
@@ -5547,6 +6272,17 @@ fn plan_and_record(
             baseline_runs_for(inputs),
             inputs.now,
         );
+        // 같은 계정에 덧붙인 모델군도 제 창의 기준선을 붙박는다.
+        for labels in &plan.extra_provider_labels {
+            freeze_ready_baselines(
+                &mut store,
+                &plan.consumer_id,
+                &request.window_label,
+                labels,
+                baseline_runs_for(inputs),
+                inputs.now,
+            );
+        }
         store.plans.push(PlanRecord {
             at: inputs.now,
             window_label: request.window_label.clone(),
@@ -5557,6 +6293,7 @@ fn plan_and_record(
             cwd: Some(request.project_path.clone()),
             max_runs: Some(plan.max_runs),
             execution_id: request.execution_id.clone(),
+            demand_labels: plan.demand_labels.clone(),
         });
         if store.plans.len() > MAX_PLAN_RECORDS {
             let excess = store.plans.len() - MAX_PLAN_RECORDS;
@@ -6504,6 +7241,7 @@ mod tests {
             account_id: Some("claude-a".to_owned()),
             resuming: false,
             forked: false,
+            fork_source_session_id: None,
             provider_session_id: Some(format!("session-{chat_id}")),
             cwd: cwd.to_owned(),
             model: None,
@@ -6698,7 +7436,7 @@ mod tests {
     fn antigravity_account_paces_the_model_group_window_of_this_round() {
         let accounts = vec![account(
             "antigravity-acd",
-            "tester-shinnanae@example.com",
+            "tester-account@example.com",
             ProviderId::Antigravity,
             // Gemini는 소진(대표 창도 100%), Claude/GPT는 아직 시작도 안 한 창.
             antigravity_usage(100.0, (0.0, None)),
@@ -6741,7 +7479,7 @@ mod tests {
     fn a_claim_from_another_model_group_does_not_block_this_group() {
         let accounts = vec![account(
             "antigravity-acd",
-            "tester-shinnanae@example.com",
+            "tester-account@example.com",
             ProviderId::Antigravity,
             // 두 모델군 모두 아직 시작되지 않은 창.
             antigravity_usage(0.0, (0.0, None)),
@@ -6753,6 +7491,7 @@ mod tests {
             at: NOW - 60_000,
             window_label: "7일".to_owned(),
             entries: vec![PlanRecordEntry {
+                model: None,
                 window_label: Some("Gemini Models · 7일".to_owned()),
                 account_id: "antigravity-acd".to_owned(),
                 count: 1,
@@ -6767,6 +7506,7 @@ mod tests {
             cwd: None,
             max_runs: Some(1),
             execution_id: None,
+            demand_labels: BTreeMap::new(),
         });
 
         let plan = compute_plan(
@@ -6911,7 +7651,7 @@ mod tests {
     fn antigravity_stays_out_of_rounds_that_declare_no_model() {
         let accounts = vec![account(
             "antigravity-acd",
-            "tester-shinnanae@example.com",
+            "tester-account@example.com",
             ProviderId::Antigravity,
             antigravity_usage(10.0, (10.0, Some(NOW + 50 * HOUR))),
         )];
@@ -6936,13 +7676,13 @@ mod tests {
         let accounts = vec![
             account(
                 "claude-acd",
-                "tester-shinnanae@example.com",
+                "tester-account@example.com",
                 ProviderId::Claude,
                 usage(vec![("7일", 10.0, Some(NOW + 50 * HOUR))]),
             ),
             account(
                 "antigravity-acd",
-                "tester-shinnanae@example.com",
+                "tester-account@example.com",
                 ProviderId::Antigravity,
                 antigravity_usage(10.0, (10.0, Some(NOW + 50 * HOUR))),
             ),
@@ -7020,6 +7760,7 @@ mod tests {
         let mut store = PacingStore::default();
         store.plans.push(PlanRecord {
             execution_id: None,
+            demand_labels: BTreeMap::new(),
             consumer_id: Some("s-on".to_owned()),
             workflow_id: Some("wf-qa".to_owned()),
             cadence_ms: Some(5 * HOUR),
@@ -7124,6 +7865,7 @@ mod tests {
     /// 칸이 하나 늘 때마다 같은 곳을 열세 번 고쳐야 했다.
     fn plan_entry(account_id: &str, count: usize) -> PlanRecordEntry {
         PlanRecordEntry {
+            model: None,
             account_id: account_id.to_owned(),
             count,
             window_label: None,
@@ -7148,6 +7890,7 @@ mod tests {
             cwd: None,
             max_runs: None,
             execution_id: None,
+            demand_labels: BTreeMap::new(),
         }
     }
 
@@ -7156,6 +7899,7 @@ mod tests {
     fn history_record(at: i64, entries: &[(&str, usize)]) -> PlanRecord {
         PlanRecord {
             execution_id: None,
+            demand_labels: BTreeMap::new(),
             consumer_id: Some("s-on".to_owned()),
             workflow_id: Some("wf-qa".to_owned()),
             cadence_ms: Some(5 * HOUR),
@@ -7202,6 +7946,7 @@ mod tests {
         let mut store = PacingStore::default();
         store.plans.push(PlanRecord {
             execution_id: None,
+            demand_labels: BTreeMap::new(),
             consumer_id: Some("s-refactor".to_owned()),
             workflow_id: Some("wf-refactor".to_owned()),
             cadence_ms: Some(5 * HOUR),
@@ -8138,6 +8883,7 @@ mod tests {
         let mut store = PacingStore::default();
         store.plans.push(PlanRecord {
             execution_id: None,
+            demand_labels: BTreeMap::new(),
             consumer_id: Some("s-refactor".to_owned()),
             workflow_id: Some("wf-refactor".to_owned()),
             cadence_ms: Some(5 * HOUR),
@@ -9148,6 +9894,707 @@ mod tests {
             .is_some_and(|reason| reason.contains("Fable 7일")));
     }
 
+    /// Claude 계정 하나: 계정 창 둘에 Fable 주간 창이 얹힌 꼴.
+    fn claude_with_fable(fable_used: f64) -> ProviderAccountView {
+        let mut view = usage(vec![
+            ("7일", 10.0, Some(NOW + 50 * HOUR)),
+            ("5시간", 10.0, Some(NOW + HOUR)),
+            ("Fable 7일", fable_used, Some(NOW + 50 * HOUR)),
+        ]);
+        view.windows[2].model_scoped = true;
+        account("claude-a", "tester-a@example.com", ProviderId::Claude, view)
+    }
+
+    fn fable_ladder_request() -> UsagePacedRunsRequest {
+        let mut req = request("7일", 92.0);
+        // 화면은 선택지 순서로 저장한다 — Opus가 앞에 와도 Fable 전용 한도를 먼저 쓴다.
+        req.claude_model = Some(" claude-opus-5 , claude-fable-5-1 ,claude-opus-5".to_owned());
+        req
+    }
+
+    /// 사다리는 쉼표 목록이다. 빈 칸·중복은 접고 순서는 지킨다. 한 개면 종전과 같다.
+    #[test]
+    fn model_ladder_reads_a_comma_list_in_priority_order() {
+        assert_eq!(
+            model_ladder(Some(" claude-fable-5-1 , claude-opus-5 ,,claude-fable-5-1")),
+            ["claude-fable-5-1", "claude-opus-5"]
+        );
+        assert_eq!(model_ladder(Some("claude-opus-5")), ["claude-opus-5"]);
+        assert!(model_ladder(Some("  ")).is_empty());
+        assert!(model_ladder(None).is_empty());
+        assert_eq!(
+            first_ladder_model("gemini-4-argon-high, gemini-3.8-flash-high"),
+            Some("gemini-4-argon-high")
+        );
+        assert_eq!(first_ladder_model(" , "), None);
+    }
+
+    /// Fable 주간 한도가 남은 동안은 Fable을 쓰고, 그 창을 함께 지킨다. 계정 창(`7일`)으로
+    /// 계획하므로 건수는 계정 창이 정하고, Fable 창은 가드로 그 위를 자른다.
+    #[test]
+    fn fable_ladder_runs_fable_while_its_window_has_room() {
+        let accounts = vec![claude_with_fable(20.0)];
+        let schedules = vec![workflow_schedule("s-on", "wf-qa", 5, true)];
+        let plan = compute_plan(
+            &store_with_measurement(),
+            &fable_ladder_request(),
+            &inputs(&accounts, &schedules, &[]),
+        )
+        .expect("plan");
+        assert!(!plan.planned.is_empty());
+        assert!(plan
+            .planned
+            .iter()
+            .all(|run| run.model.as_deref() == Some("claude-fable-5-1")));
+        let view = account_view(&plan, "claude-a");
+        assert_eq!(view["model"], "claude-fable-5-1");
+        assert_eq!(view["windowLabel"], "7일");
+        let guards: Vec<&str> = view["guards"]
+            .as_array()
+            .expect("guards")
+            .iter()
+            .filter_map(|guard| guard["label"].as_str())
+            .collect();
+        assert!(guards.contains(&"Fable 7일"), "{view}");
+        assert!(guards.contains(&"5시간"), "{view}");
+        // 이 예약은 Fable 창에도 기준선을 남겨 다음 회차가 정산할 수 있다.
+        assert!(plan.guard_baselines["claude-a"].contains_key("Fable 7일"));
+    }
+
+    /// Fable 창이 가드에 닿으면 같은 계정의 남은 계정 창은 사다리의 다음 모델이 채운다.
+    /// Fable 가드가 계정을 통째로 쉬게 하면 계정 창의 나머지가 버려진다.
+    #[test]
+    fn fable_ladder_falls_back_to_the_next_model_when_fable_is_guarded() {
+        let accounts = vec![claude_with_fable(90.0)];
+        let schedules = vec![workflow_schedule("s-on", "wf-qa", 5, true)];
+        let plan = compute_plan(
+            &store_with_measurement(),
+            &fable_ladder_request(),
+            &inputs(&accounts, &schedules, &[]),
+        )
+        .expect("plan");
+        assert!(!plan.planned.is_empty());
+        assert!(plan
+            .planned
+            .iter()
+            .all(|run| run.model.as_deref() == Some("claude-opus-5")));
+        let view = account_view(&plan, "claude-a");
+        assert!(!view["guards"]
+            .as_array()
+            .expect("guards")
+            .iter()
+            .any(|guard| guard["label"] == "Fable 7일"));
+        assert!(plan
+            .reasoning
+            .iter()
+            .any(|line| line.contains("모델 사다리") && line.contains("claude-opus-5")));
+    }
+
+    /// Fable 창이 가드 바로 아래라 열려는 보여도 회당 소비가 남은 여유보다 크면 Fable로는 0건이다.
+    /// 그때 계정 창의 여유는 사다리의 다음 모델이 받는다 — Fable을 고른 채 쉬면 Fable이 리셋될
+    /// 때까지 `7일` 여유가 논다.
+    #[test]
+    fn a_fable_round_with_no_affordable_run_falls_back_to_the_next_model() {
+        let mut store = store_with_measurement();
+        // 같은 회차가 Fable 2건으로 Fable 창을 8%p 올렸다 → 회당 4%p.
+        store.plans[0].entries[0].guards.insert(
+            "Fable 7일".to_owned(),
+            WindowClaim {
+                expected_cost_percent: None,
+                used_percent_at_claim: Some(70.0),
+                resets_at_at_claim: Some(NOW + 50 * HOUR),
+            },
+        );
+        store.series.insert(
+            series_key("claude-a", "Fable 7일"),
+            vec![
+                UsageSample {
+                    at: NOW - 6 * HOUR,
+                    used_percent: 70.0,
+                    resets_at: Some(NOW + 50 * HOUR),
+                },
+                UsageSample {
+                    at: NOW - HOUR,
+                    used_percent: 78.0,
+                    resets_at: Some(NOW + 50 * HOUR),
+                },
+            ],
+        );
+        // 가드 85%까지 1%p 남았다 — 열려 보이지만 한 건(4%p)도 감당하지 못한다.
+        let accounts = vec![claude_with_fable(84.0)];
+        let schedules = vec![workflow_schedule("s-on", "wf-qa", 5, true)];
+        let plan = compute_plan(
+            &store,
+            &fable_ladder_request(),
+            &inputs(&accounts, &schedules, &[]),
+        )
+        .expect("plan");
+        assert!(!plan.planned.is_empty(), "{:?}", plan.reasoning);
+        assert!(plan
+            .planned
+            .iter()
+            .all(|run| run.model.as_deref() == Some("claude-opus-5")));
+        assert!(plan
+            .reasoning
+            .iter()
+            .any(|line| line.contains("다음 모델")
+                && line.contains("claude-fable-5-1 → claude-opus-5")));
+        // Fable만 적은 회차는 같은 자리에서 쉰다.
+        let mut req = request("7일", 92.0);
+        req.claude_model = Some("claude-fable-5-1".to_owned());
+        let plan = compute_plan(&store, &req, &inputs(&accounts, &schedules, &[])).expect("plan");
+        assert!(plan.planned.is_empty());
+    }
+
+    /// 사다리 없이 Fable만 적은 회차는 Fable 창이 가드를 넘으면 쉰다 — 계정 창이 비어
+    /// 있어도 그 실행은 공급자 한도에 걸린다(AND).
+    #[test]
+    fn a_fable_only_round_rests_when_the_fable_window_is_guarded() {
+        let accounts = vec![claude_with_fable(90.0)];
+        let schedules = vec![workflow_schedule("s-on", "wf-qa", 5, true)];
+        let mut req = request("7일", 92.0);
+        req.claude_model = Some("claude-fable-5-1".to_owned());
+        let plan = compute_plan(
+            &store_with_measurement(),
+            &req,
+            &inputs(&accounts, &schedules, &[]),
+        )
+        .expect("plan");
+        assert!(plan.planned.is_empty());
+        assert!(account_view(&plan, "claude-a")["skipReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("Fable 7일")));
+        // Fable 창이 다 찼으면 실행 게이트 판정으로 빠진다.
+        let accounts = vec![claude_with_fable(100.0)];
+        let plan = compute_plan(
+            &store_with_measurement(),
+            &req,
+            &inputs(&accounts, &schedules, &[]),
+        )
+        .expect("plan");
+        assert!(plan.planned.is_empty());
+        assert!(account_view(&plan, "claude-a")["skipReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("사용량 소진")));
+    }
+
+    /// Antigravity 모델군은 서로 독립이라 리셋까지 남은 시간 대비 여유가 큰 모델군부터 쓴다.
+    /// 앞에서부터 채우면 리셋이 이른 모델군이 남은 채로 리셋된다.
+    #[test]
+    fn antigravity_ladder_picks_the_most_urgent_open_model_group() {
+        // Gemini: 10% 사용, 50시간 뒤 리셋. Claude/GPT: 50% 사용, 5시간 뒤 리셋 — 더 급하다.
+        let accounts = vec![account(
+            "antigravity-acd",
+            "tester-account@example.com",
+            ProviderId::Antigravity,
+            antigravity_usage(10.0, (50.0, Some(NOW + 5 * HOUR))),
+        )];
+        let schedules = vec![workflow_schedule("s-on", "wf-qa", 5, true)];
+        let plan = compute_plan(
+            &PacingStore::default(),
+            &antigravity_request("gemini-3.1-pro, claude-sonnet-4.6"),
+            &inputs(&accounts, &schedules, &[]),
+        )
+        .expect("plan");
+        // 급한 Claude/GPT가 본 계획이고, 독립인 Gemini 모델군도 같은 회차에 덧붙는다.
+        assert_eq!(plan.planned.len(), 2);
+        assert_eq!(plan.planned[0].model.as_deref(), Some("claude-sonnet-4.6"));
+        assert_eq!(plan.planned[1].model.as_deref(), Some("gemini-3.1-pro"));
+        assert_eq!(
+            plan.accounts[0]["windowLabel"].as_str(),
+            Some("Claude and GPT models · 7일")
+        );
+
+        // 급한 모델군이 다 차면 열린 모델군으로 간다.
+        let accounts = vec![account(
+            "antigravity-acd",
+            "tester-account@example.com",
+            ProviderId::Antigravity,
+            antigravity_usage(10.0, (100.0, Some(NOW + 5 * HOUR))),
+        )];
+        let plan = compute_plan(
+            &PacingStore::default(),
+            &antigravity_request("claude-sonnet-4.6, gemini-3.1-pro"),
+            &inputs(&accounts, &schedules, &[]),
+        )
+        .expect("plan");
+        assert_eq!(plan.planned.len(), 1);
+        assert_eq!(plan.planned[0].model.as_deref(), Some("gemini-3.1-pro"));
+        assert_eq!(
+            plan.accounts[0]["windowLabel"].as_str(),
+            Some("Gemini Models · 7일")
+        );
+    }
+
+    /// Antigravity 계정 하나에 세 모델군(Gemini·Claude/GPT·Argon) 7일 창이 있는 사용량.
+    fn antigravity_three_groups(gemini: f64, third_party: f64, argon: f64) -> AccountUsageView {
+        let mut view = usage(vec![
+            (
+                "7일",
+                gemini.max(third_party).max(argon),
+                Some(NOW + 20 * HOUR),
+            ),
+            ("Gemini Models · 7일", gemini, Some(NOW + 100 * HOUR)),
+            (
+                "Claude and GPT models · 7일",
+                third_party,
+                Some(NOW + 60 * HOUR),
+            ),
+            ("Gemini 4 Argon · 7일", argon, Some(NOW + 20 * HOUR)),
+        ]);
+        for window in &mut view.windows {
+            window.model_scoped = window.label.contains(" · ");
+            window.aggregate = !window.model_scoped;
+        }
+        view
+    }
+
+    fn three_group_request(max_runs: usize) -> UsagePacedRunsRequest {
+        let mut req = antigravity_request("gemini-3.1-pro, claude-sonnet-4.6, gemini-4-argon-high");
+        req.max_runs = Some(max_runs);
+        req
+    }
+
+    /// 모델군 쿼터는 서로 독립이라 같은 계정에서 한 회차에 함께 돈다. 본 계획은 가장 급한
+    /// 모델군으로 짜고, 남은 자리에 다른 모델군을 그 모델군 창으로 덧붙인다. 예약도 모델군
+    /// 창마다 따로 남는다.
+    #[test]
+    fn one_antigravity_account_runs_every_open_model_group_in_one_round() {
+        let accounts = vec![account(
+            "antigravity-acd",
+            "tester-account@example.com",
+            ProviderId::Antigravity,
+            antigravity_three_groups(10.0, 30.0, 40.0),
+        )];
+        let schedules = vec![workflow_schedule("s-on", "wf-qa", 5, true)];
+        let plan = compute_plan(
+            &PacingStore::default(),
+            &three_group_request(6),
+            &inputs(&accounts, &schedules, &[]),
+        )
+        .expect("plan");
+        let models: BTreeSet<&str> = plan
+            .planned
+            .iter()
+            .filter_map(|run| run.model.as_deref())
+            .collect();
+        assert_eq!(
+            models,
+            ["claude-sonnet-4.6", "gemini-3.1-pro", "gemini-4-argon-high"]
+                .into_iter()
+                .collect(),
+            "{:?}",
+            plan.reasoning
+        );
+        assert!(plan
+            .planned
+            .iter()
+            .all(|run| run.account_id == "antigravity-acd"));
+        // 가장 급한 Argon(20시간 뒤 리셋)이 본 계획이다.
+        assert_eq!(
+            plan.planned[0].model.as_deref(),
+            Some("gemini-4-argon-high")
+        );
+        assert_eq!(plan.recorded_runs, 1);
+        let mut labels: Vec<String> = record_entries(&plan, &plan.planned[..plan.recorded_runs])
+            .into_iter()
+            .chain(plan.extra_entries.iter().cloned())
+            .map(|entry| entry.window_label.expect("group label"))
+            .collect();
+        labels.sort();
+        assert_eq!(
+            labels,
+            [
+                "Claude and GPT models · 7일",
+                "Gemini 4 Argon · 7일",
+                "Gemini Models · 7일"
+            ]
+        );
+        assert!(plan
+            .reasoning
+            .iter()
+            .any(|line| line.contains("다른 모델군도 함께")));
+    }
+
+    /// 덧붙이는 모델군도 회차의 동시 기동 상한 안이다. 자리가 모자라면 급한 모델군부터 받는다.
+    /// 다 찬 모델군은 덧붙지 않는다.
+    #[test]
+    fn parallel_model_groups_stay_within_the_round_limit_and_skip_full_groups() {
+        let accounts = vec![account(
+            "antigravity-acd",
+            "tester-account@example.com",
+            ProviderId::Antigravity,
+            antigravity_three_groups(10.0, 30.0, 40.0),
+        )];
+        let schedules = vec![workflow_schedule("s-on", "wf-qa", 5, true)];
+        let plan = compute_plan(
+            &PacingStore::default(),
+            &three_group_request(2),
+            &inputs(&accounts, &schedules, &[]),
+        )
+        .expect("plan");
+        let models: Vec<&str> = plan
+            .planned
+            .iter()
+            .filter_map(|run| run.model.as_deref())
+            .collect();
+        // Argon(20시간) 다음으로 급한 Claude/GPT(60시간)까지만.
+        assert_eq!(models, ["gemini-4-argon-high", "claude-sonnet-4.6"]);
+
+        let accounts = vec![account(
+            "antigravity-acd",
+            "tester-account@example.com",
+            ProviderId::Antigravity,
+            antigravity_three_groups(10.0, 30.0, 100.0),
+        )];
+        let plan = compute_plan(
+            &PacingStore::default(),
+            &three_group_request(6),
+            &inputs(&accounts, &schedules, &[]),
+        )
+        .expect("plan");
+        let models: BTreeSet<&str> = plan
+            .planned
+            .iter()
+            .filter_map(|run| run.model.as_deref())
+            .collect();
+        assert_eq!(
+            models,
+            ["claude-sonnet-4.6", "gemini-3.1-pro"]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    /// 한 계획에 같은 계정의 모델군별 항목 둘. 다음 회차는 두 모델군 모두 제 예약을 읽어야 하고,
+    /// 한 모델군의 기동만 실패하면 그 항목만 정산된다.
+    fn two_group_record() -> PlanRecord {
+        let entry = |label: &str, model: &str| PlanRecordEntry {
+            model: Some(model.to_owned()),
+            window_label: Some(label.to_owned()),
+            account_id: "antigravity-acd".to_owned(),
+            count: 1,
+            expected_cost_percent: Some(3.0),
+            used_percent_at_claim: Some(10.0),
+            resets_at_at_claim: Some(NOW + 50 * HOUR),
+            guards: BTreeMap::new(),
+        };
+        let mut plan = history_record(NOW - 10 * 60_000, &[]);
+        plan.execution_id = Some("wfround-groups".to_owned());
+        plan.entries = vec![
+            entry("Gemini 4 Argon · 7일", "gemini-4-argon-high"),
+            entry("Gemini Models · 7일", "gemini-3.1-pro"),
+        ];
+        plan
+    }
+
+    #[test]
+    fn each_model_group_entry_of_one_plan_is_its_own_claim() {
+        let mut store = PacingStore::default();
+        store.plans.push(two_group_record());
+        let live = BTreeSet::new();
+        for label in ["Gemini 4 Argon · 7일", "Gemini Models · 7일"] {
+            let claims = claims_for_account(&store, "7일", label, label, "antigravity-acd", &live);
+            assert_eq!(claims.len(), 1, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_failed_launch_of_one_model_group_settles_only_that_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = PacingStore::default();
+        store.plans.push(two_group_record());
+        // Argon은 떴고 Gemini 기동은 실패했다.
+        let mut argon = antigravity_run_record(
+            "chat-argon",
+            "s-on",
+            "antigravity-acd",
+            "gemini-4-argon-high",
+            NOW - 5 * 60_000,
+            None,
+        );
+        argon.execution_id = Some("wfround-groups".to_owned());
+        store.runs.push(argon);
+        save_store(dir.path(), &store).expect("seed");
+        settle_unlaunched_claims(dir.path(), "wfround-groups");
+        let settled = load_store(dir.path()).expect("load");
+        let counts: Vec<(Option<String>, usize)> = settled.plans[0]
+            .entries
+            .iter()
+            .map(|entry| (entry.window_label.clone(), entry.count))
+            .collect();
+        // 뜨지 못한 Gemini 항목은 정산되어 빠지고 Argon 항목만 남는다.
+        assert_eq!(counts, [(Some("Gemini 4 Argon · 7일".to_owned()), 1)]);
+    }
+
+    /// 계정이 Argon 모델군을 따로 보고하면 Argon 실행은 계열 전체(`Gemini Models`) 창을 쓰지
+    /// 않는다. 같은 계정에서 둘이 함께 돌 때 Gemini 관측·점유가 깎이지 않게 한다.
+    #[test]
+    fn a_model_line_run_does_not_consume_the_family_window_of_that_account() {
+        let mut store = PacingStore::default();
+        let argon = antigravity_run_record(
+            "chat-argon",
+            "s-on",
+            "antigravity-acd",
+            "gemini-4-argon-high",
+            NOW - HOUR,
+            None,
+        );
+        // Argon 창을 보고하기 전에는 종전처럼 계열 창도 쓴다고 본다.
+        assert!(run_consumes_window(&store, &argon, "Gemini Models · 7일"));
+        store.series.insert(
+            series_key("antigravity-acd", "Gemini 4 Argon · 7일"),
+            samples(&[(NOW, 10.0)]),
+        );
+        assert!(!run_consumes_window(&store, &argon, "Gemini Models · 7일"));
+        assert!(run_consumes_window(&store, &argon, "Gemini 4 Argon · 7일"));
+        let flash = antigravity_run_record(
+            "chat-flash",
+            "s-on",
+            "antigravity-acd",
+            "gemini-3.1-pro",
+            NOW - HOUR,
+            None,
+        );
+        assert!(run_consumes_window(&store, &flash, "Gemini Models · 7일"));
+        assert!(!run_consumes_window(&store, &flash, "Gemini 4 Argon · 7일"));
+        // 공급자가 줄을 계열로 다시 합쳐 Argon 창을 더는 보고하지 않으면(마지막 조회에 없음)
+        // 옛 시계열이 남아 있어도 Argon 실행은 계열 창을 쓴다.
+        store.series.insert(
+            series_key("antigravity-acd", "Gemini Models · 7일"),
+            samples(&[(NOW + HOUR, 12.0)]),
+        );
+        assert!(run_consumes_window(&store, &argon, "Gemini Models · 7일"));
+    }
+
+    /// 계정당 항목이 하나뿐인 계획은 모델로 가르지 않는다 — 채팅이 다른 모델 id로 남아도 뜬
+    /// 실행이 그 예약을 지킨다.
+    #[test]
+    fn a_single_entry_per_account_settles_by_account_not_by_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = PacingStore::default();
+        let mut plan = two_group_record();
+        plan.entries.truncate(1);
+        store.plans.push(plan);
+        let mut run = antigravity_run_record(
+            "chat-other-id",
+            "s-on",
+            "antigravity-acd",
+            "gemini-4-argon-high-preview",
+            NOW - 5 * 60_000,
+            None,
+        );
+        run.execution_id = Some("wfround-groups".to_owned());
+        store.runs.push(run);
+        save_store(dir.path(), &store).expect("seed");
+        settle_unlaunched_claims(dir.path(), "wfround-groups");
+        let settled = load_store(dir.path()).expect("load");
+        assert_eq!(settled.plans[0].entries[0].count, 1);
+    }
+
+    /// 모델 하나만 적은 회차는 종전과 같다 — 다른 모델군을 덧붙이지 않는다.
+    #[test]
+    fn a_single_antigravity_model_round_does_not_add_other_groups() {
+        let accounts = vec![account(
+            "antigravity-acd",
+            "tester-account@example.com",
+            ProviderId::Antigravity,
+            antigravity_three_groups(10.0, 30.0, 40.0),
+        )];
+        let schedules = vec![workflow_schedule("s-on", "wf-qa", 5, true)];
+        let mut req = antigravity_request("gemini-3.1-pro");
+        req.max_runs = Some(6);
+        let plan = compute_plan(
+            &PacingStore::default(),
+            &req,
+            &inputs(&accounts, &schedules, &[]),
+        )
+        .expect("plan");
+        assert!(plan
+            .planned
+            .iter()
+            .all(|run| run.model.as_deref() == Some("gemini-3.1-pro")));
+        assert!(plan.extra_entries.is_empty());
+    }
+
+    /// 모델 한정 창의 관측은 그 모델 실행만 센다. Opus 실행을 Fable 창의 겹침으로 세면
+    /// Fable 실행이 낸 증가가 깎인다. 모델을 남기지 않은 옛 기록은 종전처럼 센다.
+    #[test]
+    fn only_runs_of_that_model_consume_a_model_limit_window() {
+        let mut fable = run_record("c1", "s-on", None, "claude-a", NOW - HOUR, Some(NOW));
+        fable.model = Some("claude-fable-5-1".to_owned());
+        let mut opus = fable.clone();
+        opus.model = Some("claude-opus-5".to_owned());
+        let legacy = run_record("c3", "s-on", None, "claude-a", NOW - HOUR, Some(NOW));
+        assert!(run_consumes_window(
+            &PacingStore::default(),
+            &fable,
+            "Fable 7일"
+        ));
+        assert!(!run_consumes_window(
+            &PacingStore::default(),
+            &opus,
+            "Fable 7일"
+        ));
+        assert!(run_consumes_window(
+            &PacingStore::default(),
+            &legacy,
+            "Fable 7일"
+        ));
+        assert!(run_consumes_window(&PacingStore::default(), &opus, "7일"));
+        assert!(run_consumes_window(&PacingStore::default(), &opus, "5시간"));
+    }
+
+    /// 계획 기록으로 재는 Fable 창 회당 소비의 분모는 Fable 가드 예약을 남긴 항목뿐이다.
+    #[test]
+    fn model_limit_window_cost_counts_only_entries_that_claimed_it() {
+        let mut store = PacingStore::default();
+        let fable_claim = || {
+            [(
+                "Fable 7일".to_owned(),
+                WindowClaim {
+                    expected_cost_percent: None,
+                    used_percent_at_claim: Some(10.0),
+                    resets_at_at_claim: Some(NOW + 50 * HOUR),
+                },
+            )]
+            .into_iter()
+            .collect()
+        };
+        let entry = |account_id: &str, count, guards| PlanRecordEntry {
+            model: None,
+            window_label: None,
+            account_id: account_id.to_owned(),
+            count,
+            expected_cost_percent: None,
+            used_percent_at_claim: None,
+            resets_at_at_claim: None,
+            guards,
+        };
+        store.plans.push(PlanRecord {
+            at: NOW - 4 * HOUR,
+            window_label: "7일".to_owned(),
+            // 같은 회차에 Fable 1건(claude-a)과 Opus 3건(claude-b).
+            entries: vec![
+                entry("claude-a", 1, fable_claim()),
+                entry("claude-b", 3, BTreeMap::new()),
+            ],
+            consumer_id: Some("s-on".to_owned()),
+            workflow_id: Some("wf-qa".to_owned()),
+            cadence_ms: Some(HOUR),
+            cwd: None,
+            max_runs: Some(4),
+            execution_id: None,
+            demand_labels: BTreeMap::new(),
+        });
+        for account_id in ["claude-a", "claude-b"] {
+            store.series.insert(
+                series_key(account_id, "Fable 7일"),
+                vec![
+                    UsageSample {
+                        at: NOW - 5 * HOUR,
+                        used_percent: 10.0,
+                        resets_at: Some(NOW + 50 * HOUR),
+                    },
+                    UsageSample {
+                        at: NOW - 3 * HOUR - 30 * 60_000,
+                        used_percent: 14.0,
+                        resets_at: Some(NOW + 50 * HOUR),
+                    },
+                ],
+            );
+        }
+        let (cost, observations) = measure_window_cost_per_run(
+            &store,
+            "7일",
+            Some("Fable 7일"),
+            &AccountWindowLabels::new(),
+            &["claude-a".to_owned(), "claude-b".to_owned()],
+            DEFAULT_COST_WINDOWS,
+            HOUR,
+        );
+        assert_eq!(observations, 1);
+        // claude-a 한 건이 4%p를 냈다. Opus 3건까지 분모에 넣으면 1%p로 보인다.
+        assert_eq!(cost, Some(4.0));
+    }
+
+    /// Antigravity 계정의 수요는 소비자의 모델 사다리가 닿는 모델군 창만 센다. 계정 대표 창은
+    /// 가장 빡빡한 모델군의 복사본이라 한 모델군이 차면 쓰는 모델군의 여유까지 속도에서
+    /// 사라지고, 모델군을 모두 더하면 닿지 않는 모델군의 여유를 쫓아 주기를 좁힌다.
+    #[test]
+    fn antigravity_demand_counts_the_model_groups_the_ladder_reaches() {
+        let mut store = PacingStore::default();
+        let sample = |used: f64, resets_in: i64| {
+            vec![UsageSample {
+                at: NOW,
+                used_percent: used,
+                resets_at: Some(NOW + resets_in),
+            }]
+        };
+        let ag = "antigravity-acd";
+        store
+            .series
+            .insert(series_key(ag, "7일"), sample(100.0, 10 * HOUR));
+        store.series.insert(
+            series_key(ag, "Gemini Models · 7일"),
+            sample(20.0, 80 * HOUR),
+        );
+        store.series.insert(
+            series_key(ag, "Gemini 4 Argon · 7일"),
+            sample(100.0, 10 * HOUR),
+        );
+        store.series.insert(
+            series_key(ag, "Claude and GPT models · 7일"),
+            sample(50.0, 40 * HOUR),
+        );
+        // 사다리 기록이 없으면 종전처럼 회차 창(계정 대표 창) 하나다.
+        assert_eq!(account_demand_labels(&store, ag, "7일", None), ["7일"]);
+        let mut plan = history_record(NOW - HOUR, &[(ag, 1)]);
+        plan.workflow_id = Some("wf-ladder".to_owned());
+        plan.demand_labels.insert(
+            ag.to_owned(),
+            vec![
+                "Gemini 4 Argon · 7일".to_owned(),
+                "Gemini Models · 7일".to_owned(),
+            ],
+        );
+        store.plans.push(plan);
+        let mut single = history_record(NOW - HOUR, &[(ag, 1)]);
+        single.workflow_id = Some("wf-gemini".to_owned());
+        single
+            .demand_labels
+            .insert(ag.to_owned(), vec!["Gemini Models · 7일".to_owned()]);
+        store.plans.push(single);
+        assert_eq!(
+            account_demand_labels(&store, ag, "7일", Some("wf-gemini")),
+            ["Gemini Models · 7일"]
+        );
+        assert_eq!(
+            account_demand_labels(&store, ag, "7일", Some("wf-ladder")),
+            ["Gemini 4 Argon · 7일", "Gemini Models · 7일"]
+        );
+        // 기록이 없는 워크플로는 종전과 같다.
+        assert_eq!(
+            account_demand_labels(&store, ag, "7일", Some("wf-other")),
+            ["7일"]
+        );
+        let policy = UsageBudgetPolicy::default();
+        let scope = |workflow_id| DemandScope {
+            window_label: "7일",
+            workflow_id,
+            target: 100.0,
+            now: NOW,
+            quiet: None,
+        };
+        // Argon은 다 차 빠지고 Gemini Models의 80%p만 남는다(대표 창 100%로 0이던 자리).
+        let windows = account_demand_windows(&store, &policy, ag, &scope(Some("wf-ladder")));
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].0, 80.0);
+        // 풀 전체는 워크플로마다의 마지막 계획을 합친다. Claude/GPT는 어느 사다리에도 없다.
+        let pool = account_demand_windows(&store, &policy, ag, &scope(None));
+        assert_eq!(pool.len(), 1);
+    }
+
     /// 예약 기록은 가드 창마다 기준선과 기대 소비를 남기고, 그 필드가 없는 옛 기록도 그대로
     /// 읽힌다(계획 창 예약만 있는 것으로).
     #[test]
@@ -10085,12 +11532,14 @@ mod tests {
     ) -> PlanRecord {
         PlanRecord {
             execution_id: None,
+            demand_labels: BTreeMap::new(),
             at,
             window_label: "7일".to_owned(),
             entries: if count == 0 {
                 Vec::new()
             } else {
                 vec![PlanRecordEntry {
+                    model: None,
                     window_label: None,
                     guards: BTreeMap::new(),
                     account_id: account_id.to_owned(),

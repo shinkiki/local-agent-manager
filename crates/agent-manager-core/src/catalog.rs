@@ -95,9 +95,10 @@ const MAX_TEXT_PROBE_BYTES: usize = 8_192;
 /// 보완 저장 결과 판정을 위해 표시 범위보다 더 읽는 항목 수. 한 턴 분량을 넉넉히 덮는다.
 const TRANSCRIPT_DEDUP_LOOKBACK: usize = 400;
 /// 표시 한도로 잘린 텍스트 블록 끝에 붙는 표시(`cap_text`).
-const TRANSCRIPT_TRUNCATION_MARK: &str = "\n…(생략)";
+pub(crate) const TRANSCRIPT_TRUNCATION_MARK: &str = "\n…(생략)";
 /// 보관 한도로 잘린 보완 저장 결과 끝에 붙는 표시(`store::cap_supplement_text`).
-const SUPPLEMENT_TRUNCATION_MARK: &str = "\n\n[Agent Manager 보관 한도에 따라 일부 생략됨]";
+pub(crate) const SUPPLEMENT_TRUNCATION_MARK: &str =
+    "\n\n[Agent Manager 보관 한도에 따라 일부 생략됨]";
 /// 사용자가 응답을 끊은 지점을 나타내는 트랜스크립트 역할. 사용자 요청도 에이전트 응답도 아니다.
 pub(crate) const INTERRUPTED_ROLE: &str = "interrupted";
 /// 응답이 끝나지 못한 지점을 나타내는 트랜스크립트 역할.
@@ -446,6 +447,37 @@ impl SessionCatalog {
         })
     }
 
+    /// 화면용 본문 검색. 색인에 쓰는 시간이 한 번에 몇 초로 묶이고, 남은 세션은
+    /// `pending_sessions`로 알려 다시 물을 때 이어서 색인한다.
+    pub fn search_sessions(
+        &self,
+        request: crate::SessionSearchRequest,
+    ) -> Result<crate::SessionSearchResponse, CoreError> {
+        self.search_sessions_with(request, crate::session_search::IndexBudget::Bounded)
+    }
+
+    /// `Complete`는 커서로 이어 받는 목록(`list_sessions`)이 쪽마다 다른 결과 집합을
+    /// 자르지 않도록 색인을 마친 뒤 답한다.
+    pub(crate) fn search_sessions_with(
+        &self,
+        request: crate::SessionSearchRequest,
+        budget: crate::session_search::IndexBudget,
+    ) -> Result<crate::SessionSearchResponse, CoreError> {
+        crate::session_search::search(
+            &self.app_data_dir,
+            &self.home,
+            self.session_list()?,
+            request,
+            budget,
+        )
+    }
+
+    /// 세션 목록만. 검색처럼 세션만 쓰는 호출이 스냅숏 전체를 복제하지 않게 한다.
+    fn session_list(&self) -> Result<Vec<SessionSummary>, CoreError> {
+        self.read_state("세션")
+            .map(|state| state.snapshot.sessions.clone())
+    }
+
     pub fn manager_snapshot(&self) -> Result<ManagerSnapshot, CoreError> {
         self.read_state("세션").map(|state| state.snapshot.clone())
     }
@@ -706,9 +738,9 @@ impl SessionCatalog {
             });
         if spawned.is_err() {
             // 진행 중 카운터는 건드리지 않고 마지막 오류만 남긴다.
-            catalog_health::finish_reconcile(Err(
-                "주기 세션 갱신 스레드를 시작하지 못했습니다".to_owned()
-            ));
+            catalog_health::note_reconcile_error(
+                "주기 세션 갱신 스레드를 시작하지 못했습니다".to_owned(),
+            );
         }
     }
 
@@ -1700,13 +1732,50 @@ fn load_session_detail_window(
     let home = home_dir()?;
     let metadata = store::load_metadata(app_data_dir)?;
     let session = resolve_session(app_data_dir, &home, source, id, &metadata)?;
-
     let supplements = if before_index.is_none() {
         store::captured_turns_for(app_data_dir, source, id)?
     } else {
         Vec::new()
     };
     let runtime_failures = store::runtime_failures_for(app_data_dir, source, id)?;
+    load_resolved_session_detail(
+        &home,
+        session,
+        supplements,
+        runtime_failures,
+        transcript_limit,
+        before_index,
+    )
+}
+
+/// 본문 검색 색인용 전체 전사. 여러 세션을 차례로 색인하는 쪽이 보완 저장소를 한 번만
+/// 읽어 세션별로 나눠 넘긴다. 실행 실패 항목은 색인하지 않는 역할이고 전사 맨 뒤에만
+/// 붙어 다른 항목의 순번을 바꾸지 않으므로, 세션마다 실행 저장소를 읽지 않고 뺀다.
+pub(crate) fn load_search_session_detail(
+    home: &Path,
+    session: SessionSummary,
+    supplements: Vec<store::CapturedTranscriptTurn>,
+) -> Result<SessionDetail, CoreError> {
+    load_resolved_session_detail(
+        home,
+        session,
+        supplements,
+        Vec::new(),
+        SessionTranscriptLimit::All,
+        None,
+    )
+}
+
+fn load_resolved_session_detail(
+    home: &Path,
+    session: SessionSummary,
+    supplements: Vec<store::CapturedTranscriptTurn>,
+    runtime_failures: Vec<SessionRuntimeFailure>,
+    transcript_limit: SessionTranscriptLimit,
+    before_index: Option<usize>,
+) -> Result<SessionDetail, CoreError> {
+    let source = session.source;
+    let id = &session.id;
 
     if !session.readable {
         return Ok(unreadable_session_detail(
@@ -1720,7 +1789,7 @@ fn load_session_detail_window(
 
     let parsed = parse_transcript(
         source,
-        &home,
+        home,
         id,
         Path::new(&session.file_path),
         transcript_parse_limit(transcript_limit, supplements.len()),

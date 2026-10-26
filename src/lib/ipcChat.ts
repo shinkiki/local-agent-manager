@@ -109,7 +109,11 @@ export interface AiaBackgroundAnalysis {
   command: string | null;
 }
 
-/** 누적 대화나 시스템 도구를 쓰지 않는 호스트 전용 일회성 사건 분석. */
+/**
+ * 누적 대화나 시스템 도구를 쓰지 않는 일회성 사건 분석.
+ * G11/C20: IPC는 채널별 로그인 요구를 따른다. Tauri 본 창에서만 자동 호출하는 조건은
+ * `appAiaSuggestions.ts`의 호출부에 있으며, IPC의 호스트 전용 권한 제한이 아니다.
+ */
 export function analyzeAiaEvent(eventSummary: string): Promise<AiaBackgroundAnalysis> {
   return call<AiaBackgroundAnalysis>("analyze_aia_event", { request: { eventSummary } });
 }

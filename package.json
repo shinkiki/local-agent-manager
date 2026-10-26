@@ -1,7 +1,7 @@
 {
   "name": "agent-manager-tauri",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Local-first desktop manager for Claude Code, OpenAI Codex, and Google Antigravity sessions",
   "author": "shinkiki",
   "license": "MIT OR Apache-2.0",
@@ -45,16 +45,16 @@
   "dependencies": {
     "@iconify-json/logos": "^1.2.14",
     "@shikijs/core": "^4.4.3",
-    "@shikijs/engine-javascript": "^4.4.3",
+    "@shikijs/engine-javascript": "^4.5.0",
     "@shikijs/langs": "^4.4.3",
-    "@shikijs/themes": "^4.4.3",
+    "@shikijs/themes": "^4.5.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.2",
     "@tauri-apps/plugin-opener": "^2",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "lucide-react": "^1.51.0",
-    "mermaid": "^11.17.2",
+    "mermaid": "^12.1.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

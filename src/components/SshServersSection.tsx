@@ -3,6 +3,7 @@ import { useState, type ReactNode } from "react";
 import { checkSshEndpoint, deleteSshServer, saveSshServer } from "../lib/ipc";
 import { useI18n } from "../lib/i18n";
 import { parseSshPort } from "../lib/sshPort";
+import { commandLines } from "../lib/sshCommandRules";
 import type { ConfirmRequest } from "./Shared";
 import type { SaveSshServerRequest, SshCommandPolicyDefaults, SshEndpointCheckReceipt, SshEndpointView, SshKeysSnapshot, SshKeyView, TerminalSshMode } from "../types";
 import { canOpenSshTerminal, SshTerminalPanel } from "./TerminalPanel";
@@ -49,11 +50,6 @@ interface ServerDraft {
   terminalEnabled: boolean;
   unrestrictedCommands: boolean;
   projectGitEnabled: boolean;
-}
-
-/** 여러 줄 입력을 규칙 목록으로 바꾼다. 백엔드와 같은 규칙으로 빈 줄과 공백을 접는다. */
-function commandLines(value: string): string[] {
-  return value.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
 }
 
 /**

@@ -130,11 +130,12 @@ export interface ConsumerSummary {
 /**
  * 공급자별 순여유 합계. 공급자마다 계정 전체를 다시 거르지 않도록 한 번만 훑는다.
  * 실측이 없는 공급자는 키 자체가 없고, 읽는 쪽은 0으로 떨어진다.
+ * 계정별 0 하한 후 합산 — 한도를 넘긴 계정이 다른 계정의 여유를 깎지 않는다.
  */
 function headroomByProvider(accounts: UsageBudgetAccount[]): Map<ProviderId, number> {
   const totals = new Map<ProviderId, number>();
   for (const account of accounts) {
-    totals.set(account.provider, (totals.get(account.provider) ?? 0) + headroomOf(account));
+    totals.set(account.provider, (totals.get(account.provider) ?? 0) + Math.max(0, headroomOf(account)));
   }
   return totals;
 }

@@ -12,7 +12,7 @@ import { formatDateTime } from "../lib/format";
 import { useI18n } from "../lib/i18n";
 import { listRoundReports, resolveRoundDecision, updateRoundGoal } from "../lib/ipc";
 import { humanPendingDecisionCount, roundAnswerableDecisionCount } from "../lib/roundDecisions";
-import { roundTextParagraphs } from "../lib/roundText";
+import { roundDecisionQuestionParts, roundTextParagraphs } from "../lib/roundText";
 import type { RoundDecision, RoundDecisionMode, RoundGoal, RoundReport } from "../types";
 import { ErrorBanner, Modal } from "./Shared";
 
@@ -96,7 +96,7 @@ export function RoundReportBlock({ report, children }: PropsWithChildren<{ repor
       <RoundReportList label={text("되돌린 것", "Reverted")} items={report.reverted} />
       <RoundReportList label={text("다음", "Next")} items={report.next} />
       {report.decisions.map((decision, index) => decision.resolved
-        ? <small className="db-connection-meta" key={index}>{text("결정", "Decision")}: {decision.question} → {decision.resolved}</small>
+        ? <small className="db-connection-meta" key={index}>{text("결정", "Decision")}: {roundDecisionQuestionParts(decision.question).lead} → {decision.resolved}</small>
         : null)}
       {children}
     </div>
@@ -228,12 +228,19 @@ export function RoundReportsModal({ goal, onClose, onResolved, onGoalUpdated }: 
               {report.decisions.map((decision, index) => {
                 if (decision.resolved) return null;
                 const key = `${report.id}:${index}`;
+                const question = roundDecisionQuestionParts(decision.question);
+                // 추천이 선택지 원문과 같으면 버튼이 강조로 보여 준다. 설명 글로 적힌 예전 추천은 따로 한 줄로 보인다
+                // (빈 추천은 백엔드가 저장 전에 지운다).
+                const looseRecommendation = decision.recommendation && !decision.options.includes(decision.recommendation) ? decision.recommendation : null;
                 return (
                   <div className="round-decision" key={key} data-decision-index={index}>
-                    <p>
+                    <p className="round-decision-lead">
                       {decision.requiresHuman && <span className="db-badge round-decision-human">{text("사람 결정", "Needs a person")}</span>}
-                      {decision.question}
+                      {question.lead}
                     </p>
+                    {question.body.map((line, lineIndex) => <p key={lineIndex}>{line}</p>)}
+                    {question.evidence && <small className="db-connection-meta round-decision-evidence">{question.evidence}</small>}
+                    {looseRecommendation && <small className="round-decision-recommendation">{text("추천", "Recommended")}: {looseRecommendation}</small>}
                     <RoundDecisionForm
                       decision={decision}
                       busy={busy}

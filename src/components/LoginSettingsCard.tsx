@@ -395,7 +395,10 @@ function PasswordForm({ settings, busy, onCancel, onSubmit }: {
       return;
     }
     setIssue(null);
-    void onSubmit(userId.trim(), next, reauth).then(() => { setNext(""); setAgain(""); setReauth({}); });
+    // 저장에 성공하면 카드가 패널을 닫아 이 폼째로 사라진다. 그러니 여기서 칸을 비우면 그것은
+    // 실패(현재 비밀번호 틀림, 아이디 거절)나 다른 동작이 도는 중일 때뿐이고, 고칠 칸 하나 때문에
+    // 새 비밀번호 두 칸까지 다시 치게 된다. 입력은 그대로 둔다.
+    void onSubmit(userId.trim(), next, reauth);
   };
   return (
     <form className="storage-secrets-form login-settings-form" onSubmit={submit}>

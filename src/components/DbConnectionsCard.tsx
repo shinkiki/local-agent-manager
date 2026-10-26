@@ -5,6 +5,7 @@ import { useI18n } from "../lib/i18n";
 import type { DbConnectionCheckReceipt, DbConnectionsSnapshot, DbConnectionView, DbCredentialSource, DbEngineKind, DbEnvironment, DbWriteMode } from "../types";
 import { ErrorBanner, useBusyAction, useConfirm } from "./Shared";
 import { errorText } from "../lib/errorText";
+import { createLatestGate } from "../lib/latestRequest";
 
 /** 엔진마다 기본 포트가 다르다. 백엔드도 같은 값을 쓰므로 한쪽만 고치지 않는다. */
 const DEFAULT_PORTS: Record<DbEngineKind, string> = { mysql: "3306", mariadb: "3306", postgres: "5432", sqlite: "" };
@@ -324,17 +325,28 @@ export function DbConnectionsCard({ active }: { active: boolean }) {
   const fileEngine = isFileEngine(draft.engine);
   const patchDraft = (patch: Partial<Draft>) => setDraft({ ...draft, ...patch });
 
+  // 목록을 고치는 응답은 마지막에 시작한 요청 것만 반영한다. 탭에 들어올 때나 새로고침으로
+  // 띄운 조회가 그 사이 끝난 토글·저장·삭제보다 늦게 오면 바뀌기 전 목록을 다시 펴고, 다음
+  // 토글이 그 낡은 값을 뒤집어 보내 앞선 토글을 조용히 무르지 못한다.
+  const [snapshotGate] = useState(createLatestGate);
+  /** 요청을 시작하며 앞선 요청을 무효로 하고, 이 요청이 여전히 마지막일 때만 반영한다. */
+  const applyLatest = useCallback(async (request: Promise<DbConnectionsSnapshot>) => {
+    const isCurrent = snapshotGate.begin();
+    const next = await request;
+    if (isCurrent()) setSnapshot(next);
+  }, [snapshotGate]);
+
   const load = useCallback(async () => {
+    const isCurrent = snapshotGate.begin();
     try {
       const next = await getDbConnections();
+      if (!isCurrent()) return;
       setSnapshot(next);
       setError(null);
-      return next;
     } catch (cause) {
-      setError(errorText(cause));
-      return null;
+      if (isCurrent()) setError(errorText(cause));
     }
-  }, []);
+  }, [snapshotGate]);
 
   useEffect(() => {
     if (!active) { loadedRef.current = false; return; }
@@ -358,7 +370,7 @@ export function DbConnectionsCard({ active }: { active: boolean }) {
   const save = () => run("save", async () => {
     const port = Number.parseInt(draft.port.trim(), 10);
     const maxRows = Number.parseInt(draft.maxRows.trim(), 10);
-    const next = await setDbConnection({
+    await applyLatest(setDbConnection({
       id: draft.id,
       displayName: draft.displayName.trim(),
       engine: draft.engine,
@@ -378,13 +390,12 @@ export function DbConnectionsCard({ active }: { active: boolean }) {
       maskedColumns: lines(draft.maskedColumns),
       maxRows: Number.isInteger(maxRows) ? maxRows : null,
       note: draft.note.trim(),
-    });
-    setSnapshot(next);
+    }));
     setEditing(null);
   });
 
   const toggle = (connection: DbConnectionView) => run(`toggle:${connection.id}`, async () => {
-    setSnapshot(await setDbConnectionEnabled({ id: connection.id, enabled: !connection.agentEnabled }));
+    await applyLatest(setDbConnectionEnabled({ id: connection.id, enabled: !connection.agentEnabled }));
   });
 
   const check = (connection: DbConnectionView) => run(`check:${connection.id}`, async () => {
@@ -404,7 +415,7 @@ export function DbConnectionsCard({ active }: { active: boolean }) {
       tone: "danger",
     });
     if (!ok) return;
-    setSnapshot(await removeDbConnection({ id: connection.id }));
+    await applyLatest(removeDbConnection({ id: connection.id }));
     if (editing === connection.id) setEditing(null);
   });
 

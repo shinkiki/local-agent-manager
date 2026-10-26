@@ -1,7 +1,7 @@
 import type { ChatInputFile } from "../types";
 import { backendHttpUrl, hasNativeShell } from "./backend.ts";
 import { assertRemoteChatAccess } from "./chatAccess.ts";
-import { withLoginSession } from "./ipcTransport.ts";
+import { responseError, withLoginSession } from "./ipcTransport.ts";
 
 export async function uploadChatInputFile(chatId: string, file: File): Promise<ChatInputFile> {
   await assertRemoteChatAccess();
@@ -57,9 +57,8 @@ async function responseJsonOrNull<Value>(response: Response): Promise<Value | nu
 }
 
 /**
- * 첨부 파일 API를 호출하고 실패 응답을 한 가지 방식으로 알린다. 실패 본문 JSON의 `error`를
- * 우선 쓰고, 본문이 없거나 JSON이 아니면 상태 코드를 덧붙인 기본 문구로 대신한다. 본문은
- * 성공했을 때만 호출부가 읽으므로 같은 응답을 두 번 읽는 일이 없다.
+ * 첨부 파일 API를 호출하고 실패 응답을 공통 처리기에 맡긴다. C20: 로그인 만료 응답은
+ * 만료 토큰을 지우고 로그인 게이트를 다시 열어야 한다. 성공 본문은 호출부가 읽는다.
  */
 async function chatAttachmentRequest(
   path: string,
@@ -68,6 +67,5 @@ async function chatAttachmentRequest(
 ): Promise<Response> {
   const response = await fetch(backendHttpUrl(path), withLoginSession(init));
   if (response.ok) return response;
-  const body = await responseJsonOrNull<{ error?: string }>(response);
-  throw new Error(body?.error || `${fallback} (${response.status})`);
+  throw await responseError(response, fallback);
 }

@@ -134,8 +134,8 @@ export const AIA_RUNTIME_DEFAULTS: AiaRuntimeSettings = {
  * 빠뜨리면 저장해 둔 값이 조용히 사라진다. 어느 쪽도 형식 오류를 내지 않는다.
  */
 interface RuntimeField<Key extends keyof AiaRuntimeSettings> {
-  /** 저장본에 이 항목이 없을 때 쓸 값. 매번 새로 떠서 표의 값이 밖으로 새지 않게 한다. */
-  stored(): AiaRuntimeSettings[Key];
+  /** 저장본의 값을 읽거나 없을 때 기본값을 쓴다. 객체는 매번 새로 떠서 표나 저장본의 값이 밖으로 새지 않게 한다. */
+  stored(value?: SystemAgentRuntime[Key] | null): AiaRuntimeSettings[Key];
   /** 저장·비교가 함께 쓰는 정본 모양. 뜻을 바꾸지 않는 차이(앞뒤 공백·키 순서)를 여기서 없앤다. */
   normalize(value: AiaRuntimeSettings[Key]): SystemAgentRuntime[Key];
   /**
@@ -152,44 +152,44 @@ interface RuntimeField<Key extends keyof AiaRuntimeSettings> {
  */
 const RUNTIME_FIELDS: { [Key in keyof AiaRuntimeSettings]: RuntimeField<Key> } = {
   model: {
-    stored: () => null,
+    stored: (value) => (typeof value === "string" ? value : null),
     normalize: (value) => value?.trim() || null,
     startup: true,
   },
   // 로컬 공급자의 서빙 연결(M7). 기동 때 정해지므로 바꾸면 다시 시작한다.
   localConnectionId: {
-    stored: () => null,
+    stored: (value) => (typeof value === "string" ? value : null),
     normalize: (value) => value?.trim() || null,
     startup: true,
   },
   // 저장본이 있는데 추론 강도만 비어 있으면 AIA 기본값이 아니라 공급자 기본값으로 남긴다.
   reasoningEffort: {
-    stored: () => null,
+    stored: (value) => value ?? null,
     normalize: (value) => value ?? null,
     startup: true,
   },
   mode: {
-    stored: () => AIA_RUNTIME_DEFAULTS.mode,
+    stored: (value) => value ?? AIA_RUNTIME_DEFAULTS.mode,
     normalize: (value) => value,
     startup: true,
   },
   approvalMode: {
-    stored: () => AIA_RUNTIME_DEFAULTS.approvalMode,
+    stored: (value) => value ?? AIA_RUNTIME_DEFAULTS.approvalMode,
     normalize: (value) => value,
     startup: true,
   },
   decisionPolicy: {
-    stored: () => AIA_RUNTIME_DEFAULTS.decisionPolicy,
+    stored: (value) => value ?? AIA_RUNTIME_DEFAULTS.decisionPolicy,
     normalize: (value) => value,
     startup: true,
   },
   uiClickPolicy: {
-    stored: () => AIA_RUNTIME_DEFAULTS.uiClickPolicy,
+    stored: (value) => value ?? AIA_RUNTIME_DEFAULTS.uiClickPolicy,
     normalize: (value) => value,
     startup: false,
   },
   settings: {
-    stored: () => ({}),
+    stored: (value) => ({ ...(value ?? {}) }),
     normalize: (value) => Object.fromEntries(normalizedDynamicSettings(value)),
     startup: true,
   },
@@ -231,8 +231,8 @@ function applyStoredField<Key extends keyof AiaRuntimeSettings>(
   key: Key,
   stored: SystemAgentRuntime,
 ): void {
-  const value = stored[key] as AiaRuntimeSettings[Key] | null | undefined;
-  target[key] = value ?? RUNTIME_FIELDS[key].stored();
+  const value = stored[key] as SystemAgentRuntime[Key] | undefined;
+  target[key] = RUNTIME_FIELDS[key].stored(value);
 }
 
 /** 실행설정 화면에서 편집한 값을 저장 요청 형태로 바꾼다. 비운 항목은 공급자 기본값으로 남긴다. */

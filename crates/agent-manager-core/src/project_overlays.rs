@@ -1338,7 +1338,7 @@ pub(crate) fn verify_stored_patch(patch_path: &Path) -> Result<StoredOverlayPatc
     }
     let bytes = fs::read(patch_path).map_err(CoreError::Io)?;
     Ok(StoredOverlayPatch {
-        patch_digest: format!("{:x}", Sha256::digest(&bytes)),
+        patch_digest: crate::identifier::lower_hex(&Sha256::digest(&bytes)),
         patch_bytes: bytes.len() as u64,
     })
 }

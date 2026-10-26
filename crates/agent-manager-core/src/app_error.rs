@@ -172,4 +172,38 @@ mod tests {
         assert!(!valid_app_error_code("HAS SPACE"));
         assert!(!valid_app_error_code("HAS-DASH"));
     }
+
+    #[test]
+    fn constructors_cover_remaining_kinds_and_message_accessor() {
+        let conflict =
+            AppError::conflict("LOGIN_OTP_SETUP_MISSING", "진행 중인 OTP 등록이 없습니다");
+        assert_eq!(conflict.code(), "LOGIN_OTP_SETUP_MISSING");
+        assert_eq!(conflict.kind(), AppErrorKind::Conflict);
+        assert_eq!(conflict.message(), "진행 중인 OTP 등록이 없습니다");
+
+        let unauthorized = AppError::unauthorized("LOGIN_REQUIRED", "로그인이 필요합니다");
+        assert_eq!(unauthorized.code(), "LOGIN_REQUIRED");
+        assert_eq!(unauthorized.kind(), AppErrorKind::Unauthorized);
+        assert_eq!(unauthorized.message(), "로그인이 필요합니다");
+
+        let rate_limited = AppError::rate_limited("LOGIN_LOCKED", "요청이 너무 많습니다");
+        assert_eq!(rate_limited.code(), "LOGIN_LOCKED");
+        assert_eq!(rate_limited.kind(), AppErrorKind::RateLimited);
+        assert_eq!(rate_limited.message(), "요청이 너무 많습니다");
+    }
+
+    #[test]
+    fn code_shape_boundary_cases() {
+        assert!(valid_app_error_code("A"));
+        assert!(valid_app_error_code("A1_B2"));
+        assert!(!valid_app_error_code("_"));
+        assert!(!valid_app_error_code("한글"));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "오류 코드는 대문자·숫자·밑줄만 쓴다")]
+    fn panics_on_invalid_code_in_debug() {
+        let _ = AppError::invalid_input("invalid code", "메시지");
+    }
 }

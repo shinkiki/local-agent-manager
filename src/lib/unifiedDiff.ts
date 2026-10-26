@@ -23,7 +23,7 @@ const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
  * 충돌 파일의 `git diff`는 부모가 둘인 combined diff(`diff --cc`)라 hunk 머리말이 `@@@`이고
  * 줄 접두가 두 칸이다. 첫 부모 열을 "변경 전"으로 삼아 같은 행 모양으로 푼다.
  */
-const COMBINED_HUNK_HEADER = /^@@@ -(\d+)(?:,(\d+))? -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@@/;
+const COMBINED_HUNK_HEADER = /^@@@ -(\d+)(?:,(\d+))? -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@@/;
 
 export function parseUnifiedDiff(text: string): UnifiedDiffRow[] {
   const rows: UnifiedDiffRow[] = [];
@@ -33,10 +33,10 @@ export function parseUnifiedDiff(text: string): UnifiedDiffRow[] {
 
   let before = 0;
   let after = 0;
-  let remainingBefore = 0;
+  let remainingParents: number[] = [];
   let remainingAfter = 0;
   let columns = 1;
-  const inHunk = () => remainingBefore > 0 || remainingAfter > 0;
+  const inHunk = () => remainingParents.some((remaining) => remaining > 0) || remainingAfter > 0;
 
   for (const line of lines) {
     const combined = COMBINED_HUNK_HEADER.exec(line);
@@ -44,9 +44,11 @@ export function parseUnifiedDiff(text: string): UnifiedDiffRow[] {
     if (header) {
       columns = combined ? 2 : 1;
       before = Number(header[1]);
-      remainingBefore = header[2] === undefined ? 1 : Number(header[2]);
-      after = Number(header[3]);
-      remainingAfter = header[4] === undefined ? 1 : Number(header[4]);
+      remainingParents = [header[2] === undefined ? 1 : Number(header[2])];
+      if (combined) remainingParents.push(combined[4] === undefined ? 1 : Number(combined[4]));
+      const resultIndex = combined ? 5 : 3;
+      after = Number(header[resultIndex]);
+      remainingAfter = header[resultIndex + 1] === undefined ? 1 : Number(header[resultIndex + 1]);
       rows.push({ kind: "hunk", before: null, after: null, text: line });
       continue;
     }
@@ -61,20 +63,24 @@ export function parseUnifiedDiff(text: string): UnifiedDiffRow[] {
     }
     const prefix = line.slice(0, columns);
     const body = line.slice(columns);
+    // V4: combined diff의 ` +`는 첫 부모에도 있는 결과 줄이고, ` -`는 둘째 부모만의
+    // 삭제 줄이다. 색은 어느 부모와라도 다른지를 보되, 번호와 hunk 끝은 부모별로 센다.
+    const inResult = !prefix.includes("-");
+    const inParents = remainingParents.map((_, index) => (
+      inResult ? prefix[index] !== "+" : prefix[index] === "-"
+    ));
     if (prefix.includes("+")) {
       rows.push({ kind: "add", before: null, after, text: body });
-      after += 1;
-      remainingAfter -= 1;
     } else if (prefix.includes("-")) {
-      rows.push({ kind: "remove", before, after: null, text: body });
-      before += 1;
-      remainingBefore -= 1;
+      rows.push({ kind: "remove", before: inParents[0] ? before : null, after: null, text: body });
     } else {
       // 공백 접두, 또는 끝 공백이 잘린 빈 문맥 줄.
       rows.push({ kind: "context", before, after, text: prefix.trim() === "" && prefix.length === columns ? body : line });
-      before += 1;
+    }
+    if (inParents[0]) before += 1;
+    remainingParents = remainingParents.map((remaining, index) => remaining - Number(inParents[index]));
+    if (inResult) {
       after += 1;
-      remainingBefore -= 1;
       remainingAfter -= 1;
     }
   }

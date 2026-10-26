@@ -89,7 +89,7 @@ type CliAction = "check" | "update" | "clearModelCaches";
  */
 const CLI_ACTION_BLOCKS: Record<
   CliAction,
-  (status: ProviderCliUpdateStatus, access: CliActionAccess) => CliActionBlock | null
+  (status: ProviderCliUpdateStatus) => CliActionBlock | null
 > = {
   check: (status) =>
     executableActionBlock(status, status.checkSupported, "checkUnsupported"),
@@ -113,16 +113,15 @@ function cliActionAllowed(
   status: ProviderCliUpdateStatus,
   access: CliActionAccess,
 ): boolean {
-  return CLI_ACTION_BLOCKS[action](status, access) === null && !access.busy;
+  return CLI_ACTION_BLOCKS[action](status) === null && !access.busy;
 }
 
 /** 이 작업을 막고 있는 것의 안내 문구. 막는 것이 없거나 문구를 내지 않는 갈래면 null. */
 function cliActionBlockedReason(
   action: CliAction,
   status: ProviderCliUpdateStatus,
-  access: CliActionAccess,
 ): string | null {
-  const block = CLI_ACTION_BLOCKS[action](status, access);
+  const block = CLI_ACTION_BLOCKS[action](status);
   return block === null ? null : CLI_ACTION_BLOCK_REASONS[block]?.(status) ?? null;
 }
 
@@ -141,12 +140,16 @@ export function canRunCliUpdate(
   return cliActionAllowed("update", status, access);
 }
 
-/** 업데이트를 실행할 수 없는 이유. 실행 가능하면 null. 막는 것이 무엇인지는 사다리가 정한다. */
+/**
+ * 업데이트를 실행할 수 없는 이유. 실행 가능하면 null. 막는 것이 무엇인지는 사다리가 정한다.
+ * 사다리는 상태 한 건만 본다 — `_access`는 공개 시그니처를 맞추려고 받을 뿐이고, 다른 작업이
+ * 도는 중(`busy`)은 막힘 사유가 아니라 잠깐 기다릴 일이라 문구를 내지 않는다.
+ */
 export function cliUpdateBlockedReason(
   status: ProviderCliUpdateStatus,
-  access: CliActionAccess,
+  _access: CliActionAccess,
 ): string | null {
-  return cliActionBlockedReason("update", status, access);
+  return cliActionBlockedReason("update", status);
 }
 
 /**
@@ -173,9 +176,9 @@ export function canClearModelCaches(
 /** 캐시 정리를 제공할 수 없는 이유. 제공 가능하거나 할 일이 없을 뿐이면 null. */
 export function modelCacheBlockedReason(
   status: ProviderCliUpdateStatus,
-  access: CliActionAccess,
+  _access: CliActionAccess,
 ): string | null {
-  return cliActionBlockedReason("clearModelCaches", status, access);
+  return cliActionBlockedReason("clearModelCaches", status);
 }
 
 /** 종료 확인이 필요한 대상 수. 0이면 확인창 없이 진행할 수 있다. */

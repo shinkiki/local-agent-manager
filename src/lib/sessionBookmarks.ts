@@ -115,3 +115,44 @@ export function removeBookmark(current: SessionBookmark[], id: string): SessionB
 export function bookmarksFull(current: SessionBookmark[]): boolean {
   return current.length >= MAX_SESSION_BOOKMARKS;
 }
+
+/**
+ * 목록 통째 저장 한 번 — 먼저 화면에 보이고, 답이 오면 저장본으로 맞추고, 실패하면 되돌린다.
+ *
+ * 저장은 비동기라 답이 오기 전에 화면이 다른 대화로 옮겨 갈 수 있다. 그때 답을 그대로
+ * 화면 목록에 적으면 앞 대화의 자리가 새 대화 목록으로 들어가고, 그 목록에서 하나를 더
+ * 표시하거나 지우는 순간 앞 대화의 자리까지 새 대화에 통째로 저장된다. 그래서 화면 목록을
+ * 고치는 두 갈래(맞추기·되돌리기)와 실패 알림은 `stillCurrent`가 참일 때만 한다.
+ * 저장 결과를 세션 목록에 알리는 `onSaved`는 그 세션의 값이라 화면이 옮겨 갔어도 알린다.
+ */
+export async function saveBookmarkList<M extends { bookmarks?: SessionBookmark[] | null }>({
+  next,
+  previous,
+  write,
+  stillCurrent,
+  show,
+  onSaved,
+  onError,
+}: {
+  next: SessionBookmark[];
+  previous: SessionBookmark[];
+  write: (next: SessionBookmark[]) => Promise<M>;
+  stillCurrent: () => boolean;
+  show: (items: SessionBookmark[]) => void;
+  onSaved?: (meta: M) => void;
+  onError: (cause: unknown) => void;
+}): Promise<void> {
+  show(next);
+  let meta: M;
+  try {
+    meta = await write(next);
+  } catch (cause) {
+    // 저장이 실패했는데 화면에만 남으면, 다음에 열었을 때 있던 자리가 사라진다.
+    if (!stillCurrent()) return;
+    show(previous);
+    onError(cause);
+    return;
+  }
+  if (stillCurrent()) show(meta.bookmarks ?? []);
+  onSaved?.(meta);
+}

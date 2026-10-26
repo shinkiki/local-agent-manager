@@ -142,6 +142,29 @@ test("stored run settings are read per provider and may fall back to provider de
   assert.deepEqual(aiaRuntimeSettings(runtimes, "codex"), runtime());
 });
 
+test("stored run settings isolate the dynamic settings object so edits do not mutate the source", () => {
+  const originalSettings = { fallbackModel: "claude-sonnet-5" };
+  const runtimes = {
+    claude: {
+      model: "claude-opus-5",
+      reasoningEffort: null,
+      mode: "plan",
+      approvalMode: "never",
+      decisionPolicy: "recommended",
+      settings: originalSettings,
+    },
+  };
+  const first = aiaRuntimeSettings(runtimes, "claude");
+  const second = aiaRuntimeSettings(runtimes, "claude");
+  assert.notEqual(first.settings, originalSettings, "저장본의 settings 객체 참조를 그대로 내보내면 안 된다");
+  assert.notEqual(first.settings, second.settings, "매번 새 객체를 만들어 호출 간 편집 상태가 공유되지 않아야 한다");
+  assert.deepEqual(first.settings, originalSettings);
+
+  first.settings.fallbackModel = "mutated";
+  assert.equal(originalSettings.fallbackModel, "claude-sonnet-5", "초안 편집이 저장본 원본을 오염시켜서는 안 된다");
+  assert.equal(second.settings.fallbackModel, "claude-sonnet-5", "초안 편집이 다른 읽기 결과를 오염시켜서는 안 된다");
+});
+
 test("saving one provider keeps the other provider's run settings", () => {
   const runtimes = { codex: { mode: "workspace", approvalMode: "autoReview", model: null, reasoningEffort: "high", decisionPolicy: "ask", settings: {} } };
   const next = systemAgentRuntimePatch(runtimes, "claude", runtime({

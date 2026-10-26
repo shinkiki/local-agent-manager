@@ -2133,12 +2133,21 @@ fn wait_for_reader_eof(mut reader: impl Read) -> std::io::Result<()> {
     }
 }
 
-fn migration_app_data_dir(mut args: impl Iterator<Item = String>) -> Result<PathBuf, String> {
-    let mut app_data_dir = default_app_data_dir()?;
+fn migration_app_data_dir(args: impl Iterator<Item = String>) -> Result<PathBuf, String> {
+    migration_app_data_dir_with(args, default_app_data_dir)
+}
+
+/// 기본 앱 데이터 경로는 `--app-data-dir`가 없을 때만 구한다. 먼저 구하면 `HOME`이 없는
+/// 컨테이너에서 경로를 명시해도 기동이 실패한다.
+fn migration_app_data_dir_with(
+    mut args: impl Iterator<Item = String>,
+    default_dir: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<PathBuf, String> {
+    let mut app_data_dir = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--app-data-dir" => {
-                app_data_dir = PathBuf::from(required_value(&mut args, "--app-data-dir")?);
+                app_data_dir = Some(PathBuf::from(required_value(&mut args, "--app-data-dir")?));
             }
             "-h" | "--help" => {
                 println!("Usage: agent-manager-server migrate-keychain-v2 [--app-data-dir PATH]");
@@ -2147,7 +2156,10 @@ fn migration_app_data_dir(mut args: impl Iterator<Item = String>) -> Result<Path
             _ => return Err(format!("알 수 없는 마이그레이션 인자입니다: {arg}")),
         }
     }
-    Ok(app_data_dir)
+    match app_data_dir {
+        Some(path) => Ok(path),
+        None => default_dir(),
+    }
 }
 
 /// C20-7. 떠 있는 백엔드는 로그인 설정을 메모리에 들고 있다가 다음 로그인·세션 갱신에서
@@ -2173,10 +2185,18 @@ struct StandaloneServerOptions {
 }
 
 impl StandaloneServerOptions {
-    fn from_args(mut args: impl Iterator<Item = String>) -> Result<Self, String> {
+    fn from_args(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        Self::from_args_with(args, default_app_data_dir)
+    }
+
+    /// `migration_app_data_dir_with`와 같은 이유로 기본 경로는 파싱이 끝난 뒤에만 구한다.
+    fn from_args_with(
+        mut args: impl Iterator<Item = String>,
+        default_dir: impl FnOnce() -> Result<PathBuf, String>,
+    ) -> Result<Self, String> {
         let mut port = DEFAULT_REMOTE_ACCESS_PORT;
         let mut static_dir = PathBuf::from("dist");
-        let mut app_data_dir = default_app_data_dir()?;
+        let mut app_data_dir = None;
         let mut tailscale_host = None;
         let mut tailscale_user = None;
         let mut tailscale_serve_port = None;
@@ -2207,7 +2227,8 @@ impl StandaloneServerOptions {
                     static_dir = PathBuf::from(required_value(&mut args, "--static-dir")?);
                 }
                 "--app-data-dir" => {
-                    app_data_dir = PathBuf::from(required_value(&mut args, "--app-data-dir")?);
+                    app_data_dir =
+                        Some(PathBuf::from(required_value(&mut args, "--app-data-dir")?));
                 }
                 "--tailscale-host" => {
                     tailscale_host = Some(required_value(&mut args, "--tailscale-host")?);
@@ -2256,6 +2277,10 @@ impl StandaloneServerOptions {
                 _ => return Err(format!("알 수 없는 인자입니다: {arg}")),
             }
         }
+        let app_data_dir = match app_data_dir {
+            Some(path) => path,
+            None => default_dir()?,
+        };
 
         if reset_login {
             let removed = reset_login_with_ownership(&app_data_dir)?;
@@ -2707,7 +2732,7 @@ async fn maybe_gzip_response(response: HttpResponse, enabled: bool) -> HttpRespo
         return Response::from_parts(parts, Full::new(body));
     };
 
-    mark_gzip_headers(&mut parts.headers);
+    mark_gzip_headers(&mut parts.headers, body.len());
     Response::from_parts(parts, Full::new(compressed))
 }
 
@@ -2718,9 +2743,17 @@ fn gzip_bytes(body: &[u8]) -> Option<Bytes> {
     (compressed.len() < body.len()).then(|| Bytes::from(compressed))
 }
 
-fn mark_gzip_headers(headers: &mut HeaderMap) {
+/// 압축하기 전 본문 크기를 싣는 헤더. 압축하면 Content-Length 는 압축된 크기가 되는데 화면이
+/// 읽는 스트림은 풀린 바이트라, 큰 응답(세션 원문)을 받는 동안의 실제 진행을 셀 기준이 사라진다.
+const UNCOMPRESSED_LENGTH_HEADER: &str = "x-uncompressed-length";
+
+fn mark_gzip_headers(headers: &mut HeaderMap, uncompressed_len: usize) {
     headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
     headers.remove(CONTENT_LENGTH);
+    headers.insert(
+        UNCOMPRESSED_LENGTH_HEADER,
+        HeaderValue::from(uncompressed_len),
+    );
     let vary = headers
         .get(VARY)
         .and_then(|value| value.to_str().ok())
@@ -2768,7 +2801,7 @@ fn cached_manager_snapshot_response(
     };
     let mut response = bytes_response(StatusCode::OK, "application/json; charset=utf-8", body);
     if gzipped {
-        mark_gzip_headers(response.headers_mut());
+        mark_gzip_headers(response.headers_mut(), entry.raw.len());
     }
     Ok(response)
 }
@@ -2828,9 +2861,11 @@ fn apply_local_ui_cors(mut response: HttpResponse, origin: Option<&str>) -> Http
     let headers = response.headers_mut();
     headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
     headers.insert(VARY, HeaderValue::from_static("Origin"));
+    // 데스크톱 창은 다른 출처라 노출하지 않은 헤더를 읽지 못한다. 압축 전 크기는 큰 응답을 받는
+    // 동안의 진행을 세는 데 쓴다.
     headers.insert(
         ACCESS_CONTROL_EXPOSE_HEADERS,
-        HeaderValue::from_static("Content-Disposition"),
+        HeaderValue::from_static("Content-Disposition, X-Uncompressed-Length"),
     );
     response
 }
@@ -3248,13 +3283,6 @@ async fn invoke_command_response(
     command: &str,
     compress: bool,
 ) -> HttpResponse {
-    // G4/C4. Vault diagnosis and repair remain host-only even though authenticated
-    // channels otherwise share command permissions (C20).
-    if access.remote() && is_credential_vault_host_only(command) {
-        return error_response(ApiError::forbidden(
-            "자격증명 저장소 복구는 Agent Manager 호스트의 로컬 UI에서만 실행할 수 있습니다",
-        ));
-    }
     if !has_json_content_type(request.headers()) {
         return unsupported_json_content_type_response();
     }
@@ -4082,13 +4110,6 @@ async fn read_body(mut body: Incoming) -> Result<Vec<u8>, ApiError> {
 /// 경계는 이 표를 보지 않는다. 남은 독자는 system_mcp의 등급(`Read`/`Execute`) 일치 시험과
 /// `src/lib/projectMenuConformance.ts`뿐이며, 새 변경 명령은 여전히 여기 적어 두 독자가 어긋나지
 /// 않게 한다.
-fn is_credential_vault_host_only(command: &str) -> bool {
-    matches!(
-        command,
-        "get_credential_vault_recovery_status" | "recover_credential_vault"
-    )
-}
-
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_write_command(command: &str) -> bool {
     matches!(
@@ -4761,7 +4782,12 @@ fn summarize_paced_preview(plan: &Value, email_of: impl Fn(&str) -> Option<Strin
     let mut runs: Vec<Value> = Vec::new();
     for run in plan["plannedRuns"].as_array().into_iter().flatten() {
         let account_id = run["accountId"].as_str().unwrap_or_default();
-        if let Some(existing) = runs.iter_mut().find(|row| row["accountId"] == account_id) {
+        // 같은 계정이라도 모델이 다르면 다른 줄이다 — Antigravity 계정 하나에 모델군 여럿을
+        // 함께 배정하면 줄을 합쳐서는 어느 모델군이 몇 건인지 보이지 않는다.
+        if let Some(existing) = runs
+            .iter_mut()
+            .find(|row| row["accountId"] == account_id && row["model"] == run["model"])
+        {
             existing["count"] = json!(existing["count"].as_u64().unwrap_or(0) + 1);
             continue;
         }
@@ -6300,6 +6326,10 @@ fn dispatch_session_command(
         "get_manager_snapshot_delta" => {
             let args: SnapshotDeltaArgs = parse_optional_params(params)?;
             to_value(session_catalog.snapshot_delta(args.since_revision)?)
+        }
+        "search_sessions" => {
+            let args: RequestEnvelope<crate::SessionSearchRequest> = parse_params(params)?;
+            to_value(session_catalog.search_sessions(args.request)?)
         }
         "list_sessions" => {
             let args: RequestEnvelope<SessionListRequest> = parse_params(params)?;
@@ -9461,6 +9491,19 @@ mod tests {
             summarize_paced_preview(&idle, email_of)["note"],
             "목표 사용률 도달"
         );
+        // 같은 Antigravity 계정에 모델군 둘을 함께 배정하면 모델마다 한 줄이다.
+        let groups = json!({
+            "plannedRuns": [
+                { "index": 1, "accountId": "antigravity-a", "source": "antigravity", "model": "gemini-4-argon-high" },
+                { "index": 2, "accountId": "antigravity-a", "source": "antigravity", "model": "claude-opus-5-5-high" }
+            ],
+            "accounts": [],
+            "reasoning": []
+        });
+        let rows = summarize_paced_preview(&groups, email_of)["runs"].clone();
+        assert_eq!(rows.as_array().map(Vec::len), Some(2));
+        assert_eq!(rows[0]["model"], "gemini-4-argon-high");
+        assert_eq!(rows[1]["model"], "claude-opus-5-5-high");
         let silent = json!({ "plannedRuns": [], "accounts": [], "reasoning": ["마지막 판단"] });
         assert_eq!(
             summarize_paced_preview(&silent, email_of)["note"],
@@ -9762,6 +9805,11 @@ mod tests {
             compressed.headers().get(VARY),
             Some(&HeaderValue::from_static("Accept-Encoding"))
         );
+        // 화면은 이 값으로 받은 바이트(풀린 크기)의 비율을 센다.
+        assert_eq!(
+            compressed.headers().get(UNCOMPRESSED_LENGTH_HEADER),
+            Some(&HeaderValue::from(original.len()))
+        );
         let bytes = compressed
             .into_body()
             .collect()
@@ -10043,7 +10091,9 @@ mod tests {
         );
         assert_eq!(
             response.headers().get(ACCESS_CONTROL_EXPOSE_HEADERS),
-            Some(&HeaderValue::from_static("Content-Disposition"))
+            Some(&HeaderValue::from_static(
+                "Content-Disposition, X-Uncompressed-Length"
+            ))
         );
         // 광고하는 목록과 검사하는 목록이 한 상수라는 사실을 여기서 못 박는다.
         assert_eq!(
@@ -10127,10 +10177,6 @@ mod tests {
         assert!(is_write_command("put_doc"));
         assert!(!is_write_command("get_credential_vault_recovery_status"));
         assert!(is_write_command("recover_credential_vault"));
-        assert!(is_credential_vault_host_only(
-            "get_credential_vault_recovery_status"
-        ));
-        assert!(is_credential_vault_host_only("recover_credential_vault"));
         // 회차 계획은 예약을 기록하므로 변경 작업이고, 미리보기는 기록이 없어 조회다.
         assert!(is_write_command("plan_usage_paced_runs"));
         assert!(!is_write_command("preview_usage_paced_runs"));
@@ -11042,6 +11088,59 @@ mod tests {
         // 원격 인자 없이 손으로 띄운 로컬 서버는 헤드리스가 아니다.
         assert!(!parsed(&[]));
         assert!(!parsed(&[DESKTOP_SHELL_ARG]));
+    }
+
+    #[test]
+    fn app_data_dir_default_is_resolved_only_without_explicit_path() {
+        let directory = tempdir().expect("temporary directory");
+        fs::write(directory.path().join("index.html"), "ok").expect("index file");
+        let explicit = directory.path().join("data");
+        let static_args = || {
+            vec![
+                "--static-dir".to_owned(),
+                directory.path().to_string_lossy().into_owned(),
+            ]
+        };
+        let with_dir = |mut args: Vec<String>| {
+            args.extend([
+                "--app-data-dir".to_owned(),
+                explicit.to_string_lossy().into_owned(),
+            ]);
+            args
+        };
+        let no_home = || Err::<PathBuf, String>("HOME을 확인할 수 없습니다".to_owned());
+        let fallback = directory.path().join("fallback");
+
+        // (a) HOME 없는 컨테이너라도 경로를 명시하면 기동한다.
+        let options =
+            StandaloneServerOptions::from_args_with(with_dir(static_args()).into_iter(), no_home)
+                .expect("explicit app data dir");
+        assert_eq!(options.app_data_dir, explicit);
+        assert_eq!(
+            migration_app_data_dir_with(with_dir(Vec::new()).into_iter(), no_home),
+            Ok(explicit.clone())
+        );
+        // (b) 명시가 없으면 기본 경로 오류를 그대로 돌려준다.
+        assert_eq!(
+            StandaloneServerOptions::from_args_with(static_args().into_iter(), no_home)
+                .err()
+                .as_deref(),
+            Some("HOME을 확인할 수 없습니다")
+        );
+        assert_eq!(
+            migration_app_data_dir_with(std::iter::empty(), no_home),
+            Err("HOME을 확인할 수 없습니다".to_owned())
+        );
+        // (c) 명시가 없으면 기본 경로를 쓴다.
+        let options = StandaloneServerOptions::from_args_with(static_args().into_iter(), || {
+            Ok(fallback.clone())
+        })
+        .expect("default app data dir");
+        assert_eq!(options.app_data_dir, fallback);
+        assert_eq!(
+            migration_app_data_dir_with(std::iter::empty(), || Ok(fallback.clone())),
+            Ok(fallback.clone())
+        );
     }
 
     #[test]

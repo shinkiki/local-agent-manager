@@ -71,8 +71,10 @@ function uiGuideItemId(item: Record<string, unknown>, index: number): {
   label: string;
   declared: string | null;
 } {
+  // id 는 백엔드 카탈로그(system_mcp.rs)와 정확히 같아야 하므로 다듬지 않고, 공백뿐인 값만 없는 것으로 본다.
   const raw = typeof item.id === "string" ? item.id : null;
-  return { label: raw ?? `#${index}`, declared: raw || null };
+  const declared = raw?.trim() ? raw : null;
+  return { label: declared ?? `#${index}`, declared };
 }
 
 /**
@@ -88,7 +90,7 @@ function readUiGuideTarget(item: Record<string, unknown>, label: string): {
   const view = isViewId(item.view) ? item.view : null;
   const tab = typeof item.tab === "string" ? item.tab : null;
   const problems = REQUIRED_TEXT_FIELDS
-    .filter(([field]) => !textField(item, field))
+    .filter(([field]) => !textField(item, field).trim())
     .map(([, problem]) => `${label}: ${problem}`);
   if (item.view !== null && view === null) problems.push(`${label}: 알 수 없는 화면 ${String(item.view)}`);
   if (item.tab !== undefined && item.tab !== null) {
@@ -102,8 +104,8 @@ function readUiGuideTarget(item: Record<string, unknown>, label: string): {
       id: label,
       view,
       tab,
-      anchor: textField(item, "anchor"),
-      description: textField(item, "description"),
+      anchor: textField(item, "anchor").trim(),
+      description: textField(item, "description").trim(),
     },
     problems,
   };

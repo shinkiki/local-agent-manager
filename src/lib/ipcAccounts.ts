@@ -43,7 +43,7 @@ export function getCredentialVaultRecoveryStatus(): Promise<CredentialVaultRecov
   return call<CredentialVaultRecoveryStatus>("get_credential_vault_recovery_status");
 }
 
-/** 사용자의 명시적 확인 뒤 호스트에서만 손상된 계정 Vault를 복구한다. */
+/** 사용자의 명시적 확인 뒤 손상된 계정 Vault를 복구한다(로그인한 모든 채널, G11). */
 export function recoverCredentialVault(): Promise<CredentialVaultRecoveryReceipt> {
   return call<CredentialVaultRecoveryReceipt>("recover_credential_vault");
 }

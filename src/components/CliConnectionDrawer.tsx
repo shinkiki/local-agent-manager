@@ -7,6 +7,7 @@ import { SetupTerminalPanel } from "./TerminalPanel";
 import { errorText } from "../lib/errorText";
 import { displayPath } from "../lib/displayPath";
 import { cliInstallCommand } from "../lib/cliInstallCommand";
+import { cliConnectHeadline } from "../lib/cliConnectHeadline";
 import { LocalLlmConnectionCard } from "./LocalLlmConnectionCard";
 
 interface CliConnectionDrawerProps {
@@ -169,9 +170,11 @@ export function CliConnectionDrawer({ provider, platform, onClose, onRefresh, on
     <Drawer title={<><SourceBadge source={provider.provider} /><span>{text(`${provider.displayName} CLI 연결`, `${provider.displayName} CLI connection`)}</span></>} onClose={onClose}>
       <section className="cli-connect-summary" data-ui-anchor="cli-connect.summary">
         <div>
-          <strong>{ready
-            ? text("CLI를 찾았습니다", "CLI found")
-            : text("채팅 기록은 있지만 CLI 실행 파일이 없습니다", "Chat history exists, but the CLI executable is missing")}</strong>
+          <strong>{{
+            found: text("CLI를 찾았습니다", "CLI found"),
+            missingWithHistory: text("채팅 기록은 있지만 CLI 실행 파일이 없습니다", "Chat history exists, but the CLI executable is missing"),
+            missing: text("CLI 실행 파일이 없습니다", "The CLI executable is missing"),
+          }[cliConnectHeadline(ready, provider.history.detected)]}</strong>
           <p>{ready
             ? text("계정 로그인을 확인한 뒤 구조화 채팅을 시작할 수 있습니다.", "Confirm the account login, then you can start structured chats.")
             : desktopTerminal

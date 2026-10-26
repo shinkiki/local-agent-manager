@@ -76,6 +76,12 @@ test("만료·신원 미확인은 공급자별로 실제 갱신되는 로그인 
   // ChatGPT 데스크탑 앱은 공유 홈 auth.json을 되쓰므로 데스크탑 경로가 유효하다.
   assert.match(codex.detail, /ChatGPT 데스크탑 앱/);
   assert.equal(codex.tone, "warning");
+
+  // Antigravity는 토큰·로그 어디에도 신원이 없을 때 이 상태가 된다. ChatGPT 앱 안내는 틀린 길이다.
+  const antigravity = homeAccountSummary("antigravity", home({ state: "expired" }), registered, now, text);
+  assert.match(antigravity.detail, /터미널에서 agy를 실행해 다시 로그인/);
+  assert.doesNotMatch(antigravity.detail, /ChatGPT/);
+  assert.equal(antigravity.tone, "warning");
 });
 
 test("조회 실패는 원인과 다음 확인 시점을 함께 적는다", () => {

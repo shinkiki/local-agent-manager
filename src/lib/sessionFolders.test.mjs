@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { sanitizeParents } from "./sessionFolderIndex.ts";
+import { folderTree } from "./sessionFolderTree.ts";
 import {
   MAX_SESSION_FOLDER_DEPTH,
   canAddChildFolder,
@@ -301,4 +302,24 @@ test("정렬값이 다르면 이름과 무관하게 정렬값 순이다", () => 
   ], []);
 
   assert.deepEqual(recounted.map((item) => item.name), ["가계부", "Zoom"]);
+});
+
+test("folderSubtreeIds와 visibleFolderSubtreeIds는 트리에 없는 폴더 ID에 빈 집합을 반환한다", () => {
+  const folders = workFolders();
+  assert.deepEqual(folderSubtreeIds(folders, "missing"), new Set());
+  assert.deepEqual(visibleFolderSubtreeIds(folders, "missing"), new Set());
+});
+
+test("서로 다른 두 폴더 목록을 번갈아 질의해도 각 목록의 트리 캐시가 보존된다", () => {
+  const foldersA = workFolders();
+  const foldersB = workFolders({ childHidden: true });
+
+  const treeA1 = folderTree(foldersA);
+  const treeB1 = folderTree(foldersB);
+  const treeA2 = folderTree(foldersA);
+  const treeB2 = folderTree(foldersB);
+
+  // WeakMap 캐시 덕분에 교차 질의 시에도 앞선 목록의 캐시가 날아가지 않는다.
+  assert.equal(treeA2, treeA1);
+  assert.equal(treeB2, treeB1);
 });

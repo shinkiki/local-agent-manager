@@ -42,6 +42,11 @@ type RelativePeriodChoice = (typeof RELATIVE_PERIOD_CHOICES)[number];
 const RELATIVE_CHOICE_BY_UNIT: ReadonlyMap<SessionReadRelativeUnit, RelativePeriodChoice> =
   new Map(RELATIVE_PERIOD_CHOICES.map((choice) => [choice.unit, choice] as const));
 
+/** 표시 문구와 일수 환산은 표에 없는 단위를 첫 선택지로 읽는다. */
+function relativeChoiceForDisplay(unit: SessionReadRelativeUnit): RelativePeriodChoice {
+  return RELATIVE_CHOICE_BY_UNIT.get(unit) ?? RELATIVE_PERIOD_CHOICES[0];
+}
+
 type SessionReadPeriodChoice =
   | "reportPeriod"
   | "recentDays"
@@ -184,7 +189,7 @@ export function sessionReadRecentDaysField(
   const foldedFromDays = byPeriodKind<number | null>(period, {
     recentDays: ({ days }) => days,
     relative: ({ unit, count }) => (
-      count * (RELATIVE_CHOICE_BY_UNIT.get(unit) ?? RELATIVE_PERIOD_CHOICES[0]).days
+      count * relativeChoiceForDisplay(unit).days
     ),
     // 제 선택지를 가진 종류는 위 판정에서 이미 걸러진다. 표가 종류를 모두 요구하므로 남긴다.
     reportPeriod: () => null,
@@ -218,8 +223,7 @@ export const SESSION_READ_PERIOD_INVERTED_TEXT =
   "세션 참조 기간의 종료일은 시작일보다 뒤여야 합니다.";
 
 function relativeLabel(unit: SessionReadRelativeUnit, count: number): string {
-  // 표에 없는 단위는 문구를 비울 수 없으므로 첫 선택지로 읽는다.
-  const choice = RELATIVE_CHOICE_BY_UNIT.get(unit) ?? RELATIVE_PERIOD_CHOICES[0];
+  const choice = relativeChoiceForDisplay(unit);
   return count === 1 ? choice.label : `지난 ${count}${choice.pluralSuffix}`;
 }
 

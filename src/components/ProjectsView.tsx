@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 import { errorText } from "../lib/errorText";
 import { useI18n } from "../lib/i18n";
 import { getProjectRegistry } from "../lib/ipc";
-import { resolveSelectedProjectPath } from "../lib/projectSelection";
+import { resolveSelectedProjectPath, selectableProjects } from "../lib/projectSelection";
 import { readStoredText, writeStoredText } from "../lib/storedText";
 import type { TabRequest } from "../lib/uiGuide";
 import type { ProjectRegistryEntry } from "../types";
@@ -58,10 +58,7 @@ export function ProjectsView({ active, tabRequest = null, registryRevision, onRe
   }, [tabRequest, setTab]);
 
   const registry = useProjectRegistry(registryRevision);
-  const activeProjects = useMemo(
-    () => (registry.entries ?? []).filter((entry) => entry.active && entry.exists),
-    [registry.entries],
-  );
+  const activeProjects = useMemo(() => selectableProjects(registry.entries), [registry.entries]);
   const [storedPath, setStoredPath] = useState<string | null>(() => readStoredText(PROJECTS_SELECTED_PATH_KEY));
   const selectedPath = resolveSelectedProjectPath(activeProjects, storedPath);
   const selectProject = (path: string) => {

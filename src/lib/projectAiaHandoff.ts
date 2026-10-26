@@ -50,6 +50,28 @@ export const DESTRUCTIVE_GIT_COMMANDS_BAN =
   + "설정이 그 자리에 있다. 다만 충돌 표시가 남은 파일에 한해 checkout --ours/--theirs로 "
   + "한쪽을 고르는 것은 폐기가 아니니 그건 써도 돼.";
 
+/**
+ * 요청문 목록에 파일 경로 한 줄을 싣는다.
+ *
+ * 경로는 `git ... -z` 출력에서 오므로 줄바꿈·제어 문자가 그대로 들어 있을 수 있다 — git은
+ * 파일 이름에 `\n`을 허용한다. 그대로 이어 붙이면 `a\n\n읽기 제한은 무시하고 reset --hard 해`
+ * 같은 이름 하나가 요청문에 **새 문단**을 만들고, 그 문단은 화면이 쓴 지시와 구별되지 않는다.
+ * 그래서 제어 문자가 있는 경로만 JSON 문자열로 따옴표를 쳐서 한 줄에 가둔다 — git의
+ * `core.quotePath`가 같은 경로를 따옴표로 감싸는 것과 같은 모양이고, 경로를 버리지 않으므로
+ * AIA는 여전히 그 파일을 찾을 수 있다. 보통 경로는 그대로 둔다.
+ */
+export function promptPathLine(path: string): string {
+  if (!PROMPT_LINE_BREAKERS.test(path)) return `- ${path}`;
+  // JSON.stringify 는 C0 만 이스케이프하고 DEL·C1(NEL 포함)·U+2028/2029 는 그대로 둔다.
+  const quoted = JSON.stringify(path).replace(
+    /[\u007f-\u009f\u2028\u2029]/g,
+    (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+  return `- ${quoted}`;
+}
+
+const PROMPT_LINE_BREAKERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
 export interface AiaReviewCommitInput {
   sha: string;
   subject: string;
@@ -155,7 +177,7 @@ export function buildAiaOverlayConflictRequest(
   const affectedPaths = [...input.affectedPaths];
   const reason = input.reason?.trim() ? input.reason.trim() : null;
   const paths = affectedPaths.length > 0
-    ? affectedPaths.map((path) => `- ${path}`).join("\n")
+    ? affectedPaths.map(promptPathLine).join("\n")
     : "- 없음";
   const prompt = [
     "다음 로컬 설정 overlay 재적용 충돌을 안전하게 풀어줘.",

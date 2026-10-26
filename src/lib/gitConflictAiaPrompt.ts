@@ -1,4 +1,4 @@
-import { DESTRUCTIVE_GIT_COMMANDS_BAN } from "./projectAiaHandoff.ts";
+import { DESTRUCTIVE_GIT_COMMANDS_BAN, promptPathLine } from "./projectAiaHandoff.ts";
 
 export interface GitConflictAiaRequest {
   projectPath: string;
@@ -44,7 +44,7 @@ export function gitConflictAiaPrompt(request: GitConflictAiaRequest): string {
   const readOnly = request.readOnly !== false;
   const blocked = request.kind === "blocked";
   const conflicted = request.conflictedFiles.length > 0
-    ? request.conflictedFiles.map((path) => `- ${path}`).join("\n")
+    ? request.conflictedFiles.map(promptPathLine).join("\n")
     : "- 없음";
   return [
     blocked

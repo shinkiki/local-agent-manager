@@ -78,7 +78,7 @@ test("충돌 파일의 combined diff(@@@)는 두 칸 접두를 읽어 추가·�
     "index 1111,2222..0000",
     "--- a/a.txt",
     "+++ b/a.txt",
-    "@@@ -1,2 -1,2 +1,6 @@@",
+    "@@@ -1,3 -1,2 +1,6 @@@",
     "  one",
     "++<<<<<<< HEAD",
     " +main",
@@ -91,4 +91,62 @@ test("충돌 파일의 combined diff(@@@)는 두 칸 접두를 읽어 추가·�
   assert.deepEqual(kinds(rows).slice(4), ["hunk", "context", "add", "add", "add", "add", "add", "remove"]);
   assert.equal(rows[6].text, "<<<<<<< HEAD");
   assert.deepEqual(numbers(rows).slice(5, 7), [[1, 1], [null, 2]]);
+});
+
+test("V4: combined diff는 혼합 접두 뒤 첫 부모 줄 번호와 다음 파일 경계를 보존한다", () => {
+  const patch = [
+    "@@@ -10,4 -20,4 +30,4 @@@",
+    "  shared",
+    " +first-parent",
+    "- first-only-deletion",
+    " -second-only-deletion",
+    "+ second-parent",
+    "  tail",
+    ...HEADER,
+    "@@ -1 +1 @@",
+    "-old",
+    "+new",
+  ].join("\n");
+  const rows = parseUnifiedDiff(patch);
+  assert.deepEqual(rows.slice(1, 7), [
+    { kind: "context", before: 10, after: 30, text: "shared" },
+    { kind: "add", before: null, after: 31, text: "first-parent" },
+    { kind: "remove", before: 12, after: null, text: "first-only-deletion" },
+    { kind: "remove", before: null, after: null, text: "second-only-deletion" },
+    { kind: "add", before: null, after: 32, text: "second-parent" },
+    { kind: "context", before: 13, after: 33, text: "tail" },
+  ]);
+  assert.deepEqual(kinds(rows).slice(7), ["meta", "meta", "meta", "meta", "hunk", "remove", "add"]);
+  assert.deepEqual(numbers(rows).slice(-2), [[1, null], [null, 1]]);
+  assert.deepEqual(unifiedDiffStats(rows), { added: 3, removed: 3 });
+});
+
+test("V4: 첫 부모와 결과가 끝나도 둘째 부모에 남은 마지막 삭제 줄을 읽는다", () => {
+  const rows = parseUnifiedDiff([
+    "@@@ -10 -20,2 +30 @@@",
+    "  shared",
+    " -second-only-deletion",
+    ...HEADER,
+  ].join("\n"));
+  assert.deepEqual(rows.slice(1, 3), [
+    { kind: "context", before: 10, after: 30, text: "shared" },
+    { kind: "remove", before: null, after: null, text: "second-only-deletion" },
+  ]);
+  assert.deepEqual(kinds(rows).slice(3), ["meta", "meta", "meta", "meta"]);
+  assert.deepEqual(unifiedDiffStats(rows), { added: 0, removed: 1 });
+});
+
+test("V4: 결과가 빈 combined hunk도 각 부모의 삭제 줄을 모두 센다", () => {
+  const rows = parseUnifiedDiff([
+    "@@@ -10 -20 +0,0 @@@",
+    "- first-only-deletion",
+    " -second-only-deletion",
+    ...HEADER,
+  ].join("\n"));
+  assert.deepEqual(rows.slice(1, 3), [
+    { kind: "remove", before: 10, after: null, text: "first-only-deletion" },
+    { kind: "remove", before: null, after: null, text: "second-only-deletion" },
+  ]);
+  assert.deepEqual(kinds(rows).slice(3), ["meta", "meta", "meta", "meta"]);
+  assert.deepEqual(unifiedDiffStats(rows), { added: 0, removed: 2 });
 });

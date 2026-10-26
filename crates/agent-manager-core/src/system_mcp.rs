@@ -33,7 +33,19 @@ use crate::{
 };
 
 const MAX_MCP_REQUEST_BODY: usize = 1024 * 1024;
+/// aia_system 도구 응답(들여 쓴 JSON 글) 한 건의 기본 상한. 문서·연결 파일(5 MiB)이나
+/// 수천 항목 목록처럼 이보다 큰 값을 돌려줄 수 있는 조회가 있어, 이 상한이 그 결과가
+/// 에이전트 컨텍스트로 통째로 들어가는 것을 막는다. 외부 MCP 도구 결과만
+/// [`MAX_REMOTE_TOOL_RESPONSE_BYTES`]를 따로 쓴다.
 const MAX_MCP_RESULT_BYTES: usize = 512 * 1024;
+/// 외부 MCP 도구 결과를 싣는 응답의 상한. 결과 자체는 `bounded_remote_result`가 이미
+/// 압축 직렬화 크기로 노출 상한(`MAX_EXPOSED_RESULT_BYTES`, 2 MiB) 안에 묶었으므로, 같은
+/// 방식(들여쓰기 없이)으로 직렬화하면 응답은 그 결과에 봉투(작업 이름·플러그인 id·도구
+/// 이름 128자 이하 등)만 더한 크기다. 봉투 몫으로 64 KiB를 더한다. 들여 쓰면 깊게 중첩된
+/// structuredContent가 몇 배로 불어 노출 상한을 지난 결과가 여기서 "더 좁은 조회"로
+/// 거절되므로 이 경로는 들여 쓰지 않는다(2026-10-25 노션 기획서 270,480바이트 생략 뒤).
+const MAX_REMOTE_TOOL_RESPONSE_BYTES: usize =
+    crate::mcp_registry::MAX_EXPOSED_RESULT_BYTES + 64 * 1024;
 
 /// show_ui_guide의 note 상한. 말풍선 한 개에 들어갈 한 문장 분량이다.
 pub(crate) const MAX_UI_GUIDE_NOTE_CHARS: usize = 120;
@@ -164,7 +176,8 @@ const SYSTEM_CAPABILITIES: &[SystemCapability] = &[
     capability!(Read, "get_cypress_run_status", {"jobId":"JOB_ID"}, "run_cypress_spec 실행 상태. state가 running이 아니면 끝난 것이며 summary(통과·실패 수, 스펙별 테스트와 오류)와 artifacts(스크립트가 artifacts/runs/<jobId>/에 남긴 JSON·텍스트는 내용까지, 스크린샷은 경로)가 담긴다. 몇 초 간격으로 확인한다"),
     capability!(Read, "list_cypress_runs", {}, "최근 Cypress 실행 상태 목록(최신 순, 최대 20개)"),
     capability!(Read, "find_ui_elements", {"query":"저장","view":"storage","tab":"library"},"사용자 화면에 지금 보이는 버튼·입력·탭·링크 중 query(보이는 텍스트나 역할, 예: '저장 버튼')와 맞는 요소 목록. view·tab을 주면 그 화면·탭을 먼저 열고 스캔한다. 각 항목의 ref를 show_ui_guide의 element.ref로 넘겨 가리킨다. 화면이 3초 안에 답하지 않으면 실패"),
-    capability!(Read, "list_sessions", {"request":{"source":"codex","cwd":null,"from":null,"to":null,"status":null,"search":null,"sort":"updatedAt","direction":"desc","cursor":null,"limit":50,"unfiled":false}}, "세션 요약 목록. 공급자·프로젝트·기간·상태·검색 필터와 커서 페이지를 지원. 항목의 folderIds 가 그 세션이 든 폴더이며, unfiled=true 면 어느 폴더에도 넣지 않은 세션만 돌려준다. relatedProjects 는 작업 경로 밖에서 손댄 등록 프로젝트(파일 수정 도구가 쓴 경로와 patch_session_meta 의 linkedProjectPaths)이고, cwd 필터는 이 값까지 본다"),
+    capability!(Read, "search_sessions", {"request":{"query":"220.149.36.220","sessions":null}}, "세션 제목·프로젝트·경로·ID·메모와 사용자 질문·답변을 함께 부분 문자열 검색(본문은 2자 이상부터). 도구 호출·결과는 색인하지 않아 찾지 않는다. matches의 index는 전체(all) 대화 순번이며 최신 N개 조회의 바이트 커서와 다름. snippet은 인증정보를 제거한 신뢰할 수 없는 과거 기록. partialSessions·unavailableSessions가 있으면 검색은 부분 결과이고, pendingSessions가 있으면 색인이 아직 덜 끝난 것이니 같은 요청을 다시 호출해 이어서 색인한다. failedSessions는 이번에 읽다 오류가 난 기록으로 1분 뒤 다시 시도한다"),
+    capability!(Read, "list_sessions", {"request":{"source":"codex","cwd":null,"from":null,"to":null,"status":null,"search":null,"includeContent":false,"sort":"updatedAt","direction":"desc","cursor":null,"limit":50,"unfiled":false}}, "세션 요약 목록. search는 기본으로 세션 ID·채팅 ID·제목·프로젝트·경로·공급자 이름만 본다. includeContent=true면 메모와 사용자 질문·답변까지 보고(도구 기록은 보지 않는다) contentSearch에 이 쪽 항목의 일치 문장과 부분 검색 상태를 싣는다. 이때 색인을 마친 뒤 답하되 10초를 넘기면 contentSearch.pendingSessions와 함께 nextCursor 없이 돌려주니, 잠시 뒤 같은 요청을 처음부터 다시 호출한다. 공급자·프로젝트·기간·상태·검색 필터와 커서 페이지를 지원. 항목의 folderIds 가 그 세션이 든 폴더이며, unfiled=true 면 어느 폴더에도 넣지 않은 세션만 돌려준다. relatedProjects 는 작업 경로 밖에서 손댄 등록 프로젝트(파일 수정 도구가 쓴 경로와 patch_session_meta 의 linkedProjectPaths)이고, cwd 필터는 이 값까지 본다"),
     capability!(Read, "get_session_statistics", {"request":{"source":null,"cwd":null,"from":null,"to":null}}, "기간·공급자·프로젝트별 세션과 턴 및 완료·실패·중단 통계. cwd 필터는 list_sessions 와 같이 그 프로젝트를 작업 경로 밖에서 손댄 세션(relatedProjects)까지 센다"),
     capability!(Read, "get_chat_delivery_status", {"idempotencyKey":"UNIQUE_KEY"}, "멱등 키로 채팅 전송·생성의 저장된 전달 결과를 다시 조회"),
     capability!(
@@ -410,7 +423,7 @@ const SYSTEM_CAPABILITIES: &[SystemCapability] = &[
     capability!(Execute, "terminate_external_provider_processes", {"provider":"claude","reason":null}, "외부 독립 실행 공급자 CLI 프로세스를 종료. 유닉스는 SIGTERM으로 요청한 뒤 유예 시간 안에 끝나지 않으면 SIGKILL로 승격하고, 윈도우는 대응하는 정상 종료 신호가 없어 곧바로 강제 종료한다(어느 쪽이든 강제로 끝낸 수는 forcedCount로 보고). 강제 종료까지 실패한 프로세스만 pid와 원인을 반환"),
     capability!(Execute, "switch_active_provider_account", {"accountId":"ACCOUNT_ID","stopRunningChats":true,"stopExternalProcesses":true}, "활성 계정을 변경하고 대상 계정 사용량을 다시 조회. 자격증명 교체·런타임 종료 없음. stopRunningChats·stopExternalProcesses는 이전 계약 호환용으로 무시됨"),
     capability!(Read, "list_provider_chats", {"provider":"claude"}, "해당 공급자의 Agent Manager 관리 런타임 전체 목록. standard·aia, attended·unattended, 연결·분리 상태를 모두 포함하고 get_live_chats가 거르는 stopped·failed도 담는다. 어떤 세션이 종료됐는지 묻는 질문은 이것으로 답하며, ready 항목은 idleMs로 유휴 시간을 함께 전하라"),
-    capability!(Read, "preview_usage_paced_runs", {"request":{"cadenceWorkflowId":"WORKFLOW_ID","cadenceMinutes":null,"emailPrefix":"user@","providers":["claude"],"windowLabel":"7일","targetPercent":92,"guardWindowLabel":"5시간","guardPercent":85,"maxRuns":6,"fallbackCostPercentPerRun":2.0,"costWindows":5,"minCostPercentPerRun":0.5,"projectPath":"/ABSOLUTE/PATH","claudeModel":null,"codexModel":null,"antigravityModel":null,"staleRunCwd":null}}, "plan_usage_paced_runs와 같은 실제 사용률·유효 예약 기반 계산을 예약 기록 없이 미리 본다. Antigravity는 antigravityModel을 명시한 회차만 해당 모델의 Gemini 또는 Claude/GPT 사용량 자원을 후보로 넣는다. windowLabel·targetPercent 생략 규칙과 공통·계정별 유효 목표·가드 응답도 같다. 가드는 계정이 보고하는 계획 창 밖의 계정 전체 창 전부(+guardWindowLabel로 지정한 창)이며, accounts[].guards[]에 창마다 사용률·미정산 예약·여유·회당 소비(실측 또는 unmeasured)·감당 건수(affordableRuns)가 실리고 가장 빡빡한 창이 guardCapRuns로 그 계정의 기동 수를 자른다. 조회가 다른 소비자의 배분과 회당 소비 실측에 흔적을 남기지 않으므로 사람·AIA의 확인은 이것으로 한다"),
+    capability!(Read, "preview_usage_paced_runs", {"request":{"cadenceWorkflowId":"WORKFLOW_ID","cadenceMinutes":null,"emailPrefix":"user@","providers":["claude"],"windowLabel":"7일","targetPercent":92,"guardWindowLabel":"5시간","guardPercent":85,"maxRuns":6,"fallbackCostPercentPerRun":2.0,"costWindows":5,"minCostPercentPerRun":0.5,"projectPath":"/ABSOLUTE/PATH","claudeModel":null,"codexModel":null,"antigravityModel":null,"staleRunCwd":null}}, "plan_usage_paced_runs와 같은 실제 사용률·유효 예약 기반 계산을 예약 기록 없이 미리 본다. Antigravity는 antigravityModel을 명시한 회차만 해당 모델의 모델군 사용량 자원을 후보로 넣는다. 모델 입력에 쉼표로 여러 모델을 적으면(모델 사다리) 계정마다 한도가 남은 모델을 고른다 — Claude는 모델 전용 창(Fable 7일)이 가드 아래인 모델을 먼저, Antigravity는 리셋까지 남은 시간 대비 여유가 큰 모델군을 고르며 accounts[].model에 고른 모델이 실린다. 모델 전용 창은 계정 창과 함께(AND) 가드로 걸린다. windowLabel·targetPercent 생략 규칙과 공통·계정별 유효 목표·가드 응답도 같다. 가드는 계정이 보고하는 계획 창 밖의 계정 전체 창 전부(+guardWindowLabel로 지정한 창)이며, accounts[].guards[]에 창마다 사용률·미정산 예약·여유·회당 소비(실측 또는 unmeasured)·감당 건수(affordableRuns)가 실리고 가장 빡빡한 창이 guardCapRuns로 그 계정의 기동 수를 자른다. 조회가 다른 소비자의 배분과 회당 소비 실측에 흔적을 남기지 않으므로 사람·AIA의 확인은 이것으로 한다"),
     capability!(Read, "get_usage_budget", {}, "사용량 예산 정책과 현황. 기본 목표·가드, 페이싱에 참여하는 계정 풀(pacingEnabled)과 계정별 목표 override, 소비자(페이싱이 켜진 워크플로를 돌리는 반복 요청) 후보와 참여·우선순위, 워크플로별 참여 계정(workflowAccounts, 빈 배열이면 풀 전체), 계정별 사용률·미정산 예약·순여유, 소비자별 실측 회당 소비. 정책 파일이 없으면 지금 돌고 있는 페이싱 반복 요청과 그 계정을 시드로 만든다"),
     capability!(Execute, "set_usage_budget_policy", {"request":{"windowLabel":"7일","targetPercent":92,"guardWindowLabel":"5시간","guardPercent":85}}, "사용량 예산의 기본 목표·가드를 통째로 바꾼다. 워크플로 인자의 목표·가드는 이 값과 계정 override 중 낮은 쪽으로 캡된다. 생략한 항목은 캡 없음. enabled는 페이싱 기능 전체 스위치라 false면 페이싱 회차의 예약 발화가 멈추고, 생략하면 켜짐으로 저장된다 — 기본값 한 벌을 통째로 교체하므로 다른 항목만 바꿀 때도 현재 값을 함께 실어야 스위치가 되살아나지 않는다"),
     capability!(Execute, "acknowledge_drain_notice", {"request":{"accountId":"ACCOUNT_ID","creditId":"CREDIT_ID"}}, "소진 마감 안내를 봤다고 기록해 같은 크레딧으로 다시 알리지 않게 한다. creditId를 비우면 기록을 지워 다시 알린다. 안내 자체는 get_usage_budget의 accounts[].overview.drain(actNow·actByAt·daysToEmpty)로 읽는다"),
@@ -424,7 +437,7 @@ const SYSTEM_CAPABILITIES: &[SystemCapability] = &[
         "등록된 시스템 워크플로 목록과 계약, 위험도, 호환성, 최근 실행 결과. pacingCapable은 계약이 사용량을 쓰는지(페이싱 계산 또는 무인 런타임 기동 단계 보유), pacingEnabled는 사용자 선택까지 반영해 이 워크플로를 사용량 예산이 통제하는지. requiredSkills는 계약이 따르게 하는 보관 스킬, missingSkills는 그 가운데 이 장치의 공통 저장소에 없는 것이다 — 비어 있지 않으면 계약은 있으나 절차가 없는 상태라 실행해도 무인 런타임이 스킬을 찾지 못한다"
     ),
     capability!(Read, "get_system_workflow", {"workflowId":"WORKFLOW_ID"}, "단일 시스템 워크플로 상세와 버전 이력. versions[]에는 각 버전의 계약 본문(contract)이 함께 실려 버전 사이의 차이를 낼 수 있다(보관 상한 10개)"),
-    capability!(Read, "propose_system_workflow_schema", {"request":{"id":"WORKFLOW_ID","displayName":"NAME","description":"PURPOSE","chatRuntime":null,"requiredSkills":[],"inputSchema":{"INPUT_NAME":{"type":"string","label":"LABEL","description":"DETAIL","required":true,"defaultValue":"DEFAULT"}},"steps":[{"id":"STEP_ID","operation":"OPERATION","arguments":{}}],"risk":"mutating"}}, "chatRuntime:{mode,approvalMode,decisionPolicy}를 선택적으로 지정하면 모든 공급자의 standard 채팅에 공통 적용한다. mode는 plan/workspace/fullAccess, approvalMode는 manual/never, decisionPolicy는 ask/recommended이며 생략한 필드는 단계 설정을 유지한다. 모델·추론·계정·경로는 덮어쓰지 않는다. system_catalog 기본 작업 조합으로 만든 워크플로 계약 초안을 검증하고 승인 요약을 반환. 페이싱 회차 계약은 paced:true를 선언하고 봉투가 정한 값을 $run 토큰(accountId·source·model·cwd·index·reasoningEffort)으로 받아 한 건의 start_chat만 기술한다 — 입력 projectPath 필수(또는 비어 있지 않은 기본값), claudeModel·codexModel·antigravityModel 선택(antigravityModel은 gemini-, claude-, gpt- 모델), maxRuns는 계약 입력이 아니라 반복 요청의 병렬 실행 설정이며 plan_usage_paced_runs 단계는 어떤 계약에서도 금지. 회차가 남은 일감을 세는 자리가 있으면 remainingWork:{file,path}로 지목한다 — file은 projectPath 기준 상대 경로의 JSON 파일, path는 그 안의 키 경로(점으로 중첩)이고 가리킨 값은 숫자 그대로·배열은 길이·\"통과/전체\" 꼴 문자열은 전체에서 통과를 뺀 수로 읽는다. 선언하면 봉투가 계획 **전에** 그 자리를 읽어 남은 수만큼만 띄운다 — 병렬 설정은 장비가 감당하는 상한이지 매 회차 채워야 할 목표가 아니다(남은 일감이 0이어도 한 건은 돈다. 선언한 자리에 일이 없다는 뜻이지 할 일이 없다는 뜻이 아니다). 선언하지 않은 회차는 종전대로 계정 여력과 상한으로만 돈다. 저장된 워크플로를 바꾸지 않으며, 등록은 이 확인을 거친 계약만 받는다. inputSchema의 입력마다 defaultValue를 함께 선언하면 워크플로 화면이 그 값을 폼에 미리 채워 사용자가 바로 실행할 수 있고, 실행에서 생략된 입력도 그 값으로 채워진다(선언한 형·enum 값과 달라지면 등록을 거절). requiredSkills에는 이 계약이 따르게 하는 보관 스킬의 키를 최대 8개까지 적는다(공통 저장소 skills 아래 디렉터리 이름, 영소문자·숫자·하이픈). 무인 런타임에 보낼 지시문이 스킬을 따르게 하는 계약이라면 반드시 선언한다 — 계약과 스킬을 함께 백업·이식할 수 있고 화면이 누락을 경고한다. 선언은 의존성 표시일 뿐 계약이 스킬을 실행하지 않으므로 권한은 늘지 않고, 스킬이 아직 없어도 등록은 거절되지 않는다. 값이 들어갈 자리는 모두 토큰 객체({\"$input\":\"이름\"}·{\"$step\":\"단계\"}·{\"$item\":\"경로\"}·{\"$run\":\"필드\"})로 분리한다 — 문자열 안에 $input.url처럼 적으면 치환되지 않고 그대로 전달되어 등록에서 거절된다. 변경 작업의 idempotencyKey는 예시의 UNIQUE_KEY 자리에 값을 적지 말고 {\"$idempotencyKey\":true} 토큰으로 적는다. 고정하면 첫 실행 뒤로는 저장된 결과만 돌아오거나 같은 키가 다른 요청에 쓰였다며 거절된다. forEach는 앞 단계 결과를 도는 {\"step\":\"단계\",\"path\":\"경로\"}와 계약이 적은 목록을 도는 {\"items\":[{...},{...}]} 둘 중 하나만 쓴다 — 값만 다른 같은 일을 단계 쌍으로 되풀이하지 말고 items 한 단계로 적는다(항목은 단계 안에서 {\"$item\":\"키\"}로 읽고, 항목 안에 토큰 객체를 적으면 치환되지 않아 등록이 거절된다). 문구를 값으로 채워야 하면 {\"$format\":\"목표 {input.goal} · 첫 항목 {step.s01.items.0.title}\"}을 쓴다 — 구멍은 {input.이름}·{step.단계.경로}·{item.경로}·{run.필드}만 가능하고 등록에서 검증되며, 중괄호 자체는 {{ }}로 적고 결과는 8192자까지다"),
+    capability!(Read, "propose_system_workflow_schema", {"request":{"id":"WORKFLOW_ID","displayName":"NAME","description":"PURPOSE","chatRuntime":null,"requiredSkills":[],"inputSchema":{"INPUT_NAME":{"type":"string","label":"LABEL","description":"DETAIL","required":true,"defaultValue":"DEFAULT"}},"steps":[{"id":"STEP_ID","operation":"OPERATION","arguments":{}}],"risk":"mutating"}}, "chatRuntime:{mode,approvalMode,decisionPolicy}를 선택적으로 지정하면 모든 공급자의 standard 채팅에 공통 적용한다. mode는 plan/workspace/fullAccess, approvalMode는 manual/never, decisionPolicy는 ask/recommended이며 생략한 필드는 단계 설정을 유지한다. 모델·추론·계정·경로는 덮어쓰지 않는다. system_catalog 기본 작업 조합으로 만든 워크플로 계약 초안을 검증하고 승인 요약을 반환. 페이싱 회차 계약은 paced:true를 선언하고 봉투가 정한 값을 $run 토큰(accountId·source·model·cwd·index·reasoningEffort)으로 받아 한 건의 start_chat만 기술한다 — 입력 projectPath 필수(또는 비어 있지 않은 기본값), claudeModel·codexModel·antigravityModel 선택(antigravityModel은 gemini-, claude-, gpt- 모델, 반복 요청 인자에 쉼표로 여러 개를 적으면 계정마다 한도가 남은 모델을 고르는 모델 사다리), maxRuns는 계약 입력이 아니라 반복 요청의 병렬 실행 설정이며 plan_usage_paced_runs 단계는 어떤 계약에서도 금지. 회차가 남은 일감을 세는 자리가 있으면 remainingWork:{file,path}로 지목한다 — file은 projectPath 기준 상대 경로의 JSON 파일, path는 그 안의 키 경로(점으로 중첩)이고 가리킨 값은 숫자 그대로·배열은 길이·\"통과/전체\" 꼴 문자열은 전체에서 통과를 뺀 수로 읽는다. 선언하면 봉투가 계획 **전에** 그 자리를 읽어 남은 수만큼만 띄운다 — 병렬 설정은 장비가 감당하는 상한이지 매 회차 채워야 할 목표가 아니다(남은 일감이 0이어도 한 건은 돈다. 선언한 자리에 일이 없다는 뜻이지 할 일이 없다는 뜻이 아니다). 선언하지 않은 회차는 종전대로 계정 여력과 상한으로만 돈다. 저장된 워크플로를 바꾸지 않으며, 등록은 이 확인을 거친 계약만 받는다. inputSchema의 입력마다 defaultValue를 함께 선언하면 워크플로 화면이 그 값을 폼에 미리 채워 사용자가 바로 실행할 수 있고, 실행에서 생략된 입력도 그 값으로 채워진다(선언한 형·enum 값과 달라지면 등록을 거절). requiredSkills에는 이 계약이 따르게 하는 보관 스킬의 키를 최대 8개까지 적는다(공통 저장소 skills 아래 디렉터리 이름, 영소문자·숫자·하이픈). 무인 런타임에 보낼 지시문이 스킬을 따르게 하는 계약이라면 반드시 선언한다 — 계약과 스킬을 함께 백업·이식할 수 있고 화면이 누락을 경고한다. 선언은 의존성 표시일 뿐 계약이 스킬을 실행하지 않으므로 권한은 늘지 않고, 스킬이 아직 없어도 등록은 거절되지 않는다. 값이 들어갈 자리는 모두 토큰 객체({\"$input\":\"이름\"}·{\"$step\":\"단계\"}·{\"$item\":\"경로\"}·{\"$run\":\"필드\"})로 분리한다 — 문자열 안에 $input.url처럼 적으면 치환되지 않고 그대로 전달되어 등록에서 거절된다. 변경 작업의 idempotencyKey는 예시의 UNIQUE_KEY 자리에 값을 적지 말고 {\"$idempotencyKey\":true} 토큰으로 적는다. 고정하면 첫 실행 뒤로는 저장된 결과만 돌아오거나 같은 키가 다른 요청에 쓰였다며 거절된다. forEach는 앞 단계 결과를 도는 {\"step\":\"단계\",\"path\":\"경로\"}와 계약이 적은 목록을 도는 {\"items\":[{...},{...}]} 둘 중 하나만 쓴다 — 값만 다른 같은 일을 단계 쌍으로 되풀이하지 말고 items 한 단계로 적는다(항목은 단계 안에서 {\"$item\":\"키\"}로 읽고, 항목 안에 토큰 객체를 적으면 치환되지 않아 등록이 거절된다). 문구를 값으로 채워야 하면 {\"$format\":\"목표 {input.goal} · 첫 항목 {step.s01.items.0.title}\"}을 쓴다 — 구멍은 {input.이름}·{step.단계.경로}·{item.경로}·{run.필드}만 가능하고 등록에서 검증되며, 중괄호 자체는 {{ }}로 적고 결과는 8192자까지다"),
     capability!(Execute, "register_system_workflow", {"request":{"id":"WORKFLOW_ID","displayName":"NAME","description":"PURPOSE","chatRuntime":null,"requiredSkills":[],"inputSchema":{"INPUT_NAME":{"type":"string","label":"LABEL","description":"DETAIL","required":true,"defaultValue":"DEFAULT"}},"steps":[{"id":"STEP_ID","operation":"OPERATION","arguments":{}}],"risk":"mutating"}}, "공통 chatRuntime 변경도 승인 요약과 새 버전 등록이 필요하다. 이 워크플로를 도는 페이싱 회차의 승인 버전은 등록과 함께 자동으로 올라가고, 버전이 어긋나 멈춰 있던 회차는 함께 재개된다 — 승인 자리는 이 등록 하나이며 회차마다 다시 승인하지 않는다. 결과의 rounds 배열이 회차별로 adopted·resumed·reason을 돌려주므로 반드시 사용자에게 어떤 회차가 함께 바뀌었는지 전하라. reason이 붙은 회차는 저장된 인자가 새 입력 스키마를 만족하지 못해 올리지 못한 것이니, 사용자에게 워크플로 페이싱 탭의 회차 편집기에서 입력을 채우라고 안내한다. 사용자가 검토·승인한 워크플로 계약을 등록. propose_system_workflow_schema로 같은 단계 구성의 승인 요약을 먼저 확인해야 하며, 수정은 기존 버전을 덮어쓰지 않고 새 버전으로 저장. 페이싱 회차는 paced:true 계약(한 건의 start_chat + $run 토큰)으로 등록하고 회차는 페이싱 탭에서 만든다. requiredSkills 변경도 계약 변경이라 새 버전으로 저장된다"),
     capability!(Execute, "execute_system_workflow", {"workflowId":"WORKFLOW_ID","arguments":{},"idempotencyKey":"UNIQUE_KEY"}, "등록된 워크플로만 실행. 단계별 성공·실패·건너뜀 상태와 변경 대상, 사후조건 결과를 반환. 페이싱 회차 계약(paced)은 회차 봉투로 돈다(사용량 갱신·기동 수 계산·정리·기동, 병렬 1건) — 계획 확인만 하려면 preview_usage_paced_runs"),
     capability!(Execute, "check_db_connection", {"request":{"id":"CONNECTION_ID"}}, "저장된 데이터베이스 연결로 한 번 붙어 서버 버전만 읽고 끊는다. 원격에서는 아무것도 바뀌지 않는다. 조회·변경 전에 접속 가능 여부를 가릴 때 먼저 쓴다. 실패하면 reachable이 false이고 message에 진단이 실린다"),
@@ -1938,6 +1951,9 @@ fn call_tool(context: &SystemMcpContext, params: &Value, origin_chat_id: Option<
     }
     if let Some(result) = call_interface_tool(context, name, &arguments) {
         return match result {
+            Ok(value) if matches!(name, "interface_read" | "interface_execute") => {
+                remote_tool_success(value)
+            }
             Ok(value) => tool_success(value),
             Err(error) => tool_error(&error.to_string()),
         };
@@ -2078,10 +2094,13 @@ fn call_system_tool(
     };
     let result = invoke_system_command(&command_context, operation, command_arguments.clone());
     if audited {
-        let failure = result.as_ref().err().map(ToString::to_string);
+        let failure = match &result {
+            Err(error) => Some(error.to_string()),
+            Ok(value) => remote_omission_failure(operation, value).map(str::to_owned),
+        };
         if let Err(error) = audit(
             crate::SystemAuditPhase::Completed,
-            Some(result.is_ok()),
+            Some(failure.is_none()),
             failure.as_deref(),
         ) {
             return tool_error(&format!(
@@ -2090,7 +2109,7 @@ fn call_system_tool(
         }
     }
     match result {
-        Ok(value) => tool_success(json!({"operation": operation, "result": value})),
+        Ok(value) => system_operation_success(operation, value),
         Err(error) => tool_error(&failure_text(operation, &error)),
     }
 }
@@ -2411,9 +2430,51 @@ fn system_capability(operation: &str) -> Option<&'static SystemCapability> {
         .find(|capability| capability.operation == operation)
 }
 
+/// system_read·system_execute 작업 하나의 성공 응답. 외부 플러그인 도구 결과를 싣는
+/// 작업만 [`remote_tool_success`]로, 나머지는 기본 상한의 [`tool_success`]로 낸다.
+fn system_operation_success(operation: &str, value: Value) -> Value {
+    let response = json!({"operation": operation, "result": value});
+    if carries_remote_tool_result(operation) {
+        remote_tool_success(response)
+    } else {
+        tool_success(response)
+    }
+}
+
+/// 외부 플러그인 도구 결과(`plugin_tool_envelope`)를 돌려주는 작업인지.
+fn carries_remote_tool_result(operation: &str) -> bool {
+    matches!(
+        operation,
+        "read_external_plugin_tool" | "execute_external_plugin_tool"
+    )
+}
+
+/// 외부 플러그인 작업이 상한 때문에 결과를 받지 못했으면 감사에 남길 실패 까닭. 생략
+/// 안내는 정상 응답으로 돌아가지만, 본문을 받지 못한 변경 호출을 성공으로 적으면
+/// 감사만 보고는 실행 여부를 확인할 수 없었다는 것이 사라진다.
+fn remote_omission_failure(operation: &str, value: &Value) -> Option<&'static str> {
+    if !carries_remote_tool_result(operation) {
+        return None;
+    }
+    crate::mcp_registry::remote_result_omission(value.get("result")?)
+        .map(crate::mcp_registry::RemoteResultOmission::audit_reason)
+}
+
 fn tool_success(value: Value) -> Value {
-    let text = match serde_json::to_string_pretty(&value) {
-        Ok(text) if text.len() <= MAX_MCP_RESULT_BYTES => text,
+    bounded_tool_text(serde_json::to_string_pretty(&value), MAX_MCP_RESULT_BYTES)
+}
+
+/// 외부 MCP 도구 결과를 실은 응답. 노출 상한과 같은 방식으로 재도록 들여 쓰지 않는다.
+fn remote_tool_success(value: Value) -> Value {
+    bounded_tool_text(
+        serde_json::to_string(&value),
+        MAX_REMOTE_TOOL_RESPONSE_BYTES,
+    )
+}
+
+fn bounded_tool_text(text: serde_json::Result<String>, limit: usize) -> Value {
+    let text = match text {
+        Ok(text) if text.len() <= limit => text,
         Ok(_) => {
             return tool_error(
                 "시스템 응답이 너무 큽니다. 카탈로그에서 더 좁은 조회 작업을 선택하세요",
@@ -2597,6 +2658,149 @@ mod tests {
             read_body(exact).map(|body| body.len()),
             Ok(super::MAX_MCP_REQUEST_BODY)
         );
+    }
+
+    /// 노션 `notion-fetch`처럼 `content[0].text`가 다시 JSON 글인 결과에, 깊게 중첩된
+    /// `structuredContent`를 붙인다. 중첩은 들여 쓰면 몇 배로 불어나는 모양이다.
+    fn notion_like_plugin_result(paragraphs: usize, blocks: usize) -> serde_json::Value {
+        let paragraph = "## 기획 \"밤의 습격\"\n> 바리케이드(\\방어선\\)를 세우고\t탄약을 아낀다. \
+            {\"wave\": 3, \"spawn\": [\"walker\"]} 🧟\n\n";
+        let page = serde_json::json!({
+            "metadata": {"type": "page"},
+            "title": "데드 루트 기획서",
+            "text": paragraph.repeat(paragraphs)
+        })
+        .to_string();
+        let mut block = serde_json::json!({"text": "좀비"});
+        for _ in 0..24 {
+            block = serde_json::json!({"type": "toggle", "children": [block]});
+        }
+        serde_json::json!({
+            "content": [{"type": "text", "text": page}],
+            "structuredContent": {"blocks": vec![block; blocks]},
+            "isError": false
+        })
+    }
+
+    fn compact_len(value: &serde_json::Value) -> usize {
+        serde_json::to_vec(value).unwrap().len()
+    }
+
+    /// 2026-10-25: 직렬화 270,480바이트 노션 페이지가 생략돼 기획 회차가 실패했다. 노출
+    /// 상한 바로 아래(약 1.9 MiB) 결과는 실제 봉투(`plugin_tool_envelope`)와 작업 응답을
+    /// 거쳐 그대로 에이전트에 가야 한다. 들여 썼다면 중첩 때문에 응답 상한을 넘었을
+    /// 결과라, 노출 상한과 같은 방식으로 재는지도 함께 확인한다.
+    #[test]
+    fn a_plugin_result_near_the_exposed_cap_fits_the_system_response() {
+        let per_paragraph = compact_len(&notion_like_plugin_result(2, 0))
+            - compact_len(&notion_like_plugin_result(1, 0));
+        let per_block = compact_len(&notion_like_plugin_result(0, 2))
+            - compact_len(&notion_like_plugin_result(0, 1));
+        let blocks = (512 * 1024) / per_block;
+        let paragraphs = (14 * 1024 * 1024 / 10) / per_paragraph;
+        let plugin_result = notion_like_plugin_result(paragraphs, blocks);
+        let plugin_bytes = compact_len(&plugin_result);
+        assert!(plugin_bytes > 18 * 1024 * 1024 / 10);
+        assert!(plugin_bytes < crate::mcp_registry::MAX_EXPOSED_RESULT_BYTES);
+
+        let envelope = crate::external_plugins::plugin_tool_envelope(
+            "notion",
+            "notion-fetch",
+            plugin_result.clone(),
+        );
+        assert!(envelope["result"].get("_meta").is_none());
+        let wrapped = serde_json::json!({
+            "operation": "read_external_plugin_tool",
+            "result": envelope.clone()
+        });
+        assert!(
+            serde_json::to_string_pretty(&wrapped).unwrap().len()
+                > super::MAX_REMOTE_TOOL_RESPONSE_BYTES,
+            "들여 썼다면 넘었을 크기여야 시험이 뜻을 가진다"
+        );
+
+        let response = super::system_operation_success("read_external_plugin_tool", envelope);
+        assert_eq!(response["isError"], false, "{}", response["content"][0]);
+        let text = response["content"][0]["text"].as_str().unwrap();
+        let echoed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(echoed, wrapped);
+        assert_eq!(echoed["result"]["result"], plugin_result);
+        assert_eq!(echoed["result"]["contentTrust"], "untrusted");
+
+        // 노출 상한을 거치지 않은 값이 응답 상한을 넘으면 여전히 거절된다.
+        let refused = super::system_operation_success(
+            "execute_external_plugin_tool",
+            serde_json::json!({"text": "x".repeat(super::MAX_REMOTE_TOOL_RESPONSE_BYTES)}),
+        );
+        assert_eq!(refused["isError"], true);
+        assert!(refused["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("시스템 응답이 너무 큽니다"));
+    }
+
+    /// 본문 상한·노출 상한에 걸린 외부 플러그인 결과는 감사에 실패 까닭을 남긴다.
+    #[test]
+    fn omitted_plugin_results_are_audited_with_a_reason() {
+        let huge = serde_json::json!({
+            "content": [{"type": "text", "text": "x".repeat(crate::mcp_registry::MAX_EXPOSED_RESULT_BYTES)}],
+            "isError": false
+        });
+        let truncated =
+            crate::external_plugins::plugin_tool_envelope("notion", "notion-update", huge);
+        let reason = super::remote_omission_failure("execute_external_plugin_tool", &truncated)
+            .expect("생략된 결과는 실패 까닭이 있어야 한다");
+        assert!(reason.starts_with("truncated:"));
+
+        let body_limit = serde_json::json!({
+            "pluginId": "notion",
+            "result": {"isError": true, "_meta": {"truncated": true, "bodyLimitBytes": 1}}
+        });
+        assert!(
+            super::remote_omission_failure("execute_external_plugin_tool", &body_limit)
+                .unwrap()
+                .starts_with("bodyLimitExceeded:")
+        );
+
+        let intact = crate::external_plugins::plugin_tool_envelope(
+            "notion",
+            "notion-update",
+            serde_json::json!({"content": [], "isError": false}),
+        );
+        assert_eq!(
+            super::remote_omission_failure("execute_external_plugin_tool", &intact),
+            None
+        );
+        // 다른 작업의 값은 들여다보지 않는다.
+        assert_eq!(super::remote_omission_failure("get_doc", &body_limit), None);
+    }
+
+    /// 외부 도구 상한은 외부 도구 작업에만 쓴다. get_doc(5 MiB)처럼 큰 값을 낼 수 있는
+    /// 다른 조회는 기본 상한(512 KB)에서 그대로 거절돼야 한다.
+    #[test]
+    fn other_operations_keep_the_default_response_cap() {
+        let document = serde_json::json!({"content": "문서 본문 ".repeat(60 * 1024)});
+        assert!(
+            serde_json::to_string_pretty(&document).unwrap().len() > super::MAX_MCP_RESULT_BYTES
+        );
+        let refused = super::system_operation_success("get_doc", document.clone());
+        assert_eq!(refused["isError"], true);
+        assert!(refused["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("시스템 응답이 너무 큽니다"));
+
+        let small =
+            super::system_operation_success("get_doc", serde_json::json!({"content": "짧다"}));
+        assert_eq!(small["isError"], false);
+        // 기본 경로는 예전처럼 들여 쓴 글이다.
+        assert!(small["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\n  \"operation\": \"get_doc\""));
+
+        let plugin = super::system_operation_success("read_external_plugin_tool", document);
+        assert_eq!(plugin["isError"], false);
     }
 
     /// 표를 이름으로 찾는다. 색인으로 집으면 표에 줄을 끼워 넣을 때 시험이 조용히

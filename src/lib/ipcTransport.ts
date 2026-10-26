@@ -31,7 +31,7 @@ import {
   LEGACY_BACKEND_SERVICE_PORT,
   validBackendServicePort,
 } from "./backend";
-import { readJsonPayload } from "./responsePayload.ts";
+import { readJsonPayload, readJsonPayloadWithProgress, type DownloadProgress } from "./responsePayload.ts";
 
 
 /** 이 UI가 요구하는 백엔드 계약. 백엔드 `REMOTE_API_PROTOCOL_VERSION`과 **정확히**
@@ -162,6 +162,12 @@ export interface RequestTimeoutOptions {
   timeoutMs?: number;
 }
 
+/** 명령 POST의 선택지. 제한시간에 더해, 성공 본문을 받는 동안의 진행을 받을 수 있다. */
+export interface CallOptions extends RequestTimeoutOptions {
+  /** 성공 응답 본문을 받는 동안 받은 바이트를 알린다. 큰 응답을 받는 화면이 실제 진행을 보일 때 쓴다. */
+  onDownloadProgress?: (progress: DownloadProgress) => void;
+}
+
 /**
  * 제한시간이 있는 요청의 중단 신호. 값을 주지 않으면(또는 0이면) 신호 없이 기다린다.
  *
@@ -184,7 +190,7 @@ function requestTimeoutSignal(timeoutMs: number | undefined): AbortSignal | unde
 async function remoteCommandResponse<T>(
   command: string,
   args: Record<string, unknown>,
-  timeoutMs?: number,
+  { timeoutMs, onDownloadProgress }: CallOptions = {},
 ): Promise<{ response: Response; payload: T | null }> {
   const signal = requestTimeoutSignal(timeoutMs);
   try {
@@ -193,7 +199,11 @@ async function remoteCommandResponse<T>(
       args,
       { signal },
     );
-    return { response, payload: await readJsonPayload<T>(response, signal) };
+    // 진행은 성공 본문에만 알린다. 오류 본문은 짧고, 그 크기를 진행으로 보이면 뜻이 없다.
+    const payload = onDownloadProgress && response.ok
+      ? await readJsonPayloadWithProgress<T>(response, onDownloadProgress, signal)
+      : await readJsonPayload<T>(response, signal);
+    return { response, payload };
   } catch (cause) {
     // 중단은 연결 실패가 아니라 시간 초과다. 재연결 배너 대신 재시도 가능한 오류로 알린다.
     if (signal?.aborted && timeoutMs) throw new BackendTimeoutError(command, timeoutMs);
@@ -201,9 +211,9 @@ async function remoteCommandResponse<T>(
   }
 }
 
-export async function call<T>(command: string, args: Record<string, unknown> = {}, options: RequestTimeoutOptions = {}): Promise<T> {
+export async function call<T>(command: string, args: Record<string, unknown> = {}, options: CallOptions = {}): Promise<T> {
   await ensureBackendProtocol();
-  const { response, payload } = await remoteCommandResponse<{ error?: string } | T>(command, args, options.timeoutMs);
+  const { response, payload } = await remoteCommandResponse<{ error?: string } | T>(command, args, options);
   if (!response.ok) {
     // 503은 "지금은 다른 갱신이 돌고 있다"는 뜻이다. 오류 배너 대신 재시도로 다룬다.
     if (response.status === 503) {

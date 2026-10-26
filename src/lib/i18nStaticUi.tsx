@@ -16,7 +16,7 @@ import {
   staticUiKoreanByEnglish,
   UI_CATALOG_VERSION,
 } from "./i18nStaticDictionary";
-import { canonicalSourceText, sendableUiCatalogSource } from "./staticUiText";
+import { canonicalSourceText, isPlainLatinText, sendableUiCatalogSource } from "./staticUiText";
 import { runtimeLocale } from "./i18nRuntime";
 import { untranslatableUiProperNoun } from "./uiProperNouns";
 
@@ -209,12 +209,6 @@ function translateStaticUiTree(target: Node, rewrite: StaticUiRewrite): void {
   for (const slot of nodeStaticUiSlots(target)) apply(slot);
   if (target.nodeType === Node.TEXT_NODE) return;
   eachDescendantStaticUiSlot(target, apply);
-}
-
-/** 한글·가나·한자 없이 라틴 문자와 기호로만 된 글자인지. 영어 화면의 되짚기 생략 판정이다. */
-export function isPlainLatinText(value: string): boolean {
-  return !/[\p{Script=Hangul}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(value)
-    && !/[^\p{Script=Latin}\p{N}\p{P}\p{S}\p{Z}\s]/u.test(value);
 }
 
 export function StaticUiLocalization({ locale, messages }: { locale: AppLocale; messages: Record<string, string> }) {

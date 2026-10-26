@@ -6,6 +6,7 @@ import type { AccountSnapshot, ChatProviderOptions, ChatReasoningOption, ModelOp
 import { displayPath } from "../lib/displayPath";
 import { accountName, type LaunchAccountChoice } from "../lib/launchAccount";
 import { submitComposerOnEnter } from "../lib/composerKeys";
+import { launchAdvancedSummary } from "../lib/launchAdvancedSummary";
 import { EmptyState, ErrorBanner, FileDropOverlay, SourceBadge } from "./Shared";
 import { defaultEffortFor, runtimeExtraSettingFields, RuntimeExtraSettings, RuntimeSettings } from "./RuntimeSettings";
 import { readHiddenCliConnectionCards, writeHiddenCliConnectionCards } from "./ChatLocalSettings";
@@ -87,9 +88,7 @@ export function useLaunchAdvancedSettings({ source, catalog, recent, extraSettin
   const [open, setOpen] = useState(false);
   const fields = useMemo(() => runtimeExtraSettingFields(catalog, source), [catalog, source]);
   // 접어 둔 고급 옵션에 기본값이 아닌 선택이 남아 있으면 펼치지 않아도 보이게 요약한다.
-  const summary = fields
-    .map((field) => extraSettings[field.key]?.trim() ? `${field.label} ${extraSettings[field.key]}` : null)
-    .filter(Boolean).join(" · ") || `${fields.map((field) => field.label).join(" · ")} 기본값`;
+  const summary = launchAdvancedSummary(fields, extraSettings);
   const launchAdvancedSettings = fields.length === 0 ? null : (
     <section className="chat-launch-advanced">
       <button className="chat-launch-advanced-toggle" type="button" aria-expanded={open} onClick={() => setOpen((current) => !current)}>

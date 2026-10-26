@@ -41,12 +41,12 @@ export function setDbConnection(request: SetDbConnectionRequest): Promise<DbConn
   return notifyBuiltinTools(call<DbConnectionsSnapshot>("set_db_connection", { request }));
 }
 
-/** 에이전트 사용 토글. 앱 데이터 안의 변경이라 원격 편집 모드에서도 쓸 수 있다. */
+/** 에이전트 사용 토글. 앱 데이터 안의 변경이다. */
 export function setDbConnectionEnabled(request: SetDbConnectionEnabledRequest): Promise<DbConnectionsSnapshot> {
   return notifyBuiltinTools(call<DbConnectionsSnapshot>("set_db_connection_enabled", { request }));
 }
 
-/** 연결 삭제. 보안 저장소의 비밀값도 함께 지우는 호스트 전용 작업이다. */
+/** 연결 삭제. 보안 저장소의 비밀값도 함께 지운다. C20 이후 로그인한 채널이면 어디서나 쓸 수 있다(C10-14). */
 export function removeDbConnection(request: DbConnectionRef): Promise<DbConnectionsSnapshot> {
   return notifyBuiltinTools(call<DbConnectionsSnapshot>("remove_db_connection", { request }));
 }

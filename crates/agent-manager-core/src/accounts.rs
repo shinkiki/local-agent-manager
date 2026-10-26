@@ -7544,9 +7544,16 @@ impl PurposeGroups {
         let mut wanted = BTreeSet::new();
         let mut classified_models = Vec::new();
         for model in models {
-            if provider != ProviderId::Antigravity
-                || crate::antigravity_usage::pacing_resource_id_for_model(model).is_err()
-            {
+            if provider != ProviderId::Antigravity {
+                // 계정 창 위에 모델 전용 한도(Claude `Fable 7일`)가 얹히는 공급자. 그 한도에
+                // 걸린 실행을 같은 한도가 찬 후보로 옮기면 게이트가 다시 거부한다 — 후보의 그
+                // 모델 창도 보게 모델을 들고 간다. 그룹 이름은 없다.
+                if !model.trim().is_empty() {
+                    classified_models.push(model.clone());
+                }
+                continue;
+            }
+            if crate::antigravity_usage::pacing_resource_id_for_model(model).is_err() {
                 continue;
             }
             classified_models.push(model.clone());
@@ -7787,14 +7794,18 @@ impl<'a> AutoSwitchEligibility<'a> {
     /// 비었을 때도 이것은 남는다.
     fn serves_models(&self, usage: &AccountUsageView) -> bool {
         self.must_serve_models.iter().all(|model| {
-            model_scoped_windows(self.provider, Some(model), &usage.windows)
-                .iter()
-                .all(|window| {
-                    !(window.used_percent >= 100.0
-                        && window
-                            .resets_at
-                            .is_none_or(|resets_at| resets_at > self.now))
-                })
+            let mut windows = model_scoped_windows(self.provider, Some(model), &usage.windows);
+            windows.extend(model_limit_windows(
+                self.provider,
+                Some(model),
+                &usage.windows,
+            ));
+            windows.iter().all(|window| {
+                !(window.used_percent >= 100.0
+                    && window
+                        .resets_at
+                        .is_none_or(|resets_at| resets_at > self.now))
+            })
         })
     }
 
@@ -8046,7 +8057,86 @@ fn readiness_from_state(
             resume_at: usage_resume_at(usage, &model_windows, now),
         };
     }
+    // 계정 전체 창이 열려 있어도 이 모델에만 걸린 한도(Claude `Fable 7일`)가 차면 이 실행은
+    // 못 돈다. 두 한도가 함께(AND) 걸리므로 모델 한정 창은 계정 판정에 **더해서** 본다.
+    let limit_windows = model_limit_windows(provider, model, &usage.windows);
+    let full = |window: &AccountUsageWindow| {
+        window.used_percent >= 100.0 && window.resets_at.is_none_or(|resets_at| resets_at > now)
+    };
+    if limit_windows.iter().copied().any(full) {
+        return RunReadiness::UsageExhausted {
+            resume_at: windows_clear_at(limit_windows.into_iter(), full),
+        };
+    }
     RunReadiness::Ready
+}
+
+/// 모델 한정 창 라벨(`Fable 7일`·`GPT-6 7일`)의 범위 이름. 계정 전체 창(`7일`)과 모델군
+/// 창(`Gemini Models · 7일`)은 `None`이다. 라벨은 [`scoped_window_label`]이 `{범위} {창 길이}`
+/// 꼴로 만들고 계정 전체 창 라벨에는 공백이 없다.
+pub(crate) fn model_limit_scope(label: &str) -> Option<&str> {
+    if label.contains(" · ") {
+        return None;
+    }
+    label
+        .rsplit_once(' ')
+        .map(|(scope, _)| scope.trim())
+        .filter(|scope| !scope.is_empty())
+}
+
+/// 이 모델이 그 범위의 한도를 쓰는지(`claude-fable-5-1`·`fable` ↔ `Fable`). 범위 이름을
+/// 낱말로 쪼개 모델 id 안에 같은 순서로 이어 나오면 그 모델의 창이다 — `GPT-6`은
+/// `gpt-6.1-sol`에 걸리고 `Fable`은 `claude-opus-5-5`에 걸리지 않는다.
+///
+/// 범위 이름에 버전이 붙어 와도(`Fable 5.1`) 버전 없는 별칭(`fable`)은 그 범위를 쓴다 — 별칭은
+/// 최신 모델을 가리키므로 버전으로 가를 근거가 없다. 버전을 적은 모델 id는 버전까지 맞아야 한다.
+pub(crate) fn model_uses_limit_scope(model: &str, scope: &str) -> bool {
+    let words = |text: &str| -> Vec<String> {
+        text.split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    };
+    let contains = |haystack: &[String], needle: &[String]| {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|run| run == needle)
+    };
+    let numeric = |word: &String| word.chars().all(|ch| ch.is_ascii_digit());
+    let scope = words(scope);
+    let model = words(model);
+    if contains(&model, &scope) {
+        return true;
+    }
+    let family: Vec<String> = scope
+        .iter()
+        .filter(|word| !numeric(word))
+        .cloned()
+        .collect();
+    family.len() < scope.len() && !model.iter().any(numeric) && contains(&model, &family)
+}
+
+/// 이번 실행의 모델에만 걸린 **추가** 한도 창. 모델군마다 쿼터가 갈리는 Antigravity는
+/// [`model_scoped_windows`]가 맡으므로 비어 있다. 그 밖의 공급자는 계정 전체 창 위에 모델별
+/// 주간 창이 얹히는 꼴이라(Claude `Fable 7일`) 그 모델 실행은 두 쪽 모두에 여유가 있어야 돈다.
+/// 모델을 모르거나 맞는 창이 없으면 비어 있다.
+pub(crate) fn model_limit_windows<'a>(
+    provider: ProviderId,
+    model: Option<&str>,
+    windows: &'a [AccountUsageWindow],
+) -> Vec<&'a AccountUsageWindow> {
+    let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
+        return Vec::new();
+    };
+    if provider == ProviderId::Antigravity {
+        return Vec::new();
+    }
+    windows
+        .iter()
+        .filter(|window| window.model_scoped)
+        .filter(|window| {
+            model_limit_scope(&window.label)
+                .is_some_and(|scope| model_uses_limit_scope(model, scope))
+        })
+        .collect()
 }
 
 /// 인증 상태가 실행을 막는지, 막는다면 어떤 이유인지. `Ready`면 `None`을 준다.
@@ -8580,6 +8670,108 @@ mod tests {
         }));
         assert_eq!(windows.len(), 2);
         assert!(windows.iter().all(|window| !window.model_scoped));
+    }
+
+    /// Fable 주간 창은 계정 창 위에 함께(AND) 걸린다. 다 차면 Fable 실행만 막히고 같은 계정의
+    /// 다른 모델 실행은 그대로 돈다. 다시 열리는 시각은 그 창의 리셋이다.
+    #[test]
+    fn a_full_model_limit_window_blocks_only_runs_of_that_model() {
+        let usage = AccountUsageView {
+            status: AccountUsageStatus::Ok,
+            windows: vec![
+                AccountUsageWindow {
+                    label: "5시간".to_owned(),
+                    used_percent: 10.0,
+                    resets_at: Some(5_000),
+                    ..Default::default()
+                },
+                AccountUsageWindow {
+                    label: "7일".to_owned(),
+                    used_percent: 20.0,
+                    resets_at: Some(9_000),
+                    ..Default::default()
+                },
+                AccountUsageWindow {
+                    label: "Fable 7일".to_owned(),
+                    used_percent: 100.0,
+                    resets_at: Some(9_500),
+                    model_scoped: true,
+                    aggregate: false,
+                },
+            ],
+            updated_at: Some(0),
+            ..AccountUsageView::default()
+        };
+        let readiness = |model: Option<&str>| {
+            readiness_from_state(
+                ProviderId::Claude,
+                false,
+                AccountAuthStatus::Ready,
+                &usage,
+                model,
+                1_000,
+            )
+        };
+        assert_eq!(
+            readiness(Some("claude-fable-5-1")),
+            RunReadiness::UsageExhausted {
+                resume_at: Some(9_500)
+            }
+        );
+        assert_eq!(
+            readiness(Some("fable")),
+            RunReadiness::UsageExhausted {
+                resume_at: Some(9_500)
+            }
+        );
+        assert_eq!(readiness(Some("claude-opus-5-5")), RunReadiness::Ready);
+        assert_eq!(readiness(None), RunReadiness::Ready);
+        // 리셋이 지나면 다시 돈다.
+        assert_eq!(
+            readiness_from_state(
+                ProviderId::Claude,
+                false,
+                AccountAuthStatus::Ready,
+                &usage,
+                Some("claude-fable-5-1"),
+                9_600,
+            ),
+            RunReadiness::Ready
+        );
+    }
+
+    /// 모델 한정 창 라벨과 모델 id를 낱말 단위로 맞춘다. 모델군 창·계정 창은 대상이 아니다.
+    #[test]
+    fn model_limit_scope_matches_model_ids_word_by_word() {
+        assert_eq!(model_limit_scope("Fable 7일"), Some("Fable"));
+        assert_eq!(model_limit_scope("GPT-6 7일"), Some("GPT-6"));
+        assert_eq!(model_limit_scope("7일"), None);
+        assert_eq!(model_limit_scope("Gemini Models · 7일"), None);
+        assert!(model_uses_limit_scope("claude-fable-5-1", "Fable"));
+        assert!(model_uses_limit_scope("fable", "Fable"));
+        assert!(model_uses_limit_scope("gpt-6.1-sol", "GPT-6"));
+        assert!(!model_uses_limit_scope("claude-opus-5-5", "Fable"));
+        assert!(!model_uses_limit_scope("claude-fabled-1", "Fable"));
+        assert!(!model_uses_limit_scope("gpt-5.6", "GPT-6"));
+        assert!(!model_uses_limit_scope("claude-fable-5-1", ""));
+        // 범위 이름에 버전이 붙어 와도 별칭은 걸리고, 버전을 적은 id는 버전까지 맞아야 한다.
+        assert!(model_uses_limit_scope("fable", "Fable 5.1"));
+        assert!(model_uses_limit_scope("claude-fable-5-1", "Fable 5.1"));
+        assert!(!model_uses_limit_scope("claude-fable-6-0", "Fable 5.1"));
+        assert!(!model_uses_limit_scope("opus", "Fable 5.1"));
+        // Antigravity는 모델군 판정(model_scoped_windows)이 맡는다.
+        let windows = vec![AccountUsageWindow {
+            label: "Fable 7일".to_owned(),
+            used_percent: 100.0,
+            model_scoped: true,
+            ..Default::default()
+        }];
+        assert!(model_limit_windows(ProviderId::Antigravity, Some("fable"), &windows).is_empty());
+        assert_eq!(
+            model_limit_windows(ProviderId::Claude, Some("fable"), &windows).len(),
+            1
+        );
+        assert!(model_limit_windows(ProviderId::Claude, Some("  "), &windows).is_empty());
     }
 
     /// 모델별 창은 그 모델을 쓰지 않는 실행까지 막으면 안 되므로 소진·여유·재개 시각

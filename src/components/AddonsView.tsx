@@ -20,6 +20,16 @@ export type AddonsTabId = "mcp" | "ssh" | "db" | "cypress" | "mermaid" | "claude
 // 같은 규칙이 그대로 듣는다 — `automation`이 저장돼 있어도 유효 id가 아니라 기본 탭으로 선다.
 const ADDONS_TAB_KEY = "agent-manager.addons-tab.v2";
 
+/** 패널 한 벌이 받는 것. 애드온 탭은 모두 붙는 도구 하나를 다루므로 화면 상태만 받는다. */
+export interface AddonsPanelProps {
+  active: boolean;
+}
+
+interface AddonsTab extends SettingsSubTab<AddonsTabId> {
+  tool?: string;
+  panel: ComponentType<AddonsPanelProps>;
+}
+
 /**
  * 애드온 탭 한 줄이 곧 탭 버튼이자 그 안에 서는 내용이다. 탭 이름·표식과 패널 내용을 따로
  * 두었을 때는 탭 id를 한 탭마다 세 번(탭 표, 패널 id, `active` 판정) 되풀이해 적어야 했고,
@@ -33,16 +43,6 @@ const ADDONS_TAB_KEY = "agent-manager.addons-tab.v2";
  * `tool` — 기본도구 카탈로그에 있는 도구만 접근 경로 상세(`BuiltinToolAccess`)를 패널 맨 위에
  * 얹는다. Claude Code는 클로드 전용 라우트라 비운다.
  */
-/** 패널 한 벌이 받는 것. 애드온 탭은 모두 붙는 도구 하나를 다루므로 화면 상태만 받는다. */
-export interface AddonsPanelProps {
-  active: boolean;
-}
-
-interface AddonsTab extends SettingsSubTab<AddonsTabId> {
-  tool?: string;
-  panel: ComponentType<AddonsPanelProps>;
-}
-
 const addonsTabs: readonly AddonsTab[] = [
   { id: "mcp", icon: Plug, ko: "외부 MCP", en: "External MCP", anchor: "addons.tab.mcp", tool: "mcp", panel: ExternalPluginsCard },
   { id: "ssh", icon: KeyRound, ko: "SSH", en: "SSH", anchor: "addons.tab.ssh", tool: "ssh", panel: SshKeysCard },

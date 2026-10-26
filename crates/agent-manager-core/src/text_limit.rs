@@ -35,14 +35,22 @@ pub(crate) fn truncate_chars(value: &str, max_chars: usize) -> String {
 /// `BOUNDARY_MIN_RATIO_PERCENT`% 뒤에서만 경계를 찾고, 그 안에 경계가 없으면 상한에서
 /// 그대로 자른다.
 pub(crate) fn truncate_chars_at_boundary(value: &str, max_chars: usize) -> String {
-    let chars = value.chars().take(max_chars + 1).collect::<Vec<_>>();
+    let chars = value
+        .chars()
+        .take(max_chars.saturating_add(1))
+        .collect::<Vec<_>>();
     if chars.len() <= max_chars {
         return value.to_owned();
     }
     let floor = max_chars * BOUNDARY_MIN_RATIO_PERCENT / 100;
     let cut = find_boundary_cut(&chars, floor, max_chars);
     let kept = chars[..cut].iter().collect::<String>();
-    format!("{}{ELLIPSIS}", kept.trim_end())
+    let trimmed = kept.trim_end();
+    if trimmed.ends_with(ELLIPSIS) {
+        trimmed.to_owned()
+    } else {
+        format!("{trimmed}{ELLIPSIS}")
+    }
 }
 
 /// 상한 안에서 문장 끝을 먼저 찾고, 없으면 낱말 사이 공백을 찾는다.
@@ -140,6 +148,18 @@ mod tests {
         assert_eq!(
             truncate_chars_at_boundary(&large, 10),
             format!("{}…", "가".repeat(10))
+        );
+    }
+
+    #[test]
+    fn boundary_truncation_does_not_duplicate_existing_ellipsis() {
+        assert_eq!(
+            truncate_chars_at_boundary("첫 문장입니다… 두 번째 문장입니다.", 10),
+            "첫 문장입니다…"
+        );
+        assert_eq!(
+            truncate_chars_at_boundary("생각 중… 다음 작업을 진행합니다.", 8),
+            "생각 중…"
         );
     }
 

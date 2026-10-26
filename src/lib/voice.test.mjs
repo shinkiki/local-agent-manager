@@ -4,6 +4,8 @@ import {
   mergeSpeechTranscript,
   isReadableFinalResponse,
   normalizeSpeechTranscript,
+  RECOGNITION_UNSUPPORTED_TEXT,
+  voiceButtonState,
   speechRecognitionErrorText,
   voiceStatusText,
 } from "./voice.ts";
@@ -65,4 +67,27 @@ test("only the last assistant message of a completed turn is readable", () => {
   assert.equal(isReadableFinalResponse("completed", false), false);
   assert.equal(isReadableFinalResponse("interrupted", true), false);
   assert.equal(isReadableFinalResponse("failed", true), false);
+});
+
+test("the voice button shows playback first, then the user's own input, then environment limits", () => {
+  const ko = (korean) => korean;
+  const inputFailed = (text) => text("입력 실패", "input failed");
+  const playbackFailed = (text) => text("재생 실패", "playback failed");
+  const idle = { status: "idle", error: null };
+  const playing = { status: "playing", error: null };
+  const replayFailed = { status: "error", error: playbackFailed };
+  const shown = (inputStatus, inputError, playback, supported) => {
+    const state = voiceButtonState(inputStatus, inputError, playback, supported);
+    return [state.status, state.error ? state.error(ko) : null];
+  };
+  // 재생 중이면 입력 실패·미지원보다 앞선다 — 그때 버튼은 재생을 끊는 일을 한다.
+  assert.deepEqual(shown("error", inputFailed, playing, false), ["playing", null]);
+  // 방금 한 입력이 재생 실패와 미지원보다 앞서고, 실패면 그 문구를 함께 낸다.
+  assert.deepEqual(shown("error", inputFailed, replayFailed, false), ["error", "입력 실패"]);
+  assert.deepEqual(shown("recording", null, replayFailed, true), ["recording", null]);
+  assert.deepEqual(shown("ready", null, idle, false), ["ready", null]);
+  // 쉬는 동안에만 미지원이, 그다음 지난 재생 실패가 드러난다. 상태와 문구는 짝으로 온다.
+  assert.deepEqual(shown("idle", null, replayFailed, false), ["error", RECOGNITION_UNSUPPORTED_TEXT(ko)]);
+  assert.deepEqual(shown("idle", null, replayFailed, true), ["error", "재생 실패"]);
+  assert.deepEqual(shown("idle", null, idle, true), ["idle", null]);
 });

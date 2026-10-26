@@ -31,6 +31,11 @@ import type { AppLocale } from "../types";
  */
 export type UiText = (ko: string, en: string) => string;
 
+/** 번역표에 직접 등록한 문구만 읽는다. 상속된 constructor 같은 값은 번역문이 아니다. */
+export function ownUiTranslation(table: Record<string, string>, source: string): string | undefined {
+  return Object.prototype.hasOwnProperty.call(table, source) ? table[source] : undefined;
+}
+
 export function localizedUiText(
   locale: AppLocale,
   source: string,
@@ -39,5 +44,5 @@ export function localizedUiText(
 ): string {
   if (locale === "ko") return source;
   if (locale === "en") return english(source);
-  return messages[source] ?? english(source);
+  return ownUiTranslation(messages, source) ?? english(source);
 }

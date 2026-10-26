@@ -1676,6 +1676,10 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 }
 /* 프로젝트 활성여부 목록. 설정 카드 안에서 행마다 이름·경로·세션 요약과 토글을 나란히 둔다. */
 .settings-subsection > header > .project-registry-search { display: inline-flex; flex: none; align-items: center; gap: 6px; color: var(--faint); }
+/* 세션 목록 본문 검색: 진행·누락 안내 한 줄, 행 제목 아래 일치 문장. */
+.session-search-status { margin: 0 0 8px; color: var(--muted); font-size: var(--ui-font-8); }
+.session-search-snippet { display: -webkit-box; overflow: hidden; margin-top: 3px; color: var(--muted); font-size: var(--ui-font-8); line-height: 1.4; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.session-search-snippet mark { border-radius: 3px; background: rgba(var(--accent-rgb), .28); color: inherit; }
 .project-registry-search .search-input { width: min(220px, 100%); }
 .project-registry-list { display: flex; flex-direction: column; margin: 0 18px 18px; padding: 0; overflow: hidden; list-style: none; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--x0b1219); }
 .project-registry-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 9px 12px 9px 14px; }
@@ -2626,7 +2630,7 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .chat-tool-state { width: 6px; height: 6px; border-radius: 50%; background: var(--x596879); }
 .chat-tool-state-running, .chat-tool-state-inProgress { background: var(--xe9be5d); box-shadow: 0 0 6px rgba(233, 190, 93, .35); }
 .chat-tool-state-completed, .chat-tool-state-success { background: var(--green); }
-.chat-tool-state-completedWithDenials, .chat-tool-state-interrupted { background: var(--xe9be5d); box-shadow: 0 0 6px rgba(233, 190, 93, .28); }
+.chat-tool-state-completedWithDenials, .chat-tool-state-denied, .chat-tool-state-interrupted { background: var(--xe9be5d); box-shadow: 0 0 6px rgba(233, 190, 93, .28); }
 .chat-tool-state-failed, .chat-tool-state-error { background: var(--danger); }
 
 .chat-hub { display: flex; width: min(1200px, 100%); height: 100%; min-height: 0; margin: 0 auto; flex-direction: column; gap: 10px; }
@@ -2709,6 +2713,18 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 /* 반복 요청의 워크플로 구분: 계약 입력 폼과 승인 버전 안내를 편집기 그리드 폭에 맞춘다. */
 .schedule-editor-grid > .wide { grid-column: 1 / -1; }
 .schedule-editor-grid > .workflow-inputs { margin-bottom: 0; }
+/* 여럿을 고르는 모델 칸(로컬 모델·페이싱 모델 사다리). 편집기 그리드의 입력 규칙(폭 100%·높이 39px)이
+   체크박스에도 걸려 칸 하나가 한 줄을 다 차지하고 이름이 아래로 밀렸다. 체크박스는 글자 크기로 고정하고
+   이름과 한 줄에 둔 촘촘한 목록으로 펼친다 — PC는 여러 열, 좁은 화면은 한 열. */
+.workflow-inputs .workflow-input-multi { grid-column: 1 / -1; display: grid; min-width: 0; grid-template-columns: repeat(auto-fill, minmax(min(210px, 100%), 1fr)); gap: 2px 14px; margin: 0; padding: 8px 11px 10px; border: 1px solid var(--border-soft); border-radius: 9px; }
+.workflow-inputs .workflow-input-multi > legend { display: flex; max-width: 100%; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; padding: 0 5px; color: var(--muted); font-size: var(--ui-font-8); font-weight: 700; }
+.workflow-inputs .workflow-input-multi > legend > small:not(.workflow-input-key) { flex-basis: 100%; }
+.workflow-inputs .workflow-input-multi > small { grid-column: 1 / -1; line-height: 1.5; }
+.workflow-inputs .workflow-input-multi > .workflow-input-hint { margin-bottom: 4px; }
+.workflow-inputs .workflow-input-multi.workflow-input-invalid { border-color: rgba(233, 190, 93, .55); }
+.workflow-inputs .workflow-input-multi > label.workflow-input-boolean { display: flex; min-width: 0; flex-direction: row; flex-wrap: nowrap; align-items: center; gap: 8px; padding: 4px 0; color: var(--xd3dde8); font-weight: 500; line-height: 1.35; cursor: pointer; }
+.workflow-inputs .workflow-input-multi > label.workflow-input-boolean > span { min-width: 0; overflow-wrap: anywhere; }
+.workflow-inputs .workflow-input-multi input[type="checkbox"] { flex: none; width: 16px; min-width: 16px; height: 16px; min-height: 16px; margin: 0; padding: 0; }
 .schedule-workflow-note { display: flex; flex-direction: column; gap: 7px; padding: 10px 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--x0b1219); color: var(--muted); font-size: var(--ui-font-8); line-height: 1.55; }
 .schedule-workflow-note p { margin: 0; }
 .schedule-workflow-note strong { display: block; margin-bottom: 3px; color: var(--xe9be5d); font-size: var(--ui-font-8); }
@@ -2766,7 +2782,8 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .button.compact { min-height: 28px; padding-inline: 8px; gap: 4px; font-size: var(--ui-font-7); }
 .translation-language-actions .button.compact, .translation-language-form .button.compact { min-height: 36px; }
 .original-content { padding: 0; }.original-content > summary { padding: 13px 15px; color: var(--muted); font-size: var(--ui-font-9); font-weight: 700; cursor: pointer; }.original-content[open] > summary { border-bottom: 1px solid var(--border-soft); }.original-content > :not(summary) { margin: 0; padding: 14px; }
-.app-toggle { display: inline-flex; width: 40px; min-width: 40px; height: 22px; flex: none; align-items: center; padding: 0; border: 0; border-radius: 999px; background: transparent; color: inherit; cursor: pointer; }
+/* 트랙은 22px 그대로 두고 버튼만 24px로 둔다 — 누르는 자리가 최소 대상 크기(24px)를 채우고, 투명한 버튼이라 모양은 같다. */
+.app-toggle { display: inline-flex; width: 40px; min-width: 40px; height: 24px; flex: none; align-items: center; padding: 0; border: 0; border-radius: 999px; background: transparent; color: inherit; cursor: pointer; }
 .app-toggle-track { position: relative; display: block; width: 40px; height: 22px; flex: none; border: 1px solid var(--x344454); border-radius: 999px; background: var(--x263442); transition: border-color 150ms ease, background 150ms ease; }
 .app-toggle-track i { position: absolute; top: 3.5px; left: 3px; display: block; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: transform 170ms ease; }
 .app-toggle.checked .app-toggle-track { border-color: var(--accent); background: var(--accent); }.app-toggle.checked .app-toggle-track i { transform: translateX(18px); background: #fff; }
@@ -3031,6 +3048,21 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
    '이전 대화 더보기'와 같은 모양을 쓴다. */
 .transcript-mount-boundary { display: flex; flex-direction: column; align-items: center; gap: 5px; padding: 4px 0 8px; }
 .transcript-mount-boundary small { color: var(--faint); font-size: var(--ui-font-7); }
+
+/* 긴 대화를 처음 열 때 자리를 잡는 동안 본문 대신 서는 진행 막. 본문은 숨기기만 하고
+   배치는 남겨 두어(visibility) 자리 잡기의 높이·위치 계산이 그대로다. 막대는 잠깐 늦게
+   드러내, 한두 프레임이면 끝나는 짧은 대화에서 막대가 깜빡이지 않게 한다. */
+.drawer-body.is-placing, .chat-stream.is-placing { visibility: hidden; }
+.transcript-placement-veil { position: absolute; z-index: 13; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; color: var(--faint); font-size: var(--ui-font-8); animation: transcript-placement-veil-in 140ms ease-out 160ms both; }
+.transcript-placement-veil > .progress { width: min(220px, 60%); }
+.progress.is-indeterminate span { width: 38%; animation: progress-indeterminate 1.1s ease-in-out infinite; }
+.transcript-placement-veil > .progress:not(.is-indeterminate) span { transition: width 160ms ease-out; }
+.transcript-placement-veil > small > span { font-variant-numeric: tabular-nums; }
+@keyframes transcript-placement-veil-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes progress-indeterminate { from { transform: translateX(-100%); } to { transform: translateX(265%); } }
+@media (prefers-reduced-motion: reduce) {
+  .progress.is-indeterminate span { width: 100%; opacity: .55; animation: none; }
+}
 
 /* 채팅 화면 위쪽에 붙는 세션 파일 원문. 라이브 스트림과 같은 폭을 쓰되, 지금 연결된 대화와
    구분되도록 머리말과 경계선을 둔다. */
@@ -4186,7 +4218,8 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .round-report-list > ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 2px; }
 .round-report-list li { overflow-wrap: anywhere; }
 .round-decision { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border: 1px dashed rgba(233, 190, 93, .45); border-radius: 8px; }
-.round-decision > p { margin: 0; font-weight: 600; }
+.round-decision > p { margin: 0; }
+.round-decision > p.round-decision-lead { font-weight: 600; }
 .round-decision-form.path-field-group { flex-direction: row; flex-wrap: wrap; align-items: center; }
 .round-decision-form > input { min-width: 200px; flex: 1; }
 .round-report-table { width: 100%; border-collapse: collapse; font-size: var(--ui-font-7); }.round-report-table th, .round-report-table td { padding: 2px 8px 2px 0; text-align: left; border-bottom: 1px solid var(--border-soft); }.round-report-table th { color: var(--muted); font-weight: 600; }

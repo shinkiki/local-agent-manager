@@ -620,7 +620,7 @@ fn read_skill_content(directory: &Path) -> Result<SkillContent, CoreError> {
         hasher.update(bytes.len().to_le_bytes());
         hasher.update(&bytes);
     }
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = crate::identifier::lower_hex(&hasher.finalize());
 
     Ok(SkillContent {
         digest,
@@ -2367,7 +2367,7 @@ fn projected_skill_digest(
         hasher.update(bytes.len().to_le_bytes());
         hasher.update(bytes);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::identifier::lower_hex(&hasher.finalize()))
 }
 
 fn checked_resource_manifest(directory: &Path) -> Result<ResourcePlatformManifest, CoreError> {

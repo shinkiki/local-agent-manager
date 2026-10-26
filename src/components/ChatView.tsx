@@ -22,6 +22,7 @@ import { useI18n } from "../lib/i18n";
 import { runtimeText } from "../lib/i18nRuntime";
 import { directoryCreationItems, missingDirectoryPath } from "../lib/missingDirectory";
 import { useChatTranscriptHistory } from "./ChatTranscriptHistory";
+import { TranscriptPlacementVeil, useOpeningVeil } from "./TranscriptPlacementVeil";
 import { useReadingBookmarks } from "./ReadingBookmarks";
 import type {
   AccountSnapshot,
@@ -175,6 +176,24 @@ interface ChatSurface {
   activeTurnId: string | null;
 }
 
+/** 응답이 이어지는 중인 상태. 이 상태의 턴은 아직 답이 다 오지 않았다. */
+const RESPONDING_CHAT_STATES = new Set(["running", "waitingApproval"]);
+
+/**
+ * 붙은 뒤 되풀이되는 지난 상태(리플레이)가 열기 직전의 목록 값까지 왔는지. 리플레이의 상태는 그때의
+ * 턴 수를 싣고 오르기만 한다. 턴 수가 목표를 넘었으면 그 사이 새 턴이 시작된 것이고, 같으면 상태가
+ * 목표와 같거나(응답 중인 채팅이면 그 턴이 시작된 자리) 응답이 끝난 상태여야 마지막 턴의 답까지 온
+ * 것이다 — 마지막 턴이 시작될 때 이미 턴 수는 목표에 닿지만 상태는 '응답 중'이다.
+ */
+function replayReached(progress: { turnCount: number; state: string } | null, target: { turnCount: number; state: string }): boolean {
+  if (!progress) return false;
+  if (progress.turnCount > target.turnCount) return true;
+  // 응답 중이던 채팅이면 같은 턴 수의 상태는 모두 그 턴의 시작부 뒤에 오므로 턴 수만 맞으면 된다
+  // ('응답 중'과 '승인 대기'를 오가도, 턴 시작 상태가 버퍼에서 밀려나 없어도).
+  return progress.turnCount === target.turnCount
+    && (RESPONDING_CHAT_STATES.has(target.state) || !RESPONDING_CHAT_STATES.has(progress.state));
+}
+
 /**
  * 아직 붙지 않은 채팅의 화면 상태. 대화와 대기열은 연결이 리플레이로 채우므로 비우고,
  * 작성 중이던 글만 그 채팅 몫으로 기억해 둔 초안에서 되살린다.
@@ -258,6 +277,24 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
   const [uploadingAttachments, setUploadingAttachments] = useState(false);
   const [session, sessionRef, putSession] = useMirroredState<ChatSessionInfo | null>(null);
   const [liveChats, setLiveChats] = useState<ChatSessionInfo[]>([]);
+  // 전환을 누른 순간의 목록 값. 전환 함수는 묶인 시점의 목록을 쥐고 있어 거울로 읽는다.
+  const liveChatsRef = useRef(liveChats);
+  liveChatsRef.current = liveChats;
+  const liveChatsLoadedRef = useRef(false);
+  // 소켓 상태 이벤트가 알려 준 마지막 턴 수·상태. 목록 폴링의 안전망 스냅숏도 세션을 덮어쓰므로,
+  // 리플레이가 어디까지 왔는지는 소켓에서 온 값으로만 잰다.
+  const [socketProgress, setSocketProgress] = useState<{ chatId: string; turnCount: number; state: string } | null>(null);
+  const [openSerial, setOpenSerial] = useState(0);
+  const [openingTurnTargetState, setOpeningTurnTargetState] = useState<{ chatId: string; turnCount: number; state: string } | null>(null);
+  // 화면이 다른 채팅으로 옮겨 가기 시작할 때마다 부른다. 여는 번호를 올려 막을 새로 세우고, 앞
+  // 연결이 남긴 리플레이 진행과 앞 채팅의 열기 목표를 지운다 — 남겨 두면 새 채팅의 막대가 그 값에서
+  // 시작하고, 조작이 실패해 같은 채팅에 머물면 지운 진행이 남은 목표에 닿지 못해 막이 상한까지 선다.
+  // 목록에서 여는 전환은 이 뒤에 자기 목표를 다시 적는다.
+  const beginOpening = useCallback(() => {
+    setOpenSerial((serial) => serial + 1);
+    setSocketProgress(null);
+    setOpeningTurnTargetState(null);
+  }, []);
   // 종료를 요청한 배경 채팅. 3초 폴링이 아직 살아 있는 그 채팅을 목록에 되살리지 못하게
   // 화면에서만 걸러 낸다. 실패하면 다시 목록에 나타난다.
   const [closingChatIds, setClosingChatIds] = useState<ReadonlySet<string>>(() => new Set());
@@ -542,6 +579,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     // 화면의 채팅은 그대로 두고, 폴링 루프만 백오프하도록 실패를 전달한다.
     const chats = await getLiveChats("standard");
     if (!isLatest()) return;
+    liveChatsLoadedRef.current = true;
     setLiveChats(chats);
     // 안전망: 라이브 state 이벤트를 놓쳐 표시가 실제 상태와 어긋나면 스냅숏으로 맞춘다.
     const active = sessionRef.current;
@@ -599,6 +637,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
       onState: (info) => {
         appliedStateGenerationRef.current = connectionGenerationRef.current;
         lastStateEventAtRef.current = Date.now();
+        setSocketProgress({ chatId: info.chatId, turnCount: info.turnCount, state: info.state });
         applySessionInfo(info);
         if (info.providerSessionId) void onSessionCatalogChanged(info.source, info.providerSessionId);
       },
@@ -662,12 +701,73 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     return () => window.cancelAnimationFrame(frame);
   }, [activeChatId, messageDisplayMode, tab, transcript.loaded]);
 
+  // 자리를 다 잡은 채팅. 전환 중이거나 위에 붙을 원문을 기다리는 동안은 본문이 맨 위에 한 번
+  // 그려졌다가 원문이 붙고 바닥으로 옮겨 가며 글자가 화면을 훑는다. 그동안 본문을 가리고
+  // 진행 막대를 세운다. 위의 자리 잡기 예약들보다 뒤에 걸어, 같은 프레임에서 그것들이
+  // 옮긴 다음에 막을 걷는다.
+  //
+  // 붙기는 첫 상태 이벤트에서 끝나고 지난 턴(리플레이)은 그 뒤 소켓 메시지로 따로 들어온다. 그래서
+  // 전환이 끝난 순간 턴이 아직 비어 있을 수 있다. 누른 시점에 목록이 알려 준 턴 수·상태를 따로 떠
+  // 두고, 소켓 상태 이벤트가 거기까지 올 때까지(replayReached) 자리 잡기를 끝내지 않는다 — 다 들어오기
+  // 전에 걷으면 지난 턴이 맨 위에 그려진 뒤 옮겨 가는 것이 그대로 보인다. 목록 값은 리플레이의 지난
+  // 상태가 덮어쓰므로 읽는 순간의 목록이 아니라 누른 순간의 값이어야 한다. 보내기 실패로 턴 수가
+  // 되돌아간 드문 경우처럼 끝내 닿지 않으면 막의 상한(6초)이 걷는다.
+  const openingTarget = openingTurnTargetState?.chatId === activeChatId ? openingTurnTargetState : null;
+  const openingTurnTarget = openingTarget?.turnCount ?? 0;
+  const progress = socketProgress?.chatId === activeChatId ? socketProgress : null;
+  const replayCaughtUp = !openingTarget || openingTarget.turnCount === 0 || replayReached(progress, openingTarget);
+  // 여는 일 하나의 열쇠. 같은 채팅이라도 전환으로 다시 열면(새 채팅을 거쳐 돌아오기, 실패한 전환
+  // 뒤 다시 열기) 스트림을 비우고 리플레이를 처음부터 다시 그리므로 다시 여는 것으로 센다.
+  const openInstance = activeChatId ? `${activeChatId}#${openSerial}` : null;
+  const [placedOpen, setPlacedOpen] = useState<string | null>(null);
+  useEffect(() => {
+    if (!openInstance || chatSwitching || transcript.pending || !replayCaughtUp || placedOpen === openInstance) return undefined;
+    const frame = window.requestAnimationFrame(() => setPlacedOpen(openInstance));
+    return () => window.cancelAnimationFrame(frame);
+  }, [openInstance, chatSwitching, placedOpen, replayCaughtUp, transcript.pending]);
+  // 세션 상세와 같은 규칙의 막 하나: 위에 붙을 원문을 읽는 동안(표시 방식과 상관없이)과 자리를
+  // 잡는 동안을 잇는다. '처음부터' 보기는 맨 위에 선 채라 옮겨 가는 화면이 없고, 그릴 것이 없는
+  // 새 채팅도 옮길 것이 없다. 오류는 스트림 밖에 떠 가려지지 않는다.
+  // 진행 막의 실제 비율: 위에 붙을 원문을 받은 바이트와, 누른 순간의 턴 수 가운데 되풀이된 지난 턴.
+  // 둘 다 셀 수 있을 때는 평균을 보이고, 셀 수 있는 것이 없으면 흘러가는 막대로 둔다.
+  const openingProgress = useMemo(() => {
+    // 전환이 끝나기 전에는 화면의 세션이 아직 앞 채팅이라, 그 채팅의 원문·턴으로 막대를 채우면 안 된다.
+    if (chatSwitching) return null;
+    const parts: number[] = [];
+    // 받기 전(서버가 원문을 읽는 동안)이나 크기를 모를 때는 0으로 센다. 빼면 리플레이만으로 100%가
+    // 되어, 원문을 다 받기도 전에 막대가 끝까지 찬다.
+    // 다만 아무것도 셀 수 없으면(크기를 모르고 리플레이 목표도 없으면) 0%로 멈춘 막대 대신 흘러가는
+    // 막대를 보인다.
+    if (transcript.pending && (transcript.loadRatio !== null || openingTurnTarget > 0)) parts.push(transcript.loadRatio ?? 0);
+    else if (transcript.loaded && transcript.items.length > 0) parts.push(1);
+    if (openingTurnTarget > 0) parts.push(Math.min(1, (progress?.turnCount ?? 0) / openingTurnTarget));
+    return parts.length > 0 ? parts.reduce((sum, part) => sum + part, 0) / parts.length : null;
+  }, [chatSwitching, openingTurnTarget, progress?.turnCount, transcript.items.length, transcript.loadRatio, transcript.loaded, transcript.pending]);
+  const veiled = useOpeningVeil({
+    openKey: tab === "conversation" ? openInstance : null,
+    loading: transcript.pending,
+    placing: placedOpen !== openInstance && messageDisplayMode !== "start"
+      && (chatSwitching || openingTurnTarget > 0 || turns.length > 0 || transcript.items.length > 0),
+  });
+
   useEffect(() => () => {
     const { connection } = takeConnection();
     if (connection) void connection.detach();
   }, []);
 
   const runChatSwitch = useCallback(async (chatId: string): Promise<boolean> => {
+    if (connectionRef.current?.info.chatId === chatId) {
+      setTab("conversation");
+      return true;
+    }
+    // 여는 채팅의 지금 턴 수·상태(아래 자리 잡기의 목표). 팝아웃 창·알림으로 처음 여는 채팅은 목록
+    // 조회보다 먼저 오므로, 목록을 아직 한 번도 받지 못했으면 한 번 물어 둔다. 받은 뒤에도 없으면
+    // 끝난 채팅이라 기다릴 리플레이 목표가 없다. 연결을 읽기 전에 물어, 그사이 바뀐 연결을 놓치지 않는다.
+    let listed = liveChatsRef.current.find((chat) => chat.chatId === chatId);
+    if (!listed && !liveChatsLoadedRef.current) {
+      try { listed = (await getLiveChats("standard")).find((chat) => chat.chatId === chatId); }
+      catch { /* 모르면 기다리지 않는다. 막은 지금까지처럼 전환이 끝나면 걷힌다. */ }
+    }
     const connected = connectionRef.current;
     if (connected?.info.chatId === chatId) {
       setTab("conversation");
@@ -675,6 +775,8 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     }
 
     markChatSwitching(true);
+    beginOpening();
+    setOpeningTurnTargetState(listed ? { chatId, turnCount: listed.turnCount, state: listed.state } : null);
     const previous = connected;
     const previousInfo = sessionRef.current ?? previous?.info ?? null;
     const previousSurface = captureChatSurface();
@@ -698,6 +800,10 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
             await detachQuietly(nextConnection);
             return false;
           }
+          // 다시 여는 것이므로 원문 도착 때의 자리 맞추기도 다시 한다. 새 채팅을 거쳐 같은 채팅으로
+          // 돌아오면 이 표시가 그 채팅에 남아 있어, 위에 다시 붙은 원문이 화면을 밀어낸 채 막이 걷혔다.
+          // 전환이 실제로 붙은 뒤에만 지운다 — 실패해 앞 채팅으로 돌아가면 그 채팅의 표시는 그대로다.
+          historyPlacedChatRef.current = null;
           connectionRef.current = nextConnection;
           applyAttachSnapshot(nextConnection.info, generation);
           const scrollTop = chatLocalMemory.scrollTopOf(nextConnection.info.chatId);
@@ -732,7 +838,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
       markChatSwitching(false);
       void refreshLiveChats();
     }
-  }, [applyChatSurface, applySessionInfo, captureChatSurface, handleEvent, markChatSwitching, putSession, rememberChatLocalState, refreshLiveChats]);
+  }, [applyChatSurface, applySessionInfo, beginOpening, captureChatSurface, handleEvent, markChatSwitching, putSession, rememberChatLocalState, refreshLiveChats]);
 
   /**
    * 전환 요청을 순서대로 처리한다. 진행 중인 전환을 그냥 버리면 그 attach 결과를 받을
@@ -1372,6 +1478,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
   const newChat = async () => {
     if (chatSwitchingRef.current) return;
     markChatSwitching(true);
+    beginOpening();
     try {
       const connection = connectionRef.current;
       if (connection) {
@@ -1427,6 +1534,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     const originSessionId = current?.providerSessionId;
     if (!current || !originSessionId || !supportsSessionFork(current.source) || chatSwitchingRef.current) return;
     markChatSwitching(true);
+    beginOpening();
     setError(null);
     try {
       const connection = connectionRef.current;
@@ -1477,6 +1585,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
     if (!current?.providerSessionId || expectedText === null || !supportsMessageEdit(current.source)) throw new Error(text("편집할 원본 메시지를 확인할 수 없습니다.", "Cannot identify the original message to edit."));
     if (chatSwitchingRef.current || (phaseRef.current === "running" || phaseRef.current === "waitingApproval" || phaseRef.current === "connecting") || queueRef.current.length > 0) throw new Error(text("응답과 대기열 처리가 끝난 뒤 편집해 주세요.", "Wait until the response and queued messages finish before editing."));
     markChatSwitching(true);
+    beginOpening();
     let branch: ChatConnection | null = null;
     let adopted = false;
     let sent = false;
@@ -1603,6 +1712,7 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
 
     const nextChatId = openChats.find((chat) => chat.chatId !== current.chatId)?.chatId ?? null;
     markChatSwitching(true);
+    beginOpening();
     setError(null);
     try {
       await connection.stop();
@@ -1800,17 +1910,20 @@ export function ChatView({ providers, accounts, projects, models, sessions, mess
           </div>
         ) : (
           <div className="chat-stream-shell">
-            <div className="chat-stream" aria-live="polite" ref={chatStreamRef}>
+            <div className={`chat-stream${veiled ? " is-placing" : ""}`} aria-live={veiled ? "off" : "polite"} ref={chatStreamRef}>
               {transcript.history}
               {turns.length === 0 && !transcript.history && <EmptyState title={text("CLI가 연결되었습니다", "CLI connected")} detail={text("아래 입력창에서 첫 메시지를 보내세요.", "Send your first message from the composer below.")} />}
               {turns.map((turn) => <ChatConversationTurn onEditMessage={session && supportsMessageEdit(session.source) ? editLiveMessage : undefined} turn={turn} chatId={activeChatId} onDecision={decide} onOpenLocalLink={linkedFilePreview.open} key={turn.id} />)}
             </div>
-            <ChatScrollControls
+            {!veiled && <ChatScrollControls
               targetRef={chatStreamRef}
               leading={readingControls}
               onScrollAwayFromLatest={pauseFollowingLatestMessages}
               onScrollToLatest={resumeFollowingLatestMessages}
-            />
+            />}
+            {/* 여는 일마다 새 막이다. 그대로 두면 앞 채팅에서 찬 만큼이 다음 채팅으로 넘어간다. 열쇠는
+                전환 동안 바뀌지 않는 여는 번호다 — 채팅 id 까지 넣으면 붙는 순간 막이 다시 서며 깜빡인다. */}
+            {veiled && <TranscriptPlacementVeil key={openSerial} progress={openingProgress} />}
             {findBar}
           </div>
         )}

@@ -734,9 +734,9 @@ pub use crate::session_folders::{
 /// 세션 보완 저장소는 [`crate::supplement_store`]가 맡는다. 호출부가 쓰던
 /// `store::` 경로를 그대로 두려고 여기서 다시 내보낸다.
 pub(crate) use crate::supplement_store::{
-    captured_turns_for, persist_captured_turn, persist_captured_turn_if_absent,
-    persist_system_prompt, prune_supplements_for, supplement_storage_stats, CapturedTranscriptTurn,
-    SupplementOrigin,
+    captured_turns_by_session, captured_turns_for, persist_captured_turn,
+    persist_captured_turn_if_absent, persist_system_prompt, prune_supplements_for,
+    supplement_storage_stats, supplement_store_path, CapturedTranscriptTurn, SupplementOrigin,
 };
 
 /// 설정에서 제외한 프로젝트의 정규 경로 집합. 스냅샷 합성과 지침 배포 원장이 같은

@@ -1,5 +1,5 @@
 import { Download, Upload } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useI18n, type UiText } from "../lib/i18n";
 import { aiaRuntimeProvider } from "../lib/aiaRuntime";
 import { errorText } from "../lib/errorText";
@@ -29,19 +29,31 @@ export function ResourceRepositoryCard({ onChanged, automation, onRequestAiaProm
   const { busy: busyKey, error, setError, run } = useBusyAction<"apply">();
   const busy = busyKey !== null;
 
+  // 첫 조회가 실패하면 다시 부르는 길이 없어 '불러오는 중…'이 오류 배너와 함께 계속 남았다.
+  // 실패를 상태로 두고, 그때는 '불러오는 중' 대신 다시 불러오기 버튼을 보인다.
+  const [loadFailed, setLoadFailed] = useState(false);
+  const mounted = useRef(true);
+  // StrictMode는 개발 중 마운트를 한 번 해제했다 다시 하므로 다시 마운트될 때 true로 돌려 둔다.
   useEffect(() => {
-    let active = true;
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  const load = useCallback(() => {
+    setLoadFailed(false);
     getResourceRepository()
       .then((settings) => {
-        if (!active) return;
+        if (!mounted.current) return;
+        setError(null);
         setRepository(settings);
         setRootPath(settings.rootPath);
       })
       .catch((cause: unknown) => {
-        if (active) setError(errorText(cause));
+        if (!mounted.current) return;
+        setError(errorText(cause));
+        setLoadFailed(true);
       });
-    return () => { active = false; };
   }, [setError]);
+  useEffect(() => { load(); }, [load]);
 
   const apply = (useDefault: boolean) => run("apply", async () => {
     setNotice(null);
@@ -83,7 +95,13 @@ export function ResourceRepositoryCard({ onChanged, automation, onRequestAiaProm
             )}
           </header>
           {error && <ErrorBanner message={error} />}
-          {!repository ? (
+          {!repository && loadFailed ? (
+            <div className="form-actions">
+              <button className="button" type="button" onClick={load}>
+                {text("다시 불러오기", "Reload")}
+              </button>
+            </div>
+          ) : !repository ? (
             <p className="settings-storage-note">{text("저장소 설정을 불러오는 중…", "Loading repository settings…")}</p>
           ) : (
             <div className="detail-card">

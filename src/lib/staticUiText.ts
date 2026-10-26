@@ -73,3 +73,14 @@ function messageSourceByTranslation(messages: Record<string, string>): ReadonlyM
  */
 export { sendableUiCatalogSource } from "./uiCatalogSource.ts";
 export { staticEnglishFallback } from "./staticCountFallback.ts";
+
+/**
+ * 한글·가나·한자 없이 라틴 문자와 기호로만 된 글자인지. 영어 화면의 되짚기 생략 판정이다 —
+ * 컴포넌트가 이미 영어로 그린 값을 한국어로 되짚었다가 다시 옮기면 같은 영어를 쓰는 다른
+ * 원문의 번역으로 바뀐다(버튼 "Pause"가 상태 "Paused"가 됐다). DOM 없이 판정하는 순수
+ * 함수라 `canonicalSourceText`와 함께 여기 두고 시험으로 고정한다.
+ */
+export function isPlainLatinText(value: string): boolean {
+  return !/[\p{Script=Hangul}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(value)
+    && !/[^\p{Script=Latin}\p{N}\p{P}\p{S}\p{Z}\s]/u.test(value);
+}

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 import {
   backendError,
@@ -72,4 +73,30 @@ test("코드가 없으면 평범한 오류다", () => {
   const error = backendError({ error: "잘못된 입력입니다" }, "잘못된 입력입니다");
   assert.ok(error instanceof Error);
   assert.ok(!(error instanceof BackendCodedError));
+});
+
+// 코어가 내보내는 코드마다 영어 문구가 있어야 한다. 표에 없는 코드는 영어 화면에서도
+// 한국어 문장으로 떨어지는데, 그 어긋남은 어느 시험에도 걸리지 않고 남는다
+// (KEYCHAIN_UNAVAILABLE이 그렇게 빠져 있었다). 코드는 문자열로도, 상수로도 넘어온다.
+test("코어가 내보내는 오류 코드는 모두 영어 문구가 있다", () => {
+  const sources = readdirSync(new URL("../../crates", import.meta.url), { recursive: true })
+    .filter((path) => path.endsWith(".rs"))
+    .map((path) => readFileSync(new URL(`../../crates/${path}`, import.meta.url), "utf8"));
+  const constants = new Map();
+  for (const source of sources) {
+    for (const [, name, value] of source.matchAll(/const\s+([A-Z][A-Z0-9_]*)\s*:\s*&str\s*=\s*"([A-Z0-9_]+)"/g)) {
+      constants.set(name, value);
+    }
+  }
+  const codes = new Set();
+  for (const source of sources) {
+    for (const [, literal, path] of source.matchAll(/AppError::[a-z_]+\(\s*(?:"([A-Z0-9_]+)"|([A-Za-z_][\w:]*))\s*,/g)) {
+      const code = literal ?? constants.get(path.split("::").pop());
+      assert.ok(code, `코드를 읽지 못한 호출: ${path}`);
+      codes.add(code);
+    }
+  }
+  assert.ok(codes.size > 0);
+  const missing = [...codes].filter((code) => backendErrorMessage("en", "원문", { code, params: {} }) === "원문");
+  assert.deepEqual(missing, []);
 });

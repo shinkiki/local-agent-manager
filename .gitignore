@@ -35,7 +35,7 @@ target
 /.codex/
 /.cursor/
 /.windsurf/
-# AGENTS.md는 개발선(dev-history)에서 추적한다. 저장소의 보안 불변식과 직접 변경
+# AGENTS.md는 개발선에서 추적한다. 저장소의 보안 불변식과 직접 변경
 # 예외(C1~)를 담고 있어 코드 변경과 같은 커밋에 실려야 근거가 남는다.
 /AGENTS.md.bak-*
 /CLAUDE.md

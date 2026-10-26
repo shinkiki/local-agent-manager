@@ -1563,7 +1563,15 @@ Third-party MCP servers are the only outbound network dependency AIA can acquire
   expired grant is reported as `expired` and must not be used. `interface_revoke` withdraws it.
 - **E7** Limits: 32 interfaces, 64 enabled tools per interface (the probed catalog itself may
   hold up to 512 tools — external plugins share the parser, and hosted Notion exceeds 64),
-  512 KB remote response body, 256 KB exposed result.
+  6.5 MiB remote response body (three times the exposed cap plus margin, because a server that
+  sends non-ASCII as `\uXXXX` can triple it; read with a running cap, so undeclared-length bodies
+  are cut while reading, and a `tools/call` body over it becomes the omitted-result notice instead
+  of an error), 2 MiB exposed result (compact serialization; above it the result is replaced by a
+  notice with `_meta.originalBytes`). The aia_system response cap is per operation: 512 KB of
+  pretty-printed JSON by default, but `interface_read`/`interface_execute` and
+  `read_external_plugin_tool`/`execute_external_plugin_tool` are serialized compactly under the
+  exposed cap plus 64 KiB for the envelope, so a result that passed the exposed cap is never
+  refused afterwards.
 - **E8** The store `aia-mcp-interfaces.json` (lock file, temp write, atomic rename, fsync) and the
   audit log `aia-mcp-audit.jsonl` (rotated to `.previous.jsonl` at 2 MB) live in the app data
   directory. Neither the audit log nor the catalog may contain secrets.
@@ -1665,7 +1673,8 @@ through the **device flow** because its authorization server has no dynamic regi
   so the preset points at the desktop app's Dev Mode server on loopback with no auth.
 - **P10** Plugin descriptions and results exposed to AIA are untrusted data, not instructions.
   Read-only tools use the read operation; every other tool uses the approval-gated execute
-  operation. Results above 256 KB are replaced with a bounded truncation receipt. Dynamic plugin
+  operation. Results above 2 MiB (E7's exposed cap; 270 KB Notion pages were being dropped at the
+  old 256 KB) are replaced with a bounded truncation receipt. Dynamic plugin
   calls cannot be embedded in a system workflow because their contracts are controlled by the
   external server. A mutating plugin call is host-only because it changes non-app-owned state and
   is not recoverable under G11.

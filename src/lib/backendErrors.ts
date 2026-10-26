@@ -40,6 +40,7 @@ const BACKEND_ERROR_EN: Record<string, string> = {
   LOGIN_OTP_SETUP_MISSING: "No OTP enrollment is in progress. Start it again.",
   LOGIN_OTP_SETUP_EXPIRED: "The OTP enrollment timed out. Start it again.",
   LOGIN_OTP_CODE_INVALID: "The OTP code is incorrect. Enter the current code from your authenticator app.",
+  KEYCHAIN_UNAVAILABLE: "The OS secure store cannot be reached.",
 };
 
 /** 백엔드 실패에 딸려 온 코드와 파라미터. 코드화되지 않은 실패에는 아예 없다. */

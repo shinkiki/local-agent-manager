@@ -618,6 +618,23 @@ pub(crate) fn model_consumes_window(model: &str, window_label: &str) -> bool {
     }
 }
 
+/// 특정 모델 한 줄에만 걸린 모델군 이름인지(`Gemini 4 Argon`). 계열 전체 모델군이면 거짓이다.
+pub(crate) fn is_model_line_group(group: &str) -> bool {
+    group_is_model_line(group)
+}
+
+/// 이 모델의 모델 줄만 쓰는 모델군(`Gemini 4 Argon`)이 계정에 따로 있는지. 있으면 그 모델의
+/// 실행은 계열 전체 모델군(`Gemini Models`) 쿼터를 쓰지 않는다 — [`model_consumes_window`]는
+/// 라벨 하나만 봐서 이것을 모른다.
+pub(crate) fn model_has_own_line<'a>(
+    model: &str,
+    groups: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    groups
+        .into_iter()
+        .any(|group| group_is_model_line(group) && model_in_line(model, group))
+}
+
 pub(crate) fn is_pacing_resource_id(value: &str) -> bool {
     PACING_RESOURCES
         .iter()

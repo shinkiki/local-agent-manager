@@ -307,7 +307,12 @@ export function useAiaScreenControl({ view, activateView, requestGuideTab, aiaTr
       const target = boxCenter(element.getBoundingClientRect());
       placeCursor(target, false);
       await waitMs(CURSOR_TRAVEL_MS);
-      if (!cursorLatest(token)) return;
+      if (!cursorLatest(token)) {
+        // 다음 클릭이 커서를 가져갔다. 누르지 않은 채 끝나도 답은 해야 한다 — 답이 없으면
+        // AIA는 3초를 다 기다린 뒤 원인 없는 시간 초과만 받는다.
+        await answerUiQueryQuietly(event.id, { clicked: false, reason: "다음 클릭 요청이 앞서 이 요소는 누르지 않았습니다" });
+        return;
+      }
       placeCursor(target, true);
       await waitMs(CURSOR_PRESS_MS);
       const text = element.getAttribute("aria-label") ?? (element as HTMLElement).innerText?.trim() ?? "";

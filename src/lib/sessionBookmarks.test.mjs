@@ -8,6 +8,7 @@ import {
   bookmarksFull,
   removeBookmark,
   renameBookmark,
+  saveBookmarkList,
 } from "./sessionBookmarks.ts";
 
 function anchor(messageKey, markdownLine, snippet = "") {
@@ -102,4 +103,53 @@ test("읽던 자리 이름은 백엔드와 같은 코드 포인트 단위로 자
   const cut = labelOf(straddling);
   assert.equal([...cut].length, 120);
   assert.equal(LONE_SURROGATE.test(cut), false);
+});
+
+/** 저장 한 번을 돌리고 화면 목록에 적힌 값·알림을 모아 돌려준다. */
+async function runSave({ write, current }) {
+  const shown = [];
+  const saved = [];
+  const errors = [];
+  await saveBookmarkList({
+    next: [mark("b")],
+    previous: [mark("a")],
+    write,
+    stillCurrent: () => current(),
+    show: (items) => shown.push(items.map((item) => item.id)),
+    onSaved: (meta) => saved.push(meta.bookmarks.map((item) => item.id)),
+    onError: (cause) => errors.push(String(cause)),
+  });
+  return { shown, saved, errors };
+}
+
+function mark(id) {
+  return { id, label: "", snippet: id, anchor: { messageKey: "m", markdownLine: 1 }, createdAt: 0 };
+}
+
+test("saveBookmarkList: 같은 대화면 저장본으로 맞추고 실패하면 되돌린다", async () => {
+  const ok = await runSave({ write: async () => ({ bookmarks: [mark("b"), mark("c")] }), current: () => true });
+  assert.deepEqual(ok.shown, [["b"], ["b", "c"]]);
+  assert.deepEqual(ok.saved, [["b", "c"]]);
+  const failed = await runSave({ write: async () => { throw new Error("거절"); }, current: () => true });
+  assert.deepEqual(failed.shown, [["b"], ["a"]]);
+  assert.deepEqual(failed.errors, ["Error: 거절"]);
+});
+
+test("saveBookmarkList: 답이 오기 전에 다른 대화로 옮겨 가면 새 대화 목록을 덮지 않는다", async () => {
+  let current = true;
+  const moved = await runSave({
+    write: async () => { current = false; return { bookmarks: [mark("b")] }; },
+    current: () => current,
+  });
+  // 처음 보인 값 하나만 남고, 앞 대화의 저장본은 새 대화 목록에 적히지 않는다.
+  assert.deepEqual(moved.shown, [["b"]]);
+  // 세션 목록 알림은 그 세션의 값이라 그대로 간다.
+  assert.deepEqual(moved.saved, [["b"]]);
+  current = true;
+  const failed = await runSave({
+    write: async () => { current = false; throw new Error("거절"); },
+    current: () => current,
+  });
+  assert.deepEqual(failed.shown, [["b"]]);
+  assert.deepEqual(failed.errors, []);
 });

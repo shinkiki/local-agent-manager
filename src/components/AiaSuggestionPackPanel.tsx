@@ -66,7 +66,9 @@ export function AiaSuggestionPackPanel({ active, automation = null, onAutomation
   const saveSuggestionsEnabled = async (next: boolean) => {
     if (!automation || saving) return;
     setSaving(true);
+    // 새 쓰기를 시작하면 앞선 성공 안내를 걷는다 — 남겨 두면 이번 실패와 지난 성공이 나란히 뜬다.
     setError(null);
+    setNotice(null);
     try {
       onAutomationChange?.(await setSystemAutomationSettings({ ...automation.settings, aiaSuggestions: next }));
     } catch (cause) {
@@ -107,6 +109,7 @@ export function AiaSuggestionPackPanel({ active, automation = null, onAutomation
     if (!accepted) return;
     setApplying(true);
     setError(null);
+    setNotice(null);
     try {
       // 복구는 이미 있는 공통 원본을 덮어쓰는 것이라 낙관적 잠금에 쓸 지문을 그 자리에서
       // 다시 읽는다. 목록을 들고 있던 예전 자리와 달리 여기서는 지문이 오래된 채 남지 않는다.

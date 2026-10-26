@@ -27,6 +27,7 @@ import type {
 import { sessionTranscriptImagePath, type TranscriptImageRef } from "./sessionImage";
 import { backendHttpUrl, hasNativeShell } from "./backend";
 import { call, nativeCall, remoteFetch, responseError } from "./ipcTransport";
+import type { DownloadProgress } from "./responsePayload";
 
 /**
  * 세션 하나를 가리키는 두 값. 색인 갱신·상세·앱 열기·링크 파일·메타 수정, 그리고 채팅
@@ -85,10 +86,11 @@ export function getSessionDetail(
   id: string,
   transcriptLimit: SessionTranscriptLimit = "latest500",
   transcriptBeforeIndex?: number,
+  onDownloadProgress?: (progress: DownloadProgress) => void,
 ): Promise<SessionDetail> {
   return call<SessionDetail>("get_session_detail", {
     request: { ...sessionRef(source, id), transcriptLimit, transcriptBeforeIndex },
-  });
+  }, { onDownloadProgress });
 }
 
 export function openProviderSessionApp(source: ProviderId, id: string): Promise<void> {
@@ -228,4 +230,15 @@ export function runSessionCleanup(): Promise<SessionCleanupReceipt> {
  */
 export function clearSessionCleanupTombstones(): Promise<number> {
   return call<number>("clear_session_cleanup_tombstones");
+}
+
+/**
+ * Shared UI/AIA literal metadata and conversation search (tool records are not indexed). `sessions` limits indexing and
+ * matching to those identities; omitted means the whole catalog.
+ */
+export function searchSessions(
+  query: string,
+  sessions?: readonly { source: SessionSummary["source"]; id: string }[],
+): Promise<import("./sessionSearch").SessionSearchResponse> {
+  return call("search_sessions", { request: { query, sessions: sessions ?? null } }, { timeoutMs: 120_000 });
 }

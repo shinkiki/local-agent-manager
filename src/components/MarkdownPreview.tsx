@@ -17,10 +17,13 @@ import {
   markdownAngleToken,
   markdownEscapedChar,
   markdownFenceOpen,
+  markdownTableAlignment,
   markdownTaskItem,
   markdownUnderscoreIsIntraword,
   splitMarkdownChunks,
+  splitMarkdownTableRow,
   startsMarkdownListItem,
+  startsMarkdownTable,
   unescapeMarkdown,
 } from "../lib/markdownBlocks";
 import { isLocalFileHref, linkifyImports, safeHref } from "../lib/markdownLinks";
@@ -356,9 +359,9 @@ function parseRuleBlock({ lineOffset }: BlockContext, start: number): ParsedBloc
 
 /** 표. 첫 줄이 머리, 둘째 줄이 정렬 지정이고, 파이프가 있는 줄이 이어지는 동안 본문으로 삼는다. */
 function parseTableBlock({ lines, lineOffset, inline }: BlockContext, start: number): ParsedBlock {
-  const headers = splitTableRow(lines[start]);
-  const alignments = splitTableRow(lines[start + 1]).map(tableAlignment);
-  const body = takeLines(lines, start + 2, (line) => line.includes("|") && line.trim() ? splitTableRow(line) : null);
+  const headers = splitMarkdownTableRow(lines[start]);
+  const alignments = splitMarkdownTableRow(lines[start + 1]).map(markdownTableAlignment);
+  const body = takeLines(lines, start + 2, (line) => line.includes("|") && line.trim() ? splitMarkdownTableRow(line) : null);
   const rows = body.taken;
   const index = body.next;
   const node = <div className="markdown-table-wrap" key={`table-${lineOffset + index}`}>
@@ -473,28 +476,6 @@ function hasVisibleContent(nodes: ReactNode[]): boolean {
 function startsMarkdownBlock(lines: string[], index: number): boolean {
   return SETEXT_H1_UNDERLINE.test(lines[index])
     || BLOCK_KINDS.some((kind) => kind.starts(lines, index));
-}
-
-/** 표의 시작. 파이프가 있는 줄 바로 다음이 정렬 지정 줄이어야 한다. */
-function startsMarkdownTable(lines: string[], index: number): boolean {
-  return index + 1 < lines.length && lines[index].includes("|") && isTableSeparator(lines[index + 1]);
-}
-
-function isTableSeparator(line: string): boolean {
-  const cells = splitTableRow(line);
-  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s/g, "")));
-}
-
-function splitTableRow(line: string): string[] {
-  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
-  return trimmed.split("|").map((cell) => cell.trim());
-}
-
-function tableAlignment(cell: string): "left" | "center" | "right" {
-  const value = cell.replace(/\s/g, "");
-  if (value.startsWith(":") && value.endsWith(":")) return "center";
-  if (value.endsWith(":")) return "right";
-  return "left";
 }
 
 /**

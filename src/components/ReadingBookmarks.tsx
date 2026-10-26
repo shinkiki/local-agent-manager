@@ -10,7 +10,7 @@
  * 갈라진다. 자리를 어떻게 적고 어떻게 되찾을지는 `lib/readingAnchor.ts`가, DOM에서
  * 어디를 짚을지는 `readingAnchorDom.ts`가 맡는다. 이 파일에는 훅과 버튼만 둔다.
  */
-import { useCallback, useEffect, useState, type ReactNode, type RefObject } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { Bookmark, BookmarkPlus, CornerUpLeft, Pencil, Trash2, X } from "lucide-react";
 import { getSessionMeta, patchSessionMeta } from "../lib/ipc";
 import { errorText } from "../lib/errorText";
@@ -25,6 +25,7 @@ import {
   removeBookmark,
   renameBookmark,
 } from "../lib/readingAnchor";
+import { saveBookmarkList } from "../lib/sessionBookmarks";
 import type { ProviderId, SessionBookmark, SessionMeta } from "../types";
 import { useDismissablePopover } from "./ChatPopover";
 import { formatDate } from "../lib/format";
@@ -213,8 +214,11 @@ function useSessionBookmarkStore({ source, sessionId, onMetaChanged, onError }: 
 }): { items: SessionBookmark[]; ready: boolean; save: (next: SessionBookmark[]) => Promise<void> } {
   const [items, setItems] = useState<SessionBookmark[]>([]);
   const [ready, setReady] = useState(false);
+  // 저장 답이 도착했을 때 화면이 아직 그 대화인지 가린다(`saveBookmarkList`).
+  const currentKey = useRef<string | null>(null);
 
   useEffect(() => {
+    currentKey.current = source && sessionId ? `${source}:${sessionId}` : null;
     setItems([]);
     setReady(false);
     if (!source || !sessionId) return undefined;
@@ -232,17 +236,16 @@ function useSessionBookmarkStore({ source, sessionId, onMetaChanged, onError }: 
 
   const save = useCallback(async (next: SessionBookmark[]) => {
     if (!source || !sessionId) return;
-    const previous = items;
-    setItems(next);
-    try {
-      const meta = await patchSessionMeta(source, sessionId, { bookmarks: next });
-      setItems(meta.bookmarks ?? []);
-      onMetaChanged?.(source, sessionId, meta);
-    } catch (cause) {
-      // 저장이 실패했는데 화면에만 남으면, 다음에 열었을 때 있던 자리가 사라진다.
-      setItems(previous);
-      onError(errorText(cause));
-    }
+    const key = `${source}:${sessionId}`;
+    await saveBookmarkList({
+      next,
+      previous: items,
+      write: (bookmarks) => patchSessionMeta(source, sessionId, { bookmarks }),
+      stillCurrent: () => currentKey.current === key,
+      show: setItems,
+      onSaved: (meta) => onMetaChanged?.(source, sessionId, meta),
+      onError: (cause) => onError(errorText(cause)),
+    });
   }, [items, onError, onMetaChanged, source, sessionId]);
 
   return { items, ready, save };

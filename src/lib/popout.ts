@@ -8,7 +8,7 @@ export type PopoutRequest =
   | { kind: "aia"; windowId: string }
   | { kind: "chat"; chatId: string }
   | { kind: "session"; source: ProviderId; sessionId: string }
-  | { kind: "gitDiff"; projectPath: string; path: string; originalPath: string | null; staged: boolean; commit: string | null; worktreePath?: string | null };
+  | { kind: "gitDiff"; projectPath: string; path: string; originalPath: string | null; staged: boolean; commit: string | null; worktreePath?: string | null; rangeFrom?: string | null; rangeTo?: string | null };
 
 type PopoutKind = PopoutRequest["kind"];
 
@@ -81,13 +81,17 @@ const POPOUT_SPECS: { [K in PopoutKind]: PopoutKindSpec<Extract<PopoutRequest, {
   // 싣고 새 창이 다시 읽는다. 같은 파일·같은 대상을 다시 열면 기존 창이 앞으로 온다.
   gitDiff: {
     defaultTitle: { ko: "변경 내용", en: "Diff" },
-    targetId: (request) => `${request.worktreePath ? `${request.worktreePath}-` : ""}${request.commit ?? (request.staged ? "staged" : "worktree")}-${request.path}`,
+    targetId: (request) => `${request.worktreePath ? `${request.worktreePath}-` : ""}${request.rangeFrom && request.rangeTo ? `${request.rangeFrom}...${request.rangeTo}` : request.commit ?? (request.staged ? "staged" : "worktree")}-${request.path}`,
     populateParams: (request, params) => {
       params.set("project", request.projectPath);
       params.set("path", request.path);
       if (request.worktreePath) params.set("wt", request.worktreePath);
       if (request.originalPath) params.set("orig", request.originalPath);
-      if (request.commit) params.set("commit", request.commit);
+      // B9 범위 diff 는 주소에서 빠지면 별도 창이 같은 파일의 작업 트리 diff 를 범위 제목 아래 연다.
+      if (request.rangeFrom && request.rangeTo) {
+        params.set("from", request.rangeFrom);
+        params.set("to", request.rangeTo);
+      } else if (request.commit) params.set("commit", request.commit);
       else if (request.staged) params.set("staged", "1");
     },
     parse: (params) => {
@@ -97,14 +101,19 @@ const POPOUT_SPECS: { [K in PopoutKind]: PopoutKindSpec<Extract<PopoutRequest, {
       const commit = params.get("commit")?.trim() || null;
       if (commit && !/^[0-9a-fA-F]{4,64}$/.test(commit)) return null;
       const worktreePath = params.get("wt")?.trim();
+      const rangeFrom = params.get("from")?.trim() || null;
+      const rangeTo = params.get("to")?.trim() || null;
+      // 한쪽 끝만 남은 범위를 작업 트리 diff 로 메우지 않는다 — 백엔드와 같은 규칙이다.
+      if ((rangeFrom === null) !== (rangeTo === null) || (rangeFrom && commit)) return null;
       return {
         kind: "gitDiff",
         projectPath,
         path,
         originalPath: params.get("orig")?.trim() || null,
-        staged: commit === null && params.get("staged") === "1",
+        staged: commit === null && rangeFrom === null && params.get("staged") === "1",
         commit,
         ...(worktreePath ? { worktreePath } : {}),
+        ...(rangeFrom && rangeTo ? { rangeFrom, rangeTo } : {}),
       };
     },
   },

@@ -1,3 +1,6 @@
+import { transcriptMessageKey } from "../lib/readingAnchor";
+import { searchSessions } from "../lib/ipcSessions";
+import { searchHighlightParts, type SessionSearchMatch, type SessionSearchResponse } from "../lib/sessionSearch";
 import { editableTranscriptText, supportsMessageEdit, type MessageRewindDraft } from "../lib/messageEdit";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type PointerEvent as ReactPointerEvent, type Dispatch, type ReactNode, type RefObject, type SetStateAction } from "react";
 import { createPortal } from "react-dom";
@@ -99,6 +102,7 @@ import {
   type ChatTurn,
 } from "./ChatConversation";
 import { SessionFolderSidebar, type FolderFilter } from "./SessionFolderSidebar";
+import { TranscriptPlacementVeil, useOpeningVeil } from "./TranscriptPlacementVeil";
 import { readSecondaryPaneOpen, writeSecondaryPaneOpen } from "../lib/secondaryPane";
 
 interface SessionsProps {
@@ -173,12 +177,26 @@ function resolveSessionHandoffLinks(
  * 그 값을 그대로 붙여 넣으면 0건이 나와 "분명 있다고 했는데 검색이 안 된다"가 됐다.
  * 채팅 id는 살아 있는 실행에만 붙으므로, 실행이 끝나면 세션 id로만 찾힌다.
  */
-function matchesSessionQuery(session: SessionSummary, query: string, chatIds: readonly string[]): boolean {
-  const needle = query.trim().toLowerCase();
+/**
+ * 백엔드 `session_search::normalize`와 같은 접기: NFC로 맞춘 뒤 글자마다 소문자로 바꾼다.
+ * 문자열 단위 `toLowerCase`는 어말 Σ를 ς로 바꿔 글자별로 바꾼 쪽과 어긋난다. ASCII만
+ * 있으면 둘이 같으므로 빠른 길로 간다.
+ */
+function literalFold(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  if (/^[\x00-\x7f]*$/.test(value)) return value.toLowerCase();
+  return Array.from(value.normalize("NFC"), (character) => character.toLowerCase()).join("");
+}
+
+function matchesSessionQuery(session: SessionSummary, query: string, chatIds: readonly string[], contentMatches?: ReadonlyMap<string, SessionSearchMatch>): boolean {
+  if (contentMatches?.has(sessionKey(session.source, session.id))) return true;
+  // 비교 규칙은 백엔드 `literal_match`와 같다(칸 구성은 `metadata_matches`에 살아 있는 채팅
+  // id를 더한 것). 칸은 이 화면이 원래 보던 것이다.
+  const needle = literalFold(query.trim());
   if (!needle) return true;
   return [session.title, session.project, session.cwd, session.id, session.meta.note, ...chatIds]
     .filter((value): value is string => Boolean(value))
-    .some((value) => value.toLowerCase().includes(needle));
+    .some((value) => literalFold(value).includes(needle));
 }
 
 // 목록을 좁히는 축은 한 벌로 묶어 둔다. 축이 하나 늘 때마다 상태 선언·걸러내기·되돌리기·
@@ -291,13 +309,15 @@ function startedBySchedule(session: SessionSummary): boolean {
  * 덮였다. 지금은 연 세션 한 건만 목록에 끼워 넣는다(`pinnedKey`).
  */
 /**
- * 걸러내기가 세션 바깥에서 가져다 쓰는 값. 지금은 실행 중인 채팅 id 뿐이다. 필터 상태
+ * 걸러내기가 세션 바깥에서 가져다 쓰는 값. 실행 중인 채팅 id와 본문 검색 결과다. 필터 상태
  * (`SessionListFilters`)와 섞지 않는다 — 저쪽은 사용자가 고른 값이라 기본값과 견줘
  * '몇 개 걸려 있는지'를 세고, 이쪽은 런타임에서 흘러드는 값이라 셈에 들어가면 안 된다.
  */
 interface SessionListLookups {
   /** `sessionKey(source, id)` → 그 세션에 붙어 있는 실행의 채팅 id. */
   chatIds: ReadonlyMap<string, string[]>;
+  /** `sessionKey(source, id)` → 그 세션의 본문(또는 메모) 검색 일치. */
+  contentMatches?: ReadonlyMap<string, SessionSearchMatch>;
 }
 
 const NO_SESSION_LIST_LOOKUPS: SessionListLookups = { chatIds: new Map() };
@@ -316,6 +336,7 @@ const SESSION_LIST_FILTER_AXES: SessionListFilterAxis[] = [
     session,
     filters.query,
     lookups.chatIds.get(sessionKey(session.source, session.id)) ?? [],
+    lookups.contentMatches,
   ),
   (session, filters) => filters.source === "all" || session.source === filters.source,
   // 작업 경로 밖에서 그 프로젝트를 손댄 대화(AIA에게 맡긴 프로젝트 작업 등)도 함께 잡는다.
@@ -504,6 +525,7 @@ interface SessionListScope {
   visible: SessionSummary[];
   /** '더 보기'. 그리는 구간을 한 쪽만큼 늘린다. */
   showMore: () => void;
+  contentSearch: ReturnType<typeof useSessionContentSearch>;
 }
 
 /**
@@ -541,6 +563,58 @@ function useLiveChatIdsBySession(active: boolean): ReadonlyMap<string, string[]>
   }, [chats]);
 }
 
+/**
+ * 목록 검색어로 본문까지 찾는다. `sessions`는 검색어를 뺀 나머지 필터를 통과한 세션이다.
+ * 기본으로 숨긴 회차·하위 에이전트 세션까지 색인하느라 보이는 결과가 늦어지지 않게, 색인과
+ * 일치 판정을 그 세션들로만 좁힌다.
+ */
+function useSessionContentSearch(query: string, sessions: SessionSummary[]) {
+  // 본문은 두 글자부터 찾는다(백엔드 MIN_CONTENT_QUERY_CHARS). 한 글자는 화면의 메타데이터
+  // 걸러내기만으로 충분해 묻지 않는다.
+  const trimmed = Array.from(query.trim()).length >= 2 ? query.trim() : "";
+  // 다시 물을 때는 검색어와 세션 구성만 본다. 실행 중인 채팅은 몇 초마다 목록의 갱신 시각을
+  // 바꾸는데, 그때마다 다시 물으면 그 세션의 전사를 계속 다시 색인한다. 새 내용은 검색어를
+  // 바꾸거나 세션이 생기고 빠질 때 반영된다.
+  // 정렬해 둔다. 갱신 시각 순 목록에서 실행 중인 세션이 맨 위로 올라오는 것만으로는 바뀌지 않게.
+  const membership = useMemo(() => trimmed ? sessions.map((s) => sessionKey(s.source, s.id)).sort().join("\n") : "", [trimmed, sessions]);
+  const queryKey = trimmed;
+  const requestKey = `${queryKey}\n${membership}`;
+  const [state, setState] = useState<{ key: string; queryKey: string; result?: SessionSearchResponse; error?: string }>({ key: "", queryKey: "" });
+  useEffect(() => {
+    if (!trimmed) return;
+    let active = true;
+    const refs = sessions.map((s) => ({ source: s.source, id: s.id }));
+    let failures = 0;
+    const run = () => {
+      searchSessions(trimmed, refs).then((result) => {
+        if (!active) return;
+        setState({ key: requestKey, queryKey, result });
+        // 한 번에 색인할 시간을 넘긴 세션이 남았으면 이어서 색인하며 결과를 넓힌다. 읽기
+        // 오류가 난 기록은 백엔드가 1분 뒤 다시 읽으므로 그때 한 번 더 묻는다.
+        if (result.pendingSessions > 0) timer = setTimeout(run, 100);
+        else if (result.failedSessions > 0) timer = setTimeout(run, 61_000);
+      }).catch((cause: unknown) => {
+        if (!active) return;
+        // 같은 검색어의 이전 결과는 남겨, 일시적인 실패로 본문 일치 행이 사라지지 않게 한다.
+        setState((previous) => ({ key: requestKey, queryKey, result: previous.queryKey === queryKey ? previous.result : undefined, error: errorText(cause) }));
+        // 잠금·일시적인 응답 실패일 수 있어 잠시 뒤 다시 묻는다. 계속 실패하면(명령이 없는
+        // 이전 버전 백엔드 등) 세 번에서 멈추고 배너만 남긴다.
+        failures += 1;
+        if (failures < 3) timer = setTimeout(run, 5_000);
+      });
+    };
+    let timer = setTimeout(run, 300);
+    return () => { active = false; clearTimeout(timer); };
+    // `sessions`의 구성은 `requestKey`(membership)가 이미 담고 있다.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requestKey, queryKey, trimmed]);
+  // 세션 구성만 바뀌었으면 같은 검색어의 이전 결과를 새 결과가 올 때까지 그대로 보여 준다.
+  // 그동안도 '검색 중'으로 둬, 새로 들어온 세션이 '결과 없음'으로 보이지 않게 한다.
+  const shown = state.key === requestKey || state.queryKey === queryKey ? state : null;
+  const matches = useMemo(() => new Map((shown?.result?.matches ?? []).map((hit) => [sessionKey(hit.source, hit.id), hit])), [shown?.result]);
+  return { matches, result: shown?.result, error: shown?.error, loading: Boolean(trimmed) && state.key !== requestKey };
+}
+
 function useSessionListScope(
   sessions: SessionSummary[],
   folders: SessionFolder[],
@@ -567,7 +641,14 @@ function useSessionListScope(
   const hiddenFolders = useMemo(() => hiddenFolderIds(folders), [folders]);
 
   const chatIds = useLiveChatIdsBySession(filters.query.trim().length > 0);
-  const lookups = useMemo<SessionListLookups>(() => ({ chatIds }), [chatIds]);
+  // 폴더 필터는 넣지 않는다. 폴더 패널의 개수는 `folderScoped`(폴더 축을 뺀 결과)로 세므로,
+  // 다른 폴더에 있는 본문 일치도 거기에 잡혀야 한다.
+  const searchCandidates = useMemo(
+    () => Array.from(filters.query.trim()).length >= 2 ? sessions.filter((session) => sessionMatchesListFilters(session, { ...filters, query: "" })) : [],
+    [sessions, filters],
+  );
+  const contentSearch = useSessionContentSearch(filters.query, searchCandidates);
+  const lookups = useMemo<SessionListLookups>(() => ({ chatIds, contentMatches: contentSearch.matches }), [chatIds, contentSearch.matches]);
 
   const folderScoped = useMemo(
     () => sessions.filter((session) => sessionMatchesListFilters(session, filters, lookups)),
@@ -629,6 +710,12 @@ function useSessionListScope(
       return;
     }
     const tracked = selectionRef.current?.key === key ? selectionRef.current : null;
+    // 본문 검색이 끝나지 않았으면(오는 중, 실패, 색인이 덜 됨) 본문으로만 맞던 세션이 잠시
+    // 빠져 보일 뿐이다. 검색어 말고 다른 필터는 모두 통과할 때만 결과를 기다린다. 다른
+    // 필터가 걸렀다면 검색 결과와 상관없이 닫는다.
+    const contentSearchSettled = !contentSearch.loading && !contentSearch.error && (contentSearch.result?.pendingSessions ?? 0) === 0;
+    const passesOtherFilters = sessionMatchesListFilters(selected, { ...filters, query: "" }) && folderPasses(selected);
+    if (tracked?.settled && !contentSearchSettled && passesOtherFilters) return;
     if (tracked?.settled) {
       onSelect(null);
       return;
@@ -636,9 +723,9 @@ function useSessionListScope(
     if (tracked) return;
     selectionRef.current = { key, settled: false };
     setPinnedKey(key);
-  }, [filters, folderPasses, lookups, onSelect, selected]);
+  }, [contentSearch.loading, contentSearch.error, contentSearch.result, filters, folderPasses, lookups, onSelect, selected]);
 
-  return { filters, patchFilters, folderFilter, selectFolder: setFolderFilter, projects, folderScoped, filtered, visible, showMore };
+  return { filters, patchFilters, folderFilter, selectFolder: setFolderFilter, projects, folderScoped, filtered, visible, showMore, contentSearch };
 }
 
 /**
@@ -762,8 +849,29 @@ function useSessionListActions(
 
 export function SessionsView({ active = true, providers, sessions, folders, selected, messageDisplayMode, transcriptLimit, onTranscriptLimitChange, onSelect, onMetaChanged, onFoldersChanged, onSessionCatalogChanged, attentionTarget, onAttentionTargetHandled, catalogHealth = null, onRefreshList, popout = false, historyControls, onOpenChat }: SessionsProps) {
   const { text } = useI18n();
-  const { filters, patchFilters, folderFilter, selectFolder, projects, folderScoped, filtered, visible, showMore } =
+  const { filters, patchFilters, folderFilter, selectFolder, projects, folderScoped, filtered, visible, showMore, contentSearch } =
     useSessionListScope(sessions, folders, selected, onSelect);
+  // 본문 검색 결과로 연 세션은 일치한 순번까지 전체 범위로 연다. 다른 경로로 세션을 열거나
+  // 사용자가 범위를 직접 고르면 그 고정을 푼다. 순번은 같은 세션의 다른 일치를 다시 열 때
+  // 서랍을 새로 띄우는 키로만 쓴다.
+  const [searchTarget, setSearchTarget] = useState<SessionSearchMatch | null>(null);
+  const [searchOpenCount, setSearchOpenCount] = useState(0);
+  const searchHit = searchTarget && selected && searchTarget.source === selected.source && searchTarget.id === selected.id ? searchTarget : null;
+  const changeTranscriptLimit = useCallback((limit: SessionTranscriptLimit) => {
+    setSearchTarget(null);
+    onTranscriptLimitChange(limit);
+  }, [onTranscriptLimitChange]);
+  const openRelatedSession = useCallback((session: SessionSummary) => {
+    setSearchTarget(null);
+    onSelect(session);
+  }, [onSelect]);
+  // 선택이 바뀌었는데(필터로 닫힘, 알림·앱 바깥에서 연 다른 세션) 검색으로 연 세션이
+  // 아니면 고정을 푼다. 선택이 바뀔 때만 보므로, 행을 누른 직후 부모의 선택이 아직
+  // 따라오지 않은 순간에 막 정한 고정을 지우지 않는다.
+  const selectedKey = selected ? sessionKey(selected.source, selected.id) : null;
+  useEffect(() => {
+    setSearchTarget((current) => current && sessionKey(current.source, current.id) === selectedKey ? current : null);
+  }, [selectedKey]);
   const [moreFiltersOpen, setMoreFiltersOpen] = useState(false);
   const folderPane = useSessionFolderPane(folders, folderFilter);
   const handleAttentionAttach = useCallback((opened: boolean) => {
@@ -783,18 +891,18 @@ export function SessionsView({ active = true, providers, sessions, folders, sele
       active={active}
       historyControls={historyControls}
       onOpenChat={onOpenChat}
-      key={sessionKey(selected.source, selected.id)}
+      key={`${sessionKey(selected.source, selected.id)}:${searchOpenCount}`}
       providers={providers}
       sessions={sessions}
       session={selected}
       folders={folders}
       messageDisplayMode={messageDisplayMode}
-      transcriptLimit={transcriptLimit}
-      onClose={() => onSelect(null)}
+      transcriptLimit={searchHit ? "all" : transcriptLimit}
+      onClose={() => { setSearchTarget(null); onSelect(null); }}
       onMetaChanged={onMetaChanged}
       onSessionCatalogChanged={onSessionCatalogChanged}
-      onOpenRelatedSession={onSelect}
-      onTranscriptLimitChange={onTranscriptLimitChange}
+      onOpenRelatedSession={openRelatedSession}
+      onTranscriptLimitChange={changeTranscriptLimit}
       attachChatId={attentionTarget?.source === selected.source && attentionTarget.sessionId === selected.id ? attentionTarget.chatId : null}
       attachRequestId={attentionTarget?.requestId ?? 0}
       onAttachHandled={handleAttentionAttach}
@@ -838,12 +946,29 @@ export function SessionsView({ active = true, providers, sessions, folders, sele
         onOpenFolderPane={() => folderPane.setOpen(true)}
       />
 
+      {contentSearch.error && <ErrorBanner message={contentSearch.error} />}
+      <SessionSearchStatus loading={contentSearch.loading} result={contentSearch.result} />
       <SessionTable
         sessions={visible}
         total={filtered.length}
         folders={folders}
         draggedSession={draggedSession}
-        onOpen={(session) => { if (!swallowsClick()) onSelect(session); }}
+        searchMatches={contentSearch.matches}
+        searchQuery={filters.query}
+        searching={contentSearch.loading || (contentSearch.result?.pendingSessions ?? 0) > 0}
+        onOpen={(session) => {
+          if (swallowsClick()) return;
+          const hit = contentSearch.matches.get(sessionKey(session.source, session.id));
+          setSearchTarget(hit?.index != null ? hit : null);
+          // 이미 그 일치로 열려 있는 서랍은 다시 띄우지 않는다(작성 중인 입력·연결된 실행 보존).
+          const sameHit = hit != null && searchHit != null && searchHit.source === hit.source && searchHit.id === hit.id && searchHit.index === hit.index;
+          if (hit?.index != null && !sameHit) setSearchOpenCount((count) => count + 1);
+          if (hit?.index != null) rememberSessionReading(sessionKey(session.source, session.id), {
+            tab: "conversation", filter: "all", top: 0,
+            anchor: transcriptMessageKey(hit.index), offset: 24,
+          });
+          onSelect(session);
+        }}
         onContextMenu={(session, x, y) => {
           setMoreFiltersOpen(false);
           listActions.openContextMenu(session, x, y);
@@ -882,6 +1007,23 @@ export function SessionsView({ active = true, providers, sessions, folders, sele
  * 바깥 클릭·Esc도 여기 딸린 관심사라 함께 옮겼다. 열림 상태만 바깥에 두는 것은 목록
  * 행의 우클릭이 팝오버를 먼저 닫아야 하기 때문이다.
  */
+/** 본문 검색이 덜 끝났거나 일부 기록을 다 보지 못했을 때만 한 줄로 알린다. 0인 항목은 뺀다. */
+function SessionSearchStatus({ loading, result }: { loading: boolean; result?: SessionSearchResponse }) {
+  const { text } = useI18n();
+  if (loading) return <p role="status" className="session-search-status">{text("본문을 색인·검색하고 있습니다…", "Indexing and searching conversation text…")}</p>;
+  if (!result) return null;
+  if (result.pendingSessions > 0) {
+    return <p role="status" className="session-search-status">{text(`본문을 색인하고 있습니다 · 남은 세션 ${result.pendingSessions}개`, `Indexing conversation text · ${result.pendingSessions} sessions left`)}</p>;
+  }
+  const parts = [
+    result.unavailableSessions > 0 ? text(`본문을 읽을 수 없는 기록 ${result.unavailableSessions}개`, `Unreadable records: ${result.unavailableSessions}`) : null,
+    result.partialSessions > 0 ? text(`일부 내용 누락 ${result.partialSessions}개`, `Partial: ${result.partialSessions}`) : null,
+    result.failedSessions > 0 ? text(`읽기 오류(잠시 뒤 다시 시도) ${result.failedSessions}개`, `Read errors (retrying shortly): ${result.failedSessions}`) : null,
+  ].filter((part): part is string => part !== null);
+  if (parts.length === 0) return null;
+  return <p role="status" className="session-search-status">{[text("일부 기록은 검색하지 못했습니다", "Some records could not be fully searched"), ...parts].join(" · ")}</p>;
+}
+
 function SessionListToolbar({
   filters,
   projects,
@@ -937,7 +1079,7 @@ function SessionListToolbar({
         className="search-input"
         value={filters.query}
         onChange={(event) => onPatchFilters({ query: event.target.value })}
-        placeholder={text("제목·프로젝트·세션/채팅 ID·메모 검색", "Search title, project, session/chat ID, memo")}
+        placeholder={text("제목·프로젝트·ID·메모·대화 내용 검색", "Search title, project, ID, memo and conversation")}
       />
       <select value={filters.project} onChange={(event) => onPatchFilters({ project: event.target.value })}>
         <option value="all">{text("프로젝트 전체", "All projects")}</option>
@@ -1077,6 +1219,8 @@ function SessionTableTitleCell({
 }
 
 interface SessionTableRowProps {
+  searchMatch?: SessionSearchMatch;
+  searchQuery: string;
   session: SessionSummary;
   foldersById: Map<string, SessionFolder>;
   isDragging: boolean;
@@ -1087,6 +1231,8 @@ interface SessionTableRowProps {
 
 /** 세션 표의 한 행. 우클릭 좌표 계산과 드래그 착수, 셀 구성을 표 본문에서 분리한다. */
 function SessionTableRow({
+  searchMatch,
+  searchQuery,
   session,
   foldersById,
   isDragging,
@@ -1120,6 +1266,9 @@ function SessionTableRow({
       </td>
       <td>
         <SessionTableTitleCell session={session} foldersById={foldersById} />
+        {searchMatch?.snippet && <small className="session-search-snippet" data-user-content>
+          {searchHighlightParts(searchMatch.snippet, searchQuery).map((part, index) => part.match ? <mark key={index}>{part.text}</mark> : <span key={index}>{part.text}</span>)}
+        </small>}
       </td>
       <td>
         <div className="project-cell" data-user-content>
@@ -1136,6 +1285,7 @@ function SessionTableRow({
 }
 
 function SessionTable({
+  searchMatches, searchQuery, searching,
   sessions,
   total,
   folders,
@@ -1145,6 +1295,9 @@ function SessionTable({
   onArmDrag,
   onLoadMore,
 }: {
+  searchMatches: ReadonlyMap<string, SessionSearchMatch>;
+  searchQuery: string;
+  searching: boolean;
   sessions: SessionSummary[];
   total: number;
   folders: SessionFolder[];
@@ -1166,7 +1319,7 @@ function SessionTable({
         <strong>{text(`세션 ${total.toLocaleString()}개`, `${total.toLocaleString()} sessions`)}</strong>
         <span>{text("행을 폴더로 드래그해 분류하거나, 선택해서 대화 내역을 확인하세요.", "Drag rows into folders to organize, or select to view conversation history.")}</span>
       </div>
-      {total === 0 ? (
+      {total === 0 && searching ? <LoadingState label={text("대화 내용을 검색하고 있습니다…", "Searching conversation text…")} /> : total === 0 ? (
         <EmptyState title={text("조건에 맞는 세션이 없습니다", "No matching sessions")} detail={text("필터를 바꾸거나 새로고침해 보세요.", "Try changing filters or refreshing.")} />
       ) : (
         <div className="table-scroll">
@@ -1179,6 +1332,8 @@ function SessionTable({
                 <SessionTableRow
                   key={sessionKey(session.source, session.id)}
                   session={session}
+                  searchMatch={searchMatches.get(sessionKey(session.source, session.id))}
+                  searchQuery={searchQuery}
                   foldersById={foldersById}
                   isDragging={draggedSession !== null && sameSessionIdentity(draggedSession, session)}
                   onOpen={onOpen}
@@ -1635,6 +1790,9 @@ function sessionDrawerTabs(text: UiText): readonly { id: SessionDrawerTab; label
 /** 대화 원문 구역이 맡는 탭. 터미널 탭은 원문 대신 터미널을 그려 여기로 오지 않는다. */
 type SessionTranscriptTab = Exclude<SessionDrawerTab, "terminal">;
 
+/** 읽던 자리를 찾아 위쪽 턴을 펼칠 때 한 프레임 안에서 이어 펼치는 최대 횟수(60턴씩). */
+const MAX_EXPAND_HOPS_PER_FRAME = 8;
+
 /**
  * 다음 페인트에 자리 옮기기를 한 번 예약하고, 그 예약을 걷는 정리 함수를 돌려준다.
  *
@@ -1690,8 +1848,16 @@ function useSessionDrawerScroll({
   onBeforeJump: () => void;
   transcript: SessionTranscriptState;
   readingReadyRef: RefObject<boolean>;
-}): { pauseFollowingLatestMessages: () => void; resumeFollowingLatestMessages: () => void } {
+}): { pauseFollowingLatestMessages: () => void; resumeFollowingLatestMessages: () => void; placing: boolean } {
   const initialPositionAppliedRef = useRef(false);
+  // 최초 위치를 다 잡은 대화의 열쇠. 기억(ref)과 따로 두는 것은 화면이 이 값을 보고 자리를
+  // 잡는 동안 본문을 가리기 때문이다 — 펼치기·앞 구간 붙이기가 프레임마다 본문을 옮긴다.
+  // 자리 잡기 예약은 원문(detail)이 바뀔 때 다시 건다. 열쇠를 의존성으로 두면 표시 범위를 바꾼
+  // 순간 옛 원문으로 자리를 잡고 끝난 것으로 적혀, 새 원문이 와도 다시 잡지 않는다.
+  const placementKey = `${sessionSource}:${sessionId}:${transcriptLimit}`;
+  const placementKeyRef = useRef(placementKey);
+  placementKeyRef.current = placementKey;
+  const [placedKey, setPlacedKey] = useState<string | null>(null);
   const restorePositionRef = useRef(sessionReadingState.get(sessionKey(sessionSource, sessionId)));
   const followLatestMessagesRef = useRef(messageDisplayMode === "latest");
   const handledContinuationUserMessageRef = useRef<string | null>(null);
@@ -1724,8 +1890,12 @@ function useSessionDrawerScroll({
     }
     let cancelled = false;
     let frame = 0;
+    let expandHops = 0;
+    // 예약한 뒤 표시 범위가 바뀌었으면 이 예약은 옛 원문 몫이다. 그대로 돌면 새 범위를 '다 잡음'으로
+    // 적어, 새 원문이 와도 자리를 잡지 않는다.
+    const scheduledKey = placementKeyRef.current;
     const apply = () => {
-      if (cancelled) return;
+      if (cancelled || placementKeyRef.current !== scheduledKey) return;
       const body = bodyRef.current;
       if (!body) return;
       if (savedPosition && activeTab !== "terminal") {
@@ -1735,7 +1905,16 @@ function useSessionDrawerScroll({
         const expand = body.querySelector<HTMLButtonElement>(".transcript-mount-boundary button");
         if (!anchor && savedPosition.anchor && expand) {
           expand.click();
-          frame = requestAnimationFrame(apply);
+          // 펼친 결과는 React 가 마이크로태스크에서 그린다. 그 뒤에 바로 다시 찾으면 한 프레임에
+          // 여러 구간을 펼쳐, 자리를 잡는 동안(막이 선 동안)이 프레임 수만큼 늘지 않는다. 그리기가
+          // 마이크로태스크 밖으로 밀리는 환경에서 끝없이 돌지 않도록 프레임마다 횟수를 묶는다.
+          if (expandHops < MAX_EXPAND_HOPS_PER_FRAME) {
+            expandHops += 1;
+            queueMicrotask(apply);
+          } else {
+            expandHops = 0;
+            frame = requestAnimationFrame(apply);
+          }
           return;
         }
         body.scrollTop = anchor ? body.scrollTop + anchor.getBoundingClientRect().top - body.getBoundingClientRect().top - (savedPosition.offset ?? 0) : savedPosition.top;
@@ -1745,6 +1924,7 @@ function useSessionDrawerScroll({
       }
       initialPositionAppliedRef.current = true;
       readingReadyRef.current = true;
+      setPlacedKey(scheduledKey);
     };
     frame = requestAnimationFrame(apply);
     return () => { cancelled = true; cancelAnimationFrame(frame); };
@@ -1774,7 +1954,11 @@ function useSessionDrawerScroll({
     });
   }, [bodyRef, activeTab, messageDisplayMode, continuationLastUserMessageId, onBeforeJump]);
 
-  return { pauseFollowingLatestMessages, resumeFollowingLatestMessages };
+  // 원문이 오기 전에는 '읽는 중' 표시가 서 있어 가릴 본문이 없다. 처음부터 보기에 읽던 자리도
+  // 없으면 맨 위에 그린 그대로라 옮길 것이 없다.
+  const movesOnOpen = messageDisplayMode !== "start" || restorePositionRef.current !== undefined;
+  const placing = Boolean(detail) && movesOnOpen && activeTab !== "terminal" && placedKey !== placementKey;
+  return { pauseFollowingLatestMessages, resumeFollowingLatestMessages, placing };
 }
 
 /**
@@ -2803,7 +2987,7 @@ function SessionDrawer({
     }, [transcript]),
   });
 
-  const { pauseFollowingLatestMessages, resumeFollowingLatestMessages } = useSessionDrawerScroll({
+  const { pauseFollowingLatestMessages, resumeFollowingLatestMessages, placing } = useSessionDrawerScroll({
     bodyRef: drawerBodyRef,
     sessionId: session.id,
     sessionSource: session.source,
@@ -2815,6 +2999,15 @@ function SessionDrawer({
     onBeforeJump: captureReadingPoint,
     transcript,
     readingReadyRef,
+  });
+  // 원문을 읽는 동안과 자리를 잡는 동안을 막 하나로 잇는다('로딩 중입니다' → 대화). 터미널 탭은
+  // 원문을 그리지 않아 여는 동안으로 치지 않고, 대화·작업 로그 탭으로 처음 올 때 연다. 이어지는
+  // 대화도 원문 아래에 붙어 함께 밀리므로 여는 동안은 같이 가린다. 머리글 조작 오류만은 바로 보인다.
+  const veiled = useOpeningVeil({
+    openKey: activeTab === "terminal" ? null : sessionKey(session.source, session.id),
+    loading: !detail && !transcriptError,
+    placing,
+    interrupt: Boolean(error),
   });
 
   // 재연결 대상 실행이 백엔드 교체로 사라졌다면 원문뿐 아니라 Core가 별도 보관한
@@ -2938,9 +3131,12 @@ function SessionDrawer({
       onClose={onClose}
       dropZone={continuationDropZone}
       bodyRef={drawerBodyRef}
+      bodyClassName={veiled ? "is-placing" : undefined}
+      bodyBusy={veiled}
       bodyOverlay={<>
+        {veiled && <TranscriptPlacementVeil progress={transcript.loadRatio} />}
         {findBar}
-        {activeTab === "conversation" && <ChatScrollControls
+        {activeTab === "conversation" && !veiled && <ChatScrollControls
           targetRef={drawerBodyRef}
           leading={readingControls}
           onScrollAwayFromLatest={pauseFollowingLatestMessages}

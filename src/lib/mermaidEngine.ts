@@ -21,7 +21,7 @@ let enginePromise: Promise<MermaidApi> | null = null;
  * - `securityLevel: "strict"` — 원문이 에이전트 답변에서 오므로 라벨의 HTML을 엔진이 걸러야 한다.
  *   다만 이것만으로는 부족하다: strict가 막는 것은 `click A call fn()`(JS 콜백)이고,
  *   `click A href "..."`는 strict에서도 `<a target="_blank">`로 그려진다. 그 앵커는 삽입 전에
- *   `MermaidBlock`이 걷어내고 앱이 직접 연다(`diagramLinks`).
+ *   `mermaidSvg`(`sanitizeDiagramSvg`, `diagramLinks`로 허용 판정)가 걷어내고 앱이 직접 연다(`diagramLinkOpener`).
  * - `htmlLabels: false` — 라벨을 foreignObject 안의 HTML이 아니라 SVG 글자로 그린다. 에이전트가
  *   쓴 문자열을 웹뷰 DOM에 HTML로 넣지 않는 것이 요점이고, 덤으로 스타일이 앱 CSS와 섞이지
  *   않고 크기 계산도 SVG 안에서 끝난다. 굵게·기울임·`<br/>` 줄바꿈은 이 설정에서도 그려진다

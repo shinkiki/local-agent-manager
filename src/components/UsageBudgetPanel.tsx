@@ -466,7 +466,11 @@ function nextRunAccountsLabel(
             ? text(`(여력 ${run.headroomRunsPerRound.toFixed(1)}건/회차)`, `(${run.headroomRunsPerRound.toFixed(1)} runs/round headroom)`)
             : text("(자동 기본)", "(auto default)");
       const effort = run.reasoningEffort ? ` · ${reasoningLabel(run.reasoningEffort)}${basis}` : "";
-      return `${name}${effort}${run.count > 1 ? ` ×${run.count}` : ""}`;
+      // 같은 계정에 모델군 여럿을 함께 배정하면 행이 모델마다 갈린다. 모델을 붙여야 같은 이름이
+      // 겹쳐 보이지 않는다.
+      const shared = runs.filter((other) => other.accountId === run.accountId).length > 1;
+      const model = shared && run.model ? ` · ${run.model}` : "";
+      return `${name}${model}${effort}${run.count > 1 ? ` ×${run.count}` : ""}`;
     })
     .join(", ");
 }
@@ -2108,7 +2112,7 @@ function useDrainExpiryNotice(snapshot: UsageBudgetSnapshot | null) {
 
 /**
  * 예산 스냅샷 옆에서 함께 읽는 스케줄러·워크플로 곁다리 조회. 반복 요청·최근 회차·워크플로
- * 목록 네 벌은 언제나 `loadTriggers` 한 번에 함께 채워지고 실패하면 함께 비워지는데, 상태
+ * 목록 네 벌은 언제나 `loadTriggers` 한 번에 함께 채워지고 실패하면 함께 그대로 남는데, 상태
  * 선언만 예산 초안·모달 사이에 흩어져 있어 "이 넷은 한 덩어리"라는 것이 읽어서는 보이지
  * 않았다. 네 setter는 이 훅 밖으로 나가지 않으므로 호출부에는 읽을 값과 다시 읽는 방법만 남는다.
  *
@@ -2137,8 +2141,8 @@ function useBudgetTriggers() {
       });
       setWorkflows(workflowList.workflows);
     } catch {
-      setRounds(emptyRoundIndex());
-      setWorkflows([]);
+      // 다시 읽기가 실패해도 이미 보이던 목록은 남긴다. 비우면 열려 있던 회차 설정이 트리거를 잃어
+      // 편집기가 닫히고 고르던 값이 사라진다. 처음 읽기가 실패한 것이면 원래 빈 목록이다.
     }
   }, []);
 

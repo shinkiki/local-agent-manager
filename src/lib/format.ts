@@ -114,8 +114,13 @@ export function formatBytes(value: number | null): string {
 
 export function formatTokens(value: number | null): string {
   if (value === null) return EMPTY_PLACEHOLDER;
-  for (const [threshold, suffix] of TOKEN_UNITS) {
+  for (let i = 0; i < TOKEN_UNITS.length; i++) {
+    const [threshold, suffix] = TOKEN_UNITS[i];
     if (value >= threshold) return `${(value / threshold).toFixed(1)}${suffix}`;
+    const nextUnit = TOKEN_UNITS[i + 1];
+    if (nextUnit && (value / nextUnit[0]).toFixed(1) === "1000.0") {
+      return `1.0${suffix}`;
+    }
   }
   return value.toLocaleString();
 }
