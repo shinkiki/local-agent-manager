@@ -50,6 +50,9 @@ struct StoredSession {
     channel: LoginChannel,
     created_at: i64,
     last_seen_at: i64,
+    /// C20-3: 저장 간격은 직전 요청이 아니라 마지막 저장 성공 시각부터 센다.
+    #[serde(skip)]
+    last_persisted_at: i64,
     expires_at: i64,
     label: String,
 }
@@ -91,7 +94,7 @@ pub struct LoginSessionStore {
 impl LoginSessionStore {
     pub fn open(app_data_dir: &Path) -> Result<Self, CoreError> {
         let path = app_data_dir.join(LOGIN_SESSIONS_FILE_NAME);
-        let sessions = match read_private_json::<StoredSessions>(&path)? {
+        let mut sessions = match read_private_json::<StoredSessions>(&path)? {
             Some(stored) => {
                 ensure_schema_version(
                     stored.schema_version,
@@ -102,6 +105,9 @@ impl LoginSessionStore {
             }
             None => Vec::new(),
         };
+        for session in &mut sessions {
+            session.last_persisted_at = session.last_seen_at;
+        }
         Ok(Self { path, sessions })
     }
 
@@ -121,6 +127,7 @@ impl LoginSessionStore {
             channel,
             created_at: now,
             last_seen_at: now,
+            last_persisted_at: now,
             expires_at,
             label: label.chars().take(120).collect(),
         });
@@ -150,7 +157,7 @@ impl LoginSessionStore {
             return None;
         }
         let session = &mut self.sessions[index];
-        let stale = now - session.last_seen_at >= LAST_SEEN_PERSIST_INTERVAL_MS;
+        let stale = now - session.last_persisted_at >= LAST_SEEN_PERSIST_INTERVAL_MS;
         session.last_seen_at = now;
         session.expires_at = expiry(session.created_at, now);
         let resolved = ResolvedSession {
@@ -225,14 +232,18 @@ impl LoginSessionStore {
         }
     }
 
-    fn persist(&self) -> Result<(), CoreError> {
+    fn persist(&mut self) -> Result<(), CoreError> {
         write_private_json(
             &self.path,
             &StoredSessions {
                 schema_version: SESSIONS_SCHEMA_VERSION,
                 sessions: self.sessions.clone(),
             },
-        )
+        )?;
+        for session in &mut self.sessions {
+            session.last_persisted_at = session.last_seen_at;
+        }
+        Ok(())
     }
 }
 
@@ -372,6 +383,67 @@ mod tests {
             .expect("reopen")
             .list(NOW, None)
             .is_empty());
+    }
+
+    #[test]
+    fn c20_3_continuous_use_is_persisted_each_minute_and_survives_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = LoginSessionStore::open(directory.path()).expect("open");
+        let issued = store
+            .issue(LoginChannel::Remote, "browser", NOW)
+            .expect("issue");
+
+        for step in 1..=4 {
+            let at = NOW + step * 30_000;
+            assert!(store.touch(&issued.token, at).is_some());
+            let listed = LoginSessionStore::open(directory.path())
+                .expect("reopen")
+                .list(at, None);
+            assert_eq!(listed.len(), 1);
+            let saved_at = NOW + (step / 2) * 60_000;
+            assert_eq!(listed[0].last_seen_at, saved_at);
+            assert_eq!(listed[0].expires_at, saved_at + SESSION_IDLE_MS);
+        }
+
+        // 다시 열어도 직전 저장부터 한 분이 되기 전에는 되쓰지 않는다.
+        let mut reopened = LoginSessionStore::open(directory.path()).expect("reopen");
+        assert!(reopened.touch(&issued.token, NOW + 150_000).is_some());
+        let listed = LoginSessionStore::open(directory.path())
+            .expect("reopen after touch")
+            .list(NOW + 150_000, None);
+        assert_eq!(listed[0].last_seen_at, NOW + 120_000);
+
+        // 발급 당시 유휴 만료 시각을 넘겨도 저장된 사용 시각 덕분에 유효하다.
+        assert!(LoginSessionStore::open(directory.path())
+            .expect("reopen near expiry")
+            .touch(&issued.token, NOW + SESSION_IDLE_MS + 90_000)
+            .is_some());
+    }
+
+    #[test]
+    fn c20_3_failed_touch_persistence_is_retried_on_the_next_request() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = LoginSessionStore::open(directory.path()).expect("open");
+        let issued = store
+            .issue(LoginChannel::Remote, "browser", NOW)
+            .expect("issue");
+        let path = directory.path().join(LOGIN_SESSIONS_FILE_NAME);
+        let backup = directory.path().join("sessions-backup.json");
+
+        // 권한에 기대지 않고 저장 경로를 디렉터리로 바꿔 원자적 교체를 실패시킨다.
+        fs::rename(&path, &backup).expect("save previous file");
+        fs::create_dir(&path).expect("block replacement");
+        assert!(store.touch(&issued.token, NOW + 60_000).is_some());
+        fs::remove_dir(&path).expect("unblock replacement");
+        fs::rename(&backup, &path).expect("restore previous file");
+
+        assert!(store.touch(&issued.token, NOW + 60_001).is_some());
+        let listed = LoginSessionStore::open(directory.path())
+            .expect("reopen")
+            .list(NOW + 60_002, None);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].last_seen_at, NOW + 60_001);
+        assert_eq!(listed[0].expires_at, NOW + 60_001 + SESSION_IDLE_MS);
     }
 
     /// `list`는 최근에 쓰인 세션을 먼저 돌려준다. 정렬이 빠지거나 뒤집히면
