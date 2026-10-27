@@ -50,7 +50,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 zeroize = "1"
 # C20. 접근 채널 로그인. 비밀번호는 argon2id PHC 문자열로, OTP는 RFC 6238(HMAC-SHA1)로
 # 검증한다. QR은 서버가 SVG로 그려 화면은 `<img>`에 넣기만 한다.
-argon2 = "0.5"
+argon2 = "0.6"
 rand_core = { version = "0.6", features = ["getrandom"] }
 hmac = "0.12"
 sha1 = "0.10"
