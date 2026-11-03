@@ -36,7 +36,7 @@ portable-pty = "0.9"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = { version = "0.10", features = ["serde"] }
-cron = "0.15"
+cron = "0.17"
 bytes = "1"
 base64 = "0.22"
 futures-util = "0.3"
