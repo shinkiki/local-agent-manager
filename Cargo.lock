@@ -5145,7 +5145,7 @@ dependencies = [
  "serde_with",
  "swift-rs",
  "thiserror 2.0.21",
- "toml 0.9.12+spec-1.1.0",
+ "toml 1.1.6+spec-1.1.0",
  "url",
  "urlpattern",
  "uuid",
@@ -6821,9 +6821,9 @@ dependencies = [
 
 [[package]]
 name = "zeroize"
-version = "1.9.0"
+version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 dependencies = [
  "zeroize_derive",
 ]
