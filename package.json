@@ -43,7 +43,7 @@
     "i18n:catalog": "node ./scripts/generate-ui-catalog.mjs"
   },
   "dependencies": {
-    "@iconify-json/logos": "^1.2.14",
+    "@iconify-json/logos": "^1.2.18",
     "@shikijs/core": "^4.4.3",
     "@shikijs/engine-javascript": "^4.5.0",
     "@shikijs/langs": "^4.4.3",
