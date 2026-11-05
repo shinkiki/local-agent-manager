@@ -27,7 +27,7 @@ export interface PollVisibility {
 export interface PollLoopOptions {
   /** 성공 후 다음 실행까지의 기본 간격. */
   intervalMs: number;
-  /** 연속 실패 시 지수 백오프 상한. */
+  /** 연속 실패 시 지수 백오프 상한. 기본 간격보다 작으면 기본 간격을 쓴다. */
   maxBackoffMs?: number;
   run: () => Promise<unknown>;
   timers?: PollTimers;
@@ -96,11 +96,13 @@ function createPollTimer(timers: PollTimers) {
  * 묻고, 그 답이 어떻게 변하는지는 여기 안에서만 산다.
  */
 function createPollBackoff(intervalMs: number, maxBackoffMs: number) {
+  // V4: 긴 주기의 조회가 실패했다고 기본 주기보다 더 자주 요청하지 않는다.
+  const ceilingMs = Math.max(intervalMs, maxBackoffMs);
   let delayMs = intervalMs;
   return {
     next: () => delayMs,
     succeeded: () => { delayMs = intervalMs; },
-    failed: () => { delayMs = Math.min(delayMs * 2, maxBackoffMs); },
+    failed: () => { delayMs = Math.min(delayMs * 2, ceilingMs); },
   };
 }
 

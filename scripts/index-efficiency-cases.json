@@ -1,0 +1,226 @@
+[
+  {
+    "id": "symbol-01",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/project_files.rs",
+    "query": "search_project_files",
+    "expected": "fn search_project_files("
+  },
+  {
+    "id": "symbol-02",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/project_git.rs",
+    "query": "project_git_overview",
+    "expected": "fn project_git_overview("
+  },
+  {
+    "id": "symbol-03",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/project_overlays.rs",
+    "query": "list_project_overlay_sets",
+    "expected": "fn list_project_overlay_sets("
+  },
+  {
+    "id": "symbol-04",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/agent_builtin_tools.rs",
+    "query": "load_agent_builtin_tools",
+    "expected": "fn load_agent_builtin_tools("
+  },
+  {
+    "id": "symbol-05",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/system_skills.rs",
+    "query": "get_system_skill_notice",
+    "expected": "fn get_system_skill_notice("
+  },
+  {
+    "id": "symbol-06",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/login_auth.rs",
+    "query": "login_invalid",
+    "expected": "fn login_invalid("
+  },
+  {
+    "id": "symbol-07",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/login_sessions.rs",
+    "query": "token_digest",
+    "expected": "fn token_digest("
+  },
+  {
+    "id": "symbol-08",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/login_totp.rs",
+    "query": "verify_totp",
+    "expected": "fn verify_totp("
+  },
+  {
+    "id": "symbol-09",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/user_path.rs",
+    "query": "plan_user_directory",
+    "expected": "fn plan_user_directory("
+  },
+  {
+    "id": "symbol-10",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/path_guard.rs",
+    "query": "canonical_child_facing",
+    "expected": "fn canonical_child_facing("
+  },
+  {
+    "id": "symbol-11",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/db_connections.rs",
+    "query": "get_db_connections",
+    "expected": "fn get_db_connections("
+  },
+  {
+    "id": "symbol-12",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/db_exec.rs",
+    "query": "run_db_query",
+    "expected": "fn run_db_query("
+  },
+  {
+    "id": "symbol-13",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/db_sql.rs",
+    "query": "validate_statement_policy",
+    "expected": "fn validate_statement_policy("
+  },
+  {
+    "id": "symbol-14",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/document_tree.rs",
+    "query": "read_document_file",
+    "expected": "fn read_document_file("
+  },
+  {
+    "id": "symbol-15",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/project_registry.rs",
+    "query": "build_project_registry",
+    "expected": "fn build_project_registry("
+  },
+  {
+    "id": "symbol-16",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/resource_repository.rs",
+    "query": "repository_skills_root",
+    "expected": "fn repository_skills_root("
+  },
+  {
+    "id": "symbol-17",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/skill_library.rs",
+    "query": "validate_skill_key",
+    "expected": "fn validate_skill_key("
+  },
+  {
+    "id": "symbol-18",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/skill_trash.rs",
+    "query": "restore_skill_trash",
+    "expected": "fn restore_skill_trash("
+  },
+  {
+    "id": "symbol-19",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/session_context.rs",
+    "query": "normalize_policy",
+    "expected": "fn normalize_policy("
+  },
+  {
+    "id": "symbol-20",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/session_cleanup.rs",
+    "query": "removable_under",
+    "expected": "fn removable_under("
+  },
+  {
+    "id": "symbol-21",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/ssh_keys.rs",
+    "query": "get_ssh_keys",
+    "expected": "fn get_ssh_keys("
+  },
+  {
+    "id": "symbol-22",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/ssh_endpoints.rs",
+    "query": "list_agent_ssh_endpoints",
+    "expected": "fn list_agent_ssh_endpoints("
+  },
+  {
+    "id": "symbol-23",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/system_workflows.rs",
+    "query": "next_version_for",
+    "expected": "fn next_version_for("
+  },
+  {
+    "id": "symbol-24",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/catalog_health.rs",
+    "query": "begin_reconcile",
+    "expected": "fn begin_reconcile("
+  },
+  {
+    "id": "symbol-25",
+    "split": "tuning",
+    "path": "crates/agent-manager-core/src/file_kind.rs",
+    "query": "ensure_regular_file",
+    "expected": "fn ensure_regular_file("
+  },
+  {
+    "id": "symbol-26",
+    "split": "tuning",
+    "path": "crates/agent-manager-core/src/git_refs.rs",
+    "query": "head_branch",
+    "expected": "fn head_branch("
+  },
+  {
+    "id": "symbol-27",
+    "split": "tuning",
+    "path": "crates/agent-manager-core/src/document_automation.rs",
+    "query": "validate_patterns",
+    "expected": "fn validate_patterns("
+  },
+  {
+    "id": "symbol-28",
+    "split": "tuning",
+    "path": "crates/agent-manager-core/src/quiet_hours.rs",
+    "query": "parse_clock",
+    "expected": "fn parse_clock("
+  },
+  {
+    "id": "symbol-29",
+    "split": "tuning",
+    "path": "crates/agent-manager-core/src/markdown_plain.rs",
+    "query": "markdown_plain_text",
+    "expected": "fn markdown_plain_text("
+  },
+  {
+    "id": "symbol-30",
+    "split": "tuning",
+    "path": "crates/agent-manager-core/src/identifier.rs",
+    "query": "is_slug",
+    "expected": "fn is_slug("
+  },
+  {
+    "id": "symbol-31",
+    "split": "tuning",
+    "path": "crates/agent-manager-core/src/app_data_file.rs",
+    "query": "open_private_file",
+    "expected": "fn open_private_file("
+  },
+  {
+    "id": "symbol-32",
+    "split": "tuning",
+    "path": "crates/agent-manager-core/src/project_files.rs",
+    "query": "list_project_entries",
+    "expected": "fn list_project_entries("
+  }
+]

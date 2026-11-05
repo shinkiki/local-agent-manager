@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::app_data_file::write_private_json;
+use crate::app_data_file::{read_private_json_or_default, write_private_json};
 use crate::domain::ProviderId;
 use crate::store_lock;
 use crate::CoreError;
@@ -53,6 +53,8 @@ pub struct SkillMetaStore {
     pub skills: BTreeMap<String, SkillMetaEntry>,
 }
 
+/// 목록·화면용 읽기. 파일이 없거나 해석되지 않으면 빈 저장소로 보아 조회를 막지 않는다.
+/// 갱신은 이 함수를 쓰지 않는다 — [`update_skill_meta`] 참고.
 pub(crate) fn load_skill_meta(app_data_dir: &Path) -> SkillMetaStore {
     let path = app_data_dir.join(META_FILE);
     let Ok(bytes) = fs::read(&path) else {
@@ -67,13 +69,21 @@ fn save_skill_meta(app_data_dir: &Path, store: &SkillMetaStore) -> Result<(), Co
     write_private_json(&app_data_dir.join(META_FILE), &next)
 }
 
+/// 갱신 경로와 같은 기준으로 저장본을 읽어 본다. 되돌리기 어려운 쓰기(공통 원본 생성)를
+/// 하기 전에 불러, 그 뒤 출처 기록이 깨진 저장본 때문에 실패하는 반쪽 상태를 막는다.
+pub(crate) fn ensure_skill_meta_readable(app_data_dir: &Path) -> Result<(), CoreError> {
+    read_private_json_or_default::<SkillMetaStore>(&app_data_dir.join(META_FILE)).map(|_| ())
+}
+
 fn update_skill_meta<F>(app_data_dir: &Path, mutate: F) -> Result<(), CoreError>
 where
     F: FnOnce(&mut SkillMetaStore) -> bool,
 {
     // G7: atomic replace만으로는 동시 갱신의 유실을 막지 못하므로 읽기부터 저장까지 잠근다.
     let _lock = store_lock::acquire(app_data_dir, META_LOCK_FILE, "스킬 메타 저장소")?;
-    let mut store = load_skill_meta(app_data_dir);
+    // G7: 해석되지 않는 저장본을 빈 값으로 읽고 저장하면 다른 스킬의 출처·자동 동기화가
+    // 모두 지워진다. 갱신은 그 파일을 덮지 않고 오류로 돌려준다(목록 읽기는 관대하게 둔다).
+    let mut store: SkillMetaStore = read_private_json_or_default(&app_data_dir.join(META_FILE))?;
     if mutate(&mut store) {
         save_skill_meta(app_data_dir, &store)?;
     }
@@ -170,6 +180,33 @@ mod tests {
                 assert_eq!(origin.archived_at_ms, Some(worker as i64));
             }
         }
+    }
+
+    #[test]
+    fn g7_unparsable_store_is_not_overwritten_by_updates() {
+        let temp = tempdir().expect("tempdir");
+        let app_data_dir = temp.path();
+        let path = app_data_dir.join(META_FILE);
+        let corrupt = br#"{"version":1,"skills":{"kept":{"autoSync":true}"#;
+        fs::write(&path, corrupt).expect("write corrupt store");
+
+        assert!(set_skill_auto_sync(app_data_dir, "other", true).is_err());
+        assert!(remove_skill_meta(app_data_dir, "kept").is_err());
+        assert!(record_skill_origin(
+            app_data_dir,
+            "other",
+            SkillOriginMeta {
+                provider: ProviderId::Codex,
+                scope: "personal".into(),
+                project_path: None,
+                archived_at_ms: None,
+            },
+        )
+        .is_err());
+        assert!(ensure_skill_meta_readable(app_data_dir).is_err());
+        assert_eq!(fs::read(&path).expect("read store"), corrupt);
+        // 읽기는 여전히 막히지 않는다.
+        assert!(load_skill_meta(app_data_dir).skills.is_empty());
     }
 
     #[test]

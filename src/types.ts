@@ -600,17 +600,12 @@ export interface LocalLlmConnections {
 }
 
 /** 연결 추가·편집. `id`가 없으면 새 연결이고 id 는 label 에서 만든다. `apiKey` 규칙은 SetLocalLlmConnectionRequest 와 같다. */
-export interface UpsertLocalLlmConnectionRequest {
+export interface UpsertLocalLlmConnectionRequest extends SetLocalLlmConnectionRequest {
   id?: string;
   label: string;
-  baseUrl: string;
-  defaultModel: string;
-  contextWindow: number | null;
   modelWindows?: Record<string, number>;
-  enabled: boolean;
   /** 단계 계획을 거칠지. 생략하면 켠 것으로 본다. */
   planSteps: boolean;
-  apiKey?: string;
 }
 
 /** 주소 하나를 찔러 본 결과. 닿지 않는 것도 오류가 아니라 값으로 온다. */
@@ -738,6 +733,93 @@ export interface SshServerRef {
 export interface SshEndpointCheckReceipt {
   serverId: string;
   fingerprint: string;
+  destination: string;
+  reachable: boolean;
+  timedOut: boolean;
+  message: string;
+}
+
+/** C21. 분산처리 실행기 한 대. 주소·키는 SSH 연결 서버가 갖고, 실행기는 그 서버 ID만 가리킨다. */
+export interface RunnerView {
+  id: string;
+  serverId: string;
+  name: string;
+  slots: number;
+  /** C21-5 브라우저 자리. 0이면 이 실행기로 브라우저 시험(Cypress)을 보내지 않는다. 옛 백엔드는 싣지 않는다. */
+  browsers?: number;
+  enabled: boolean;
+  note: string;
+  updatedAt: number;
+  /** 가리키는 SSH 서버가 아직 있는지. false면 서버가 지워진 것이다. */
+  serverFound: boolean;
+  serverName: string;
+  host: string;
+  port: number;
+  user: string;
+  /** 그 SSH 서버의 에이전트 사용. 꺼져 있으면 외부 도구가 이 실행기를 쓰지 않는다. */
+  agentEnabled: boolean;
+  keyFingerprint: string;
+  /** `<CLI> runners list`와 같은 판정. 둘 다 null이면 외부 도구가 이 실행기를 쓴다. */
+  skipCode: RunnerSkipCode | null;
+  skipReason: string | null;
+}
+
+/** 외부 도구가 실행기를 쓰지 않는 이유의 갈래. */
+export type RunnerSkipCode = "disabled" | "serverMissing" | "agentOff" | "keyUnavailable" | "passphraseProtected" | "inventoryUnavailable";
+
+/** 실행기로 검증 명령을 보내도 되는 프로젝트 폴더. */
+export interface RunnerProject {
+  id: string;
+  name: string;
+  root: string;
+  exclude: string[];
+}
+
+/** 실행기 추가 화면이 고르는 SSH 연결 서버. */
+export interface RunnerSshServerOption {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  agentEnabled: boolean;
+}
+
+export interface RunnersSnapshot {
+  runners: RunnerView[];
+  projects: RunnerProject[];
+  sshServers: RunnerSshServerOption[];
+  minSlots: number;
+  maxSlots: number;
+  defaultSlots: number;
+  /** 브라우저 자리 상한. 하한은 0이고 u32 끝(4294967295)이면 상한이 없다. 이 칸을 모르는 옛 백엔드는 보내지 않는다. */
+  maxBrowsers?: number;
+  issues: string[];
+}
+
+/** 실행기 저장 요청. id가 없으면 새 실행기다. 이름을 비우면 SSH 서버 이름이 된다. */
+export interface SaveRunnerRequest {
+  id?: string | null;
+  serverId: string;
+  name: string;
+  slots: number;
+  /** 빠지면 백엔드가 고치는 실행기의 저장값을 그대로 둔다(옛 백엔드는 이 칸을 모른다). */
+  browsers?: number;
+  enabled: boolean;
+  note: string;
+}
+
+export interface RunnerProjectInput {
+  id?: string | null;
+  name: string;
+  root: string;
+  exclude: string[];
+}
+
+/** 실행기 접속 확인 결과. SSH 탭의 접속 확인과 같은 고정 명령 하나만 돈다. */
+export interface RunnerCheckReceipt {
+  runnerId: string;
+  serverId: string;
   destination: string;
   reachable: boolean;
   timedOut: boolean;
@@ -1122,6 +1204,8 @@ export interface LinkedFile {
   content: string;
   sizeBytes: number;
   targetLine: number | null;
+  /** 이미지 파일이면 그대로 그릴 `data:` URL. 이때 `content`는 비어 있다. */
+  imageDataUrl: string | null;
 }
 
 export interface ProjectOption {
@@ -4276,6 +4360,21 @@ export interface DocumentEntry {
   previewKind: DocumentPreviewKind | null;
 }
 
+/** 파일 화면 우클릭 메뉴가 만드는 항목 종류. */
+export type DocumentEntryKind = "file" | "directory";
+
+/**
+ * 등록 폴더 안 항목 삭제 결과. 비어 있지 않은 폴더를 `recursive` 없이 지우라고 하면
+ * 백엔드는 아무것도 지우지 않고 `deleted: false`와 하위 수(숨김 항목 포함)만 돌려준다.
+ */
+export interface DocumentDeleteResult {
+  deleted: boolean;
+  files: number;
+  directories: number;
+  /** 하위 항목을 상한까지만 셌다. 실제 수는 더 많다. */
+  truncated: boolean;
+}
+
 export interface DocumentEntryPage {
   entries: DocumentEntry[];
   nextCursor: string | null;
@@ -4706,6 +4805,7 @@ export interface AgentBuiltinToolView {
 /** 기본도구 상태 한 줄의 갈래. 문구가 아니라 값이라 ko·en 어느 쪽으로도 조립된다. */
 export type AgentBuiltinToolNote =
   | { kind: "sshEndpoints"; available: number; unusable: number }
+  | { kind: "indexSources"; available: number; unusable: number }
   | { kind: "dbConnections"; available: number; unusable: number }
   | { kind: "cypressEnabled" }
   | { kind: "cypressDisabled" }

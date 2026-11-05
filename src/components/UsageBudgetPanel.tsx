@@ -10,6 +10,7 @@ import { acknowledgeDrainNotice, deleteScheduledRequest, getSchedulerSnapshot, g
 // 필요한 자리들이 있어 pacingSummary를 거치지 않고 여기서 직접 가져온다 — 화면이 같은
 // 필터를 다시 적으면 카드·모달·회차 설정이 서로 다른 "참여 계정"을 말하게 된다.
 import { pooledAccounts } from "../lib/pacingAccounts";
+import { clampBaselineRuns, clampPercent, parseCount, parseNumberField, parsePercent } from "../lib/usageBudgetFields";
 import { accountLabel, consumerSummary, defaultQuietHours, describeQuietHours, poolSummary, quietWeekdays, WEEKDAY_NAMES, WEEKDAY_NAMES_EN, WEEKDAY_ORDER } from "../lib/pacingSummary";
 import { PACING_PROVIDER_IDS } from "../lib/pacingSummary";
 import type { PoolSummary } from "../lib/pacingSummary";
@@ -319,31 +320,6 @@ function AgentCostSection<T extends AgentCostEntry>({ title, unit, total, groups
 }
 
 /**
- * 숫자 칸 하나를 읽는다. 이 화면의 숫자 입력 다섯 자리가 "trim → 빈 값 처리 → `Number` →
- * `Number.isFinite` 확인"이라는 같은 네 줄을 각자 적고 있었고, 진짜로 다른 것은 빈 칸을
- * 무엇으로 볼지(캡 없음은 `null`, 상한 해제와 우선순위는 `0`) 하나뿐이었다. 그 하나만
- * 인자로 받고 나머지는 여기서 한 번만 적는다. 숫자가 아니면 언제나 `null`이라 호출부는
- * "고치지 않고 돌아간다"는 판단을 그대로 유지한다.
- */
-function parseNumberField(raw: string, whenEmpty: number | null): number | null {
-  const trimmed = raw.trim();
-  if (trimmed === "") return whenEmpty;
-  const value = Number(trimmed);
-  return Number.isFinite(value) ? value : null;
-}
-
-/** 백분율은 화면에서도 저장에서도 0~100 밖으로 나가지 않는다. 입력 보정과 막대 그리기가 같은 규칙을 봐야 한다. */
-function clampPercent(value: number): number {
-  return Math.min(100, Math.max(0, value));
-}
-
-/** 빈 입력은 "캡 없음"(null), 숫자는 0~100으로 잘라 보낸다. */
-function parsePercent(raw: string): number | null {
-  const value = parseNumberField(raw, null);
-  return value === null ? null : clampPercent(value);
-}
-
-/**
  * 절감 목표 초안. 저장값(`SavingsDefaults`)과 달리 `baselineRuns`가 비어 있을 수 있다 —
  * 숫자 칸을 고치려면 먼저 지워야 하고, 그때 곧바로 기본값으로 되돌리면 지우는 순간 5가
  * 다시 채워져 다른 값을 넣을 수 없다. 범위 보정은 저장할 때 한 번만 한다.
@@ -355,19 +331,6 @@ interface SavingsDraft {
 
 function savingsDraftFrom(savings: SavingsDefaults): SavingsDraft {
   return { targetReductionPercent: savings.targetReductionPercent ?? null, baselineRuns: savings.baselineRuns };
-}
-
-/**
- * 기준선 회차 수의 허용 범위. 백엔드가 1~32 밖을 거절하므로(usage_budget_policy.rs) 저장
- * 경로와 화면 보정이 같은 규칙을 봐야 한다 — 한쪽만 자르면 조용히 다른 값이 저장된다.
- */
-function clampBaselineRuns(value: number): number {
-  return Math.min(32, Math.max(1, Math.round(value)));
-}
-
-/** 빈 입력은 미입력(null). 범위는 저장할 때 자르므로 여기서는 자르지 않는다. */
-function parseCount(raw: string): number | null {
-  return parseNumberField(raw, null);
 }
 
 /** 스냅샷의 스케줄을 편집 초안으로. 없으면 꺼진 기본 초안, 구형 응답의 요일 누락은 매일로 읽는다. */

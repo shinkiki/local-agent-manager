@@ -45,7 +45,7 @@ function fixture(t, payload = folder, status = 200) {
     assert.equal(target.origin, "https://manager.example.test");
     if (target.pathname === "/api/access") {
       return Response.json({
-        protocolVersion: 14, storeId: "00000000-0000-0000-0000-000000000001",
+        protocolVersion: 15, storeId: "00000000-0000-0000-0000-000000000001",
         instanceId: "test-backend", backendPort: 54178, mode: "tailscale", remote: true,
         channel: "remote", authenticated: false,
         loginRequired: { password: false, otp: false }, headless: true,

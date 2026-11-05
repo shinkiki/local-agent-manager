@@ -318,7 +318,7 @@ function inputLabel(contract: SystemWorkflowContract, inputs: string[]): string 
     : runtimeText(`입력 ${shown}`, `Inputs ${shown}`);
 }
 
-/** 이 단계의 인자·조건·사후검증이 읽는 앞 단계 id. `$step` 토큰만 그렇게 읽을 수 있다. */
+/** 이 단계의 인자·조건·사후검증이 읽는 앞 단계 id. `$step`과 `$format`의 `{step.<id>...}`가 그렇게 읽는다. */
 function referencedSteps(step: SystemWorkflowStep): string[] {
   const found = new Set<string>();
   const walk = (value: unknown): void => {
@@ -330,6 +330,10 @@ function referencedSteps(step: SystemWorkflowStep): string[] {
     const record = value as Record<string, unknown>;
     const source = record.$step;
     if (typeof source === "string") found.add(source);
+    const format = record.$format;
+    if (typeof format === "string") {
+      for (const stepId of formatReferencedSteps(format)) found.add(stepId);
+    }
     for (const item of Object.values(record)) walk(item);
   };
   walk(step.arguments);
@@ -338,6 +342,37 @@ function referencedSteps(step: SystemWorkflowStep): string[] {
   // 리터럴 목록을 도는 forEach는 앞 단계를 가리키지 않는다.
   if (step.forEach?.step) found.add(step.forEach.step);
   return [...found];
+}
+
+/**
+ * `$format` 문자열 안의 `{step.<id>...}` 구멍에서 앞 단계 id를 뽑는다.
+ * 백엔드 `parse_format`과 같은 규칙으로 `{{`·`}}` 이스케이프는 리터럴 중괄호로 건너뛴다.
+ */
+function formatReferencedSteps(text: string): string[] {
+  const steps: string[] = [];
+  let index = 0;
+  while (index < text.length) {
+    const ch = text[index];
+    if (ch === "{" || ch === "}") {
+      if (text[index + 1] === ch) {
+        index += 2;
+        continue;
+      }
+      if (ch === "{") {
+        const end = text.indexOf("}", index + 1);
+        if (end < 0) break;
+        const body = text.slice(index + 1, end).trim();
+        if (body.startsWith("step.")) {
+          const [stepId] = body.slice("step.".length).split(".");
+          if (stepId) steps.push(stepId);
+        }
+        index = end + 1;
+        continue;
+      }
+    }
+    index += 1;
+  }
+  return steps;
 }
 
 /**

@@ -27,7 +27,8 @@ import {
   startFileDownload,
   updateFileDownload,
 } from "./fileDownloads";
-import { chooseDownloadDestination, sanitizeDownloadName, saveBlobAsFile } from "./fileSave";
+import { linkedFileName, responseFileName } from "./downloadName";
+import { chooseDownloadDestination, saveBlobAsFile } from "./fileSave";
 import { chatLinkedFileRef, type ChatLinkedFileRef } from "./ipcChat";
 import { docLinkedFileRef, type DocLinkedFileRef } from "./ipcDocuments";
 import {
@@ -138,33 +139,6 @@ function newDownloadId(): string {
   return typeof crypto?.randomUUID === "function"
     ? crypto.randomUUID()
     : `download-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
-function linkedFileName(href: string): string {
-  let target = href.trim().replace(/^<|>$/g, "").split(/[?#]/, 1)[0].replace(/:\d+$/, "");
-  target = decodedUriComponent(target) ?? target;
-  const name = target.replace(/\\/g, "/").split("/").filter(Boolean).pop();
-  return sanitizeDownloadName(name || "download");
-}
-
-function responseFileName(disposition: string | null): string | null {
-  if (!disposition) return null;
-  const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
-  if (encoded) {
-    const decoded = decodedUriComponent(encoded);
-    if (decoded !== null) return sanitizeDownloadName(decoded);
-  }
-  const fallback = disposition.match(/filename="([^"]+)"/i)?.[1];
-  return fallback ? sanitizeDownloadName(fallback) : null;
-}
-
-/** 링크와 응답 헤더가 공유하는 URI 디코딩 실패 규칙. 호출부가 각자의 대체값을 고른다. */
-function decodedUriComponent(value: string): string | null {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return null;
-  }
 }
 
 export function downloadSessionLinkedFile(

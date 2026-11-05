@@ -48,8 +48,8 @@ function groupScope(item: ChatAttentionItem): AttentionGroupScope {
   // 페이싱 제안은 회차가 아니라 페이싱 전체에 대한 것이라 소비자별로 나누지 않는다.
   // 같은 key끼리는 백엔드가 이미 교체하므로 여기서는 한 묶음으로만 모은다.
   if (item.kind === "pacingSuggestion") return { reason: "workflow", scope: "pacing-suggestion" };
-  // 회차 결정도 채팅이 없고 목표별로 백엔드가 하나만 유지하므로 한 묶음으로 모은다.
-  if (item.kind === "roundDecision") return { reason: "workflow", scope: "round-decision" };
+  // 회차 결정은 목표(goalId)별로 알림이 관리되므로 목표별 묶음으로 분리한다.
+  if (item.kind === "roundDecision") return { reason: "workflow", scope: `round-decision:${roundDecisionGoalId(item.id) ?? "unknown"}` };
   const origin = item.origin;
   const consumerId = origin?.consumerId ?? origin?.scheduleId ?? null;
   if (consumerId) {

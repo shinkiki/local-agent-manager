@@ -1251,15 +1251,24 @@ fn spawn_named_thread(name: String, body: impl FnOnce() + Send + 'static) -> Res
 }
 
 fn read_terminal(runtime: Arc<TerminalRuntime>, mut reader: Box<dyn Read + Send>) {
+    if let Err(error) = read_terminal_output(&mut reader, |data| runtime.append_output(data)) {
+        runtime.mark_failed(format!("PTY 출력을 읽지 못했습니다: {error}"));
+    }
+}
+
+/// 일시 중단은 자식의 실패가 아니다. 출력 전달과 영구 오류 판정은 그대로 두고 읽기만
+/// 재시도한다. 반복을 분리해 실제 신호 타이밍 없이 이 경계를 검증한다(V2).
+fn read_terminal_output(
+    reader: &mut dyn Read,
+    mut on_output: impl FnMut(&[u8]),
+) -> std::io::Result<()> {
     let mut buffer = [0_u8; 8192];
     loop {
         match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => runtime.append_output(&buffer[..read]),
-            Err(error) => {
-                runtime.mark_failed(format!("PTY 출력을 읽지 못했습니다: {error}"));
-                break;
-            }
+            Ok(0) => return Ok(()),
+            Ok(read) => on_output(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
     }
 }
@@ -1899,6 +1908,62 @@ mod tests {
         assert!(TerminalPhase::Failed.is_terminated());
         assert!(!TerminalPhase::Running.is_terminated());
         assert!(!TerminalPhase::Stopping.is_terminated());
+    }
+
+    struct ScriptedTerminalReader {
+        steps: VecDeque<std::io::Result<Vec<u8>>>,
+    }
+
+    impl Read for ScriptedTerminalReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let data = self.steps.pop_front().expect("unexpected extra read")?;
+            assert!(data.len() <= buffer.len());
+            buffer[..data.len()].copy_from_slice(&data);
+            Ok(data.len())
+        }
+    }
+
+    /// V2: 연속·중간 일시 중단 뒤에도 바이트를 순서대로 전달하고 EOF에서 멈춘다.
+    #[test]
+    fn v2_terminal_output_retries_interrupted_reads_and_stops_at_eof() {
+        use std::io::{Error, ErrorKind};
+        let first = vec![0, b'a', 0xff];
+        let second = b"next".to_vec();
+        let mut reader = ScriptedTerminalReader {
+            steps: VecDeque::from([
+                Err(Error::from(ErrorKind::Interrupted)),
+                Err(Error::from(ErrorKind::Interrupted)),
+                Ok(first.clone()),
+                Err(Error::from(ErrorKind::Interrupted)),
+                Ok(second.clone()),
+                Ok(Vec::new()),
+                Ok(b"after EOF".to_vec()),
+            ]),
+        };
+        let mut output = Vec::new();
+        read_terminal_output(&mut reader, |data| output.push(data.to_vec())).expect("EOF");
+        assert_eq!(output, vec![first, second]);
+        assert_eq!(reader.steps.len(), 1, "EOF 뒤에는 읽지 않는다");
+    }
+
+    /// V2: 일시 중단 외의 오류는 원래대로 반환하고 후속 출력을 읽지 않는다.
+    #[test]
+    fn v2_terminal_output_preserves_fatal_errors_and_stops_reading() {
+        use std::io::{Error, ErrorKind};
+        let mut reader = ScriptedTerminalReader {
+            steps: VecDeque::from([
+                Ok(b"before error".to_vec()),
+                Err(Error::new(ErrorKind::BrokenPipe, "PTY read sentinel")),
+                Ok(b"after error".to_vec()),
+            ]),
+        };
+        let mut output = Vec::new();
+        let error = read_terminal_output(&mut reader, |data| output.extend_from_slice(data))
+            .expect_err("fatal error");
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "PTY read sentinel");
+        assert_eq!(output, b"before error");
+        assert_eq!(reader.steps.len(), 1, "오류 뒤에는 읽지 않는다");
     }
 
     #[test]

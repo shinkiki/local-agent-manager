@@ -3,6 +3,7 @@ import { AlertTriangle, Camera, FileText, Layers, RefreshCw, Trash2, Undo2 } fro
 import { useI18n } from "../lib/i18n";
 import { formatRelative } from "../lib/format";
 import { overlayPatchSectionIndex, overlayPatchSections, sectionsJoinToOriginal } from "../lib/overlayPatchSections";
+import { projectOverlayCandidates } from "../lib/projectOverlayCandidates";
 import {
   applyProjectOverlay,
   checkProjectOverlayApply,
@@ -78,13 +79,7 @@ export function ProjectOverlayPanel({ projectPath, active }: {
       ]);
       setSets(nextSets);
       setDrift(nextDrift);
-      setCandidates(
-        status === null
-          ? []
-          : status.entries
-            .filter((entry) => entry.worktreeStatus === "modified" && entry.unmerged === null && !entry.isSubmodule)
-            .map((entry) => entry.path),
-      );
+      setCandidates(projectOverlayCandidates(status));
     } catch (cause) {
       setLoadError(cause instanceof Error ? cause.message : String(cause));
     } finally {

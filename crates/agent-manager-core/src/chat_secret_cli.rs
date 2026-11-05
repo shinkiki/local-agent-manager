@@ -179,7 +179,14 @@ impl SecretCliOptions {
                             "--env는 ENV=NAME 모양이어야 합니다: {pair}"
                         ))
                     })?;
-                    env.insert(env_name.to_owned(), secret_name.to_owned());
+                    // 같은 환경변수를 두 번 주면 앞의 지정이 조용히 사라져 의도와 다른 값으로
+                    // 명령이 돈다. 어느 쪽이 맞는지 이 프로세스는 알 수 없으니 거절한다.
+                    if let Some(previous) = env.insert(env_name.to_owned(), secret_name.to_owned())
+                    {
+                        return Err(CoreError::InvalidInput(format!(
+                            "--env {env_name}가 두 번 지정됐습니다({previous}, {secret_name}). 하나만 남기세요"
+                        )));
+                    }
                 }
                 "--stdin" => stdin = Some(value()?),
                 "--path" => path = Some(value()?),
@@ -345,6 +352,25 @@ mod tests {
         )
         .expect_err("ENV=NAME 모양이 아니다");
         assert!(error.to_string().contains("ENV=NAME"));
+    }
+
+    #[test]
+    fn duplicate_env_name_is_refused() {
+        let error = SecretCliOptions::parse(
+            [
+                "--app-data-dir",
+                "/tmp/app",
+                "--env",
+                "API_KEY=FIRST",
+                "--env",
+                "API_KEY=SECOND",
+            ]
+            .iter()
+            .map(|arg| (*arg).to_owned()),
+            Some("chat-1".to_owned()),
+        )
+        .expect_err("같은 환경변수를 두 번 주면 거절한다");
+        assert!(error.to_string().contains("API_KEY"));
     }
 
     #[test]

@@ -5773,4 +5773,57 @@ mod tests {
             assert!(!servers.contains_key(id));
         }
     }
+
+    /// E2: 인증 서버 메타데이터가 광고한 endpoint마다 HTTPS(또는 loopback HTTP)를 요구한다.
+    /// 하나라도 평문 원격 주소면 code·token·client secret이 평문으로 나가므로 거절해야 한다.
+    #[test]
+    fn metadata_endpoints_require_https_or_loopback_e2() {
+        let base = || OAuthServerMetadata {
+            authorization_endpoint: "https://auth.example.com/authorize".to_owned(),
+            token_endpoint: "https://auth.example.com/token".to_owned(),
+            registration_endpoint: Some("https://auth.example.com/register".to_owned()),
+            device_authorization_endpoint: Some("https://auth.example.com/device".to_owned()),
+            resource: "https://mcp.example.com".to_owned(),
+            scope: None,
+        };
+        assert!(ensure_metadata_endpoints_allowed(&base()).is_ok());
+
+        let plain_hosts = [
+            "http://auth.example.com/x",
+            "http://localhost.evil.example/x",
+            "http://127.0.0.1.nip.io/x",
+        ];
+        let downgrades: [fn(&mut OAuthServerMetadata, String); 4] = [
+            |m, u| m.authorization_endpoint = u,
+            |m, u| m.token_endpoint = u,
+            |m, u| m.registration_endpoint = Some(u),
+            |m, u| m.device_authorization_endpoint = Some(u),
+        ];
+        for downgrade in downgrades {
+            for plain in plain_hosts {
+                let mut metadata = base();
+                downgrade(&mut metadata, plain.to_owned());
+                assert!(
+                    ensure_metadata_endpoints_allowed(&metadata).is_err(),
+                    "{plain}"
+                );
+            }
+            for loopback in [
+                "http://127.0.0.1:8080/x",
+                "http://localhost:8080/x",
+                "http://[::1]:8080/x",
+            ] {
+                let mut metadata = base();
+                downgrade(&mut metadata, loopback.to_owned());
+                assert!(ensure_metadata_endpoints_allowed(&metadata).is_ok());
+            }
+        }
+
+        let mut absent = base();
+        absent.registration_endpoint = None;
+        absent.device_authorization_endpoint = None;
+        assert!(ensure_metadata_endpoints_allowed(&absent).is_ok());
+        assert!(validate_https_or_loopback("ftp://auth.example.com/x", "x").is_err());
+        assert!(validate_https_or_loopback("not a url", "x").is_err());
+    }
 }

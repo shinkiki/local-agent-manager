@@ -179,6 +179,10 @@ function LinkedFilePreviewHeader({
 function linkedFileSubtitle(file: LinkedFile | null, codeLanguage: CodeLanguage | null): string {
   if (!file) return "읽기 전용 미리보기";
   const parts = [formatBytes(file.sizeBytes)];
+  if (file.imageDataUrl) {
+    parts.push("이미지");
+    return parts.join(" · ");
+  }
   if (codeLanguage) parts.push(codeLanguage.label);
   if (file.targetLine) parts.push(`${file.targetLine}번째 줄`);
   return parts.join(" · ");
@@ -206,6 +210,14 @@ function LinkedFilePreviewBody({
       <div className="state-panel"><p>{UNSUPPORTED_PREVIEW_MESSAGE}</p></div>
     ) : (
       <ErrorBanner message={state.message} />
+    );
+  }
+
+  if (state.file.imageDataUrl) {
+    return (
+      <div className="linked-file-image">
+        <img src={state.file.imageDataUrl} alt={state.file.relativePath} />
+      </div>
     );
   }
 

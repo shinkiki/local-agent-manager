@@ -117,7 +117,21 @@ fn strip_heading(text: &str) -> Option<&str> {
         return None;
     }
     // 닫는 `###`까지 적은 제목은 뒤쪽 표기도 함께 걷는다.
-    Some(rest.trim().trim_end_matches('#').trim_end())
+    // CommonMark ATX 닫는 `#` 뭉치는 본문과 공백으로 나뉘어 있어야 표기로 본다.
+    // 공백 없이 단어 끝에 붙은 `#`(`C#`·`F#` 등)은 본문의 일부다.
+    Some(strip_closing_heading_hashes(rest.trim()))
+}
+
+fn strip_closing_heading_hashes(trimmed: &str) -> &str {
+    let rest = trimmed.trim_end_matches('#');
+    if rest.len() == trimmed.len() {
+        return trimmed;
+    }
+    if rest.is_empty() || rest.ends_with(char::is_whitespace) {
+        rest.trim_end()
+    } else {
+        trimmed
+    }
 }
 
 fn strip_bullet(text: &str) -> Option<&str> {
@@ -333,6 +347,18 @@ mod tests {
             markdown_plain_text("- [x] 끝난 일\n- [ ] 남은 일"),
             "끝난 일\n남은 일"
         );
+    }
+
+    #[test]
+    fn preserves_heading_trailing_hash_without_whitespace() {
+        assert_eq!(
+            markdown_plain_text("# C# 언어\n## C#\n### F# ###\n#### .NET C#\n##### F#"),
+            "C# 언어\nC#\nF#\n.NET C#\nF#"
+        );
+        // 탭으로 나뉜 닫는 뭉치는 표기이고, 본문만 남은 `#` 뭉치는 빈 제목이다.
+        assert_eq!(markdown_plain_text("# 제목\t##\n# ##\n###"), "제목");
+        // 이스케이프한 `\#`는 본문의 `#`로 남는다.
+        assert_eq!(markdown_plain_text("# 값 \\#"), "값 #");
     }
 
     #[test]

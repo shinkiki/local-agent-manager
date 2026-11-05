@@ -40,17 +40,21 @@ export {
 } from "./ipcInstructions";
 export {
   acknowledgeDocumentOfflineReport,
-  createDoc,
   createDocRoot,
+  createDocumentEntry,
   createDocumentTrigger,
   deleteDocRoot,
+  deleteDocumentEntry,
   deleteDocumentTrigger,
+  duplicateDocumentEntry,
   getDocLinkedFile,
   getDocRoots,
   getDocumentAutomationSnapshot,
   getDocumentFile,
   listDocumentEntries,
+  moveDocumentEntry,
   putDoc,
+  renameDocumentEntry,
   runDocumentTriggerTest,
   searchDocumentEntries,
   setDocumentTriggerEnabled,
@@ -111,6 +115,16 @@ export {
   resolveRoundDecision,
   updateRoundGoal,
 } from "./ipcRounds";
+export {
+  addRunnerProject,
+  checkRunner,
+  deleteRunner,
+  deleteRunnerProject,
+  listRunners,
+  saveRunner,
+  setRunnerEnabled,
+  updateRunnerProject,
+} from "./ipcRunners";
 export {
   checkSshEndpoint,
   deleteSshKey,
@@ -308,7 +322,6 @@ export {
   disableLoginOtp,
   getLoginSettings,
   listLoginSessions,
-  login,
   logout,
   revokeAllLoginSessions,
   revokeLoginSession,
@@ -323,7 +336,6 @@ export type {
   OtpSetup,
   Reauth,
 } from "./ipcLogin";
-export type { LoginRequirement } from "./loginSession";
 export {
   getClaudePluginBranchRules,
   getClaudeSettingsStates,

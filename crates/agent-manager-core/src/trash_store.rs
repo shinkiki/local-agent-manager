@@ -67,12 +67,13 @@ impl TrashEntry {
     }
 
     /// manifest를 써서 항목을 완성한다. 쓰지 못하면 옮겨 둔 실체를 `source`로
-    /// 되돌리려 시도한 뒤 항목 디렉터리를 지우고 실패를 알린다.
+    /// 되돌린 뒤 항목 디렉터리를 지우고 실패를 알린다. 복구도 실패하면 실체가 든
+    /// 미완성 항목을 남긴다(C3-11, C11-7).
     pub(crate) fn commit(self, manifest: &impl Serialize, source: &Path) -> Result<(), CoreError> {
         let bytes = serde_json::to_vec_pretty(manifest)?;
         if let Err(error) = fs::write(self.entry_dir.join(MANIFEST_FILE), bytes) {
             if fs::symlink_metadata(&self.content).is_ok() {
-                let _ = move_path(&self.content, source);
+                move_path(&self.content, source)?;
             }
             let _ = fs::remove_dir_all(&self.entry_dir);
             return Err(CoreError::Io(error));
@@ -400,6 +401,38 @@ mod tests {
         assert!(entry.commit(&serde_json::json!({}), &source).is_err());
         assert_eq!(fs::read(&source).expect("restored content"), b"payload");
         assert!(!entry_dir.exists());
+    }
+
+    #[test]
+    fn c3_11_c11_7_commit_preserves_content_when_manifest_and_rollback_fail() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("trash");
+        let source_parent = directory.path().join("original");
+        let source = source_parent.join("skill");
+        fs::create_dir_all(source.join("nested")).expect("source directory");
+        fs::write(source.join("nested/file.txt"), b"recoverable payload").expect("source file");
+
+        let entry = begin_entry(&root, "key").expect("entry");
+        let entry_dir = root.join(entry.id());
+        let content = entry.content().to_path_buf();
+        move_path(&source, &content).expect("move");
+        // 기록 저장과 원위치 복구를 각각 막아 두 경로 모두 실패하게 한다.
+        fs::create_dir(entry_dir.join(MANIFEST_FILE)).expect("block manifest write");
+        fs::remove_dir(&source_parent).expect("remove empty original parent");
+        fs::write(&source_parent, b"blocking parent").expect("block rollback");
+
+        assert!(entry.commit(&serde_json::json!({}), &source).is_err());
+        assert_eq!(
+            fs::read(content.join("nested/file.txt")).expect("retained recovery copy"),
+            b"recoverable payload"
+        );
+        assert_eq!(
+            fs::read(&source_parent).expect("parent blocker"),
+            b"blocking parent"
+        );
+        assert!(read_entries::<Manifest>(&root, |item| item.deleted_at_ms)
+            .expect("listing incomplete entry")
+            .is_empty());
     }
 
     #[test]

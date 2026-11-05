@@ -7,6 +7,25 @@ import { runtimeText } from "./i18nRuntime.ts";
 // 바뀌는 이유가 다르다. 실행 상태 갈래가 늘거나 요약 문구를 손볼 때 경로 검증 규칙을 함께
 // 읽을 이유가 없고, 반대로 편집 금지 폴더를 고칠 때 요약 표를 지나칠 이유도 없다.
 
+/**
+ * 실행 상태별 표시 알약의 클래스. 화면 안 `switch`의 `default`가 모르는 상태를 모두 붉은
+ * 충돌 표시로 떨어뜨리고 있어, 상태가 하나 늘면 조용히 실패처럼 보였다. 표를 상태 전체에
+ * 대한 `Record`로 두어 새 상태는 여기서 빠지면 타입 검사가 막는다.
+ * 런처를 닫은 것(`closed`)은 실패가 아니다(C7-8) — 붉은 표시로 남기면 수동 점검마다 오류처럼 쌓인다.
+ */
+const RUN_STATE_PILL: Record<CypressRunState, string> = {
+  passed: "skill-sync-pill current",
+  running: "skill-sync-pill partial",
+  closed: "skill-sync-pill",
+  failed: "skill-sync-pill conflict",
+  timedOut: "skill-sync-pill conflict",
+  error: "skill-sync-pill conflict",
+};
+
+export function cypressRunStatePill(state: CypressRunState): string {
+  return RUN_STATE_PILL[state];
+}
+
 function formatDuration(durationMs: number): string {
   if (durationMs < 1000) return `${Math.max(0, Math.round(durationMs))}ms`;
   const seconds = durationMs / 1000;

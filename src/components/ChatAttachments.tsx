@@ -73,10 +73,15 @@ export function addAttachmentDrafts(
  * 목록에서 뺀 드래프트가 이 화면이 올린 파일이면 서버에 남은 업로드도 지운다. 화면에서는
  * 이미 사라진 뒤라 실패를 되돌릴 자리가 없으므로 결과를 기다리지 않고 삼킨다. 채팅이 아직
  * 없거나 남이 올린 파일이면 지울 것이 없다.
+ *
+ * 업로드는 대화별이라 지우는 자리도 **올린 대화**여야 한다. 호출부는 모두 "지금 연결된
+ * 대화"를 넘기는데, 올린 뒤 대화가 바뀌면 그 id 로는 다른 대화에 삭제가 가고 원래 파일은
+ * 남는다. 그래서 드래프트가 기억한 대화를 먼저 쓰고, 모를 때만 호출부의 값을 쓴다.
  */
 export function releaseAttachmentDraftUpload(draft: ChatAttachmentDraft, chatId: string | null | undefined): void {
-  if (!draft.uploaded || !draft.ownedUpload || !chatId) return;
-  void removeChatInputFile(chatId, draft.uploaded.id).catch(() => undefined);
+  const ownerChatId = draft.chatId ?? chatId;
+  if (!draft.uploaded || !draft.ownedUpload || !ownerChatId) return;
+  void removeChatInputFile(ownerChatId, draft.uploaded.id).catch(() => undefined);
 }
 
 export function queuedAttachmentsToDrafts(files: ChatInputFile[], chatId: string | null): ChatAttachmentDraft[] {
@@ -109,7 +114,8 @@ export async function uploadAttachmentDrafts(
     if (draft.uploaded) continue;
     if (!draft.file) throw new Error("첨부할 로컬 파일을 찾을 수 없습니다");
     const uploaded = await uploadChatInputFile(chatId, draft.file);
-    next[index] = { ...draft, uploaded };
+    // 올린 대화를 함께 적어 두어야 미리보기와 해제가 그 대화를 찾아간다.
+    next[index] = { ...draft, uploaded, chatId };
     onProgress([...next]);
   }
   return next;

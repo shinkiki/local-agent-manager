@@ -72,7 +72,7 @@ function words(text: Translate): CleanupWords {
   };
 }
 
-/** 바이트를 사람이 읽는 단위로. 0은 "0B"가 아니라 "없음"으로 말한다. */
+/** 바이트를 사람이 읽는 단위로. 0이나 유효하지 않은 값은 "0B"로 표현한다. */
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0B";
   const units = ["B", "KB", "MB", "GB", "TB"];

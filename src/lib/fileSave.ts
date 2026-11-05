@@ -16,12 +16,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { hasNativeShell } from "./backend";
-
-/** 경로 구분자·NUL을 걷어낸 파일 이름. 이름이 남지 않으면 `download`으로 떨어진다. */
-export function sanitizeDownloadName(name: string): string {
-  const safe = name.replace(/[\\/\0]/g, "_").trim();
-  return safe && safe !== "." && safe !== ".." ? safe : "download";
-}
+import { sanitizeDownloadName } from "./downloadName";
 
 /**
  * 저장 대화상자로 목적지를 정한다. 취소하면 null이고, 부르는 쪽은 아무것도 하지 않는다.

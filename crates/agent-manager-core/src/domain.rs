@@ -1975,30 +1975,81 @@ mod tests {
         assert_eq!("local".parse::<ProviderId>().unwrap(), ProviderId::Local);
     }
 
-    /// 능력 술어는 공급자를 늘릴 때 한 자리만 고치고 나머지를 잊기 쉬운 표다. 네 술어를
+    /// 능력 술어는 공급자를 늘릴 때 한 자리만 고치고 나머지를 잊기 쉬운 표다. 일곱 술어를
     /// 한 줄로 세워, 새 공급자가 어느 칸을 물려받는지 이 테스트에서 먼저 결정하게 한다.
     #[test]
     fn provider_capability_table_is_pinned() {
-        // (공급자, 시스템 에이전트, 계정 관리, 사용량 한도, 하네스)
+        // (공급자, 시스템 에이전트, 실행 단위 MCP, 플러그인 승인 확인, 계정 관리, 사용량 한도, 하네스, 단계 계획 고리)
         let table = [
-            (ProviderId::Claude, true, true, true, Harness::Claude),
-            (ProviderId::Codex, true, true, true, Harness::Codex),
+            (
+                ProviderId::Claude,
+                true,
+                true,
+                true,
+                true,
+                true,
+                Harness::Claude,
+                false,
+            ),
+            (
+                ProviderId::Codex,
+                true,
+                true,
+                true,
+                true,
+                true,
+                Harness::Codex,
+                false,
+            ),
             (
                 ProviderId::Antigravity,
+                false,
+                false,
                 false,
                 true,
                 true,
                 Harness::Antigravity,
+                false,
             ),
-            // 로컬 모델은 계정도 사용량 한도도 없고 실행은 ACP 하네스로 돈다.
-            (ProviderId::Local, false, false, false, Harness::OpenCode),
+            // 로컬 모델은 실행 단위 MCP와 플러그인 승인 확인은 지원하지만 계정도 사용량 한도도 없고 ACP 단계 계획 고리로 돈다.
+            (
+                ProviderId::Local,
+                false,
+                true,
+                true,
+                false,
+                false,
+                Harness::OpenCode,
+                true,
+            ),
         ];
         assert_eq!(table.len(), ProviderId::ALL.len());
-        for (provider, system_agent, accounts, quota, harness) in table {
+        for (
+            provider,
+            system_agent,
+            run_scoped_mcp,
+            confirms_tools,
+            accounts,
+            quota,
+            harness,
+            plans_in_steps,
+        ) in table
+        {
             assert_eq!(provider.can_run_system_agent(), system_agent, "{provider}");
+            assert_eq!(
+                provider.supports_run_scoped_mcp(),
+                run_scoped_mcp,
+                "{provider}"
+            );
+            assert_eq!(
+                provider.confirms_plugin_tools(),
+                confirms_tools,
+                "{provider}"
+            );
             assert_eq!(provider.manages_accounts(), accounts, "{provider}");
             assert_eq!(provider.has_usage_quota(), quota, "{provider}");
             assert_eq!(provider.harness(), harness, "{provider}");
+            assert_eq!(provider.plans_in_steps(), plans_in_steps, "{provider}");
         }
     }
 
@@ -2008,15 +2059,20 @@ mod tests {
         assert_eq!(counts.claude, 0);
         assert_eq!(counts.codex, 0);
         assert_eq!(counts.antigravity, 0);
+        assert_eq!(counts.local, 0);
 
         counts.increment(ProviderId::Claude);
         counts.increment(ProviderId::Claude);
         counts.increment(ProviderId::Codex);
         counts.increment(ProviderId::Antigravity);
+        counts.increment(ProviderId::Local);
+        counts.increment(ProviderId::Local);
+        counts.increment(ProviderId::Local);
 
         assert_eq!(counts.claude, 2);
         assert_eq!(counts.codex, 1);
         assert_eq!(counts.antigravity, 1);
+        assert_eq!(counts.local, 3);
     }
 
     #[test]

@@ -80,3 +80,19 @@ test("비율은 전체 크기를 알 때만 있고 1 을 넘지 않는다", () =
 test("진행을 알리며 읽어도 JSON 이 아니면 null 이다", async () => {
   assert.equal(await readJsonPayloadWithProgress(streamedResponse("<html>"), () => {}), null);
 });
+
+// 성공 응답의 본문을 받다 연결이 끊기면 "본문 없는 성공(null)"이 아니라 오류다.
+function droppedResponse() {
+  const body = new ReadableStream({
+    start(stream) {
+      stream.enqueue(new TextEncoder().encode('{"partial":'));
+      stream.error(new TypeError("network error"));
+    },
+  });
+  return new Response(body);
+}
+
+test("본문 수신이 끊기면 null로 삼키지 않고 다시 던진다", async () => {
+  await assert.rejects(readJsonPayload(droppedResponse()), { name: "TypeError", message: "network error" });
+  await assert.rejects(readJsonPayloadWithProgress(droppedResponse(), () => {}), { name: "TypeError", message: "network error" });
+});

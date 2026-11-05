@@ -130,7 +130,7 @@ fn is_allowed_path_char(character: char) -> bool {
 /// 업로드 원본으로 받지 않는 이름·경로 조각. 앱 데이터·공급자 홈·`~/.ssh`는 별도 경계로
 /// 막고(C9-16), 여기는 그 밖에서 흔히 자격증명을 담는 자리를 잡는다. 일반적인 비밀값
 /// 탐지기가 아니므로 사용자에게 이 목록이 전부라고 말하지 않는다.
-const REFUSED_LOCAL_SEGMENTS: &[&str] = &[
+pub(crate) const REFUSED_LOCAL_SEGMENTS: &[&str] = &[
     ".ssh",
     ".gnupg",
     ".aws",

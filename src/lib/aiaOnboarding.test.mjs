@@ -737,6 +737,38 @@ test("붙여넣기를 잘못하면 아무것도 만들기 전에 막는다", () 
   assert.ok(wrong[1].includes("대문자로 시작"), wrong[1]);
 });
 
+test("QA 카드의 노션 데이터베이스 칸도 주소를 확인한다", () => {
+  const notionOnly = { field: "recordTarget", equals: "notion" };
+  const qaCard = {
+    ...card,
+    steps: [{
+      ...card.steps[0],
+      fields: [
+        field("systemKey"),
+        field("projectPath", { required: true, kind: "projectPicker" }),
+        field("scenarioDatabase", { label: { ko: "Test Scenario 데이터베이스", en: null }, visibleWhen: notionOnly }),
+        field("ticketDatabase", { label: { ko: "QA Sheets 데이터베이스", en: null }, visibleWhen: notionOnly }),
+      ],
+    }],
+    actions: [{ ...card.actions[1], workflow: { ...card.actions[1].workflow, id: "{{systemKey}}-qa" } }],
+  };
+  const base = { ...initialValues(qaCard), systemKey: "alpha", projectPath: "/repo", recordTarget: "notion" };
+  const options = { paced: true, skillsRoot: "/s", recordTargets: ["markdown"] };
+  const id = "c3420374ee48430f9333d49795c8c8ec";
+
+  assert.deepEqual(creationProblems(qaCard, base, options), []);
+  assert.deepEqual(creationProblems(qaCard, {
+    ...base,
+    scenarioDatabase: `https://www.notion.so/team/Scenarios-${id}`,
+    ticketDatabase: `https://www.notion.so/team/QA-Sheets-${id}`,
+  }, options), []);
+  // 노션을 고르지 않았으면 칸이 숨어 남은 글자로 막지 않는다.
+  assert.deepEqual(creationProblems(qaCard, { ...base, recordTarget: "jira", scenarioDatabase: "x" }, options), []);
+  const wrong = creationProblems(qaCard, { ...base, scenarioDatabase: "Test Scenario", ticketDatabase: "QA 시트" }, options);
+  assert.equal(wrong.length, 2, wrong.join(" | "));
+  assert.ok(wrong.every((line) => line.includes("노션 데이터베이스 주소가 아닙니다")), wrong.join(" | "));
+});
+
 test("같은 워크플로를 도는 회차가 있으면 새로 만들지 않고 그것을 고친다", () => {
   const input = buildScheduleInput("데모 회차", "demo-round", 4, { enabled: false, timezone: "Asia/Seoul", maxRuns: 5 });
   const schedules = [

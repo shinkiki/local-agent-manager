@@ -1055,6 +1055,13 @@ pub fn run_with_chat_secrets(
         injected.push(format!("{PLACEHOLDER_OPEN}{name}{PLACEHOLDER_CLOSE}"));
     }
     drop(taken);
+    // C15-4: 제한 시간은 실행 전체를 묶는다. 자식이 띄운 손자가 출력 파이프를 물려받은 채
+    // 살아 있으면 회수가 끝나지 않으므로, 그룹으로 띄워 제한 시간에 함께 끝낸다.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
 
     let mut child = command.spawn().map_err(|error| {
         CoreError::Runtime(format!(
@@ -1062,28 +1069,51 @@ pub fn run_with_chat_secrets(
             executable.display()
         ))
     })?;
-    if let (Some(payload), Some(mut stdin)) = (stdin_payload, child.stdin.take()) {
-        use std::io::Write as _;
-        // 자식이 다 읽기 전에 죽어도 쓰기 오류로 우리가 죽으면 안 된다.
-        let _ = stdin.write_all(payload.as_bytes());
-        drop(stdin);
-    }
+    // 출력 파이프를 읽기 전에 묶어야 먼저 태어난 손자도 그룹 안에 든다.
+    let group = crate::cli_interface::ProcessGroup::attach(&child);
+    // 출력 회수를 먼저 띄우고 stdin은 별도 스레드에서 쓴다. 자식이 stdin을 읽기 전에 파이프
+    // 한 통 넘게 출력하면 여기서 쓰기가 막혀 제한 시간조차 시작되지 않는다.
     let readers = CappedOutputReaders::spawn(child.stdout.take(), child.stderr.take());
+    let stdin_writer = match (stdin_payload, child.stdin.take()) {
+        (Some(payload), Some(mut stdin)) => Some(std::thread::spawn(move || {
+            use std::io::Write as _;
+            // 자식이 다 읽기 전에 죽어도 쓰기 오류로 우리가 죽으면 안 된다.
+            let _ = stdin.write_all(payload.as_bytes());
+        })),
+        _ => None,
+    };
+    let output_reader = std::thread::spawn(move || readers.finish());
     let started = Instant::now();
     let mut timed_out = false;
-    let status = loop {
-        match child.try_wait()? {
-            Some(status) => break Some(status),
-            None if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                timed_out = true;
-                break None;
-            }
-            None => std::thread::sleep(Duration::from_millis(100)),
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait()?;
         }
-    };
-    let (stdout, stderr) = readers.finish();
+        let io_finished = output_reader.is_finished()
+            && stdin_writer
+                .as_ref()
+                .is_none_or(|writer| writer.is_finished());
+        if status.is_some() && (group.is_none() || io_finished) {
+            break;
+        }
+        if started.elapsed() >= timeout {
+            // 부모가 이미 끝났어도 그룹에는 파이프를 쥔 자손이 남을 수 있다.
+            if let Some(group) = group.as_ref() {
+                group.kill();
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            timed_out = true;
+            status = None;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if let Some(writer) = stdin_writer {
+        let _ = writer.join();
+    }
+    let (stdout, stderr) = output_reader.join().unwrap_or_default();
     let secrets = store.values_for_scrub(chat_id);
     let (stdout, stdout_cut) = tail(
         &scrub(&String::from_utf8_lossy(&stdout), &secrets),
@@ -1504,6 +1534,44 @@ mod tests {
         assert!(!receipt.stdout.contains("hunter2secret"));
         assert!(receipt.stdout.contains(REDACTED), "{}", receipt.stdout);
         assert_eq!(receipt.injected, vec!["MY_TOKEN".to_owned()]);
+    }
+
+    /// C15-4: 제한 시간은 자식 하나가 아니라 실행 전체를 묶는다. 자식이 먼저 끝나도 파이프를
+    /// 물려받은 손자가 살아 있으면 출력 회수가 끝나지 않아, 예전에는 손자가 끝날 때까지
+    /// 돌아오지 않았다.
+    #[cfg(unix)]
+    #[test]
+    fn run_timeout_bounds_descendants_holding_the_output_pipe() {
+        let store = store();
+        store
+            .store(
+                CHAT,
+                "TOKEN",
+                "용도",
+                "hunter2secret",
+                ChatSecretSource::User,
+            )
+            .expect("store");
+        let mut env = BTreeMap::new();
+        env.insert("MY_TOKEN".to_owned(), "TOKEN".to_owned());
+        let mut request = run_request(
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "sleep 30 & echo started".to_owned(),
+            ],
+            env,
+        );
+        request.timeout_seconds = Some(1);
+        let started = Instant::now();
+        let receipt = run_with_chat_secrets(&store, CHAT, request).expect("run");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "제한 시간 1초 실행이 {:?} 걸렸다",
+            started.elapsed()
+        );
+        assert!(receipt.timed_out, "{receipt:?}");
+        assert!(receipt.stdout.contains("started"), "{receipt:?}");
     }
 
     #[test]

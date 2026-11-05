@@ -50,6 +50,42 @@ test("a newer running or completed item suppresses an interrupted reminder by ch
   })).length, 0);
 });
 
+test("V4: an interrupted reminder matches provider sessions only within the same provider", () => {
+  const interrupted = attentionItem("interrupted", { providerSessionId: "shared-session-id" });
+  const input = evaluation({ catalog: catalog(definition("interruptedSessionReminder")) });
+  for (const kind of ["running", "completed"]) {
+    for (const source of ["codex", "antigravity", "local"]) {
+      const resumed = attentionItem("resumed", {
+        source,
+        kind,
+        providerSessionId: interrupted.providerSessionId,
+        createdAt: interrupted.createdAt + 1,
+      });
+      const remaining = evaluateAiaSuggestions({ ...input, attention: attention([interrupted, resumed]) });
+      assert.deepEqual(remaining.map((item) => item.targetId), [interrupted.id], `${source} ${kind}`);
+
+      // 같은 공급자의 같은 세션 재개는 다른 채팅에서 시작해도 기존대로 제안을 내린다.
+      assert.deepEqual(evaluateAiaSuggestions({
+        ...input, attention: attention([interrupted, { ...resumed, source: interrupted.source }]),
+      }), []);
+    }
+  }
+});
+
+test("V4: missing provider session IDs match a newer resume only by chat ID", () => {
+  const interrupted = attentionItem("interrupted", { providerSessionId: null });
+  const resumed = attentionItem("resumed", {
+    providerSessionId: null, kind: "running", createdAt: interrupted.createdAt + 1,
+  });
+  const input = evaluation({ catalog: catalog(definition("interruptedSessionReminder")) });
+  assert.deepEqual(evaluateAiaSuggestions({
+    ...input, attention: attention([interrupted, resumed]),
+  }).map((item) => item.targetId), [interrupted.id]);
+  assert.deepEqual(evaluateAiaSuggestions({
+    ...input, attention: attention([interrupted, { ...resumed, chatId: interrupted.chatId }]),
+  }), []);
+});
+
 test("operational definitions evaluate CLI, account, scheduler and translation facts", () => {
   const definitions = [
     definition("providerCliMissing"),

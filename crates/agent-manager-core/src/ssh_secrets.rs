@@ -328,6 +328,40 @@ mod tests {
     }
 
     #[test]
+    fn c9_19_peek_rechecks_expiry_after_the_approval_card_check_g4() {
+        let store = store();
+        store.store(CHAT, PRINT, "synthetic").expect("store");
+        assert!(store.holds(CHAT, PRINT));
+        // G4: 카드가 값을 확인한 뒤 실행하기 전에 만료될 수 있다. 잠들지 않고
+        // 시간을 넘겨, holds가 먼저 지워 주지 않아도 peek 자체가 거절하는지 본다.
+        store.entries.lock().expect("lock")[0].expires_at = 0;
+
+        assert!(store.peek(CHAT, PRINT).is_none());
+        assert!(store.entries.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn c9_19_expiry_includes_the_deadline_and_keeps_live_secrets_g4() {
+        let store = store();
+        {
+            let mut entries = store.entries.lock().expect("lock");
+            for (server_id, expires_at) in [("past", 999), ("deadline", 1000), ("live", 1001)] {
+                entries.push(StoredSecret {
+                    chat_id: CHAT.to_owned(),
+                    server_id: server_id.to_owned(),
+                    secret: Zeroizing::new("synthetic".to_owned()),
+                    expires_at,
+                });
+            }
+        }
+
+        // G4: 만료 시각과 같으면 이미 쓸 수 없고, 아직 유효한 다른 값은 남는다.
+        let entries = store.lock_live(1000).expect("lock");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].matches(CHAT, "live"));
+    }
+
+    #[test]
     fn debug_does_not_print_the_secret() {
         let store = store();
         store.store(CHAT, PRINT, "hunter2").expect("store");

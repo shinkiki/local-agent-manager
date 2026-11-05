@@ -1484,22 +1484,7 @@ fn load_antigravity_model_catalog(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
         })?;
-    let status = wait_for_model_catalog_exit(
-        &mut child,
-        ANTIGRAVITY_CATALOG_SUBJECT,
-        ANTIGRAVITY_MODELS_TIMEOUT,
-    )?;
-    if !status.success() {
-        return Err(CoreError::Runtime(
-            "Antigravity CLI가 모델 목록 조회에 실패했습니다. 로그인 상태를 확인하세요".to_owned(),
-        ));
-    }
-    let mut stdout = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        pipe.read_to_string(&mut stdout).map_err(|error| {
-            CoreError::Runtime(format!("Antigravity 모델 목록을 읽지 못했습니다: {error}"))
-        })?;
-    }
+    let stdout = read_antigravity_model_output(&mut child, ANTIGRAVITY_MODELS_TIMEOUT)?;
     let models = parse_antigravity_models(&stdout);
     if models.is_empty() {
         return Err(CoreError::Runtime(
@@ -1507,6 +1492,60 @@ fn load_antigravity_model_catalog(
         ));
     }
     Ok(models)
+}
+
+/// V2: 종료를 기다리는 동안 stdout을 비워 큰 목록도 파이프를 막지 않게 한다.
+/// 종료와 출력 회수는 하나의 시간 예산을 쓰며, UTF-8·종료코드 오류는 그대로 보고한다.
+fn read_antigravity_model_output(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<String, CoreError> {
+    let started = std::time::Instant::now();
+    let mut pipe = match take_child_stdout(child, "Antigravity 모델 목록") {
+        Ok(pipe) => pipe,
+        Err(error) => {
+            discard_model_catalog_child(child);
+            return Err(error);
+        }
+    };
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    if let Err(error) = std::thread::Builder::new()
+        .name("antigravity-model-output".to_owned())
+        .spawn(move || {
+            let mut stdout = String::new();
+            let result = pipe.read_to_string(&mut stdout).map(|_| stdout);
+            let _ = sender.send(result);
+        })
+    {
+        discard_model_catalog_child(child);
+        return Err(CoreError::Runtime(format!(
+            "Antigravity 모델 목록 읽기를 시작하지 못했습니다: {error}"
+        )));
+    }
+    let status = wait_for_model_catalog_exit(
+        child,
+        ANTIGRAVITY_CATALOG_SUBJECT,
+        timeout.saturating_sub(started.elapsed()),
+    )?;
+    if !status.success() {
+        return Err(CoreError::Runtime(
+            "Antigravity CLI가 모델 목록 조회에 실패했습니다. 로그인 상태를 확인하세요".to_owned(),
+        ));
+    }
+    // EOF가 늦어져도 자식 종료 뒤에 또 전체 제한시간만큼 기다리지는 않는다.
+    let output = receiver
+        .recv_timeout(timeout.saturating_sub(started.elapsed()))
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                CoreError::Runtime("Antigravity 모델 목록 조회 시간이 초과되었습니다".to_owned())
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                CoreError::Runtime("Antigravity 모델 목록 읽기가 중단되었습니다".to_owned())
+            }
+        })?;
+    output.map_err(|error| {
+        CoreError::Runtime(format!("Antigravity 모델 목록을 읽지 못했습니다: {error}"))
+    })
 }
 
 fn parse_antigravity_models(stdout: &str) -> Vec<ChatModelOption> {
@@ -2786,6 +2825,68 @@ mod tests {
         let models = load_antigravity_model_catalog(&script, &env).expect("프로필 홈 조회");
         assert_eq!(model_ids(&models), ["gemini-4-argon-high"]);
         assert_eq!(models[0].display_name, "Gemini 4 Argon (High)");
+    }
+
+    #[cfg(unix)]
+    fn catalog_output_child(bytes: &[u8]) -> (tempfile::TempDir, Child) {
+        let dir = schema_dir();
+        let output = dir.path().join("models.tsv");
+        fs::write(&output, bytes).expect("모델 목록 fixture");
+        let child = spawn_model_catalog_child(Path::new("/bin/cat"), "시험", |command| {
+            command
+                .arg(&output)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+        })
+        .expect("목록 자식 기동");
+        (dir, child)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_antigravity_catalog_drains_output_before_waiting_for_exit() {
+        // Linux 파이프 용량보다 훨씬 큰 정상 목록: 뒤쪽 모델까지 손실 없이 받아야 한다.
+        let text: String = (0..32768)
+            .map(|index| format!("model-{index}\t모델 {index}\n"))
+            .collect();
+        let (_dir, mut child) = catalog_output_child(text.as_bytes());
+        let output = read_antigravity_model_output(&mut child, Duration::from_secs(5))
+            .expect("큰 모델 목록 조회");
+        assert_eq!(output, text);
+        let models = parse_antigravity_models(&output);
+        assert_eq!(models.len(), 32768);
+        assert_eq!(models.last().unwrap().model, "model-32767");
+        assert!(child.try_wait().expect("자식 상태").is_some());
+    }
+
+    #[test]
+    fn v2_antigravity_catalog_output_timeout_reclaims_the_child() {
+        let mut command = long_running_child_command();
+        let mut child = command.stdout(Stdio::piped()).spawn().expect("조회 자식");
+        let error = read_antigravity_model_output(&mut child, Duration::from_millis(100))
+            .expect_err("조회 시한 초과");
+        assert!(matches!(error, CoreError::Runtime(message) if message.contains("시간이 초과")));
+        assert!(child.try_wait().expect("자식 상태").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_antigravity_catalog_output_preserves_utf8_and_exit_errors() {
+        let (_dir, mut child) = catalog_output_child(&[0xff]);
+        let error = read_antigravity_model_output(&mut child, Duration::from_secs(5))
+            .expect_err("UTF-8 오류");
+        assert!(
+            matches!(error, CoreError::Runtime(message) if message.contains("읽지 못했습니다"))
+        );
+
+        let mut child = Command::new("false")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("실패 자식");
+        let error = read_antigravity_model_output(&mut child, Duration::from_secs(5))
+            .expect_err("종료코드 오류");
+        assert!(matches!(error, CoreError::Runtime(message) if message.contains("로그인 상태")));
     }
 
     #[test]

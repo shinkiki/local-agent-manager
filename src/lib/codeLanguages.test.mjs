@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { codeLanguageForPath } from "./codeLanguages.ts";
+import { codeLanguageForPath, codeLanguageLoader } from "./codeLanguages.ts";
 
 // 파일명에서 언어를 고르는 규칙만 본다. 하이라이터를 언제 띄우고 어디까지 다루는지는
 // codeHighlight.test.mjs가 맡는다 — 모듈이 갈라진 경계와 같다.
@@ -41,4 +41,12 @@ test("codeLanguageForPath returns null for extensionless or unknown files", () =
   assert.equal(codeLanguageForPath("LICENSE"), null);
   assert.equal(codeLanguageForPath(""), null);
   assert.equal(codeLanguageForPath("archive.xyz123"), null);
+});
+
+test("codeLanguageLoader returns callable loader function returning grammar module", async () => {
+  const loader = codeLanguageLoader("rust");
+  assert.equal(typeof loader, "function");
+  const grammar = await loader();
+  assert.ok(grammar);
+  assert.throws(() => codeLanguageLoader("not_exist"), /TypeError/);
 });

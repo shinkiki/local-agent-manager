@@ -1,7 +1,8 @@
 /**
  * 좌측 메뉴에 **어느 계정의 사용량을 올릴지** 고르는 자리. 공급자마다 등록된 기본 계정이
- * 우선하고, 없으면 공유 CLI 홈의 검증된 계정으로 내려가며, 계정 레지스트리 밖의
- * Antigravity는 공급자 단위 쿼터로 따로 붙는다.
+ * 우선하고, 없으면 공유 CLI 홈의 검증된 계정으로 내려간다. Antigravity는 계정 등록 없이
+ * 쓰일 수 있어, 그 두 갈래에서 Antigravity 소스가 나오지 않았을 때만 공급자 단위 쿼터로
+ * 따로 붙는다.
  *
  * 미터 조립(`sidebarUsage`)과는 서로 읽을 것이 없다. 저쪽은 소스 하나를 받아 이름·눈금·
  * 도움말 문자열을 만드는 일이라 화면에 적을 말과 접기 밀도가 바뀔 때 달라지고, 여기는
@@ -23,8 +24,9 @@ export interface SidebarUsageSource {
   key: string;
   provider: ProviderId;
   /**
-   * `default`·`home`은 계정 레지스트리에서 온 계정이고, `provider`는 계정을 관리하지
-   * 않는 공급자(Antigravity)의 공급자 단위 쿼터다. 이름이 없어 공급자 이름만 쓴다.
+   * `default`·`home`은 계정 레지스트리에서 온 계정이고, `provider`는 계정 없이 받은
+   * 공급자 단위 자리다 — 계정 소스가 나오지 않은 Antigravity의 쿼터와 로컬 연결의 무제한
+   * 표시가 여기 든다. 이름이 없어 공급자 이름만 쓴다.
    */
   kind: "default" | "home" | "provider";
   displayName: string | null;
@@ -94,8 +96,9 @@ function resolveProviderSource(
 }
 
 /**
- * Antigravity는 계정 레지스트리에 없어 별도 쿼터로 받는다.
- * 표시할 창이 있을 때만 소스로 취급한다.
+ * 계정을 등록하지 않고 쓰는 Antigravity의 공급자 단위 쿼터. 표시할 창이 있을 때만 소스로
+ * 취급한다. Antigravity의 기본 계정이나 검증된 홈 계정 소스가 이미 나왔으면
+ * `sidebarUsageSources`가 이 자리를 아예 묻지 않는다 — 그 소스가 같은 쿼터를 올리고 있다.
  */
 function resolveAntigravitySource(antigravity: AccountUsageView | null): SidebarUsageSource | null {
   if (!antigravity || antigravity.windows.length === 0) return null;
@@ -109,8 +112,10 @@ function resolveAntigravitySource(antigravity: AccountUsageView | null): Sidebar
 }
 
 /**
- * 좌측 메뉴의 공급자별 사용량 소스. 계정 레지스트리 밖에 있는 Antigravity는
- * 별도 쿼터를 받으며, 표시할 창이 있을 때만 추가한다.
+ * 좌측 메뉴의 공급자별 사용량 소스. 공급자마다 고른 소스(기본 계정·검증된 홈)가 먼저이고,
+ * 그중 Antigravity가 없을 때만 공급자 단위 쿼터를 창이 있는 경우에 한해 뒤에 붙인다. 계정
+ * 소스와 공급자 쿼터가 같은 한도를 두 번 올리지 않게 하는 자리는 여기 하나다(쿼터 자체를
+ * 넘길지는 호출부가 Antigravity 탐지 여부로 먼저 가른다).
  */
 export function sidebarUsageSources(
   snapshot: AccountSnapshot | null | undefined,

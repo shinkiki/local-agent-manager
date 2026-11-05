@@ -35,6 +35,24 @@ export interface SkillLibraryFilters {
 }
 
 /**
+ * 저장해 둔 필터 묶음을 되살린다. 저장값은 이전 판이 쓴 것일 수도, 손으로 고친 것일 수도
+ * 있어 축마다 아는 값만 받고 나머지는 `all`로 떨어뜨린다 — 모르는 값을 그대로 넘기면
+ * 걸러내기가 그 값을 아무것에도 맞지 않는 것으로 보고 목록이 빈 채로 열린다.
+ * 출처는 값이 프로젝트 경로라 목록이 없으므로 모양(`project:` 접두사)만 본다.
+ */
+export function parseStoredSkillFilters(stored: Partial<SkillLibraryFilters> | null): SkillLibraryFilters {
+  return {
+    kind: SKILL_KIND_VALUES.includes(stored?.kind as SkillKindFilter) ? stored?.kind as SkillKindFilter : "all",
+    state: SKILL_STATE_VALUES.includes(stored?.state as SkillStateFilter) ? stored?.state as SkillStateFilter : "all",
+    agent: SKILL_AGENT_VALUES.includes(stored?.agent as SkillAgentFilter) ? stored?.agent as SkillAgentFilter : "all",
+    origin: typeof stored?.origin === "string"
+      && (["all", "personal", "project"].includes(stored.origin) || stored.origin.startsWith("project:"))
+      ? stored.origin
+      : "all",
+  };
+}
+
+/**
  * 필터 칩에 붙일 축별 개수. 어떤 축이 있고 그 축이 어떤 값을 가질 수 있는지는
  * `SkillLibraryFilters`가 이미 선언하므로 여기서 다시 늘어놓지 않고 그 선언을 그대로
  * 뒤집는다 — 두 벌로 적으면 축이 하나 늘 때 개수 쪽만 빠뜨려도 빌드가 통과하고,
@@ -44,7 +62,7 @@ export type SkillFilterCounts = {
   [Axis in SkillFilterAxis]: Record<SkillLibraryFilters[Axis], number>;
 };
 
-function matchesSkillKind(entry: SkillLibraryEntry, kind: string): boolean {
+export function matchesSkillKind(entry: SkillLibraryEntry, kind: string): boolean {
   if (kind === "shared") return Boolean(entry.common);
   if (kind === "agent") return !entry.common;
   return true;
@@ -63,12 +81,12 @@ const SKILL_STATE_SYNC: Record<Exclude<SkillStateFilter, "all">, SkillSyncState>
   undeployed: "unpublished",
 };
 
-function matchesSkillState(entry: SkillLibraryEntry, state: string): boolean {
+export function matchesSkillState(entry: SkillLibraryEntry, state: string): boolean {
   const required = SKILL_STATE_SYNC[state as Exclude<SkillStateFilter, "all">] as SkillSyncState | undefined;
   return required === undefined || skillSyncState(entry) === required;
 }
 
-function matchesSkillAgent(entry: SkillLibraryEntry, agent: string): boolean {
+export function matchesSkillAgent(entry: SkillLibraryEntry, agent: string): boolean {
   if (agent === "all") return true;
   return entry.providers.some(
     (item) => item.provider === agent && isSkillProviderDeployed(item),
@@ -142,7 +160,7 @@ const SKILL_FILTER_AXES: {
 const SKILL_FILTER_AXIS_NAMES = Object.keys(SKILL_FILTER_AXES) as SkillFilterAxis[];
 
 /** 모든 축을 통과하는지. */
-function matchesSkillFilters(entry: SkillLibraryEntry, filters: SkillLibraryFilters): boolean {
+export function matchesSkillFilters(entry: SkillLibraryEntry, filters: SkillLibraryFilters): boolean {
   return SKILL_FILTER_AXIS_NAMES.every(
     (axis) => SKILL_FILTER_AXES[axis].matches(entry, filters[axis]),
   );

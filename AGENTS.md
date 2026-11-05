@@ -93,6 +93,7 @@ row being here at all.
 | C18 | cask quarantine release (`cli_quarantine.rs`) | the `com.apple.quarantine` extended attribute — nothing else — on regular files directly inside the resolved provider CLI's `Caskroom/<token>/<version>/…` folder, for a cask token registered in `TRUSTED_CASK_SIGNERS` and a file whose signature satisfies that vendor's Developer ID team | the attribute only makes Gatekeeper re-evaluate a notarized binary on every exec; file contents, permissions and every other attribute stay as installed, and the next cask upgrade stamps a fresh folder anyway | yes — it runs as part of resolving an executable, never as its own operation |
 | C20 | access-channel login adapter (`login_auth.rs`, `login_sessions.rs`, `login_totp.rs`) | `login-settings-v1.json` (user ID, argon2id hash, per-channel requirements, last OTP step), `login-sessions-v1.json` (session SHA-256 only) and the OTP secret — OS Keychain item `Agent Manager Login`/`totp`, falling back to the `0600` file `login-otp-secret` only where no secure store exists | nothing provider-owned is touched; `--reset-login` (or deleting the three files) returns to "no login required". Sessions expire (30 days idle, 90 days absolute) and can be revoked from the settings card | the whole card is reachable from any signed-in channel; changing a method needs the current password (or OTP) again (`C20-4`) |
 | C19 | local overlay adapter (`project_overlays.rs`) | 앱 데이터의 `<app data>/git-overlays/`, 그리고 스냅샷·적용 시점에만 **등록된 활성 프로젝트** 작업 트리의 선택된 추적 파일 | patch를 먼저 쓰고 digest까지 확인한 뒤에만 되돌리고, 재적용은 `git apply --check`가 통과할 때만 한다. 세트 삭제는 앱 소유 휴지통으로 옮긴다 | 읽기는 열려 있고, 세트 저장·삭제와 작업 트리를 바꾸는 스냅샷·적용 모두 write mode에서 원격 가능(2026-10-02 사용자 결정) |
+| C21 | distributed runner settings (`runners.rs`) | `runners-v1.json` in the app data directory — runner rows that point at a C9 connection server by id (slots, browsers, enabled, note) and the project folders whose verification commands may be sent; nothing on the runner machines, in `~/.ssh` or in the project folders. The app executes nothing on runners beyond the C9-11 check; the external consumers described in `C21-4`/`C21-5` do | the store is secret-free app data; deleting a row (or the file) returns to "no runners", and the consumer runs the work elsewhere | yes — list, edits and the connection check are reachable from any signed-in channel; AIA gets the C9-bounded read and check only (`C21-3`) |
 
 ### C1 — credential adapter
 
@@ -1545,6 +1546,77 @@ channel is the desktop. The adapter owns three app-data stores and nothing else.
   false` become writable-from-remote on upgrade; the settings card shows a warning while the
   Tailscale service is on and the remote channel requires nothing.
 
+
+### C21 — distributed runner settings (`runners.rs`)
+
+User decision, 2026-10-26 (design option A): the Add-ons → 분산처리 tab lets an **external tool** —
+the shared heavy-slot tool, not Agent Manager — send pure verification commands of selected project
+folders to other machines. The app only stores the settings and exposes them read-only.
+
+- **C21-1** A runner holds **no address and no key**. It points at an existing C9 connection server
+  by `serverId` and adds only runner settings: `slots` (1–8, default 2), `browsers` (0 or more with no upper bound — a user decision, 2026-10-27: one browser run's memory
+  cost differs per machine, so the user sizes it; the screen listing carries `maxBrowsers` = `u32::MAX`, a number rather than `null`
+  so a screen built for the old cap of 4 still validates — default 0
+  — see C21-5; a save that omits it keeps the stored value, a store written before the field reads 0),
+  `enabled`, a name
+  (`[A-Za-z0-9._-]{1,64}`, unique — consumers use it as an identifier; the default is the server's
+  name, else its host, with other characters folded to `-`) and a bounded note. An unknown server id
+  is refused and one server backs at most one runner. The store is `runners-v1.json`
+  (`runners-v1.lock`) in the app data directory (G7), bounded to 64 runners and 64 project folders.
+  Deleting an SSH server leaves its runner in place (`serverFound: false`); it can still be switched
+  off, and saving it again requires choosing a server. Edits are row-scoped
+  (`set_runner_enabled`, `add_/update_/delete_runner_project`) so two screens editing different rows
+  never overwrite each other.
+- **C21-2** A project folder is a short name (`[a-z0-9._-]{1,64}`), a root and `exclude` folder
+  names directly under that root (`[A-Za-z0-9._-]{1,64}`). The root must be absolute, free of `..`,
+  and an existing directory; it is **canonicalized (symlinks resolved) before every check and stored
+  canonical**, because the consumer resolves its working folder with `realpath` too and a link must
+  not smuggle a forbidden target in. Because the folder's subtree is copied to another machine, the
+  C9-16 boundary applies: provider homes, redirected credential directories, the app data directory
+  and anything that contains one of them (the home itself, `/`) are refused, as is any path with a
+  credential segment (`.ssh`, `.aws`, … — `ssh_exec::REFUSED_LOCAL_SEGMENTS`). The one exception is
+  the inside of the AIA workspace (`<app data>/aia-workspace/…`, not the workspace itself): headless
+  installs keep app data at `/data` and real work under that workspace
+  (`doc_roots::is_restricted_outside_aia_workspace`). The app never reads or writes inside these
+  folders.
+- **C21-3** `check_runner` is exactly the C9-11 check (`exit`, 10 s connect / 20 s total, host-key
+  checking on) against the referenced server; it goes outward, so it is classified as a write like
+  `probe_local_llm_connection`. `list_runners` is a secret-free read; every edit only changes app
+  data. AIA gets `list_runners` (read) and `check_runner` (execute) **inside the C9 boundary**: its
+  listing omits `sshServers`, and a runner whose server has agent use off carries only its id,
+  name, slots, browsers, enabled flag and skip code/reason — no server id, name, host, port, user or fingerprint — and AIA's
+  `check_runner` on such a runner is refused before connecting. Editing stays on the screen
+  (`show_ui_guide addons.runners`).
+- **C21-4** **This is a direct-execution exception outside the C9-14/C9-17 per-command approval
+  flow.** The consumer copies a project's subtree to the runner (excluding `node_modules`, `dist`,
+  `.git`, the configured `exclude` names and similar build output) and runs fixed verification
+  command shapes there — `npm ci`, `npm test`, `npm run build|test`, `npx vitest|tsc`. Those run the
+  project's `package.json` scripts and install hooks, so **code the project defines executes on the
+  runner as that SSH user**. It may do so only when the runner is `enabled` **and** the referenced
+  server's agent-use flag (C9-9) is on. It learns that from the read-only `<CLI> runners list
+  [--app-data-dir DIR]` (no backend lease, `AGENT_MANAGER_APP_DATA_DIR` honored like `ssh list`),
+  which prints `{schemaVersion, runners[{id, name, host, port, user, identityPath, sshArgs, slots, browsers}],
+  projects[{name, root, exclude}], skipped[{id, name, code, reason}]}`. A runner is listed only when
+  both switches are on and the key is usable without the app; a key whose passphrase only the app
+  can supply (C9-21) is skipped, never relayed. The screen's skip reason and `skipped` come from one
+  function (`runners::availability`). `sshArgs` are the `ssh list` `connect_args` — the app's
+  host-key policy included — and **the consumer connects with them and never disables host-key
+  checking or switches it to `accept-new`**. Only the key **path** leaves the store — no key
+  contents, passphrases or other secrets (G4). The user's allow/deny lists do not govern this path;
+  turning off either switch is how the user withdraws a machine. This clause is enforced where the
+  consumer (heavy-slot) reads this CLI; the app cannot enforce it once the listing is printed.
+- **C21-5** **Browser tests are a second exception under the same two switches**, added 2026-10-27
+  (user decision: browser slots in the tab rather than a side file). When a listed runner has
+  `browsers ≥ 1`, the consumer (the shared remote-smoke tool) may copy a Cypress workspace that lies
+  inside a registered project folder (C21-2 applies unchanged — its `exclude` names and the
+  credential/app-data refusals) to that runner and run that workspace's configured spec there through
+  the Cypress module API, headless, bounded by a wall-clock limit, against a URL the consumer names
+  (after one `curl` from the runner to see that the URL answers), plus the bookkeeping to stop that
+  run and copy its artifacts back; the spec and config files are project code and **run on the runner as that SSH user** like C21-4.
+  It never holds more concurrent browser runs on a runner than `browsers`, counted apart from
+  `slots`; `0` (the default) means no browser runs are sent there, so a machine without Cypress
+  installed is never picked. The app still executes nothing on runners beyond the C9-11 check; this
+  clause, like C21-4, is enforced in the consumer.
 
 ## 4. External MCP interfaces (`mcp_registry.rs`)
 

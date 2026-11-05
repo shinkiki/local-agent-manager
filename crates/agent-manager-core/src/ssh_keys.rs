@@ -2388,6 +2388,135 @@ mod tests {
         .is_err());
     }
 
+    /// C9-7. 삭제 요청은 화면에 보이던 지문을 함께 들고 온다. 그 사이 파일이 바뀌어 지문이
+    /// 다르면 아무것도 옮기지 않고, 휴지통 항목도 만들지 않는다.
+    #[test]
+    fn c9_7_deletion_refuses_a_fingerprint_that_no_longer_matches() {
+        let home = tempfile::tempdir().expect("home");
+        let app_data = tempfile::tempdir().expect("app data");
+        let root = home.path().join(".ssh");
+        fs::create_dir(&root).expect("ssh root");
+        fs::write(
+            root.join("id_example.pub"),
+            public_key_line("ssh-ed25519", "developer@example"),
+        )
+        .expect("public");
+        fs::write(root.join("id_example"), b"private material").expect("private");
+        let fingerprint = get_ssh_keys_with_home(home.path()).expect("inventory").keys[0]
+            .fingerprint
+            .clone();
+        let stale = format!("{}{}", &fingerprint[..fingerprint.len() - 1], "X");
+        assert_ne!(stale, fingerprint);
+
+        let error = delete_ssh_key_with_home(
+            home.path(),
+            app_data.path(),
+            &SshKeyRef {
+                file_name: "id_example.pub".to_owned(),
+                fingerprint: stale,
+            },
+        )
+        .expect_err("stale fingerprint must refuse");
+        assert!(matches!(error, CoreError::Conflict(_)), "{error:?}");
+        assert!(root.join("id_example.pub").is_file());
+        assert_eq!(
+            fs::read(root.join("id_example")).expect("private stays"),
+            b"private material"
+        );
+        assert!(!root.join(TRASH_DIR_NAME).exists());
+    }
+
+    /// C9-7. 같은 이름 개인키 자리가 일반 파일이 아니면(심볼릭 링크) 쌍으로 다루지 않는다 —
+    /// 공개키도 옮기지 않고 링크 대상도 건드리지 않는다. 개인키 자리가 비어 있으면
+    /// 공개키만 옮기고 영수증이 그 사실을 적는다.
+    #[cfg(unix)]
+    #[test]
+    fn c9_7_deletion_refuses_a_symlinked_private_slot_and_moves_a_lone_public_key() {
+        let home = tempfile::tempdir().expect("home");
+        let app_data = tempfile::tempdir().expect("app data");
+        let root = home.path().join(".ssh");
+        fs::create_dir(&root).expect("ssh root");
+        let line = public_key_line("ssh-ed25519", "developer@example");
+        fs::write(root.join("id_linked.pub"), &line).expect("public");
+        let elsewhere = home.path().join("real-private");
+        fs::write(&elsewhere, b"linked material").expect("link target");
+        std::os::unix::fs::symlink(&elsewhere, root.join("id_linked")).expect("symlink");
+        fs::write(root.join("id_lone.pub"), &line).expect("lone public");
+
+        let snapshot = get_ssh_keys_with_home(home.path()).expect("inventory");
+        let fingerprint = snapshot.keys[0].fingerprint.clone();
+
+        let error = delete_ssh_key_with_home(
+            home.path(),
+            app_data.path(),
+            &SshKeyRef {
+                file_name: "id_linked.pub".to_owned(),
+                fingerprint: fingerprint.clone(),
+            },
+        )
+        .expect_err("symlinked private slot must refuse");
+        assert!(matches!(error, CoreError::Conflict(_)), "{error:?}");
+        assert!(root.join("id_linked.pub").is_file());
+        assert!(fs::symlink_metadata(root.join("id_linked"))
+            .expect("link stays")
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&elsewhere).expect("target"), b"linked material");
+        assert!(!root.join(TRASH_DIR_NAME).exists());
+
+        let receipt = delete_ssh_key_with_home(
+            home.path(),
+            app_data.path(),
+            &SshKeyRef {
+                file_name: "id_lone.pub".to_owned(),
+                fingerprint,
+            },
+        )
+        .expect("lone public key moves");
+        assert!(!receipt.private_key_moved);
+        assert!(!root.join("id_lone.pub").exists());
+        let entry = PathBuf::from(&receipt.trash_path);
+        assert!(entry.join("id_lone.pub").is_file());
+        assert!(!entry.join("id_lone").exists());
+    }
+
+    /// C9-7. 휴지통 폴더 자리가 심볼릭 링크면 그 너머로 키를 옮기지 않는다 — 링크가
+    /// `~/.ssh` 밖을 가리킬 수 있기 때문이다. 키 쌍은 제자리에 남는다.
+    #[cfg(unix)]
+    #[test]
+    fn c9_7_deletion_refuses_a_symlinked_trash_root() {
+        let home = tempfile::tempdir().expect("home");
+        let app_data = tempfile::tempdir().expect("app data");
+        let root = home.path().join(".ssh");
+        fs::create_dir(&root).expect("ssh root");
+        fs::write(
+            root.join("id_example.pub"),
+            public_key_line("ssh-ed25519", "developer@example"),
+        )
+        .expect("public");
+        fs::write(root.join("id_example"), b"private material").expect("private");
+        let outside = home.path().join("outside-trash");
+        fs::create_dir(&outside).expect("outside dir");
+        std::os::unix::fs::symlink(&outside, root.join(TRASH_DIR_NAME)).expect("trash link");
+        let fingerprint = get_ssh_keys_with_home(home.path()).expect("inventory").keys[0]
+            .fingerprint
+            .clone();
+
+        let error = delete_ssh_key_with_home(
+            home.path(),
+            app_data.path(),
+            &SshKeyRef {
+                file_name: "id_example.pub".to_owned(),
+                fingerprint,
+            },
+        )
+        .expect_err("symlinked trash root must refuse");
+        assert!(matches!(error, CoreError::InvalidInput(_)), "{error:?}");
+        assert!(root.join("id_example.pub").is_file());
+        assert!(root.join("id_example").is_file());
+        assert!(fs::read_dir(&outside).expect("outside").next().is_none());
+    }
+
     /// C9-8. 메모는 공개키 파일이 아니라 앱 데이터에 남고, 키가 사라지면 함께 사라진다.
     #[test]
     fn c9_notes_live_in_app_data_and_go_away_with_the_key() {

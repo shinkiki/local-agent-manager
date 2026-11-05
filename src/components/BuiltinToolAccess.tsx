@@ -90,6 +90,8 @@ function noteLabel(note: AgentBuiltinToolNote, text: (ko: string, en: string) =>
         `사용 가능한 연결 서버 ${note.available}개, 켰지만 사용할 수 없는 서버 ${note.unusable}개`,
         `${note.available} usable server(s), ${note.unusable} enabled but unusable`,
       );
+    case "indexSources":
+      return text(`검색 가능한 폴더 ${note.available}개, 색인 전 또는 사용 불가 ${note.unusable}개`, `${note.available} searchable folder(s), ${note.unusable} not indexed or unavailable`);
     case "dbConnections":
       return text(
         `사용 가능한 연결 ${note.available}개, 켰지만 사용할 수 없는 연결 ${note.unusable}개`,

@@ -77,9 +77,47 @@ test("본문에 들어 있는 'diff --git' 글자는 줄 머리일 때만 자른
   assert.equal(sections[0].path, "docs/round.md");
 });
 
-test("공백이 든 경로는 따옴표 모양으로 읽는다", () => {
-  const sections = overlayPatchSections('diff --git "a/my docs/a.md" "b/my docs/a.md"\n@@ -0 +0 @@\n');
-  assert.equal(sections[0].path, "my docs/a.md");
+test("공백이 든 경로는 따옴표 없이 오므로 두 경로가 같다는 사실로 가른다", () => {
+  // 실측(git 2.x): 공백만으로는 경로를 따옴표로 감싸지 않는다 — `diff --git a/dir b/file b/dir b/file`.
+  // 앞에서부터 ` b/`를 찾으면 `file b/dir b/file`이, 뒤에서부터 찾으면 `file`이 나와 둘 다 틀린다.
+  // v1은 rename을 거절하므로(C19-3) 두 경로는 같고, 그래서 반으로 갈라 재조립이 원문과 같을 때만 받는다.
+  const sections = overlayPatchSections([
+    "diff --git a/dir b/file b/dir b/file",
+    "@@ -0 +0 @@",
+    "diff --git a/notes b.md b/notes b.md",
+    "@@ -0 +0 @@",
+    "",
+  ].join("\n"));
+  assert.deepEqual(sections.map((section) => section.path), ["dir b/file", "notes b.md"]);
+  assert.equal(overlayPatchSectionIndex(sections, "dir b/file"), 0);
+  assert.equal(overlayPatchSectionIndex(sections, "notes b.md"), 1);
+});
+
+test("따옴표 모양도 같은 규칙으로 가르되 이스케이프는 풀지 않는다(이전과 같다)", () => {
+  // git은 `"`·`\`·제어문자·비ASCII(core.quotePath)가 든 경로만 따옴표로 감싸고 C 문자열로 이스케이프한다.
+  // 그 해제는 이 자리의 범위 밖이라 경로는 이스케이프된 채 남는다 — 영수증의 실제 경로와는 아직 맞지 않는다.
+  const sections = overlayPatchSections([
+    'diff --git "a/quote\\"d b/x" "b/quote\\"d b/x"',
+    "@@ -0 +0 @@",
+    'diff --git "a/caf\\303\\251.md" "b/caf\\303\\251.md"',
+    "@@ -0 +0 @@",
+    "",
+  ].join("\n"));
+  assert.deepEqual(sections.map((section) => section.path), ['quote\\"d b/x', "caf\\303\\251.md"]);
+});
+
+test("CRLF 머리는 경로를 읽지 못하지만 원문은 그대로 보존한다", () => {
+  const body = "diff --git a/x b/x\r\n@@ -0 +0 @@\r\n";
+  const sections = overlayPatchSections(body);
+  assert.equal(sections[0].path, null);
+  assert.ok(sectionsJoinToOriginal(body, sections));
+});
+
+test("두 경로가 같지 않은 머리(rename·손상)는 경로 없는 구간으로 둔다 — 엉뚱한 자리로 스크롤하지 않는다", () => {
+  const sections = overlayPatchSections("diff --git a/old.ts b/new.ts\n@@ -0 +0 @@\n");
+  assert.equal(sections.length, 1);
+  assert.equal(sections[0].path, null);
+  assert.ok(sectionsJoinToOriginal("diff --git a/old.ts b/new.ts\n@@ -0 +0 @@\n", sections));
 });
 
 test("경로를 정확히 일치로 찾는다 — 접미사 일치면 엉뚱한 자리로 스크롤한다", () => {

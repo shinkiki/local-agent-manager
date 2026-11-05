@@ -195,6 +195,42 @@ mod tests {
     }
 
     #[test]
+    fn c20_2_time_windows_follow_epoch_and_30_second_boundaries() {
+        // RFC 4226 부록 D의 카운터 0~4: 검증 대상 함수로 기대 코드를 만들지 않는다.
+        let codes = [
+            (0, "755224"),
+            (1, "287082"),
+            (2, "359152"),
+            (3, "969429"),
+            (4, "338314"),
+        ];
+        for (now, center, accepted_steps) in [
+            (0, 0, 0..=1),
+            (29, 0, 0..=1),
+            (30, 1, 0..=2),
+            (59, 1, 0..=2),
+            (60, 2, 1..=3),
+        ] {
+            assert_eq!(current_step(now), center, "C20-2: now={now}");
+            for (step, code) in codes {
+                let expected = accepted_steps.contains(&step).then_some(step);
+                assert_eq!(
+                    verify_totp(RFC_SECRET, now, None, code),
+                    expected,
+                    "C20-2: now={now}, step={step}",
+                );
+                if expected.is_some() {
+                    assert_eq!(
+                        verify_totp(RFC_SECRET, now, Some(step), code),
+                        None,
+                        "C20-2: 첫 시간 창에서도 사용한 코드는 거부한다: now={now}, step={step}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn accepts_one_step_of_skew_and_rejects_two() {
         let now = 1_234_567_890u64;
         let center = current_step(now);

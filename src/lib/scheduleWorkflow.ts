@@ -26,14 +26,21 @@ export {
   workflowModelInputIsMultiple,
 } from "./scheduleWorkflowInputs.ts";
 
-/** 워크플로 등록 승인 버전과 카탈로그 호환성에 문제가 있는지 판정한다. */
+/**
+ * 워크플로 등록 승인 버전과 카탈로그 호환성에 문제가 있는지 판정한다. 문장은 아래 카드 표기와
+ * 같이 화면 언어로 적는다 — 호출부가 여러 문장을 `" "` 로 이어 오류 배너에 넣으므로, 정적
+ * 대응표가 문장 하나는 옮겨도 이어 붙인 줄은 통째로 맞지 않아 영어 화면에 한국어로 남았다.
+ */
 function validateWorkflowEligibility(workflow: SystemWorkflowSummary): string[] {
   const problems: string[] = [];
   if (typeof workflow.version !== "number" || workflow.version <= 0) {
-    problems.push("워크플로 승인 버전을 확인할 수 없습니다.");
+    problems.push(runtimeText("워크플로 승인 버전을 확인할 수 없습니다.", "The approved workflow version could not be read."));
   }
   if (!workflow.compatible) {
-    problems.push("현재 카탈로그와 호환되지 않는 워크플로입니다. AIA가 다시 등록해야 합니다.");
+    problems.push(runtimeText(
+      "현재 카탈로그와 호환되지 않는 워크플로입니다. AIA가 다시 등록해야 합니다.",
+      "This workflow is not compatible with the current catalog. AIA has to register it again.",
+    ));
   }
   return problems;
 }
@@ -48,11 +55,14 @@ export function validateScheduleWorkflowDraft(draft: {
   inputs: Record<string, string>;
 }): string[] {
   const workflow = draft.workflow;
-  if (!workflow) return ["실행할 워크플로를 선택하세요."];
+  if (!workflow) return [runtimeText("실행할 워크플로를 선택하세요.", "Select the workflow to run.")];
 
   const problems = validateWorkflowEligibility(workflow);
   const missing = missingRequiredInputNames(workflowInputEntries(workflow), draft.inputs);
-  if (missing.length > 0) problems.push(`필수 입력이 비어 있습니다: ${missing.join(", ")}`);
+  if (missing.length > 0) {
+    const names = missing.join(", ");
+    problems.push(runtimeText(`필수 입력이 비어 있습니다: ${names}`, `Required inputs are empty: ${names}`));
+  }
   return problems;
 }
 

@@ -56,3 +56,13 @@ test("C16-11 설정 카드는 HTTPS 호스트와 이미 고른 지정을 합쳐 
   assert.deepEqual(rows[3].remotes, []);
   assert.equal(rows[3].binding.secretExists, false);
 });
+
+test("C16-11 같은 이름의 원격이 중복 등록되어도 호스트의 remotes 목록에는 한 번만 들어간다", () => {
+  const remotes = [
+    remote({ method: "token", tokenSecret: "GH_ORG" }),
+    remote({ method: "token", tokenSecret: "GH_ORG" }),
+  ];
+  const rows = gitRemoteAuthRows(remotes, []);
+  assert.equal(rows.length, 1);
+  assert.deepEqual(rows[0].remotes, ["origin"]);
+});

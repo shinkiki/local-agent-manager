@@ -41,6 +41,11 @@ struct SystemSkillFile {
 
 const SYSTEM_SKILLS: &[SystemSkill] = &[
     SystemSkill {
+        key: "index-search",
+        skill_md: include_str!("../skills/index-search/SKILL.md"),
+        extras: &[],
+    },
+    SystemSkill {
         key: "session-context",
         skill_md: include_str!("../skills/session-context/SKILL.md"),
         extras: &[],
@@ -458,11 +463,17 @@ mod tests {
     use super::*;
 
     fn skill() -> &'static SystemSkill {
-        &SYSTEM_SKILLS[0]
+        SYSTEM_SKILLS
+            .iter()
+            .find(|skill| skill.key == "session-context")
+            .expect("bundled session-context skill")
     }
 
     fn ssh_skill() -> &'static SystemSkill {
-        &SYSTEM_SKILLS[1]
+        SYSTEM_SKILLS
+            .iter()
+            .find(|skill| skill.key == "ssh-endpoints")
+            .expect("bundled ssh-endpoints skill")
     }
 
     #[test]

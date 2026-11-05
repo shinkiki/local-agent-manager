@@ -2302,7 +2302,7 @@ mod tests {
         );
         assert_eq!(cli_parse_source("local").unwrap(), ProviderId::Local);
 
-        let error = cli_parse_source("unknown").unwrap_err();
+        let error = cli_parse_source("unknown").expect_err("expected error");
         assert!(matches!(error, CoreError::InvalidInput(message) if message
             == "알 수 없는 공급자입니다: unknown. claude|codex|antigravity|local 중 하나를 쓰세요"));
     }
@@ -2657,5 +2657,104 @@ mod tests {
         let gone = temp.path().join("gone").to_string_lossy().into_owned();
         let vanished = scope_policy(vec![gone.clone()]);
         assert!(cli_assert_in_scope(&vanished, ProviderId::Claude, Some(&gone)).is_err());
+    }
+
+    #[test]
+    fn cli_options_parsing_and_flag_collection() {
+        let temp = TempDir::new().expect("temp");
+        let app_data = temp.path().join("app-data");
+        std::fs::create_dir_all(&app_data).expect("app data");
+        let policy_file = temp.path().join("policy.json");
+        std::fs::write(
+            &policy_file,
+            r#"{"enabled":true,"projectScope":"allRegistered","period":{"kind":"relative","unit":"day","count":3}}"#,
+        )
+        .expect("write policy");
+
+        let args = vec![
+            "detail".to_string(),
+            "--app-data-dir".to_string(),
+            app_data.to_string_lossy().to_string(),
+            "--policy-file".to_string(),
+            policy_file.to_string_lossy().to_string(),
+            "--own-cwd".to_string(),
+            "/test/cwd".to_string(),
+            "--timezone".to_string(),
+            "Asia/Seoul".to_string(),
+            "--cursor".to_string(),
+            "cur_123".to_string(),
+            "--source".to_string(),
+            "claude".to_string(),
+            "--id".to_string(),
+            "sess_456".to_string(),
+            "--href".to_string(),
+            "file.rs".to_string(),
+        ];
+
+        let options = SessionReadCliOptions::from_args(args.into_iter()).expect("parse options");
+        assert_eq!(options.op, SessionReadCliOp::Detail);
+        assert_eq!(options.own_cwd, "/test/cwd");
+        assert_eq!(options.timezone, "Asia/Seoul");
+        assert_eq!(options.cursor.as_deref(), Some("cur_123"));
+        assert_eq!(options.source, Some(ProviderId::Claude));
+        assert_eq!(options.id.as_deref(), Some("sess_456"));
+        assert_eq!(options.href.as_deref(), Some("file.rs"));
+        assert!(options.policy.enabled);
+        assert_eq!(
+            options.policy.project_scope,
+            SessionReadProjectScope::AllRegistered
+        );
+
+        // --policy 직접 인자 지원 검증
+        let direct_policy_args = vec![
+            "list".to_string(),
+            "--app-data-dir".to_string(),
+            app_data.to_string_lossy().to_string(),
+            "--policy".to_string(),
+            r#"{"enabled":true,"projectScope":"allRegistered"}"#.to_string(),
+        ];
+        let direct_options = SessionReadCliOptions::from_args(direct_policy_args.into_iter())
+            .expect("direct policy");
+        assert_eq!(direct_options.op, SessionReadCliOp::List);
+        assert!(direct_options.policy.enabled);
+
+        // 작업 이름 누락 시 오류 검증
+        let empty_args: Vec<String> = vec![];
+        let res = SessionReadCliOptions::from_args(empty_args.into_iter());
+        assert!(matches!(res, Err(CoreError::InvalidInput(_))));
+
+        // 정책 누락 시 오류 검증
+        let no_policy_args = vec![
+            "list".to_string(),
+            "--app-data-dir".to_string(),
+            app_data.to_string_lossy().to_string(),
+        ];
+        let res = SessionReadCliOptions::from_args(no_policy_args.into_iter());
+        assert!(matches!(res, Err(CoreError::InvalidInput(_))));
+
+        // 알 수 없는 플래그 시 오류 검증
+        let bad_flag_args = vec!["list".to_string(), "--unknown-flag".to_string()];
+        let res = SessionReadCliOptions::from_args(bad_flag_args.into_iter());
+        assert!(matches!(res, Err(CoreError::InvalidInput(_))));
+
+        // 필수 인자 도우미(cli_session_ref, cli_required) 동작 검증
+        let (source, id) = cli_session_ref(&options).expect("session ref");
+        assert_eq!(source, ProviderId::Claude);
+        assert_eq!(id, "sess_456");
+
+        let mut missing_source_options = direct_options;
+        missing_source_options.id = Some("sess_456".to_string());
+        assert!(matches!(
+            cli_session_ref(&missing_source_options),
+            Err(CoreError::InvalidInput(_))
+        ));
+
+        let mut missing_id_options = missing_source_options;
+        missing_id_options.source = Some(ProviderId::Claude);
+        missing_id_options.id = None;
+        assert!(matches!(
+            cli_session_ref(&missing_id_options),
+            Err(CoreError::InvalidInput(_))
+        ));
     }
 }

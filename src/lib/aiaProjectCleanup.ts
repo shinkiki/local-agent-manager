@@ -81,8 +81,8 @@ export function projectCleanupSuggestions(rule: RuleContext): AiaSuggestion[] {
 function projectGroups(sessions: SessionSummary[]): ProjectGroup[] {
   const groups = new Map<string, ProjectGroup>();
   for (const session of sessions) {
-    // AIA 작업공간은 프로젝트가 아니므로 정리·분류 제안 대상에서 뺀다.
-    if (session.meta.hidden || session.archived || !session.readable || session.isSubagent || session.aiaWorkspace) continue;
+    // AIA·기본 작업공간은 앱이 마련한 경로이므로 프로젝트 정리·분류 제안 대상에서 뺀다.
+    if (session.meta.hidden || session.archived || !session.readable || session.isSubagent || session.aiaWorkspace || session.defaultWorkspace) continue;
     const cwd = normalizeProjectPath(session.cwd);
     if (!cwd) continue;
     const group = groups.get(cwd) ?? emptyProjectGroup(cwd, session);

@@ -299,7 +299,7 @@ function main() {
       const run = runCargo({ pkg: options.pkg, filters, testThreads });
       const names = run.failures.map((failure) => failure.name);
       log(
-        `${index + 1}/${options.runs} ${run.buildError ? '빌드실패' : names.length === 0 ? 'ok' : `실패 ${names.join(', ')}`} (${run.wallSeconds}s)`,
+        `${index + 1}/${options.runs} ${run.buildError ? '빌드실패' : names.length === 0 ? (run.exitCode === 0 ? 'ok' : `비정상 종료(${run.exitCode})`) : `실패 ${names.join(', ')}`} (${run.wallSeconds}s)`,
       );
       return run;
     });

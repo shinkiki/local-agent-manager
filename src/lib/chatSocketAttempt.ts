@@ -1,4 +1,5 @@
 import type { ChatEvent, ChatSessionInfo } from "../types";
+import { createCancelableHandle } from "./cancelableHandle.ts";
 import { assertRemoteChatAccess } from "./chatAccess.ts";
 import { normalizeChatEvent } from "./chatCompatibility.ts";
 import { type ChatEventBatch } from "./chatEventBatch.ts";
@@ -63,21 +64,24 @@ function createChatSocketConclusion(
   reject: (reason?: unknown) => void,
 ): ChatSocketConclusion {
   let settled = false;
-  let timer = 0;
+  const timeout = createCancelableHandle(
+    (run) => window.setTimeout(run, CONNECT_TIMEOUT_MS),
+    (handle) => window.clearTimeout(handle),
+  );
 
   const claimFailure = (): ((error: unknown) => void) | null => {
     if (settled) return null;
     settled = true;
-    window.clearTimeout(timer);
+    timeout.cancel();
     return reject;
   };
 
-  timer = window.setTimeout(() => {
+  timeout.arm(() => {
     const fail = claimFailure();
     if (!fail) return;
     socket.close();
     fail(new Error("구조화 채팅 연결 시간이 초과되었습니다"));
-  }, CONNECT_TIMEOUT_MS);
+  });
 
   return {
     done: () => settled,

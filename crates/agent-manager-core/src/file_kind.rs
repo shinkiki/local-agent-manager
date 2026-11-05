@@ -122,6 +122,59 @@ mod tests {
         }
     }
 
+    /// G10: FIFO는 열 때 상대편을 기다리므로 읽기 전에 일반 파일 검사에서 거절한다.
+    #[cfg(unix)]
+    #[test]
+    fn g10_regular_file_guards_reject_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let dir = tempfile::tempdir().expect("임시 디렉터리");
+        let path = dir.path().join("fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO 경로");
+        // SAFETY: c_path는 이 호출 동안 유지되는 NUL 종료 경로다.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        assert_special_file_rejected(&path);
+        assert!(fs::symlink_metadata(&path)
+            .expect("그대로 남은 FIFO")
+            .file_type()
+            .is_fifo());
+    }
+
+    /// G10: 심볼릭 링크가 아닌 소켓도 일반 파일로 취급하지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn g10_regular_file_guards_reject_socket() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("임시 디렉터리");
+        let path = dir.path().join("socket");
+        let _listener = UnixListener::bind(&path).expect("Unix 소켓 생성");
+
+        assert_special_file_rejected(&path);
+        assert!(fs::symlink_metadata(&path)
+            .expect("그대로 남은 소켓")
+            .file_type()
+            .is_socket());
+    }
+
+    #[cfg(unix)]
+    fn assert_special_file_rejected(path: &Path) {
+        let metadata = fs::symlink_metadata(path).expect("특수 파일 메타데이터");
+        let rejection = "일반 파일만 읽을 수 있습니다";
+        for result in [
+            ensure_regular_file(&metadata, rejection),
+            regular_file_metadata(path, rejection).map(|_| ()),
+        ] {
+            match result {
+                Err(CoreError::InvalidInput(message)) => assert_eq!(message, rejection),
+                other => panic!("특수 파일을 지정된 안내로 거절해야 합니다: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn reports_limit_value_when_exceeded() {
         let dir = tempfile::tempdir().expect("임시 디렉터리");

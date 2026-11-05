@@ -414,6 +414,64 @@ test('파일이 아직 없어서 깨진 가드 점검은 위반이 아니라 미
   assert.equal(classifyItem(byId.get('H')), '안전규칙위반');
 });
 
+test('requiredLiterals가 여러 파일 중 일부 파일만 아직 없는 경우 기존 파일이 깨끗하면 미구현으로 분류한다', () => {
+  const guardChecklist = {
+    version: 1,
+    items: [
+      {
+        id: 'G_partial',
+        stage: '4',
+        title: '부분적으로 아직 없는 모듈들의 가드',
+        checks: [
+          {
+            id: 'G_partial.guard',
+            kind: 'requiredLiterals',
+            title: '가드',
+            category: 'safety',
+            files: [
+              'crates/agent-manager-core/src/project_git.rs',
+              'crates/agent-manager-core/src/project_overlays_future.rs',
+            ],
+            literals: ['assert_within_root'],
+          },
+        ],
+      },
+      {
+        id: 'H_partial',
+        stage: '4',
+        title: '기존 파일에서도 가드가 없고 새 파일도 아직 없는 경우',
+        checks: [
+          {
+            id: 'H_partial.guard',
+            kind: 'requiredLiterals',
+            title: '가드',
+            category: 'safety',
+            files: [
+              'crates/agent-manager-core/src/project_git.rs',
+              'crates/agent-manager-core/src/project_overlays_future.rs',
+            ],
+            literals: ['non_existent_guard'],
+          },
+        ],
+      },
+    ],
+  };
+  const files = {
+    ...FILES,
+    'crates/agent-manager-core/src/project_overlays_future.rs': null,
+  };
+  const result = evaluateChecklist(guardChecklist, files);
+  const byId = new Map(result.items.map((item) => [item.id, item]));
+
+  // project_git.rs 에는 assert_within_root 가 있고 future 모듈만 아직 없으므로 미구현(missingFile: true)
+  assert.equal(byId.get('G_partial').checks[0].missingFile, true);
+  assert.equal(classifyItem(byId.get('G_partial')), '미구현');
+
+  // project_git.rs 에도 non_existent_guard 가 없으므로 새 파일 유무와 무관하게 안전규칙위반(missingFile: false)
+  assert.equal(byId.get('H_partial').checks[0].missingFile, false);
+  assert.equal(classifyItem(byId.get('H_partial')), '안전규칙위반');
+});
+
 // testNamed 는 2026-10-03 까지 `fn <이름>(` 문자열만 봤다. 그래서 파수꾼 바로 위에 `#[ignore]`
 // 한 줄을 넣어도 탐침은 97/97 녹색을 유지했고(cargo 가 ignored 를 실패로 세지 않으므로 전건도
 // 녹색이다), push_project_git 의 호스트 전용 고정이 꺼진 채 모든 관문이 통과했다. 실제로 주입해

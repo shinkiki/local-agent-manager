@@ -92,7 +92,16 @@ impl DbCliOptions {
                 args.next()
                     .ok_or_else(|| CoreError::InvalidInput(format!("{flag} 값이 필요합니다")))
             };
+            // 같은 인자를 두 번 주면 앞의 값이 조용히 사라져, 에이전트가 고른 것과 다른
+            // 연결·SQL로 실행된다. 어느 쪽이 의도인지 알 수 없으므로 거절한다.
+            let duplicate =
+                || CoreError::InvalidInput(format!("{flag}가 두 번 지정됐습니다. 하나만 남기세요"));
             match flag.as_str() {
+                "--connection" if connection.is_some() => return Err(duplicate()),
+                "--sql" if sql.is_some() => return Err(duplicate()),
+                "--approval-id" if approval_id.is_some() => return Err(duplicate()),
+                "--max-rows" if max_rows.is_some() => return Err(duplicate()),
+                "--app-data-dir" if app_data_dir.is_some() => return Err(duplicate()),
                 "--connection" => connection = Some(value()?),
                 "--sql" => sql = Some(value()?),
                 "--approval-id" => approval_id = Some(value()?),
@@ -186,5 +195,24 @@ mod tests {
         let error = DbCliOptions::parse(["--danger", "1"].into_iter().map(str::to_owned), None)
             .expect_err("unknown");
         assert!(matches!(error, CoreError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn c10_13_repeated_flags_are_refused_instead_of_keeping_the_last() {
+        for flag in [
+            "--connection",
+            "--sql",
+            "--approval-id",
+            "--max-rows",
+            "--app-data-dir",
+        ] {
+            let error =
+                DbCliOptions::parse([flag, "1", flag, "2"].into_iter().map(str::to_owned), None)
+                    .expect_err("repeated flag");
+            assert!(
+                matches!(&error, CoreError::InvalidInput(message) if message.contains("두 번")),
+                "{flag}: {error:?}"
+            );
+        }
     }
 }

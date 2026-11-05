@@ -344,3 +344,144 @@ impl<T: ApprovalEntry> ApprovalLedger<T> {
         self.entries.lock().map_err(|_| T::lock_poisoned())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestEntry {
+        id: String,
+        chat_id: String,
+        expires_at: i64,
+        granted: Option<bool>,
+        consumed: bool,
+    }
+
+    impl ApprovalEntry for TestEntry {
+        const WORDING: ApprovalWording = ApprovalWording {
+            subject: "시험",
+            retry_noun: "요청",
+        };
+        type Decision = bool;
+
+        fn chat_id(&self) -> &str {
+            &self.chat_id
+        }
+
+        fn expires_at(&self) -> i64 {
+            self.expires_at
+        }
+
+        fn is_consumed(&self) -> bool {
+            self.consumed
+        }
+
+        fn granted(&self) -> Option<bool> {
+            self.granted
+        }
+
+        fn set_granted(&mut self, granted: bool) {
+            self.granted = Some(granted);
+        }
+
+        fn mark_consumed(&mut self) {
+            self.consumed = true;
+        }
+
+        fn decision(&self, granted: bool) -> Self::Decision {
+            granted
+        }
+    }
+
+    fn open(
+        ledger: &ApprovalLedger<TestEntry>,
+        index: usize,
+        now: i64,
+        expires_at: i64,
+    ) -> Result<String, CoreError> {
+        let chat_id = format!("chat-{index}");
+        ledger.open(
+            &chat_id,
+            now,
+            |_| true,
+            || {
+                let id = format!("approval-{index}");
+                (
+                    id.clone(),
+                    TestEntry {
+                        id,
+                        chat_id: chat_id.clone(),
+                        expires_at,
+                        granted: None,
+                        consumed: false,
+                    },
+                )
+            },
+            |entry| entry.id.clone(),
+        )
+    }
+
+    /// C9-17/C10-12/V2: 전체 상한은 대화별 상한과 별개이며, 답한 토큰도 만료 전에는 남는다.
+    #[test]
+    fn c9_17_c10_12_global_capacity_keeps_duplicates_and_decided_tokens() {
+        let ledger = ApprovalLedger::<TestEntry>::default();
+        let ids: Vec<_> = (0..MAX_ENTRIES)
+            .map(|index| open(&ledger, index, 0, 100).expect("상한까지 발급"))
+            .collect();
+
+        // 가득 찼어도 미결 중복 요청은 새 카드를 만들지 않고 기존 카드를 돌려준다.
+        assert_eq!(
+            ledger
+                .open(
+                    "chat-0",
+                    1,
+                    |_| true,
+                    || panic!("미결 중복 요청은 새 항목을 만들면 안 된다"),
+                    |entry| entry.id.clone(),
+                )
+                .expect("가득 찬 장부의 중복 요청"),
+            ids[0]
+        );
+        ledger.resolve("chat-0", &ids[0], 1, true).expect("승인");
+        ledger
+            .consume("chat-0", &ids[0], 1, |_| Ok(()))
+            .expect("소모");
+        ledger.resolve("chat-1", &ids[1], 1, false).expect("거절");
+        ledger
+            .resolve("chat-2", &ids[2], 1, true)
+            .expect("미사용 승인");
+
+        // 각 대화에는 한 건뿐이다. 다른 대화에서도 전체 상한을 넘길 수 없다.
+        assert!(matches!(
+            open(&ledger, MAX_ENTRIES, 1, 100),
+            Err(CoreError::Conflict(message))
+                if message == "답을 기다리는 시험 승인 요청이 너무 많습니다"
+        ));
+        assert!(!ledger.owns(&format!("approval-{MAX_ENTRIES}")));
+        assert!(ids.iter().all(|id| ledger.owns(id)));
+    }
+
+    /// C9-17/C10-12/V2: 만료 시각에 도달한 항목만 먼저 치워 새 요청의 자리를 돌려준다.
+    #[test]
+    fn c9_17_c10_12_global_capacity_is_reclaimed_at_exact_expiry() {
+        let ledger = ApprovalLedger::<TestEntry>::default();
+        let ids: Vec<_> = (0..MAX_ENTRIES)
+            .map(|index| {
+                open(&ledger, index, 0, if index == 0 { 10 } else { 20 }).expect("상한까지 발급")
+            })
+            .collect();
+        assert!(open(&ledger, MAX_ENTRIES, 9, 30).is_err());
+        assert!(ids.iter().all(|id| ledger.owns(id)));
+
+        // pending 조회가 먼저 청소해서 open의 만료 청소 결함을 가리지 않도록 바로 연다.
+        let replacement = open(&ledger, MAX_ENTRIES, 10, 30).expect("만료 한 건의 자리 회복");
+        assert!(!ledger.owns(&ids[0]));
+        assert!(ids[1..].iter().all(|id| ledger.owns(id)));
+        assert!(open(&ledger, MAX_ENTRIES + 1, 10, 40).is_err());
+
+        let next = open(&ledger, MAX_ENTRIES + 1, 20, 40).expect("나머지 만료 자리 회복");
+        assert!(ids.iter().all(|id| !ledger.owns(id)));
+        assert!(ledger.owns(&replacement));
+        assert!(ledger.owns(&next));
+    }
+}

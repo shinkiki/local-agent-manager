@@ -236,12 +236,27 @@ pub fn apply(
     let path = config_path(home);
     let existing = match fs::read_to_string(&path) {
         Ok(text) if text.trim().is_empty() => Value::Null,
-        Ok(text) => serde_json::from_str(&text).map_err(|error| {
-            CoreError::Runtime(format!(
-                "{}를 읽지 못했습니다: {error}. 파일을 고치거나 옮긴 뒤 다시 시도하세요",
-                path.display()
-            ))
-        })?,
+        Ok(text) => {
+            let value: Value = serde_json::from_str(&text).map_err(|error| {
+                CoreError::Runtime(format!(
+                    "{}를 읽지 못했습니다: {error}. 파일을 고치거나 옮긴 뒤 다시 시도하세요",
+                    path.display()
+                ))
+            })?;
+            // C14-2: 병합이 빈 객체로 대체할 형태는 쓰기 전에 거절해 원본을 보존한다.
+            // G4: 설정 값은 오류에 싣지 않는다.
+            if !value.is_object()
+                || ["provider", "agent"]
+                    .iter()
+                    .any(|key| value.get(key).is_some_and(|entry| !entry.is_object()))
+            {
+                return Err(CoreError::Runtime(format!(
+                    "{}의 최상위와 provider·agent 항은 객체여야 합니다. 파일을 고친 뒤 다시 시도하세요",
+                    path.display()
+                )));
+            }
+            value
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Null,
         Err(error) => {
             return Err(CoreError::Runtime(format!(
@@ -2042,6 +2057,72 @@ mod tests {
         assert!(format!("{error}").contains("읽지 못했습니다"));
         // 원본이 그대로 남아 있어야 한다.
         assert_eq!(fs::read_to_string(&path).expect("읽기"), "{ 깨진 json");
+    }
+
+    #[test]
+    fn c14_2_apply_still_initializes_missing_blank_and_empty_object_configs() {
+        for original in [None, Some(""), Some(" \n\t"), Some("{}\n")] {
+            let home = tempfile::tempdir().expect("홈");
+            let path = config_path(home.path());
+            if let Some(original) = original {
+                fs::create_dir_all(path.parent().expect("부모")).expect("디렉터리");
+                fs::write(&path, original).expect("기존 파일");
+            }
+            apply(
+                home.path(),
+                &connection("http://127.0.0.1:11434/v1", true),
+                &[],
+                None,
+                &[],
+                false,
+            )
+            .expect("초기화");
+            let written: Value =
+                serde_json::from_slice(&fs::read(&path).expect("읽기")).expect("json");
+            assert!(written["provider"][PROVIDER_ID].is_object());
+            assert!(written["agent"][AGENT_ID].is_object());
+        }
+    }
+
+    #[test]
+    fn c14_2_apply_preserves_non_object_config_instead_of_replacing_it() {
+        let home = tempfile::tempdir().expect("홈");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("부모")).expect("디렉터리");
+        for value in [
+            Value::Null,
+            serde_json::json!(["config-shape-sentinel"]),
+            serde_json::json!("config-shape-sentinel"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+        ] {
+            for key in [None, Some("provider"), Some("agent")] {
+                let existing = match key {
+                    None => value.clone(),
+                    Some(key) => {
+                        let mut root = serde_json::json!({"permission": {"edit": "ask"}});
+                        root[key] = value.clone();
+                        root
+                    }
+                };
+                let original = serde_json::to_vec_pretty(&existing).expect("json");
+                for enabled in [true, false] {
+                    fs::write(&path, &original).expect("기존 파일");
+                    let error = apply(
+                        home.path(),
+                        &connection("http://127.0.0.1:11434/v1", enabled),
+                        &[],
+                        None,
+                        &[],
+                        false,
+                    )
+                    .expect_err("비객체 설정을 덮어쓰면 안 된다");
+                    assert!(error.to_string().contains("객체여야 합니다"));
+                    assert!(!error.to_string().contains("config-shape-sentinel"));
+                    assert_eq!(fs::read(&path).expect("읽기"), original);
+                }
+            }
+        }
     }
 
     #[test]

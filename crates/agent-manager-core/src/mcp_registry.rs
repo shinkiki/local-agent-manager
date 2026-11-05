@@ -690,7 +690,7 @@ impl McpHttpSession {
         {
             self.session_id = Some(session_id.to_owned());
         }
-        parse_http_response(response)
+        parse_http_response(response, payload.get("id"))
     }
 }
 
@@ -809,7 +809,10 @@ fn interface_identity(
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn parse_http_response(response: Response) -> Result<Option<Value>, CoreError> {
+fn parse_http_response(
+    response: Response,
+    request_id: Option<&Value>,
+) -> Result<Option<Value>, CoreError> {
     let status = response.status();
     if status.is_redirection() {
         return Err(CoreError::Conflict(
@@ -839,7 +842,7 @@ fn parse_http_response(response: Response) -> Result<Option<Value>, CoreError> {
     if is_event_stream(&content_type) {
         let text = std::str::from_utf8(&body)
             .map_err(|_| CoreError::Runtime("MCP SSE 응답이 UTF-8이 아닙니다".to_owned()))?;
-        return parse_sse_json(text).map(Some);
+        return parse_sse_json(text, request_id).map(Some);
     }
     serde_json::from_slice(&body)
         .map(Some)
@@ -882,7 +885,9 @@ fn is_event_stream(content_type: &str) -> bool {
         .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
-fn parse_sse_json(text: &str) -> Result<Value, CoreError> {
+// MCP 2025-03-26 permits server requests and notifications before the response.
+// Select only this request's result/error; E7's body cap still bounds all events.
+fn parse_sse_json(text: &str, request_id: Option<&Value>) -> Result<Value, CoreError> {
     let normalized = text.replace("\r\n", "\n");
     for event in normalized.split("\n\n") {
         let data = event
@@ -892,11 +897,18 @@ fn parse_sse_json(text: &str) -> Result<Value, CoreError> {
             .collect::<Vec<_>>()
             .join("\n");
         if !data.is_empty() {
-            return serde_json::from_str(&data).map_err(CoreError::Json);
+            let value: Value = serde_json::from_str(&data)?;
+            if request_id.is_some()
+                && value.get("id") == request_id
+                && value.get("method").is_none()
+                && (value.get("result").is_some() || value.get("error").is_some())
+            {
+                return Ok(value);
+            }
         }
     }
     Err(CoreError::Runtime(
-        "MCP SSE 응답에 JSON data 이벤트가 없습니다".to_owned(),
+        "MCP SSE 응답에 요청과 일치하는 JSON-RPC 응답이 없습니다".to_owned(),
     ))
 }
 
@@ -1176,6 +1188,7 @@ mod tests {
     fn sse_crlf_pagination_and_large_results_are_bounded() {
         let event = parse_sse_json(
             "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\r\n\r\n",
+            Some(&json!(1)),
         )
         .unwrap();
         assert_eq!(event["id"], 1);
@@ -1202,6 +1215,55 @@ mod tests {
         }));
         assert_eq!(bounded["_meta"]["truncated"], true);
         assert_eq!(bounded["isError"], false);
+    }
+
+    #[test]
+    fn v2_sse_selects_matching_result_or_error_after_server_messages() {
+        let prefix = concat!(
+            ": heartbeat\r\n\r\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\r\n\r\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\r\n\r\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\r\n\r\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-1}}\r\n\r\n",
+        );
+        for response in [
+            json!({"jsonrpc": "2.0", "id": 2, "result": {"ok": true}}),
+            json!({"jsonrpc": "2.0", "id": 2, "error": {"code": -1, "message": "failed"}}),
+        ] {
+            let stream = format!("{prefix}event: message\r\ndata: {response}\r\n\r\n");
+            assert_eq!(parse_sse_json(&stream, Some(&json!(2))).unwrap(), response);
+        }
+    }
+
+    #[test]
+    fn v2_sse_rejects_stream_without_matching_response() {
+        for stream in [
+            ": heartbeat\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":2}\n\n",
+        ] {
+            assert!(parse_sse_json(stream, Some(&json!(2))).is_err());
+        }
+        assert!(parse_sse_json("data: invalid\n\n", Some(&json!(2))).is_err());
+    }
+
+    #[test]
+    fn v2_sse_http_tool_call_ignores_progress_and_server_requests() {
+        let expected = json!({"content": [{"type": "text", "text": "complete"}], "isError": false});
+        let (url, server) = spawn_mock_mcp_with_call_result(
+            3,
+            expected.clone(),
+            MockBody {
+                sse: true,
+                ..MockBody::default()
+            },
+        );
+        let (mut session, _) = McpHttpSession::connect(&url).unwrap();
+        let result = session.call_tool("search", json!({})).unwrap();
+        server.join().unwrap();
+        assert_eq!(result, expected);
     }
 
     #[test]
@@ -1313,6 +1375,8 @@ mod tests {
         /// `Content-Length` 없이 연결을 닫아 본문 끝을 알리는 서버(chunked·SSE처럼 길이를
         /// 미리 모르는 본문).
         undeclared_length: bool,
+        /// tools/call 결과 앞에 진행 알림·서버 요청·다른 요청의 응답을 보내는 SSE 서버.
+        sse: bool,
     }
 
     /// `tools/call`이 `call_result`를 돌려주는 모의 서버.
@@ -1360,6 +1424,18 @@ mod tests {
                     "result": result
                 }))
                 .unwrap();
+                let (response, content_type) = if body.sse && method == "tools/call" {
+                    let progress = json!({"jsonrpc": "2.0", "method": "notifications/progress"});
+                    let server_request = json!({"jsonrpc": "2.0", "id": id, "method": "ping"});
+                    let other_response =
+                        json!({"jsonrpc": "2.0", "id": 0, "result": {"wrong": true}});
+                    (
+                        format!("data: {progress}\r\n\r\ndata: {server_request}\r\n\r\ndata: {other_response}\r\n\r\ndata: {response}\r\n\r\n"),
+                        "text/event-stream",
+                    )
+                } else {
+                    (response, "application/json")
+                };
                 let response = if body.ascii_only {
                     escape_non_ascii(&response)
                 } else {
@@ -1373,7 +1449,7 @@ mod tests {
                 };
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: mock-session\r\n{length}Connection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nMcp-Session-Id: mock-session\r\n{length}Connection: close\r\n\r\n",
                 )
                 .unwrap();
                 // 상한을 넘는 본문은 받는 쪽이 중간에 끊고 닫으므로 쓰기 실패는 정상이다.
@@ -1520,6 +1596,7 @@ mod tests {
             MockBody {
                 ascii_only: true,
                 undeclared_length: true,
+                ..MockBody::default()
             },
         );
         let (mut session, _) = McpHttpSession::connect(&url).unwrap();
@@ -1542,6 +1619,7 @@ mod tests {
                 MockBody {
                     ascii_only: false,
                     undeclared_length,
+                    ..MockBody::default()
                 },
             );
             let (mut session, _) = McpHttpSession::connect(&url).unwrap();

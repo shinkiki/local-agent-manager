@@ -39,3 +39,27 @@ test("collapseUnchanged keeps context around changes and folds the rest", () => 
   // 변경이 없으면 전부 접힌다.
   assert.deepEqual(collapseUnchanged(diffLines("a\nb\n", "a\nb\n")), [{ kind: "skip", count: 2 }]);
 });
+
+test("empty inputs produce empty diff and empty collapsed rows", () => {
+  const lines = diffLines("", "");
+  assert.deepEqual(lines, []);
+  assert.deepEqual(collapseUnchanged(lines), []);
+  assert.deepEqual(diffStats(lines), { added: 0, removed: 0 });
+});
+
+test("collapseUnchanged supports zero context and merges close change contexts", () => {
+  const lines = diffLines("a\nb\nc", "a\nB\nc");
+  const zeroContextRows = collapseUnchanged(lines, 0);
+  assert.deepEqual(
+    zeroContextRows.map((row) => (row.kind === "skip" ? `skip:${row.count}` : `${row.kind}:${row.text}`)),
+    ["skip:1", "remove:b", "add:B", "skip:1"],
+  );
+
+  const before = "l1\nl2\nl3\nl4\nl5\nl6\nl7";
+  const after = "l1\nL2\nl3\nl4\nL5\nl6\nl7";
+  const mergedRows = collapseUnchanged(diffLines(before, after), 1);
+  assert.deepEqual(
+    mergedRows.map((row) => (row.kind === "skip" ? `skip:${row.count}` : `${row.kind}:${row.text}`)),
+    ["same:l1", "remove:l2", "add:L2", "same:l3", "same:l4", "remove:l5", "add:L5", "same:l6", "skip:1"],
+  );
+});

@@ -598,6 +598,82 @@ mod tests {
         assert!(snapshot.rules.is_empty());
     }
 
+    // G7/V2: 앱 소유 규칙의 상한은 새 항목만 막고 기존 항목의 갱신은 허용한다.
+    #[test]
+    fn g7_branch_rule_capacity_preserves_updates_and_rejected_writes() {
+        let root = tempdir().expect("temp");
+        let app_data = root.path().join("app-data");
+        fs::create_dir(&app_data).expect("app data");
+        let repo = root.path().join("repo");
+        fs::create_dir(&repo).expect("repo");
+        let project = path_key(&repo);
+        // 마지막 한 자리만 실제 setter로 채워 경계의 양쪽을 확인한다.
+        STORE
+            .update(&app_data, |store: &mut BranchRuleStore| {
+                store.rules = (0..MAX_BRANCH_RULES - 1)
+                    .map(|index| rule(&project, "*", &format!("demo-{index}@official"), true))
+                    .collect();
+                Ok(true)
+            })
+            .expect("seed below capacity");
+        let mut request = SetClaudePluginBranchRuleRequest {
+            project_path: project.clone(),
+            branch: "*".to_owned(),
+            plugin_id: "last@official".to_owned(),
+            enabled: true,
+        };
+        let full = set_claude_plugin_branch_rule(&app_data, &repo, &request, &[])
+            .expect("last slot is available");
+        assert_eq!(full.rules.len(), MAX_BRANCH_RULES);
+
+        request.enabled = false;
+        let updated = set_claude_plugin_branch_rule(&app_data, &repo, &request, &[])
+            .expect("existing rule can change at capacity");
+        assert_eq!(updated.rules.len(), MAX_BRANCH_RULES);
+        assert!(
+            !updated
+                .rules
+                .iter()
+                .find(|rule| rule.plugin_id == request.plugin_id)
+                .expect("updated rule")
+                .enabled
+        );
+        let saved = fs::read(STORE.path(&app_data)).expect("saved rules");
+
+        request.plugin_id = "overflow@official".to_owned();
+        assert!(matches!(
+            set_claude_plugin_branch_rule(&app_data, &repo, &request, &[]),
+            Err(CoreError::InvalidInput(_))
+        ));
+        assert_eq!(
+            fs::read(STORE.path(&app_data)).expect("rules after rejection"),
+            saved,
+            "a rejected addition must leave the persisted rules untouched"
+        );
+        assert_eq!(
+            load_claude_plugin_branch_rules(&app_data, &[])
+                .expect("reload after rejection")
+                .rules,
+            updated.rules
+        );
+
+        let removal = RemoveClaudePluginBranchRuleRequest {
+            project_path: project,
+            branch: "*".to_owned(),
+            plugin_id: "last@official".to_owned(),
+        };
+        let removed = remove_claude_plugin_branch_rule(&app_data, &removal, &[])
+            .expect("remove at capacity after rejection");
+        assert_eq!(removed.rules.len(), MAX_BRANCH_RULES - 1);
+        let refilled = set_claude_plugin_branch_rule(&app_data, &repo, &request, &[])
+            .expect("removed rule frees a slot");
+        assert_eq!(refilled.rules.len(), MAX_BRANCH_RULES);
+        assert!(refilled
+            .rules
+            .iter()
+            .any(|rule| rule.plugin_id == request.plugin_id));
+    }
+
     #[test]
     fn invalid_branch_and_plugin_values_are_refused() {
         assert!(validated_branch(" main ").is_ok());

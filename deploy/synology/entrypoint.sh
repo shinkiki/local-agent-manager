@@ -11,6 +11,128 @@
 # 자신을 다시 실행한다. 아래 볼트·서버 기동은 전부 전용 사용자로 돈다.
 set -euo pipefail
 
+# 키링 감시(2026-10-27). 기동 때 `--unlock`으로 띄운 gnome-keyring-daemon이 NAS에서 사흘 새
+# 네 번 SIGTRAP(dmesg `trap int3`)으로 죽었다. 죽은 뒤 첫 비밀값 요청이 오면 D-Bus가
+# `org.freedesktop.secrets.service`(`--start --foreground`, 암호 없음)로 데몬을 다시 띄우고,
+# 그 데몬의 login 키링은 잠긴 채다. 그때부터 새 채팅·재개·회차가 모두 "자격증명 격리를
+# 준비하지 못해"로 거부되고, 아래 잠금 해제는 기동 때 한 번만 돌므로 컨테이너를 다시 띄우는
+# 것 말고는 복구할 길이 없었다.
+#
+# 그래서 볼트 암호를 쥔 감시 프로세스 하나를 서버 옆에 둔다. 주기마다 버스에 비밀 서비스
+# 주인이 있는지와 기본 컬렉션의 Locked 속성을 묻고, 주인이 없거나(데몬 사망) 잠겼으면
+# `--replace --unlock`으로 데몬을 갈아 끼운다. 속성만 읽으므로 잠긴 컬렉션에서도 프롬프트가
+# 뜨지 않는다(값을 읽는 lookup은 멈춰 선다). 주인 확인을 먼저 하는 이유는 둘이다. 주인이 없을
+# 때 Locked를 물으면 그 질문이 D-Bus 활성화로 잠긴 데몬을 띄우고, 주인은 있는데 답이 없는
+# 데몬(멈춤·과부하)은 `--replace`도 그 데몬의 제어 소켓에서 멈춰 고치지 못한다 — 그 경우는
+# 갈지 않고 기록만 한다. 멀쩡하지만 느린 데몬을 갈아 진행 중인 서버 읽기를 끊지 않는다.
+#
+# 볼트 암호는 감시 프로세스 메모리에 남는다. 환경·인자로는 보이지 않지만 같은 uid는
+# `/proc/<pid>/mem`으로 읽을 수 있다 — 다만 잠금이 풀린 gnome-keyring-daemon도 같은 암호를
+# 메모리에 쥐고 있고, 같은 uid는 D-Bus로 모든 비밀값을 읽을 수 있으므로 새로 열리는 길은 아니다.
+#
+# 아래 함수들은 시험(`test-keyring-watchdog.sh`)이 이 파일을 source해서 진짜 gnome-keyring에
+# 돌린다. 그래서 다른 어떤 동작보다 앞에 두고, source일 때는 정의만 하고 돌아간다.
+
+# 세션 버스에 묻는다. 응답 본문을 찍고, 버스가 답하지 않으면 빈 문자열이다.
+keyring_bus_call() {
+  timeout 10 dbus-send --session --print-reply=literal --reply-timeout=5000 "$@" 2>/dev/null || true
+}
+
+# V2/G4: process substitution은 잠금 해제의 실패를 호출자에게 돌려주지 않는다.
+# 먼저 제한 시간 안에 성공했는지 확인하고, 성공한 환경 설정만 현재 셸에 반영한다.
+# 암호는 명령 인자나 환경 대신 stdin으로만 넘긴다.
+# 종료 신호를 무시하는 데몬도 5초의 정리 시간 뒤에는 강제로 끝낸다.
+unlock_keyring() {
+  local assignments assignment
+  if ! assignments="$(printf '%s' "$1" | timeout --kill-after=5 30 gnome-keyring-daemon --unlock --components=secrets)"; then
+    echo "자격증명 볼트 잠금 해제 명령이 실패했거나 30초 안에 끝나지 않았습니다." >&2
+    return 1
+  fi
+  while IFS= read -r assignment; do
+    if [ -n "${assignment}" ]; then
+      export "${assignment?}" || return 1
+    fi
+  done <<< "${assignments}"
+}
+
+# 비밀 서비스 상태: false(열림) · true(잠김) · absent(주인 없음 = 데몬 사망)
+# · error(버스나 데몬이 답하지 않음).
+keyring_locked_state() {
+  case "$(keyring_bus_call --dest=org.freedesktop.DBus / \
+    org.freedesktop.DBus.NameHasOwner string:org.freedesktop.secrets)" in
+    *"boolean false"*) echo absent; return ;;
+    *"boolean true"*) ;;
+    *) echo error; return ;;
+  esac
+  case "$(keyring_bus_call --dest=org.freedesktop.secrets /org/freedesktop/secrets/aliases/default \
+    org.freedesktop.DBus.Properties.Get string:org.freedesktop.Secret.Collection string:Locked)" in
+    *"boolean false"*) echo false ;;
+    *"boolean true"*) echo true ;;
+    *) echo error ;;
+  esac
+}
+
+# 감시 본체. 볼트 암호는 stdin으로만 받는다 — 인자는 `ps`에, 환경은 `/proc/<pid>/environ`에
+# 같은 uid로 보인다. 교체가 실패하면(암호 불일치·버스 죽음) 간격을 5분까지 늘려 로그를
+# 덮지 않는다. 고친 것도 못 고친 것도 컨테이너 로그에 한 줄씩 남긴다.
+keyring_watchdog() {
+  local password="" state interval="${KEYRING_WATCHDOG_INTERVAL:-10}" delay hung_logged=""
+  IFS= read -r -d '' password || true
+  [[ "${interval}" =~ ^[1-9][0-9]*$ ]] || interval=10
+  delay="${interval}"
+  while sleep "${delay}"; do
+    state="$(keyring_locked_state)"
+    if [ "${state}" = error ]; then
+      # 주인은 있는데 답이 없다. 갈아도 고쳐지지 않고 멀쩡한 느린 데몬이면 해만 끼친다.
+      if [ -z "${hung_logged}" ]; then
+        echo "[keyring-watchdog] $(date -u +%FT%TZ) 비밀 서비스가 답하지 않습니다 — 교체하지 않고 지켜봅니다" >&2
+        hung_logged=1
+      fi
+      delay="${interval}"
+      continue
+    fi
+    hung_logged=""
+    if [ "${state}" = false ]; then
+      delay="${interval}"
+      continue
+    fi
+    echo "[keyring-watchdog] $(date -u +%FT%TZ) 볼트 키링 상태 ${state} — 데몬을 다시 띄워 잠금을 풉니다" >&2
+    printf '%s' "${password}" \
+      | timeout 30 gnome-keyring-daemon --replace --unlock --components=secrets >/dev/null 2>&1 || true
+    # 교체 명령이 돌아온 순간에는 새 데몬이 아직 버스 이름을 넘겨받지 못했을 수 있다(실측:
+    # 바로 물으면 옛 데몬이 `true`를 답하고, 넘겨받기까지 5초를 넘긴 적도 있다). 교체는 지금의
+    # 주인(잠긴 활성화 데몬)을 끝낸다. 활성화와 겹친 드문 경우 잠긴 데몬이 하나 더 남을 수
+    # 있지만, 그 데몬이 이름을 넘겨받으면 다음 주기에 `true`로 보여 같은 교체로 고쳐진다.
+    for _ in $(seq 1 15); do
+      state="$(keyring_locked_state)"
+      [ "${state}" = false ] && break
+      sleep 1
+    done
+    if [ "${state}" = false ]; then
+      echo "[keyring-watchdog] $(date -u +%FT%TZ) 볼트 키링을 다시 열었습니다" >&2
+      delay="${interval}"
+    else
+      delay=$(( delay * 2 > 300 ? 300 : delay * 2 ))
+      echo "[keyring-watchdog] $(date -u +%FT%TZ) 볼트 키링을 열지 못했습니다(상태 ${state}). ${delay}초 뒤 다시 봅니다" >&2
+    fi
+  done
+  echo "[keyring-watchdog] $(date -u +%FT%TZ) 감시가 끝났습니다 — 키링이 다시 죽으면 컨테이너를 다시 띄워야 합니다" >&2
+}
+
+# 감시를 띄운다. 이 셸은 볼트 암호가 든 환경으로 exec됐으므로(`/proc/<pid>/environ`은 unset
+# 뒤에도 그대로다) 포크한 자식도 같은 환경 블록을 물려받는다. 감시는 그래서 `bash -c`로 새로
+# exec해 export된 값만 받게 하고, 암호는 파이프로 넘긴다. 바깥 `( … & )`는 감시를 PID 1
+# (docker-init) 밑으로 보내 서버가 자식으로 떠안지 않게 한다.
+start_keyring_watchdog() {
+  local password="$1"
+  ( printf '%s' "${password}" \
+      | bash -c "$(declare -f keyring_bus_call keyring_locked_state keyring_watchdog); keyring_watchdog" & )
+}
+
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
+
 AGENT_USER="${AGENT_MANAGER_USER:-agent}"
 
 drop_privileges() {
@@ -108,6 +230,16 @@ require KEYRING_PASSWORD
 require TAILSCALE_HOST
 require TAILSCALE_USER
 
+# 볼트 암호는 export하지 않는 셸 변수로 옮기고 환경에서 바로 지운다. 지우지 않으면 서버를
+# 거쳐 에이전트 CLI·터미널·회차가 모두 물려받아, 에이전트가 `env` 한 번으로 암호를 읽고 세션
+# 기록에 평문으로 남길 수 있다(키링 파일 사본만 있으면 어디서든 열린다). 잠금 해제 **전에**
+# 지우는 이유: 예전처럼 해제 뒤에 지우면 그 사이에 뜬 dbus-daemon·gnome-keyring-daemon·CLI
+# 씨앗 `--version`이 암호를 환경에 든 채 남아, 같은 uid에서 `/proc/<pid>/environ`으로 읽혔다.
+# 암호는 잠금 해제와 감시에 stdin으로만 넘긴다. `docker inspect`에 남는 컨테이너 설정은
+# 여기서 지울 수 없다.
+keyring_password="${KEYRING_PASSWORD}"
+unset KEYRING_PASSWORD
+
 # 에이전트 CLI 씨앗 심기. 이미지는 CLI를 씨앗 prefix(`AGENT_MANAGER_CLI_SEED`)에만 담고, 실제로
 # 실행되는 사본은 HOME 볼륨의 `~/.local`에 둔다 — 앱의 업데이트 버튼이 비root로 그 사본을 올리고,
 # 볼륨이라 컨테이너를 다시 만들어도 올린 버전이 남는다(Dockerfile의 씨앗 주석).
@@ -190,14 +322,20 @@ export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
 
 # 시크릿 서비스. 잠금 해제 결과로 나오는 GNOME_KEYRING_CONTROL 등을 환경에 반영한다.
 mkdir -p "${HOME}/.local/share/keyrings"
-while IFS= read -r assignment; do
-  [ -n "${assignment}" ] && export "${assignment?}"
-done < <(printf '%s' "${KEYRING_PASSWORD}" | gnome-keyring-daemon --unlock --components=secrets)
-# 볼트 암호는 위 잠금 해제에만 쓴다. 지우지 않으면 서버를 거쳐 에이전트 CLI·터미널·회차가
-# 모두 물려받아, 에이전트가 `env` 한 번으로 암호를 읽고 세션 기록에 평문으로 남길 수 있다
-# (키링 파일 사본만 있으면 어디서든 열린다). 서버는 이 값을 읽지 않고, 아래 실패 안내는
-# 값이 아니라 변수 이름만 쓴다. `docker inspect`에 남는 컨테이너 설정은 이 줄로 지울 수 없다.
-unset KEYRING_PASSWORD
+if ! unlock_keyring "${keyring_password}"; then
+  # 다른 볼트 기동 실패와 같이 재시작 반복의 간격을 벌린다.
+  sleep 10
+  exit 1
+fi
+
+# 잠금 해제 명령이 돌아온 순간에는 데몬이 아직 버스 이름을 잡지 못했을 수 있다. 그 틈에 아래
+# 프로브가 비밀값을 요청하면 D-Bus가 잠긴 데몬을 따로 띄우고, 프로브는 그 잠긴 키링을 보고
+# 기동을 멈춘다(부하가 걸린 NAS에서 실측). 활성화를 일으키지 않는 질문으로 최대 10초 기다린다.
+# 끝내 열리지 않으면 그대로 프로브로 넘어가 거기서 원인을 남긴다.
+for _ in $(seq 1 10); do
+  [ "$(keyring_locked_state)" = false ] && break
+  sleep 1
+done
 
 # L02: 볼트가 실제로 열렸는지 기동 전에 확인하고, 열리지 않았으면 **멈춘다.**
 #
@@ -241,6 +379,15 @@ if [ -n "${keyring_probe_failure}" ]; then
   sleep 10
   exit 1
 fi
+
+# 볼트가 열린 것을 확인한 뒤에만 감시를 띄운다. 처음부터 열리지 않는 암호라면 위에서 멈췄다.
+start_keyring_watchdog "${keyring_password}"
+unset keyring_password
+
+# 서버가 잠긴 키링 앞에서 잠금 해제 prompt를 띄우지 않게 한다. 이 컨테이너에는 prompt에 답할
+# 화면이 없어 응답이 오지 않고, 그걸 기다리던 볼트 읽기가 2026-10-28 Vault를 6시간 묶었다.
+# 대신 서버는 감시가 키링을 다시 열기를 잠깐 기다리고, 그래도 잠겨 있으면 "잠김"으로 실패한다.
+export AGENT_MANAGER_KEYRING_NO_PROMPT=1
 
 args=(
   --port "${AGENT_MANAGER_PORT:-4178}"

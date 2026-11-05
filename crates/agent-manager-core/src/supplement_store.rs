@@ -129,27 +129,11 @@ pub(crate) fn persist_captured_turn(
     persist_captured_turn_inner(
         app_data_dir,
         captured_turn(source, session_id, turn_id, completed_at, text, origin)?,
-        true,
     )
 }
 
-pub(crate) fn persist_captured_turn_if_absent(
-    app_data_dir: &Path,
-    source: ProviderId,
-    session_id: &str,
-    turn_id: &str,
-    completed_at: i64,
-    text: String,
-    origin: SupplementOrigin,
-) -> Result<(), CoreError> {
-    persist_captured_turn_inner(
-        app_data_dir,
-        captured_turn(source, session_id, turn_id, completed_at, text, origin)?,
-        false,
-    )
-}
-
-fn captured_turn(
+/// 보완 턴 한 건을 만든다. 식별자 검사와 본문 상한은 어느 출처든 같다.
+pub(crate) fn captured_turn(
     source: ProviderId,
     session_id: &str,
     turn_id: &str,
@@ -189,32 +173,71 @@ pub(crate) fn persist_system_prompt(
         SupplementOrigin::SystemPrompt,
     )?;
     turn.label = Some(label.to_owned());
-    persist_captured_turn_inner(app_data_dir, turn, true)
+    persist_captured_turn_inner(app_data_dir, turn)
 }
 
+/// 같은 턴이 있으면 덮어쓴다 — 채팅 응답과 런타임 지시는 마지막 것이 맞는 값이다.
 fn persist_captured_turn_inner(
     app_data_dir: &Path,
     next: CapturedTranscriptTurn,
-    replace_existing: bool,
 ) -> Result<(), CoreError> {
     if next.text.is_empty() {
         return Ok(());
     }
     with_supplement_store(app_data_dir, |store| {
-        if let Some(existing) = store.turns.iter_mut().find(|turn| {
+        store.insert_turn(next, true);
+        trim_supplements(store);
+        Ok(true)
+    })
+}
+
+/// 완료된 예약 실행의 요약을 한 번에 적어 둔다. 이미 같은 턴이 있으면 그대로 둔다.
+/// 백엔드가 시작할 때마다 완료 실행 전부를 다시 넘기는 자리라, 턴마다 잠금·전체
+/// 읽기·전체 쓰기를 되풀이하지 않고 한 번만 한다 — 새로 적을 턴이 하나도 없으면
+/// 파일을 쓰지 않는다.
+pub(crate) fn persist_captured_turns_if_absent(
+    app_data_dir: &Path,
+    turns: impl IntoIterator<Item = CapturedTranscriptTurn>,
+) -> Result<(), CoreError> {
+    let turns = turns
+        .into_iter()
+        .filter(|turn| !turn.text.is_empty())
+        .collect::<Vec<_>>();
+    if turns.is_empty() {
+        return Ok(());
+    }
+    with_supplement_store(app_data_dir, |store| {
+        let count = store.turns.len();
+        let mut inserted = false;
+        for turn in turns {
+            inserted |= store.insert_turn(turn, false);
+        }
+        // 정리는 묶음 끝에 한 번이다 — 턴마다 하면 4,000턴 정렬을 실행 수만큼 되풀이한다.
+        // 상한이 낮아져 정리만으로 줄어든 저장소도 바뀐 것으로 쳐서 다시 쓴다.
+        trim_supplements(store);
+        Ok(inserted || store.turns.len() != count)
+    })
+}
+
+impl SupplementStore {
+    /// 턴을 넣고 저장소가 바뀌었는지 돌려준다. 같은 턴이 이미 있을 때 `replace_existing`
+    /// 이 꺼져 있으면 아무것도 바꾸지 않으므로 파일을 다시 쓸 이유가 없다. 상한 정리는
+    /// 호출부가 묶음 끝에 한 번 한다.
+    fn insert_turn(&mut self, next: CapturedTranscriptTurn, replace_existing: bool) -> bool {
+        if let Some(existing) = self.turns.iter_mut().find(|turn| {
             turn.source == next.source
                 && turn.session_id == next.session_id
                 && turn.turn_id == next.turn_id
         }) {
-            if replace_existing {
-                *existing = next;
+            if !replace_existing {
+                return false;
             }
+            *existing = next;
         } else {
-            store.turns.push(next);
+            self.turns.push(next);
         }
-        trim_supplements(store);
-        Ok(())
-    })
+        true
+    }
 }
 
 fn load_supplement_store(app_data_dir: &Path) -> Result<SupplementStore, CoreError> {
@@ -232,19 +255,22 @@ fn supplement_store_size(app_data_dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn with_supplement_store<T>(
+/// 잠금 아래에서 저장소를 읽어 `action` 에 넘기고, 바꿨다고(`true`) 답한 때만 다시 쓴다.
+/// 쓰기는 임시 파일·fsync·교체를 거치므로 결과가 같은 쓰기도 공짜가 아니다.
+fn with_supplement_store(
     app_data_dir: &Path,
-    action: impl FnOnce(&mut SupplementStore) -> Result<T, CoreError>,
-) -> Result<T, CoreError> {
+    action: impl FnOnce(&mut SupplementStore) -> Result<bool, CoreError>,
+) -> Result<(), CoreError> {
     let _lock = store_lock::acquire(app_data_dir, SUPPLEMENT_LOCK_FILE_NAME, "보완 저장소")?;
     let mut store = load_supplement_store(app_data_dir)?;
-    let value = action(&mut store)?;
+    if !action(&mut store)? {
+        return Ok(());
+    }
     // G7·G10: 보완 저장소는 캡처한 응답 본문을 담는 앱 소유 파일이다. 그 자리에 바로
     // 쓰면 끊긴 쓰기가 반쪽 JSON을 남기고 다음 읽기가 그것을 기본값으로 삼아 보관한
     // 응답을 말없이 잃는다. 또 그 자리의 심볼릭 링크를 따라가 앱 데이터 밖 파일을
     // 덮어쓰고, 새 파일은 0600이 아니라 umask 권한으로 생긴다.
-    write_private_json(&app_data_dir.join(SUPPLEMENT_STORE_FILE_NAME), &store)?;
-    Ok(value)
+    write_private_json(&app_data_dir.join(SUPPLEMENT_STORE_FILE_NAME), &store)
 }
 
 fn cap_supplement_text(text: String) -> String {
@@ -279,20 +305,13 @@ pub(crate) fn prune_supplements_for(
         return Ok(0);
     }
     let before = supplement_store_size(app_data_dir);
-    let removed = with_supplement_store(app_data_dir, |store| {
-        let mut removed = 0usize;
-        store.turns.retain(|turn| {
-            let keep = !keys.contains(&session_key(turn.source, &turn.session_id));
-            if !keep {
-                removed += 1;
-            }
-            keep
-        });
-        Ok(removed)
+    with_supplement_store(app_data_dir, |store| {
+        let count = store.turns.len();
+        store
+            .turns
+            .retain(|turn| !keys.contains(&session_key(turn.source, &turn.session_id)));
+        Ok(store.turns.len() != count)
     })?;
-    if removed == 0 {
-        return Ok(0);
-    }
     let after = supplement_store_size(app_data_dir);
     Ok(before.saturating_sub(after))
 }
@@ -330,6 +349,94 @@ mod tests {
         let meta = fs::symlink_metadata(&path).expect("store meta");
         assert!(meta.file_type().is_file());
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    /// 같은 턴을 다시 넘긴 묶음 저장과 지울 것이 없는 정리는 파일을 다시 쓰지 않는다.
+    /// 저장된 파일을 뜻은 같고 바이트는 다른 꼴(압축 JSON)로 바꿔 두면, 어떤 경로든
+    /// 다시 쓰는 순간 pretty 인코딩으로 바뀌므로 바이트 비교가 "다시 썼는가" 를 가른다.
+    #[test]
+    fn unchanged_store_is_not_rewritten() {
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        let path = temp.path().join(SUPPLEMENT_STORE_FILE_NAME);
+        let existing = captured_turn(
+            ProviderId::Claude,
+            "session-1234567890",
+            "run-1234567890abcd",
+            1,
+            "요약".to_owned(),
+            SupplementOrigin::Scheduled,
+        )
+        .expect("turn");
+        persist_captured_turns_if_absent(temp.path(), [existing.clone()]).expect("first save");
+        let store = load_supplement_store(temp.path()).expect("load");
+        let compact = serde_json::to_vec(&store).expect("compact encoding");
+        fs::write(&path, &compact).expect("rewrite compact");
+        let unchanged = || fs::read(&path).expect("store bytes") == compact;
+
+        persist_captured_turns_if_absent(temp.path(), [existing]).expect("repeat save");
+        assert!(
+            unchanged(),
+            "같은 턴을 다시 넘긴 묶음 저장이 파일을 다시 썼다"
+        );
+
+        let freed = prune_supplements_for(
+            temp.path(),
+            &BTreeSet::from(["claude:other-session".to_owned()]),
+        )
+        .expect("prune must run");
+        assert_eq!(freed, 0);
+        assert!(unchanged(), "지울 것 없는 정리가 파일을 다시 썼다");
+
+        persist_captured_turns_if_absent(temp.path(), []).expect("empty save");
+        assert!(unchanged(), "빈 묶음 저장이 파일을 다시 썼다");
+
+        prune_supplements_for(
+            temp.path(),
+            &BTreeSet::from(["claude:session-1234567890".to_owned()]),
+        )
+        .expect("matching prune");
+        assert!(!unchanged(), "지운 정리는 파일을 다시 써야 한다");
+    }
+
+    #[test]
+    fn batched_backfill_keeps_existing_turns_and_adds_missing_ones() {
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        persist_captured_turn(
+            temp.path(),
+            ProviderId::Claude,
+            "session-1234567890",
+            "run-1234567890abcd",
+            1,
+            "원래 요약".to_owned(),
+            SupplementOrigin::Scheduled,
+        )
+        .expect("first save");
+
+        let turns = [
+            ("run-1234567890abcd", "바뀐 요약"),
+            ("run-1234567890abce", "새 요약"),
+            ("run-1234567890abcf", "   "),
+        ]
+        .into_iter()
+        .map(|(turn_id, text)| {
+            captured_turn(
+                ProviderId::Claude,
+                "session-1234567890",
+                turn_id,
+                2,
+                text.to_owned(),
+                SupplementOrigin::Scheduled,
+            )
+            .expect("turn")
+        });
+        persist_captured_turns_if_absent(temp.path(), turns).expect("backfill");
+
+        let stored = captured_turns_for(temp.path(), ProviderId::Claude, "session-1234567890")
+            .expect("load");
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].text, "원래 요약");
+        assert_eq!(stored[1].turn_id, "run-1234567890abce");
+        assert_eq!(stored[1].origin, SupplementOrigin::Scheduled);
     }
 
     #[test]

@@ -66,3 +66,17 @@ test("메시지 열쇠는 화면마다 다른 접두사를 쓴다", () => {
   assert.equal(liveMessageKey("msg-1", "message"), "live:msg-1:message");
   assert.equal(transcriptMessageKey(4096), "item:4096");
 });
+
+test("같은 메시지에서 동률이면 앞선 후보가 이기고, null 블록만 있거나 뒤섞여도 처리한다", () => {
+  // 동률(거리 5): 10과 20 중 앞선 10(index 1)이 이긴다
+  const tied = [candidate("item:10", 1), candidate("item:10", 10), candidate("item:10", 20)];
+  assert.equal(pickAnchorCandidate(tied, anchor("item:10", 15)), 1);
+
+  // null 블록과 줄 번호 블록이 섞였을 때 줄 번호가 있는 블록으로 바르게 찾는다
+  const mixed = [candidate("item:10", null), candidate("item:10", 10)];
+  assert.equal(pickAnchorCandidate(mixed, anchor("item:10", 8)), 1);
+
+  // 모든 블록이 null이면 첫 번째 후보로 안전하게 돌아간다
+  const allNull = [candidate("item:10", null), candidate("item:10", null)];
+  assert.equal(pickAnchorCandidate(allNull, anchor("item:10", 8)), 0);
+});

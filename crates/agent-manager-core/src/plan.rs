@@ -3427,6 +3427,49 @@ Creates one or more Notion pages."
         values.iter().map(|value| value.to_string()).collect()
     }
 
+    /// 선택지는 다듬고 겹친 것을 한 번만 받는다. 빈 칸을 빼고 둘이 안 되면 갈림길이 아니다.
+    #[test]
+    fn decision_options_are_trimmed_deduplicated_and_bounded() {
+        assert_eq!(
+            normalize_options(&decision_options(&[" A ", "", "B", "A"])).unwrap(),
+            decision_options(&["A", "B"])
+        );
+        assert!(normalize_options(&decision_options(&["A", " A", "  "])).is_err());
+        assert!(normalize_options(&decision_options(&["A", "B\nC"])).is_err());
+        let too_many: Vec<String> = (1..=MAX_DECISION_OPTIONS + 1)
+            .map(|n| format!("안{n}"))
+            .collect();
+        let message = normalize_options(&too_many).unwrap_err().to_string();
+        assert!(message.contains("개까지만"), "{message}");
+        let long = "가".repeat(MAX_DECISION_OPTION_CHARS + 1);
+        let message = normalize_options(&[long, "B".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("자 이하"), "{message}");
+    }
+
+    /// 답은 선택지 글을 먼저, 그다음 1부터 세는 번호로 읽는다. 어긋나면 고를 수 있는 것을 돌려준다.
+    #[test]
+    fn decision_choice_reads_text_before_number_and_lists_options_on_miss() {
+        let options = decision_options(&["2", "B", "C"]);
+        assert_eq!(parse_choice(&options, " B ").unwrap(), 1);
+        // 글이 번호보다 앞선다: "2"는 둘째가 아니라 글이 "2"인 첫째다.
+        assert_eq!(parse_choice(&options, "2").unwrap(), 0);
+        assert_eq!(parse_choice(&options, "3").unwrap(), 2);
+        assert!(parse_choice(&options, "0").is_err());
+        assert!(parse_choice(&options, "4").is_err());
+        let message = parse_choice(&options, "D").unwrap_err().to_string();
+        assert!(message.contains("2, B, C"), "{message}");
+    }
+
+    /// 범위·상한은 `a_reference_must_point_backwards_and_stay_within_the_cap`가 본다.
+    /// 여기서는 겹친 참조를 한 번만, 적힌 차례대로 남기는지만 본다.
+    #[test]
+    fn step_uses_drop_repeats_and_keep_their_order() {
+        assert_eq!(normalize_uses(&[1, 1], 2).unwrap(), vec![1]);
+        assert_eq!(normalize_uses(&[2, 1], 2).unwrap(), vec![2, 1]);
+    }
+
     #[test]
     fn recommended_policy_picks_and_leaves_a_record_without_stopping() {
         let mut plan = two_step_plan();

@@ -291,6 +291,9 @@ impl<'a> SqlScanner<'a> {
         while self.index < self.characters.len() {
             let character = self.characters[self.index];
             let next = self.characters.get(self.index + 1).copied();
+            // C10-8. PostgreSQL의 #는 연산자다. 그 뒤의 문장·참조를 숨기면 안 된다.
+            let is_hash_comment = character == '#'
+                && matches!(self.engine, DbEngineKind::Mysql | DbEngineKind::Mariadb);
             // 낱말이 끊기는 자리에서 모아 둔 글자를 확정한다.
             let is_word_char = character.is_ascii_alphanumeric()
                 || matches!(character, '_' | '$' | '.')
@@ -302,7 +305,7 @@ impl<'a> SqlScanner<'a> {
                 && !character.is_whitespace()
                 && !(character == '-' && next == Some('-'))
                 && !(character == '/' && next == Some('*'))
-                && character != '#'
+                && !is_hash_comment
             {
                 return Err(CoreError::InvalidInput(
                     "한 번에 한 문장만 실행합니다. 세미콜론으로 이어 붙인 여러 문장은 받지 않습니다 — 단계마다 따로 호출하세요".to_owned(),
@@ -319,7 +322,7 @@ impl<'a> SqlScanner<'a> {
                 '-' if next == Some('-') => {
                     self.skip_line_comment();
                 }
-                '#' => {
+                '#' if is_hash_comment => {
                     self.skip_line_comment();
                 }
                 '/' if next == Some('*') => {
@@ -495,6 +498,58 @@ mod tests {
             DbEngineKind::Mysql,
         )
         .expect_err("two");
+        assert!(matches!(error, CoreError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn c10_8_hash_comments_follow_the_engine() {
+        for engine in [DbEngineKind::Mysql, DbEngineKind::Mariadb] {
+            let parsed = parse_sql("SELECT 1 # ; DROP TABLE t", engine).expect("hash comment");
+            assert_eq!(parsed.kind, DbStatementKind::Read);
+            let trailing = parse_sql("SELECT 1; # comment", engine).expect("trailing comment");
+            assert_eq!(trailing.normalized, "SELECT 1");
+            parse_sql("# comment\nSELECT 1", engine).expect("leading comment");
+        }
+        for engine in [DbEngineKind::Postgres, DbEngineKind::Sqlite] {
+            for sql in ["SELECT 17 # 5; SELECT 2", "SELECT 1; #"] {
+                let error = parse_sql(sql, engine).expect_err("hash cannot hide another token");
+                assert!(
+                    matches!(error, CoreError::InvalidInput(_)),
+                    "{engine:?}: {sql}"
+                );
+            }
+        }
+        for engine in [
+            DbEngineKind::Mysql,
+            DbEngineKind::Mariadb,
+            DbEngineKind::Postgres,
+            DbEngineKind::Sqlite,
+        ] {
+            let parsed = parse_sql("SELECT '#; still literal';", engine).expect("quoted hash");
+            assert_eq!(parsed.normalized, "SELECT '#; still literal'");
+        }
+    }
+
+    #[test]
+    fn c10_10_postgres_hash_operator_does_not_hide_policy_words() {
+        let parsed = parse_sql(
+            "SELECT 17 # 5 FROM restricted_table",
+            DbEngineKind::Postgres,
+        )
+        .expect("hash operator");
+        assert_eq!(parsed.references, vec!["RESTRICTED_TABLE"]);
+        ensure_scope(&parsed, &["restricted_".to_owned()]).expect("in scope");
+        let error = ensure_scope(&parsed, &["allowed_".to_owned()]).expect_err("out of scope");
+        assert!(matches!(error, CoreError::InvalidInput(_)));
+
+        let write = parse_sql(
+            "WITH x AS (SELECT 17 # 5) DELETE FROM t",
+            DbEngineKind::Postgres,
+        )
+        .expect("write after hash operator");
+        assert_eq!(write.kind, DbStatementKind::Dml);
+        let error = parse_sql("SELECT 17 # pg_read_file('x')", DbEngineKind::Postgres)
+            .expect_err("refused function after hash operator");
         assert!(matches!(error, CoreError::InvalidInput(_)));
     }
 

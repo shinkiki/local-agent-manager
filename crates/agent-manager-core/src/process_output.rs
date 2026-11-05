@@ -147,6 +147,43 @@ mod tests {
     }
 
     #[test]
+    fn read_capped_preserves_prefix_and_stops_on_permanent_error_v2() {
+        struct FailingReader {
+            data: std::io::Cursor<Vec<u8>>,
+            failed: bool,
+        }
+
+        impl Read for FailingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                // V2: 오류를 재시도하는 변이가 무한 반복 대신 즉시 실패하게 한다.
+                assert!(!self.failed, "a permanent read error must stop reading");
+                let read = self.data.read(buffer)?;
+                if read > 0 {
+                    Ok(read)
+                } else {
+                    self.failed = true;
+                    Err(ErrorKind::Other.into())
+                }
+            }
+        }
+
+        for length in [0, 17, MAX_CAPTURED_OUTPUT_BYTES + 17] {
+            let data: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+            let mut reader = FailingReader {
+                data: std::io::Cursor::new(data.clone()),
+                failed: false,
+            };
+
+            let kept = read_capped(&mut reader);
+
+            // V2: 오류 전 출력은 보존하고, 상한 뒤에도 오류가 날 때까지 비운다.
+            assert_eq!(kept, data[..length.min(MAX_CAPTURED_OUTPUT_BYTES)]);
+            assert_eq!(reader.data.position(), length as u64);
+            assert!(reader.failed);
+        }
+    }
+
+    #[test]
     fn finish_capped_reader_returns_the_thread_output() {
         let reader = thread::spawn(|| b"captured".to_vec());
         assert_eq!(finish_capped_reader(reader), b"captured");

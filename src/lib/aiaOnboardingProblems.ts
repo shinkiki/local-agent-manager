@@ -212,6 +212,16 @@ export function isJiraProjectKey(value: string): boolean {
  * 끝나서야 드러나고, 그때는 워크플로가 이미 등록된 뒤다.
  */
 const PROJECT_KEY_FIELDS = new Set(["jiraProject", "jiraProjectKey"]);
+/**
+ * 노션 데이터베이스 주소를 받는 칸. 키에 `notion`이 든 칸은 이름만으로 잡히지만, QA 카드의
+ * `scenarioDatabase`·`ticketDatabase`는 이름에 도구가 없어 그 검사를 그대로 지나쳤다 —
+ * 같은 카드의 지라 키는 막히는데 노션 주소 오타는 첫 회차에서야 드러났다.
+ */
+const NOTION_DATABASE_FIELDS = new Set(["scenarioDatabase", "ticketDatabase"]);
+
+function isNotionDatabaseField(key: string): boolean {
+  return /notion/i.test(key) || NOTION_DATABASE_FIELDS.has(key);
+}
 
 export function pastedTargetProblems(card: AiaOnboardingCard, values: OnboardingValues): string[] {
   const problems: string[] = [];
@@ -221,7 +231,7 @@ export function pastedTargetProblems(card: AiaOnboardingCard, values: Onboarding
       if (value.length === 0) continue;
       // 칸 이름도 화면 언어로 부른다 — 문구만 영어인데 앞머리가 한국어면 한 줄이 두 언어로 갈린다.
       const label = runtimeText(field.label.ko, field.label.en ?? field.label.ko);
-      if (/notion/i.test(field.key) && notionDatabaseId(value) === null) {
+      if (isNotionDatabaseField(field.key) && notionDatabaseId(value) === null) {
         problems.push(`${label}: ${runtimeText(
           "노션 데이터베이스 주소가 아닙니다. 그 데이터베이스를 열고 주소창의 주소를 그대로 붙여넣으세요.",
           "This is not a Notion database URL. Open that database and paste the URL from the address bar as is.",

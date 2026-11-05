@@ -1,0 +1,36 @@
+/* 본문은 settings-subsection 머리와 같은 18px 안쪽에 선다. 예전에는 문단·폼·목록이 카드 테두리에 붙어 있었다. */
+.index-addon { min-width: 0; }
+.index-addon-body { display: grid; min-width: 0; gap: 12px; padding: 0 18px 16px; }
+.index-addon-body p { margin: 0; color: var(--muted); font-size: var(--ui-font-9); line-height: 1.6; }
+.index-addon-toggles, .index-addon-source-controls { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
+.index-addon-check { display: inline-flex; align-items: center; gap: 6px; }
+.index-addon-form { display: flex; min-width: 0; flex-wrap: wrap; align-items: end; gap: 12px; }
+.index-addon-form > label { display: grid; min-width: 0; flex: 1 1 200px; gap: 6px; }
+.index-addon-form > label > span { color: var(--muted); font-size: var(--ui-font-8); }
+.index-addon-form input, .index-addon-form select { width: 100%; min-width: 0; box-sizing: border-box; }
+.index-addon-sources { display: flex; min-width: 0; flex-direction: column; margin: 0; padding: 0; overflow: hidden; border: 1px solid var(--border-soft); border-radius: 10px; list-style: none; }
+.index-addon-sources > li { display: grid; min-width: 0; gap: 8px; padding: 12px 14px; }
+.index-addon-sources > li + li { border-top: 1px solid var(--border-soft); }
+.index-addon-source-title { display: grid; gap: 4px; }
+.index-addon code { overflow-wrap: anywhere; white-space: normal; }
+.index-addon-sources small { color: var(--muted); font-size: var(--ui-font-8); line-height: 1.5; }
+.index-addon-scope { display: grid; min-width: 0; gap: 6px; }
+.index-addon-sources .project-registry-collapse small { margin-left: auto; color: var(--faint); font-size: var(--ui-font-7); text-align: right; }
+.index-addon-scope-note { color: var(--faint); font-size: var(--ui-font-7); line-height: 1.5; overflow-wrap: anywhere; }
+.index-addon-scope > .project-registry-list { margin: 0; }
+.index-addon-scope-all { background: rgba(var(--accent-rgb), .05); }
+/* 적용 프로젝트: 프로젝트 활성여부 카드와 같은 줄. 켠 프로젝트 폴더는 백엔드가 자동 등록·색인한다. */
+.index-addon-project-rows { margin: 0; }
+.index-addon-project-rows .project-registry-main { gap: 2px; }
+.index-addon-row-actions { display: inline-flex; align-items: center; gap: 8px; }
+.index-addon-count { color: var(--faint); font-size: var(--ui-font-7); font-weight: 600; }
+.index-addon-scope-note.warn { color: var(--danger); }
+.index-addon-source-actions { display: inline-flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.index-addon-results { display: grid; min-width: 0; gap: 12px; }
+.index-addon-hit { display: grid; min-width: 0; gap: 6px; }
+.index-addon-hit pre { margin: 0; padding: 12px; max-height: 280px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--border); border-radius: 8px; }
+@media (max-width: 600px) {
+  .index-addon-form > label { flex-basis: 100%; }
+  .index-addon-form > button { width: 100%; justify-content: center; }
+  .index-addon-source-actions { margin-left: 0; }
+}

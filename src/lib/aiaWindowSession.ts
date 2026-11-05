@@ -95,6 +95,22 @@ export function ownedAiaWindowChatId(
   }
 }
 
+/**
+ * 창별 세션을 켜되, 저장소가 던져도 호출부를 막지 않는다. 팝아웃을 여는 자리가 부른다 —
+ * 그 자리는 창을 여는 일이 본업이고 이 플래그는 "새 창이 남의 대화를 가져가지 않게" 하는
+ * 힌트라, 플래그를 못 적었다고 창까지 안 열리면 안 된다. 저장소가 막힌 새 창은 어차피
+ * `selectAiaWindowSession`이 던짐을 삼키고 null을 돌려주므로 플래그 없이도 가져가지 않는다.
+ * `window.localStorage`는 접근만으로 던질 수 있어(`defaultAiaWindowStorages`) 그 접근도 안에서 한다.
+ */
+export function enableAiaWindowSessionsQuietly(storages: AiaWindowStorages | null = defaultAiaWindowStorages()): void {
+  if (!storages) return;
+  try {
+    enableAiaWindowSessions(storages.shared);
+  } catch {
+    // 저장소가 막히면 플래그 없이 간다. 창을 못 여는 쪽보다 낫다.
+  }
+}
+
 export function selectAiaWindowSession(
   chats: ChatSessionInfo[], shared: Storage, local: Storage, windowId: string | null,
 ): ChatSessionInfo | null {

@@ -111,6 +111,55 @@ mod tests {
         assert!(!stage.exists());
     }
 
+    // C3-9/C5-4: a failed backup move must leave the original intact and discard
+    // the prepared replacement, before the swap is even attempted.
+    fn assert_failed_backup_move_discards_stage(kind: StagedKind) {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let target = root.path().join("target");
+        let stage = root.path().join(".stage");
+        // A missing parent makes rename fail even when the tests run as root.
+        let backup = root.path().join("missing-parent/backup");
+        let original = match kind {
+            StagedKind::File => {
+                fs::write(&target, b"old").expect("target");
+                fs::write(&stage, b"new").expect("stage");
+                target.clone()
+            }
+            StagedKind::Directory => {
+                fs::create_dir(&target).expect("target directory");
+                fs::create_dir_all(stage.join("nested")).expect("stage directory");
+                let original = target.join("original.md");
+                fs::write(&original, b"old").expect("target content");
+                fs::write(stage.join("nested/new.md"), b"new").expect("stage content");
+                original
+            }
+        };
+
+        let error = StagedReplace {
+            kind,
+            stage: &stage,
+            target: &target,
+            backup: Some(&backup),
+        }
+        .commit()
+        .expect_err("the backup parent does not exist");
+
+        assert!(matches!(error, CoreError::Io(_)));
+        assert_eq!(fs::read(original).expect("original content"), b"old");
+        assert!(!stage.exists(), "{kind} stage must be discarded");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn c3_9_c5_4_failed_backup_move_discards_file_stage() {
+        assert_failed_backup_move_discards_stage(StagedKind::File);
+    }
+
+    #[test]
+    fn c3_9_c5_4_failed_backup_move_discards_directory_stage() {
+        assert_failed_backup_move_discards_stage(StagedKind::Directory);
+    }
+
     #[test]
     fn a_failed_swap_restores_the_target_and_leaves_no_stage() {
         let root = tempfile::tempdir().expect("temporary directory");

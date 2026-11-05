@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   firstVisibleView,
   loadNavigationPreferences,
+  saveNavigationPreferences,
   moveNavigationItem,
   setNavigationVisibility,
 } from "./navigationPreferences.ts";
@@ -143,4 +144,29 @@ test("firstVisibleView falls back to the fixed settings menu when every configur
 test("firstVisibleView normalizes stale stored preferences before choosing", () => {
   // 순서에 없는 메뉴는 기본 순서 뒤에 보완되고, 알 수 없는 값은 버려진다.
   assert.equal(firstVisibleView({ order: ["nowhere"], hidden: ["dashboard"] }), "chat");
+});
+
+test("saveNavigationPreferences normalizes preferences before storing", () => {
+  const store = new Map();
+  const previousWindow = globalThis.window;
+  globalThis.window = {
+    localStorage: {
+      getItem: (key) => store.get(key) ?? null,
+      setItem: (key, value) => store.set(key, value),
+    },
+  };
+  try {
+    saveNavigationPreferences({
+      order: ["chat", ...UNCONFIGURABLE_VIEWS, "chat", "dashboard", "unknown"],
+      hidden: ["docs", ...UNCONFIGURABLE_VIEWS, "docs", "unknown"],
+    });
+    const raw = store.get(CURRENT_KEY);
+    assert.ok(raw);
+    const parsed = JSON.parse(raw);
+    assert.deepEqual(parsed.order.slice(0, 2), ["chat", "dashboard"]);
+    assert.deepEqual([...parsed.order].sort(), [...DEFAULT_NAVIGATION_ORDER].sort());
+    assert.deepEqual(parsed.hidden, ["docs"]);
+  } finally {
+    globalThis.window = previousWindow;
+  }
 });

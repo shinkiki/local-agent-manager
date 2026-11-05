@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::ProviderId;
 #[cfg(unix)]
 use crate::process_signal;
+use crate::providers::provider_executable_names;
 use crate::CoreError;
 
 #[cfg(unix)]
@@ -195,7 +196,7 @@ const RUNTIME_EXECUTABLE_NAMES: &[&str] = &["node", "bun", "deno"];
 ///
 /// 조회에 셸을 쓰는 것은 유닉스에서 `ps`를 쓰는 것과 같은 성격이고, 문자열은 이 상수와
 /// 닫힌 열거형에서만 만들어진다. 사용자 입력은 한 글자도 들어오지 않으며, 끼워 넣는
-/// 이름조차 ASCII 소문자로 한 번 더 거른다(G9).
+/// 이름조차 ASCII 소문자와 `-` 로 한 번 더 거른다(G9).
 #[cfg(windows)]
 const WINDOWS_PROCESS_QUERY_TEMPLATE: &str = concat!(
     "$ErrorActionPreference='Stop';",
@@ -221,13 +222,17 @@ const WINDOWS_PROCESS_QUERY_TEMPLATE: &str = concat!(
 fn command_line_executable_names() -> Vec<String> {
     ProviderId::ALL
         .iter()
-        .map(|provider| provider.as_str().to_owned())
-        .chain(
-            RUNTIME_EXECUTABLE_NAMES
-                .iter()
-                .map(|name| (*name).to_owned()),
-        )
-        .filter(|name| !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_lowercase()))
+        .flat_map(|provider| external_executable_names(*provider).iter())
+        .chain(RUNTIME_EXECUTABLE_NAMES.iter())
+        .map(|name| (*name).to_owned())
+        // 작은따옴표 PowerShell 문자열에 끼워 넣는다. 소문자와 `-`(`antigravity-cli`)만
+        // 통과시키면 따옴표를 닫을 수 있는 글자는 하나도 들어가지 못한다(G9).
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+        })
         .collect()
 }
 
@@ -548,13 +553,18 @@ fn select_external_processes(
 /// 파생 이름은 매칭하지 않는다. ChatGPT.app 내장 `codex`처럼 이름이 CLI와
 /// 같아도 데스크톱 앱 번들 안의 실행 파일은 앱 자체 세션으로 인증하므로
 /// 제외한다.
+///
+/// 비교 대상은 공급자 id 가 아니라 탐지 표의 **실행 파일 이름**이다(C1-9). 둘이 같은
+/// 것은 Claude·Codex 뿐이고 Antigravity 의 CLI 는 `agy`·`antigravity-cli` 다 — id 로
+/// 비교하던 동안 Antigravity 의 외부 프로세스는 한 번도 찾히지 않아 C2-4 의 종료가
+/// 조용히 0건으로 끝났다.
 fn matches_provider_command(provider: ProviderId, command: &str) -> bool {
-    let target = provider.as_str();
+    let targets = external_executable_names(provider);
     let mut tokens = command_tokens(command).into_iter();
     let Some(first) = tokens.next() else {
         return false;
     };
-    if token_matches(&first, target) {
+    if token_matches_any(&first, targets) {
         return true;
     }
     if let Some(runtime) = RuntimeWrapper::from_executable(&first) {
@@ -571,10 +581,28 @@ fn matches_provider_command(provider: ProviderId, command: &str) -> bool {
             if token.starts_with('-') {
                 continue;
             }
-            return token_matches(&token, target);
+            return token_matches_any(&token, targets);
         }
     }
     false
+}
+
+/// 외부 프로세스 매칭이 보는 실행 파일 이름. 탐지 표(`providers::PROVIDERS`)와 같되,
+/// 로컬 공급자는 **비어 있다**: 그 공급자가 빌려 쓰는 `opencode` 는 사용자의 하네스이지
+/// 이 앱이 교체하거나 갱신하는 CLI 가 아니고(C14-2 는 사용자 자신의 `opencode` 세션을
+/// 보호한다), 계정도 공유 자격증명도 없어 C1-8·C2-4 가 종료할 이유가 없다. id 로 비교하던
+/// 동안에도 `local` 이라는 이름은 어느 프로세스와도 맞지 않아 사실상 0건이었으므로, 이
+/// 빈 목록이 그 동작을 그대로 잇는다. 사용자의 `opencode` 를 종료 대상에 넣을지는 사람이
+/// 정할 일이다.
+fn external_executable_names(provider: ProviderId) -> &'static [&'static str] {
+    match provider {
+        ProviderId::Local => &[],
+        other => provider_executable_names(other),
+    }
+}
+
+fn token_matches_any(token: &str, targets: &[&str]) -> bool {
+    targets.iter().any(|target| token_matches(token, target))
 }
 
 /// 명령줄을 토큰으로 나눈다. 큰따옴표로 묶인 구간은 공백이 있어도 한 토큰이고, 따옴표
@@ -903,6 +931,58 @@ mod tests {
         assert!(!matches_provider_command(claude, "grep claude"));
     }
 
+    /// C1-9. 매칭은 공급자 id 가 아니라 CLI 실행 파일 이름으로 한다. Antigravity 의 CLI 는
+    /// `agy`(또는 `antigravity-cli`)다 — id 로 비교하면 한 번도 찾히지 않는다. `antigravity`
+    /// 는 데스크톱 IDE 런처라 표에 없고 계속 제외한다. 로컬 공급자는 사용자의 `opencode`
+    /// 하네스를 빌리므로 외부 종료 대상이 없다(`external_executable_names`) — `local` 이라는
+    /// 무관한 이름도, 사용자의 `opencode` 도 걸리지 않는다.
+    #[test]
+    fn c1_9_provider_commands_match_cli_executable_names_not_provider_ids() {
+        let antigravity = ProviderId::Antigravity;
+        let local = ProviderId::Local;
+        assert!(matches_provider_command(antigravity, "agy --print /usage"));
+        assert!(matches_provider_command(
+            antigravity,
+            "/opt/homebrew/bin/antigravity-cli chat"
+        ));
+        assert!(matches_provider_command(
+            antigravity,
+            "node /x/node_modules/.bin/agy --print /usage"
+        ));
+        assert!(!matches_provider_command(antigravity, "antigravity"));
+        assert!(!matches_provider_command(
+            antigravity,
+            "/Applications/Antigravity.app/Contents/MacOS/antigravity"
+        ));
+        assert!(!matches_provider_command(
+            local,
+            "/usr/local/bin/opencode acp"
+        ));
+        assert!(!matches_provider_command(local, "local"));
+        assert!(matches_provider_command(
+            antigravity,
+            "agy.exe --print /usage"
+        ));
+        assert!(!matches_provider_command(
+            ProviderId::Claude,
+            "agy --print /usage"
+        ));
+
+        let entries = vec![
+            entry(100, 1, 501, "agent-manager"),
+            entry(200, 1, 501, "agy --print /usage"),
+            entry(201, 200, 501, "mcp-server"),
+            entry(300, 1, 501, "local"),
+            entry(400, 1, 501, "/usr/local/bin/opencode"),
+        ];
+        let pids: Vec<u32> = select_external_processes(antigravity, &entries, 100, 501)
+            .iter()
+            .map(|process| process.pid)
+            .collect();
+        assert_eq!(pids, vec![200, 201]);
+        assert!(select_external_processes(local, &entries, 100, 501).is_empty());
+    }
+
     #[test]
     fn c1_9_node_inline_arguments_are_not_provider_scripts() {
         for provider in [ProviderId::Claude, ProviderId::Codex] {
@@ -958,11 +1038,12 @@ mod tests {
     fn command_line_name_list_covers_every_matchable_executable() {
         let names = command_line_executable_names();
         for provider in ProviderId::ALL {
-            assert!(
-                names.iter().any(|name| name == provider.as_str()),
-                "{} 이름이 조회 목록에 없다",
-                provider.as_str()
-            );
+            for executable in external_executable_names(provider) {
+                assert!(
+                    names.iter().any(|name| name == executable),
+                    "{executable} 이름이 조회 목록에 없다"
+                );
+            }
         }
         for runtime in RUNTIME_EXECUTABLE_NAMES {
             assert!(

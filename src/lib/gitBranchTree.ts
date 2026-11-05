@@ -103,8 +103,12 @@ function buildChildren(folder: MutableFolder): GitBranchTreeNode[] {
   if (folder.path !== "") return nodes;
   // 이름순 정렬은 Core의 최근순을 잃는다. 루트의 직접 브랜치만 안정 분할해서 먼저 훑고,
   // `/`가 있는 외자식과 접두사 폴더는 원래 순서를 지킨 채 그다음에 둔다.
-  const directBranches = nodes.filter((node) => node.kind === "branch" && !node.branch.name.includes("/"));
-  const pathEntries = nodes.filter((node) => node.kind === "folder" || node.branch.name.includes("/"));
+  const directBranches: GitBranchTreeNode[] = [];
+  const pathEntries: GitBranchTreeNode[] = [];
+  for (const node of nodes) {
+    const group = node.kind === "branch" && !node.branch.name.includes("/") ? directBranches : pathEntries;
+    group.push(node);
+  }
   return [...directBranches, ...pathEntries];
 }
 

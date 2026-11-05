@@ -5,8 +5,12 @@ import {
   normalizeExtraSettings,
   normalizeSettingValue,
   sameChatSettings,
+  settingField,
   settingFieldsFor,
+  settingOptionLabel,
+  settingOptions,
 } from "./chatSettings.ts";
+import { setRuntimeLocale } from "./i18nRuntime.ts";
 
 const field = (key, options, defaultValue = null) => ({
   key,
@@ -81,4 +85,28 @@ test("빈 실행설정 값은 정규화와 동등성 비교에서 같은 기준�
     sameChatSettings({ reviewer: "auto", model: "codex" }, { model: "codex", reviewer: "auto" }),
     true,
   );
+});
+
+test("스키마 항목과 선택지 목록 조회", () => {
+  const fields = [field("mode", [option("plan"), option("workspace")], "workspace")];
+  assert.equal(settingField(fields, "mode")?.key, "mode");
+  assert.equal(settingField(fields, "nonexistent"), null);
+  assert.deepEqual(
+    settingOptions(fields, "mode").map((opt) => opt.value),
+    ["plan", "workspace"],
+  );
+  assert.deepEqual(settingOptions(fields, "nonexistent"), []);
+});
+
+test("선택지 라벨은 화면 언어로 바꿔 돌려주고, 없는 값·항목은 null", () => {
+  const fields = [field("approvalMode", [{ ...option("manual"), label: "직접 승인" }])];
+  assert.equal(settingOptionLabel(fields, "approvalMode", "manual"), "직접 승인");
+  assert.equal(settingOptionLabel(fields, "approvalMode", "missingValue"), null);
+  assert.equal(settingOptionLabel(fields, "missingField", "manual"), null);
+  setRuntimeLocale("en", {});
+  try {
+    assert.equal(settingOptionLabel(fields, "approvalMode", "manual"), "Manual approval");
+  } finally {
+    setRuntimeLocale("ko", {});
+  }
 });

@@ -75,6 +75,24 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn g10_c6_1_unix_home_preserves_non_utf8_path_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        // G10/C6-1: UTF-8 밖의 바이트도 경로의 일부이므로 손실 변환하지 않는다.
+        let bytes = b"/home/account-\xff";
+        let home = OsString::from_vec(bytes.to_vec());
+        for (candidate, profile) in [
+            (Some(home.clone()), Some("/home/other".into())),
+            (None, Some(home.clone())),
+            (Some(OsString::new()), Some(home)),
+        ] {
+            let resolved = home_dir_from_values(candidate, profile).expect("home must resolve");
+            assert_eq!(resolved.as_os_str().as_bytes(), bytes);
+        }
+    }
+
     /// 두 함수는 같은 값을 봐야 한다. 한쪽만 변수를 더 보게 되면 홈이 있는데도 실패하는
     /// 경로가 생긴다.
     #[test]

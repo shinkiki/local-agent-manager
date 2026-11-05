@@ -126,6 +126,10 @@ const HARD_TO_RECOVER_OPERATIONS: &[(&str, &str)] = &[
     ("delete_scheduled_request", "반복 요청 삭제"),
     ("delete_session_folder", "세션 폴더 삭제"),
     ("delete_doc_root", "등록 폴더 제거"),
+    (
+        "delete_document_entry",
+        "등록 폴더 안 파일·폴더 삭제: 휴지통을 거치지 않아 되돌릴 수 없습니다",
+    ),
     // C16. 되돌릴 수 없는 git 명령은 제공하지 않지만, 아래 넷은 작업 트리나 이력을 다시
     // 써서 reflog·스태시 SHA로만 되돌릴 수 있고 push는 앱 밖으로 나간다.
     (
@@ -4326,6 +4330,50 @@ mod tests {
         assert_eq!(format_scalar(&json!(3), "input.n").expect("number"), "3");
         assert_eq!(format_scalar(&json!(null), "input.n").expect("null"), "");
         assert!(format_scalar(&json!({"a": 1}), "input.n").is_err());
+    }
+
+    /// W4/W8: 짧은 템플릿도 치환한 인자가 길면 실행 결과 한도에 걸려야 한다.
+    #[test]
+    fn w4_w8_format_runtime_limit_applies_to_nested_arguments() {
+        let inputs = BTreeMap::from([("half".to_owned(), json!("x".repeat(4096)))]);
+        let results = BTreeMap::from([(
+            "read".to_owned(),
+            json!({"body": "x".repeat(8192), "over": "x".repeat(8193)}),
+        )]);
+        let ctx = TemplateContext {
+            chat_runtime: None,
+            inputs: &inputs,
+            results: &results,
+            item: None,
+            run: None,
+            execution_id: "format-runtime-limit",
+            round_execution_id: None,
+            step_id: "compose",
+            iteration: 0,
+        };
+        let arguments = |text| json!({"request": {"message": {"$format": text}}});
+
+        for text in ["{input.half}{input.half}", "{step.read.body}"] {
+            assert_eq!(
+                resolve_template(&arguments(text), &ctx).expect("한도까지 허용"),
+                json!({"request": {"message": "x".repeat(8192)}}),
+                "{text}"
+            );
+        }
+        // 마지막 조각이 리터럴이거나 치환값이어도 누적 길이가 한 글자 넘으면 거절한다.
+        for text in [
+            "{input.half}{input.half}!",
+            "!{input.half}{input.half}",
+            "{step.read.over}",
+        ] {
+            let error = resolve_template(&arguments(text), &ctx).expect_err(text);
+            match error {
+                CoreError::InvalidInput(message) => {
+                    assert_eq!(message, "$format 결과가 8192자를 넘었습니다", "{text}");
+                }
+                other => panic!("한도 초과는 입력 오류여야 합니다: {other:?}"),
+            }
+        }
     }
 
     #[test]

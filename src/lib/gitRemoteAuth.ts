@@ -61,7 +61,7 @@ export function gitRemoteAuthRows(remotes: GitRemote[], tokens: ProjectGitRemote
     // push 주소의 판정과, 가져오기 주소(`pushurl`과 다를 수 있다)의 호스트를 함께 센다.
     if (auth.transport === "https" && auth.host) {
       const current = row(auth.host);
-      current.remotes.push(remote.name);
+      if (!current.remotes.includes(remote.name)) current.remotes.push(remote.name);
       if (auth.method === "credentialHelper" || auth.method === "urlCredential") current.otherMethod ??= auth.method;
     }
     if (auth.fetchHost && !(auth.transport === "https" && auth.fetchHost === auth.host)) {

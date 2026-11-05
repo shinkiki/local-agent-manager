@@ -715,8 +715,8 @@ fn unsupported_plan(
 
 /// 업데이트 명령이 바꿔 써야 하는 폴더 가운데 현재 사용자가 쓸 수 없는 것이 있으면 그 사유.
 ///
-/// npm 전역 설치는 패키지 폴더를 갈아 끼우므로 바깥쪽 `node_modules`와, 있으면 `<prefix>/bin`에
-/// 써야 한다. 자체 업데이트(`agy update` 등)는 실행 파일이 놓인 폴더다. Homebrew는 brew가 자기
+/// npm 전역 설치는 패키지 폴더를 갈아 끼우므로 바깥쪽 `node_modules`와 범위 폴더(`@openai` 등),
+/// 있으면 `<prefix>/bin`에 써야 한다. 자체 업데이트(`agy update` 등)는 실행 파일이 놓인 폴더다. Homebrew는 brew가 자기
 /// 권한 모델로 판단하므로 보지 않는다.
 ///
 /// 쓰기 가능 여부는 `access(W_OK)`로만 묻는다. 시험 삼아 파일을 만들어 보면 그 자체가 설치
@@ -746,6 +746,16 @@ fn install_write_targets(source: CliInstallSource, executable: &Path) -> Vec<Pat
                 return Vec::new();
             };
             let mut targets = vec![root.to_path_buf()];
+            // 범위형 패키지는 범위 폴더 안에서 이름을 바꿔 교체한다. 전역 루트가
+            // 쓰기 가능해도 범위 폴더가 읽기 전용이면 런타임을 끝내기 전에 막는다.
+            if let Some(scope) = executable
+                .strip_prefix(root)
+                .ok()
+                .and_then(|relative| relative.iter().next())
+                .filter(|name| name.as_encoded_bytes().starts_with(b"@"))
+            {
+                targets.push(root.join(scope));
+            }
             if let Some(bin) = root
                 .parent()
                 .filter(|lib| lib.file_name().is_some_and(|name| name == "lib"))
@@ -2000,6 +2010,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn v2_npm_write_targets_include_only_the_outer_package_scope() {
+        let prefix = tempfile::tempdir().expect("임시 디렉터리");
+        let root = prefix.path().join("lib/node_modules");
+        let bin = prefix.path().join("bin");
+        fs::create_dir(&bin).expect("bin 폴더");
+        for relative in [
+            "@openai/codex/bin/codex.js",
+            "@openai/codex/node_modules/@vendor/dep/bin/tool",
+        ] {
+            assert_eq!(
+                install_write_targets(CliInstallSource::NpmGlobal, &root.join(relative)),
+                vec![root.clone(), root.join("@openai"), bin.clone()],
+                "범위형 패키지는 바깥 범위 폴더에 쓸 수 있어야 한다: {relative}"
+            );
+        }
+        for relative in [
+            "codex/bin/codex.js",
+            "codex/node_modules/@vendor/dep/bin/tool",
+        ] {
+            assert_eq!(
+                install_write_targets(CliInstallSource::NpmGlobal, &root.join(relative)),
+                vec![root.clone(), bin.clone()],
+                "비범위형 패키지는 중첩 범위 폴더를 검사하지 않는다: {relative}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn read_only_install_locations_block_the_update_with_a_recreate_hint() {
         use std::os::unix::fs::PermissionsExt;
         let prefix = temporary_directory();
@@ -2012,10 +2051,11 @@ mod tests {
         }
         let executable = package.join("codex.js");
         let root = prefix.join("lib/node_modules");
+        let scope = root.join("@openai");
 
         assert_eq!(
             install_write_targets(CliInstallSource::NpmGlobal, &nested.join("tool")),
-            vec![root.clone(), bin.clone()]
+            vec![root.clone(), scope.clone(), bin.clone()]
         );
         assert_eq!(
             read_only_install_reason(CliInstallSource::NpmGlobal, &executable),
@@ -2039,6 +2079,13 @@ mod tests {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("권한 복구");
         let reason = reason.expect("쓸 수 없는 전역 루트는 막혀야 한다");
         assert!(reason.contains(&root.display().to_string()));
+        assert!(reason.contains("재생성"));
+
+        fs::set_permissions(&scope, fs::Permissions::from_mode(0o555)).expect("권한");
+        let reason = read_only_install_reason(CliInstallSource::NpmGlobal, &executable);
+        fs::set_permissions(&scope, fs::Permissions::from_mode(0o755)).expect("권한 복구");
+        let reason = reason.expect("전역 루트가 쓰기 가능해도 읽기 전용 범위 폴더는 막혀야 한다");
+        assert!(reason.contains(&scope.display().to_string()));
         assert!(reason.contains("재생성"));
 
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o555)).expect("권한");

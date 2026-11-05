@@ -12,7 +12,10 @@ fn is_loopback_name(host: &str) -> bool {
 pub(crate) fn is_loopback_host(host: &str) -> bool {
     is_loopback_name(host)
         || host.rsplit_once(':').is_some_and(|(name, port)| {
-            is_loopback_name(name) && port.parse::<u16>().is_ok_and(|p| p > 0)
+            // G11: Host의 포트는 십진 숫자만 허용한다. 정수 파서는 `+4178`도 받는다.
+            is_loopback_name(name)
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && port.parse::<u16>().is_ok_and(|p| p > 0)
         })
 }
 
@@ -79,6 +82,30 @@ mod tests {
             "LocalHost:65535",
         ] {
             assert!(is_loopback_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn g11_loopback_host_rejects_signed_ports() {
+        for name in ["127.0.0.1", "localhost", "LOCALHOST", "[::1]"] {
+            for port in ["+1", "+4178", "+65535", "-1"] {
+                let host = format!("{name}:{port}");
+                assert!(!is_loopback_host(&host), "{host}");
+            }
+        }
+    }
+
+    #[test]
+    fn g11_loopback_host_preserves_decimal_port_boundaries() {
+        for name in ["127.0.0.1", "localhost", "LOCALHOST", "[::1]"] {
+            for port in ["1", "01", "04178", "65535"] {
+                let host = format!("{name}:{port}");
+                assert!(is_loopback_host(&host), "{host}");
+            }
+            for port in ["", "0", "65536", " 4178", "4178 ", "４１７８"] {
+                let host = format!("{name}:{port}");
+                assert!(!is_loopback_host(&host), "{host}");
+            }
         }
     }
 

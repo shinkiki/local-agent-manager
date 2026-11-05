@@ -597,6 +597,69 @@ mod tests {
         assert!(list_instruction_trash(&app_data).unwrap().items.is_empty());
     }
 
+    // G10/C5-8/C5-9: 연결 문서는 파일의 부모가 아닌 기록된 배포 루트 안으로만
+    // 복구한다. 거절한 항목은 보존하며 링크를 치우면 같은 항목을 재시도할 수 있다.
+    #[cfg(unix)]
+    #[test]
+    fn g10_c5_8_c5_9_linked_doc_restore_keeps_deployment_root_and_allows_retry() {
+        let temp = tempdir().expect("임시 디렉터리 생성");
+        let app_data = temp.path().join("app_data");
+        let project = temp.path().join("project");
+        let docs = project.join("docs");
+        let deployed = docs.join("nested/guide.md");
+        let payload = b"linked policy document\n";
+        fs::create_dir_all(deployed.parent().unwrap()).unwrap();
+        fs::write(&deployed, payload).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("unrelated.txt");
+        fs::write(&sentinel, b"external content").unwrap();
+        let mut linked_draft = draft(
+            "linked-group",
+            InstructionTrashItemKind::File,
+            Some(ProviderId::Codex),
+            "docs/nested/guide.md",
+        );
+        linked_draft.project_path = Some(project.to_string_lossy().into_owned());
+        linked_draft.total_bytes = payload.len() as u64;
+        let item = store_instruction_trash_item(&app_data, &deployed, linked_draft)
+            .expect("연결 문서 보관");
+        let (entry_dir, content) = trash_store::entry_paths(&trash_root(&app_data), &item.id);
+        fs::remove_dir(deployed.parent().unwrap()).unwrap();
+        fs::remove_dir(&docs).unwrap();
+        std::os::unix::fs::symlink(&outside, &docs).unwrap();
+
+        let receipt = restore_instruction_trash(&app_data, &item.id).expect("경계 밖 복구 거절");
+        assert_eq!(receipt.results.len(), 1);
+        assert_eq!(receipt.results[0].id, item.id);
+        assert_eq!(
+            receipt.results[0].outcome,
+            InstructionTrashRestoreOutcome::Failed
+        );
+        assert_eq!(fs::read_link(&docs).unwrap(), outside);
+        assert!(!outside.join("nested").exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"external content");
+        assert_eq!(fs::read(&content).unwrap(), payload);
+        assert_eq!(
+            list_instruction_trash(&app_data).unwrap().items.as_slice(),
+            std::slice::from_ref(&item)
+        );
+
+        fs::remove_file(&docs).expect("경계 밖 링크만 제거");
+        let retried = restore_instruction_trash(&app_data, &item.id).expect("같은 항목 재복구");
+        assert_eq!(retried.results.len(), 1);
+        assert_eq!(retried.results[0].id, item.id);
+        assert_eq!(
+            retried.results[0].outcome,
+            InstructionTrashRestoreOutcome::Restored
+        );
+        assert_eq!(fs::read(&deployed).unwrap(), payload);
+        assert!(!entry_dir.exists());
+        assert!(list_instruction_trash(&app_data).unwrap().items.is_empty());
+        assert!(!outside.join("nested").exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"external content");
+    }
+
     // C3-11: 실체가 사라진 항목은 Failed로 알리고 manifest를 남겨 목록에서 지우지 않는다.
     #[test]
     fn restore_reports_failed_and_keeps_the_entry_when_the_content_is_gone() {

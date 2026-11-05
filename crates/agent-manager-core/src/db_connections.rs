@@ -426,6 +426,16 @@ impl SchemaVersioned for DbConnectionStore {
     }
 }
 
+impl DbConnectionStore {
+    /// C10-1: 저장과 사용 설정이 같은 ID 조회와 없는 연결 오류를 공유한다.
+    fn connection_mut(&mut self, id: &str) -> Result<&mut DbConnectionView, CoreError> {
+        self.connections
+            .iter_mut()
+            .find(|connection| connection.id == id)
+            .ok_or_else(|| connection_not_found(id))
+    }
+}
+
 fn snapshot_from(store: DbConnectionStore, issues: Vec<String>) -> DbConnectionsSnapshot {
     let mut connections = store.connections;
     connections.sort_by(|left, right| left.display_name.cmp(&right.display_name));
@@ -676,11 +686,7 @@ pub fn set_db_connection(
             id
         } else {
             let id = request.id.trim().to_owned();
-            let existing = store
-                .connections
-                .iter_mut()
-                .find(|connection| connection.id == id)
-                .ok_or_else(|| connection_not_found(&id))?;
+            let existing = store.connection_mut(&id)?;
             // 출처를 앱 보관 밖으로 옮기면 보관하던 비밀값을 남겨 두지 않는다.
             let credential_stored_at = if existing.credential_source
                 == DbCredentialSource::AppKeychain
@@ -718,11 +724,7 @@ pub fn set_db_connection_enabled(
     request: SetDbConnectionEnabledRequest,
 ) -> Result<DbConnectionsSnapshot, CoreError> {
     let store = STORE.update(app_data_dir, |store: &mut DbConnectionStore| {
-        let connection = store
-            .connections
-            .iter_mut()
-            .find(|connection| connection.id == request.id)
-            .ok_or_else(|| connection_not_found(&request.id))?;
+        let connection = store.connection_mut(&request.id)?;
         if request.enabled && connection.credential_source == DbCredentialSource::AppKeychain {
             // 저장된 비밀값 없이 켜 두면 목록에는 열려 있는데 접속만 실패한다.
             if connection.credential_stored_at.is_none() {
@@ -1057,6 +1059,70 @@ mod tests {
         let blank = validate_connection_secret(DbCredentialSource::AppKeychain, &payload)
             .expect("blank is no secret");
         assert_eq!(blank, None);
+    }
+
+    #[test]
+    fn c10_1_updates_select_the_id_and_missing_ids_leave_the_store_unchanged() {
+        let dir = TempDir::new().expect("temp");
+        let mut payload = request("원본");
+        payload.credential_source = "none".to_owned();
+        let mut other = payload.clone();
+        other.display_name = "다른 연결".to_owned();
+        let other = set_db_connection(dir.path(), other)
+            .expect("create another")
+            .connections[0]
+            .clone();
+        let first = set_db_connection(dir.path(), payload.clone()).expect("create");
+        let id = first
+            .connections
+            .iter()
+            .find(|connection| connection.id != other.id)
+            .expect("new connection")
+            .id
+            .clone();
+
+        payload.id = format!(" {id} ");
+        payload.display_name = "수정".to_owned();
+        payload.host = "updated.example.com".to_owned();
+        payload.agent_enabled = true;
+        let updated = set_db_connection(dir.path(), payload.clone()).expect("update");
+        assert_eq!(updated.connections.len(), 2);
+        let connection = connection_of(dir.path(), &id).expect("updated connection");
+        assert_eq!(connection.display_name, "수정");
+        assert_eq!(connection.host, "updated.example.com");
+        assert!(connection.agent_enabled);
+        set_db_connection_enabled(
+            dir.path(),
+            SetDbConnectionEnabledRequest {
+                id: id.clone(),
+                enabled: false,
+            },
+        )
+        .expect("disable");
+        assert!(!connection_of(dir.path(), &id).expect("read").agent_enabled);
+        assert_eq!(connection_of(dir.path(), &other.id).expect("other"), other);
+
+        let before = std::fs::read(STORE.path(dir.path())).expect("stored bytes");
+        payload.id = "missing".to_owned();
+        for error in [
+            connection_of(dir.path(), "missing").expect_err("missing read"),
+            set_db_connection(dir.path(), payload).expect_err("missing update"),
+            set_db_connection_enabled(
+                dir.path(),
+                SetDbConnectionEnabledRequest {
+                    id: "missing".to_owned(),
+                    enabled: true,
+                },
+            )
+            .expect_err("missing toggle"),
+        ] {
+            assert!(matches!(error, CoreError::NotFound(_)));
+            assert_eq!(
+                error.to_string(),
+                connection_not_found("missing").to_string()
+            );
+        }
+        assert_eq!(std::fs::read(STORE.path(dir.path())).expect("read"), before);
     }
 
     #[test]

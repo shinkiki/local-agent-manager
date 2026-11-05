@@ -279,6 +279,15 @@ fn prepare_doc_parent(root: &Path, path: &Path) -> Result<(), CoreError> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
+    // G10·G2: 먼저 기존 조상을 확인해야 외부 링크 아래에 빈 폴더도 만들지 않는다.
+    path_guard::assert_within_root(
+        root,
+        parent,
+        path_guard::RootLabels {
+            subject: "문서 폴더 경로",
+            escaped: "허용된 경로를 벗어났습니다",
+        },
+    )?;
     fs::create_dir_all(parent)?;
     let parent_real = fs::canonicalize(parent)?;
     if !parent_real.starts_with(root) {
@@ -335,7 +344,7 @@ fn resolve_root_entry(
     Ok((root, path))
 }
 
-fn resolve_root(app_data_dir: &Path, root_id: &str) -> Result<PathBuf, CoreError> {
+pub(crate) fn resolve_root(app_data_dir: &Path, root_id: &str) -> Result<PathBuf, CoreError> {
     let metadata = load_metadata(app_data_dir)?;
     let root = metadata
         .doc_roots
@@ -525,7 +534,7 @@ fn collect_document_entries(
     Ok(())
 }
 
-fn document_entry(
+pub(crate) fn document_entry(
     root: &Path,
     path: &Path,
     metadata: &fs::Metadata,
@@ -603,7 +612,11 @@ fn node_order(left: &FileNode, right: &FileNode) -> std::cmp::Ordering {
     )
 }
 
-fn resolve_doc_path(root: &Path, relative: &str, must_exist: bool) -> Result<PathBuf, CoreError> {
+pub(crate) fn resolve_doc_path(
+    root: &Path,
+    relative: &str,
+    must_exist: bool,
+) -> Result<PathBuf, CoreError> {
     let relative = Path::new(relative);
     // 빈 경로는 루트 자체를 가리키는 정상 입력이라 그대로 통과시킨다.
     if !matches!(
@@ -625,7 +638,7 @@ fn resolve_doc_path(root: &Path, relative: &str, must_exist: bool) -> Result<Pat
 }
 
 /// 문서 루트 경계 밖을 가리키는 모든 경로 판정이 공유하는 오류.
-fn path_outside_root() -> CoreError {
+pub(crate) fn path_outside_root() -> CoreError {
     CoreError::InvalidInput("허용된 경로를 벗어났습니다".to_owned())
 }
 
@@ -762,6 +775,127 @@ mod tests {
         std::os::unix::fs::symlink(&dangling, docs.join("dangling.md")).unwrap();
         assert!(save_doc(&app_data, &root_id, "dangling.md", "created", None).is_err());
         assert!(!dangling.exists());
+    }
+
+    #[cfg(unix)]
+    fn assert_external_doc_parent_unchanged(
+        write: impl Fn(&Path, &str, &str) -> Result<DocFile, CoreError>,
+    ) {
+        for parent in ["link", "link/existing"] {
+            let temp = tempfile::tempdir().expect("temp");
+            let app_data = temp.path().join("app-data");
+            let docs = temp.path().join("docs");
+            let outside = temp.path().join("outside");
+            fs::create_dir_all(&docs).unwrap();
+            fs::create_dir_all(outside.join("existing")).unwrap();
+            fs::write(outside.join("existing/keep.md"), "original").unwrap();
+            std::os::unix::fs::symlink(&outside, docs.join("link")).unwrap();
+            let root = add_doc_root(&app_data, "docs", docs.to_string_lossy().as_ref(), false)
+                .expect("root");
+
+            let error = write(
+                &app_data,
+                &root.root.id,
+                &format!("{parent}/new/deep/note.md"),
+            )
+            .expect_err("external parent must be refused");
+            assert!(matches!(error, CoreError::InvalidInput(_)));
+            assert!(
+                !outside.join("new").exists(),
+                "refusal must precede creation"
+            );
+            assert!(
+                !outside.join("existing/new").exists(),
+                "existing external parents must stay unchanged"
+            );
+            assert_eq!(
+                fs::read_to_string(outside.join("existing/keep.md")).unwrap(),
+                "original"
+            );
+            assert_eq!(fs::read_link(docs.join("link")).unwrap(), outside);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_create_doc_checks_parent_before_directory_creation() {
+        assert_external_doc_parent_unchanged(|app_data, root_id, path| {
+            create_doc(app_data, root_id, path, "# created")
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_save_doc_checks_parent_before_directory_creation() {
+        assert_external_doc_parent_unchanged(|app_data, root_id, path| {
+            save_doc(app_data, root_id, path, "# saved", None)
+        });
+    }
+
+    #[test]
+    fn g10_document_parent_preflight_keeps_nested_creation_and_save() {
+        let temp = tempfile::tempdir().expect("temp");
+        let app_data = temp.path().join("app-data");
+        let docs = temp.path().join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        let root =
+            add_doc_root(&app_data, "docs", docs.to_string_lossy().as_ref(), false).expect("root");
+        for parent in ["create/new/deep", "save/new/deep"] {
+            let path = format!("{parent}/note.md");
+            let doc = if parent.starts_with("create") {
+                create_doc(&app_data, &root.root.id, &path, "# original")
+            } else {
+                save_doc(&app_data, &root.root.id, &path, "# original", None)
+            }
+            .expect("nested write");
+            assert_eq!(doc.relative_path, path);
+            assert_eq!(doc.content, "# original");
+            let saved = save_doc(
+                &app_data,
+                &root.root.id,
+                &path,
+                "# updated",
+                Some(doc.modified_at),
+            )
+            .expect("existing document save");
+            assert_eq!(saved.content, "# updated");
+            assert_eq!(fs::read_to_string(docs.join(path)).unwrap(), "# updated");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_document_parent_preflight_keeps_links_within_root() {
+        let temp = tempfile::tempdir().expect("temp");
+        let app_data = temp.path().join("app-data");
+        let docs = temp.path().join("docs");
+        fs::create_dir_all(docs.join("actual")).unwrap();
+        std::os::unix::fs::symlink(docs.join("actual"), docs.join("link")).unwrap();
+        let root =
+            add_doc_root(&app_data, "docs", docs.to_string_lossy().as_ref(), false).expect("root");
+        create_doc(
+            &app_data,
+            &root.root.id,
+            "link/new/deep/create.md",
+            "# created",
+        )
+        .expect("internal link creation");
+        save_doc(
+            &app_data,
+            &root.root.id,
+            "link/new/deep/save.md",
+            "# saved",
+            None,
+        )
+        .expect("internal link save");
+        assert_eq!(
+            fs::read_to_string(docs.join("actual/new/deep/create.md")).unwrap(),
+            "# created"
+        );
+        assert_eq!(
+            fs::read_to_string(docs.join("actual/new/deep/save.md")).unwrap(),
+            "# saved"
+        );
     }
 
     #[test]

@@ -118,3 +118,27 @@ test("B4 일괄 펴기는 중첩된 폴더 경로까지 모은다", () => {
 
   assert.deepEqual(collectGitBranchFolderPaths(tree).sort(), ["a", "a/b"]);
 });
+
+test("B4 빈 목록이 주어지면 빈 트리를 돌려준다", () => {
+  assert.deepEqual(buildGitBranchTree([]), []);
+  assert.deepEqual(collectGitBranchFolderPaths([]), []);
+});
+
+test("B4 슬래시로만 된 이름이나 연속 슬래시가 있어도 트리가 깨지지 않는다", () => {
+  const tree = buildGitBranchTree([branch("///"), branch("origin//main")]);
+  assert.equal(tree.length, 2);
+  assert.equal(tree[0].kind, "branch");
+  assert.equal(tree[0].label, "///");
+  assert.equal(tree[1].kind, "branch");
+  assert.equal(tree[1].label, "origin//main");
+});
+
+test("B4 폴더 이름과 동일한 단일 브랜치가 공존할 때 브랜치와 폴더가 각각 안정적으로 선다", () => {
+  const tree = buildGitBranchTree([branch("origin"), branch("origin/main"), branch("origin/feat")]);
+  assert.equal(tree[0].kind, "branch");
+  assert.equal(tree[0].label, "origin");
+  assert.equal(tree[1].kind, "folder");
+  assert.equal(tree[1].path, "origin");
+  assert.equal(tree[1].count, 2);
+  assert.deepEqual(tree[1].children.map((child) => child.label), ["main", "feat"]);
+});

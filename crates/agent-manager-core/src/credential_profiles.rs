@@ -31,7 +31,8 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread::{self, sleep, JoinHandle};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -48,6 +49,11 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 /// 되는데도 판정 불가로 끝난다.
 const ANTIGRAVITY_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// 자식이 끝난(또는 끝낸) 뒤 출력 파이프가 닫히기를 기다리는 상한. 자식과 그 그룹이 끝나면
+/// 파이프는 바로 닫히므로 정상 경로는 이 시한에 닿지 않는다. 닿는 것은 프로세스 그룹 밖으로
+/// 달아난 자손(`setsid`로 떨어져 나간 데몬)이 쓰기 끝을 쥐고 있을 때뿐이고, 그때 읽기를
+/// 끝까지 기다리면 프로브가 시한과 무관하게 돌아오지 않는다.
+const PROBE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// 로컬 자격증명 판독형 프로브(Claude·Codex)가 공유하는 판정 문구. 응답 원문은 계정
 /// 정보를 담을 수 있어 어느 쪽도 문구에 섞지 않으므로, 두 공급자가 같은 문장을 각자
 /// 적어 두면 한쪽만 고쳐져 같은 뜻이 두 문장으로 갈린다.
@@ -650,9 +656,20 @@ fn run_probe_command(
         command.env(key, value);
     }
     crate::chat::configure_no_window_command(&mut command);
+    // 시한을 넘기면 CLI 하나가 아니라 그 자손까지 끝내야 한다. `claude`는 node 래퍼이고 `agy`는
+    // 공유 설정의 MCP 서버를 자식으로 띄우는데, 그 자손이 출력 파이프의 쓰기 끝을 물려받은 채
+    // 살아남으면 EOF가 오지 않아 아래 읽기 대기가 시한과 무관하게 끝나지 않았다. 유닉스는
+    // spawn 시점에 자기 그룹으로 띄우고, 윈도우는 `ProcessGroup`이 job 객체로 같은 일을 한다.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .spawn()
         .map_err(|error| format!("CLI를 실행하지 못했습니다: {error}"))?;
+    // 출력 파이프를 읽기 전에 묶는다 — 손자가 먼저 태어나면 그룹 밖에 남는다.
+    let group = crate::cli_interface::ProcessGroup::attach(&child);
     // 두 파이프를 동시에 비운다. 한쪽만 읽으면 다른 쪽 버퍼가 차는 순간 CLI가 막혀
     // 종료하지 않고, 마감 시한까지 기다린 뒤 판정 불가로 끝난다.
     let stdout = drain_stream(child.stdout.take());
@@ -664,19 +681,32 @@ fn run_probe_command(
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
-                    let _ = child.wait();
                     break Some("CLI 인증 상태 조회가 시간 안에 끝나지 않았습니다".to_owned());
                 }
                 sleep(PROBE_POLL_INTERVAL);
             }
-            Err(error) => break Some(format!("CLI 종료를 확인하지 못했습니다: {error}")),
+            Err(error) => {
+                let _ = child.kill();
+                break Some(format!("CLI 종료를 확인하지 못했습니다: {error}"));
+            }
         }
     };
-    // 자식이 끝나면 파이프가 닫히므로 읽기 스레드도 함께 끝난다. 마감으로 끊은 뒤에도
-    // 스레드는 거두어야 하므로 실패 판정보다 먼저 합류한다.
+    // 어느 갈래로 나왔든 그룹을 함께 끝낸다. 정상 종료 뒤에도 CLI가 거두지 못한 자손이 그룹에
+    // 남아 파이프를 쥐고 있을 수 있고, 그러면 이미 파이프에 든 응답을 아래 시한에 걸려 버리게
+    // 된다 — 자손이 죽으면 EOF가 바로 와서 응답이 그대로 회수된다. 리더를 이미 거둔 뒤라도
+    // pid 번호는 그룹에 구성원이 남아 있는 동안 재사용되지 않고, 그룹이 비었으면 `killpg`는
+    // ESRCH로 끝나 아무에게도 닿지 않는다.
+    if let Some(group) = &group {
+        group.kill();
+    }
+    let _ = child.wait();
+    // 자식이 끝나면 파이프가 닫히므로 읽기 스레드도 곧 끝난다. 그래도 join 대신 시한을 두고
+    // 기다린다 — 그룹 밖으로 달아난 자손이 파이프를 쥐고 있으면 join은 돌아오지 않고, 그
+    // 스레드는 파이프가 닫힐 때 스스로 끝나므로 여기서 거두지 않아도 된다.
+    let drain_deadline = Instant::now() + PROBE_DRAIN_GRACE;
     let response = ProbeResponse {
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout: receive_drained(&stdout, drain_deadline),
+        stderr: receive_drained(&stderr, drain_deadline),
     };
     match failure {
         Some(failure) => Err(failure),
@@ -715,14 +745,26 @@ impl ProbeResponse {
     }
 }
 
+/// 읽기 스레드가 보낸 결과를 시한까지 기다린다. 시한 안에 오지 않으면(파이프를 쥔 자손)
+/// 빈 응답으로 둔다 — 시한을 넘긴 프로브는 어차피 실패로 끝나고, 정상 종료한 자식의 출력은
+/// 종료 전에 이미 파이프에 들어 있다.
+fn receive_drained(receiver: &Receiver<String>, deadline: Instant) -> String {
+    receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or_default()
+}
+
 /// 파이프 하나를 끝까지 읽어 비우는 스레드. 판정에 쓸 앞부분만 남기고 나머지는
 /// 버리되 읽기는 계속한다. 한도에서 읽기를 멈추면 CLI가 파이프에서 막혀 종료하지
 /// 않고 마감 시한까지 기다리게 된다. 유효하지 않은 바이트는 대체 문자로 바꿔
-/// 인코딩 문제로 응답을 잃지 않는다.
-fn drain_stream(stream: Option<impl Read + Send + 'static>) -> JoinHandle<String> {
+/// 인코딩 문제로 응답을 잃지 않는다. 결과는 채널로 보내 호출자가 join 없이 시한을 두고
+/// 기다릴 수 있게 한다.
+fn drain_stream(stream: Option<impl Read + Send + 'static>) -> Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let Some(mut stream) = stream else {
-            return String::new();
+            let _ = sender.send(String::new());
+            return;
         };
         let mut kept: Vec<u8> = Vec::new();
         let mut chunk = [0_u8; 8 * 1024];
@@ -737,8 +779,9 @@ fn drain_stream(stream: Option<impl Read + Send + 'static>) -> JoinHandle<String
                 }
             }
         }
-        String::from_utf8_lossy(&kept).into_owned()
-    })
+        let _ = sender.send(String::from_utf8_lossy(&kept).into_owned());
+    });
+    receiver
 }
 
 /// `claude auth status --json`은 자격증명 저장소를 프로필로 갈라도 `email`은 공유
@@ -1106,6 +1149,121 @@ mod tests {
             probe_profile(ProviderId::Codex, &script, &[]),
             ProbeOutcome::Ready
         );
+    }
+
+    /// 시한을 넘긴 프로브는 CLI 하나가 아니라 그 자손까지 끝내고 돌아와야 한다. `claude`는
+    /// node 래퍼이고 `agy`는 공유 설정의 MCP 서버를 자식으로 띄우므로, 자손이 출력 파이프의
+    /// 쓰기 끝을 쥔 채 살아남으면 읽기 스레드가 EOF를 받지 못하고 프로브는 시한과 무관하게
+    /// 영원히 돌아오지 않았다(C4-6·C12-7 — 실패한 프로브는 공유 홈으로 되돌려야 하는데,
+    /// 돌아오지 않는 프로브는 되돌릴 기회조차 주지 않는다).
+    #[cfg(unix)]
+    #[test]
+    fn probe_timeout_kills_cli_descendants_and_returns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("grandchild.pid");
+        let script = temp.path().join("hanging-cli");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nsleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        let outcome = run_probe_command(&script, &[], &[], Duration::from_secs(2));
+        assert!(
+            matches!(outcome, Err(ref failure) if failure.contains("시간 안에 끝나지")),
+            "timed-out probe must report the deadline, got {:?}",
+            outcome.as_ref().err()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "probe must return soon after its deadline"
+        );
+
+        let grandchild: u32 = fs::read_to_string(&pid_file)
+            .expect("grandchild pid must be recorded")
+            .trim()
+            .parse()
+            .expect("grandchild pid must parse");
+        // 고아가 된 손자는 init이 거두므로 잠깐 좀비로 보일 수 있다.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while probe_process_alive(grandchild) && Instant::now() < deadline {
+            sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !probe_process_alive(grandchild),
+            "CLI descendant survived the probe deadline"
+        );
+    }
+
+    /// 그룹 밖으로 달아난 자손(`setsid`로 새 세션을 연 데몬)은 그룹 신호가 닿지 않아 파이프를
+    /// 계속 쥔다. 그래도 프로브는 읽기를 끝까지 기다리지 않고 시한 안에 돌아와야 한다 —
+    /// 그룹을 끝내는 것과 별개로 읽기 대기 자체에 상한이 있어야 한다는 뜻이다.
+    #[cfg(unix)]
+    #[test]
+    fn probe_timeout_returns_even_when_an_escaped_descendant_holds_the_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if Command::new("setsid")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            // util-linux `setsid`가 없는 기계(macOS·busybox)에서는 이 경우를 만들 수 없다.
+            eprintln!("setsid(util-linux) 없음 — 그룹 밖 자손 시험을 건너뜀");
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("daemon.pid");
+        let script = temp.path().join("daemon-cli");
+        // 배경 작업은 그룹 리더가 아니므로 `setsid`는 fork 없이 그대로 exec 하고, `$!`가 곧
+        // 데몬의 pid다 — 시험이 끝날 때 그 pid 하나만 거둔다.
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsetsid sleep 30 &\necho $! > '{}'\nsleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        let outcome = run_probe_command(&script, &[], &[], Duration::from_secs(1));
+        assert!(outcome.is_err(), "timed-out probe must fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(1) + PROBE_DRAIN_GRACE + Duration::from_secs(3),
+            "probe must return within the deadline plus the drain grace"
+        );
+        // 떠도는 데몬은 시험이 거둔다. 그룹 밖이라 프로브가 끝낼 수 없다는 것이 이 시험의 전제다.
+        if let Some(daemon) = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+        {
+            let _ = crate::process_signal::signal_pid(daemon, libc::SIGKILL);
+        }
+    }
+
+    /// 좀비는 살아 있는 것으로 치지 않는다(`/proc` 없는 유닉스에서는 존재 여부만 본다).
+    #[cfg(unix)]
+    fn probe_process_alive(pid: u32) -> bool {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z')),
+            Err(_) if Path::new("/proc/self").exists() => false,
+            Err(_) => crate::process_signal::pid_exists(pid).unwrap_or(false),
+        }
     }
 
     /// 두 스트림을 이어 붙일 때 한쪽 끝과 다른 쪽 시작이 붙어 없던 문구가 생기면

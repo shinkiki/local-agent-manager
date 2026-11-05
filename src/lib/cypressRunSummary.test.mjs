@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { cypressArtifactLabel, failedCypressTests, summarizeCypressRun } from "./cypressRunSummary.ts";
+import { cypressArtifactLabel, cypressRunStatePill, failedCypressTests, summarizeCypressRun } from "./cypressRunSummary.ts";
 
 // 실행 한 건을 사람이 읽는 모양으로 바꾸는 규칙만 본다. 작업공간 안의 파일을 어디까지
 // 만질 수 있는지는 cypressWorkspace.test.mjs가 맡는다 — 모듈이 갈라진 경계와 같다.
@@ -76,4 +76,13 @@ test("cypressArtifactLabel drops the run directory prefix", () => {
   // 잡 폴더 바로 밑이 아니거나 접두가 다르면 그대로 둔다.
   assert.equal(cypressArtifactLabel("artifacts/runs/job1"), "artifacts/runs/job1");
   assert.equal(cypressArtifactLabel("e2e/login.cy.js"), "e2e/login.cy.js");
+});
+
+test("C7-8 run state pill: closed is neutral, never the failure colour", () => {
+  assert.equal(cypressRunStatePill("closed"), "skill-sync-pill");
+  assert.equal(cypressRunStatePill("passed"), "skill-sync-pill current");
+  assert.equal(cypressRunStatePill("running"), "skill-sync-pill partial");
+  for (const state of ["failed", "timedOut", "error"]) {
+    assert.equal(cypressRunStatePill(state), "skill-sync-pill conflict", state);
+  }
 });

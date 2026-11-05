@@ -217,6 +217,105 @@ fn trim_runtime_failures(store: &mut ChatRuntimeStore) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn g7_g10_runtime_store_rejects_symlinked_locks_without_changes_and_retries() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("app data");
+        let outside = tempfile::tempdir().expect("outside app data");
+        let mut lease = ManagedChatRuntimeLease {
+            chat_id: "chat-12345678901".to_owned(),
+            source: ProviderId::Claude,
+            session_id: Some("session-1234567890".to_owned()),
+            active_turn_id: Some("turn-12345678901".to_owned()),
+            pid: 42,
+            process_started: "synthetic start".to_owned(),
+            command_digest: "synthetic digest".to_owned(),
+            manager_instance_id: "manager-test".to_owned(),
+            recorded_at: 1,
+        };
+        let record = |turn: &str, at| {
+            persist_runtime_failure(
+                temp.path(),
+                ProviderId::Claude,
+                "session-1234567890",
+                "chat-12345678901",
+                turn,
+                "failed",
+                "runtimeFailed",
+                "synthetic failure",
+                at,
+            )
+        };
+        upsert_managed_chat_runtime_lease(temp.path(), lease.clone()).expect("initial lease");
+        record("turn-12345678901", 1).expect("initial failure");
+        let store_path = temp.path().join(CHAT_RUNTIME_STORE_FILE_NAME);
+        let before = fs::read(&store_path).expect("initial store bytes");
+        let lock_path = temp.path().join(CHAT_RUNTIME_LOCK_FILE_NAME);
+        fs::remove_file(&lock_path).expect("remove released lock");
+        let existing = outside.path().join("existing");
+        let missing = outside.path().join("missing");
+        fs::write(&existing, b"outside app data").expect("foreign contents");
+        lease.pid = 43;
+
+        // G7/G10: every write entry point must stop when the lock path is refused.
+        for target in [&existing, &missing] {
+            symlink(target, &lock_path).expect("planted lock link");
+            for result in [
+                upsert_managed_chat_runtime_lease(temp.path(), lease.clone()),
+                remove_managed_chat_runtime_lease(temp.path(), &lease.chat_id),
+                record("turn-12345678902", 2),
+            ] {
+                assert!(matches!(
+                    result,
+                    Err(CoreError::Io(ref error)) if error.raw_os_error() == Some(libc::ELOOP)
+                ));
+            }
+            assert_eq!(fs::read(&store_path).expect("unchanged store"), before);
+            assert_eq!(
+                fs::read_link(&lock_path).expect("unchanged link target"),
+                *target
+            );
+            assert!(fs::symlink_metadata(&lock_path)
+                .expect("link is preserved")
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                fs::read(&existing).expect("foreign contents"),
+                b"outside app data"
+            );
+            assert!(
+                !missing.exists(),
+                "a dangling lock must not create its target"
+            );
+            fs::remove_file(&lock_path).expect("remove only the link");
+        }
+
+        // V2: the same requests work after the obstruction is removed, with old failures intact.
+        upsert_managed_chat_runtime_lease(temp.path(), lease.clone()).expect("retry lease update");
+        record("turn-12345678902", 2).expect("retry failure record");
+        assert_eq!(
+            managed_chat_runtime_leases(temp.path()).expect("leases"),
+            vec![lease.clone()]
+        );
+        remove_managed_chat_runtime_lease(temp.path(), &lease.chat_id)
+            .expect("retry lease removal");
+        assert!(managed_chat_runtime_leases(temp.path())
+            .expect("removed lease")
+            .is_empty());
+        let failures = runtime_failures_for(temp.path(), ProviderId::Claude, "session-1234567890")
+            .expect("both failures");
+        assert_eq!(
+            failures
+                .iter()
+                .map(|failure| failure.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            ["turn-12345678901", "turn-12345678902"]
+        );
+    }
+
     #[test]
     fn managed_chat_runtime_lease_is_atomic_and_removable() {
         let temp = tempfile::tempdir().expect("temp directory");

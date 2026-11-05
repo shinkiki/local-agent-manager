@@ -283,12 +283,86 @@ mod tests {
         let json = br#"{
             "BackendState":"Running",
             "Self":{"DNSName":"device.example.ts.net.","UserID":42,"Online":true},
-            "User":{"42":{"LoginName":"user@example.com"}}
+            "User":{"43":{"LoginName":"other@example.com"},"42":{"LoginName":"  user@example.com\t "}}
         }"#;
         let identity =
             parse_tailscale_identity(PathBuf::from("tailscale"), json).expect("tailscale identity");
+        assert_eq!(identity.executable, PathBuf::from("tailscale"));
         assert_eq!(identity.host, "device.example.ts.net");
         assert_eq!(identity.login, "user@example.com");
+    }
+
+    fn identity_status() -> Value {
+        serde_json::json!({
+            "BackendState": "Running",
+            "Self": {"DNSName": "device.example.ts.net.", "UserID": 42, "Online": true},
+            "User": {"42": {"LoginName": "user@example.com"}}
+        })
+    }
+
+    // G11/V2: Serve 준비 전에 실행 중인 온라인 노드인지 두 조건을 각각 검사한다.
+    #[test]
+    fn g11_identity_requires_both_running_and_online() {
+        for (state, online) in [
+            ("Stopped", true),
+            ("NeedsLogin", true),
+            ("Running", false),
+            ("Stopped", false),
+        ] {
+            let mut status = identity_status();
+            status["BackendState"] = state.into();
+            status["Self"]["Online"] = online.into();
+            let result = parse_tailscale_identity(
+                PathBuf::from("tailscale"),
+                &serde_json::to_vec(&status).expect("status JSON"),
+            );
+            assert!(
+                matches!(result, Err(CoreError::Runtime(_))),
+                "{state}/{online}: {result:?}"
+            );
+        }
+    }
+
+    // G11/V2: 다른 사용자의 로그인은 현재 노드의 신원을 대신할 수 없다.
+    #[test]
+    fn g11_identity_requires_the_current_users_nonblank_login() {
+        for login in [None, Some(""), Some(" \t\n ")] {
+            let mut status = identity_status();
+            status["User"] = serde_json::json!({"43": {"LoginName": "other@example.com"}});
+            if let Some(login) = login {
+                status["User"]["42"] = serde_json::json!({"LoginName": login});
+            }
+            let result = parse_tailscale_identity(
+                PathBuf::from("tailscale"),
+                &serde_json::to_vec(&status).expect("status JSON"),
+            );
+            assert!(
+                matches!(result, Err(CoreError::Runtime(_))),
+                "{login:?}: {result:?}"
+            );
+        }
+    }
+
+    // G11/V2: 상태 JSON을 읽는 경로도 호스트 검증을 빠뜨리지 않아야 한다.
+    #[test]
+    fn g11_identity_rejects_invalid_tailnet_hosts() {
+        for host in [
+            "example.com.",
+            "https://device.example.ts.net",
+            ".ts.net.",
+            "device..ts.net.",
+        ] {
+            let mut status = identity_status();
+            status["Self"]["DNSName"] = host.into();
+            let result = parse_tailscale_identity(
+                PathBuf::from("tailscale"),
+                &serde_json::to_vec(&status).expect("status JSON"),
+            );
+            assert!(
+                matches!(result, Err(CoreError::InvalidInput(_))),
+                "{host}: {result:?}"
+            );
+        }
     }
 
     #[test]

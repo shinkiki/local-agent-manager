@@ -625,13 +625,14 @@ pub fn set_local_llm_connection(
     app_data_dir: &Path,
     request: SetLocalLlmConnectionRequest,
 ) -> Result<LocalLlmConnection, CoreError> {
-    // v1 요청에는 라벨도 계획 여부도 없다. 저장본의 값을 그대로 지킨다 — 옛 화면이 저장했다고
-    // 해서 새 칸이 기본값으로 되돌아가면 안 된다.
+    // v1 요청에는 라벨·계획 여부·모델별 창이 없다. 저장본의 값을 그대로 지킨다 — 옛 화면이
+    // 저장했다고 해서 새 칸이 기본값으로 되돌아가면 안 된다.
     let saved = get_local_llm_connection_by_id(app_data_dir, DEFAULT_CONNECTION_ID).ok();
     let label = saved
         .as_ref()
         .map(|entry| entry.label.clone())
         .unwrap_or_else(|| "기본 연결".to_owned());
+    let model_windows = saved.as_ref().map(|entry| entry.model_windows.clone());
     let plan_steps = saved.is_none_or(|entry| entry.connection.plan_steps);
     let entry = upsert_local_llm_connection(
         app_data_dir,
@@ -641,7 +642,7 @@ pub fn set_local_llm_connection(
             base_url: request.base_url,
             default_model: request.default_model,
             context_window: request.context_window,
-            model_windows: None,
+            model_windows,
             enabled: request.enabled,
             plan_steps,
             api_key: request.api_key,
@@ -1164,6 +1165,60 @@ mod connection_list_tests {
         )
         .unwrap();
         assert!(!saved.plan_steps, "v1 저장이 계획 선택을 되돌렸다");
+    }
+
+    // V2: v1 요청에 없는 모델별 창은 기본 포인터가 어느 연결을 가리켜도 보존한다.
+    #[test]
+    fn v2_the_v1_save_keeps_model_windows_on_the_current_default() {
+        for select_other in [false, true] {
+            let dir = temp_dir();
+            let mut first = request(Some(DEFAULT_CONNECTION_ID), "기본", "http://a/v1");
+            first.model_windows = Some(BTreeMap::from([("model-a".to_owned(), 16_384)]));
+            let first = upsert_local_llm_connection(dir.path(), first).unwrap();
+            let mut other = request(None, "Other", "http://b/v1");
+            other.model_windows = Some(BTreeMap::from([
+                ("model-a".to_owned(), 65_536),
+                ("model-b".to_owned(), 131_072),
+            ]));
+            let other = upsert_local_llm_connection(dir.path(), other).unwrap();
+            let (target, untouched) = if select_other {
+                set_default_local_llm_connection(dir.path(), &other.id).unwrap();
+                (other, first)
+            } else {
+                (first, other)
+            };
+
+            let saved = set_local_llm_connection(
+                dir.path(),
+                SetLocalLlmConnectionRequest {
+                    base_url: "http://updated/v1".to_owned(),
+                    default_model: "model-a".to_owned(),
+                    context_window: Some(32_768),
+                    enabled: true,
+                    api_key: None,
+                },
+            )
+            .unwrap();
+            let reread = get_local_llm_connection_by_id(dir.path(), DEFAULT_CONNECTION_ID).unwrap();
+            assert_eq!(reread.id, target.id);
+            assert_eq!(reread.connection, saved);
+            assert_eq!(reread.connection.base_url, "http://updated/v1");
+            assert_eq!(reread.model_windows, target.model_windows);
+            assert_eq!(
+                reread.context_window_for("model-a"),
+                target.model_windows.get("model-a").copied()
+            );
+            assert_eq!(reread.context_window_for("unlisted"), Some(32_768));
+            assert_eq!(
+                get_local_llm_connections(dir.path())
+                    .unwrap()
+                    .connections
+                    .into_iter()
+                    .find(|entry| entry.id == untouched.id)
+                    .unwrap(),
+                untouched
+            );
+        }
     }
 
     // M7 7.1: v1 단일 연결은 첫 읽기에서 default 로 한 번 옮겨지고 v1 파일은 남는다.

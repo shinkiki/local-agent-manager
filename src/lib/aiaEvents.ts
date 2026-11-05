@@ -278,8 +278,14 @@ function compareEvents(left: AiaEvent, right: AiaEvent): number {
 /** 첫 사건으로부터 병합 시간이 지난 경우에만 가장 중요한 한 건을 반환한다. */
 export function coalesceAiaEvents(events: AiaEvent[], now: number, windowMs = 30_000): AiaEvent | null {
   if (events.length === 0) return null;
-  const oldest = Math.min(...events.map((event) => event.observedAt));
+  let selected = events[0];
+  let oldest = selected.observedAt;
+  // V2: 대표 한 건만 필요하므로 전체 순서를 만들지 않는다. 엄격히 앞설 때만
+  // 바꿔야 비교 결과가 같은 사건 중 먼저 들어온 것을 고르는 기존 규칙도 보존한다.
+  for (const event of events) {
+    oldest = Math.min(oldest, event.observedAt);
+    if (compareEvents(event, selected) < 0) selected = event;
+  }
   if (now - oldest < Math.max(0, windowMs)) return null;
-  const selected = [...events].sort(compareEvents)[0];
   return { ...selected, coalescedCount: events.length };
 }

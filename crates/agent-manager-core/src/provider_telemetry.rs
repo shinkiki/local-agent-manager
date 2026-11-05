@@ -394,7 +394,9 @@ fn read_file(path: &Path, format: SettingsFormat) -> LoadedFile {
                 json: None,
                 toml: Some(document),
             },
-            Err(error) => empty(true, Some(error.to_string())),
+            // G4: TOML 파서 오류에는 원문 줄과 키 이름이 들어갈 수 있다. 설정의
+            // 비밀값이 parse_error·옵션 note·쓰기 오류를 통해 화면으로 나가지 않게 한다.
+            Err(_) => empty(true, Some(BAD_FORMAT.to_owned())),
         },
     }
 }
@@ -1027,6 +1029,48 @@ mod tests {
         assert!(file.options.iter().all(|option| !option.editable));
         assert!(fixture.set("gemini.telemetry", true).is_err());
         assert_eq!(fs::read_to_string(path).expect("read"), "{ not json");
+    }
+
+    #[test]
+    fn g4_broken_toml_never_exposes_source_in_snapshot_or_write_errors() {
+        let fixture = Fixture::new();
+        let marker = "telemetry-test-secret";
+        // 문법 오류의 원문 줄뿐 아니라 중복 키 오류의 메시지에도 비밀값이 섞일 수 있다.
+        for source in [
+            format!("api_key = \"{marker}\" trailing\n"),
+            format!("\"{marker}\" = 1\n\"{marker}\" = 2\n"),
+        ] {
+            let path = fixture.write(".codex/config.toml", &source);
+            let snapshot = load_from(&fixture.roots()).expect("load");
+            let file = snapshot
+                .files
+                .iter()
+                .find(|file| file.provider == "codex")
+                .expect("codex file");
+            assert!(file.exists);
+            assert!(file.parse_error.is_some());
+            assert!(file.options.iter().all(|option| {
+                !option.editable && option.blocked.is_none() && option.current.is_none()
+            }));
+            let response = serde_json::to_string(&snapshot).expect("serialize snapshot");
+            assert!(
+                !response.contains(marker),
+                "snapshot must not contain source"
+            );
+            assert!(!response.contains("api_key"));
+
+            // C13-5: 잘못된 파일은 차단·해제 모두 거절하고 원본과 백업 저장소를 건드리지 않는다.
+            for key in ["codex.telemetry", "codex.promptLogging"] {
+                for blocked in [true, false] {
+                    let error = fixture.set(key, blocked).expect_err("must refuse");
+                    assert!(matches!(error, CoreError::InvalidInput(_)));
+                    assert!(!error.to_string().contains(marker));
+                    assert!(!format!("{error:?}").contains(marker));
+                }
+            }
+            assert_eq!(fs::read_to_string(path).expect("read"), source);
+            assert!(!fixture.app_data.path().join(BACKUP_STORE).exists());
+        }
     }
 
     #[test]

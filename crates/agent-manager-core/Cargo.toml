@@ -1,6 +1,6 @@
 [package]
 name = "agent-manager-core"
-version = "0.4.1"
+version = "0.5.0"
 description = "Platform-independent domain and application core for Agent Manager"
 edition = "2021"
 publish = false
@@ -36,7 +36,7 @@ portable-pty = "0.9"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = { version = "0.10", features = ["serde"] }
-cron = "0.15"
+cron = "0.17"
 bytes = "1"
 base64 = "0.22"
 futures-util = "0.3"
@@ -50,7 +50,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 zeroize = "1"
 # C20. 접근 채널 로그인. 비밀번호는 argon2id PHC 문자열로, OTP는 RFC 6238(HMAC-SHA1)로
 # 검증한다. QR은 서버가 SVG로 그려 화면은 `<img>`에 넣기만 한다.
-argon2 = "0.5"
+argon2 = "0.6"
 rand_core = { version = "0.6", features = ["getrandom"] }
 hmac = "0.12"
 sha1 = "0.10"
@@ -63,7 +63,12 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 libc = "0.2"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-keyring = { version = "3", features = ["sync-secret-service", "vendored", "crypto-rust"] }
+# keyring 크레이트의 Secret Service 백엔드 그 자체(같은 판). keyring은 잠금 해제 prompt 응답을
+# 시한 없이 기다려서, 리눅스 OS 보안 저장소는 이 크레이트를 직접 부른다
+# (os_keychain/secret_service.rs). keyring은 예전 항목 호환 시험에만 남는다(아래 dev-dependencies).
+dbus-secret-service = { version = "4.1", features = ["vendored", "crypto-rust"] }
+# 위 크레이트가 쓰는 D-Bus 바인딩(같은 판). 비밀 서비스를 깨우지 않고 주인만 묻는 데 쓴다.
+dbus = { version = "0.9", features = ["vendored"] }
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
@@ -77,3 +82,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 
 [dev-dependencies]
 tempfile = "3"
+
+# 리눅스: 새 Secret Service 통로가 예전 keyring 통로의 항목을 찾고, 예전 판이 새 항목을 읽는지
+# 시험한다(os_keychain::tests::secret_service_phase).
+[target.'cfg(all(unix, not(target_os = "macos")))'.dev-dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "vendored", "crypto-rust"] }

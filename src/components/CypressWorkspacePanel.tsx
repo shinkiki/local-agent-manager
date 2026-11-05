@@ -25,13 +25,12 @@ import {
   writeCypressWorkspaceFile,
   type WebAccessStatus,
 } from "../lib/ipc";
-import { cypressArtifactLabel, failedCypressTests, filterCypressFilePaths, isMissingCypressFile, isSensitiveCypressFile, parseEnvJsonText, specFiles, summarizeCypressRun, validateWorkspaceRelativePath } from "../lib/cypressWorkspace";
+import { cypressArtifactLabel, cypressRunStatePill, failedCypressTests, filterCypressFilePaths, isMissingCypressFile, isSensitiveCypressFile, parseEnvJsonText, specFiles, summarizeCypressRun, validateWorkspaceRelativePath } from "../lib/cypressWorkspace";
 import type {
   CypressEnvironmentCheck,
   CypressExecutionType,
   CypressRegistry,
   CypressRunArtifact,
-  CypressRunState,
   CypressRunStatus,
   CypressRunSummary,
   CypressWorkspace,
@@ -86,16 +85,6 @@ function maskContent(content: string): string {
 /** 보기 모드에서 Markdown으로 그릴 파일인지. 나머지는 문법 강조한 코드로 보여 준다. */
 function isMarkdownPath(path: string): boolean {
   return /\.(md|markdown|mdx)$/i.test(path);
-}
-
-function runStatePill(state: CypressRunState): string {
-  switch (state) {
-    case "passed": return "skill-sync-pill current";
-    case "running": return "skill-sync-pill partial";
-    // 런처를 닫은 것은 실패가 아니다. 붉은 표시로 남기면 수동 점검마다 오류처럼 쌓인다.
-    case "closed": return "skill-sync-pill";
-    default: return "skill-sync-pill conflict";
-  }
 }
 
 /**
@@ -1631,7 +1620,7 @@ function CypressRunSection({ workspace, runner, specs, gate, busy, canRun, runBl
               {runner.workspaceRuns.map((run) => (
                 <li key={run.jobId}>
                   <button type="button" className={run.jobId === runner.currentRun?.jobId ? "active" : ""} onClick={() => runner.showRun(run)}>
-                    <span className={runStatePill(run.state)}>{run.state}</span>
+                    <span className={cypressRunStatePill(run.state)}>{run.state}</span>
                     <span className="cypress-run-summary" data-user-content>{summarizeCypressRun(run)}</span>
                     <time>{formatDate(run.startedAt)}</time>
                   </button>
@@ -1651,7 +1640,7 @@ function RunResult({ run }: { run: CypressRunStatus }) {
   return (
     <div className="cypress-run-result" data-state={run.state}>
       <div className="cypress-run-head">
-        <span className={runStatePill(run.state)}>{run.state}</span>
+        <span className={cypressRunStatePill(run.state)}>{run.state}</span>
         <strong data-user-content>{summarizeCypressRun(run)}</strong>
         {run.state === "running" && (
           <small>{run.mode === "open"

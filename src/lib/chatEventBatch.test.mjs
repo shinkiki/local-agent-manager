@@ -42,6 +42,42 @@ test("different streams preserve their arrival order", () => {
   assert.deepEqual(events.map((event) => event.id), ["reasoning", "answer"]);
 });
 
+for (const [field, value] of [["role", "user"], ["kind", "thinking"]]) {
+  test(`V4: same-id message deltas keep different ${field} streams separate`, () => {
+    const frame = fixture();
+    const events = [];
+    const batch = createChatEventBatch((event) => events.push(event), frame.scheduler);
+    const first = { type: "messageDelta", id: "shared", role: "assistant", kind: "text", delta: "A" };
+    const second = { ...first, [field]: value, delta: "B" };
+
+    batch.push(first);
+    batch.push(second);
+    assert.equal(events.length, 0);
+    frame.runFrame();
+
+    assert.deepEqual(events, [first, second]);
+    assert.equal(frame.callbacks.size, 0);
+  });
+}
+
+test("V4: returning to an earlier message stream keeps intervening deltas in order", () => {
+  const frame = fixture();
+  const events = [];
+  const batch = createChatEventBatch((event) => events.push(event), frame.scheduler);
+  const chunks = [
+    { type: "messageDelta", id: "answer", role: "assistant", kind: "text", delta: "A" },
+    { type: "messageDelta", id: "reasoning", role: "assistant", kind: "thinking", delta: "B" },
+    { type: "messageDelta", id: "answer", role: "assistant", kind: "text", delta: "C" },
+  ];
+
+  for (const chunk of chunks) batch.push(chunk);
+  assert.equal(frame.callbacks.size, 1);
+  frame.runFrame();
+
+  assert.deepEqual(events, chunks);
+  assert.equal(frame.callbacks.size, 0);
+});
+
 test("non-delta events synchronously flush earlier text", () => {
   const frame = fixture();
   const events = [];

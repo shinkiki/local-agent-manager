@@ -509,29 +509,38 @@ pub(crate) fn run_capped_with(
         })
     });
 
+    // C16-3: 부모가 먼저 종료해도 자손이 파이프를 물려받으면 회수는 끝나지 않는다.
+    // 출력 회수도 감시 대상에 넣되, 기존의 상한 읽기와 두 스트림 동시 회수는 유지한다.
+    let output_reader = thread::spawn(move || output_readers.finish());
     let started = Instant::now();
     let mut timed_out = false;
-    let status = loop {
-        match child.try_wait()? {
-            Some(status) => break Some(status),
-            None => {
-                if started.elapsed() >= timeout {
-                    // 그룹을 먼저 끝낸다. 자식만 먼저 죽이면 손자가 파이프를 쥔 채 남고
-                    // 아래 `finish`가 EOF를 기다리며 막힌다.
-                    if let Some(group) = group.as_ref() {
-                        group.kill();
-                    }
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    timed_out = true;
-                    break None;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait()?;
         }
-    };
-    let (stdout, stderr) = output_readers.finish();
-    // 자식이 끝났으니 파이프는 닫혔고, 쓰기 스레드는 다 썼거나 끊겨 곧 돌아온다.
+        let io_finished = output_reader.is_finished()
+            && stdin_writer
+                .as_ref()
+                .is_none_or(|writer| writer.is_finished());
+        if status.is_some() && (group.is_none() || io_finished) {
+            break;
+        }
+        if started.elapsed() >= timeout {
+            // 부모가 이미 회수됐어도 그룹에는 파이프를 쥔 자손이 남을 수 있다.
+            if let Some(group) = group.as_ref() {
+                group.kill();
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            timed_out = true;
+            status = None;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (stdout, stderr) = output_reader.join().unwrap_or_default();
+    // 관리 그룹의 자손까지 끝났으므로 쓰기 스레드도 다 썼거나 파이프가 끊겨 돌아온다.
     if let Some(writer) = stdin_writer {
         let _ = writer.join();
     }
@@ -660,6 +669,9 @@ Options:
     /// 손자가 살아 있는 동안 계속 길어지는 파일. 이 길이가 **더 자라지 않는 것**이
     /// "손자가 죽었다"의 증거다.
     const HEARTBEAT: &str = "heartbeat";
+    const PIPE_ENV: &str = "AGENT_MANAGER_PG_TEST_INHERITED_PIPE";
+    const STOP_MARK: &str = "stop";
+    const ECHO_ENV: &str = "AGENT_MANAGER_PG_TEST_ECHO_DIR";
 
     /// 가운데 자식 노릇. `run_capped_with`가 띄우는 쪽이고, 손자를 하나 띄운 뒤 스스로는
     /// 제한 시간을 넘기도록 그냥 잔다. 환경변수가 없으면 평소 시험 실행에서는 아무 일도
@@ -671,18 +683,30 @@ Options:
         };
         let dir = PathBuf::from(dir);
         let exe = std::env::current_exe().expect("시험 바이너리 경로");
+        let pipe = std::env::var(PIPE_ENV).ok();
         let mut grandchild = Command::new(exe);
         grandchild
             .args(["--exact", "cli_interface::tests::process_group_beat_helper"])
             .env(BEAT_ENV, &dir)
             .env_remove(SPAWNER_ENV)
-            // 손자의 출력은 버린다. 물려받게 두면 손자가 살아남았을 때 파이프에 EOF가
-            // 오지 않아 `finish`가 막히고, 이 시험은 **실패가 아니라 멈춤**이 된다.
-            // 멈추는 시험은 무인 실행에서 아무것도 알려 주지 않으므로 그 길을 닫는다.
-            // 파이프가 막히는 것 자체는 `ProcessGroup` 문서주석에 결과로 적어 두었다.
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            // 기본 시험은 손자의 입출력을 끊어 종료 누락을 심박으로 판정한다.
+            // 파이프 상속 시험만 지정한 핸들을 물려주고, 별도 정리 표식으로 회귀해도
+            // 시험 자체가 영원히 막히지 않게 한다.
+            .stdin(if pipe.as_deref() == Some("stdin") {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .stdout(if pipe.as_deref() == Some("stdout") {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .stderr(if pipe.as_deref() == Some("stderr") {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            });
         // 기다리지 않는 것이 이 시험의 전제다 — 손자는 부모보다 오래 살아남아야 하고,
         // 부모가 `wait()`로 막히면 그룹 종료를 재는 자리 자체가 사라진다. 좀비는 이
         // 보조 프로세스가 곧 끝나면서 init이 거둔다.
@@ -692,6 +716,14 @@ Options:
         )]
         let _grandchild = grandchild.spawn().expect("손자를 띄우지 못했습니다");
         std::fs::write(dir.join(SPAWNED_MARK), b"1").expect("표식을 쓰지 못했습니다");
+        // 파이프 상속 시험에서는 손자가 실제로 시작한 뒤 부모가 먼저 정상 종료한다.
+        if pipe.is_some() {
+            let started = Instant::now();
+            while heartbeat_len(&dir) == 0 && started.elapsed() < Duration::from_secs(2) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            return;
+        }
         // 부모의 제한 시간보다 한참 길게 잔다. 스스로 끝나면 이 시험은 "제한 시간이
         // 걸렸다"가 아니라 "자식이 알아서 끝났다"를 재게 된다.
         thread::sleep(Duration::from_secs(120));
@@ -704,8 +736,13 @@ Options:
         let Ok(dir) = std::env::var(BEAT_ENV) else {
             return;
         };
-        let path = PathBuf::from(dir).join(HEARTBEAT);
+        let dir = PathBuf::from(dir);
+        let path = dir.join(HEARTBEAT);
         for _ in 0..1_200 {
+            // 변이 시험에서도 떠도는 자손 없이 정리할 수 있도록 부모가 표식을 남긴다.
+            if dir.join(STOP_MARK).exists() {
+                return;
+            }
             use std::io::Write;
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
@@ -795,6 +832,126 @@ Options:
         assert_eq!(
             later, at_kill,
             "제한 시간 뒤에도 손자가 살아 있습니다 — 그룹 종료가 듣지 않았습니다"
+        );
+    }
+
+    fn assert_exited_parent_pipe_timeout(pipe: &str) {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().expect("임시 폴더");
+        let path = dir.path().to_path_buf();
+        let env = vec![
+            (SPAWNER_ENV.to_owned(), path.display().to_string()),
+            (PIPE_ENV.to_owned(), pipe.to_owned()),
+        ];
+        let with_input = pipe == "stdin";
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let exe = std::env::current_exe().expect("시험 바이너리 경로");
+            let input = vec![b'x'; 4 * 1024 * 1024];
+            let started = Instant::now();
+            let result = run_capped_with(
+                &exe,
+                &[
+                    "--exact",
+                    "cli_interface::tests::process_group_spawner_helper",
+                ],
+                Duration::from_secs(1),
+                &CappedOptions {
+                    env: &env,
+                    input: with_input.then_some(input.as_slice()),
+                    own_process_group: true,
+                    ..CappedOptions::default()
+                },
+            );
+            let _ = sender.send((result, started.elapsed()));
+        });
+        // 제품이 회귀해도 시험 자체는 영원히 막히지 않고 자손을 정리한 뒤 실패한다.
+        let first = receiver.recv_timeout(Duration::from_secs(3));
+        let at_return = heartbeat_len(&path);
+        thread::sleep(Duration::from_millis(150));
+        let after_return = heartbeat_len(&path);
+        std::fs::write(path.join(STOP_MARK), b"1").expect("자손 정리 표식");
+        let (result, elapsed) = first.unwrap_or_else(|_| {
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("자손 정리 뒤 회수")
+        });
+        worker.join().expect("실행 스레드 회수");
+        let outcome = result.expect("실행 결과");
+        assert!(path.join(SPAWNED_MARK).exists(), "자손을 띄우지 않았습니다");
+        assert!(at_return > 0, "자손이 실행되지 않았습니다");
+        assert!(outcome.timed_out, "{pipe}: 제한시간이 사라졌습니다");
+        assert!(
+            !outcome.success,
+            "{pipe}: 시간 초과를 성공으로 보고했습니다"
+        );
+        assert!(elapsed < Duration::from_secs(3), "{pipe}: {elapsed:?}");
+        assert_eq!(at_return, after_return, "{pipe}: 자손이 살아 있습니다");
+    }
+
+    #[test]
+    fn c16_3_timeout_survives_parent_exit_with_inherited_stdout() {
+        assert_exited_parent_pipe_timeout("stdout");
+    }
+
+    #[test]
+    fn c16_3_timeout_survives_parent_exit_with_inherited_stderr() {
+        assert_exited_parent_pipe_timeout("stderr");
+    }
+
+    #[test]
+    fn c16_3_timeout_survives_parent_exit_with_inherited_stdin() {
+        assert_exited_parent_pipe_timeout("stdin");
+    }
+
+    #[test]
+    fn process_group_echo_helper() {
+        let Ok(dir) = std::env::var(ECHO_ENV) else {
+            return;
+        };
+        use std::io::{Read, Write};
+        std::io::stdout()
+            .write_all(b"stdout-marker")
+            .expect("stdout");
+        std::io::stderr()
+            .write_all(b"stderr-marker")
+            .expect("stderr");
+        let mut input = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut input)
+            .expect("입력과 EOF");
+        std::fs::write(PathBuf::from(dir).join("input"), input).expect("입력 기록");
+    }
+
+    #[test]
+    fn c16_3_completed_group_keeps_output_and_delivers_full_input_with_eof() {
+        let dir = tempfile::tempdir().expect("임시 폴더");
+        let env = [(ECHO_ENV.to_owned(), dir.path().display().to_string())];
+        let input = vec![b'x'; 128 * 1024];
+        let outcome = run_capped_with(
+            &std::env::current_exe().expect("시험 바이너리 경로"),
+            &[
+                "--exact",
+                "cli_interface::tests::process_group_echo_helper",
+                "--nocapture",
+            ],
+            Duration::from_secs(5),
+            &CappedOptions {
+                env: &env,
+                input: Some(&input),
+                own_process_group: true,
+                ..CappedOptions::default()
+            },
+        )
+        .expect("정상 실행");
+        assert!(outcome.success, "{outcome:?}");
+        assert!(!outcome.timed_out, "{outcome:?}");
+        assert!(outcome.stdout.contains("stdout-marker"));
+        assert!(outcome.stderr.contains("stderr-marker"));
+        assert_eq!(
+            std::fs::read(dir.path().join("input")).expect("전달된 입력"),
+            input
         );
     }
 }

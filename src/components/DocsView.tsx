@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { ArrowLeft, ArrowRight, ChevronDown, PanelLeftClose, PanelLeftOpen, Plus, Settings, TriangleAlert, X } from "lucide-react";
 import {
-  createDoc,
   createDocRoot,
   deleteDocRoot,
   downloadDocumentFile,
@@ -20,22 +19,18 @@ import { runtimeText } from "../lib/i18nRuntime";
 import { LinkedFilePreview, useLinkedFilePreview } from "./LinkedFilePreview";
 import { directoryCreationItems, missingDirectoryPath } from "../lib/missingDirectory";
 import { readSecondaryPaneOpen, writeSecondaryPaneOpen } from "../lib/secondaryPane";
-import { DocumentTreePane, docRootTreeSource, useRequestGeneration } from "./DocumentTreePane";
+import { DocumentTreePane, docRootTreeSource, useRequestGeneration, type DocumentTreeChange } from "./DocumentTreePane";
+import { isPathWithin, useDocEntryActions } from "./DocumentEntryMenu";
 import { DocumentFilePane, type DocumentFilePaneProps } from "./DocumentFilePane";
 import { DocumentAutomationPanel } from "./DocumentAutomationPanel";
 import { errorText } from "../lib/errorText";
 import { createLatestGate } from "../lib/latestRequest";
 import { displayPath } from "../lib/displayPath";
+import { isMarkdownPath, parseLinkPath, resolveDocLinkPath } from "../lib/docLinkPath";
 
 const DOC_HISTORY_LIMIT = 100;
 const DOC_SIDEBAR_OPEN_KEY = "agent-manager.docs-sidebar";
 const SIDEBAR_OVERLAY_QUERY = "(max-width: 760px)";
-
-/** 새 문서 입력을 다듬고 Markdown 확장자가 없을 때만 붙인다. */
-function markdownDocumentPath(input: string): string {
-  const path = input.trim();
-  return path.toLowerCase().endsWith(".md") ? path : `${path}.md`;
-}
 
 /**
  * 문서 한 건을 가리키는 두 칸. 기록 항목·열려 있는 문서·이동 요청·트리에서 고른 파일이 모두
@@ -94,6 +89,7 @@ export function DocsView({ providers, accounts, models, onRequestAiaPrompt }: Do
     setEditing,
     showDocument,
     clearDocument: clearDocumentState,
+    relocateDocument,
     changeDraft,
     confirmDiscardDraft,
   } = useDocDraft(confirm);
@@ -125,12 +121,12 @@ export function DocsView({ providers, accounts, models, onRequestAiaPrompt }: Do
     navigating,
     linkedFilePreview,
     downloadLinkedFile,
-    closeSidebarOverlay,
     clearDocument,
     selectFile,
     moveHistory,
     selectRoot,
     openLinkedDoc,
+    openCreatedFile,
   } = useDocNavigation({
     doc,
     roots,
@@ -145,27 +141,55 @@ export function DocsView({ providers, accounts, models, onRequestAiaPrompt }: Do
     setSidebarVisibility,
   });
 
-  // 파일을 건드리는 세 자리(새 문서·저장·내려받기)와 그 진행 표시·트리 리비전은 이동
+  // 열린 문서를 건드리는 두 자리(저장·내려받기)와 그 진행 표시·트리 리비전은 이동
   // 기록·사이드바와 상태를 나눠 갖지 않으므로 훅 한 벌로 모은다. 이 훅은 효과를 등록하지
   // 않으므로 호출 자리가 다른 훅들의 효과 순서를 바꾸지 않는다.
   const {
-    newDocPath,
-    setNewDocPath,
     treeRevision,
     saving,
     downloading,
-    createFile,
     save,
     downloadCurrentDoc,
   } = useDocFileActions({
     doc,
     draft,
-    selectedRoot,
-    history,
     showDocument,
-    confirmDiscardDraft,
     setError,
-    onNavigated: closeSidebarOverlay,
+  });
+
+  // 트리 우클릭 메뉴(만들기·이름 변경·이동·복제·삭제·다운로드). 열린 문서와 이동 기록이
+  // 그 작업과 맞물리는 세 자리만 넘긴다 — 경로가 바뀌면 이동 기록을 고치고 열린 문서는
+  // 초안을 그대로 둔 채 경로만 고치며, 지워지면 기록에서 걷어내고 열린 문서를 닫고, 새로
+  // 만든 파일은 연다.
+  const entryActions = useDocEntryActions({
+    root: selectedRoot,
+    openPath: doc && selectedRoot && doc.rootId === selectedRoot.id ? doc.relativePath : null,
+    dirty,
+    confirm,
+    setError,
+    onRelocated: (rootId, from, to) => {
+      history.remap(rootId, from, to);
+      if (!doc || doc.rootId !== rootId || !isPathWithin(doc.relativePath, from)) return;
+      const relativePath = to + doc.relativePath.slice(from.length);
+      // 고치던 초안이 있으면 경로만 고쳐 이어 쓰게 한다. 없으면 새 이름으로 다시 읽는다 —
+      // 확장자가 바뀌면(.txt → .md) 미리보기 종류도 바뀌어야 하기 때문이다.
+      if (dirty) {
+        relocateDocument(rootId, from, to);
+        return;
+      }
+      getDocumentFile(rootId, relativePath).then(
+        (file) => showDocument(file),
+        (cause) => {
+          relocateDocument(rootId, from, to);
+          setError(errorText(cause));
+        },
+      );
+    },
+    onRemoved: (rootId, path) => {
+      history.remap(rootId, path, null);
+      if (doc && doc.rootId === rootId && isPathWithin(doc.relativePath, path)) clearDocument();
+    },
+    onCreatedFile: (entry) => void openCreatedFile(entry),
   });
 
   // 등록 폴더를 되살리는 버튼은 빈 화면 머리말과 문서 머리말 두 자리에 같은 모양·같은
@@ -207,14 +231,13 @@ export function DocsView({ providers, accounts, models, onRequestAiaPrompt }: Do
             if (selectedRoot?.id === root.id) clearDocument();
           }),
         }}
-        newFile={{
-          newDocPath,
-          saving,
-          navigating,
-          onNewDocPathChange: setNewDocPath,
-          onCreateFile: createFile,
+        tree={{
+          selectedPath: currentDocPath,
+          revision: treeRevision,
+          change: entryActions.treeChange,
+          onSelect: selectFile,
+          onContextMenu: entryActions.openMenu,
         }}
-        tree={{ selectedPath: currentDocPath, revision: treeRevision, onSelect: selectFile }}
       />}
       {sidebarOpen && sidebarIsOverlay && <button className="docs-sidebar-backdrop" type="button" onClick={() => setSidebarVisibility(false)} aria-label={text("등록 폴더 닫기", "Close registered folders")} />}
       <main className="doc-workspace" ref={workspaceRef}>
@@ -244,6 +267,8 @@ export function DocsView({ providers, accounts, models, onRequestAiaPrompt }: Do
         onMove={moveHistory}
       />}
       {linkedFilePreview.state && <LinkedFilePreview state={linkedFilePreview.state} onClose={linkedFilePreview.close} onDownload={downloadLinkedFile} />}
+      {entryActions.menu}
+      {entryActions.dialogs}
       {confirmDialog}
     </div>
   );
@@ -354,14 +379,12 @@ function DocsSidebar({
   onClose,
   form,
   rootList,
-  newFile,
   tree,
 }: {
   closeRef: RefObject<HTMLButtonElement | null>;
   onClose: () => void;
   form: DocRootFormState;
   rootList: DocRootListProps;
-  newFile: DocNewFileRowProps;
   tree: DocsSidebarTree;
 }) {
   const { roots, selectedRoot } = rootList;
@@ -387,16 +410,24 @@ function DocsSidebar({
         </div>
       </div>
       <DocRootForm form={form} />
-      <DocRootList {...rootList} />
+      <DocRootList
+        {...rootList}
+        // 선택한 등록 폴더 줄의 우클릭은 그 폴더 맨 위(루트) 메뉴다. 접근할 수 없는 폴더는
+        // 만들 자리도 없으므로 브라우저 기본 메뉴를 그대로 둔다.
+        onRootContextMenu={selectedRoot?.exists && !selectedRoot.restricted
+          ? (x, y) => tree.onContextMenu(null, x, y)
+          : undefined}
+      />
       {selectedRoot && (
         <div className="doc-tree-panel">
-          <DocNewFileRow {...newFile} />
           {selectedRoot.exists && !selectedRoot.restricted ? (
             <DocumentTreePane
               key={`${selectedRoot.id}:${selectedRoot.path}:${tree.revision}`}
               source={docRootTreeSource(selectedRoot.id, text("등록 폴더 파일", "Registered folder files"))}
               selectedPath={tree.selectedPath}
               onSelect={tree.onSelect}
+              onEntryContextMenu={tree.onContextMenu}
+              change={tree.change}
             />
           ) : (
             <p className="tree-empty">{text("접근할 수 없는 폴더입니다.", "This folder is not accessible.")}</p>
@@ -484,7 +515,17 @@ interface DocRootListProps {
 }
 
 /** 등록 폴더 목록. 로딩·빈 상태와 폴더 행 목록을 다룬다. */
-function DocRootList({ roots, selectedRoot, settings, onSelectRoot, onRemoveRoot }: DocRootListProps) {
+function DocRootList({
+  roots,
+  selectedRoot,
+  settings,
+  onSelectRoot,
+  onRemoveRoot,
+  onRootContextMenu,
+}: DocRootListProps & {
+  /** 선택한 등록 폴더 줄의 우클릭. 없으면 브라우저 기본 메뉴다. */
+  onRootContextMenu?: (x: number, y: number) => void;
+}) {
   const { text } = useI18n();
   if (roots === null) return <LoadingState label={text("등록 폴더 확인 중", "Checking registered folders")} />;
   if (roots.length === 0) {
@@ -495,11 +536,13 @@ function DocRootList({ roots, selectedRoot, settings, onSelectRoot, onRemoveRoot
     <div className={settings.editingRootId ? "root-list has-editor" : "root-list"}>
       {roots.map((root) => {
         const editing = settings.editingRootId === root.id;
+        const active = selectedRoot?.id === root.id;
         return (
           <div key={root.id} className={editing ? "root-item editing" : "root-item"}>
             <DocRootRow
               root={root}
-              active={selectedRoot?.id === root.id}
+              active={active}
+              onContextMenu={active ? onRootContextMenu : undefined}
               editing={editing}
               onSelectRoot={onSelectRoot}
               onToggleSettings={settings.toggle}
@@ -517,6 +560,7 @@ function DocRootList({ roots, selectedRoot, settings, onSelectRoot, onRemoveRoot
 function DocRootRow({
   root,
   active,
+  onContextMenu,
   editing,
   onSelectRoot,
   onToggleSettings,
@@ -524,6 +568,7 @@ function DocRootRow({
 }: {
   root: DocRootStatus;
   active: boolean;
+  onContextMenu?: (x: number, y: number) => void;
   editing: boolean;
   onSelectRoot: (root: DocRootStatus) => void;
   onToggleSettings: (root: DocRootStatus) => void;
@@ -533,7 +578,17 @@ function DocRootRow({
   const settingsLabel = text("폴더 설정", "Folder settings");
   return (
     <div className={active ? "root-row active" : "root-row"}>
-      <button type="button" onClick={() => onSelectRoot(root)}>
+      <button
+        type="button"
+        onClick={() => onSelectRoot(root)}
+        onContextMenu={onContextMenu && ((event) => {
+          // Shift+우클릭은 WebView 개발 메뉴에 남겨 둔다. 키보드(Shift+F10)로 연 메뉴는 받는다.
+          if (event.shiftKey && event.button === 2) return;
+          event.preventDefault();
+          const box = event.currentTarget.getBoundingClientRect();
+          onContextMenu(event.clientX || box.left + 24, event.clientY || box.top + 12);
+        })}
+      >
         {root.exists ? <ChevronDown size={13} /> : <TriangleAlert size={13} />}
         <span>
           <span className="root-row-heading">
@@ -632,46 +687,19 @@ function DocRootSettingsForm({ settings }: { settings: DocRootSettingsState }) {
   );
 }
 
-/** 새 문서 입력 행이 받는 한 벌. 사이드바는 이 묶음을 그대로 받아 행에 넘긴다. */
-interface DocNewFileRowProps {
-  newDocPath: string;
-  saving: boolean;
-  navigating: boolean;
-  onNewDocPathChange: (value: string) => void;
-  onCreateFile: () => void;
-}
-
-/** 새 마크다운 문서 파일 생성 경로 입력 행. */
-function DocNewFileRow({ newDocPath, saving, navigating, onNewDocPathChange, onCreateFile }: DocNewFileRowProps) {
-  return (
-    <div className="new-doc-row">
-      <input
-        value={newDocPath}
-        onChange={(event) => onNewDocPathChange(event.target.value)}
-        onKeyDown={(event) => event.key === "Enter" && !navigating && onCreateFile()}
-        placeholder="새문서.md"
-      />
-      <button
-        type="button"
-        disabled={saving || navigating || !newDocPath.trim()}
-        onClick={onCreateFile}
-        aria-label="새 문서 만들기"
-      >
-        <Plus size={14} />
-      </button>
-    </div>
-  );
-}
-
 /**
  * 문서 트리가 사이드바에서 보는 한 벌. 트리 자체는 선택 폴더에서 rootId를 받으므로, 바깥이
- * 넘길 것은 지금 열린 문서 경로·트리 리비전·선택 처리기 셋뿐이다.
+ * 넘길 것은 지금 열린 문서 경로·트리 리비전·우클릭 메뉴가 바꾼 자리·처리기 둘뿐이다.
  */
 interface DocsSidebarTree {
   selectedPath: string | null;
   /** 파일 목록·수정 일시를 다시 읽게 하는 리비전. 트리의 key에 들어간다. */
   revision: number;
+  /** 우클릭 메뉴가 바꾼 폴더. key와 달리 펼침 상태를 지우지 않고 그 폴더만 다시 읽는다. */
+  change: DocumentTreeChange | null;
   onSelect: (entry: DocumentEntry) => void;
+  /** 항목 줄이면 그 항목, 빈 자리·선택한 등록 폴더 줄이면 null(루트)이다. */
+  onContextMenu: (entry: DocumentEntry | null, x: number, y: number) => void;
 }
 
 /** 등록 폴더 등록 폼 한 벌. 사이드바는 이 묶음만 받아 칸이 늘어도 props가 흔들리지 않는다. */
@@ -716,7 +744,6 @@ interface DocRootSettingsSubmitHooks {
  */
 const DISCARD_QUESTIONS = {
   navigate: { ko: "이동할까요?", en: "Navigate anyway?" },
-  createFile: { ko: "새 문서를 만들까요?", en: "Create a new document anyway?" },
   changeRootPath: { ko: "폴더 경로를 바꿀까요?", en: "Change the folder path anyway?" },
 } as const;
 
@@ -755,13 +782,24 @@ function useDocDraft(confirm: (request: ConfirmRequest) => Promise<boolean>) {
     setEditing(false);
   };
 
+  /**
+   * 열린 문서(또는 그 상위 폴더)의 이름이 바뀌거나 옮겨졌을 때 경로만 고친다. 초안과 수정
+   * 여부는 그대로 둔다 — 이름을 바꾼다고 고치던 글이 사라질 까닭이 없고, 수정 시각도 이름
+   * 변경·이동으로는 바뀌지 않아 이어서 저장할 때 변경 충돌 검사가 그대로 맞는다.
+   */
+  const relocateDocument = (rootId: string, from: string, to: string) => {
+    setDoc((current) => current && current.rootId === rootId && isPathWithin(current.relativePath, from)
+      ? { ...current, relativePath: to + current.relativePath.slice(from.length) }
+      : current);
+  };
+
   /** 초안이 원본과 달라진 순간에만 수정 표시가 켜진다. 되돌려 적으면 다시 꺼진다. */
   const changeDraft = (value: string) => {
     setDraft(value);
     setDirty(value !== (doc?.content ?? ""));
   };
 
-  // 저장하지 않은 초안이 있을 때 되묻는 자리가 넷(문서 이동·폴더 전환·새 문서·기록 이동)이라
+  // 저장하지 않은 초안이 있을 때 되묻는 자리가 셋(문서 이동·폴더 전환·기록 이동)이라
   // 조건과 문구 조립이 그만큼 흩어져 있었다.
   const confirmDiscardDraft = async (question: DiscardQuestion) => !dirty || await confirm({
     title: "저장하지 않은 변경",
@@ -774,7 +812,7 @@ function useDocDraft(confirm: (request: ConfirmRequest) => Promise<boolean>) {
     tone: "danger",
   });
 
-  return { doc, draft, editing, dirty, setEditing, showDocument, clearDocument, changeDraft, confirmDiscardDraft };
+  return { doc, draft, editing, dirty, setEditing, showDocument, clearDocument, relocateDocument, changeDraft, confirmDiscardDraft };
 }
 
 /**
@@ -805,37 +843,25 @@ type DocHistory = ReturnType<typeof useDocHistory>;
 interface UseDocFileActionsOptions {
   doc: DocumentFile | null;
   draft: string;
-  selectedRoot: DocRootStatus | null;
-  history: DocHistory;
   showDocument: (file: DocumentFile, nextEditing?: boolean) => void;
-  confirmDiscardDraft: (question: DiscardQuestion) => Promise<boolean>;
   setError: (message: string | null) => void;
-  /** 새 문서를 만들어 화면을 옮긴 뒤. 겹쳐 떠 있는 사이드바를 닫는 자리다. */
-  onNavigated: () => void;
 }
 
 /**
- * 파일을 건드리는 세 자리(새 문서 만들기·저장·내려받기) 한 벌. 셋은 같은 순서(진행 표시
- * 켜기 → 오류 지우기 → 실패 시 오류 표시 → 진행 표시 끄기)를 지나고, 앞의 둘은 끝나고
- * 나면 같은 뒷정리(파일을 다시 읽어 화면에 올리고 트리 리비전을 올리기)까지 함께한다.
- * 그 공통 절차와 진행 표시 두 칸, 새 문서 입력 칸, 트리 리비전이 화면 본문에서 이동·폴더
- * 전환·사이드바 흐름 사이에 흩어져 있어 한자리에 모은다.
+ * 열린 문서를 건드리는 두 자리(저장·내려받기) 한 벌. 둘은 같은 순서(진행 표시 켜기 → 오류
+ * 지우기 → 실패 시 오류 표시 → 진행 표시 끄기)를 지나고, 저장은 끝나고 나면 파일을 다시
+ * 읽어 화면에 올리고 트리 리비전을 올린다.
  *
- * 이동 기록과 사이드바 닫기는 이 훅이 소유하지 않는다 — 이동 자리도 같은 기록을 쓰므로,
- * 새 문서가 착지할 기준만 `history`로 받고 화면 전환 뒷일은 `onNavigated`로 돌려 준다.
+ * 예전에는 사이드바의 `새문서.md` 입력 칸으로 문서를 만드는 자리도 여기 있었다. 만들기는
+ * 이제 트리 우클릭 메뉴(`useDocEntryActions`)가 맡아 일반 파일·폴더까지 다룬다.
  * 이 훅은 효과를 하나도 등록하지 않아 호출 자리가 다른 훅들의 효과 순서를 바꾸지 않는다.
  */
 function useDocFileActions({
   doc,
   draft,
-  selectedRoot,
-  history,
   showDocument,
-  confirmDiscardDraft,
   setError,
-  onNavigated,
 }: UseDocFileActionsOptions) {
-  const [newDocPath, setNewDocPath] = useState("");
   const [treeRevision, setTreeRevision] = useState(0);
   const [saving, setSaving] = useState(false);
   const [downloading, setDownloading] = useState(false);
@@ -848,36 +874,13 @@ function useDocFileActions({
     setBusy(false);
   };
 
-  // 문서 저장과 생성 뒤 파일 내용을 다시 읽고 화면과 트리를 동기화한다.
+  // 문서 저장 뒤 파일 내용을 다시 읽고 화면과 트리를 동기화한다.
   // 트리는 파일 목록·수정 일시 변경을 반영하기 위해 리비전을 올린다.
-  const syncDocumentFile = async (
-    target: DocumentRef,
-    onLoaded?: (file: DocumentFile) => void,
-    nextEditing?: boolean,
-  ) => {
+  const syncDocumentFile = async (target: DocumentRef) => {
     const file = await getDocumentFile(target.rootId, target.relativePath);
-    onLoaded?.(file);
-    showDocument(file, nextEditing);
+    showDocument(file);
     setTreeRevision((current) => current + 1);
     return file;
-  };
-
-  const createFile = async () => {
-    if (!selectedRoot || !newDocPath.trim()) return;
-    if (!(await confirmDiscardDraft("createFile"))) return;
-    const historyBeforeNavigation = history.captureScroll();
-    await runBusy(setSaving, async () => {
-      const path = markdownDocumentPath(newDocPath);
-      // QA #65. 만들기는 저장이 아니다. putDoc을 expected=null로 부르면 같은 이름의 문서가
-      // 이미 있을 때 아무 확인 없이 본문이 '# 새 문서' 한 줄로 덮여 사라졌다. 생성 전용
-      // 입구는 이미 있는 경로를 거절하고, 그 사유를 아래 오류 자리에 그대로 보여 준다.
-      const created = await createDoc(selectedRoot.id, path, "# 새 문서\n");
-      await syncDocumentFile(created, (file) => {
-        history.land(historyBeforeNavigation, file);
-      }, true);
-      setNewDocPath("");
-      onNavigated();
-    });
   };
 
   const save = async () => {
@@ -893,7 +896,7 @@ function useDocFileActions({
     await runBusy(setDownloading, () => downloadDocumentFile(doc.rootId, doc.relativePath));
   };
 
-  return { newDocPath, setNewDocPath, treeRevision, saving, downloading, createFile, save, downloadCurrentDoc };
+  return { treeRevision, saving, downloading, save, downloadCurrentDoc };
 }
 
 interface UseDocNavigationOptions {
@@ -978,6 +981,7 @@ function useDocNavigation({
   const navigateToDocument = async (
     target: DocumentRef,
     historyIndex: number | null = null,
+    nextEditing = false,
   ) => {
     if (historyIndex === null && isSameDocument(doc, target)) return;
     if (!(await confirmDiscardDraft("navigate"))) return;
@@ -998,7 +1002,7 @@ function useDocNavigation({
       onResult: (file) => {
         history.land(historyBeforeNavigation, target, historyIndex);
         setSelectedRoot(targetRoot);
-        showDocument(file, false);
+        showDocument(file, nextEditing);
         closeSidebarOverlay();
       },
       onError: setError,
@@ -1014,6 +1018,16 @@ function useDocNavigation({
       return;
     }
     void navigateToDocument(target);
+  };
+
+  /** 우클릭 메뉴로 만든 파일을 연다. Markdown이면 바로 쓸 수 있게 편집 상태로 연다. */
+  const openCreatedFile = async (entry: DocumentEntry) => {
+    if (!selectedRoot) return;
+    await navigateToDocument(
+      { rootId: selectedRoot.id, relativePath: entry.relativePath },
+      null,
+      entry.previewKind === "markdown",
+    );
   };
 
   const moveHistory = (offset: -1 | 1) => {
@@ -1052,12 +1066,12 @@ function useDocNavigation({
     navigating,
     linkedFilePreview,
     downloadLinkedFile,
-    closeSidebarOverlay,
     clearDocument,
     selectFile,
     moveHistory,
     selectRoot,
     openLinkedDoc,
+    openCreatedFile,
   };
 }
 
@@ -1385,7 +1399,27 @@ function useDocHistory(workspaceRef: RefObject<HTMLElement | null>, doc: Documen
 
   /** 등록이 풀린 폴더의 항목을 걷어낸다. 현재 위치는 남은 항목 기준으로 다시 센다. */
   const dropRoot = (rootId: string) => {
-    commit(dropHistoryRoot(stateRef.current, rootId));
+    commit(dropHistoryEntries(stateRef.current, (entry) => entry.rootId === rootId));
+  };
+
+  /**
+   * 우클릭 메뉴가 `from`(파일이거나 폴더)을 옮기거나 지운 뒤 기록을 맞춘다. 옮겼으면 그
+   * 아래 항목의 경로 앞부분을 `to`로 바꾸고, 지웠으면(`to`가 null) 걷어낸다. 그대로 두면
+   * 앞뒤 화살표가 없는 경로를 열려다 오류 배너를 띄운다.
+   */
+  const remap = (rootId: string, from: string, to: string | null) => {
+    const within = (entry: DocHistoryEntry) => entry.rootId === rootId && isPathWithin(entry.relativePath, from);
+    const current = stateRef.current;
+    if (to === null) {
+      commit(dropHistoryEntries(current, within));
+      return;
+    }
+    commit({
+      entries: current.entries.map((entry) => within(entry)
+        ? { ...entry, relativePath: to + entry.relativePath.slice(from.length) }
+        : entry),
+      index: current.index,
+    });
   };
 
   useLayoutEffect(() => {
@@ -1395,19 +1429,20 @@ function useDocHistory(workspaceRef: RefObject<HTMLElement | null>, doc: Documen
     workspaceRef.current?.scrollTo({ top: scrollTop, behavior: "auto" });
   }, [doc?.relativePath, doc?.rootId]);
 
-  return { state, captureScroll, pointsAt, land, step, dropRoot };
+  return { state, captureScroll, pointsAt, land, step, dropRoot, remap };
 }
 
 /**
- * 등록이 풀린 폴더의 이동 기록과 현재 위치를 한 번에 다시 만든다. 예전에는 전체 기록과
- * 현재 위치 앞 기록을 따로 걸러 같은 항목을 두 번 판별했다. 원래 배열을 한 번만 훑으며
- * 현재 위치까지 남은 항목 수도 함께 세어, 제거 뒤에도 같은 기록을 가리키게 한다.
+ * 걷어낼 항목(등록이 풀린 폴더·지운 파일)을 빼고 이동 기록과 현재 위치를 한 번에 다시
+ * 만든다. 예전에는 전체 기록과 현재 위치 앞 기록을 따로 걸러 같은 항목을 두 번 판별했다.
+ * 원래 배열을 한 번만 훑으며 현재 위치까지 남은 항목 수도 함께 세어, 제거 뒤에도 같은
+ * 기록을 가리키게 한다.
  */
-function dropHistoryRoot(current: DocHistoryState, rootId: string): DocHistoryState {
+function dropHistoryEntries(current: DocHistoryState, drop: (entry: DocHistoryEntry) => boolean): DocHistoryState {
   const entries: DocHistoryEntry[] = [];
   let retainedThroughCurrent = 0;
   current.entries.forEach((entry, sourceIndex) => {
-    if (entry.rootId === rootId) return;
+    if (drop(entry)) return;
     entries.push(entry);
     if (sourceIndex <= current.index) retainedThroughCurrent += 1;
   });
@@ -1431,33 +1466,6 @@ function pushHistoryEntry(base: DocHistoryState, target: DocumentRef): DocHistor
   return { entries, index: entries.length - 1 };
 }
 
-// 링크 표기에서 바깥 꺾쇠(`<...>`)를 벗겨낸다.
-function stripLinkBrackets(target: string): string {
-  const trimmed = target.trim();
-  return trimmed.startsWith("<") && trimmed.endsWith(">") ? trimmed.slice(1, -1).trim() : trimmed;
-}
-
-// 링크 표기에서 퍼센트 인코딩을 풀고 구분자·쿼리·프래그먼트와 `:12` 같은 줄 번호 꼬리를
-// 떼어 경로만 남긴다. 디코드할 수 없는 링크는 비교하지 않고 버린다(null).
-function decodeLinkPath(target: string): string | null {
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(target);
-  } catch {
-    return null;
-  }
-  return decoded.replace(/\\/g, "/").split(/[?#]/, 1)[0].replace(/:\d+$/, "");
-}
-
-/** 꺾쇠를 벗기고 디코딩과 쿼리·해시 제거를 거쳐 순수 링크 경로만 추출한다. */
-function parseLinkPath(href: string): string | null {
-  return decodeLinkPath(stripLinkBrackets(href));
-}
-
-function isMarkdownPath(path: string): boolean {
-  return /\.md$/i.test(path);
-}
-
 /** 연결 문서를 읽거나 내려받기 전에 두 작업이 공유하는 현재 문서 문맥을 확인한다. */
 function withSelectedDocument<T>(
   rootId: string | null,
@@ -1468,46 +1476,4 @@ function withSelectedDocument<T>(
   // 따르는 `runtimeText`로 짝을 짓는다.
   if (!rootId || !relativePath) return Promise.reject(new Error(runtimeText("파일을 선택하세요.", "Select a file.")));
   return work(rootId, relativePath);
-}
-
-/**
- * 경로 세그먼트 배열에서 빈 문자열과 '.'을 건너뛰고 '..'으로 상위 디렉터리를 거슬러 올라간다.
- * 최상위 경로를 벗어나려는 '..'이 나오면 잘못된 상대 경로로 보아 null을 돌려준다.
- */
-function normalizePathSegments(segments: string[]): string | null {
-  const normalized: string[] = [];
-  for (const segment of segments) {
-    if (!segment || segment === ".") continue;
-    if (segment === "..") {
-      if (normalized.length === 0) return null;
-      normalized.pop();
-      continue;
-    }
-    normalized.push(segment);
-  }
-  return normalized.length > 0 ? normalized.join("/") : null;
-}
-
-/**
- * 구문 분석(꺾쇠·퍼센트 인코딩·쿼리·줄 번호)을 거친 링크 경로를 등록 폴더 기준으로 해석한다.
- * 절대 경로는 등록 폴더 접두사를 확인하고, 상대 경로는 현재 문서 위치에 얹어 정규화한다.
- */
-function resolveDocLinkPath(rootPath: string, currentPath: string, target: string): string | null {
-  const root = rootPath.replace(/\\/g, "/").replace(/\/$/, "");
-  const absolute = target.startsWith("/") || /^[a-z]:\//i.test(target);
-  let segments: string[];
-  if (absolute) {
-    const rootPrefix = `${root}/`;
-    if (target.toLowerCase().startsWith(rootPrefix.toLowerCase())) {
-      segments = target.slice(rootPrefix.length).split("/");
-    } else if (target.startsWith("/")) {
-      segments = target.slice(1).split("/");
-    } else {
-      return null;
-    }
-  } else {
-    segments = [...currentPath.split("/").slice(0, -1), ...target.split("/")];
-  }
-
-  return normalizePathSegments(segments);
 }

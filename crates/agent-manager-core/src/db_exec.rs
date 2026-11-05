@@ -681,37 +681,47 @@ fn query_mysql(
 ) -> Result<QueryOutcome, CoreError> {
     use mysql::prelude::Queryable;
     let mut handle = open_mysql(connection)?;
-    // C10-9. 읽기는 엔진 수준 읽기 전용 트랜잭션 안에서만 돈다. 지원하지 않는 옛 서버는
-    // 평범한 트랜잭션으로 물러서되, 문장 검사가 읽기로 판정한 것만 여기 닿는다.
-    if handle.query_drop("START TRANSACTION READ ONLY").is_err() {
-        handle
-            .query_drop("START TRANSACTION")
-            .map_err(mysql_error)?;
-    }
-    let outcome = (|| -> Result<QueryOutcome, CoreError> {
-        let mut result = handle.query_iter(sql).map_err(mysql_error)?;
-        let columns: Vec<String> = result
-            .columns()
-            .as_ref()
-            .iter()
-            .map(|column| column.name_str().to_string())
-            .collect();
-        let mut collector = RowCollector::new(limit);
-        for row in result.by_ref() {
-            let row = row.map_err(mysql_error)?;
-            if !collector.offer(|| {
-                row.unwrap()
-                    .into_iter()
-                    .map(mysql_value_to_string)
-                    .collect()
-            }) {
-                break;
+    mysql_read_only_query(
+        &mut handle,
+        |handle, statement| handle.query_drop(statement),
+        |handle| {
+            let mut result = handle.query_iter(sql)?;
+            let columns: Vec<String> = result
+                .columns()
+                .as_ref()
+                .iter()
+                .map(|column| column.name_str().to_string())
+                .collect();
+            let mut collector = RowCollector::new(limit);
+            for row in result.by_ref() {
+                let row = row?;
+                if !collector.offer(|| {
+                    row.unwrap()
+                        .into_iter()
+                        .map(mysql_value_to_string)
+                        .collect()
+                }) {
+                    break;
+                }
             }
-        }
-        Ok(collector.finish(columns))
-    })();
-    let _ = handle.query_drop("ROLLBACK");
-    outcome
+            Ok(collector.finish(columns))
+        },
+        mysql_error,
+    )
+}
+
+/// C10-9: 읽기 전용 시작이 실패하면 SQL을 실행하지 않는다. 일반 트랜잭션으로
+/// 재시도하면 문장 검사가 놓친 쓰기를 엔진이 막는다는 보장이 사라진다.
+fn mysql_read_only_query<H, T, E>(
+    handle: &mut H,
+    run: impl Fn(&mut H, &str) -> Result<(), E>,
+    query: impl FnOnce(&mut H) -> Result<T, E>,
+    to_error: impl Fn(E) -> CoreError,
+) -> Result<T, CoreError> {
+    run(handle, "START TRANSACTION READ ONLY").map_err(&to_error)?;
+    let outcome = query(handle);
+    let _ = run(handle, "ROLLBACK");
+    outcome.map_err(to_error)
 }
 
 fn mysql_value_to_string(value: mysql::Value) -> Option<String> {
@@ -1006,6 +1016,80 @@ mod tests {
         )
         .expect_err("write");
         assert!(matches!(error, CoreError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn c10_9_mysql_refuses_query_when_read_only_transaction_cannot_start() {
+        let mut statements = Vec::new();
+        let result = mysql_read_only_query(
+            &mut statements,
+            |statements, statement| {
+                statements.push(statement.to_owned());
+                if statement == "START TRANSACTION READ ONLY" {
+                    Err("read-only transaction refused")
+                } else {
+                    Ok(())
+                }
+            },
+            |statements| {
+                statements.push("QUERY".to_owned());
+                Ok(())
+            },
+            |error| CoreError::Runtime(error.to_owned()),
+        );
+        assert!(
+            matches!(result, Err(CoreError::Runtime(message)) if message == "read-only transaction refused")
+        );
+        assert_eq!(statements, ["START TRANSACTION READ ONLY"]);
+    }
+
+    #[test]
+    fn c10_9_mysql_reads_only_after_read_only_start_and_rolls_back() {
+        let mut statements = Vec::new();
+        let result = mysql_read_only_query(
+            &mut statements,
+            |statements, statement| {
+                statements.push(statement.to_owned());
+                Ok::<_, &str>(())
+            },
+            |statements| {
+                statements.push("QUERY".to_owned());
+                Ok(42)
+            },
+            |error| CoreError::Runtime(error.to_owned()),
+        )
+        .expect("read-only query");
+        assert_eq!(result, 42);
+        assert_eq!(
+            statements,
+            ["START TRANSACTION READ ONLY", "QUERY", "ROLLBACK"]
+        );
+    }
+
+    #[test]
+    fn c10_9_mysql_query_error_survives_failed_rollback() {
+        let mut statements = Vec::new();
+        let result = mysql_read_only_query(
+            &mut statements,
+            |statements, statement| {
+                statements.push(statement.to_owned());
+                if statement == "ROLLBACK" {
+                    Err("rollback failed")
+                } else {
+                    Ok(())
+                }
+            },
+            |statements| {
+                statements.push("QUERY".to_owned());
+                Err::<(), _>("query failed")
+            },
+            |error| CoreError::Runtime(error.to_owned()),
+        );
+        assert!(matches!(result, Err(CoreError::Runtime(message)) if message == "query failed"));
+        assert_eq!(
+            statements,
+            ["START TRANSACTION READ ONLY", "QUERY", "ROLLBACK"]
+        );
     }
 
     #[test]

@@ -13,8 +13,9 @@
  * 앵커를 달아 그 자리로 스크롤만 한다.
  *
  * 경로는 `diff --git` 줄에서 읽는다. patch는 `git diff --binary --full-index`가 뜬 것이고
- * (C19-1) 그 줄의 두 경로는 같은 파일이므로, `b/` 쪽을 쓴다 — v1은 rename을 거절하므로
- * (C19-3) 양쪽이 갈라지는 경우는 애초에 들어오지 않는다.
+ * (C19-1) 그 줄의 두 경로는 같은 파일이다 — v1은 rename을 거절하므로(C19-3) 양쪽이
+ * 갈라지는 경우는 애초에 들어오지 않는다. 그래서 두 경로가 같을 때만 경로로 받고, 다르면
+ * 경로 없는 구간으로 둔다(`pathOfHeader`).
  */
 
 export type OverlayPatchSection = {
@@ -24,14 +25,29 @@ export type OverlayPatchSection = {
   readonly text: string;
 };
 
-/** `diff --git a/x b/x` 한 줄에서 경로를 꺼낸다. 읽지 못하면 null. */
+/**
+ * `diff --git a/x b/x` 한 줄에서 경로를 꺼낸다. 읽지 못하면 null.
+ *
+ * 공백은 git이 따옴표로 감싸는 사유가 아니다(실측, git 2.x) — `dir b/file`은
+ * `diff --git a/dir b/file b/dir b/file`로 온다. 그 줄에서 ` b/`를 앞에서 찾든 뒤에서 찾든
+ * 경로의 일부를 잘라 먹어, 영수증의 충돌 경로와 일치하지 않고 구간으로 스크롤하지 못했다.
+ * 두 경로가 같다는 사실(v1은 rename을 거절한다, C19-3)이 유일하게 믿을 수 있는 경계이므로
+ * 길이로 반을 갈라 재조립이 원문과 같을 때만 경로로 받는다. 따옴표 모양(`"`·`\`·제어문자·
+ * 비ASCII 경로)도 같은 규칙으로 가르되 이스케이프는 풀지 않는다 — 이전과 같다.
+ */
 function pathOfHeader(line: string): string | null {
-  // 경로에 공백이 있으면 git이 따옴표로 감싸므로 그 모양을 먼저 본다.
-  const quoted = line.match(/^diff --git "a\/(.*)" "b\/(.+)"$/);
-  if (quoted) return quoted[2].length > 0 ? quoted[2] : null;
-  const plain = line.match(/^diff --git a\/(.*) b\/(.+)$/);
-  if (!plain) return null;
-  return plain[2].length > 0 ? plain[2] : null;
+  const rest = line.slice("diff --git ".length);
+  return twinPath(rest, "a/", " b/", "") ?? twinPath(rest, '"a/', '" "b/', '"');
+}
+
+/** `<head><p><mid><p><tail>` 모양에서 두 번 나온 같은 `p`를 꺼낸다. 그 모양이 아니면 null. */
+function twinPath(rest: string, head: string, mid: string, tail: string): string | null {
+  if (!rest.startsWith(head) || !rest.endsWith(tail)) return null;
+  const inner = rest.slice(head.length, rest.length - tail.length);
+  const twice = inner.length - mid.length;
+  if (twice <= 0 || twice % 2 !== 0) return null;
+  const path = inner.slice(0, twice / 2);
+  return inner === `${path}${mid}${path}` ? path : null;
 }
 
 /**

@@ -3,16 +3,23 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use serde::Serialize;
 
-use crate::file_kind::ensure_within_limit;
+use crate::file_kind::{ensure_regular_file, ensure_within_limit};
+use crate::path_guard::child_facing;
 use crate::CoreError;
 
 const MAX_LINKED_FILE_BYTES: u64 = 5 * 1024 * 1024;
+/// 이미지 미리보기 상한. 텍스트처럼 줄마다 하이라이팅하지 않고 `data:` URL 하나로 실어
+/// 보내므로 텍스트보다 크게 잡는다. 두 상한은 [`ResolvedLinkedFile::into_preview`]가 건다.
+const MAX_LINKED_IMAGE_BYTES: u64 = 30 * 1024 * 1024;
 const MAX_LINKED_FILE_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
 /// 이어 복사할 때 한 번에 옮기는 양. 진행률을 알리는 간격이기도 하다. 파일 전체를
 /// 메모리에 올리지 않는 것이 이 경로의 존재 이유이므로 상수는 파일 크기와 무관하다.
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
+const LINK_NOT_REGULAR_FILE: &str = "링크 대상이 일반 파일이 아닙니다";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,6 +28,8 @@ pub struct LinkedFile {
     pub content: String,
     pub size_bytes: u64,
     pub target_line: Option<usize>,
+    /// 이미지 파일이면 화면이 그대로 그릴 `data:` URL. 이때 `content`는 비어 있다.
+    pub image_data_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,27 +63,50 @@ struct ResolvedLinkedFile {
     relative_path: String,
     size_bytes: u64,
     target_line: Option<usize>,
+    /// 자리 확인 때 잰 상한. 실제로 읽을 때 같은 값을 다시 적용한다 — 재기와 읽기
+    /// 사이에 파일이 바뀌어도 메모리에 올리는 양은 이 값을 넘지 않는다.
+    max_bytes: u64,
 }
 
 impl ResolvedLinkedFile {
+    /// 미리보기 상한은 종류마다 달라 자리 확인 뒤 여기서 고른다. 자리 확인은 상한 없이
+    /// 하므로, 30MB를 넘는 텍스트도 텍스트 상한(5MB)으로 안내된다.
     fn into_preview(self) -> Result<LinkedFile, CoreError> {
-        let bytes = fs::read(self.path)?;
-        let content = String::from_utf8(bytes).map_err(|_| {
-            CoreError::InvalidInput("미리보기를 지원하지 않는 파일입니다.".to_owned())
-        })?;
+        let image_mime = image_mime_type(&self.path);
+        let limit = if image_mime.is_some() {
+            MAX_LINKED_IMAGE_BYTES
+        } else {
+            MAX_LINKED_FILE_BYTES
+        };
+        let bytes = read_bounded(&self.path, limit.min(self.max_bytes))?;
+        let size_bytes = bytes.len() as u64;
+        let (content, image_data_url) = match image_mime {
+            Some(mime) => (
+                String::new(),
+                Some(format!("data:{mime};base64,{}", STANDARD.encode(bytes))),
+            ),
+            None => {
+                let content = String::from_utf8(bytes).map_err(|_| {
+                    CoreError::InvalidInput("미리보기를 지원하지 않는 파일입니다.".to_owned())
+                })?;
+                (content, None)
+            }
+        };
         Ok(LinkedFile {
             relative_path: self.relative_path,
+            size_bytes,
             content,
-            size_bytes: self.size_bytes,
             target_line: self.target_line,
+            image_data_url,
         })
     }
 
     fn into_download(self) -> Result<LinkedFileDownload, CoreError> {
+        let bytes = read_bounded(&self.path, self.max_bytes)?;
         Ok(LinkedFileDownload {
-            bytes: fs::read(self.path)?,
+            size_bytes: bytes.len() as u64,
+            bytes,
             relative_path: self.relative_path,
-            size_bytes: self.size_bytes,
         })
     }
 
@@ -87,33 +119,61 @@ impl ResolvedLinkedFile {
     }
 }
 
+/// 크기를 잰 파일과 읽는 파일이 같은 핸들이 되게 읽는다. 경로로 재고 경로로 다시 열면
+/// 그 사이에 파일이 커지거나 바뀐 경우 상한보다 큰 바이트가 통째로 메모리에 올라간다 —
+/// 상한이 있는 이유가 메모리이므로, 읽는 쪽이 상한을 다시 지켜야 한다(G10).
+/// `take(max + 1)` 로 한 바이트만 더 읽어, 잰 뒤에 자란 파일도 잘라 돌려주지 않고
+/// 거절한다.
+fn read_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, CoreError> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    ensure_regular_file(&metadata, LINK_NOT_REGULAR_FILE)?;
+    ensure_within_limit(&metadata, max_bytes)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    (&file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(CoreError::TooLarge(max_bytes));
+    }
+    Ok(bytes)
+}
+
 pub(crate) fn read_linked_file(root: &Path, href: &str) -> Result<LinkedFile, CoreError> {
     read_linked_file_from(root, root, href)
 }
 
-/// 채팅의 현재 권한으로 읽는다. 문서·지침·과거 세션의 작업공간 제한은 별도로 유지한다.
-pub(crate) fn read_chat_linked_file(
-    root: &Path,
-    href: &str,
-    allow_external: bool,
-) -> Result<LinkedFile, CoreError> {
-    resolve_linked_file_with_access(root, root, href, MAX_LINKED_FILE_BYTES, allow_external)?
-        .into_preview()
+/// 채팅 링크가 열어도 되는 자리. 문서·지침·과거 세션의 작업공간 제한은 별도로 유지한다.
+///
+/// `primary`(작업 폴더)가 상대 링크의 기준이고, `others`는 에이전트가 함께 다루는
+/// 폴더(등록 폴더·Cypress 작업공간 등)다. 에이전트가 만든 파일을 링크로 보내 놓고
+/// 사용자는 "작업 경로 밖"이라 못 여는 일이 없게, 루트 목록은 그 채팅이 실제로 다루는
+/// 범위를 그대로 받는다. 전체 접근 채팅(`allow_external`)은 루트와 무관하게 연다.
+///
+/// `others`는 링크가 작업 폴더 밖일 때만 부른다. 등록 폴더 확인은 굳은 폴더를 기다리고
+/// 세션 목록까지 훑으므로, 대부분인 작업 폴더 안 링크가 그 값을 치르지 않게 한다.
+///
+/// `denied`는 범위 안이어도 미리보기·다운로드로 내보내지 않는 파일을 고른다. 비밀이 든
+/// `cypress.env.json`처럼 원문을 호스트 전용 명령으로만 여는 파일이 여기 걸린다.
+pub(crate) struct LinkScope<'a> {
+    pub primary: PathBuf,
+    pub others: &'a dyn Fn() -> Vec<PathBuf>,
+    pub denied: &'a dyn Fn(&Path) -> bool,
+    pub allow_external: bool,
 }
 
-pub(crate) fn read_chat_linked_file_download(
-    root: &Path,
+pub(crate) fn read_scoped_linked_file(
+    scope: &LinkScope<'_>,
     href: &str,
-    allow_external: bool,
+) -> Result<LinkedFile, CoreError> {
+    resolve_scoped_linked_file(scope, href, u64::MAX)?.into_preview()
+}
+
+pub(crate) fn read_scoped_linked_file_download(
+    scope: &LinkScope<'_>,
+    href: &str,
 ) -> Result<LinkedFileDownload, CoreError> {
-    resolve_linked_file_with_access(
-        root,
-        root,
-        href,
-        MAX_LINKED_FILE_DOWNLOAD_BYTES,
-        allow_external,
-    )?
-    .into_download()
+    resolve_scoped_linked_file(scope, href, MAX_LINKED_FILE_DOWNLOAD_BYTES)?.into_download()
 }
 
 pub(crate) fn read_linked_file_from(
@@ -121,7 +181,7 @@ pub(crate) fn read_linked_file_from(
     base: &Path,
     href: &str,
 ) -> Result<LinkedFile, CoreError> {
-    resolve_linked_file(root, base, href, MAX_LINKED_FILE_BYTES)?.into_preview()
+    resolve_linked_file(root, base, href, u64::MAX)?.into_preview()
 }
 
 pub(crate) fn read_linked_file_download(
@@ -314,39 +374,68 @@ fn resolve_linked_file(
     href: &str,
     max_bytes: u64,
 ) -> Result<ResolvedLinkedFile, CoreError> {
-    resolve_linked_file_with_access(root, base, href, max_bytes, false)
-}
-
-fn resolve_linked_file_with_access(
-    root: &Path,
-    base: &Path,
-    href: &str,
-    max_bytes: u64,
-    allow_external: bool,
-) -> Result<ResolvedLinkedFile, CoreError> {
     let (root, base) = resolve_link_workspace(root, base)?;
     let (path_text, target_line) = parse_link_target(href)?;
-    let path = resolve_link_target(&root, &base, &path_text, allow_external)?;
-    let metadata = fs::metadata(&path)?;
-    if !metadata.is_file() {
+    let path = resolve_link_target(&root, &base, &path_text, false)?;
+    resolved_file(path, &root, target_line, max_bytes)
+}
+
+/// [`resolve_linked_file`]의 채팅 판. 상대 링크는 작업 폴더에 붙이고, 결과가 [`LinkScope`]
+/// 범위 안이면 연다.
+fn resolve_scoped_linked_file(
+    scope: &LinkScope<'_>,
+    href: &str,
+    max_bytes: u64,
+) -> Result<ResolvedLinkedFile, CoreError> {
+    let (primary, _) = resolve_link_workspace(&scope.primary, &scope.primary)?;
+    let (path_text, target_line) = parse_link_target(href)?;
+    // 경계는 아래에서 범위 전체로 따로 본다.
+    let path = resolve_link_target(&primary, &primary, &path_text, true)?;
+    if (scope.denied)(&path) {
         return Err(CoreError::InvalidInput(
-            "링크 대상이 일반 파일이 아닙니다".to_owned(),
+            "이 파일은 링크로 열 수 없습니다".to_owned(),
         ));
     }
-    ensure_within_limit(&metadata, max_bytes)?;
+    // 함께 다루는 폴더는 지금 열리지 않으면 건너뛴다. 하나가 사라졌다고 다른 폴더의
+    // 링크까지 못 열면 안 된다.
+    let in_scope = scope.allow_external
+        || is_inside(&path, &primary)
+        || (scope.others)()
+            .iter()
+            .filter_map(|root| fs::canonicalize(root).ok())
+            .any(|root| root.is_dir() && is_inside(&path, &root));
+    if !in_scope {
+        return Err(CoreError::InvalidInput(
+            "작업 경로 밖의 파일은 열 수 없습니다".to_owned(),
+        ));
+    }
+    resolved_file(path, &primary, target_line, max_bytes)
+}
 
-    // 외부 파일은 절대 경로로 표시해 다른 프로젝트의 동명 파일과 구분한다.
-    let relative_path = path
-        .strip_prefix(&root)
-        .unwrap_or(&path)
-        .to_string_lossy()
-        .replace('\\', "/");
+/// 확인을 마친 경로에 크기와 표시 이름을 붙인다. 작업 폴더 안이면 그 기준 상대 경로로,
+/// 밖이면 다른 프로젝트의 동명 파일과 구분되게 전체 경로로 표시한다.
+fn resolved_file(
+    path: PathBuf,
+    root: &Path,
+    target_line: Option<usize>,
+    max_bytes: u64,
+) -> Result<ResolvedLinkedFile, CoreError> {
+    let metadata = fs::metadata(&path)?;
+    ensure_regular_file(&metadata, LINK_NOT_REGULAR_FILE)?;
+    ensure_within_limit(&metadata, max_bytes)?;
+    let relative_path = match path.strip_prefix(root) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => child_facing(&path),
+    }
+    .to_string_lossy()
+    .replace('\\', "/");
 
     Ok(ResolvedLinkedFile {
         path,
         relative_path,
         size_bytes: metadata.len(),
         target_line,
+        max_bytes,
     })
 }
 
@@ -394,6 +483,26 @@ fn resolve_link_target(
         ));
     }
     Ok(path)
+}
+
+/// 루트 자신은 파일이 아니므로 안쪽으로 치지 않는다.
+fn is_inside(path: &Path, root: &Path) -> bool {
+    path != root && path.starts_with(root)
+}
+
+/// 미리보기를 그림으로 그릴 파일인지 확장자로 판정한다. 화면은 `<img>`로 그리기만 하므로
+/// 내용이 확장자와 달라도 깨진 그림이 될 뿐 다른 해석으로 번지지 않는다. SVG는 텍스트라
+/// 지금처럼 원문 미리보기로 둔다.
+fn image_mime_type(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => return None,
+    })
 }
 
 fn parse_link_target(href: &str) -> Result<(String, Option<usize>), CoreError> {
@@ -468,6 +577,40 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    /// 작업 폴더 하나만 있는 채팅 범위. 권한별 경계 시험이 루트 목록과 무관하게 쓴다.
+    fn with_workspace_scope<T>(
+        root: &Path,
+        allow_external: bool,
+        read: impl FnOnce(&LinkScope<'_>) -> T,
+    ) -> T {
+        read(&LinkScope {
+            primary: root.to_path_buf(),
+            others: &Vec::new,
+            denied: &|_| false,
+            allow_external,
+        })
+    }
+
+    fn read_chat_linked_file(
+        root: &Path,
+        href: &str,
+        allow_external: bool,
+    ) -> Result<LinkedFile, CoreError> {
+        with_workspace_scope(root, allow_external, |scope| {
+            read_scoped_linked_file(scope, href)
+        })
+    }
+
+    fn read_chat_linked_file_download(
+        root: &Path,
+        href: &str,
+        allow_external: bool,
+    ) -> Result<LinkedFileDownload, CoreError> {
+        with_workspace_scope(root, allow_external, |scope| {
+            read_scoped_linked_file_download(scope, href)
+        })
+    }
 
     #[test]
     fn reads_relative_and_absolute_utf8_files_with_line_targets() {
@@ -546,6 +689,48 @@ mod tests {
                 .bytes,
             b"secret"
         );
+    }
+
+    #[test]
+    fn g10_bounded_read_measures_and_reads_through_one_handle() {
+        let temp = tempdir().expect("temp directory");
+        let path = temp.path().join("grown.txt");
+        fs::write(&path, b"0123456789").expect("source file");
+
+        // 자리 확인이 끝난 뒤 파일이 상한을 넘게 자란 상황: 경로로 다시 열어 통째로 읽는
+        // 구현은 10바이트를 돌려주고, 핸들에서 상한을 다시 지키는 구현은 거절한다.
+        assert!(matches!(
+            read_bounded(&path, 9),
+            Err(CoreError::TooLarge(9))
+        ));
+        assert_eq!(
+            read_bounded(&path, 10).expect("within limit"),
+            b"0123456789"
+        );
+        assert!(matches!(
+            read_bounded(temp.path(), 10),
+            Err(CoreError::InvalidInput(_))
+        ));
+    }
+
+    /// 잰 크기보다 실제 바이트가 많은 파일 — 리눅스 `/proc` 항목은 stat 길이가 0 이다.
+    /// 경로 stat 상한만 보는 구현은 통째로 읽어 돌려주고, 핸들에서 상한을 다시 지키는
+    /// 구현만 거절한다. 그래서 이 시험이 `take(max + 1)` 가드를 고정한다.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn g10_bounded_read_rejects_bytes_beyond_the_limit_even_when_stat_understates() {
+        let status = Path::new("/proc/self/status");
+        let stat_len = fs::metadata(status).expect("proc metadata").len();
+        assert_eq!(
+            stat_len, 0,
+            "/proc 항목은 길이를 0 으로 보고해야 전제가 성립한다"
+        );
+        assert!(matches!(
+            read_bounded(status, 8),
+            Err(CoreError::TooLarge(8))
+        ));
+        let whole = read_bounded(status, MAX_LINKED_FILE_BYTES).expect("within limit");
+        assert!(whole.len() > 8);
     }
 
     #[test]
@@ -800,5 +985,132 @@ mod tests {
             parse_link_target("src/main.rs#L0"),
             Err(CoreError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn previews_images_as_data_urls_within_their_own_limit() {
+        let temp = tempdir().expect("temp directory");
+        let root = temp.path().join("workspace");
+        fs::create_dir_all(&root).expect("workspace directory");
+        let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        fs::write(root.join("shot.PNG"), png).expect("image file");
+
+        let preview = read_linked_file(&root, "shot.PNG").expect("image preview");
+        assert_eq!(preview.content, "");
+        assert_eq!(
+            preview.image_data_url.as_deref(),
+            Some(format!("data:image/png;base64,{}", STANDARD.encode(png)).as_str())
+        );
+        assert_eq!(preview.size_bytes, png.len() as u64);
+
+        // 텍스트 상한(5MB)을 넘어도 이미지 상한(30MB) 안이면 열린다.
+        let big = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(root.join("big.jpg"))
+            .expect("big image");
+        big.set_len(MAX_LINKED_FILE_BYTES + 1)
+            .expect("big image length");
+        assert!(read_linked_file(&root, "big.jpg")
+            .expect("image over text limit")
+            .image_data_url
+            .is_some_and(|url| url.starts_with("data:image/jpeg;base64,")));
+
+        big.set_len(MAX_LINKED_IMAGE_BYTES + 1)
+            .expect("huge image length");
+        assert!(matches!(
+            read_linked_file(&root, "big.jpg"),
+            Err(CoreError::TooLarge(MAX_LINKED_IMAGE_BYTES))
+        ));
+    }
+
+    #[test]
+    fn text_over_every_limit_reports_the_text_limit() {
+        let temp = tempdir().expect("temp directory");
+        let root = temp.path().join("workspace");
+        fs::create_dir_all(&root).expect("workspace directory");
+        let huge = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(root.join("huge.log"))
+            .expect("huge log");
+        huge.set_len(MAX_LINKED_IMAGE_BYTES + 1)
+            .expect("huge log length");
+
+        assert!(matches!(
+            read_linked_file(&root, "huge.log"),
+            Err(CoreError::TooLarge(MAX_LINKED_FILE_BYTES))
+        ));
+    }
+
+    #[test]
+    fn scoped_links_open_files_in_every_root_but_not_denied_or_outside() {
+        let temp = tempdir().expect("temp directory");
+        let primary = temp.path().join("project");
+        let cypress = temp.path().join("project-cypress");
+        let outside = temp.path().join("other");
+        for dir in [&primary, &cypress, &outside] {
+            fs::create_dir_all(dir.join("sub")).expect("directories");
+        }
+        fs::write(primary.join("sub/notes.md"), "# 메모\n").expect("primary file");
+        fs::write(cypress.join("sub/result.json"), "{}\n").expect("cypress file");
+        fs::write(cypress.join("cypress.env.json"), "{\"password\":\"x\"}").expect("env file");
+        fs::write(outside.join("secret.txt"), "no").expect("outside file");
+        let other_calls = std::cell::Cell::new(0);
+        let others = || {
+            other_calls.set(other_calls.get() + 1);
+            vec![cypress.clone(), temp.path().join("missing")]
+        };
+        let denied = |path: &Path| path.ends_with("cypress.env.json");
+        let scope = LinkScope {
+            primary: primary.clone(),
+            others: &others,
+            denied: &denied,
+            allow_external: false,
+        };
+
+        let relative = read_scoped_linked_file(&scope, "sub/notes.md").expect("primary link");
+        assert_eq!(relative.relative_path, "sub/notes.md");
+        // 작업 폴더 안 링크는 나머지 루트를 확인하지 않는다.
+        assert_eq!(other_calls.get(), 0);
+
+        let absolute = cypress.join("sub/result.json");
+        let other_root = read_scoped_linked_file(&scope, absolute.to_string_lossy().as_ref())
+            .expect("absolute link into another root");
+        let expected = child_facing(&fs::canonicalize(&absolute).expect("canonical"))
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert_eq!(other_root.relative_path, expected);
+        assert_eq!(other_root.content, "{}\n");
+        // 상대 링크로 옆 루트에 닿아도 그 루트 안이면 열린다.
+        assert!(read_scoped_linked_file(&scope, "../project-cypress/sub/result.json").is_ok());
+        assert!(
+            read_scoped_linked_file_download(&scope, absolute.to_string_lossy().as_ref()).is_ok()
+        );
+
+        for href in [
+            cypress
+                .join("cypress.env.json")
+                .to_string_lossy()
+                .into_owned(),
+            "../project-cypress/cypress.env.json".to_owned(),
+        ] {
+            assert!(matches!(
+                read_scoped_linked_file(&scope, &href),
+                Err(CoreError::InvalidInput(message)) if message == "이 파일은 링크로 열 수 없습니다"
+            ));
+            assert!(read_scoped_linked_file_download(&scope, &href).is_err());
+        }
+        for href in [
+            outside.join("secret.txt").to_string_lossy().into_owned(),
+            "../other/secret.txt".to_owned(),
+        ] {
+            assert!(matches!(
+                read_scoped_linked_file(&scope, &href),
+                Err(CoreError::InvalidInput(message)) if message == "작업 경로 밖의 파일은 열 수 없습니다"
+            ));
+        }
     }
 }

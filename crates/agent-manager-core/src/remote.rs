@@ -88,7 +88,10 @@ pub const DEFAULT_REMOTE_ACCESS_PORT: u16 = crate::DEFAULT_BACKEND_SERVICE_PORT;
 /// 13: C9 SSH 연결 서버가 키에서 독립했다 — `set_ssh_key_endpoint`가 `save_ssh_server`·
 ///     `delete_ssh_server`로 바뀌고 확인·터미널·실행이 `serverId`로 서버를 고른다.
 /// 14: 등록 폴더 설정 변경 명령(`update_doc_root`)이 추가됐다.
-pub const REMOTE_API_PROTOCOL_VERSION: u32 = 14;
+/// 15: C21 분산처리 실행기 명령(`list_runners`·`save_runner`·`set_runner_enabled`·
+///     `delete_runner`·`add_runner_project`·`update_runner_project`·`delete_runner_project`·
+///     `check_runner`)이 추가됐다.
+pub const REMOTE_API_PROTOCOL_VERSION: u32 = 15;
 const MIN_REMOTE_ACCESS_PORT: u16 = crate::MIN_BACKEND_SERVICE_PORT;
 /// 재시작 시 이전 백엔드가 저장소 잠금을 놓을 때까지 기다리는 최대 시간.
 const BACKEND_OWNERSHIP_HANDOVER_WAIT: Duration = Duration::from_secs(15);
@@ -1878,6 +1881,39 @@ fn stop_running_server(server: &mut Option<RunningServer>) {
     }
 }
 
+/// 인덱스 프로젝트 적용이 따르는 등록부 프로젝트(활성·폴더 여부 포함). 등록부를 못 읽거나 아직
+/// 비어 있으면 `None` — 그때 맞추지 않는다(자동 등록 폴더를 잘못 지우지 않도록).
+fn index_projects(catalog: &SessionCatalog) -> Option<Vec<crate::index_addon::IndexProject>> {
+    let registry = catalog.project_registry().ok()?;
+    if registry.is_empty() {
+        return None;
+    }
+    Some(
+        registry
+            .into_iter()
+            .map(|entry| crate::index_addon::IndexProject {
+                path: entry.path,
+                name: entry.name,
+                active: entry.active,
+                exists: entry.exists,
+            })
+            .collect(),
+    )
+}
+
+/// 적용 설정·인덱스 사용·프로젝트 활성이 바뀐 뒤 프로젝트 폴더를 맞추고, 새로 생긴 폴더의 첫
+/// 색인은 요청을 붙잡지 않도록 뒤에서 한다. 주기 작업(1분)이 같은 일을 다시 하므로 실패는 넘긴다.
+fn sync_index_projects_now(app_data_dir: &Path, catalog: &SessionCatalog) {
+    let Some(projects) = index_projects(catalog) else {
+        return;
+    };
+    if crate::index_addon::sync_index_projects(app_data_dir, &projects).is_err() {
+        return;
+    }
+    let app = app_data_dir.to_path_buf();
+    std::thread::spawn(move || crate::index_addon::index_pending_project_sources(&app));
+}
+
 async fn serve_loop<F>(
     listener: TcpListener,
     config: Arc<Config>,
@@ -1886,6 +1922,19 @@ async fn serve_loop<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    let catalog = config.session_catalog.clone();
+    let index_refresh =
+        crate::index_addon::start_index_refresh(config.app_data_dir.clone(), move || {
+            index_projects(&catalog)
+        });
+    // Dropping a server loop must stop its periodic task, including listener failures.
+    struct StopIndexRefresh(tokio::task::JoinHandle<()>);
+    impl Drop for StopIndexRefresh {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _index_refresh = StopIndexRefresh(index_refresh);
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -1933,6 +1982,12 @@ pub fn run_remote_server_from_args(
         crate::run_ssh_endpoint_cli(args.into_iter().skip(1))?;
         return Ok(());
     }
+    // C21-4. 외부 도구(공용 자리 도구)가 부르는 실행기 목록. 읽기만 하므로 SSH 목록과
+    // 같은 이유로 서버 소유권 lease를 잡지 않는다.
+    if args.first().map(String::as_str) == Some("runners") {
+        crate::runners::run_runners_cli(args.into_iter().skip(1))?;
+        return Ok(());
+    }
     // C10-13. 데이터베이스 스킬이 부르는 목록·조회·변경. 목록과 조회는 이 프로세스에서
     // 끝나고, 변경만 승인 카드를 띄울 백엔드로 넘어간다.
     if args.first().map(String::as_str) == Some("db") {
@@ -1943,6 +1998,10 @@ pub fn run_remote_server_from_args(
     // 셋 다 떠 있는 백엔드로 넘어간다.
     if args.first().map(String::as_str) == Some("secret") {
         crate::run_chat_secret_cli(args.into_iter().skip(1))?;
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("index") {
+        crate::run_index_cli(args.into_iter().skip(1))?;
         return Ok(());
     }
     let options = StandaloneServerOptions::from_args(args.into_iter())?;
@@ -4133,6 +4192,11 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "delete_doc_root"
             | "create_doc"
             | "put_doc"
+            | "create_document_entry"
+            | "rename_document_entry"
+            | "move_document_entry"
+            | "duplicate_document_entry"
+            | "delete_document_entry"
             | "create_document_trigger"
             | "update_document_trigger"
             | "delete_document_trigger"
@@ -4213,11 +4277,26 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "save_ssh_server"
             | "delete_ssh_server"
             | "check_ssh_endpoint"
+            | "save_runner"
+            | "set_runner_enabled"
+            | "delete_runner"
+            | "add_runner_project"
+            | "update_runner_project"
+            | "delete_runner_project"
+            | "check_runner"
             | "execute_ssh_command"
             | "relay_ssh_command"
             | "allow_ssh_command_permanently"
             | "upload_ssh_file"
             | "download_ssh_file"
+            | "set_index_settings"
+            | "set_index_projects"
+            | "add_index_source"
+            | "set_index_source_enabled"
+            | "set_index_source_projects"
+            | "remove_index_source"
+            | "refresh_index_source"
+            | "refresh_agent_index_source"
             | "set_db_connection"
             | "set_db_connection_enabled"
             | "remove_db_connection"
@@ -5485,6 +5564,22 @@ fn dispatch_command(
             let args: RequestEnvelope<crate::SshServerRef> = parse_params(params)?;
             to_value(crate::check_ssh_endpoint(app_data_dir, args.request)?)
         }
+        // C21. 분산처리 실행기. 화면과 AIA가 같은 이름을 쓰되, AIA에는 C9 경계 안의 모양만
+        // 준다(`dispatch_runner_command`). 홈을 확인하지 못해도 저장은 되고 목록이 알린다.
+        "list_runners"
+        | "save_runner"
+        | "set_runner_enabled"
+        | "delete_runner"
+        | "add_runner_project"
+        | "update_runner_project"
+        | "delete_runner_project"
+        | "check_runner" => dispatch_runner_command(
+            context.actor,
+            crate::user_home::home_dir().ok().as_deref(),
+            app_data_dir,
+            command,
+            params,
+        ),
         // 로컬 LLM 연결 한 벌. API 키는 값이 아니라 `apiKeyConfigured` 여부로만 실린다.
         "get_local_llm_connection" => to_value(crate::get_local_llm_connection(app_data_dir)?),
         // 주소 하나를 실제로 찔러 모델 목록을 받아 온다. 저장본에 닿지 않지만 **바깥으로
@@ -5525,6 +5620,62 @@ fn dispatch_command(
             )?)
         }
         // C10-1. 등록된 연결 목록. 비밀값은 어느 필드에도 없다.
+        "set_index_settings" => {
+            let args: RequestEnvelope<crate::SetIndexSettingsRequest> = parse_params(params)?;
+            crate::set_index_settings(app_data_dir, args.request)?;
+            sync_index_projects_now(app_data_dir, session_catalog);
+            to_value(crate::get_index_sources(app_data_dir, false)?)
+        }
+        "set_index_projects" => {
+            let args: RequestEnvelope<crate::SetIndexProjectsRequest> = parse_params(params)?;
+            crate::set_index_projects(app_data_dir, args.request)?;
+            sync_index_projects_now(app_data_dir, session_catalog);
+            to_value(crate::get_index_sources(app_data_dir, false)?)
+        }
+        "get_index_sources" => to_value(crate::get_index_sources(app_data_dir, false)?),
+        "list_agent_index_sources" => {
+            let args: OptionalRequestEnvelope<crate::AgentIndexRequest> =
+                parse_optional_params(params)?;
+            to_value(crate::list_agent_index_sources(app_data_dir, args.request)?)
+        }
+        "add_index_source" => {
+            let args: RequestEnvelope<crate::AddIndexSourceRequest> = parse_params(params)?;
+            to_value(crate::add_index_source(app_data_dir, args.request)?)
+        }
+        "set_index_source_enabled" => {
+            let args: RequestEnvelope<crate::SetIndexSourceEnabledRequest> = parse_params(params)?;
+            to_value(crate::set_index_source_enabled(app_data_dir, args.request)?)
+        }
+        "set_index_source_projects" => {
+            let args: RequestEnvelope<crate::SetIndexSourceProjectsRequest> = parse_params(params)?;
+            to_value(crate::set_index_source_projects(
+                app_data_dir,
+                args.request,
+            )?)
+        }
+        "remove_index_source" | "refresh_index_source" => {
+            let args: RequestEnvelope<crate::IndexSourceRequest> = parse_params(params)?;
+            if command == "remove_index_source" {
+                to_value(crate::remove_index_source(app_data_dir, &args.request.id)?)
+            } else {
+                to_value(crate::refresh_index_source(app_data_dir, &args.request.id)?)
+            }
+        }
+        "search_index" => {
+            let args: RequestEnvelope<crate::SearchIndexRequest> = parse_params(params)?;
+            to_value(crate::search_index(app_data_dir, args.request)?)
+        }
+        "refresh_agent_index_source" => {
+            let args: RequestEnvelope<crate::AgentIndexSourceRequest> = parse_params(params)?;
+            to_value(crate::index_addon::refresh_agent_index_source(
+                app_data_dir,
+                args.request,
+            )?)
+        }
+        "read_index_excerpt" => {
+            let args: RequestEnvelope<crate::ReadIndexExcerptRequest> = parse_params(params)?;
+            to_value(crate::read_index_excerpt(app_data_dir, args.request)?)
+        }
         "get_db_connections" => to_value(crate::get_db_connections(app_data_dir)?),
         // C10-1/C10-5. 연결 저장은 비밀번호를 함께 받을 수 있어 호스트 화면에서만 한다.
         "set_db_connection" => {
@@ -6675,6 +6826,8 @@ fn dispatch_skill_command(
             // 않고, 최소 주기 갱신은 30초 안의 스캔이 있으면 건너뛴다. 설정은 이미 저장됐으니
             // 스캔 실패가 토글을 실패로 만들지는 않는다.
             let _ = session_catalog.refresh_resources();
+            // 인덱스 프로젝트 적용은 활성 프로젝트를 따른다. 제외하면 그 폴더 색인을 지운다.
+            sync_index_projects_now(app_data_dir, session_catalog);
             to_value(session_catalog.project_registry()?)
         }
         // 공통 원본 지문만 읽는 변경 감지용 축약 조회. 공급자 설치본을 훑지 않아
@@ -7519,6 +7672,58 @@ fn dispatch_document_command(
                 args.request.expected_modified_at,
             )?)
         }
+        // 파일 화면 우클릭 메뉴. 다섯 입구 모두 등록 폴더 안에서만 움직이고(G10), 이미 있는
+        // 항목을 덮지 않으며, AIA는 에이전트 접근을 켠 등록 폴더에서만 부를 수 있다.
+        "create_document_entry" => {
+            let args: RequestEnvelope<CreateDocumentEntryRequest> = parse_params(params)?;
+            require_doc_root_agent_access(actor, app_data_dir, &args.request.root_id)?;
+            to_value(crate::create_document_entry(
+                app_data_dir,
+                &args.request.root_id,
+                &args.request.parent_path,
+                &args.request.name,
+                args.request.kind,
+            )?)
+        }
+        "rename_document_entry" => {
+            let args: RequestEnvelope<RenameDocumentEntryRequest> = parse_params(params)?;
+            require_doc_root_agent_access(actor, app_data_dir, &args.request.root_id)?;
+            to_value(crate::rename_document_entry(
+                app_data_dir,
+                &args.request.root_id,
+                &args.request.relative_path,
+                &args.request.new_name,
+            )?)
+        }
+        "move_document_entry" => {
+            let args: RequestEnvelope<MoveDocumentEntryRequest> = parse_params(params)?;
+            require_doc_root_agent_access(actor, app_data_dir, &args.request.root_id)?;
+            to_value(crate::move_document_entry(
+                app_data_dir,
+                &args.request.root_id,
+                &args.request.relative_path,
+                &args.request.target_parent_path,
+            )?)
+        }
+        "duplicate_document_entry" => {
+            let args: RequestEnvelope<DocumentEntryRequest> = parse_params(params)?;
+            require_doc_root_agent_access(actor, app_data_dir, &args.request.root_id)?;
+            to_value(crate::duplicate_document_file(
+                app_data_dir,
+                &args.request.root_id,
+                &args.request.relative_path,
+            )?)
+        }
+        "delete_document_entry" => {
+            let args: RequestEnvelope<DeleteDocumentEntryRequest> = parse_params(params)?;
+            require_doc_root_agent_access(actor, app_data_dir, &args.request.root_id)?;
+            to_value(crate::delete_document_entry(
+                app_data_dir,
+                &args.request.root_id,
+                &args.request.relative_path,
+                args.request.recursive,
+            )?)
+        }
         "get_document_automation_snapshot" => {
             to_value(document_automation_access(context)?.snapshot()?)
         }
@@ -8359,6 +8564,13 @@ struct RequestEnvelope<T> {
     request: T,
 }
 
+/// `request`를 생략해도 되는 명령. 비우면 기본값이다.
+#[derive(Debug, Default, Deserialize)]
+struct OptionalRequestEnvelope<T: Default> {
+    #[serde(default)]
+    request: T,
+}
+
 /// C9-18. `<CLI> ssh exec`가 보내는 본문. `chatId`는 출력이 흐를 대화이며 권한이 아니다.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -8561,6 +8773,90 @@ fn validated_claude_settings_project(
         "Claude 설정은 활성 상태의 등록 프로젝트에서만 바꿀 수 있습니다",
     )
     .map(Some)
+}
+
+/// C21. `save_runner`의 인자 `{ "runner": {...} }`.
+#[derive(Debug, Deserialize)]
+struct SaveRunnerArg {
+    runner: crate::runners::SaveRunnerRequest,
+}
+
+/// C21. 프로젝트 폴더 한 줄 명령의 인자 `{ "project": {...} }`. 목록을 통째로 보내지 않으므로
+/// 두 화면이 서로 다른 줄을 고쳐도 한쪽 변경이 사라지지 않는다.
+#[derive(Debug, Deserialize)]
+struct RunnerProjectArg {
+    project: crate::runners::RunnerProjectInput,
+}
+
+/// 다른 모듈의 시험(`system_mcp`)이 AIA·화면 행위자별 실행기 응답을 견줄 때 쓰는 입구.
+#[cfg(test)]
+pub(crate) fn runner_command_for_test(
+    actor: SessionReadActor,
+    home: Option<&Path>,
+    app_data_dir: &Path,
+    command: &str,
+    params: Value,
+) -> Result<Value, String> {
+    dispatch_runner_command(actor, home, app_data_dir, command, params)
+        .map_err(|error| error.message)
+}
+
+/// C21. 실행기 명령 한 벌. 변경은 모두 앱 데이터의 `runners-v1.json`만 바꾸고, 끝나면 부른
+/// 쪽에 맞는 목록을 돌려준다 — 화면에는 고를 수 있는 SSH 서버까지, AIA에는 에이전트 사용이
+/// 꺼진 서버의 접속 정보와 서버 목록을 뺀 모양(C21-3). AIA의 접속 확인은 그 서버의 에이전트
+/// 사용이 켜져 있어야 한다.
+fn dispatch_runner_command(
+    actor: SessionReadActor,
+    home: Option<&Path>,
+    app_data_dir: &Path,
+    command: &str,
+    params: Value,
+) -> Result<Value, ApiError> {
+    use crate::runners;
+    let for_agent = actor == SessionReadActor::Aia;
+    match command {
+        "list_runners" => {}
+        "save_runner" => {
+            let args: SaveRunnerArg = parse_params(params)?;
+            runners::save_runner(app_data_dir, args.runner)?;
+        }
+        "set_runner_enabled" => {
+            let args: runners::SetRunnerEnabledRequest = parse_params(params)?;
+            runners::set_runner_enabled(app_data_dir, args)?;
+        }
+        "delete_runner" => {
+            let args: runners::RunnerRef = parse_params(params)?;
+            runners::delete_runner(app_data_dir, args)?;
+        }
+        "add_runner_project" => {
+            let args: RunnerProjectArg = parse_params(params)?;
+            runners::add_runner_project(app_data_dir, args.project)?;
+        }
+        "update_runner_project" => {
+            let args: RunnerProjectArg = parse_params(params)?;
+            runners::update_runner_project(app_data_dir, args.project)?;
+        }
+        "delete_runner_project" => {
+            let args: runners::RunnerRef = parse_params(params)?;
+            runners::delete_runner_project(app_data_dir, args)?;
+        }
+        // C21-3. 실행기가 가리키는 서버로 C9-11 확인을 한 번 한다. 저장본에 닿지 않아도
+        // 바깥으로 나가는 행위라 `probe_local_llm_connection`과 같이 변경 쪽으로 분류한다.
+        "check_runner" => {
+            let args: runners::RunnerRef = parse_params(params)?;
+            return to_value(runners::check_runner(app_data_dir, args, for_agent)?);
+        }
+        other => {
+            return Err(ApiError::not_found(format!(
+                "알 수 없는 실행기 명령입니다: {other}"
+            )))
+        }
+    }
+    if for_agent {
+        to_value(runners::list_runners_for_agent_with(home, app_data_dir)?)
+    } else {
+        to_value(runners::list_runners_with(home, app_data_dir)?)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -9280,6 +9576,52 @@ struct CreateDocRequest {
     root_id: String,
     relative_path: String,
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateDocumentEntryRequest {
+    root_id: String,
+    /// 새 항목을 둘 폴더. 비어 있으면 등록 폴더 맨 위다.
+    #[serde(default)]
+    parent_path: String,
+    name: String,
+    kind: crate::DocumentEntryKind,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenameDocumentEntryRequest {
+    root_id: String,
+    relative_path: String,
+    new_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MoveDocumentEntryRequest {
+    root_id: String,
+    relative_path: String,
+    /// 옮겨 갈 폴더. 비어 있으면 등록 폴더 맨 위다.
+    #[serde(default)]
+    target_parent_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentEntryRequest {
+    root_id: String,
+    relative_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteDocumentEntryRequest {
+    root_id: String,
+    relative_path: String,
+    /// 비어 있지 않은 폴더를 통째로 지울지. 끄면 하위 항목 수만 돌려받는다.
+    #[serde(default)]
+    recursive: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -10770,6 +11112,63 @@ mod tests {
         ));
         // C9-12. 열린 엔드포인트 목록은 개인키 경로와 `ssh` 인자만 담은 조회다.
         assert!(!is_write_command("list_agent_ssh_endpoints"));
+    }
+
+    /// C21. 실행기 목록은 비밀 없는 조회이고, 저장·켜짐·삭제·프로젝트 한 줄 명령은 앱 데이터만
+    /// 바꾸는 변경이다. 접속 확인은 저장본에 닿지 않아도 바깥으로 나가므로 변경 쪽이다.
+    #[test]
+    fn runners_c21_classification_and_argument_shapes() {
+        assert!(!is_write_command("list_runners"));
+        for command in [
+            "save_runner",
+            "set_runner_enabled",
+            "delete_runner",
+            "add_runner_project",
+            "update_runner_project",
+            "delete_runner_project",
+            "check_runner",
+        ] {
+            assert!(is_write_command(command), "{command}");
+        }
+        // 목록을 통째로 바꾸던 명령은 없어졌다 — 동시 편집에서 다른 줄이 사라졌다.
+        assert!(!is_write_command("save_runner_projects"));
+        let save: SaveRunnerArg = parse_params(json!({
+            "runner": {"serverId": "srv-abc", "slots": 3, "enabled": false}
+        }))
+        .expect("save arg");
+        assert_eq!(save.runner.server_id, "srv-abc");
+        assert_eq!(save.runner.slots, Some(3));
+        assert_eq!(save.runner.enabled, Some(false));
+        assert!(save.runner.id.is_none());
+        let project: RunnerProjectArg = parse_params(json!({
+            "project": {"name": "game", "root": "/srv/game", "exclude": ["_land"]}
+        }))
+        .expect("project arg");
+        assert_eq!(project.project.exclude, vec!["_land".to_owned()]);
+        assert!(project.project.id.is_none());
+        let toggle: crate::runners::SetRunnerEnabledRequest =
+            parse_params(json!({"id": "run-abc", "enabled": true})).expect("toggle");
+        assert!(toggle.enabled);
+        assert!(parse_params::<SaveRunnerArg>(json!({"runner": {}})).is_err());
+
+        let app_data = tempfile::tempdir().expect("app data");
+        let unknown = dispatch_runner_command(
+            SessionReadActor::User,
+            None,
+            app_data.path(),
+            "save_runner_projects",
+            json!({}),
+        );
+        assert!(unknown.is_err());
+        let listed = dispatch_runner_command(
+            SessionReadActor::User,
+            None,
+            app_data.path(),
+            "list_runners",
+            Value::Null,
+        )
+        .expect("list");
+        assert!(listed.get("sshServers").is_some());
     }
 
     #[test]

@@ -63,6 +63,46 @@ test("기본 계정이 없으면 확인된 홈 계정 사용량을 표시한다"
   assert.equal(sources[0].usage.windows[0].usedPercent, 22);
 });
 
+test("V4: 기본 계정 ID가 다른 공급자의 계정을 가리키면 검증된 홈으로 폴백한다", () => {
+  const foreignAccount = { id: "claude-1", provider: "claude", displayName: "다른 공급자", usage: usage([win("5시간", 91)]) };
+  const homeUsage = usage([win("5시간", 22)]);
+  const sources = sidebarUsageSources(snapshot({
+    accounts: [foreignAccount],
+    providers: [provider({ activeAccountId: foreignAccount.id, home: home({ usage: homeUsage }) })],
+  }));
+
+  assert.equal(sources.length, 1);
+  assert.equal(sources[0].key, "home:codex");
+  assert.equal(sources[0].kind, "home");
+  assert.equal(sources[0].provider, "codex");
+  assert.equal(sources[0].displayName, "home@example.com");
+  assert.deepEqual(sources[0].usage, homeUsage);
+});
+
+test("V4: 다른 공급자의 기본 계정 참조와 미검증 홈으로는 사용량을 표시하지 않는다", () => {
+  const foreignAccount = { id: "claude-1", provider: "claude", displayName: "다른 공급자", usage: usage([win("5시간", 91)]) };
+  const sources = sidebarUsageSources(snapshot({
+    accounts: [foreignAccount],
+    providers: [provider({ activeAccountId: foreignAccount.id, home: home({ state: "absent" }) })],
+  }));
+
+  assert.deepEqual(sources, []);
+});
+
+test("V4: 공급자까지 일치하는 기본 계정은 홈이 미검증이어도 표시한다", () => {
+  const account = { id: "codex-1", provider: "codex", displayName: "기본 계정", usage: usage([win("5시간", 71)]) };
+  const sources = sidebarUsageSources(snapshot({
+    accounts: [account],
+    providers: [provider({ activeAccountId: account.id, home: home({ state: "absent" }) })],
+  }));
+
+  assert.equal(sources.length, 1);
+  assert.equal(sources[0].key, "account:codex-1");
+  assert.equal(sources[0].kind, "default");
+  assert.equal(sources[0].displayName, account.displayName);
+  assert.deepEqual(sources[0].usage, account.usage);
+});
+
 test("기본 계정이 없고 홈 로그인의 신원이 확인되지 않았으면 표시하지 않는다", () => {
   const sources = sidebarUsageSources(snapshot({
     providers: [provider({ home: home({ state: "absent" }) })],
@@ -134,6 +174,19 @@ test("Antigravity 계정이 등록돼 계정 소스가 나오면 공급자 단�
   assert.deepEqual(homeOnly.map((entry) => entry.kind), ["home"]);
   // 계정도 검증된 홈도 없으면 공급자 단위 쿼터가 유일한 창이라 그대로 낸다.
   assert.deepEqual(unverified.map((entry) => entry.kind), ["provider"]);
+});
+
+test("등록만 되고 기본이 아닌 Antigravity 계정은 계정 소스가 아니라 공급자 쿼터가 선다", () => {
+  // 가르는 기준은 "등록 여부"가 아니라 "앞서 고른 소스(기본 계정·검증된 홈) 중 Antigravity 가
+  // 있는가"다. 기본으로 고르지 않은 계정은 소스를 내지 않으므로 홈이 미검증이면 쿼터가 남는다.
+  const antigravity = usage([win("5시간", 29), win("7일", 71)]);
+  const account = { id: "agy-2", provider: "antigravity", displayName: "spare@example.com", usage: antigravity };
+  const sources = sidebarUsageSources(snapshot({
+    accounts: [account],
+    providers: [provider({ provider: "antigravity", activeAccountId: null, home: home({ state: "absent" }) })],
+  }), antigravity);
+
+  assert.deepEqual(sources.map((entry) => entry.key), ["provider:antigravity"]);
 });
 
 test("등록 계정 미터는 공급자 이름과 계정 이름을 붙이고 창 값을 반올림한다", () => {

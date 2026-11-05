@@ -492,6 +492,49 @@ mod tests {
     }
 
     #[test]
+    fn c16_11_c17_1_git_value_read_holds_the_store_lock_and_keeps_metadata_secret_free() {
+        let directory = stored_secret();
+        set_saved_secret_agent_enabled(directory.path(), "API_KEY", false).expect("disable");
+        let value = take_for_git_remote_with(directory.path(), "API_KEY", || {
+            // 삭제와 같은 잠금을 다른 핸들로 시도해 값 읽기 도중의 배제를 확인한다.
+            let contender = crate::app_data_file::open_private_file(
+                &directory.path().join(STORE.lock_file),
+                false,
+            )?;
+            assert!(matches!(
+                fs4::FileExt::try_lock(&contender),
+                Err(fs4::TryLockError::WouldBlock)
+            ));
+            Ok(Some(Zeroizing::new("synthetic-git-only-value".to_owned())))
+        })
+        .expect("git read")
+        .expect("named value");
+        assert_eq!(value.as_str(), "synthetic-git-only-value");
+        let store: SavedSecretStore = STORE.read(directory.path()).expect("metadata");
+        assert!(store.secrets[0].last_used_at.is_some());
+        assert!(!store.secrets[0].agent_enabled);
+        let raw = std::fs::read_to_string(STORE.path(directory.path())).expect("metadata file");
+        assert!(
+            !raw.contains(value.as_str()),
+            "G4/C17-1: metadata has no value"
+        );
+    }
+
+    #[test]
+    fn c16_11_git_usage_timestamp_write_failure_does_not_discard_the_value() {
+        let directory = stored_secret();
+        let value = take_for_git_remote_with(directory.path(), "API_KEY", || {
+            std::fs::remove_file(STORE.path(directory.path()))?;
+            std::fs::create_dir(STORE.path(directory.path()))?;
+            Ok(Some(Zeroizing::new("synthetic-git-only-value".to_owned())))
+        })
+        .expect("timestamp failure is non-fatal")
+        .expect("named value");
+        assert_eq!(value.as_str(), "synthetic-git-only-value");
+        assert!(STORE.path(directory.path()).is_dir());
+    }
+
+    #[test]
     fn missing_name_reads_as_not_found() {
         let error = not_found("API_KEY");
         assert!(matches!(error, CoreError::NotFound(_)));

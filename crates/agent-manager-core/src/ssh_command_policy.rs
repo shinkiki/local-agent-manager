@@ -90,8 +90,10 @@ fn head_name(token: &str) -> &str {
 /// 첫 단어만 보면 `nohup rm -rf …`가 `rm -rf` 차단을 비켜 간다.
 fn command_head_positions(argv: &[&str]) -> Vec<usize> {
     let mut positions = Vec::new();
-    for (index, token) in argv.iter().enumerate() {
+    let mut index = 0;
+    while let Some(token) = argv.get(index) {
         if token.starts_with('-') {
+            index += 1;
             continue;
         }
         // 실행 자리의 `NAME=값`은 원격 셸(첫 자리)과 `sudo`(감싸인 자리)가 명령이 아니라
@@ -102,6 +104,13 @@ fn command_head_positions(argv: &[&str]) -> Vec<usize> {
         if is_assignment_word(token) || !WRAPPER_COMMAND_HEADS.contains(&head_name(token)) {
             break;
         }
+        // C9-14. `sudo -u app bash`의 `app`은 실행 파일이 아니라 옵션 값이다.
+        // 비밀번호 처리와 같은 경계로 건너뛰어 실제 명령에 거부·차단을 적용한다.
+        index = if head_name(token) == "sudo" {
+            sudo_options(argv, index).1
+        } else {
+            index + 1
+        };
     }
     positions
 }
@@ -194,20 +203,47 @@ const SUDO_VALUE_OPTIONS: &[&str] = &[
 /// `ls`·`sort`의 플래그다. 앞은 비밀번호를 받을 자리를 통째로 건너뛰게 하고, 뒤는 이미
 /// `-S`가 있다고 보아 sudo에 `-S`를 붙이지 않은 채 비밀번호만 stdin으로 밀어 넣는다.
 pub(crate) fn sudo_own_options<'a>(argv: &[&'a str], sudo_index: usize) -> Vec<&'a str> {
+    sudo_options(argv, sudo_index).0
+}
+
+/// C9-14/C9-19. 옵션 토큰과 그 뒤 실행 대상의 위치를 한 번의 해석으로 구한다.
+fn sudo_options<'a>(argv: &[&'a str], sudo_index: usize) -> (Vec<&'a str>, usize) {
     let mut options = Vec::new();
     let mut index = sudo_index + 1;
     while let Some(token) = argv.get(index) {
-        if *token == "--" || !token.starts_with('-') {
+        if *token == "--" {
+            index += 1;
+            break;
+        }
+        if !token.starts_with('-') {
             break;
         }
         options.push(*token);
-        if SUDO_VALUE_OPTIONS.contains(token) {
+        if sudo_option_takes_next_value(token) {
             // 값까지 건너뛴다. 값이 없이 끝나면 `get`이 None을 내 반복이 멈춘다.
             index += 1;
         }
         index += 1;
     }
-    options
+    (options, index)
+}
+
+/// `-nu app`은 값을 다음 토큰에서 받고, `-uapp`·`-nuroot`·`--user=app`은
+/// 같은 토큰 안에서 받는다. 값 안의 글자를 다시 옵션으로 해석하지 않는다.
+fn sudo_option_takes_next_value(token: &str) -> bool {
+    if token.starts_with("--") {
+        return SUDO_VALUE_OPTIONS.contains(&token);
+    }
+    let mut flags = token.strip_prefix('-').unwrap_or_default().chars();
+    while let Some(flag) = flags.next() {
+        if SUDO_VALUE_OPTIONS
+            .iter()
+            .any(|option| option.len() == 2 && char::from(option.as_bytes()[1]) == flag)
+        {
+            return flags.as_str().is_empty();
+        }
+    }
+    false
 }
 
 /// 규칙 한 줄을 명령과 **같은 방식으로** 단어로 가른다. 규칙에 따옴표가 있으면 그 경계를
@@ -492,6 +528,65 @@ mod tests {
         match command_allowance(endpoint, &line) {
             CommandAllowance::Allowed => Ok(()),
             CommandAllowance::NeedsApproval { reason } => Err(CoreError::Conflict(reason)),
+        }
+    }
+
+    /// C9-14/C9-20. sudo의 옵션 값은 실행 파일이 아니다. 실제 실행 대상이 금지된
+    /// 명령이면 허용 목록·무제한 토글과 무관하게 거절해야 한다.
+    #[test]
+    fn c9_14_sudo_option_values_do_not_hide_refused_heads() {
+        for unrestricted in [false, true] {
+            let mut endpoint = view(&["sudo", "nohup", "head"], &[]);
+            endpoint.unrestricted_commands = unrestricted;
+            for command in [
+                "sudo -u app bash -c id",
+                "sudo --user app /bin/sh -c id",
+                "sudo -g staff curl https://example.com",
+                "sudo -p prompt python3 /tmp/task.py",
+                "sudo -nu app bash",
+                "sudo -unobody bash",
+                "sudo -uapp bash",
+                "sudo --user=app bash",
+                "sudo -u app -- bash",
+                "sudo -u app sudo -g staff bash",
+                "nohup sudo -u app bash",
+                "head /tmp/log | sudo -u app bash",
+            ] {
+                let line = validate_remote_command(command).expect(command);
+                assert!(
+                    enforce_hard_command_refusals(&endpoint, &line).is_err(),
+                    "{command}, unrestricted={unrestricted}"
+                );
+            }
+        }
+    }
+
+    /// C9-14. sudo에 넘긴 계정·프롬프트와 명령 인자는 그대로 두고, 차단 목록은
+    /// 옵션 뒤의 실제 명령에 적용한다.
+    #[test]
+    fn c9_14_sudo_option_values_do_not_hide_denied_commands() {
+        let endpoint = view(&["sudo"], &["rm -rf", "cat /etc/shadow"]);
+        for command in [
+            "sudo -u app rm -rf /srv/app",
+            "sudo --user app /bin/rm -rf /srv/app",
+            "sudo -nu app cat /etc/shadow",
+            "sudo -u app -- cat /etc/shadow",
+            "sudo -u app sudo -g staff rm -rf /srv/app",
+        ] {
+            let line = validate_remote_command(command).expect(command);
+            assert!(
+                enforce_hard_command_refusals(&endpoint, &line).is_err(),
+                "{command}"
+            );
+        }
+        for command in [
+            "sudo -u bash echo rm -rf",
+            "sudo -p 'bash -c id' echo ok",
+            "sudo -u app -- systemctl status app",
+            "sudo -nu app echo bash",
+            "sudo -unobody echo bash",
+        ] {
+            enforce_command_policy(&endpoint, command).expect(command);
         }
     }
 

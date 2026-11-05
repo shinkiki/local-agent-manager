@@ -39,6 +39,10 @@ export function sessionMetaWithDefaults(meta: Partial<SessionMeta> | null | unde
     handoffTargets: meta?.handoffTargets ?? [],
     // 통째 교체 패치라, 여기서 빠지면 화면이 빈 목록을 들고 있다가 다음 연결 때 저장된 연결을 지운다.
     linkedProjectPaths: Array.isArray(meta?.linkedProjectPaths) ? meta.linkedProjectPaths : [],
+    // 기본값이 없는 선택 필드는 백엔드가 실었을 때만 옮긴다. 빠뜨리면 위의 출처·인계처럼
+    // 화면에 닿기 전에 조용히 사라진다.
+    ...(meta?.localConnectionId !== undefined ? { localConnectionId: meta.localConnectionId } : {}),
+    ...(Array.isArray(meta?.bookmarks) ? { bookmarks: meta.bookmarks } : {}),
   };
 }
 

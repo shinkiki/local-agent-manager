@@ -11,6 +11,8 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react()],
   define: { __APP_VERSION__: JSON.stringify(packageVersion) },
+  // Preserve Vite 7's browser support when Vite 8 raises its default target.
+  build: { target: ["chrome107", "edge107", "firefox104", "safari16"] },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

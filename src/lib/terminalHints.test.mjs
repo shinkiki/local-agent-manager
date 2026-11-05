@@ -48,6 +48,15 @@ test("newest hints come first and duplicates collapse", () => {
   assert.deepEqual(hints.codes, ["CCCC-DDDD2", "AAAA-BBBB1"]);
 });
 
+test("V2/V4 hint limits keep the newest four distinct links and three codes", () => {
+  const links = Array.from({ length: 6 }, (_, index) => `https://login-${index}.example/device`);
+  const codes = ["AAAA-BBBB1", "CCCC-DDDD2", "EEEE-FFFF3", "GGGG-HHHH4", "IIII-JJJJ5"];
+  const hints = extractTerminalHints([...links, ...codes, links[0], codes[0]].join("\n"));
+
+  assert.deepEqual(hints.links, [links[0], links[5], links[4], links[3]]);
+  assert.deepEqual(hints.codes, [codes[0], codes[4], codes[3]]);
+});
+
 test("ignores non-http schemes and lower-case words that look like codes", () => {
   const hints = extractTerminalHints("file:///etc/passwd javascript:alert(1) abcd-efghi ABCD-EFGH");
   assert.deepEqual(hints, { links: [], codes: [] });
@@ -70,6 +79,31 @@ test("the collector keeps multibyte characters intact across chunk boundaries", 
   collector.push(bytes.slice(0, 5));
   const hints = collector.push(bytes.slice(5));
   assert.deepEqual(hints?.links, ["https://x.example/한"]);
+});
+
+test("V2/V4 the 64 KiB output window expires old hints and reports the empty state once", () => {
+  const collector = new TerminalHintCollector();
+  const oldHints = { links: ["https://old.example/device"], codes: ["AAAA-BBBB1"] };
+  assert.deepEqual(collector.push(encoder.encode("https://old.example/device\nAAAA-BBBB1\n")), oldHints);
+
+  assert.deepEqual(collector.push(encoder.encode("x".repeat(64 * 1024))), { links: [], codes: [] });
+  assert.equal(collector.push(encoder.encode("\nplain output\n")), null);
+  assert.deepEqual(collector.push(encoder.encode("https://new.example/device\nCCCC-DDDD2\n")), {
+    links: ["https://new.example/device"],
+    codes: ["CCCC-DDDD2"],
+  });
+});
+
+test("V2/V4 reset allows the same hints to be reported for a new login connection", () => {
+  const collector = new TerminalHintCollector();
+  const output = encoder.encode("https://login.example/device\nAAAA-BBBB1\n");
+  const expected = { links: ["https://login.example/device"], codes: ["AAAA-BBBB1"] };
+  assert.deepEqual(collector.push(output), expected);
+
+  collector.reset();
+  assert.deepEqual(collector.push(output), expected, "the previous connection must not suppress this update");
+  collector.reset();
+  assert.equal(collector.push(encoder.encode("plain output\n")), null, "old hints must not leak into the new connection");
 });
 
 test("equality and emptiness helpers", () => {

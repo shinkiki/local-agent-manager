@@ -166,7 +166,7 @@ impl<'de> Deserialize<'de> for LocalizedText {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(untagged)]
+        #[serde(untagged, deny_unknown_fields)]
         enum Raw {
             Plain(String),
             Pair {
@@ -1501,6 +1501,49 @@ mod tests {
         assert!(!catalog.cards.is_empty());
     }
 
+    /// W6: 문구 안의 오타도 무시하지 않고 팩 전체를 거절하며, 정상 팩은 계속 싣는다.
+    #[test]
+    fn w6_unknown_localized_text_fields_are_reported_and_skipped() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("skills");
+        write_pack(&root, "valid", &minimal_pack("valid", "valid-start"));
+        let locations = [
+            ("bad-title", "/cards/0/title"),
+            ("bad-field", "/cards/0/steps/0/fields/0/label"),
+            ("bad-action", "/cards/0/actions/0/label"),
+        ];
+        for (key, pointer) in locations {
+            let mut pack = minimal_pack(key, key);
+            *pack.pointer_mut(pointer).expect("문구 위치") =
+                json!({ "ko": "제목", "en": "Title", "eng": "Typo" });
+            write_pack(&root, key, &pack);
+        }
+
+        let catalog = load_aia_onboarding_catalog_from_root(&root).expect("catalog");
+        assert_eq!(catalog.issues.len(), locations.len());
+        for (key, _) in locations {
+            let issue = catalog
+                .issues
+                .iter()
+                .find(|issue| issue.skill_key == key)
+                .expect("잘못된 팩의 사유");
+            assert!(
+                issue.message.contains("JSON이 올바르지 않습니다"),
+                "{issue:?}"
+            );
+            assert!(catalog.packs.iter().all(|pack| pack.pack_id != key));
+            assert!(catalog.cards.iter().all(|card| card.card.id != key));
+        }
+        assert!(catalog
+            .cards
+            .iter()
+            .any(|card| card.card.id == "valid-start"));
+        assert!(catalog
+            .cards
+            .iter()
+            .any(|card| card.source == AiaOnboardingPackSource::Bundled));
+    }
+
     /// W6: 템플릿은 그 카드가 선언한 입력만 가리킬 수 있다. 없는 키를 조용히 빈 값으로
     /// 치환하면 사용자가 채운 줄 아는 값이 빠진 채 워크플로가 등록된다.
     #[test]
@@ -1708,6 +1751,12 @@ mod tests {
 
         let pair: LocalizedText =
             serde_json::from_value(json!({ "ko": "제목", "en": "Title" })).expect("pair");
+        assert_eq!(pair.ko, "제목");
         assert_eq!(pair.en.as_deref(), Some("Title"));
+
+        for value in [json!({ "ko": "제목" }), json!({ "ko": "제목", "en": null })] {
+            let ko_only: LocalizedText = serde_json::from_value(value).expect("한국어 문구");
+            assert_eq!(ko_only, plain);
+        }
     }
 }

@@ -42,6 +42,31 @@ test("project cleanup excludes hidden, archived, unreadable, subagent and AIA wo
   })).length, 0);
 });
 
+test("V4 프로젝트 정리 제안은 앱이 마련한 기본 작업공간을 프로젝트로 세지 않는다", () => {
+  const defaults = Array.from({ length: 8 }, (_, index) => session(`default-${index}`, {
+    cwd: "/app-data/default-workspace",
+    project: "기본 작업공간",
+    defaultWorkspace: true,
+  }));
+  const projectCatalog = catalog(definition("projectSessionCleanup"));
+  assert.deepEqual(evaluateAiaSuggestions(evaluation({
+    catalog: projectCatalog,
+    manager: manager(defaults),
+  })), []);
+
+  // 기본 작업공간과 일반 프로젝트가 함께 있어도 실제 프로젝트의 집계는 유지한다.
+  const projects = Array.from({ length: 8 }, (_, index) => session(`project-${index}`, {
+    defaultWorkspace: false,
+  }));
+  const suggestions = evaluateAiaSuggestions(evaluation({
+    catalog: projectCatalog,
+    manager: manager([...defaults, ...projects]),
+  }));
+  assert.deepEqual(suggestions.map((item) => item.targetId), ["/work/alpha"]);
+  assert.equal(suggestions[0].metadata.sessionCount, 8);
+  assert.equal(suggestions[0].metadata.unfiledCount, 8);
+});
+
 test("project cleanup returns at most three projects sorted by unfiled count then recency", () => {
   const sessions = [];
   const specs = [

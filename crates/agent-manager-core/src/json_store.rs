@@ -230,6 +230,38 @@ mod tests {
         assert!(matches!(failure, CoreError::Conflict(_)));
     }
 
+    #[test]
+    fn g7_v2_update_rejects_unknown_schema_before_editing_or_writing() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = STORE.path(directory.path());
+        // G7/V2: a newer format may contain fields this version cannot preserve.
+        write_private_json(
+            &path,
+            &serde_json::json!({
+                "schema_version": 99,
+                "value": 7,
+                "future_field": "keep this data"
+            }),
+        )
+        .expect("write newer store");
+        let before = std::fs::read(&path).expect("original bytes");
+        let edited = std::cell::Cell::new(false);
+
+        let result = STORE.update(directory.path(), |store: &mut Sample| {
+            edited.set(true);
+            store.schema_version = SAMPLE_VERSION;
+            store.value = 42;
+            Ok(true)
+        });
+
+        assert!(
+            !edited.get(),
+            "an unknown format must not reach the edit callback"
+        );
+        assert!(matches!(result, Err(CoreError::Conflict(_))));
+        assert_eq!(std::fs::read(&path).expect("preserved bytes"), before);
+    }
+
     /// 수정이 참을 돌려주면 저장본이 바뀌고, 돌려받는 값도 바뀐 쪽이다.
     #[test]
     fn an_update_that_reports_a_change_is_written_and_returned() {
