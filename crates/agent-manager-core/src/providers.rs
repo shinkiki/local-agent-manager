@@ -73,6 +73,12 @@ pub(crate) fn provider_display_name(provider: ProviderId) -> &'static str {
     provider_spec(provider).display_name
 }
 
+/// 공급자 CLI의 실행 파일 이름들. 탐지가 PATH에서 찾는 이름과 같은 표에서 나오므로,
+/// 외부 프로세스 매칭(C1-9)이 "이 공급자의 CLI" 를 다른 철자로 적을 수 없다.
+pub(crate) fn provider_executable_names(provider: ProviderId) -> &'static [&'static str] {
+    provider_spec(provider).executable_names
+}
+
 /// 공급자 CLI 실행 파일을 지금 다시 탐지한다. 업데이트 직후 교체된 실행 파일을
 /// 다시 찾기 위해 매번 PATH를 새로 읽는다.
 pub(crate) fn detect_provider_cli(provider: ProviderId) -> Result<Option<PathBuf>, CoreError> {

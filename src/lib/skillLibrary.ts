@@ -33,6 +33,7 @@ export {
   filterSkillEntries,
   isProjectOriginFilter,
   matchesSkillOrigin,
+  parseStoredSkillFilters,
   skillFilterCounts,
   skillOriginProjects,
   SKILL_AGENT_VALUES,

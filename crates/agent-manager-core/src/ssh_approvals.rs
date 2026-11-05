@@ -628,6 +628,52 @@ mod tests {
             .expect("정확히 일치");
     }
 
+    /// C9-17-1. 같은 서버·명령·용도여도 다른 대화의 요청은 별개 승인이다.
+    #[test]
+    fn c9_17_1_identical_commands_in_different_chats_keep_independent_approvals() {
+        for scope in [SshApprovalScope::OneShot, SshApprovalScope::Persist] {
+            let store = SshApprovalStore::new();
+            let command = "ls /srv";
+            let (first, _) = store
+                .open(CHAT, open_request(command, scope))
+                .expect("첫 대화 요청");
+            let (second, _) = store
+                .open(OTHER_CHAT, open_request(command, scope))
+                .expect("다른 대화의 같은 요청");
+            assert_ne!(first.id, second.id);
+
+            // 각 대화의 재요청은 그 대화의 카드만 재사용한다.
+            for (chat, ticket) in [(CHAT, &first), (OTHER_CHAT, &second)] {
+                let (duplicate, _) = store
+                    .open(chat, open_request(command, scope))
+                    .expect("같은 대화 재요청");
+                assert_eq!(duplicate.id, ticket.id);
+                let cards = store.pending_cards(chat);
+                assert_eq!(cards.len(), 1);
+                assert_eq!(cards[0].id, ticket.id);
+            }
+
+            store.resolve(CHAT, &first.id, false).expect("첫 대화 거절");
+            assert!(store
+                .consume(CHAT, consume_request(&first.id, command, scope))
+                .is_err());
+            let error = store
+                .consume(OTHER_CHAT, consume_request(&second.id, command, scope))
+                .expect_err("다른 대화는 아직 미승인");
+            assert!(error.to_string().contains("아직"));
+
+            store.discard_chat(CHAT);
+            assert!(!store.owns(&first.id));
+            assert!(store.owns(&second.id));
+            store
+                .resolve(OTHER_CHAT, &second.id, true)
+                .expect("다른 대화 승인");
+            store
+                .consume(OTHER_CHAT, consume_request(&second.id, command, scope))
+                .expect("다른 대화의 독립 승인 사용");
+        }
+    }
+
     /// C9-17. 승인된 토큰 하나에 여러 요청이 동시에 달려들어도 정확히 하나만 통과한다.
     /// 이 성질이 없으면 "1회용"은 순차 호출에서만 참이고, 같은 승인으로 원격 명령이 여러
     /// 번 나갈 수 있다.

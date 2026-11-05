@@ -57,17 +57,18 @@ pub fn doc_root_paths(app_data_dir: &Path) -> Result<Vec<PathBuf>, CoreError> {
 /// AIA 시스템 MCP 등 에이전트 경로에서 특정 등록 폴더를 읽거나 쓸 때 에이전트 접근 허용
 /// 여부를 확인한다.
 pub fn ensure_doc_root_agent_enabled(app_data_dir: &Path, root_id: &str) -> Result<(), CoreError> {
-    if let Some(root) = load_metadata(app_data_dir)?
+    let metadata = load_metadata(app_data_dir)?;
+    let root = metadata
         .doc_roots
         .into_iter()
         .find(|root| root.id == root_id)
-    {
-        if !root.agent_enabled {
-            return Err(CoreError::InvalidInput(format!(
-                "에이전트 접근이 비활성화된 등록 폴더입니다: {}",
-                root.name
-            )));
-        }
+        .ok_or_else(|| CoreError::NotFound("등록 폴더를 찾을 수 없습니다".to_owned()))?;
+
+    if !root.agent_enabled {
+        return Err(CoreError::InvalidInput(format!(
+            "에이전트 접근이 비활성화된 등록 폴더입니다: {}",
+            root.name
+        )));
     }
     Ok(())
 }
@@ -244,9 +245,43 @@ fn is_restricted_doc_root_with_provider_dirs(
     path: &Path,
     redirected_provider_dirs: &[PathBuf],
 ) -> bool {
+    is_restricted_root(app_data_dir, path, redirected_provider_dirs, None)
+}
+
+/// C21-2. 실행기 프로젝트 폴더의 금지 경계. 문서 루트와 **같은 기준**(앱 데이터·공급자 홈·
+/// 옮긴 공급자 홈, 그리고 그것들을 품는 상위 — 홈 자체와 `/`)을 쓰되, 앱 데이터 안에서도
+/// AIA 작업공간(`<app data>/aia-workspace`)의 **하위**만은 연다. 헤드리스 설치는 앱 데이터를
+/// `/data`로 두고 실제 작업 폴더를 그 작업공간 아래에 두므로, 예외 없이는 쓸 수 있는 폴더가
+/// 남지 않는다. 그 밖의 앱 데이터(설정 JSON·자격증명 프로필)는 그대로 막힌다.
+pub(crate) fn is_restricted_outside_aia_workspace(app_data_dir: &Path, path: &Path) -> bool {
+    let redirected_provider_dirs = crate::credential_profiles::inherited_credential_dirs();
+    let workspace = app_data_dir.join(crate::chat::AIA_WORKSPACE_DIR);
+    is_restricted_root(
+        app_data_dir,
+        path,
+        &redirected_provider_dirs,
+        Some(&workspace),
+    )
+}
+
+/// 금지 경계 판정 한 벌. `app_data_exception`이 있으면 그 폴더의 **하위**는 앱 데이터 안이라도
+/// 앱 데이터 때문에 막지 않는다(그 폴더 자체는 막는다). 공급자 홈 판정은 예외 없이 그대로다.
+fn is_restricted_root(
+    app_data_dir: &Path,
+    path: &Path,
+    redirected_provider_dirs: &[PathBuf],
+    app_data_exception: Option<&Path>,
+) -> bool {
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let app_data = fs::canonicalize(app_data_dir).unwrap_or_else(|_| app_data_dir.to_path_buf());
-    let mut protected = vec![app_data];
+    let inside_exception = app_data_exception
+        .and_then(|exception| fs::canonicalize(exception).ok())
+        .is_some_and(|exception| path != exception && path.starts_with(&exception));
+    let mut protected = Vec::new();
+    // 예외 하위는 앱 데이터의 상위일 수 없으므로, 앱 데이터 항목만 빼면 된다.
+    if !inside_exception {
+        protected.push(app_data);
+    }
     if let Some(home) = user_home::optional_home_dir() {
         protected.extend(AGENT_DATA_DIR_NAMES.into_iter().map(|name| home.join(name)));
     }
@@ -424,6 +459,10 @@ mod tests {
         assert_eq!(agent_paths[0], PathBuf::from(&other.root.path));
         assert!(ensure_doc_root_agent_enabled(&app_data, &created.root.id).is_err());
         assert!(ensure_doc_root_agent_enabled(&app_data, &other.root.id).is_ok());
+        // G10: 등록되지 않은 식별자는 접근 검증을 통과하지 않는다.
+        let missing_err = ensure_doc_root_agent_enabled(&app_data, "non-existent-root")
+            .expect_err("존재하지 않는 등록 폴더는 NotFound 에러여야 한다");
+        assert!(matches!(missing_err, CoreError::NotFound(_)));
 
         // 다른 등록 폴더와 같은 경로로 바꾸려는 요청은 충돌로 거절한다.
         let conflict = update_doc_root(

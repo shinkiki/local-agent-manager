@@ -61,13 +61,17 @@ export const DESTRUCTIVE_GIT_COMMANDS_BAN =
  * AIA는 여전히 그 파일을 찾을 수 있다. 보통 경로는 그대로 둔다.
  */
 export function promptPathLine(path: string): string {
-  if (!PROMPT_LINE_BREAKERS.test(path)) return `- ${path}`;
+  return `- ${promptInlineText(path)}`;
+}
+
+/** C16-4. 저장소에서 온 제목도 경로처럼 요청문에 새 줄·문단을 만들지 않게 한다. */
+function promptInlineText(text: string): string {
+  if (!PROMPT_LINE_BREAKERS.test(text)) return text;
   // JSON.stringify 는 C0 만 이스케이프하고 DEL·C1(NEL 포함)·U+2028/2029 는 그대로 둔다.
-  const quoted = JSON.stringify(path).replace(
+  return JSON.stringify(text).replace(
     /[\u007f-\u009f\u2028\u2029]/g,
     (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
   );
-  return `- ${quoted}`;
 }
 
 const PROMPT_LINE_BREAKERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
@@ -112,7 +116,7 @@ export function buildAiaCommitReviewRequest(input: {
     subject: commit.subject,
     order: index + 1,
   }));
-  const lines = commits.map((commit) => `${commit.order}. ${commit.sha} ${commit.subject}`).join("\n");
+  const lines = commits.map((commit) => `${commit.order}. ${commit.sha} ${promptInlineText(commit.subject)}`).join("\n");
   const head = input.intent === "analyze"
     ? "다음 커밋들을 분석해줘."
     : "다음 커밋들을 코드리뷰해줘.";

@@ -22,6 +22,7 @@ use crate::app_data_file::{ensure_schema_version, write_private_json};
 use crate::clock::now_ms;
 use crate::domain::wire_enum;
 use crate::file_kind::ensure_not_symlink;
+use crate::path_guard::relative_path_key;
 use crate::store_lock::{self, StoreLock};
 use crate::{list_doc_roots, ChatApprovalMode, ChatMode, CoreError, ProviderId, ReasoningEffort};
 
@@ -1242,12 +1243,12 @@ fn scan_root(root: &Path) -> Result<BTreeMap<String, FileState>, CoreError> {
         let Some(state) = regular_file_state(entry.path())? else {
             continue;
         };
+        // G10: 성분 결합이라 Unix 파일명 안의 역슬래시가 보존된다(`relative_path_key` 참조).
         let relative_path = entry
             .path()
             .strip_prefix(&canonical)
-            .map_err(|_| CoreError::InvalidInput("허용된 경로를 벗어났습니다".to_owned()))?
-            .to_string_lossy()
-            .replace('\\', "/");
+            .map(relative_path_key)
+            .map_err(|_| CoreError::InvalidInput("허용된 경로를 벗어났습니다".to_owned()))?;
         snapshot.insert(relative_path, state);
     }
     Ok(snapshot)
@@ -2148,6 +2149,39 @@ mod tests {
         assert!(snapshot.contains_key("nested/data.bin"));
         assert!(!snapshot.contains_key(".hidden/secret.txt"));
         assert!(!snapshot.keys().any(|path| path.starts_with("linked/")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn v2_scan_preserves_backslash_filenames_as_distinct_paths() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("docs");
+        fs::create_dir_all(root.join("nested")).expect("nested");
+        let literal_path = root.join(r"nested\note.md");
+        fs::write(&literal_path, "literal filename").expect("literal file");
+        fs::write(root.join("nested/note.md"), "nested file").expect("nested file");
+
+        // G10: Unix treats a backslash as a filename character, not a separator.
+        let before = scan_root(&root).expect("scan both files");
+        assert_eq!(
+            before.len(),
+            2,
+            "distinct files must not share an index key"
+        );
+        assert_eq!(before[r"nested\note.md"].size_bytes, 16);
+        assert_eq!(before["nested/note.md"].size_bytes, 11);
+
+        fs::remove_file(&literal_path).expect("remove literal file");
+        let after = scan_root(&root).expect("scan remaining file");
+        assert_eq!(
+            compare_snapshots(&before, &after),
+            vec![DocumentChange {
+                kind: DocumentChangeKind::Deleted,
+                relative_path: r"nested\note.md".to_owned(),
+                size_bytes: None,
+            }]
+        );
+        assert_eq!(after["nested/note.md"], before["nested/note.md"]);
     }
 
     #[test]

@@ -161,7 +161,8 @@ fn collect_packed_branches(path: &Path, limit: usize, out: &mut Vec<String>) {
             continue;
         };
         if let Some(branch) = reference.trim().strip_prefix("refs/heads/") {
-            if !branch.is_empty() {
+            // V2: a packed ref may also have a loose copy; count that branch only once.
+            if !branch.is_empty() && !out.iter().any(|name| name == branch) {
                 out.push(branch.to_owned());
             }
         }
@@ -282,6 +283,26 @@ mod tests {
         assert!(
             all_branches(root.path()).is_empty(),
             "git 저장소가 아니면 빈 목록이다"
+        );
+    }
+
+    #[test]
+    fn v2_duplicate_loose_and_packed_refs_do_not_consume_the_listing_limit() {
+        let root = tempdir().expect("temp");
+        let git = root.path().join(".git");
+        let heads = git.join("refs/heads");
+        fs::create_dir_all(&heads).expect("heads");
+        fs::write(heads.join("main"), "9f0b2c1d\n").expect("loose ref");
+        fs::write(
+            git.join("packed-refs"),
+            "9f0b2c1d refs/heads/main\n9f0b2c1d refs/heads/release/1\n",
+        )
+        .expect("packed refs");
+
+        assert_eq!(
+            local_branches(root.path(), 2, &|_| true),
+            vec!["main".to_owned(), "release/1".to_owned()],
+            "V2: a loose copy must not hide a distinct packed branch at the limit"
         );
     }
 

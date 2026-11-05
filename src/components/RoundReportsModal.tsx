@@ -218,9 +218,11 @@ export function RoundReportsModal({ goal, onClose, onResolved, onGoalUpdated }: 
           const head = (
             <>
               <strong>{report.title}</strong>
-              <span className={report.outcome === "pass" ? "health ready" : "health warning"}>{outcomeLabel(text, report.outcome)}</span>
-              <span className="db-badge">{formatDateTime(report.recordedAt)}</span>
-              {humanPending > 0 && <span className="db-badge round-goal-pending">{text(`결정 대기 ${humanPending}`, `${humanPending} pending`)}</span>}
+              <span className="round-report-meta">
+                <span className={report.outcome === "pass" ? "health ready" : "health warning"}>{outcomeLabel(text, report.outcome)}</span>
+                <span className="db-badge">{formatDateTime(report.recordedAt)}</span>
+                {humanPending > 0 && <span className="db-badge round-goal-pending">{text(`결정 대기 ${humanPending}`, `${humanPending} pending`)}</span>}
+              </span>
             </>
           );
           const body = (

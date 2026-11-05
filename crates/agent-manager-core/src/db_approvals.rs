@@ -382,6 +382,64 @@ mod tests {
     }
 
     #[test]
+    fn c10_12_foreign_chat_cannot_answer_or_change_the_owners_pending_approval() {
+        for granted in [true, false] {
+            let store = DbApprovalStore::new();
+            let ticket = open(&store, "UPDATE t SET a = 1");
+
+            let error = store
+                .resolve("other", &ticket.id, granted)
+                .expect_err("another chat cannot answer this card");
+            let missing = store
+                .resolve("other", "db-approval-missing", granted)
+                .expect_err("unknown approval");
+            assert!(matches!(error, CoreError::NotFound(_)));
+            assert_eq!(error.to_string(), missing.to_string());
+            assert!(store.pending_cards("other").is_empty());
+            let cards = store.pending_cards("chat");
+            assert_eq!(cards.len(), 1);
+            assert_eq!(cards[0].id, ticket.id);
+            let decision = store
+                .resolve("chat", &ticket.id, true)
+                .expect("the owner can still grant the unanswered approval");
+            assert!(decision.granted);
+        }
+    }
+
+    #[test]
+    fn c10_12_foreign_chat_cannot_consume_or_burn_the_owners_granted_approval() {
+        let store = DbApprovalStore::new();
+        let ticket = open(&store, "UPDATE t SET a = 1");
+        store.resolve("chat", &ticket.id, true).expect("grant");
+        let request = DbApprovalConsume {
+            approval_id: &ticket.id,
+            connection_id: "kbf",
+            sql: "UPDATE t SET a = 1",
+            kind: DbApprovalKind::Dml,
+        };
+
+        let error = store
+            .consume("other", request.clone())
+            .expect_err("another chat cannot use this approval");
+        let missing = store
+            .consume(
+                "other",
+                DbApprovalConsume {
+                    approval_id: "db-approval-missing",
+                    ..request.clone()
+                },
+            )
+            .expect_err("unknown approval");
+        assert!(matches!(error, CoreError::NotFound(_)));
+        assert_eq!(error.to_string(), missing.to_string());
+        let decision = store
+            .consume("chat", request)
+            .expect("the owner's granted approval was not consumed by the refused call");
+        assert_eq!(decision.id, ticket.id);
+        assert!(decision.granted);
+    }
+
+    #[test]
     fn c10_12_the_card_states_the_previewed_row_count() {
         let store = DbApprovalStore::new();
         let ticket = open(&store, "DELETE FROM t WHERE a = 1");

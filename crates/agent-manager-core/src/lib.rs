@@ -37,6 +37,7 @@ mod db_exec;
 mod db_sql;
 mod doc_roots;
 mod document_automation;
+mod document_entry_ops;
 mod document_tree;
 mod domain;
 mod external_plugins;
@@ -44,6 +45,8 @@ mod external_processes;
 mod file_kind;
 mod git_refs;
 mod identifier;
+mod index_addon;
+mod index_cli;
 mod instruction_links;
 mod instruction_trash;
 mod json_store;
@@ -75,6 +78,7 @@ mod quiet_hours;
 mod remote;
 mod resource_repository;
 mod rounds;
+mod runners;
 mod saved_secrets;
 mod scheduler;
 mod session_cleanup;
@@ -82,7 +86,6 @@ mod session_context;
 mod session_folders;
 mod session_management;
 mod session_search;
-pub use session_search::{SessionSearchMatch, SessionSearchRequest, SessionSearchResponse};
 mod skill_library;
 mod skill_meta;
 mod skill_trash;
@@ -228,6 +231,10 @@ pub use document_automation::{
     DocumentTrigger, DocumentTriggerAction, DocumentTriggerInput, DocumentTriggerRun,
     DocumentTriggerRunStatus, DocumentTriggerStatus, DocumentWorkflowAction,
 };
+pub use document_entry_ops::{
+    create_document_entry, delete_document_entry, duplicate_document_file, move_document_entry,
+    rename_document_entry, DocumentDeleteResult, DocumentEntryKind,
+};
 pub use domain::{
     AgentDefinition, AgentDetail, AiaDecisionPolicy, AppStatus, ArtifactDetail, ArtifactGroup,
     ArtifactSummary, CommonSkillDetail, CommonSkillDigest, CommonSkillSource, ContentBlock,
@@ -255,6 +262,15 @@ pub use external_processes::{
     list_external_provider_processes, terminate_external_provider_processes,
     ExternalProcessFailure, ExternalProviderProcess, TerminateExternalProcessesReport,
 };
+pub use index_addon::{
+    add_index_source, get_index_sources, list_agent_index_sources, read_index_excerpt,
+    refresh_index_source, remove_index_source, search_index, set_index_projects,
+    set_index_settings, set_index_source_enabled, set_index_source_projects, AddIndexSourceRequest,
+    AgentIndexRequest, AgentIndexSourceRequest, IndexProjectMode, IndexSourceRequest,
+    ReadIndexExcerptRequest, SearchIndexRequest, SetIndexProjectsRequest, SetIndexSettingsRequest,
+    SetIndexSourceEnabledRequest, SetIndexSourceProjectsRequest,
+};
+pub use index_cli::run_index_cli;
 pub use instruction_trash::{
     list_instruction_trash, purge_instruction_trash, restore_instruction_trash,
     InstructionTrashItem, InstructionTrashItemKind, InstructionTrashOverview,
@@ -410,6 +426,7 @@ pub use session_management::{
     SystemAuditListResponse, SystemAuditPhase, SystemAuditRecord, TranscriptAppliedFilters,
     TranscriptCategory,
 };
+pub use session_search::{SessionSearchMatch, SessionSearchRequest, SessionSearchResponse};
 pub use skill_library::{
     check_skill_delete, check_skill_publish, compare_skill_install, create_common_skill,
     delete_installed_skill, delete_shared_skill, get_skill_migration_plan, import_skill_to_common,
@@ -474,8 +491,7 @@ pub use terminal::{
     TerminalPhase, TerminalSessionInfo, TerminalSetupRequest, TerminalSshRequest,
     TerminalSupervisor,
 };
-pub use translation::TranslationSupervisor;
-pub use translation::{AiaBackgroundAnalysis, AiaBackgroundAnalysisRequest};
+pub use translation::{AiaBackgroundAnalysis, AiaBackgroundAnalysisRequest, TranslationSupervisor};
 pub use usage_budget_policy::{
     AcknowledgeDrainNoticeRequest, QuietHours, SavingsDefaults, SetUsageBudgetAccountRequest,
     SetUsageBudgetConsumerRequest, SetUsageBudgetWorkflowRequest, UsageBudgetDefaults,

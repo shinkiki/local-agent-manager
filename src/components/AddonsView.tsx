@@ -1,4 +1,4 @@
-import { Database, KeyRound, Plug } from "lucide-react";
+import { Database, KeyRound, Network, Plug, Search } from "lucide-react";
 import { useEffect, type ComponentType } from "react";
 import { useI18n } from "../lib/i18n";
 import type { TabRequest } from "../lib/uiGuide";
@@ -6,23 +6,29 @@ import { useStoredChoice } from "./SkillLibraryPanel";
 import { BuiltinToolAccess } from "./BuiltinToolAccess";
 import { ClaudePluginsCard } from "./ClaudePluginsCard";
 import { CypressWorkspacePanel } from "./CypressWorkspacePanel";
+import { IndexAddonPanel } from "./IndexAddonPanel";
 import { DbConnectionsCard } from "./DbConnectionsCard";
 import { ExternalPluginsCard } from "./ExternalPluginsCard";
 import { MermaidPluginPanel } from "./MermaidPluginPanel";
+import { RunnersCard } from "./RunnersCard";
 import { SettingsSubTabPanel, SettingsSubTabs, type SettingsSubTab } from "./SettingsSubTabs";
 import { SshKeysCard } from "./SshKeysCard";
 import { brandMarkIcon } from "./Shared";
 
-export type AddonsTabId = "mcp" | "ssh" | "db" | "cypress" | "mermaid" | "claude";
+export type AddonsTabId = "mcp" | "ssh" | "db" | "runners" | "index" | "cypress" | "mermaid" | "claude";
 
 // 탭 id가 도구 축으로 바뀌어 예전 값(aia·codex)은 되살릴 자리가 없다. 키를 올려 옛 선택이
 // 남아 있어도 기본 탭으로 떨어지게 한다. 자동화 탭이 워크플로 화면으로 옮겨 간 뒤에도
 // 같은 규칙이 그대로 듣는다 — `automation`이 저장돼 있어도 유효 id가 아니라 기본 탭으로 선다.
 const ADDONS_TAB_KEY = "agent-manager.addons-tab.v2";
 
-/** 패널 한 벌이 받는 것. 애드온 탭은 모두 붙는 도구 하나를 다루므로 화면 상태만 받는다. */
+/**
+ * 패널 한 벌이 받는 것. 애드온 탭은 모두 붙는 도구 하나를 다루므로 화면 상태만 받는다.
+ * `openTab`은 다른 탭에 기대는 패널(분산처리 → SSH 서버 등록)이 그 탭으로 안내할 때 쓴다.
+ */
 export interface AddonsPanelProps {
   active: boolean;
+  openTab: (tab: AddonsTabId) => void;
 }
 
 interface AddonsTab extends SettingsSubTab<AddonsTabId> {
@@ -41,12 +47,15 @@ interface AddonsTab extends SettingsSubTab<AddonsTabId> {
  * `<img>`로는 다크 테마에서 사라져 콘센트를 유지한다.
  *
  * `tool` — 기본도구 카탈로그에 있는 도구만 접근 경로 상세(`BuiltinToolAccess`)를 패널 맨 위에
- * 얹는다. Claude Code는 클로드 전용 라우트라 비운다.
+ * 얹는다. Claude Code는 클로드 전용 라우트라 비운다. 분산처리는 에이전트가 쓰는 도구가 아니라
+ * 외부 공용 자리 도구가 읽는 설정이라 역시 비운다(C21).
  */
 const addonsTabs: readonly AddonsTab[] = [
   { id: "mcp", icon: Plug, ko: "외부 MCP", en: "External MCP", anchor: "addons.tab.mcp", tool: "mcp", panel: ExternalPluginsCard },
   { id: "ssh", icon: KeyRound, ko: "SSH", en: "SSH", anchor: "addons.tab.ssh", tool: "ssh", panel: SshKeysCard },
   { id: "db", icon: Database, ko: "데이터베이스", en: "Database", anchor: "addons.tab.db", tool: "db", panel: DbConnectionsCard },
+  { id: "runners", icon: Network, ko: "분산처리", en: "Distributed runners", anchor: "addons.tab.runners", panel: RunnersCard },
+  { id: "index", icon: Search, ko: "인덱스", en: "Index", anchor: "addons.tab.index", tool: "index", panel: IndexAddonPanel },
   { id: "cypress", icon: brandMarkIcon("cypress"), ko: "Cypress", en: "Cypress", anchor: "addons.tab.cypress", tool: "cypress", panel: CypressWorkspacePanel },
   { id: "mermaid", icon: brandMarkIcon("mermaid"), ko: "Mermaid", en: "Mermaid", anchor: "addons.tab.mermaid", tool: "mermaid", panel: MermaidPluginPanel },
   { id: "claude", icon: brandMarkIcon("claude"), ko: "Claude Code", en: "Claude Code", anchor: "addons.tab.claude", panel: ClaudePluginsCard },
@@ -79,7 +88,7 @@ export function AddonsView({ active, tabRequest = null }: {
     <div className="settings-subtab-view addons-view">
       <SettingsSubTabs idPrefix="addons" tabs={addonsTabs} value={tab} onChange={setTab} label={text("애드온 종류", "Add-on type")} />
       {addonsTabs.map((addon) => (
-        <AddonPanelSlot addon={addon} selected={tab === addon.id} viewActive={active} key={addon.id} />
+        <AddonPanelSlot addon={addon} selected={tab === addon.id} viewActive={active} openTab={setTab} key={addon.id} />
       ))}
     </div>
   );
@@ -89,16 +98,17 @@ export function AddonsView({ active, tabRequest = null }: {
  * 탭의 선택 상태는 패널을 보일지 정하고, 화면 활성 상태까지 겹친 `shown`은 패널 내부의
  * 폴링·조회 여부를 정한다. 두 상태를 슬롯 한 곳에서 짝지어 새 탭도 같은 수명 규칙을 쓴다.
  */
-function AddonPanelSlot({ addon: { id, tool, panel: Panel }, selected, viewActive }: {
+function AddonPanelSlot({ addon: { id, tool, panel: Panel }, selected, viewActive, openTab }: {
   addon: AddonsTab;
   selected: boolean;
   viewActive: boolean;
+  openTab: (tab: AddonsTabId) => void;
 }) {
   const shown = viewActive && selected;
   return (
     <SettingsSubTabPanel idPrefix="addons" id={id} active={selected}>
       {tool ? <BuiltinToolAccess toolId={tool} active={shown} /> : null}
-      <Panel active={shown} />
+      <Panel active={shown} openTab={openTab} />
     </SettingsSubTabPanel>
   );
 }

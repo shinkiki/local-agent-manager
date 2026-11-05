@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -409,7 +410,18 @@ fn read_bounded(path: &Path) -> Option<String> {
     if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
         return None;
     }
-    fs::read_to_string(path).ok()
+    read_bounded_config(fs::File::open(path).ok()?)
+}
+
+/// 크기 검사 뒤에도 공급자 프로세스가 파일을 늘릴 수 있으므로 실제 읽기에도 상한을
+/// 건다. 초과 여부를 확인할 한 바이트만 더 읽고, 잘린 설정은 해석하지 않는다(V2).
+fn read_bounded_config(reader: impl Read) -> Option<String> {
+    let mut text = String::new();
+    reader
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() as u64 <= MAX_CONFIG_BYTES).then_some(text)
 }
 
 /// 크기 제한 안의 JSON 설정만 해석한다. 설정 소스 하나가 없거나 깨져 있어도 전체 계정
@@ -946,6 +958,50 @@ mod tests {
             .prefix("agent-manager-account-tools-")
             .tempdir()
             .expect("temporary home must be created")
+    }
+
+    #[test]
+    fn v2_config_read_caps_a_stream_that_outgrows_its_metadata() {
+        // 메타데이터를 읽은 뒤 커진 파일을 결정적으로 재현한다.
+        let data = vec![b'x'; MAX_CONFIG_BYTES as usize + 4096];
+        let mut reader = std::io::Cursor::new(data);
+        assert!(read_bounded_config(&mut reader).is_none());
+        assert_eq!(reader.position(), MAX_CONFIG_BYTES + 1);
+    }
+
+    #[test]
+    fn v2_config_read_preserves_the_exact_limit_and_rejects_invalid_utf8() {
+        let data = vec![b'x'; MAX_CONFIG_BYTES as usize];
+        assert_eq!(
+            read_bounded_config(data.as_slice()).unwrap().as_bytes(),
+            data
+        );
+        assert_eq!(read_bounded_config(b"".as_slice()).as_deref(), Some(""));
+        assert_eq!(
+            read_bounded_config("한글".as_bytes()).as_deref(),
+            Some("한글")
+        );
+        assert!(read_bounded_config(b"\xff".as_slice()).is_none());
+        let mut truncated = vec![b'x'; MAX_CONFIG_BYTES as usize - 1];
+        truncated.extend_from_slice("한".as_bytes());
+        assert!(read_bounded_config(truncated.as_slice()).is_none());
+    }
+
+    #[test]
+    fn v2_config_path_reads_keep_existing_skip_behavior() {
+        let home = temporary_home();
+        let path = home.path().join("config");
+        assert!(read_bounded(&path).is_none());
+        assert!(read_bounded(home.path()).is_none());
+        fs::write(&path, "한글 설정").unwrap();
+        assert_eq!(read_bounded(&path).as_deref(), Some("한글 설정"));
+        fs::write(&path, b"\xff").unwrap();
+        assert!(read_bounded(&path).is_none());
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_CONFIG_BYTES + 1)
+            .unwrap();
+        assert!(read_bounded(&path).is_none());
     }
 
     #[test]

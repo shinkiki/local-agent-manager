@@ -335,6 +335,18 @@ pub fn registry(app_data_dir: &Path) -> Result<CypressRegistryView, CoreError> {
     with_lock(app_data_dir, |dir| Ok(registry_view(&load_unlocked(dir)?)))
 }
 
+/// 등록된 작업공간 폴더. 채팅 링크가 산출물(스크린샷·결과 JSON)을 열 수 있게 링크
+/// 범위에 더하는 데 쓴다. 비밀이 든 [`ENV_FILE`]은 [`reaches_any_env_file`]로 막는다.
+pub(crate) fn workspace_dirs(app_data_dir: &Path) -> Result<Vec<PathBuf>, CoreError> {
+    with_lock(app_data_dir, |dir| {
+        Ok(load_unlocked(dir)?
+            .workspaces
+            .iter()
+            .map(CypressWorkspace::project_dir)
+            .collect())
+    })
+}
+
 pub fn is_enabled(app_data_dir: &Path) -> Result<bool, CoreError> {
     with_lock(app_data_dir, |dir| Ok(load_unlocked(dir)?.enabled))
 }
@@ -603,6 +615,25 @@ fn reaches_env_file(workspace: &CypressWorkspace, relative: &Path, target: &Path
     // 대소문자를 가리지 않는 파일시스템(macOS·Windows)에서는 `Cypress.env.json` 도 env 자리다.
     fs::canonicalize(parent)
         .is_ok_and(|parent| parent == root && name.to_string_lossy().eq_ignore_ascii_case(ENV_FILE))
+}
+
+/// 작업공간 밖에서 들어온 경로(채팅 링크)가 어느 작업공간의 env 파일에 닿는지. 이름이
+/// 같으면 어느 폴더에 있든 막는다 — 등록 목록을 못 읽은 때에도 비밀이 새지 않아야 하고,
+/// 다른 이름의 하드 링크는 [`reaches_env_file`]과 같이 같은 파일인지로 본다.
+pub(crate) fn reaches_any_env_file(target: &Path, workspace_dirs: &[PathBuf]) -> bool {
+    if target
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(ENV_FILE))
+    {
+        return true;
+    }
+    let Ok(found) = fs::metadata(target) else {
+        return false;
+    };
+    workspace_dirs.iter().any(|dir| {
+        let env = dir.join(ENV_FILE);
+        fs::metadata(&env).is_ok_and(|env_meta| same_file(&found, &env_meta, target, &env))
+    })
 }
 
 #[cfg(unix)]
@@ -964,6 +995,30 @@ mod tests {
         assert!(fs::read_to_string(root.join(ENV_FILE))
             .expect("env read")
             .contains("plain-secret"));
+    }
+
+    /// 채팅 링크는 env 파일을 이름으로는 어느 폴더에서든, 하드 링크는 같은 파일인지로 막는다.
+    /// 등록 목록을 못 읽어 작업공간 폴더를 모를 때도 이름 검사는 남는다.
+    #[test]
+    fn chat_links_cannot_reach_any_env_file() {
+        let (data, _project, workspace) = fixture();
+        let root = workspace.project_dir();
+        fs::write(root.join(ENV_FILE), r#"{"PASSWORD":"plain-secret"}"#).expect("env");
+        fs::write(root.join("e2e/plain.json"), "{}").expect("plain file");
+        let dirs = workspace_dirs(data.path()).expect("workspace dirs");
+        assert_eq!(dirs, vec![root.clone()]);
+
+        assert!(reaches_any_env_file(&root.join(ENV_FILE), &dirs));
+        assert!(reaches_any_env_file(&root.join("Cypress.Env.JSON"), &[]));
+        let elsewhere = TempDir::new().expect("other folder");
+        assert!(reaches_any_env_file(&elsewhere.path().join(ENV_FILE), &[]));
+        assert!(!reaches_any_env_file(&root.join("e2e/plain.json"), &dirs));
+
+        #[cfg(unix)]
+        {
+            fs::hard_link(root.join(ENV_FILE), root.join("e2e/copy.json")).expect("hard link");
+            assert!(reaches_any_env_file(&root.join("e2e/copy.json"), &dirs));
+        }
     }
 
     /// C7-2: 끊긴 링크가 사슬로 이어져도 env 파일을 만들 수 없다.

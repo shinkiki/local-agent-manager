@@ -44,7 +44,6 @@ import {
 import {
   activeActions,
   creationProblems,
-  RECORD_TARGETS,
   buildScheduleInput,
   buildWorkflowContract,
   cardSteps,
@@ -61,6 +60,7 @@ import {
   visibleFields,
   type OnboardingValues,
 } from "../lib/aiaOnboarding";
+import { availableRecordTargets } from "../lib/aiaOnboardingRecordTargets";
 import { onboardingDraftPrompt } from "../lib/aiaOnboardingDraftPrompt";
 import { aiaRuntimeProvider } from "../lib/aiaRuntime";
 import { directoryCreationItems } from "../lib/missingDirectory";
@@ -94,14 +94,6 @@ const cardIcons: Record<AiaOnboardingIcon, LucideIcon> = {
   target: Target,
   workflow: Workflow,
 };
-
-function availableRecordTargets(plugins: readonly ExternalPluginView[]) {
-  return RECORD_TARGETS.filter(({ needles }) => needles.length === 0 || plugins.some((plugin) => {
-    if (!plugin.attachable) return false;
-    const haystack = `${plugin.id} ${plugin.displayName} ${plugin.url ?? ""}`.toLowerCase();
-    return needles.some((needle) => haystack.includes(needle));
-  }));
-}
 
 interface OnboardingSources {
   projects: ProjectRegistryEntry[];

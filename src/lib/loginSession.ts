@@ -38,8 +38,13 @@ function storage(): Storage | null {
 /** 지금 들고 있는 세션 토큰. 없으면 null. */
 export function loginSessionToken(): string | null {
   if (memoryToken === undefined) {
-    const stored = storage()?.getItem(STORAGE_KEY) ?? null;
-    memoryToken = stored && stored.length > 0 ? stored : null;
+    try {
+      const stored = storage()?.getItem(STORAGE_KEY) ?? null;
+      memoryToken = stored && stored.length > 0 ? stored : null;
+    } catch {
+      // C20-3. 객체를 얻어도 읽기는 거절될 수 있다. 저장 실패와 같이 메모리로 이어간다.
+      memoryToken = null;
+    }
   }
   return memoryToken;
 }

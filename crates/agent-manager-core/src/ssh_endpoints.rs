@@ -485,15 +485,30 @@ pub fn list_agent_ssh_endpoints(app_data_dir: &Path) -> Result<AgentSshEndpoints
 }
 
 /// 실행 경로 테스트가 홈과 앱 데이터를 직접 지정해 서버를 심을 때 쓰는 입구.
-/// 지금은 이 입구를 부르는 시험이 없다 — 서버를 심는 시험이 다시 생길 때 쓴다.
+/// 실행기 시험(`runners.rs`)이 가리킬 서버를 이 입구로 심는다.
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) fn save_ssh_server_for_test(
     home: &Path,
     app_data_dir: &Path,
     request: &SaveSshServerRequest,
 ) -> Result<SshKeysSnapshot, CoreError> {
     save_ssh_server_with(home, app_data_dir, request)
+}
+
+/// 실행기 시험이 "가리키던 서버가 지워진" 상태를 만들 때 쓰는 입구.
+#[cfg(test)]
+pub(crate) fn delete_ssh_server_for_test(
+    home: &Path,
+    app_data_dir: &Path,
+    server_id: &str,
+) -> Result<SshKeysSnapshot, CoreError> {
+    delete_ssh_server_with(
+        home,
+        app_data_dir,
+        &SshServerRef {
+            server_id: server_id.to_owned(),
+        },
+    )
 }
 
 fn save_ssh_server_with(
@@ -1064,7 +1079,7 @@ fn resolve_interactive_target(
     })
 }
 
-fn list_agent_ssh_endpoints_with(
+pub(crate) fn list_agent_ssh_endpoints_with(
     home: &Path,
     app_data_dir: &Path,
 ) -> Result<AgentSshEndpointsView, CoreError> {
@@ -1208,7 +1223,8 @@ fn edit_servers(
     })
 }
 
-fn load_servers(app_data_dir: &Path) -> Result<Vec<SshEndpointView>, CoreError> {
+/// 저장된 연결 서버 전체. 실행기(C21)도 이 목록으로 가리키는 서버를 푼다.
+pub(crate) fn load_servers(app_data_dir: &Path) -> Result<Vec<SshEndpointView>, CoreError> {
     SERVERS_STORE.with_lock(app_data_dir, || {
         Ok(load_servers_unlocked(app_data_dir)?.servers)
     })
@@ -1606,11 +1622,18 @@ fn unknown_argument(flag: &str, hint: &str) -> CoreError {
     CoreError::InvalidInput(format!("알 수 없는 인자입니다: {flag}{hint}"))
 }
 
+/// 같은 플래그를 두 번 받았을 때의 거절. 마지막 값을 조용히 남기면 에이전트가 고른 것과
+/// 다른 서버에서 명령이 돈다(C9-18). 어느 쪽이 의도인지 알 수 없으므로 거절한다.
+fn repeated_argument(flag: &str) -> CoreError {
+    CoreError::InvalidInput(format!("{flag}가 두 번 지정됐습니다. 하나만 남기세요"))
+}
+
 fn parse_list_args(args: impl Iterator<Item = String>) -> Result<std::path::PathBuf, CoreError> {
     let mut args = FlagArgs::new(args);
     let mut app_data_dir = None;
     while let Some(flag) = args.next_flag() {
         match flag.as_str() {
+            "--app-data-dir" if app_data_dir.is_some() => return Err(repeated_argument(&flag)),
             "--app-data-dir" => app_data_dir = Some(args.path_value("--app-data-dir")?),
             other => return Err(unknown_argument(other, "")),
         }
@@ -1655,6 +1678,10 @@ impl SshExecCliOptions {
         let mut command_words: Option<Vec<String>> = None;
         while let Some(flag) = args.next_flag() {
             match flag.as_str() {
+                "--server" if server_id.is_some() => return Err(repeated_argument(&flag)),
+                "--fingerprint" if fingerprint.is_some() => return Err(repeated_argument(&flag)),
+                "--timeout" if timeout_seconds.is_some() => return Err(repeated_argument(&flag)),
+                "--app-data-dir" if app_data_dir.is_some() => return Err(repeated_argument(&flag)),
                 "--server" => server_id = Some(args.value("--server")?),
                 "--fingerprint" => fingerprint = Some(args.value("--fingerprint")?),
                 "--timeout" => {
@@ -2263,6 +2290,43 @@ mod tests {
             None
         )
         .is_err());
+    }
+
+    /// C9-18. `ssh exec`·`ssh list`는 같은 플래그를 두 번 받으면 마지막 값을 남기지 않고
+    /// 거절한다 — `--server A --server B`가 B에서 실행되면 안 된다.
+    #[test]
+    fn c9_18_repeated_cli_flags_are_refused_instead_of_keeping_the_last() {
+        let refused = |result: Result<(), CoreError>, flag: &str| {
+            assert!(
+                matches!(&result, Err(CoreError::InvalidInput(message)) if message.contains("두 번")),
+                "{flag}: {result:?}"
+            );
+        };
+        for (flag, first, second) in [
+            ("--server", "srv-a", "srv-b"),
+            ("--fingerprint", "SHA256:a", "SHA256:b"),
+            ("--timeout", "10", "20"),
+            ("--app-data-dir", "/tmp/a", "/tmp/b"),
+        ] {
+            let mut words = vec![flag, first, flag, second];
+            if flag != "--server" {
+                words.extend(["--server", "srv-a"]);
+            }
+            words.extend(["--", "ls"]);
+            refused(
+                SshExecCliOptions::parse(words.into_iter().map(str::to_owned), None).map(drop),
+                flag,
+            );
+        }
+        refused(
+            parse_list_args(
+                ["--app-data-dir", "/tmp/a", "--app-data-dir", "/tmp/b"]
+                    .into_iter()
+                    .map(str::to_owned),
+            )
+            .map(drop),
+            "list --app-data-dir",
+        );
     }
 
     /// C9-19. 대화형 터미널 사양은 저장된 서버와 개인키만 요구하고 에이전트 사용 토글은

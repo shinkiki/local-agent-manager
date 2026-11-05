@@ -9,7 +9,7 @@ import { cleanPathInput, normalizePathSlashes, pathFileName } from "./crossPlatf
 // cypressEnv.ts가, 경로 문자열을 판단 전에 손질하는 일(구분자 통일·공백 다듬기·마지막 조각)은
 // crossPlatformPath.ts가 맡는다. 화면과 테스트가 창구 하나만 알면 되도록 앞의 둘은 여기서
 // 다시 내보낸다(경로 손질은 도메인과 무관한 규칙이라 쓰는 쪽에서 직접 가져다 쓴다).
-export { cypressArtifactLabel, failedCypressTests, summarizeCypressRun } from "./cypressRunSummary.ts";
+export { cypressArtifactLabel, cypressRunStatePill, failedCypressTests, summarizeCypressRun } from "./cypressRunSummary.ts";
 export { parseEnvJsonText } from "./cypressEnv.ts";
 
 /** 비밀정보 파일 이름. 백엔드도 같은 이름을 민감 파일로 다룬다. */

@@ -121,6 +121,8 @@ fn owned_by_app(name: &str, url: &str, base: &str, ledger: &BTreeMap<String, Str
     ledger.get(name).is_some_and(|recorded| recorded == url)
         || url == format!("{base}/{name}")
         || url == plugin_url(base, name)
+        || (name == crate::chat::INDEX_MCP_SERVER_ID
+            && url == format!("{base}{}", crate::system_mcp::INDEX_PATH))
         || (name == crate::chat::CYPRESS_MCP_SERVER_ID && url == cypress_url(base))
 }
 
@@ -254,6 +256,12 @@ fn desired_servers(app_data_dir: &Path, base: &str) -> Result<BTreeMap<String, S
         desired.insert(
             crate::chat::CYPRESS_MCP_SERVER_ID.to_owned(),
             cypress_url(base),
+        );
+    }
+    if crate::index_addon::index_enabled(app_data_dir) {
+        desired.insert(
+            crate::chat::INDEX_MCP_SERVER_ID.to_owned(),
+            format!("{base}{}", crate::system_mcp::INDEX_PATH),
         );
     }
     Ok(desired)

@@ -43,8 +43,9 @@ import { readJsonPayload, readJsonPayloadWithProgress, type DownloadProgress } f
  *      싣고 `writable`을 버렸다.
  *      헤드리스 표시(`headless`)도 함께 온다.
  *  13: SSH 연결 서버가 키에서 독립한 계약을 지원한다.
- *  14: 등록 폴더 설정 변경(`update_doc_root`)을 지원한다. */
-const EXPECTED_BACKEND_PROTOCOL_VERSION = 14;
+ *  14: 등록 폴더 설정 변경(`update_doc_root`)을 지원한다.
+ *  15: C21 분산처리 실행기 명령(`list_runners` 등)을 지원한다. */
+const EXPECTED_BACKEND_PROTOCOL_VERSION = 15;
 
 /** 단일 백엔드까지 요청이 도달하지 못한 네트워크 수준 실패. */
 export class RemoteConnectionError extends Error {
@@ -88,7 +89,9 @@ function failedResponseError(payload: unknown, status: number, fallback: string)
 /** 실패한 응답의 본문을 읽어 던질 오류를 만든다. 성공 응답에는 쓰지 않는다 —
  *  본문은 한 번만 읽을 수 있어 성공 값을 여기서 소비하면 안 된다. */
 export async function responseError(response: Response, fallback: string): Promise<Error> {
-  return failedResponseError(await readJsonPayload(response), response.status, fallback);
+  // 오류 본문을 받다 끊겨도 알릴 것은 상태 코드다. 수신 실패로 바꿔 던지면 그 상태가 사라진다.
+  const payload = await readJsonPayload(response).catch(() => null);
+  return failedResponseError(payload, response.status, fallback);
 }
 
 /** 백엔드로 나가는 모든 `fetch`. 세션 토큰이 있으면 헤더로 싣는다(C20). */
@@ -202,7 +205,11 @@ async function remoteCommandResponse<T>(
     // 진행은 성공 본문에만 알린다. 오류 본문은 짧고, 그 크기를 진행으로 보이면 뜻이 없다.
     const payload = onDownloadProgress && response.ok
       ? await readJsonPayloadWithProgress<T>(response, onDownloadProgress, signal)
-      : await readJsonPayload<T>(response, signal);
+      // 실패 응답의 본문이 끊겨도 알릴 것은 상태 코드다(503 → 재시도). 중단만 그대로 던진다.
+      : await readJsonPayload<T>(response, signal).catch((cause) => {
+        if (response.ok || signal?.aborted) throw cause;
+        return null;
+      });
     return { response, payload };
   } catch (cause) {
     // 중단은 연결 실패가 아니라 시간 초과다. 재연결 배너 대신 재시도 가능한 오류로 알린다.

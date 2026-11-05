@@ -8,7 +8,7 @@ import {
   type PopoutRequest,
 } from "./popout";
 import type { AppLocale } from "../types";
-import { enableAiaWindowSessions } from "./aiaWindowSession";
+import { enableAiaWindowSessionsQuietly } from "./aiaWindowSession";
 import { diagramPopoutSearch, diagramPopoutWindowName, stashDiagramSource } from "./diagramPopout";
 import { runtimeText } from "./i18nRuntime";
 import { phraseText, type Phrase } from "./phrase";
@@ -117,7 +117,10 @@ function popoutShell(): PopoutShell {
  * 호출부는 이 함수를 await 없이 바로 호출해야 하고 이 함수도 창을 열기 전에 대기하지 않는다.
  */
 export async function openPopoutWindow(request: PopoutRequest): Promise<void> {
-  if (request.kind === "aia") enableAiaWindowSessions(window.localStorage);
+  // 저장소가 막힌 브라우저(쿠키 전면 차단)에서 `window.localStorage`는 닿기만 해도 던진다.
+  // 여기서 던지면 창을 열기도 전에 약속이 거절돼 "새 창" 버튼이 오류만 띄웠다. 플래그는
+  // 힌트이고 창 열기가 본업이므로 저장소 실패를 삼키는 쪽을 부른다.
+  if (request.kind === "aia") enableAiaWindowSessionsQuietly();
   await openPopoutTarget(popoutWindowName(request), popoutSearch(request), popoutDefaultTitle(request));
 }
 

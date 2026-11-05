@@ -61,6 +61,33 @@ test("a step that reads an earlier result gets a dashed data edge, not an order 
   assert.doesNotMatch(diagram, /step_1 -\. "결과 참조" \.-> step_1/);
 });
 
+test("a step that reads an earlier result through $format also gets a dashed data edge and ignores escaped braces", () => {
+  const formatted = {
+    ...sequential,
+    steps: [
+      { id: "list", operation: "list_sessions", arguments: {}, forEach: null, condition: null, expect: null },
+      { id: "fake", operation: "list_sessions", arguments: {}, forEach: null, condition: null, expect: null },
+      {
+        id: "note",
+        operation: "list_sessions",
+        arguments: {
+          request: {
+            search: {
+              $format: "첫 세션 {step.list.items.0.title} · 이스케이프 {{step.fake.items.0.title}} · 중첩 {{{step.list.count}}}",
+            },
+          },
+        },
+        forEach: null,
+        condition: null,
+        expect: null,
+      },
+    ],
+  };
+  const diagram = workflowDiagram(formatted);
+  assert.match(diagram, /step_0 -\. "결과 참조" \.-> step_2/);
+  assert.doesNotMatch(diagram, /step_1 -\. "결과 참조" \.-> step_2/);
+});
+
 test("a declared skill hangs off the chat step and clicks only when an address is given", () => {
   const plain = workflowDiagram(paced);
   assert.match(plain, /skill_0\(\["스킬<br\/>agent-manager-refactor-round"\]\)/);

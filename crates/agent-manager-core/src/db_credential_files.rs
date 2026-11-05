@@ -53,7 +53,10 @@ fn decode_mylogin(path: &Path) -> Result<Option<Zeroizing<String>>, CoreError> {
     if !path.is_file() {
         return Ok(None);
     }
-    let raw = std::fs::read(path)?;
+    // 파일 머리에 키가 그대로 있으니 원본 바이트도 비밀번호와 같은 값이다. 해독 버퍼까지
+    // 모두 Zeroizing으로 두고, 평문은 미리 원본 크기만큼 잡아 자라며 지워지지 않은 앞 버퍼를
+    // 풀지 않게 한다(G4, C10-5).
+    let raw = Zeroizing::new(std::fs::read(path)?);
     if raw.len() < 24 {
         return Err(CoreError::InvalidInput(format!(
             "{} 형식을 해석할 수 없습니다",
@@ -61,12 +64,12 @@ fn decode_mylogin(path: &Path) -> Result<Option<Zeroizing<String>>, CoreError> {
         )));
     }
     // 앞 4바이트는 예약, 그다음 20바이트가 키 원본이다.
-    let mut key = [0u8; 16];
+    let mut key = Zeroizing::new([0u8; 16]);
     for (index, byte) in raw[4..24].iter().enumerate() {
         key[index % 16] ^= byte;
     }
-    let cipher = aes::Aes128::new(GenericArray::from_slice(&key));
-    let mut plain = Vec::new();
+    let cipher = aes::Aes128::new(GenericArray::from_slice(key.as_slice()));
+    let mut plain = Zeroizing::new(Vec::with_capacity(raw.len()));
     let mut cursor = 24;
     while cursor + 4 <= raw.len() {
         let length = u32::from_le_bytes([
@@ -79,7 +82,7 @@ fn decode_mylogin(path: &Path) -> Result<Option<Zeroizing<String>>, CoreError> {
         if length == 0 || !length.is_multiple_of(16) || cursor + length > raw.len() {
             break;
         }
-        let mut chunk = raw[cursor..cursor + length].to_vec();
+        let mut chunk = Zeroizing::new(raw[cursor..cursor + length].to_vec());
         cursor += length;
         for block in chunk.chunks_mut(16) {
             cipher.decrypt_block(GenericArray::from_mut_slice(block));
@@ -87,13 +90,15 @@ fn decode_mylogin(path: &Path) -> Result<Option<Zeroizing<String>>, CoreError> {
         // PKCS#7 패딩을 떼어 낸다. 값이 범위를 벗어나면 이 덩이는 버린다.
         if let Some(padding) = chunk.last().copied() {
             if padding as usize <= 16 && padding as usize <= chunk.len() {
-                chunk.truncate(chunk.len() - padding as usize);
+                let kept = chunk.len() - padding as usize;
+                chunk.truncate(kept);
             }
         }
         plain.extend_from_slice(&chunk);
     }
-    let text = String::from_utf8_lossy(&plain).into_owned();
-    Ok(Some(Zeroizing::new(text)))
+    Ok(Some(Zeroizing::new(
+        String::from_utf8_lossy(&plain).into_owned(),
+    )))
 }
 
 /// 해독한 INI에서 한 구역의 값 하나를 읽는다.
@@ -233,6 +238,57 @@ mod tests {
             Some("uhrms")
         );
         assert_eq!(mylogin_field(document, "missing", "password"), None);
+    }
+
+    /// MySQL 클라이언트와 같은 규칙으로 `.mylogin.cnf`를 만든다: 예약 4바이트, 키 원본
+    /// 20바이트, 그 뒤 줄마다 길이(LE u32)와 PKCS#7로 채운 AES-128-ECB 덩이.
+    fn obfuscate_mylogin(lines: &[&str]) -> Vec<u8> {
+        use aes::cipher::generic_array::GenericArray;
+        use aes::cipher::{BlockEncrypt, KeyInit};
+        let seed: Vec<u8> = (1..=20).collect();
+        let mut key = [0u8; 16];
+        for (index, byte) in seed.iter().enumerate() {
+            key[index % 16] ^= byte;
+        }
+        let cipher = aes::Aes128::new(GenericArray::from_slice(&key));
+        let mut out = vec![0u8; 4];
+        out.extend_from_slice(&seed);
+        for line in lines {
+            let mut chunk = line.as_bytes().to_vec();
+            let padding = 16 - chunk.len() % 16;
+            chunk.extend(std::iter::repeat_n(padding as u8, padding));
+            for block in chunk.chunks_mut(16) {
+                cipher.encrypt_block(GenericArray::from_mut_slice(block));
+            }
+            out.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+            out.extend_from_slice(&chunk);
+        }
+        out
+    }
+
+    #[test]
+    fn c10_5_mylogin_file_is_decoded_into_the_requested_password() {
+        let dir = TempDir::new().expect("temp");
+        let path = dir.path().join(".mylogin.cnf");
+        let lines = [
+            "[client]\n",
+            "password = \"shared\"\n",
+            "[dev]\n",
+            "user = app\n",
+            "password = \"exactly-sixteen!\"\n",
+        ];
+        std::fs::write(&path, obfuscate_mylogin(&lines)).expect("write");
+        let found = read_mylogin_password(&path, "dev").expect("read");
+        assert_eq!(
+            found.as_deref().map(String::as_str),
+            Some("exactly-sixteen!")
+        );
+        let missing = read_mylogin_password(&path, "other").expect("read");
+        assert!(missing.is_none());
+        let absent = read_mylogin_password(&dir.path().join("none"), "dev").expect("read");
+        assert!(absent.is_none());
+        std::fs::write(&path, [0u8; 10]).expect("write");
+        assert!(read_mylogin_password(&path, "dev").is_err());
     }
 
     #[test]

@@ -10,6 +10,7 @@ import {
   skillDivergenceHint,
   skillDivergenceLabel,
   skillKeyError,
+  skillProviderStatusLabel,
   skillStatusModifier,
   skillSyncCounts,
   skillSyncLabel,
@@ -219,4 +220,32 @@ test("방향을 모르면 어느 쪽이 새 내용인지 단정하지 않는다"
 test("방향별 다음 조치를 문구로 알려 준다", () => {
   assert.match(skillDivergenceHint("behind", translate), /변경사항 취소/);
   assert.match(skillDivergenceHint("edited", translate), /이 버전으로 통일/);
+});
+
+// V2/V4: 공급자 칩의 본문·도움말은 링크 종류보다 원본과 달라진 방향을 먼저 알려야 한다.
+// 이 조합을 놓치면 뒤처진 사본도 단순한 링크/사본으로 보여 원본 선택을 오해할 수 있다.
+test("V2/V4 공급자 상태는 링크·사본보다 갈라짐 방향을 먼저 표시한다", () => {
+  const english = (_ko, en) => en;
+  for (const status of ["linked", "copy"]) {
+    for (const [divergence, ko, en, modifier] of [
+      ["behind", "뒤처짐", "Out of date", "stale"],
+      ["edited", "외부 수정 감지", "Externally edited", "divergent"],
+      ["unknown", "원본과 다름", "Differs from source", "divergent"],
+      [null, "원본과 다름", "Differs from source", "divergent"],
+    ]) {
+      const state = providerState({ status, divergent: true, divergence });
+      const context = `${status}/${divergence}`;
+      assert.equal(skillProviderStatusLabel(state, translate), ko, context);
+      assert.equal(skillProviderStatusLabel(state, english), en, context);
+      assert.equal(skillStatusModifier(state), modifier, context);
+    }
+  }
+});
+
+test("V2/V4 갈라짐이 없는 공급자는 남아 있는 방향 값보다 배포 상태를 표시한다", () => {
+  for (const [status, label] of [["linked", "링크"], ["copy", "사본"]]) {
+    const state = providerState({ status, divergent: false, divergence: "behind" });
+    assert.equal(skillProviderStatusLabel(state, translate), label, status);
+    assert.equal(skillStatusModifier(state), status, status);
+  }
 });

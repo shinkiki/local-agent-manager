@@ -120,14 +120,17 @@ export function resolveStaleDismissals(
 ): void {
   markResolvedWhenGone(history.projectDismissals, (key) => projectStates.get(key)?.qualifies === true);
 
-  const activeIncidentKeys = new Set(
-    allCandidates
-      .filter((suggestion) => dismissalBucket(suggestion.kind) === "incident")
-      .map(DISMISSAL_RULES.incident.key),
-  );
+  // 두 인덱스를 함께 모아 같은 후보 목록의 재순회와 중간 배열을 피한다.
+  const activeIncidentKeys = new Set<string>();
+  const activeFingerprints = new Set<string>();
+  for (const suggestion of allCandidates) {
+    activeFingerprints.add(suggestion.fingerprint);
+    if (dismissalBucket(suggestion.kind) === "incident") {
+      activeIncidentKeys.add(DISMISSAL_RULES.incident.key(suggestion));
+    }
+  }
   markResolvedWhenGone(history.incidentDismissals, (key) => activeIncidentKeys.has(key));
 
-  const activeFingerprints = new Set(allCandidates.map((suggestion) => suggestion.fingerprint));
   for (const fingerprint of Object.keys(history.dismissed)) {
     if (!activeFingerprints.has(fingerprint)) delete history.dismissed[fingerprint];
   }

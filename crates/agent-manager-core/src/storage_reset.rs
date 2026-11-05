@@ -88,6 +88,49 @@ mod tests {
     }
 
     #[test]
+    fn s1_marker_records_only_removed_files_and_survives_retry_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = temp.path();
+        let removed_path = app_data.join("scheduled-requests.json");
+        let missing_path = app_data.join("session-catalog-v1.json");
+        let directory_path = app_data.join("session-supplements.json");
+        fs::write(&removed_path, b"legacy").unwrap();
+        fs::create_dir(&directory_path).unwrap();
+        fs::write(directory_path.join("keep"), b"directory contents").unwrap();
+
+        prepare_account_management_storage(app_data).unwrap();
+        let marker_path = app_data.join(RESET_MARKER);
+        let marker_bytes = fs::read(&marker_path).unwrap();
+        let marker: serde_json::Value = serde_json::from_slice(&marker_bytes).unwrap();
+        assert_eq!(marker["schemaVersion"], 1);
+        let completed_at = marker["completedAt"].as_i64().unwrap();
+        assert!(completed_at > 0);
+        // S1: 없는 파일과 디렉터리는 삭제되지 않았으므로 기록에도 들어가지 않는다.
+        assert_eq!(
+            marker["removed"],
+            serde_json::json!(["scheduled-requests.json"])
+        );
+        assert!(!removed_path.exists());
+        assert!(!missing_path.exists());
+        assert_eq!(
+            fs::read(directory_path.join("keep")).unwrap(),
+            b"directory contents"
+        );
+
+        // S1: 완료 뒤 같은 이름의 파일이 생겨도 지우거나 최초 기록을 다시 쓰지 않는다.
+        fs::write(&removed_path, b"new data").unwrap();
+        fs::write(&missing_path, b"new catalog").unwrap();
+        prepare_account_management_storage(app_data).unwrap();
+        assert_eq!(fs::read(removed_path).unwrap(), b"new data");
+        assert_eq!(fs::read(missing_path).unwrap(), b"new catalog");
+        assert_eq!(
+            fs::read(directory_path.join("keep")).unwrap(),
+            b"directory contents"
+        );
+        assert_eq!(fs::read(marker_path).unwrap(), marker_bytes);
+    }
+
+    #[test]
     fn removes_only_allowlisted_agent_manager_data_once() {
         let temp = tempfile::tempdir().unwrap();
         let app_data = temp.path().join("app-data");

@@ -43,6 +43,20 @@ pub(crate) fn has_parent_dir(path: &Path) -> bool {
         .any(|component| matches!(component, Component::ParentDir))
 }
 
+/// 루트 기준 상대 경로를 저장·표시용 키로 바꾼다. 성분을 `/`로 잇는다.
+///
+/// 문자열 전체에서 `\`를 `/`로 바꾸는 치환은 Unix에서 파일명 안의 역슬래시까지 바꿔
+/// `nested\note.md`와 `nested/note.md`를 한 키로 겹치게 한다(G10). Windows는 `\`와 `/`
+/// 둘 다 성분 경계라 성분 결합이 치환과 같은 결과를 낸다. 문서 감시(`document_automation`)와
+/// 프로젝트 파일 화면(`project_files`)이 각자 적어 두던 같은 규칙을 여기 하나로 모은다.
+pub(crate) fn relative_path_key(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// `.` 구성요소를 어떻게 볼지. 대부분은 정규 상대 경로만 받지만, 지침 구성 파일 경로는
 /// 원본이 `./doc.md` 꼴로 적어 둔 것을 그대로 받아야 해서 통과시킨다.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -211,6 +225,43 @@ pub(crate) fn assert_within_root(
 mod tests {
     use super::*;
 
+    #[test]
+    fn relative_path_key_joins_components_with_forward_slash() {
+        assert_eq!(
+            relative_path_key(Path::new("nested/data.bin")),
+            "nested/data.bin"
+        );
+        assert_eq!(
+            relative_path_key(&Path::new("nested").join("deep").join("note.md")),
+            "nested/deep/note.md"
+        );
+        assert_eq!(relative_path_key(Path::new("")), "");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn relative_path_key_keeps_unix_backslash_filenames() {
+        // G10: a backslash is a filename character on Unix, not a separator.
+        assert_eq!(
+            relative_path_key(Path::new(r"nested\note.md")),
+            r"nested\note.md"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn relative_path_key_normalizes_windows_separators() {
+        assert_eq!(
+            relative_path_key(Path::new(r"nested\note.md")),
+            "nested/note.md"
+        );
+        // Both separators are component boundaries, so a mixed path joins the same way.
+        assert_eq!(
+            relative_path_key(Path::new(r"nested/deep\note.md")),
+            "nested/deep/note.md"
+        );
+    }
+
     const LABELS: RootLabels = RootLabels {
         subject: "시험 경로",
         escaped: "시험 경로가 허용된 루트를 벗어납니다",
@@ -253,15 +304,46 @@ mod tests {
     }
 
     #[test]
-    fn missing_tail_is_resolved_against_the_nearest_existing_ancestor() {
+    fn g10_missing_tail_is_resolved_against_the_nearest_existing_ancestor_for_both_policies() {
         let (_dir, root) = temp_root();
-        let resolved = resolve_existing_ancestor(
-            &root.join("absent/child.md"),
-            MissingTail::SkipAnyError,
-            "시험 경로",
-        )
-        .expect("resolved");
-        assert_eq!(resolved, root.join("absent/child.md"));
+        let target = root.join("absent/child.md");
+        for missing in MissingTail::ALL {
+            let resolved =
+                resolve_existing_ancestor(&target, missing, "시험 경로").expect("resolved");
+            assert_eq!(resolved, target, "{missing}");
+        }
+    }
+
+    /// G10: 권한 우회 여부와 무관하게 ENOTDIR·ELOOP로 두 정책의 차이를 고정한다.
+    /// 쓰기 경로를 정하는 엄격 정책은 OS 오류를 보존하고, 루트 포함 여부만 확인하는
+    /// 정책은 기존 조상까지 올라간다. 기존 권한 시험은 관리자 실행에서 이 갈래를 못 본다.
+    #[cfg(unix)]
+    #[test]
+    fn g10_missing_tail_preserves_non_not_found_io_errors_only_in_strict_policy() {
+        let (_dir, root) = temp_root();
+        let file = root.join("file");
+        fs::write(&file, "ancestor is a file").expect("file ancestor");
+        let cycle = root.join("cycle");
+        std::os::unix::fs::symlink("cycle", &cycle).expect("symlink cycle");
+
+        for target in [file.join("child.md"), cycle.join("child.md")] {
+            let expected = fs::canonicalize(&target).expect_err("invalid ancestor");
+            assert_ne!(expected.kind(), std::io::ErrorKind::NotFound);
+            let strict = resolve_existing_ancestor(&target, MissingTail::SkipNotFound, "시험 경로");
+            let Err(CoreError::Io(actual)) = strict else {
+                panic!(
+                    "OS error must be preserved for {}: {strict:?}",
+                    target.display()
+                );
+            };
+            assert_eq!(actual.kind(), expected.kind());
+            assert_eq!(actual.raw_os_error(), expected.raw_os_error());
+            assert_eq!(
+                resolve_existing_ancestor(&target, MissingTail::SkipAnyError, "시험 경로")
+                    .expect("resolve through existing ancestor"),
+                target
+            );
+        }
     }
 
     /// `SkipNotFound`는 없는 대상만 건너뛰고 다른 입출력 오류는 그대로 올린다. 쓰기 대상을

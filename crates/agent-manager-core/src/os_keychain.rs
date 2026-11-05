@@ -25,7 +25,7 @@ use std::thread;
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 use keyring::Entry;
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
@@ -33,6 +33,9 @@ use zeroize::Zeroizing;
 #[cfg(target_os = "macos")]
 use crate::credential_profiles;
 use crate::CoreError;
+
+#[cfg(all(unix, not(target_os = "macos")))]
+mod secret_service;
 
 #[cfg(target_os = "macos")]
 const MACOS_SECURITY_BIN: &str = "/usr/bin/security";
@@ -45,7 +48,7 @@ const KEYCHAIN_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(target_os = "macos")]
 const MAX_KEYCHAIN_COMMAND_OUTPUT_BYTES: u64 = 1024 * 1024;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn vault_error(prefix: &'static str) -> impl FnOnce(keyring::Error) -> CoreError {
     move |error| match error {
         // 저장소 자체가 없거나 닿을 수 없다(헤드리스 리눅스의 Secret Service 부재 등).
@@ -67,6 +70,16 @@ pub(crate) const KEYCHAIN_UNAVAILABLE_CODE: &str = "KEYCHAIN_UNAVAILABLE";
 /// 저장소 부재로 실패했는지. 파일 폴백을 가진 호출자만 이 판정을 쓴다.
 pub(crate) fn is_keychain_unavailable(error: &CoreError) -> bool {
     matches!(error, CoreError::Coded(coded) if coded.code() == KEYCHAIN_UNAVAILABLE_CODE)
+}
+
+/// 저장소는 있는데 잠겨 있어 열지 못했을 때의 코드. 부재(`KEYCHAIN_UNAVAILABLE_CODE`)와
+/// 가른다 — 파일 폴백은 저장소가 없을 때의 자리이지, 잠깐 잠긴 동안 비밀을 옮겨 둘 자리가 아니다.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) const KEYCHAIN_LOCKED_CODE: &str = "KEYCHAIN_LOCKED";
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+pub(crate) fn is_keychain_locked(error: &CoreError) -> bool {
+    matches!(error, CoreError::Coded(coded) if coded.code() == KEYCHAIN_LOCKED_CODE)
 }
 
 #[cfg(target_os = "macos")]
@@ -505,7 +518,7 @@ pub(crate) fn read_os_keychain_password_with_timeout(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn read_keyring_entry(
     service: &str,
     account: &str,
@@ -524,9 +537,31 @@ fn read_keyring_entry(
     }
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
+fn read_keyring_entry(
+    service: &str,
+    account: &str,
+) -> Result<Option<Zeroizing<String>>, CoreError> {
+    let Some(mut bytes) =
+        secret_service::read(service, account, "OS 보안 저장소를 읽지 못했습니다")?
+    else {
+        return Ok(None);
+    };
+    match String::from_utf8(std::mem::take(&mut *bytes)) {
+        Ok(value) => Ok(Some(Zeroizing::new(value))),
+        Err(error) => {
+            let mut bytes = error.into_bytes();
+            bytes.zeroize();
+            Err(CoreError::Runtime(
+                "OS 보안 저장소를 읽지 못했습니다: Data is not UTF-8 encoded".to_owned(),
+            ))
+        }
+    }
+}
+
 /// `BadEncoding`은 UTF-8로 풀지 못한 저장 값 **그 자체**를 들고 온다. 오류 문구에는
 /// 실리지 않지만, 그대로 버리면 비밀 바이트가 지워지지 않은 채 해제된다(`G4`).
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn scrub_keyring_error(error: &mut keyring::Error) {
     if let keyring::Error::BadEncoding(bytes) = error {
         bytes.zeroize();
@@ -586,12 +621,22 @@ fn write_macos_keychain_password_with_executable(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn write_keyring_entry(service: &str, account: &str, secret: &str) -> Result<(), CoreError> {
     Entry::new(service, account)
         .map_err(vault_error("OS 보안 저장소를 열지 못했습니다"))?
         .set_password(secret)
         .map_err(vault_error("OS 보안 저장소에 저장하지 못했습니다"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn write_keyring_entry(service: &str, account: &str, secret: &str) -> Result<(), CoreError> {
+    secret_service::write(
+        service,
+        account,
+        secret.as_bytes(),
+        "OS 보안 저장소에 저장하지 못했습니다",
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -609,7 +654,12 @@ pub(crate) fn delete_os_keychain_password(service: &str, account: &str) -> Resul
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
+fn delete_keyring_entry(service: &str, account: &str) -> Result<(), CoreError> {
+    secret_service::delete(service, account, "OS 보안 저장소에서 삭제하지 못했습니다").map(|_| ())
+}
+
+#[cfg(windows)]
 fn delete_keyring_entry(service: &str, account: &str) -> Result<(), CoreError> {
     match Entry::new(service, account)
         .map_err(vault_error("OS 보안 저장소를 열지 못했습니다"))?
@@ -658,22 +708,14 @@ pub(crate) fn read_foreign_secret(
     account: &str,
     windows_target: &str,
 ) -> Result<Option<Zeroizing<String>>, CoreError> {
-    let entry = foreign_keyring_entry(service, account, windows_target)
-        .map_err(vault_error("OS 보안 저장소를 열지 못했습니다"))?;
-    match entry.get_secret() {
-        Ok(bytes) => {
-            let bytes = Zeroizing::new(bytes);
-            match std::str::from_utf8(&bytes) {
-                Ok(text) => Ok(Some(Zeroizing::new(text.to_owned()))),
-                Err(_) => Err(CoreError::Runtime(
-                    "OS 보안 저장소 값이 UTF-8이 아닙니다".to_owned(),
-                )),
-            }
-        }
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(CoreError::Runtime(format!(
-            "OS 보안 저장소를 읽지 못했습니다: {error}"
-        ))),
+    let Some(bytes) = read_foreign_secret_bytes(service, account, windows_target)? else {
+        return Ok(None);
+    };
+    match std::str::from_utf8(&bytes) {
+        Ok(text) => Ok(Some(Zeroizing::new(text.to_owned()))),
+        Err(_) => Err(CoreError::Runtime(
+            "OS 보안 저장소 값이 UTF-8이 아닙니다".to_owned(),
+        )),
     }
 }
 
@@ -683,6 +725,27 @@ pub(crate) fn foreign_secret_present(
     account: &str,
     windows_target: &str,
 ) -> Result<bool, CoreError> {
+    Ok(read_foreign_secret_bytes(service, account, windows_target)?.is_some())
+}
+
+/// 값 읽기와 존재 확인은 같은 원시 바이트 읽기를 쓰고, 비밀은 두 경로 모두에서 지운다(`G4`).
+/// Secret Service는 service/account 짝으로 찾고, target 없는 남의 항목은 기본 컬렉션 대체
+/// 검색이 찾는다(`secret_service::find_unique`).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn read_foreign_secret_bytes(
+    service: &str,
+    account: &str,
+    _windows_target: &str,
+) -> Result<Option<Zeroizing<Vec<u8>>>, CoreError> {
+    secret_service::read(service, account, "OS 보안 저장소를 읽지 못했습니다")
+}
+
+#[cfg(windows)]
+fn read_foreign_secret_bytes(
+    service: &str,
+    account: &str,
+    windows_target: &str,
+) -> Result<Option<Zeroizing<Vec<u8>>>, CoreError> {
     let entry = foreign_keyring_entry(service, account, windows_target)
         .map_err(vault_error("OS 보안 저장소를 열지 못했습니다"))?;
     // 바이트로 받는다. `get_password`는 값을 그 플랫폼의 문자열 규약으로 풀어 보는데, 남이
@@ -691,13 +754,10 @@ pub(crate) fn foreign_secret_present(
     // 항목을 찾고도 `Data is not UTF-8 encoded`로 실패했다(2026-09-24 실측). 존재만 보는
     // 자리에서 값을 해석할 까닭이 없다.
     match entry.get_secret() {
-        // 값은 여기서 지워진다. 조각난 문서(`KEYCHAIN_CHUNK_MARKER`)인지도 따지지 않는다 —
+        // 조각난 문서(`KEYCHAIN_CHUNK_MARKER`)인지도 따지지 않는다 —
         // 조각내 쓰는 것은 우리 Vault뿐이고, 여기서 보는 항목은 남의 것이다.
-        Ok(value) => {
-            drop(Zeroizing::new(value));
-            Ok(true)
-        }
-        Err(keyring::Error::NoEntry) => Ok(false),
+        Ok(bytes) => Ok(Some(Zeroizing::new(bytes))),
+        Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(CoreError::Runtime(format!(
             "OS 보안 저장소를 읽지 못했습니다: {error}"
         ))),
@@ -719,7 +779,16 @@ pub(crate) fn delete_foreign_secret(
     Ok(present)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn delete_foreign_secret(
+    service: &str,
+    account: &str,
+    _windows_target: &str,
+) -> Result<bool, CoreError> {
+    secret_service::delete(service, account, "OS 보안 저장소에서 삭제하지 못했습니다")
+}
+
+#[cfg(windows)]
 pub(crate) fn delete_foreign_secret(
     service: &str,
     account: &str,
@@ -743,15 +812,6 @@ fn foreign_keyring_entry(
     windows_target: &str,
 ) -> Result<Entry, keyring::Error> {
     Entry::new_with_target(windows_target, service, account)
-}
-
-#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-fn foreign_keyring_entry(
-    service: &str,
-    account: &str,
-    _windows_target: &str,
-) -> Result<Entry, keyring::Error> {
-    Entry::new(service, account)
 }
 
 /// 한 항목에 담을 UTF-16 코드 단위 상한. Windows 자격 증명 관리자는 값 하나를
@@ -1021,7 +1081,7 @@ pub(crate) fn delete_os_keychain_password(service: &str, account: &str) -> Resul
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     #[test]
     fn g4_bad_encoding_secret_bytes_are_wiped_before_the_error_leaves() {
         let mut error = keyring::Error::BadEncoding(vec![0xff, b's', b'e', b'c']);
@@ -1033,6 +1093,82 @@ mod tests {
             other => panic!("unexpected {other}"),
         }
         assert_eq!(error.to_string(), "Data is not UTF-8 encoded");
+    }
+
+    /// 진짜 Secret Service에서 단계별로 돈다. 격리된 D-Bus 세션과 gnome-keyring이 있어야 해서
+    /// 기본으로는 돌지 않는다 — `deploy/synology/test-keyring-prompt-hang.sh`가 키링을 띄우고
+    /// 잠그고 다시 열면서 단계(`AM_KEYRING_TEST_PHASE`)를 하나씩 부른다.
+    ///
+    /// `keyring-*` 단계는 예전 통로(`keyring` 크레이트)로 읽고 써서, 새 통로가 이미 저장된 볼트를
+    /// 그대로 찾고 예전 판이 새 통로가 쓴 값을 그대로 읽는지(되돌려 배포해도 되는지) 본다.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    #[ignore = "격리된 D-Bus 세션의 gnome-keyring이 필요하다"]
+    fn secret_service_phase() {
+        use std::time::{Duration, Instant};
+
+        let phase = std::env::var("AM_KEYRING_TEST_PHASE").expect("AM_KEYRING_TEST_PHASE");
+        let service = "agent-manager-keyring-test";
+        let old_entry = |account: &str| keyring::Entry::new(service, account).unwrap();
+        let started = Instant::now();
+        match phase.as_str() {
+            "keyring-write" => old_entry("compat-old").set_password("옛-값").unwrap(),
+            "read-old" => {
+                let value = super::read_os_keychain_password(service, "compat-old").unwrap();
+                assert_eq!(value.as_deref().map(String::as_str), Some("옛-값"));
+            }
+            "write" => {
+                super::write_os_keychain_password(service, "probe", "값-0").unwrap();
+                // 있는 항목은 새로 만들지 않고 덮는다.
+                super::write_os_keychain_password(service, "probe", "값-1").unwrap();
+            }
+            "keyring-read" => assert_eq!(old_entry("probe").get_password().unwrap(), "값-1"),
+            "foreign-read" => {
+                let value =
+                    super::read_foreign_secret("am-test-foreign", "foreign-user", "").unwrap();
+                assert_eq!(value.as_deref().map(String::as_str), Some("남의-값"));
+                assert!(!super::foreign_secret_present("am-test-foreign", "nobody", "").unwrap());
+            }
+            "read-unlocked-later" => {
+                let value = super::read_os_keychain_password(service, "probe").unwrap();
+                assert_eq!(value.as_deref().map(String::as_str), Some("값-1"));
+                assert!(
+                    started.elapsed() >= Duration::from_secs(1),
+                    "잠금을 기다리지 않았다"
+                );
+            }
+            "read-stays-locked" => {
+                let error = super::read_os_keychain_password(service, "probe").unwrap_err();
+                assert!(super::is_keychain_locked(&error), "{error}");
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed >= super::secret_service::UNLOCK_WAIT
+                        && elapsed < Duration::from_secs(25),
+                    "{elapsed:?}"
+                );
+                // 기다려도 안 열렸으면 바로 뒤 호출은 다시 기다리지 않는다.
+                let again = Instant::now();
+                let error = super::read_os_keychain_password(service, "probe").unwrap_err();
+                assert!(super::is_keychain_locked(&error), "{error}");
+                assert!(
+                    again.elapsed() < Duration::from_secs(1),
+                    "{:?}",
+                    again.elapsed()
+                );
+            }
+            "delete" => {
+                super::delete_os_keychain_password(service, "probe").unwrap();
+                assert!(matches!(
+                    old_entry("probe").get_password(),
+                    Err(keyring::Error::NoEntry)
+                ));
+                assert!(super::read_os_keychain_password(service, "probe")
+                    .unwrap()
+                    .is_none());
+                super::delete_os_keychain_password(service, "probe").unwrap();
+            }
+            other => panic!("unknown phase {other}"),
+        }
     }
 
     #[cfg(target_os = "macos")]

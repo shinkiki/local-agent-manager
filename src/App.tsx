@@ -79,6 +79,7 @@ import { useAiaPopupShell, useAiaRuntime } from "./appAiaPopup";
 import { useNewProjectsPrompt } from "./appNewProjects";
 import { useChatAttentionCenter } from "./appChatAttention";
 import { keepIfSame } from "./appStateIdentity";
+import { automationRenderPayload } from "./lib/automationRenderPayload";
 import {
   activeViewStore,
   catalogDiscoveryStore,
@@ -90,24 +91,10 @@ import {
   sidebarUsageDensityStore,
   useStoredState,
 } from "./appStoredState";
-import type { AccountSnapshot, AccountUsageView, AccentColor, LocalLlmConnection, CatalogHealth, ManagerSnapshot, MessageDisplayMode, ProjectOption, ProviderId, ProviderStatus, SchedulerSnapshot, SessionFolder, SessionMeta, SessionSummary, SessionTranscriptLimit, SystemAutomationSnapshot, ThemeMode, TranslationStatus, ViewId } from "./types";
+import type { AccountSnapshot, AccountUsageView, AccentColor, LocalLlmConnection, CatalogHealth, ManagerSnapshot, MessageDisplayMode, ProjectOption, ProviderId, ProviderStatus, SchedulerSnapshot, SessionFolder, SessionMeta, SessionSummary, SessionTranscriptLimit, SystemAutomationSnapshot, ThemeMode, ViewId } from "./types";
 
 /** 사이드바 Antigravity 사용량 폴링 주기. 백엔드가 30초 캐시를 두므로 그보다 자주 두드릴 이유가 없다. */
 const ANTIGRAVITY_USAGE_POLL_MS = 60_000;
-
-// 번역 진행 revision·updatedAt은 백엔드가 스캔할 때마다 새 값을 반환하므로,
-// 화면 표시와 번역 재조회에 실제로 영향을 주는 내용만 비교한다.
-function automationRenderPayload(snapshot: SystemAutomationSnapshot): string {
-  const stripTime = ({ updatedAt: _updatedAt, ...status }: TranslationStatus) => status;
-  const { revision: _revision, uiTranslation, skills, agents, artifacts, ...rest } = snapshot;
-  return JSON.stringify({
-    ...rest,
-    uiTranslation: stripTime(uiTranslation),
-    skills: stripTime(skills),
-    agents: stripTime(agents),
-    artifacts: stripTime(artifacts),
-  });
-}
 
 // 전역 폴링 setState가 무거운 뷰(세션 상세 트랜스크립트 등)를 다시 그리지 않도록 뷰 단위로 memo한다.
 const MemoDashboardView = memo(DashboardView);

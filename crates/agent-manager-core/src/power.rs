@@ -518,6 +518,102 @@ mod tests {
         assert!(!held.snapshot(true).active);
     }
 
+    /// 저장이 실패하면 억제 상태는 건드리지 않는다(`set_sleep_prevention` 계약). 설정 자리에
+    /// 일반 파일을 두면 root 여부와 무관하게 `create_dir_all`이 EEXIST 로 실패하므로, 이전에
+    /// 남긴 사유가 그대로 있어야 하고 새로 걸리지도 않아야 한다.
+    #[test]
+    fn a_failed_save_leaves_the_held_state_untouched() {
+        let _guard = HELD_TEST_LOCK.lock().expect("test lock");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let not_a_directory = directory.path().join("app-data");
+        std::fs::write(&not_a_directory, b"").expect("file in the way");
+        with_held(|held| {
+            held.release();
+            held.record_error("이전 사유".to_owned());
+        });
+
+        let error = set_sleep_prevention(&not_a_directory, true).expect_err("save rejected");
+
+        assert!(matches!(error, CoreError::Io(_)), "{error:?}");
+        with_held(|held| {
+            assert!(held.guard.is_none());
+            assert!(held.mechanism.is_none());
+            assert_eq!(held.error.as_deref(), Some("이전 사유"));
+        });
+        with_held(Held::release);
+    }
+
+    /// 저장 실패는 걸려 있던 억제도 풀지 않는다 — 다음 기동에서 되돌아올 설정과 지금 걸린
+    /// 상태가 어긋나는 쪽을 피한다. 살아 있는 자식을 손잡이로 꽂아 두고 끄기를 시도한다.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_save_does_not_release_a_live_mechanism() {
+        let _guard = HELD_TEST_LOCK.lock().expect("test lock");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let not_a_directory = directory.path().join("app-data");
+        std::fs::write(&not_a_directory, b"").expect("file in the way");
+        let child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("long-lived child");
+        with_held(|held| {
+            held.release();
+            held.guard = Some(platform::guard_for_test(child));
+            held.mechanism = Some(platform::MECHANISM);
+        });
+
+        set_sleep_prevention(&not_a_directory, false).expect_err("save rejected");
+
+        with_held(|held| {
+            assert!(held.guard.is_some());
+            assert_eq!(held.mechanism, Some(platform::MECHANISM));
+            assert!(held.error.is_none());
+        });
+        release_sleep_prevention();
+        with_held(|held| assert!(held.guard.is_none()));
+    }
+
+    /// 설정을 읽지 못해도 기동은 막지 않는다 — 사유만 남기고 아무것도 걸지 않으며, 깨진
+    /// 저장본을 기본값으로 덮어쓰지도 않는다. 그 뒤의 상태 조회는 같은 읽기 오류를 그대로 낸다.
+    #[test]
+    fn an_unreadable_setting_at_startup_records_the_reason_without_engaging() {
+        let _guard = HELD_TEST_LOCK.lock().expect("test lock");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(&path, b"{not json").expect("broken file");
+        with_held(Held::release);
+
+        let status = apply_saved_sleep_prevention(directory.path());
+
+        assert!(!status.enabled);
+        assert!(!status.active);
+        assert!(status.mechanism.is_none());
+        assert!(status.error.is_some());
+        assert_eq!(std::fs::read(&path).expect("unchanged"), b"{not json");
+        assert!(sleep_prevention_status(directory.path()).is_err());
+        with_held(Held::release);
+    }
+
+    /// 잠금이 poison돼도 억제는 계속 다뤄진다(`with_held` 계약). 한 번 패닉이 지나간 뒤에도
+    /// 다음 호출이 손잡이를 읽고 풀 수 있어야 한다.
+    #[test]
+    fn a_poisoned_lock_does_not_stop_sleep_prevention_handling() {
+        let _guard = HELD_TEST_LOCK.lock().expect("test lock");
+        with_held(|held| {
+            held.release();
+            held.record_error("poison 전 사유".to_owned());
+        });
+
+        let outcome = std::panic::catch_unwind(|| {
+            with_held(|_| panic!("poisoning the held lock on purpose"));
+        });
+        assert!(outcome.is_err());
+
+        with_held(|held| assert_eq!(held.error.as_deref(), Some("poison 전 사유")));
+        release_sleep_prevention();
+        with_held(|held| assert!(held.error.is_none()));
+    }
+
     /// 꺼 둔 설정으로 기동하면 수단이 없어도 사유 자리가 비어 있다 — 수용 기준의
     /// "조용한 무동작"이 회귀하지 않게 고정한다.
     #[test]

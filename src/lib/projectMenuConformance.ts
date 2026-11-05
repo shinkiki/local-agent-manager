@@ -651,8 +651,12 @@ export function evaluateCheck(check: ConformanceCheck, files: FileMap): CheckRes
       }
       if (check.kind === 'requiredLiterals') {
         if (missing.length === 0) return pass(check);
-        const allMissingFiles = paths.every((path) => files[path] === null);
-        return fail(check, `없다 — ${missing.join(', ')}`, allMissingFiles);
+        const hasMissingFile = paths.some((path) => files[path] === null);
+        const missingInExistingFiles = paths.some(
+          (path) => files[path] !== null && missing.some((m) => m.startsWith(`${path}:`)),
+        );
+        const isMissingFile = hasMissingFile && !missingInExistingFiles;
+        return fail(check, `없다 — ${missing.join(', ')}`, isMissingFile);
       }
       return found.length === 0
         ? pass(check)

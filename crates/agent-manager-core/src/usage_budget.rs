@@ -371,11 +371,13 @@ pub(crate) fn overlap_share(target: &RunSpan, others: &[RunSpan]) -> (f64, f64) 
     if overlapping.is_empty() {
         return (1.0, 1.0);
     }
-    let target_ms = (target.end - target.start).max(1) as f64;
+    // G7/V2: 저장된 i64 시각의 차이는 i64 범위를 넘을 수 있다. 더 큰 정수에서
+    // 빼야 긴 구간의 비율과 기존 최소 1ms 보정을 함께 보존한다.
+    let target_ms = (i128::from(target.end) - i128::from(target.start)).max(1) as f64;
     let total_ms = target_ms
         + overlapping
             .iter()
-            .map(|other| (other.end - other.start).max(1) as f64)
+            .map(|other| (i128::from(other.end) - i128::from(other.start)).max(1) as f64)
             .sum::<f64>();
     (target_ms / total_ms, 0.5)
 }
@@ -748,6 +750,47 @@ mod tests {
         );
         assert!((share - 0.5).abs() < 1e-9);
         assert_eq!(weight, 0.5);
+    }
+
+    #[test]
+    fn overlap_share_handles_extreme_timestamps_v2() {
+        for ((start, end), (other_start, other_end), expected) in [
+            ((i64::MIN, i64::MAX), (0, i64::MAX), 2.0 / 3.0),
+            ((0, i64::MAX), (i64::MIN, i64::MAX), 1.0 / 3.0),
+            ((i64::MIN, 0), (i64::MIN, i64::MAX), 1.0 / 3.0),
+            ((i64::MIN, i64::MAX), (i64::MIN, i64::MAX), 0.5),
+        ] {
+            let (share, weight) = overlap_share(
+                &RunSpan { start, end },
+                &[RunSpan {
+                    start: other_start,
+                    end: other_end,
+                }],
+            );
+            assert!((share - expected).abs() < 1e-9, "{share} != {expected}");
+            assert_eq!(weight, 0.5);
+        }
+    }
+
+    #[test]
+    fn overlap_share_preserves_minimum_duration_v2() {
+        // V2: 더 큰 정수로 바꿔도 0 이하 길이의 기존 1ms 보정은 유지한다.
+        for ((start, end), (other_start, other_end), expected) in [
+            ((0, 0), (-1, 1), 1.0 / 3.0),
+            ((1, 0), (-1, 2), 0.25),
+            ((0, 4), (2, 2), 0.8),
+            ((0, 4), (3, 1), 0.8),
+        ] {
+            let (share, weight) = overlap_share(
+                &RunSpan { start, end },
+                &[RunSpan {
+                    start: other_start,
+                    end: other_end,
+                }],
+            );
+            assert!((share - expected).abs() < 1e-9, "{share} != {expected}");
+            assert_eq!(weight, 0.5);
+        }
     }
 
     #[test]

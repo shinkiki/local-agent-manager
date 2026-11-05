@@ -1,9 +1,10 @@
 import { transcriptMessageKey } from "../lib/readingAnchor";
 import { searchSessions } from "../lib/ipcSessions";
-import { searchHighlightParts, type SessionSearchMatch, type SessionSearchResponse } from "../lib/sessionSearch";
+import { matchesSessionQuery, searchHighlightParts, type SessionSearchMatch, type SessionSearchResponse } from "../lib/sessionSearch";
 import { editableTranscriptText, supportsMessageEdit, type MessageRewindDraft } from "../lib/messageEdit";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type PointerEvent as ReactPointerEvent, type Dispatch, type ReactNode, type RefObject, type SetStateAction } from "react";
 import { createPortal } from "react-dom";
+import { useContextMenuPopup } from "./contextMenuPopup";
 import { AppWindow, Archive, ArchiveRestore, Check, ChevronDown, ExternalLink, Folder, GitBranch, GripVertical, MessagesSquare, PanelLeftOpen, ScrollText, SlidersHorizontal, SquareTerminal, Star, TriangleAlert, type LucideIcon } from "lucide-react";
 import { attachChat, connectChat, supportsDeliveryDuringTurn, supportsSessionFork, type ChatConnection } from "../lib/chat";
 import { BACKEND_RESTARTED_MESSAGE, ChatRejectedError } from "../lib/chatReconnect";
@@ -168,35 +169,6 @@ function resolveSessionHandoffLinks(
     ...item,
     session: sessions.find((candidate) => sameSessionIdentity(candidate, item.link)) ?? null,
   }));
-}
-
-/**
- * 목록 검색 조건. 필터와 '가려졌는지' 판정이 같은 규칙을 쓰도록 한곳에 둔다.
- *
- * 세션 id 말고 채팅 id도 받는다. AIA와 알림은 실행 중인 대화를 채팅 id로 가리키는데,
- * 그 값을 그대로 붙여 넣으면 0건이 나와 "분명 있다고 했는데 검색이 안 된다"가 됐다.
- * 채팅 id는 살아 있는 실행에만 붙으므로, 실행이 끝나면 세션 id로만 찾힌다.
- */
-/**
- * 백엔드 `session_search::normalize`와 같은 접기: NFC로 맞춘 뒤 글자마다 소문자로 바꾼다.
- * 문자열 단위 `toLowerCase`는 어말 Σ를 ς로 바꿔 글자별로 바꾼 쪽과 어긋난다. ASCII만
- * 있으면 둘이 같으므로 빠른 길로 간다.
- */
-function literalFold(value: string): string {
-  // eslint-disable-next-line no-control-regex
-  if (/^[\x00-\x7f]*$/.test(value)) return value.toLowerCase();
-  return Array.from(value.normalize("NFC"), (character) => character.toLowerCase()).join("");
-}
-
-function matchesSessionQuery(session: SessionSummary, query: string, chatIds: readonly string[], contentMatches?: ReadonlyMap<string, SessionSearchMatch>): boolean {
-  if (contentMatches?.has(sessionKey(session.source, session.id))) return true;
-  // 비교 규칙은 백엔드 `literal_match`와 같다(칸 구성은 `metadata_matches`에 살아 있는 채팅
-  // id를 더한 것). 칸은 이 화면이 원래 보던 것이다.
-  const needle = literalFold(query.trim());
-  if (!needle) return true;
-  return [session.title, session.project, session.cwd, session.id, session.meta.note, ...chatIds]
-    .filter((value): value is string => Boolean(value))
-    .some((value) => literalFold(value).includes(needle));
 }
 
 // 목록을 좁히는 축은 한 벌로 묶어 둔다. 축이 하나 늘 때마다 상태 선언·걸러내기·되돌리기·
@@ -1369,77 +1341,9 @@ interface SessionContextMenuProps {
   onToggleArchived: () => void | Promise<void>;
 }
 
-/** 메뉴가 화면 밖으로 밀려 나지 않게 남기는 여백. */
-const SESSION_CONTEXT_MENU_MARGIN = 8;
-
-/** 메뉴 안에서 초점을 받을 수 있는 항목. 접기·펴기 없이 버튼만 늘어서는 메뉴다. */
-const SESSION_CONTEXT_MENU_ITEMS = "button:not(:disabled)";
-
-/**
- * 우클릭 메뉴가 뜬 자리에 눌러앉기 위한 거동 한 벌 — 화면 안으로 접어 넣는 위치, 첫 항목
- * 초점, 닫는 네 경로(Esc · 바깥 눌림 · 뒤쪽 화면 스크롤 · 창 크기 변경), 방향키 초점 이동.
- * 이 다섯은 메뉴가 그리는 내용과 무관하게 "떠 있는 메뉴라면 늘 같은" 규칙인데 마크업과 한
- * 몸으로 붙어 있어, 항목을 늘리거나 문구를 고치는 변경이 매번 이 규칙들을 헤집고 지나가야
- * 했다. 규칙은 여기 두고, 컴포넌트는 붙일 손잡이 셋만 받는다.
- */
-function useSessionContextMenuPopup(anchorX: number, anchorY: number, onClose: () => void): {
-  menuRef: RefObject<HTMLDivElement | null>;
-  position: { left: number; top: number };
-  onKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => void;
-} {
-  const menuRef = useRef<HTMLDivElement | null>(null);
-  const [position, setPosition] = useState({ left: anchorX, top: anchorY });
-
-  useEscapeToClose(onClose);
-  useOutsidePointerToClose(onClose, true, [menuRef]);
-
-  useLayoutEffect(() => {
-    const menu = menuRef.current;
-    if (!menu) return;
-    const margin = SESSION_CONTEXT_MENU_MARGIN;
-    const rect = menu.getBoundingClientRect();
-    setPosition({
-      left: Math.max(margin, Math.min(anchorX, window.innerWidth - rect.width - margin)),
-      top: Math.max(margin, Math.min(anchorY, window.innerHeight - rect.height - margin)),
-    });
-    menu.querySelector<HTMLButtonElement>(SESSION_CONTEXT_MENU_ITEMS)?.focus();
-  }, [anchorX, anchorY]);
-
-  useEffect(() => {
-    const closeOnOutsideScroll = (event: Event) => {
-      const target = event.target;
-      // scroll은 버블링하지 않지만 캡처 단계에서는 메뉴 내부 목록의 스크롤도 window에
-      // 도달한다. 폴더를 훑는 정상 동작은 유지하고, 뒤쪽 화면이 움직일 때만 닫는다.
-      if (target instanceof Node && menuRef.current?.contains(target)) return;
-      onClose();
-    };
-    window.addEventListener("resize", onClose);
-    window.addEventListener("scroll", closeOnOutsideScroll, true);
-    return () => {
-      window.removeEventListener("resize", onClose);
-      window.removeEventListener("scroll", closeOnOutsideScroll, true);
-    };
-  }, [onClose]);
-
-  const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
-    const items = [...(menuRef.current?.querySelectorAll<HTMLButtonElement>(SESSION_CONTEXT_MENU_ITEMS) ?? [])];
-    if (items.length === 0) return;
-    event.preventDefault();
-    const current = items.indexOf(document.activeElement as HTMLButtonElement);
-    const next = event.key === "Home" ? 0
-      : event.key === "End" ? items.length - 1
-        : event.key === "ArrowDown" ? (current + 1 + items.length) % items.length
-          : (current - 1 + items.length) % items.length;
-    items[next]?.focus();
-  };
-
-  return { menuRef, position, onKeyDown };
-}
-
 function SessionContextMenu({ session, folders, anchorX, anchorY, onClose, onOpen, onOpenPopout, onToggleFavorite, onChooseFolder, onToggleArchived }: SessionContextMenuProps) {
   const { text } = useI18n();
-  const { menuRef, position, onKeyDown } = useSessionContextMenuPopup(anchorX, anchorY, onClose);
+  const { menuRef, position, onKeyDown } = useContextMenuPopup(anchorX, anchorY, onClose);
 
   return createPortal(
     <div

@@ -1214,6 +1214,7 @@ fn backfill_completed_summaries(app_data_dir: &Path) -> Result<(), CoreError> {
         .iter()
         .map(|schedule| (schedule.id.as_str(), schedule.input.source))
         .collect::<HashMap<_, _>>();
+    let mut turns = Vec::new();
     for run in scheduled.runs {
         if run.status != ScheduleRunStatus::Completed {
             continue;
@@ -1225,17 +1226,18 @@ fn backfill_completed_summaries(app_data_dir: &Path) -> Result<(), CoreError> {
         ) else {
             continue;
         };
-        store::persist_captured_turn_if_absent(
-            app_data_dir,
+        turns.push(store::captured_turn(
             source,
             session_id,
             &run.id,
             run.finished_at.unwrap_or(run.scheduled_for),
             summary,
             SupplementOrigin::Scheduled,
-        )?;
+        )?);
     }
-    Ok(())
+    // 시작마다 완료 실행 전부를 다시 넘기므로 잠금·읽기·쓰기는 한 번이고, 새 턴이 없으면
+    // 파일을 쓰지 않는다(supplement_store).
+    store::persist_captured_turns_if_absent(app_data_dir, turns)
 }
 
 fn reconcile_interrupted_runs(app_data_dir: &Path) -> Result<(), CoreError> {

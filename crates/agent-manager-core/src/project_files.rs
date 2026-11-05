@@ -271,11 +271,25 @@ pub fn search_project_files(
         if truncated {
             break;
         }
-        for item in fs::read_dir(&dir)? {
+        // 읽을 수 없는 하위 폴더는 건너뛴다. 트리 전체를 걷는 호출이라 다른 사용자 소유의
+        // 폴더 하나(NAS 마운트·컨테이너 볼륨에 흔하다)가 검색 전체를 실패시키면 F1이
+        // 약속한 "있는 파일이 검색된다"가 그 폴더 밖에서까지 깨진다. 루트 자체를 읽지 못하는
+        // 것은 그대로 오류다 — 그때는 건너뛸 "나머지"가 없다.
+        let items = match fs::read_dir(&dir) {
+            Ok(items) => items,
+            Err(error) if dir != root && is_skippable_walk_error(&error) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for item in items {
             let item = item?;
             let name = item.file_name().to_string_lossy().into_owned();
             let path = item.path();
-            let metadata = fs::symlink_metadata(&path)?;
+            // 목록을 읽은 뒤 항목이 사라지거나 권한이 막힌 것도 같은 자리다.
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if is_skippable_walk_error(&error) => continue,
+                Err(error) => return Err(error.into()),
+            };
             if is_hidden_project_child(&name, &metadata) {
                 continue;
             }
@@ -447,13 +461,30 @@ fn content_matches(
     if is_excluded_content_path(relative) || metadata.len() > MAX_PROJECT_SEARCH_CONTENT_BYTES {
         return Ok(ContentMatch::NotRead);
     }
-    match preview_kind_for_path(path, metadata)? {
+    // 판별도 본문 읽기도 파일을 연다. 권한이 막힌 파일(다른 사용자 소유)과 목록을 읽은 뒤
+    // 사라진 파일은 "열지 않은" 것과 같은 자리다 — 폴더를 건너뛰는 것과 같은 이유로, 그
+    // 파일 하나가 검색 전체를 실패시키지 않는다. 이름으로는 여전히 걸린다.
+    let kind = match preview_kind_for_path(path, metadata) {
+        Ok(kind) => kind,
+        Err(CoreError::Io(error)) if is_skippable_walk_error(&error) => {
+            return Ok(ContentMatch::NotRead)
+        }
+        Err(error) => return Err(error),
+    };
+    match kind {
         DocumentPreviewKind::Markdown | DocumentPreviewKind::Text => {}
         DocumentPreviewKind::Binary | DocumentPreviewKind::TooLarge => {
             return Ok(ContentMatch::NotRead)
         }
     }
-    let Some(text) = read_document_text(path)? else {
+    let text = match read_document_text(path) {
+        Ok(text) => text,
+        Err(CoreError::Io(error)) if is_skippable_walk_error(&error) => {
+            return Ok(ContentMatch::NotRead)
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(text) = text else {
         // 판별은 텍스트로 갈렸는데 전체를 읽으니 UTF-8이 아니었다. 바이너리와 같은 자리다.
         return Ok(ContentMatch::NotRead);
     };
@@ -462,6 +493,17 @@ fn content_matches(
     } else {
         ContentMatch::Miss
     })
+}
+
+/// 검색이 트리를 걷다 만난 오류 중 그 항목만 건너뛰어도 되는 것. 권한이 막힌 폴더·파일과
+/// 목록을 읽은 뒤 사라진 항목이다. 폴더는 건너뛰고 파일은 본문을 읽지 않은 것으로 센다
+/// (`content_matches`). 그 밖(입출력 오류 등)은 검색을 실패시킨다 — 조용히 빈 결과를 주는
+/// 것보다 낫다.
+fn is_skippable_walk_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+    )
 }
 
 /// 상대 경로를 등록 폴더 안의 실제 경로로 푼다. 빈 경로는 루트 자체다. `.git` 구성요소와
@@ -538,13 +580,7 @@ fn project_entry(
 fn normalized_relative(root: &Path, path: &Path) -> Result<String, CoreError> {
     path.strip_prefix(root)
         // C16-9 / G10: Unix의 역슬래시는 파일명 일부다. 실제 경로 성분 사이만 정규화한다.
-        .map(|relative| {
-            relative
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/")
-        })
+        .map(path_guard::relative_path_key)
         .map_err(|_| path_outside_root())
 }
 
@@ -755,6 +791,56 @@ mod tests {
             assert!(read_project_file(&root, "alias/main.rs").is_err());
             assert!(list_project_entries(&root, "alias", None, None).is_err());
         }
+    }
+
+    /// F1 / 정확성. 읽을 수 없는 하위 폴더 하나가 검색 전체를 실패시키면 안 된다 — 그 폴더
+    /// 밖의 파일은 그대로 걸리고, 폴더 자체는 이름으로는 걸린다(목록은 읽지 못해도 항목은
+    /// 보인다). 루트가 아닌 폴더에서만 건너뛴다. 2026-10-27 R01: NAS 마운트의 다른 사용자
+    /// 소유 폴더에서 `read_dir`의 PermissionDenied가 `?`로 올라가 검색이 통째로 죽었다.
+    #[cfg(unix)]
+    #[test]
+    fn project_files_search_skips_unreadable_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, root, app_data) = project();
+        let locked = root.join("locked");
+        fs::create_dir(&locked).expect("locked dir");
+        fs::write(locked.join("secret-main.rs"), "fn main() {}").expect("inner file");
+        let sealed = root.join("sealed-notes.txt");
+        fs::write(&sealed, "main entry\n").expect("sealed file");
+        let set_mode = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+        set_mode(&locked, 0o000);
+        set_mode(&sealed, 0o000);
+        // root(uid 0)는 모드 000도 읽는다 — 이 시험의 전제가 서지 않으므로 판정하지 않는다.
+        if fs::read_dir(&locked).is_ok() {
+            set_mode(&locked, 0o755);
+            set_mode(&sealed, 0o644);
+            eprintln!("skipped: this user reads a mode-000 directory (uid 0?)");
+            return;
+        }
+        let result = search_project_files(&app_data, &root, "main", None, true);
+        set_mode(&locked, 0o755);
+        set_mode(&sealed, 0o644);
+        let page = result.expect("search must skip the unreadable folder and file");
+        let paths: Vec<_> = page
+            .entries
+            .iter()
+            .map(|hit| hit.entry.relative_path.as_str())
+            .collect();
+        assert!(paths.contains(&"src/main.rs"), "{paths:?}");
+        assert!(!paths.contains(&"locked/secret-main.rs"), "{paths:?}");
+        // 읽지 못한 파일은 본문으로는 걸리지 않고 "열지 않은" 수에 든다. 권한을 되돌린 뒤의
+        // 같은 검색과 견준다 — 고정값은 본보기 폴더의 바이너리 수에 묶인다.
+        assert!(!paths.contains(&"sealed-notes.txt"), "{paths:?}");
+        let readable =
+            search_project_files(&app_data, &root, "main", None, true).expect("readable");
+        assert!(readable
+            .entries
+            .iter()
+            .any(|hit| hit.entry.relative_path == "sealed-notes.txt"));
+        assert_eq!(page.excluded, readable.excluded + 1);
+        assert!(!page.truncated);
     }
 
     /// F1. 검색은 이름과 상대경로 어느 쪽으로도 걸리고, `.git`은 어느 깊이에서든 빠지며,

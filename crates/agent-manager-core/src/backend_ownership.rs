@@ -94,8 +94,15 @@ fn open_lock_file(path: &Path) -> Result<File, CoreError> {
     #[cfg(unix)]
     options
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     let file = options.open(path)?;
+    // G10: FIFO 같은 특수 파일은 열 때 기다리지 않고, 권한을 바꾸기 전에 거절한다.
+    // 경로가 교체되어도 실제로 연 대상을 검사하도록 파일 서술자에서 종류를 읽는다.
+    if !file.metadata()?.is_file() {
+        return Err(CoreError::InvalidInput(
+            "백엔드 소유권 잠금은 일반 파일이어야 합니다".to_owned(),
+        ));
+    }
     #[cfg(unix)]
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
     Ok(file)
@@ -199,5 +206,27 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_fifo_lock_file_is_refused_without_changing_its_mode() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let lock_path = directory.path().join(BACKEND_OWNERSHIP_LOCK_FILE);
+        let fifo_path =
+            std::ffi::CString::new(lock_path.as_os_str().as_bytes()).expect("FIFO path");
+        // SAFETY: fifo_path is a valid, NUL-terminated path retained for this call.
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).expect("FIFO mode");
+
+        let result = BackendOwnershipLease::acquire(directory.path());
+
+        let metadata = fs::symlink_metadata(&lock_path).expect("unchanged FIFO");
+        assert!(metadata.file_type().is_fifo());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+        assert!(matches!(result, Err(CoreError::InvalidInput(_))));
     }
 }

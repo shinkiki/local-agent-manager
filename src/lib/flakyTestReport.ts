@@ -32,6 +32,12 @@ export type RunSummary = {
   /** 어떤 시험이든 실패한 실행 수. */
   failedRuns: number;
   buildErrorRuns: number;
+  /**
+   * 0 이 아닌 코드로 끝났는데 실패한 시험 이름도 빌드 오류도 없는 실행 수. 시험 바이너리가
+   * 도중에 죽은 것(SIGSEGV·abort·스택 넘침, 신호로 끝나면 러너가 -1 로 적는다)이라 무엇이
+   * 깨졌는지 알 수 없다. 실패 이름이 없다는 이유로 통과처럼 세면 간헐 실패를 보고도 clean 으로 판정한다.
+   */
+  abnormalExitRuns: number;
   /** 시험 이름 → 실패한 실행 수. 실패 횟수 내림차순, 같으면 이름순. */
   failureCountsByTest: { name: string; runs: number }[];
   /**
@@ -58,7 +64,7 @@ export type Verdict =
   | 'target-flaky'
   /** 대상은 통과했지만 다른 시험이 간헐 실패했다. */
   | 'suite-flaky'
-  /** 빌드·링크가 깨졌거나 대상 시험이 한 번도 돌지 않았다. 측정이 성립하지 않는다. */
+  /** 빌드·링크가 깨졌거나, 원인 모를 비정상 종료가 있었거나, 대상 시험이 한 번도 돌지 않았다. 측정이 성립하지 않는다. */
   | 'broken';
 
 const RESULT_LINE =
@@ -193,8 +199,9 @@ export function diagnosticSignature(diagnostic: string): string {
  * 그대로 전후 비교할 수 있다 — 2회차 보고가 "판정은 '진단이 code 5 인 실패 종류'가 사라졌는지로
  * 한다"로 남긴 다음 회차의 판정 축이 이것이다.
  *
- * `failureKinds` 의 셋(대상·다른 시험·빌드)을 바꾸지 않고 축을 더하는 이유: 그 셋은 기준선
- * 파일과 회차 절차가 이미 쓰고 있는 계약이라, 늘리면 지난 기준선과 견줄 수 없게 된다.
+ * `failureKinds` 의 종류(대상·다른 시험·빌드·비정상 종료)에 지문을 섞지 않고 축을 따로 두는
+ * 이유: 그 종류는 기준선 파일과 회차 절차가 이미 쓰고 있는 계약이다. 0 건인 종류는 빠지므로
+ * 비정상 종료가 실제로 나지 않는 한 지난 기준선과의 비교는 그대로다.
  */
 export function diagnosticKinds(summary: RunSummary): FailureKind[] {
   return summary.failureCountsByDiagnostic.map((entry) => ({
@@ -215,6 +222,7 @@ export function summarizeRuns(runs: CargoRun[], target: string): RunSummary {
   let targetFailedRuns = 0;
   let failedRuns = 0;
   let buildErrorRuns = 0;
+  let abnormalExitRuns = 0;
   let measuredRuns = 0;
 
   for (const run of runs) {
@@ -224,6 +232,7 @@ export function summarizeRuns(runs: CargoRun[], target: string): RunSummary {
     }
     measuredRuns += 1;
     const names = new Set(run.failures.map((failure) => failure.name));
+    if (names.size === 0 && run.exitCode !== 0) abnormalExitRuns += 1;
     if (names.size > 0) failedRuns += 1;
     if (names.has(target)) targetFailedRuns += 1;
     for (const name of names) counts.set(name, (counts.get(name) ?? 0) + 1);
@@ -260,6 +269,7 @@ export function summarizeRuns(runs: CargoRun[], target: string): RunSummary {
     targetFailedRuns,
     failedRuns,
     buildErrorRuns,
+    abnormalExitRuns,
     failureCountsByTest,
     failureCountsByDiagnostic,
     targetObserved: runs.some(
@@ -282,13 +292,20 @@ export function failureKinds(summary: RunSummary): FailureKind[] {
         .reduce((total, entry) => total + entry.runs, 0),
     },
     { kind: '빌드·링크 실패', count: summary.buildErrorRuns },
+    { kind: '원인 모를 비정상 종료', count: summary.abnormalExitRuns },
   ];
   return kinds.filter((kind) => kind.count > 0);
 }
 
 /** 측정이 성립했는지까지 함께 본다. 성립하지 않은 측정은 통과가 아니라 broken 이다. */
 export function verdict(summary: RunSummary): Verdict {
-  if (summary.buildErrorRuns > 0 || summary.measuredRuns === 0 || !summary.targetObserved) {
+  // 비정상 종료는 대상이 깨졌는지 알 수 없으니 target-flaky 도 suite-flaky 도 아니다.
+  if (
+    summary.buildErrorRuns > 0 ||
+    summary.abnormalExitRuns > 0 ||
+    summary.measuredRuns === 0 ||
+    !summary.targetObserved
+  ) {
     return 'broken';
   }
   if (summary.targetFailedRuns > 0) return 'target-flaky';

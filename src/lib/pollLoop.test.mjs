@@ -179,3 +179,34 @@ test("stop한 루프는 다시 시작하지 않고 반복 stop도 안전하다",
   assert.equal(h.nextDelay(), null);
   assert.equal(h.hasListener(), false);
 });
+
+for (const maxBackoffMs of [undefined, 10_000, 60_000]) {
+  test(`V4: 상한 ${maxBackoffMs ?? "기본값"}에서도 실패가 1분 주기를 단축하지 않는다`, async () => {
+    const h = harness();
+    let fail = true;
+    const loop = h.loop({
+      intervalMs: 60_000,
+      maxBackoffMs,
+      run: async () => { if (fail) throw new Error("remote down"); },
+    });
+
+    try {
+      loop.start();
+      await flush();
+      assert.equal(h.nextDelay(), 60_000, "첫 실패도 기본 주기보다 자주 재시도하지 않는다");
+      await h.fire();
+      assert.equal(h.nextDelay(), 60_000, "연속 실패에도 기본 주기를 지킨다");
+
+      fail = false;
+      await h.fire();
+      assert.equal(h.nextDelay(), 60_000, "성공하면 기본 주기를 쓴다");
+      fail = true;
+      await h.fire();
+      assert.equal(h.nextDelay(), 60_000, "성공 뒤 다시 실패해도 주기를 단축하지 않는다");
+    } finally {
+      loop.stop();
+    }
+    assert.equal(h.nextDelay(), null);
+    assert.equal(h.hasListener(), false);
+  });
+}

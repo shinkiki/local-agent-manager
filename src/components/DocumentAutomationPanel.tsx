@@ -12,8 +12,15 @@ import {
   setDocumentTriggerEnabled,
   updateDocumentTrigger,
 } from "../lib/ipc";
-import { defaultApprovalMode, effectiveApprovalMode, normalizeSettingValue, settingFieldsFor } from "../lib/chatSettings";
+import { defaultApprovalMode, normalizeSettingValue, settingFieldsFor } from "../lib/chatSettings";
 import { validateDocumentTriggerDraft, type DocumentTriggerActionKind } from "../lib/documentWorkspace";
+import {
+  buildDocumentTriggerInput,
+  draftFromTrigger,
+  isChatActionKind,
+  isSkillActionKind,
+  type DocumentTriggerDraft as TriggerDraft,
+} from "../lib/documentTriggerInput";
 import { reasoningOptionsFor, useProviderOptions } from "../lib/providerOptions";
 import type {
   AccountSnapshot,
@@ -44,67 +51,29 @@ import { errorText } from "../lib/errorText";
 type ActionKind = DocumentTriggerActionKind;
 
 /**
- * 트리거 초안 한 벌. 같은 열여섯 칸을 초기화·수정 적재·저장 세 곳이 각각 나열하던 것을
- * 한 자료로 모아, 칸이 늘 때 세 곳을 함께 고쳐야 하는 부담을 없앤다.
- */
-interface TriggerDraft {
-  name: string;
-  rootId: string;
-  include: string;
-  exclude: string;
-  changeKinds: DocumentChangeKind[];
-  actionKind: ActionKind;
-  targetId: string;
-  source: ProviderId;
-  accountId: string;
-  model: string;
-  reasoningEffort: ReasoningEffort | "";
-  mode: ChatMode;
-  approvalMode: ChatApprovalMode;
-  fullAccessAcknowledged: boolean;
-  prompt: string;
-  skillId: string;
-}
-
-/**
- * 액션 갈래 하나가 정하는 것 한 벌. 갈래를 보고 갈리는 자리는 넷(고르는 드롭다운의 선택지,
- * 채팅 계열인지, 스킬 계열인지, 채팅 계열이 아닐 때 '실행 대상'이 고를 목록)인데 넷이
+ * 액션 갈래 하나가 화면에서 정하는 것 한 벌. 갈래를 보고 갈리는 자리는 넷(고르는 드롭다운의
+ * 선택지, 채팅 계열인지, 스킬 계열인지, 채팅 계열이 아닐 때 '실행 대상'이 고를 목록)인데 넷이
  * 저마다 갈래 이름을 문자열로 다시 나열했다. 그래서 갈래가 하나 늘면 네 자리를 함께
- * 고쳐야 했고, 어느 한 자리를 빠뜨려도 타입은 아무 말을 하지 않았다.
+ * 고쳐야 했고, 어느 한 자리를 빠뜨려도 타입은 아무 말을 하지 않았다. 채팅·스킬 계열 판정은
+ * 저장 변환도 같이 읽으므로 `lib/documentTriggerInput`의 표(`ACTION_KIND_TRAITS`)가 쥐고,
+ * 이 표는 화면에만 있는 두 칸을 든다.
  */
 interface ActionKindSpec {
   /** 액션 드롭다운에 보일 이름. 목록 순서는 아래 표의 줄 순서 그대로다. */
   label: (text: (ko: string, en: string) => string) => string;
-  /** 채팅 계열인가. 공급자·실행 계정·모델·프롬프트 칸은 이 갈래에만 뜬다. */
-  chat: boolean;
-  /** 스킬 계열인가. 적용 스킬 칸과 재승인 안내는 이 갈래에만 뜬다. */
-  skill: boolean;
   /** 채팅 계열이 아닐 때 '실행 대상'이 고를 목록. 채팅 계열은 그 칸 자체가 없어 null이다. */
   targets: "scheduledRequests" | "workflows" | null;
 }
 
 const ACTION_KIND_SPECS = {
-  runSchedule: { label: (text) => text("반복 요청 실행", "Run recurring schedule"), chat: false, skill: false, targets: "scheduledRequests" },
-  startChat: { label: (text) => text("새 채팅 요청", "New chat request"), chat: true, skill: false, targets: null },
-  runSkill: { label: (text) => text("스킬 실행", "Run skill"), chat: true, skill: true, targets: null },
-  executeWorkflow: { label: (text) => text("시스템 워크플로 실행", "Execute system workflow"), chat: false, skill: false, targets: "workflows" },
+  runSchedule: { label: (text) => text("반복 요청 실행", "Run recurring schedule"), targets: "scheduledRequests" },
+  startChat: { label: (text) => text("새 채팅 요청", "New chat request"), targets: null },
+  runSkill: { label: (text) => text("스킬 실행", "Run skill"), targets: null },
+  executeWorkflow: { label: (text) => text("시스템 워크플로 실행", "Execute system workflow"), targets: "workflows" },
 } satisfies Record<ActionKind, ActionKindSpec>;
 
 /** 드롭다운이 훑을 갈래 목록. 표에서 뽑으므로 선택지와 규칙이 어긋날 수 없다. */
 const ACTION_KINDS = Object.keys(ACTION_KIND_SPECS) as ActionKind[];
-
-/** 채팅 실행 계열과 스킬 실행 여부를 액션 분기마다 문자열로 다시 풀어 쓰지 않는다. */
-function isChatActionKind(kind: ActionKind): boolean {
-  return ACTION_KIND_SPECS[kind].chat;
-}
-
-function isSkillActionKind(kind: ActionKind): boolean {
-  return ACTION_KIND_SPECS[kind].skill;
-}
-
-function lines(value: string): string[] {
-  return value.split("\n").map((item) => item.trim()).filter(Boolean);
-}
 
 function emptyDraft(providers: ProviderStatus[], rootId: string): TriggerDraft {
   const source = providers[0]?.provider ?? "codex";
@@ -127,94 +96,6 @@ function emptyDraft(providers: ProviderStatus[], rootId: string): TriggerDraft {
     fullAccessAcknowledged: false,
     prompt: "",
     skillId: "",
-  };
-}
-
-/**
- * 채팅 계열이 아닌 액션에는 공급자·모델 칸이 없으므로, 그 칸은 지금 화면에 있는 값을 그대로
- * 둔다(예전 setter 나열과 같은 동작).
- */
-function draftFromTrigger(trigger: DocumentTrigger, current: TriggerDraft): TriggerDraft {
-  const common: TriggerDraft = {
-    ...current,
-    name: trigger.name,
-    rootId: trigger.rootId,
-    include: trigger.include.join("\n"),
-    exclude: trigger.exclude.join("\n"),
-    changeKinds: trigger.changeKinds,
-    fullAccessAcknowledged: false,
-  };
-  const action = trigger.action;
-  if (action.type === "runSchedule") return { ...common, actionKind: "runSchedule", targetId: action.scheduleId };
-  if (action.type === "executeWorkflow") return { ...common, actionKind: "executeWorkflow", targetId: action.workflowId };
-  return {
-    ...common,
-    actionKind: action.skill ? "runSkill" : "startChat",
-    targetId: "",
-    source: action.source,
-    accountId: action.accountId ?? "",
-    model: action.model ?? "",
-    reasoningEffort: action.reasoningEffort ?? "",
-    mode: action.mode,
-    approvalMode: action.approvalMode,
-    prompt: action.prompt,
-    skillId: action.skill?.skillId ?? "",
-  };
-}
-
-/**
- * 화면 초안을 저장 계약으로 바꾼다. 패널은 상태와 검증 흐름만 맡고, 액션별 직렬화와 기존
- * 트리거의 실행 간격 보존은 이 순수 변환 한 곳에서 다룬다.
- */
-function buildDocumentTriggerInput(
-  draft: TriggerDraft,
-  editing: DocumentTrigger | null,
-  selectedSkill?: DocumentActionOption,
-  selectedWorkflow?: DocumentActionOption,
-): DocumentTriggerInput {
-  const {
-    name, rootId, include, exclude, changeKinds, actionKind, targetId, source, accountId,
-    model, reasoningEffort, mode, approvalMode, prompt,
-  } = draft;
-  let action: DocumentTriggerAction;
-  if (actionKind === "runSchedule") {
-    action = { type: "runSchedule", scheduleId: targetId };
-  } else if (actionKind === "executeWorkflow") {
-    action = {
-      type: "executeWorkflow",
-      workflowId: targetId,
-      approvedVersion: selectedWorkflow?.version ?? 0,
-      arguments: {},
-    };
-  } else {
-    action = {
-      type: "startChat",
-      source,
-      accountId: accountId || null,
-      model: model.trim() || null,
-      reasoningEffort: reasoningEffort || null,
-      mode,
-      approvalMode: effectiveApprovalMode(source, approvalMode),
-      prompt,
-      settings: {},
-      // 스킬 실행은 지금 보이는 내용의 지문을 승인값으로 고정한다. 새 채팅 구분에서는
-      // 스킬을 붙이지 않아 두 구분이 저장본에서도 섞이지 않는다.
-      skill: isSkillActionKind(actionKind) && selectedSkill
-        ? { skillId: selectedSkill.id, contentDigest: selectedSkill.contentDigest ?? "" }
-        : null,
-    };
-  }
-
-  return {
-    name: name.trim(),
-    rootId,
-    include: lines(include),
-    exclude: lines(exclude),
-    changeKinds,
-    enabled: editing?.enabled ?? true,
-    debounceMs: editing?.debounceMs ?? 2000,
-    cooldownMs: editing?.cooldownMs ?? 30000,
-    action,
   };
 }
 

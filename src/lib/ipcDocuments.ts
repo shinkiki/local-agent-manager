@@ -14,7 +14,7 @@
  * `ipc.ts`가 이 파일의 이름을 그대로 다시 내보내므로 화면 쪽 import 경로는 예전 그대로
  * `lib/ipc`다.
  */
-import type { DocFile, DocRootStatus, DocumentAutomationSnapshot, DocumentEntryPage, DocumentFile, DocumentTrigger, DocumentTriggerInput, DocumentTriggerRun, LinkedFile, UpdateDocRootInput } from "../types";
+import type { DocFile, DocRootStatus, DocumentAutomationSnapshot, DocumentDeleteResult, DocumentEntry, DocumentEntryKind, DocumentEntryPage, DocumentFile, DocumentTrigger, DocumentTriggerInput, DocumentTriggerRun, LinkedFile, UpdateDocRootInput } from "../types";
 import { call } from "./ipcTransport";
 
 export function getDocRoots(): Promise<DocRootStatus[]> {
@@ -107,6 +107,36 @@ export function putDoc(
   return call<DocFile>("put_doc", {
     request: { rootId, relativePath, content, expectedModifiedAt },
   });
+}
+
+/**
+ * 파일 화면 우클릭 메뉴의 다섯 입구. 모두 등록 폴더 안에서만 움직이고 이미 있는 항목을
+ * 덮어쓰지 않는다. `parentPath`·`targetParentPath`가 빈 문자열이면 등록 폴더 맨 위다.
+ */
+export function createDocumentEntry(
+  rootId: string,
+  parentPath: string,
+  name: string,
+  kind: DocumentEntryKind,
+): Promise<DocumentEntry> {
+  return call<DocumentEntry>("create_document_entry", { request: { rootId, parentPath, name, kind } });
+}
+
+export function renameDocumentEntry(rootId: string, relativePath: string, newName: string): Promise<DocumentEntry> {
+  return call<DocumentEntry>("rename_document_entry", { request: { rootId, relativePath, newName } });
+}
+
+export function moveDocumentEntry(rootId: string, relativePath: string, targetParentPath: string): Promise<DocumentEntry> {
+  return call<DocumentEntry>("move_document_entry", { request: { rootId, relativePath, targetParentPath } });
+}
+
+export function duplicateDocumentEntry(rootId: string, relativePath: string): Promise<DocumentEntry> {
+  return call<DocumentEntry>("duplicate_document_entry", { request: { rootId, relativePath } });
+}
+
+/** 휴지통을 거치지 않는다. `recursive`가 꺼져 있으면 비어 있지 않은 폴더는 지우지 않고 수만 돌려준다. */
+export function deleteDocumentEntry(rootId: string, relativePath: string, recursive: boolean): Promise<DocumentDeleteResult> {
+  return call<DocumentDeleteResult>("delete_document_entry", { request: { rootId, relativePath, recursive } });
 }
 
 export function getDocumentAutomationSnapshot(): Promise<DocumentAutomationSnapshot> {

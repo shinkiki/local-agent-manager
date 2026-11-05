@@ -202,6 +202,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn g7_private_file_creation_refuses_to_clobber_and_reopening_keeps_content() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("store.lock");
+        let mut created = open_private_file(&path, true).expect("new file");
+        created
+            .write_all(b"existing owner")
+            .expect("initial contents");
+        drop(created);
+
+        assert!(matches!(
+            open_private_file(&path, true),
+            Err(CoreError::Io(ref error)) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(
+            fs::read(&path).expect("contents after collision"),
+            b"existing owner"
+        );
+
+        drop(open_private_file(&path, false).expect("reopen existing lock"));
+        assert_eq!(
+            fs::read(&path).expect("contents after reopening"),
+            b"existing owner"
+        );
+    }
+
+    #[test]
+    fn g7_private_append_preserves_records_even_after_seeking_to_the_start() {
+        use std::io::{Seek, SeekFrom};
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("audit.jsonl");
+        let mut first = open_private_append_file(&path).expect("new audit log");
+        first.write_all(b"first\n").expect("first record");
+        drop(first);
+
+        let mut reopened = open_private_append_file(&path).expect("existing audit log");
+        reopened.write_all(b"second\n").expect("second record");
+        reopened.seek(SeekFrom::Start(0)).expect("reset cursor");
+        reopened.write_all(b"third\n").expect("third record");
+        drop(reopened);
+
+        assert_eq!(
+            fs::read(&path).expect("complete audit log"),
+            b"first\nsecond\nthird\n"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_open_helpers_refuse_a_symlinked_final_component_g10() {

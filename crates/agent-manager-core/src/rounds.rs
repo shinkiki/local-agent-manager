@@ -561,8 +561,20 @@ pub fn record_round_report(
         // 없는 목표에 보고를 붙이면 화면 어디에도 안 보인다. 목표를 적었으면 실재해야 한다.
         get_round_goal(app_data_dir, goal_id)?;
     }
+    // V2: 문자열 목록과 같은 상한을 적용하되, 결정을 조용히 잘라 저장하지 않는다.
+    for (length, what) in [
+        (input.decisions.len(), "결정 질문"),
+        (input.measures.len(), "측정값"),
+        (input.failure_kinds.len(), "실패 종류"),
+    ] {
+        if length > MAX_LIST_ITEMS {
+            return Err(CoreError::InvalidInput(format!(
+                "{what}은(는) {MAX_LIST_ITEMS}개 이하여야 합니다"
+            )));
+        }
+    }
     let mut decisions = Vec::new();
-    for decision in input.decisions.iter().take(MAX_LIST_ITEMS) {
+    for decision in &input.decisions {
         decisions.push(RoundDecision {
             question: required_text(&decision.question, MAX_ITEM_CHARS, "결정 질문")?,
             options: clean_list(&decision.options, "선택지")?,
@@ -577,7 +589,7 @@ pub fn record_round_report(
         });
     }
     let mut measures = Vec::new();
-    for measure in input.measures.iter().take(MAX_LIST_ITEMS) {
+    for measure in &input.measures {
         measures.push(RoundMeasure {
             label: required_text(&measure.label, MAX_ITEM_CHARS, "측정 이름")?,
             before: clean_text(&measure.before, MAX_ITEM_CHARS, "측정 전")?,
@@ -585,7 +597,7 @@ pub fn record_round_report(
         });
     }
     let mut failure_kinds = Vec::new();
-    for kind in input.failure_kinds.iter().take(MAX_LIST_ITEMS) {
+    for kind in &input.failure_kinds {
         failure_kinds.push(RoundFailureKind {
             kind: required_text(&kind.kind, MAX_ITEM_CHARS, "실패 종류")?,
             before: kind.before,
@@ -958,6 +970,60 @@ mod tests {
         );
         delete_round_report(dir.path(), &report.id).unwrap();
         assert!(get_round_report(dir.path(), &report.id).is_err());
+    }
+
+    #[test]
+    fn v2_structured_report_lists_preserve_the_limit_and_reject_overflow_without_writing() {
+        for (field, item, label) in [
+            (
+                "decisions",
+                serde_json::json!({"question": "사람이 정할 것", "requiresHuman": true}),
+                "결정 질문",
+            ),
+            (
+                "measures",
+                serde_json::json!({"label": "측정", "before": "1", "after": "0"}),
+                "측정값",
+            ),
+            (
+                "failureKinds",
+                serde_json::json!({"kind": "정확성", "before": 1, "after": 0}),
+                "실패 종류",
+            ),
+        ] {
+            let dir = temp_dir();
+            let input = |length| {
+                serde_json::from_value::<RoundReportInput>(serde_json::json!({
+                    "title": field,
+                    (field): vec![item.clone(); length],
+                }))
+                .unwrap()
+            };
+            for length in [0, MAX_LIST_ITEMS] {
+                let saved = record_round_report(dir.path(), input(length)).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&saved).unwrap()[field]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    length,
+                    "{field}"
+                );
+                assert_eq!(get_round_report(dir.path(), &saved.id).unwrap(), saved);
+            }
+            let before = std::fs::read(REPORTS_STORE.path(dir.path())).unwrap();
+            let result = record_round_report(dir.path(), input(MAX_LIST_ITEMS + 1));
+            assert!(
+                matches!(result, Err(CoreError::InvalidInput(message))
+                    if message == format!("{label}은(는) {MAX_LIST_ITEMS}개 이하여야 합니다")),
+                "{field} overflow must fail rather than silently discard report items"
+            );
+            assert_eq!(
+                std::fs::read(REPORTS_STORE.path(dir.path())).unwrap(),
+                before,
+                "{field}: a rejected report must leave existing reports unchanged"
+            );
+        }
     }
 
     #[test]

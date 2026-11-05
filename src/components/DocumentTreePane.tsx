@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type RefObject } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -55,21 +55,79 @@ export interface DocumentTreePaneProps {
   source: DocumentTreeSource;
   selectedPath: string | null;
   onSelect: (entry: DocumentEntry) => void;
+  /**
+   * 우클릭. 항목 줄이면 그 항목을, 줄 바깥 빈 자리면 `null`(등록 폴더 맨 위)을 넘긴다.
+   * 없으면 브라우저 기본 메뉴가 그대로 뜬다 — 읽기 전용인 프로젝트 화면이 그 경우다.
+   */
+  onEntryContextMenu?: (entry: DocumentEntry | null, x: number, y: number) => void;
+  /** 바깥에서 바꾼 항목을 펼침 상태를 지운 채 다시 읽게 하는 신호. `revision`이 바뀔 때만 반영한다. */
+  change?: DocumentTreeChange | null;
+}
+
+/**
+ * 트리 밖에서 항목을 만들고·옮기고·지운 뒤 트리에 알리는 한 벌. 예전에는 트리 `key`를 바꿔
+ * 통째로 다시 그렸는데, 그러면 펼쳐 둔 폴더가 모두 접혀 깊은 곳의 파일 이름 하나를 바꿔도
+ * 다시 찾아 들어가야 했다. 바뀐 폴더만 다시 읽는다.
+ */
+export interface DocumentTreeChange {
+  revision: number;
+  /** 다시 읽을 폴더(빈 문자열은 맨 위). 펼친 적 없는 폴더는 건너뛴다. */
+  parents: string[];
+  /** 사라진 폴더 경로. 그 아래 캐시와 펼침 표시를 함께 지운다. */
+  removed?: string[];
+  /** 새로 펼칠 폴더. 하위 폴더를 만든 직후 그 자리를 보여 줄 때 쓴다. */
+  expand?: string;
+}
+
+/**
+ * 우클릭을 받아 바깥 메뉴로 넘기는 처리기. Shift+우클릭은 WebView 개발 메뉴에 남겨 두되,
+ * 키보드로 연 메뉴(Shift+F10)는 마우스 단추가 없으므로 그대로 받는다.
+ */
+function contextMenuHandler(
+  onEntryContextMenu: DocumentTreePaneProps["onEntryContextMenu"],
+  entry: DocumentEntry | null,
+) {
+  if (!onEntryContextMenu) return undefined;
+  return (event: MouseEvent<HTMLElement>) => {
+    if (event.shiftKey && event.button === 2) return;
+    // 검색 입력 칸은 붙여넣기·복사 메뉴가 필요하므로 그대로 둔다.
+    if (entry === null && event.target instanceof HTMLInputElement) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const box = event.currentTarget.getBoundingClientRect();
+    onEntryContextMenu(entry, event.clientX || box.left + 24, event.clientY || box.top + 12);
+  };
 }
 
 interface SearchPageState extends DocumentEntryPage {
   query: string;
 }
 
-export function DocumentTreePane({ source, selectedPath, onSelect }: DocumentTreePaneProps) {
+export function DocumentTreePane({ source, selectedPath, onSelect, onEntryContextMenu, change }: DocumentTreePaneProps) {
   // 원천은 ref로 붙든다. 부르는 쪽이 렌더마다 새 객체를 만들어도 훅은 `source.key`에만
   // 반응하고, 실제 호출은 언제나 가장 최근에 받은 함수로 나간다.
   const sourceRef = useRef(source);
   sourceRef.current = source;
   // 훅 호출 순서는 트리가 먼저여야 한다 — 검색 초기화가 트리 초기화보다 먼저 돌면 폴더를
   // 바꾼 첫 배치에서 트리와 검색의 갱신 순서가 예전과 어긋난다.
-  const tree = useDocumentEntryTree(sourceRef, source.key, selectedPath, onSelect);
+  const tree = useDocumentEntryTree(sourceRef, source.key, selectedPath, onSelect, onEntryContextMenu);
   const search = useDocumentEntrySearch(sourceRef, source.key);
+  // 바깥 변경은 트리와 검색 결과 양쪽에 반영한다. 검색 중이면 지금 검색어로 다시 찾는다.
+  // 반영 시점은 리비전 하나로만 정한다. 창이 새로 설 때 이미 있던 변경은 첫 읽기가 이미
+  // 담고 있으므로 다시 반영하지 않는다.
+  const changeRevision = change?.revision;
+  const changeRef = useRef(change);
+  changeRef.current = change;
+  const appliedRevisionRef = useRef(changeRevision);
+  const { applyChange } = tree;
+  const { refresh: refreshSearch } = search;
+  useEffect(() => {
+    const current = changeRef.current;
+    if (!current || appliedRevisionRef.current === current.revision) return;
+    appliedRevisionRef.current = current.revision;
+    applyChange(current);
+    refreshSearch();
+  }, [changeRevision]);
   // 이 창은 등록 폴더를 고른 뒤에만 그려져 앞선 두 문서 화면 번역(AM-79·AM-213)의
   // 재현 경로 밖에 있었고, 그래서 영어 UI에서 통째로 한국어로 남아 있었다(QA #86).
   const { text } = useI18n();
@@ -77,7 +135,7 @@ export function DocumentTreePane({ source, selectedPath, onSelect }: DocumentTre
   const searchLabel = text("파일명 또는 경로 검색", "Search by file name or path");
 
   return (
-    <section className="document-tree-pane" aria-label={source.label}>
+    <section className="document-tree-pane" aria-label={source.label} onContextMenu={contextMenuHandler(onEntryContextMenu, null)}>
       {source.search ? (
         <label className="document-tree-search">
           <Search size={14} aria-hidden="true" />
@@ -90,7 +148,7 @@ export function DocumentTreePane({ source, selectedPath, onSelect }: DocumentTre
         </label>
       ) : null}
       {search.active ? (
-        <DocumentSearchResults search={search} selectedPath={selectedPath} onActivate={tree.activateEntry} />
+        <DocumentSearchResults search={search} selectedPath={selectedPath} onActivate={tree.activateEntry} onEntryContextMenu={onEntryContextMenu} />
       ) : (
         <DocumentTreeScroll tree={tree} />
       )}
@@ -110,10 +168,12 @@ function DocumentSearchResults({
   search,
   selectedPath,
   onActivate,
+  onEntryContextMenu,
 }: {
   search: DocumentEntrySearch;
   selectedPath: string | null;
   onActivate: (entry: DocumentEntry) => void;
+  onEntryContextMenu: DocumentTreePaneProps["onEntryContextMenu"];
 }) {
   const { text } = useI18n();
   return (
@@ -126,6 +186,7 @@ function DocumentSearchResults({
           type="button"
           key={entry.relativePath}
           onClick={() => onActivate(entry)}
+          onContextMenu={contextMenuHandler(onEntryContextMenu, entry)}
         >
           <DocumentEntryIcon entry={entry} />
           <span><strong>{entry.name}</strong><code>{entry.relativePath}</code></span>
@@ -179,6 +240,7 @@ function useDocumentEntryTree(
   sourceKey: string,
   selectedPath: string | null,
   onSelect: (entry: DocumentEntry) => void,
+  onEntryContextMenu: DocumentTreePaneProps["onEntryContextMenu"],
 ) {
   const [cache, setCache] = useState<DocumentTreeCache>(() => new Map());
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
@@ -232,7 +294,30 @@ function useDocumentEntryTree(
   const rootEntries = useMemo(() => documentEntriesForParent(cache, ""), [cache]);
   const rootPage = cache.get("");
 
+  // 바깥에서 바꾼 폴더만 다시 읽는다. 사라진 폴더는 그 아래 캐시·펼침까지 지워, 같은
+  // 이름으로 다시 생겨도 옛 목록이 끼어들지 않게 한다. 한 번도 읽지 않은 폴더는 펼칠 때
+  // 어차피 새로 읽으므로 건너뛴다.
+  const applyChange = (change: DocumentTreeChange) => {
+    const removed = change.removed ?? [];
+    const gone = (path: string) => removed.some((root) => path === root || path.startsWith(`${root}/`));
+    const loaded = new Set([...cache.keys()].filter((path) => !gone(path)));
+    setCache((current) => new Map([...current].filter(([path]) => !gone(path))));
+    setExpanded((current) => {
+      const next = new Set([...current].filter((path) => !gone(path)));
+      if (change.expand !== undefined) next.add(change.expand);
+      return next;
+    });
+    const parents = new Set(change.parents);
+    if (change.expand !== undefined) parents.add(change.expand);
+    for (const parent of parents) {
+      if (parent === "" || loaded.has(parent) || parent === change.expand) {
+        void fetchFolder(parent, null, generation.current());
+      }
+    }
+  };
+
   return {
+    applyChange,
     /** 검색 결과 줄도 같은 한 벌을 쓴다 — 고른 항목을 다루는 갈래는 창에 하나뿐이다. */
     activateEntry,
     error,
@@ -245,6 +330,7 @@ function useDocumentEntryTree(
       loadingParents,
       selectedPath,
       onActivate: activateEntry,
+      onEntryContextMenu,
       onLoadMore: (parentPath: string, cursor: string) => void fetchFolder(parentPath, cursor, generation.current()),
     } satisfies DocumentTreeView,
   };
@@ -343,6 +429,12 @@ function useDocumentEntrySearch(sourceRef: RefObject<DocumentTreeSource>, source
     await fetchPage(normalizedQuery, cursor, requestId);
   };
 
+  /** 지금 검색어로 첫 쪽부터 다시 찾는다. 검색 중이 아니면 아무것도 하지 않는다. */
+  const refresh = () => {
+    if (!normalizedQuery) return;
+    void fetchPage(normalizedQuery, null, beginSearch());
+  };
+
   return {
     query,
     setQuery,
@@ -355,6 +447,7 @@ function useDocumentEntrySearch(sourceRef: RefObject<DocumentTreeSource>, source
     firstPageLoading: searching && !page,
     error,
     loadMore,
+    refresh,
   };
 }
 
@@ -370,6 +463,7 @@ interface DocumentTreeView {
   selectedPath: string | null;
   /** 폴더는 펼치고 파일은 고른다. 검색 결과 줄과 같은 한 벌이라 갈래를 여기서 다시 나누지 않는다. */
   onActivate: (entry: DocumentEntry) => void;
+  onEntryContextMenu: DocumentTreePaneProps["onEntryContextMenu"];
   onLoadMore: (parentPath: string, cursor: string) => void;
 }
 
@@ -424,7 +518,7 @@ function DocumentTreeItem({
   view: DocumentTreeView;
   depth: number;
 }) {
-  const { cache, expanded, loadingParents, selectedPath, onActivate } = view;
+  const { cache, expanded, loadingParents, selectedPath, onActivate, onEntryContextMenu } = view;
   const isDir = entry.isDirectory;
   const open = isDir && expanded.has(entry.relativePath);
   const childPage = isDir ? cache.get(entry.relativePath) : null;
@@ -437,6 +531,7 @@ function DocumentTreeItem({
         style={{ paddingLeft: `${depth * 13 + 8}px` }}
         type="button"
         onClick={() => onActivate(entry)}
+        onContextMenu={contextMenuHandler(onEntryContextMenu, entry)}
         aria-expanded={isDir ? open : undefined}
       >
         {isDir ? (

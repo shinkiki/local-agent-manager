@@ -1,3 +1,4 @@
+import { dedupeByKey } from "./sequence.ts";
 import type { ServiceIconName } from "../assets/serviceIcons";
 import type { AccountToolAttribution, AccountToolKind, AccountToolView, AccountToolsSnapshot, AccountToolsView, ProviderHomeToolsView, ProviderId } from "../types";
 
@@ -160,22 +161,15 @@ const ATTRIBUTION_DISPLAY: Record<AccountToolAttribution, { strength: number; or
   shared: { strength: 1, order: 2 },
 };
 
-/** 같은 서비스가 여러 경로로 잡히면 가장 강한 귀속 근거를 남긴다. */
-function stronger(current: AccountToolView, candidate: AccountToolView): AccountToolView {
-  return ATTRIBUTION_DISPLAY[candidate.attribution].strength < ATTRIBUTION_DISPLAY[current.attribution].strength
-    ? candidate
-    : current;
-}
-
+// V4: 노출 필터·귀속 우선순위는 이 모듈이 정하고, 최초 자리와 동률의 첫 항목을
+// 보존하는 수집은 세션 목록도 쓰는 공통 규칙에 맡긴다.
 /** 같은 서비스의 도구 중복을 하나로 합치고 노출 대상만 남긴다. */
 function mergeToolsByService(tools: AccountToolView[]): AccountToolView[] {
-  const merged = new Map<string, AccountToolView>();
-  for (const tool of tools) {
-    if (!tool.exposed || tool.service.length === 0) continue;
-    const current = merged.get(tool.service);
-    merged.set(tool.service, current ? stronger(current, tool) : tool);
-  }
-  return [...merged.values()];
+  return dedupeByKey(
+    tools.filter((tool) => tool.exposed && tool.service.length > 0),
+    (tool) => tool.service,
+    (candidate, current) => ATTRIBUTION_DISPLAY[candidate.attribution].strength < ATTRIBUTION_DISPLAY[current.attribution].strength,
+  );
 }
 
 /** 계정 도구 표시 순서: 귀속 근거(계정 > 미확정 > 공용) 우선 후 레이블 사전순 */

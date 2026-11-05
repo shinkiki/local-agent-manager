@@ -906,7 +906,11 @@ fn validate_reasoning_efforts(
 ) -> Result<(), CoreError> {
     for (provider, lane) in lanes {
         let ladder = crate::usage_pacing::reasoning_effort_ladder(*provider);
-        for (name, value) in [("고정값", &lane.fixed), ("자동 상한", &lane.max_auto)] {
+        for (name, value) in [
+            ("고정값", &lane.fixed),
+            ("자동 상한", &lane.max_auto),
+            ("자동 하한", &lane.min_auto),
+        ] {
             if let Some(effort) = value.as_ref().filter(|effort| !ladder.contains(effort)) {
                 return Err(CoreError::InvalidInput(format!(
                     "{} 레인의 추론수준 {name} {}은 지원하지 않습니다(가능: {})",
@@ -1974,6 +1978,66 @@ mod tests {
         assert_eq!(policy.consumers["s-qa"].max_tokens_per_run, Some(50_000));
         let policy = set_consumer(dir.path(), no_seed, base(Some(0))).expect("set");
         assert_eq!(policy.consumers["s-qa"].max_tokens_per_run, None);
+    }
+
+    #[test]
+    fn v2_reasoning_floor_rejects_unsupported_values_before_saving() {
+        let valid = [
+            (ProviderId::Claude, Some(ReasoningEffort::Max)),
+            (ProviderId::Codex, Some(ReasoningEffort::Xhigh)),
+            (ProviderId::Antigravity, Some(ReasoningEffort::High)),
+            (ProviderId::Local, None),
+        ];
+        for (provider, min_auto) in valid {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut request: SetUsageBudgetConsumerRequest = serde_json::from_value(json!({
+                "scheduleId": "s-floor",
+                "enabled": true,
+                "reasoningEfforts": {
+                    provider.as_str(): { "minAuto": min_auto }
+                }
+            }))
+            .expect("request");
+            let policy = set_consumer(dir.path(), no_seed, request.clone()).expect("valid floor");
+            assert_eq!(
+                policy.consumers["s-floor"].reasoning_efforts[&provider].min_auto,
+                min_auto
+            );
+            assert_eq!(load_optional(dir.path()).expect("reload"), Some(policy));
+            let before = fs::read(dir.path().join(STORE_FILE)).expect("stored bytes");
+            // 고정 모드에서도 하한은 저장된다. 나중에 자동으로 전환할 때를 위해 검증한다.
+            for fixed in [None, min_auto.clone()] {
+                for unsupported in [
+                    ReasoningEffort::None,
+                    ReasoningEffort::Minimal,
+                    ReasoningEffort::Ultra,
+                    ReasoningEffort::Other("custom".to_owned()),
+                ] {
+                    request.reasoning_efforts = Some(BTreeMap::from([(
+                        provider,
+                        LaneReasoningEffort {
+                            fixed: fixed.clone(),
+                            min_auto: Some(unsupported.clone()),
+                            ..LaneReasoningEffort::default()
+                        },
+                    )]));
+                    assert!(
+                        matches!(
+                            set_consumer(dir.path(), no_seed, request.clone()),
+                            Err(CoreError::InvalidInput(message))
+                                if message.contains(provider.as_str())
+                                    && message.contains("자동 하한")
+                                    && message.contains(unsupported.as_str())
+                        ),
+                        "{provider:?}: {unsupported:?} (fixed={fixed:?})"
+                    );
+                    assert_eq!(
+                        fs::read(dir.path().join(STORE_FILE)).expect("unchanged store"),
+                        before
+                    );
+                }
+            }
+        }
     }
 
     /// 소비 성향은 칸이 없으면 유지, `null`이면 해제다. 화면에서 성향을 '기본값 따름'이나

@@ -254,16 +254,57 @@ mod tests {
         );
     }
 
-    /// 강제 종료 신호를 보내지 못하면 그 오류가 그대로 올라온다 — 더 올릴 단계가 없어
-    /// 호출부가 실패로 다뤄야 하는 자리다.
+    /// C1-5/C1-7/V2: 종료 여부를 확인하지 못한 오류는 호출부로 그대로 올라가야 한다.
+    /// 어느 단계가 실패하든 뒤의 신호·대기를 실행하지 않고, 각 대기의 시한도 보존한다.
     #[test]
-    fn escalation_surfaces_a_failed_forced_signal() {
-        let outcome = escalate_stop(
-            (|| Ok(SignalDelivery::Delivered), Duration::ZERO),
-            (|| Err("강제 종료 실패"), Duration::ZERO),
-            |_| Ok(false),
-        );
-        assert_eq!(outcome, Err("강제 종료 실패"));
+    fn c1_7_escalation_preserves_errors_and_stops_at_each_failed_step() {
+        use std::cell::{Cell, RefCell};
+
+        let steps = [
+            "graceful signal",
+            "graceful wait",
+            "forced signal",
+            "forced wait",
+        ];
+        let graceful_timeout = Duration::from_millis(17);
+        let forced_timeout = Duration::from_millis(29);
+        for failed_step in 0..steps.len() {
+            let visited = RefCell::new(Vec::new());
+            let waits = Cell::new(0);
+            let visit = |step| {
+                visited.borrow_mut().push(step);
+                if step == steps[failed_step] {
+                    Err(step)
+                } else {
+                    Ok(())
+                }
+            };
+            let outcome = escalate_stop(
+                (
+                    || visit(steps[0]).map(|()| SignalDelivery::Delivered),
+                    graceful_timeout,
+                ),
+                (
+                    || visit(steps[2]).map(|()| SignalDelivery::Delivered),
+                    forced_timeout,
+                ),
+                |timeout| {
+                    let wait = waits.get();
+                    waits.set(wait + 1);
+                    let (step, expected_timeout) = match wait {
+                        0 => (steps[1], graceful_timeout),
+                        1 => (steps[3], forced_timeout),
+                        _ => panic!("종료 대기는 두 단계를 넘을 수 없다"),
+                    };
+                    assert_eq!(timeout, expected_timeout);
+                    visit(step)?;
+                    Ok(false)
+                },
+            );
+
+            assert_eq!(outcome, Err(steps[failed_step]));
+            assert_eq!(*visited.borrow(), steps[..=failed_step]);
+        }
     }
 
     fn pid_group_leader() -> u32 {

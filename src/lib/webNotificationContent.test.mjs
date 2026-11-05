@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { attentionNotificationDetail, attentionNotifications, projectNotifications } from "./webNotificationContent.ts";
+import { attentionNotificationDetail, attentionNotifications, credentialExpiryNotifications, projectNotifications } from "./webNotificationContent.ts";
 import { setRuntimeLocale } from "./i18nRuntime.ts";
 
 const item = {
@@ -103,6 +103,70 @@ test("기기 알림 제목과 본문은 DOM 밖에서도 선택한 언어를 따
       body: "Project · Keep active or exclude it",
       tag: "new-project:/tmp/project",
     });
+  } finally {
+    setRuntimeLocale("ko", {});
+  }
+});
+
+test("pacing suggestion and round decision notifications have appropriate labels and bodies", () => {
+  const pacingItem = {
+    id: "pacing-1",
+    chatId: "chat-1",
+    source: "codex",
+    kind: "pacingSuggestion",
+    title: "페이싱 제안",
+    detail: "요청 간격 10초 권장",
+    cwd: "",
+  };
+  assert.equal(
+    attentionNotificationDetail(pacingItem, []),
+    "Codex: 요청 간격 10초 권장",
+  );
+  const [pacingNotification] = attentionNotifications([pacingItem], []);
+  assert.equal(pacingNotification.title, "페이싱 제안");
+  assert.equal(pacingNotification.body, "Codex: 요청 간격 10초 권장");
+
+  const decisionItem = {
+    id: "decision-1",
+    chatId: "chat-1",
+    source: "codex",
+    kind: "roundDecision",
+    title: "리뷰 회차 1",
+    detail: "2건 대기",
+    cwd: "",
+  };
+  assert.equal(
+    attentionNotificationDetail(decisionItem, []),
+    "리뷰 회차 1 · 2건 대기",
+  );
+  assert.equal(
+    attentionNotificationDetail({ ...decisionItem, detail: "" }, []),
+    "리뷰 회차 1",
+  );
+  const [decisionNotification] = attentionNotifications([decisionItem], []);
+  assert.equal(decisionNotification.title, "회차 결정 대기");
+  assert.equal(decisionNotification.body, "리뷰 회차 1 · 2건 대기");
+});
+
+test("credential expiry notifications generate correct title, body, and tag with singular and plural days in en and ko", () => {
+  const accounts = [
+    { id: "acc-1", displayName: "Claude Dev", days: 1 },
+    { id: "acc-2", displayName: "Codex Pro", days: 3 },
+  ];
+  const koNotifications = credentialExpiryNotifications(accounts);
+  assert.equal(koNotifications.length, 2);
+  assert.equal(koNotifications[0].title, "계정 인증 만료 임박");
+  assert.equal(koNotifications[0].body, "Claude Dev · 1일 뒤 만료됩니다. 미리 재인증하세요");
+  assert.equal(koNotifications[0].tag, "credential-expiry:acc-1");
+  assert.equal(koNotifications[1].body, "Codex Pro · 3일 뒤 만료됩니다. 미리 재인증하세요");
+  assert.equal(koNotifications[1].tag, "credential-expiry:acc-2");
+
+  setRuntimeLocale("en", {});
+  try {
+    const enNotifications = credentialExpiryNotifications(accounts);
+    assert.equal(enNotifications[0].title, "Account authentication expiring");
+    assert.equal(enNotifications[0].body, "Claude Dev · expires in 1 day. Re-authenticate now");
+    assert.equal(enNotifications[1].body, "Codex Pro · expires in 3 days. Re-authenticate now");
   } finally {
     setRuntimeLocale("ko", {});
   }

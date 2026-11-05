@@ -56,7 +56,8 @@ run() {
 fail=0
 expect() {
   local label="$1" needle="$2" output="$3"
-  if printf '%s' "${output}" | grep -qF -- "${needle}"; then
+  # V2: grep -q가 먼저 끝나도 긴 로그를 쓰는 printf의 SIGPIPE를 실패로 보지 않는다.
+  if grep -qF -- "${needle}" <<< "${output}"; then
     echo "ok   ${label}"
   else
     echo "FAIL ${label}: '${needle}' 없음"

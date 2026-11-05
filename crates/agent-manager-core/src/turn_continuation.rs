@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::app_data_file::open_private_append_file;
 use crate::clock::now_ms;
+use crate::store_lock;
 use crate::{CoreError, ProviderId};
 
 /// 이어가기 문구. 평가 스크립트(`scripts/turn-continuation-eval.mjs`)도 이 파일을 그대로 읽어
@@ -29,6 +30,7 @@ use crate::{CoreError, ProviderId};
 const PROMPT_TEMPLATE: &str = include_str!("turn_continuation_prompt.md");
 const REQUESTS_PLACEHOLDER: &str = "{requests}";
 const RECORD_FILE: &str = "turn-continuations-v1.jsonl";
+const RECORD_LOCK_FILE: &str = "turn-continuations-v1.lock";
 const PREVIOUS_RECORD_FILE: &str = "turn-continuations-v1.previous.jsonl";
 const MAX_RECORD_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -122,7 +124,8 @@ pub(crate) fn record(
     app_data_dir: &Path,
     record: &ContinuationRecord<'_>,
 ) -> Result<(), CoreError> {
-    fs::create_dir_all(app_data_dir)?;
+    // G7: 회전과 JSON·개행 추가를 함께 잠가 동시 이어가기 기록이 섞이거나 유실되지 않게 한다.
+    let _lock = store_lock::acquire(app_data_dir, RECORD_LOCK_FILE, "이어가기 기록")?;
     let path = app_data_dir.join(RECORD_FILE);
     if fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= MAX_RECORD_FILE_BYTES) {
         let previous = app_data_dir.join(PREVIOUS_RECORD_FILE);
@@ -141,6 +144,95 @@ pub(crate) fn record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn g7_concurrent_records_rotate_once_and_preserve_every_json_line() {
+        const WORKERS: usize = 8;
+        const BATCHES: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let full = vec![b'x'; MAX_RECORD_FILE_BYTES as usize];
+        fs::write(dir.path().join(RECORD_FILE), &full).unwrap();
+        fs::write(dir.path().join(PREVIOUS_RECORD_FILE), b"oldest").unwrap();
+        let barrier = std::sync::Barrier::new(WORKERS);
+
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for worker in 0..WORKERS {
+                let barrier = &barrier;
+                let app_data_dir = dir.path();
+                workers.push(scope.spawn(move || {
+                    let mut results = Vec::new();
+                    for batch in 0..BATCHES {
+                        let chat_id = format!("chat-{worker}-{batch}");
+                        let entry = ContinuationRecord::new(
+                            ProviderId::Codex,
+                            None,
+                            "old",
+                            &chat_id,
+                            None,
+                            None,
+                            1,
+                            0,
+                        );
+                        barrier.wait();
+                        // 실패해도 다음 장벽에 도달하도록 판정은 모든 작업이 끝난 뒤 한다.
+                        results.push(record(app_data_dir, &entry));
+                    }
+                    results
+                }));
+            }
+            for worker in workers {
+                for result in worker.join().expect("writer must finish") {
+                    result.expect("concurrent record must succeed");
+                }
+            }
+        });
+
+        assert_eq!(
+            fs::read(dir.path().join(PREVIOUS_RECORD_FILE)).unwrap(),
+            full
+        );
+        let current = fs::read_to_string(dir.path().join(RECORD_FILE)).unwrap();
+        let rows: Vec<serde_json::Value> = current
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one complete JSON record per line"))
+            .collect();
+        assert_eq!(rows.len(), WORKERS * BATCHES);
+        let actual: std::collections::BTreeSet<_> = rows
+            .iter()
+            .map(|row| row["chatId"].as_str().unwrap().to_owned())
+            .collect();
+        let expected = (0..WORKERS)
+            .flat_map(|worker| (0..BATCHES).map(move |batch| format!("chat-{worker}-{batch}")))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g7_g10_lock_failure_preserves_current_and_previous_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("untouched");
+        fs::write(&target, b"outside app data").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(RECORD_LOCK_FILE)).unwrap();
+        let full = vec![b'x'; MAX_RECORD_FILE_BYTES as usize];
+        fs::write(dir.path().join(RECORD_FILE), &full).unwrap();
+        fs::write(dir.path().join(PREVIOUS_RECORD_FILE), b"oldest").unwrap();
+        let entry =
+            ContinuationRecord::new(ProviderId::Codex, None, "old", "new", None, None, 1, 0);
+
+        assert!(matches!(
+            record(dir.path(), &entry),
+            Err(CoreError::Io(ref error)) if error.raw_os_error() == Some(libc::ELOOP)
+        ));
+        assert_eq!(fs::read(dir.path().join(RECORD_FILE)).unwrap(), full);
+        assert_eq!(
+            fs::read(dir.path().join(PREVIOUS_RECORD_FILE)).unwrap(),
+            b"oldest"
+        );
+        assert_eq!(fs::read(target).unwrap(), b"outside app data");
+    }
 
     #[test]
     fn no_interrupted_request_means_no_continuation() {

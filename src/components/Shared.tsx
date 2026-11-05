@@ -637,7 +637,7 @@ export function ChatSendActionMenu({
         title={trigger.title}
         aria-haspopup="menu"
         aria-expanded={open}
-        onClick={() => setOpen((current) => !current)}
+        onClick={() => changeOpen(!open)}
       >
         {trigger.content}
       </button>

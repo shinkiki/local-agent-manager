@@ -267,7 +267,8 @@ fn format_clock(minute: u16) -> String {
 
 /// 두 반열린 구간 `[a_start, a_end)`와 `[b_start, b_end)`가 겹치는 시간(ms).
 fn overlap_ms(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> i64 {
-    (a_end.min(b_end) - a_start.max(b_start)).max(0)
+    // V2: 겹치지 않는 먼 구간의 음수 차이도 i64 범위를 넘을 수 있다.
+    a_end.min(b_end).saturating_sub(a_start.max(b_start)).max(0)
 }
 
 #[cfg(test)]
@@ -305,6 +306,36 @@ mod tests {
 
     const EVERY_DAY: [u8; 7] = [0, 1, 2, 3, 4, 5, 6];
     const WEEKDAYS: [u8; 5] = [1, 2, 3, 4, 5];
+
+    #[test]
+    fn v2_disjoint_overlap_is_zero_even_when_the_gap_exceeds_i64() {
+        for (a_start, a_end, b_start, b_end) in [
+            (10, 20, i64::MIN, i64::MIN + 1),
+            (-20, -10, i64::MAX - 1, i64::MAX),
+            (i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX),
+        ] {
+            assert_eq!(overlap_ms(a_start, a_end, b_start, b_end), 0);
+            assert_eq!(overlap_ms(b_start, b_end, a_start, a_end), 0);
+        }
+        // 반열린 구간의 경계와 실제 겹침은 기존 계산을 지킨다.
+        assert_eq!(overlap_ms(10, 20, 20, 30), 0);
+        assert_eq!(overlap_ms(10, 20, 15, 25), 5);
+        assert_eq!(overlap_ms(10, 20, 12, 18), 6);
+        assert_eq!(
+            overlap_ms(i64::MIN, i64::MIN + 10, i64::MIN + 5, i64::MIN + 15),
+            5
+        );
+        assert_eq!(
+            overlap_ms(i64::MAX - 10, i64::MAX, i64::MAX - 5, i64::MAX),
+            5
+        );
+    }
+
+    #[test]
+    fn v2_open_ms_between_keeps_a_short_extreme_range_open() {
+        let quiet = schedule("10:00", "18:00", &EVERY_DAY);
+        assert_eq!(quiet.open_ms_between(i64::MIN, i64::MIN + 1), 1);
+    }
 
     #[test]
     fn daytime_block_stops_only_its_hours() {

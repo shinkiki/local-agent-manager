@@ -9,38 +9,26 @@ import { serverLabel, SshServersSection, type SshServerTask } from "./SshServers
 import { errorText } from "../lib/errorText";
 import { displayPath } from "../lib/displayPath";
 
-const DEFAULT_FILE_NAME = "id_agent_manager";
-const DEFAULT_COMMENT = "agent-manager";
-/** 백엔드가 키 종류 목록을 주지 않을 때(옛 백엔드) 쓰는 기본 종류. */
-const DEFAULT_KEY_TYPE = "ed25519";
-const MAX_NOTE_CHARS = 300;
-/** 설명(주석)의 한도. 생성 버튼의 비활성 조건과 입력 한도가 같은 값을 봐야 한다. */
-const MAX_COMMENT_CHARS = 120;
+import {
+  DEFAULT_COMMENT,
+  DEFAULT_FILE_NAME,
+  DEFAULT_KEY_TYPE,
+  MAX_COMMENT_CHARS,
+  MAX_NOTE_CHARS,
+  canCreateSshKey,
+  canSaveSshKeyNote,
+  isKeyTask,
+  isRowBusy,
+  keyTask,
+  serversUsingKey,
+  type SshKeyTask,
+} from "../lib/sshKeyTask";
 
 /**
- * 이 카드는 한 번에 한 동작만 돌리고, 지금 도는 동작을 `"갈래:대상"` 문자열 하나로 들고
- * 다닌다. 그 문자열을 만드는 쪽(카드 본문의 `run` 호출)과 읽는 쪽(행·액션 버튼의 스피너
- * 조건)이 서로 떨어져 있어, 양쪽이 같은 리터럴을 각자 손으로 적고 있었다 — 한쪽에서 갈래
- * 이름을 고쳐도 다른 쪽은 조용히 어긋난 채 남는다. 만드는 자리와 읽는 자리를 아래 세
- * 도우미로 모아, 갈래 이름을 타입이 잡게 한다. 연결 서버 갈래는 서버 구역이 따로 정한다.
+ * 한 번에 한 동작만 돌리는 카드의 busy 토큰. 키 갈래의 표시와 판정은 `sshKeyTask.ts`가,
+ * 연결 서버 갈래는 서버 구역이 따로 정한다.
  */
-type SshKeyTaskKind = "reveal" | "note" | "passphrase" | "delete";
-type SshTask = "create" | `${SshKeyTaskKind}:${string}` | SshServerTask;
-
-/** 키 한 건을 대상으로 하는 동작의 표시를 만든다. */
-function keyTask(kind: SshKeyTaskKind, fingerprint: string): SshTask {
-  return `${kind}:${fingerprint}`;
-}
-
-/** 지금 도는 동작이 이 키의 그 갈래인지. 버튼 하나의 스피너 조건이다. */
-function isKeyTask(busy: SshTask | null, kind: SshKeyTaskKind, fingerprint: string): boolean {
-  return busy === keyTask(kind, fingerprint);
-}
-
-/** 갈래를 가리지 않고 이 키를 대상으로 무언가 돌고 있는지. 행 전체를 잠그는 조건이다. */
-function isRowBusy(busy: SshTask | null, fingerprint: string): boolean {
-  return busy !== null && busy.endsWith(`:${fingerprint}`);
-}
+type SshTask = "create" | SshKeyTask | SshServerTask;
 
 /** 키 한 줄에 펴는 입력 상자. 메모와 암호는 같은 줄을 겹쳐 쓰므로 한 번에 하나만 연다. */
 interface KeyEditorState {
@@ -266,8 +254,7 @@ export function SshKeysCard({ active }: { active: boolean }) {
     });
   };
 
-  const serversUsing = (key: SshKeyView): SshEndpointView[] =>
-    (snapshot?.servers ?? []).filter((server) => server.fingerprint === key.fingerprint);
+  const serversUsing = (key: SshKeyView): SshEndpointView[] => serversUsingKey(snapshot?.servers, key.fingerprint);
 
   const remove = async (key: SshKeyView) => {
     const using = serversUsing(key);
@@ -426,7 +413,7 @@ function SshNoteEditor({
 }: SshNoteEditorProps) {
   const { text } = useI18n();
   const trimmed = binding.draft.trim();
-  const canSave = !rowBusy && trimmed !== (sshKey.note ?? "");
+  const canSave = canSaveSshKeyNote(binding.draft, sshKey.note, rowBusy);
 
   return (
     <div className="ssh-key-note-form">
@@ -668,7 +655,7 @@ function SshKeyCreateCard({
 }: SshKeyCreateCardProps) {
   const { text } = useI18n();
   const passphraseMismatch = passphrase !== passphraseConfirm;
-  const canCreate = !busy && Boolean(fileName.trim()) && comment.length <= MAX_COMMENT_CHARS && !passphraseMismatch;
+  const canCreate = canCreateSshKey({ fileName, comment, passphraseMismatch, busy });
 
   return (
     <div className="detail-card ssh-key-form">

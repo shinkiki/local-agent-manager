@@ -157,7 +157,7 @@ fn no_browser_dir() -> Option<&'static Path> {
     let directory = DIR.get_or_init(|| std::env::temp_dir().join("agent-manager-agy-no-browser"));
     // 한 번 확인한 결과를 기억하지 않는다. 오래 도는 헤드리스 백엔드에서는 `/tmp` 정리가
     // 이 디렉터리를 지울 수 있고, 그 뒤 같은 이름을 다른 사용자가 만들 수 있다.
-    match prepare_unix_no_browser_dir(directory) {
+    match prepare_unix_no_browser_dir(directory, Path::new(NO_BROWSER_TARGET)) {
         Ok(()) => Some(directory.as_path()),
         Err(error) => {
             eprintln!("[antigravity] 브라우저 차단 디렉터리를 쓰지 않습니다: {error}");
@@ -172,8 +172,17 @@ fn no_browser_dir() -> Option<&'static Path> {
 /// 심링크가 아닌 디렉터리이고, 이 프로세스의 사용자 소유이며, 그룹·기타에 아무 권한이 없을
 /// 때만 쓴다. 조건이 안 맞으면 차단 없이 조회한다 — 창이 뜨는 쪽이 남의 실행 파일보다 낫다.
 #[cfg(unix)]
-fn prepare_unix_no_browser_dir(directory: &Path) -> std::io::Result<()> {
+fn prepare_unix_no_browser_dir(directory: &Path, target: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    // G9, G10: symlink는 대상이 없어도 성공한다. 기존 링크를 재사용할 때도 시스템
+    // 실행 파일의 존재·종류·실행 비트를 확인해야 차단 준비 성공으로 취급할 수 있다.
+    let target_metadata = std::fs::metadata(target)?;
+    if !target_metadata.is_file() || target_metadata.permissions().mode() & 0o111 == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "브라우저 차단 대상이 실행 가능한 일반 파일이 아닙니다",
+        ));
+    }
     match std::fs::DirBuilder::new().mode(0o700).create(directory) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -207,11 +216,11 @@ fn prepare_unix_no_browser_dir(directory: &Path) -> std::io::Result<()> {
     }
     let link = directory.join("open");
     match std::fs::read_link(&link) {
-        Ok(target) if target == Path::new(NO_BROWSER_TARGET) => return Ok(()),
+        Ok(existing) if existing == target => return Ok(()),
         _ if std::fs::symlink_metadata(&link).is_ok() => std::fs::remove_file(&link)?,
         _ => {}
     }
-    std::os::unix::fs::symlink(NO_BROWSER_TARGET, &link)
+    std::os::unix::fs::symlink(target, &link)
 }
 
 /// Windows에서 CLI는 `rundll32 url.dll,FileProtocolHandler <url>`로 브라우저를 열고, 그
@@ -338,8 +347,11 @@ pub(crate) fn no_browser_path(executable: &Path) -> Option<(String, String)> {
 /// Windows에서는 손자가 새 콘솔을 할당받아 창이 잠깐 나타난다(실측 2026-09-24, 채팅 회차마다).
 /// CLI 업데이트는 사람이 요청할 때 `cli_updates.rs`가 따로 맡으므로, 화면 뒤에서 도는 조회가
 /// 겸할 이유도 없다.
+///
+/// 값은 `true`여야 한다. agy 1.4.7에서 `last_check.timestamp`를 하루 전으로 돌려 놓고 A/B로
+/// 재 보니 `1`·`yes`는 여전히 `--bg-updater`를 띄웠고 `true`만 막았다(실측 2026-10-26).
 pub(crate) fn no_auto_update_env() -> (String, String) {
-    ("AGY_CLI_DISABLE_AUTO_UPDATE".to_owned(), "1".to_owned())
+    ("AGY_CLI_DISABLE_AUTO_UPDATE".to_owned(), "true".to_owned())
 }
 
 /// CLI 호출 차례. 잠금이 오염됐으면 그대로 이어 쓴다 — 줄 세우기는 최선 노력이고, 여기서
@@ -1911,7 +1923,8 @@ mod tests {
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777))
             .expect("chmod");
         std::os::unix::fs::symlink("/bin/sh", directory.join("open")).expect("planted");
-        prepare_unix_no_browser_dir(&directory).expect("own directory");
+        prepare_unix_no_browser_dir(&directory, Path::new(NO_BROWSER_TARGET))
+            .expect("own directory");
         let mode = std::fs::metadata(&directory)
             .expect("meta")
             .permissions()
@@ -1923,11 +1936,91 @@ mod tests {
         );
         let linked = temp.path().join("linked");
         std::os::unix::fs::symlink(&directory, &linked).expect("symlink");
-        assert!(prepare_unix_no_browser_dir(&linked).is_err());
+        assert!(prepare_unix_no_browser_dir(&linked, Path::new(NO_BROWSER_TARGET)).is_err());
         std::fs::write(directory.join("xdg-open"), b"").expect("planted");
-        assert!(prepare_unix_no_browser_dir(&directory).is_err());
+        assert!(prepare_unix_no_browser_dir(&directory, Path::new(NO_BROWSER_TARGET)).is_err());
         let file = temp.path().join("file");
         std::fs::write(&file, b"").expect("file");
-        assert!(prepare_unix_no_browser_dir(&file).is_err());
+        assert!(prepare_unix_no_browser_dir(&file, Path::new(NO_BROWSER_TARGET)).is_err());
+    }
+
+    /// V2, G10: 쓸 수 없는 대상을 가리키는 링크를 만들고 성공으로 보고하지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn v2_no_browser_dir_rejects_unusable_targets() {
+        use std::io::ErrorKind;
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("temp");
+        let directory = temp.path().join("shim");
+        let target = temp.path().join("target");
+        assert_eq!(
+            prepare_unix_no_browser_dir(&directory, &target)
+                .expect_err("missing target")
+                .kind(),
+            ErrorKind::NotFound
+        );
+        assert!(!directory.exists(), "검증 실패 전에 shim을 만들지 않는다");
+
+        std::fs::create_dir(&target).expect("target directory");
+        assert_eq!(
+            prepare_unix_no_browser_dir(&directory, &target)
+                .expect_err("directory target")
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        std::fs::remove_dir(&target).expect("remove target directory");
+        std::fs::write(&target, b"not executable").expect("target file");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("target permissions");
+        assert_eq!(
+            prepare_unix_no_browser_dir(&directory, &target)
+                .expect_err("non-executable target")
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert!(!directory.exists(), "쓸 수 없는 대상은 준비하지 않는다");
+    }
+
+    /// V2, G9: 정상 shim은 셸 없이 실행되고 기존 링크의 대상도 매번 다시 확인한다.
+    #[cfg(unix)]
+    #[test]
+    fn v2_no_browser_dir_rechecks_target_before_reusing_link() {
+        use std::io::ErrorKind;
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("temp");
+        let directory = temp.path().join("shim");
+        let target = temp.path().join("true");
+        std::fs::copy(NO_BROWSER_TARGET, &target).expect("copy system true");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+            .expect("executable target");
+        prepare_unix_no_browser_dir(&directory, &target).expect("prepare");
+        prepare_unix_no_browser_dir(&directory, &target).expect("reuse valid link");
+        let link = directory.join("open");
+        assert_eq!(std::fs::read_link(&link).expect("link"), target);
+        assert!(Command::new(&link)
+            .arg("https://example.invalid/?a=1&b=2")
+            .status()
+            .expect("run shim")
+            .success());
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("revoke execution");
+        assert_eq!(
+            prepare_unix_no_browser_dir(&directory, &target)
+                .expect_err("recheck execution bits")
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        std::fs::remove_file(&target).expect("remove target");
+        assert_eq!(
+            prepare_unix_no_browser_dir(&directory, &target)
+                .expect_err("recheck target presence")
+                .kind(),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            std::fs::read_link(&link).expect("existing link retained"),
+            target
+        );
     }
 }

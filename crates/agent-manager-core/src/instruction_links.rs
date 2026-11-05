@@ -8,11 +8,13 @@
 use std::collections::BTreeSet;
 
 /// 문서가 참조하는 로컬 파일 링크를 나온 순서대로 모은다. 가져오기 표기(`@경로`)를
-/// 먼저 마크다운 링크로 바꾸므로 화면에 링크로 그려지는 것과 목록이 어긋나지 않는다.
+/// 산문 조각 안에서 바꾸고 바로 수집하므로 화면 규칙(C5-7)과 목록이 어긋나지 않는다.
+/// 변환은 백틱·줄바꿈을 만들지 않아, 중간 문서를 재구성하고 다시 훑을 필요가 없다.
 pub(crate) fn local_document_links(source: &str) -> Vec<String> {
     let mut links = Vec::new();
     let mut seen = BTreeSet::new();
-    for_each_line(&linkify_imports(source), |line, in_code| {
+    let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
+    for_each_line(&normalized, |line, in_code| {
         if in_code {
             return;
         }
@@ -20,42 +22,14 @@ pub(crate) fn local_document_links(source: &str) -> Vec<String> {
             if index % 2 == 1 {
                 continue;
             }
-            collect_markdown_links(segment, &mut links, &mut seen);
+            collect_markdown_links(&linkify_segment(segment), &mut links, &mut seen);
         }
     });
     links
 }
 
-/// `@context/agent/rules.md`처럼 지침이 다른 문서를 가져오는 표기를 마크다운 링크로
-/// 바꾼다. 경로처럼 보이는 토큰(슬래시가 있거나 확장자로 끝남)만 바꾸고, 코드 블록과
-/// 인라인 코드는 원문 그대로 남긴다. 앞이 공백이어야 하므로 이메일은 걸리지 않는다.
-fn linkify_imports(source: &str) -> String {
-    let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
-    let mut lines = Vec::new();
-    for_each_line(&normalized, |line, in_code| {
-        if in_code || !line.contains('@') {
-            lines.push(line.to_owned());
-            return;
-        }
-        let mut rebuilt = String::with_capacity(line.len());
-        for (index, segment) in line.split('`').enumerate() {
-            if index > 0 {
-                rebuilt.push('`');
-            }
-            if index % 2 == 1 {
-                rebuilt.push_str(segment);
-            } else {
-                rebuilt.push_str(&linkify_segment(segment));
-            }
-        }
-        lines.push(rebuilt);
-    });
-    lines.join("\n")
-}
-
 /// 줄을 코드 펜스 상태와 함께 넘긴다. 펜스 줄 자체도 코드로 본다 — 링크를 모으는
-/// 쪽은 그 줄을 건너뛰고, 가져오기 표기를 바꾸는 쪽은 그대로 두므로 판정이 같다.
-/// 두 훑기가 펜스 상태를 따로 세다 어긋나면 한쪽에만 보이는 링크가 생긴다.
+/// 쪽은 그 줄을 건너뛴다. 산문 조각만 가져오기 변환과 링크 수집을 함께 거친다.
 fn for_each_line(source: &str, mut visit: impl FnMut(&str, bool)) {
     let mut fenced = false;
     for line in source.split('\n') {
@@ -270,9 +244,9 @@ mod tests {
 
     #[test]
     fn keeps_import_tokens_that_are_not_paths_untouched() {
-        assert_eq!(linkify_imports("@mention 확인"), "@mention 확인");
+        assert_eq!(linkify_segment("@mention 확인"), "@mention 확인");
         assert_eq!(
-            linkify_imports("@team/notes.md 확인"),
+            linkify_segment("@team/notes.md 확인"),
             "[@team/notes.md](team/notes.md) 확인"
         );
     }

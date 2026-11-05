@@ -7,18 +7,13 @@ import type { ClaudePluginBranchProject, ClaudePluginBranchRule, ClaudePluginBra
 import { AppToggle, BrandMark, ErrorBanner } from "./Shared";
 import { errorText } from "../lib/errorText";
 import { displayPath } from "../lib/displayPath";
+import { parsePluginScopes, PLUGIN_SCOPES, type PluginScope } from "../lib/claudePluginScopes";
 
 const CLAUDE_PLUGIN_SCOPE_KEY = "agent-manager.claude-plugin-scope.v1";
 
-type PluginScope = "global" | "project" | "branch";
-
-const PLUGIN_SCOPES: PluginScope[] = ["global", "project", "branch"];
-
 function loadPluginScopes(): Record<string, PluginScope> {
   try {
-    const parsed = JSON.parse(window.localStorage.getItem(CLAUDE_PLUGIN_SCOPE_KEY) || "{}");
-    if (!parsed || typeof parsed !== "object") return {};
-    return Object.fromEntries(Object.entries(parsed).filter(([, value]) => PLUGIN_SCOPES.includes(value as PluginScope))) as Record<string, PluginScope>;
+    return parsePluginScopes(window.localStorage.getItem(CLAUDE_PLUGIN_SCOPE_KEY));
   } catch {
     return {};
   }

@@ -63,5 +63,14 @@
     "name": "주소 앞뒤 공백은 자바스크립트 trim과 같은 문자만 걷어낸다",
     "source": "[BOM](\ufeffdoc.md) [NEL](\u0085next.md)\n",
     "links": ["doc.md", "\u0085next.md"]
+  },
+  {
+    "name": "C5-7 산문 조각과 혼합 줄바꿈에서도 수집 순서와 중복 제거를 유지한다",
+    "source": "[첫째](docs/first.md)\r\n`@ignored/inline.md` @docs/second.md\r   ```md\r@ignored/fenced.md\r```\r(@docs/third.md), [중복](docs/first.md)\n",
+    "links": [
+      "docs/first.md",
+      "docs/second.md",
+      "docs/third.md"
+    ]
   }
 ]

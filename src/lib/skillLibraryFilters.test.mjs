@@ -3,7 +3,12 @@ import test from "node:test";
 import {
   filterSkillEntries,
   isProjectOriginFilter,
+  matchesSkillAgent,
+  matchesSkillFilters,
+  matchesSkillKind,
   matchesSkillOrigin,
+  matchesSkillState,
+  parseStoredSkillFilters,
   skillFilterCounts,
   skillOriginProjects,
 } from "./skillLibraryFilters.ts";
@@ -30,7 +35,56 @@ test("출처 필터는 프로젝트 전체와 개별 프로젝트를 따로 가�
   assert.deepEqual(filterSkillEntries([personal, alpha, beta], filters).map((item) => item.key), ["beta"]);
 });
 
-test("Antigravity에 게시한 스킬을 에이전트 필터로 찾는다", () => {
+test("보관 구분(kind) 필터는 공통 원본 존재 여부를 정확히 판정한다", () => {
+  const shared = entry({ key: "shared-item", common: { sourceDigest: "d1", archivedAt: "2026-10-30" } });
+  const agentOnly = entry({ key: "agent-item", common: null });
+
+  assert.equal(matchesSkillKind(shared, "all"), true);
+  assert.equal(matchesSkillKind(shared, "shared"), true);
+  assert.equal(matchesSkillKind(shared, "agent"), false);
+
+  assert.equal(matchesSkillKind(agentOnly, "all"), true);
+  assert.equal(matchesSkillKind(agentOnly, "shared"), false);
+  assert.equal(matchesSkillKind(agentOnly, "agent"), true);
+});
+
+test("동기화 상태(state) 필터는 conflict, stale, undeployed 상태를 정확히 판정한다", () => {
+  const conflict = entry({
+    key: "conflict-item",
+    providers: [providerState({ status: "copy", divergent: true, divergence: "edited" })],
+  });
+  const stale = entry({
+    key: "stale-item",
+    providers: [providerState({ status: "copy", divergent: true, divergence: "behind" })],
+  });
+  const undeployed = entry({
+    key: "undeployed-item",
+    providers: [providerState({ status: "missing" })],
+  });
+  const upToDate = entry({
+    key: "synced-item",
+    providers: [providerState({ status: "copy" })],
+  });
+
+  assert.equal(matchesSkillState(conflict, "all"), true);
+  assert.equal(matchesSkillState(conflict, "conflict"), true);
+  assert.equal(matchesSkillState(conflict, "stale"), false);
+  assert.equal(matchesSkillState(conflict, "undeployed"), false);
+
+  assert.equal(matchesSkillState(stale, "stale"), true);
+  assert.equal(matchesSkillState(stale, "conflict"), false);
+  assert.equal(matchesSkillState(stale, "undeployed"), false);
+
+  assert.equal(matchesSkillState(undeployed, "undeployed"), true);
+  assert.equal(matchesSkillState(undeployed, "conflict"), false);
+  assert.equal(matchesSkillState(undeployed, "stale"), false);
+
+  assert.equal(matchesSkillState(upToDate, "conflict"), false);
+  assert.equal(matchesSkillState(upToDate, "stale"), false);
+  assert.equal(matchesSkillState(upToDate, "undeployed"), false);
+});
+
+test("에이전트(agent) 필터는 공급자별 배포 여부를 판정하며 local을 포함한다", () => {
   const antigravity = entry({
     key: "antigravity-skill",
     providers: [providerState({ provider: "antigravity", status: "copy" })],
@@ -39,16 +93,58 @@ test("Antigravity에 게시한 스킬을 에이전트 필터로 찾는다", () =
     key: "claude-skill",
     providers: [providerState({ provider: "claude", status: "copy" })],
   });
-  const filters = { kind: "all", state: "all", agent: "antigravity", origin: "all" };
+  const local = entry({
+    key: "local-skill",
+    providers: [providerState({ provider: "local", status: "linked" })],
+  });
 
+  assert.equal(matchesSkillAgent(antigravity, "all"), true);
+  assert.equal(matchesSkillAgent(antigravity, "antigravity"), true);
+  assert.equal(matchesSkillAgent(antigravity, "claude"), false);
+  assert.equal(matchesSkillAgent(antigravity, "local"), false);
+
+  assert.equal(matchesSkillAgent(local, "local"), true);
+  assert.equal(matchesSkillAgent(local, "claude"), false);
+
+  const filters = { kind: "all", state: "all", agent: "antigravity", origin: "all" };
   assert.deepEqual(
-    filterSkillEntries([antigravity, claude], filters).map((item) => item.key),
+    filterSkillEntries([antigravity, claude, local], filters).map((item) => item.key),
     ["antigravity-skill"],
   );
   assert.equal(
-    skillFilterCounts([antigravity, claude], filters, ["all"]).agent.antigravity,
+    skillFilterCounts([antigravity, claude, local], filters, ["all"]).agent.antigravity,
     1,
   );
+});
+
+test("matchesSkillFilters는 모든 축 조건을 종합 판정한다", () => {
+  const target = entry({
+    key: "target-skill",
+    common: { sourceDigest: "d1", archivedAt: "2026-10-30" },
+    origin: projectOrigin("/repos/alpha", "alpha"),
+    providers: [providerState({ provider: "antigravity", status: "copy" })],
+  });
+
+  assert.equal(matchesSkillFilters(target, {
+    kind: "shared",
+    state: "all",
+    agent: "antigravity",
+    origin: "project:/repos/alpha",
+  }), true);
+
+  assert.equal(matchesSkillFilters(target, {
+    kind: "agent",
+    state: "all",
+    agent: "antigravity",
+    origin: "project:/repos/alpha",
+  }), false);
+
+  assert.equal(matchesSkillFilters(target, {
+    kind: "shared",
+    state: "conflict",
+    agent: "antigravity",
+    origin: "project:/repos/alpha",
+  }), false);
 });
 
 test("출처 프로젝트 목록은 중복 없이 이름순으로 나온다", () => {
@@ -121,4 +217,23 @@ test("두 축에서 걸린 항목은 어느 축의 칩 개수에도 들지 않�
   assert.equal(counts.origin.project, 1);
   assert.equal(counts.origin["project:/repos/alpha"], 1);
   assert.equal(counts.state.all, 1);
+});
+
+test("저장된 필터 복원은 아는 값만 받고 나머지는 전부 all로 떨어뜨린다", () => {
+  const all = { kind: "all", state: "all", agent: "all", origin: "all" };
+  assert.deepEqual(parseStoredSkillFilters(null), all);
+  assert.deepEqual(parseStoredSkillFilters(["shared"]), all);
+  assert.deepEqual(parseStoredSkillFilters("shared"), all);
+  assert.deepEqual(
+    parseStoredSkillFilters({ kind: "shared", state: "undeployed", agent: "local", origin: "project:/repos/alpha" }),
+    { kind: "shared", state: "undeployed", agent: "local", origin: "project:/repos/alpha" },
+  );
+  for (const origin of ["personal", "project"]) {
+    assert.equal(parseStoredSkillFilters({ origin }).origin, origin);
+  }
+  assert.deepEqual(
+    parseStoredSkillFilters({ kind: "common", state: "unpublished", agent: "gemini", origin: "projects/alpha" }),
+    all,
+  );
+  assert.deepEqual(parseStoredSkillFilters({ kind: 1, state: null, agent: ["claude"], origin: 7 }), all);
 });

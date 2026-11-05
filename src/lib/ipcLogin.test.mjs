@@ -54,7 +54,7 @@ function fixture(t, respond) {
     requests.push({ path, token, method: init?.method, body: init?.body });
     if (path === "/api/access") {
       return Response.json({
-        protocolVersion: 14,
+        protocolVersion: 15,
         storeId: "00000000-0000-0000-0000-000000000001",
         instanceId: "test-backend",
         backendPort: 54178,

@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -221,7 +221,7 @@ pub(crate) struct AskpassSession {
     port: u16,
     token: Zeroizing<String>,
     executable: PathBuf,
-    shutdown: Arc<AtomicBool>,
+    shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -230,6 +230,7 @@ struct Shared {
     token: Zeroizing<String>,
     secret: Zeroizing<String>,
     remaining: AtomicUsize,
+    shutdown: AtomicBool,
     open: AtomicUsize,
 }
 
@@ -255,22 +256,22 @@ impl AskpassSession {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         ));
-        let shutdown = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
             token: token.clone(),
             secret,
             remaining: AtomicUsize::new(answers),
+            shutdown: AtomicBool::new(false),
             open: AtomicUsize::new(0),
         });
         let worker = {
-            let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || serve(&listener, &shared, &shutdown))
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || serve(&listener, &shared))
         };
         Ok(Self {
             port,
             token,
             executable,
-            shutdown,
+            shared,
             worker: Some(worker),
         })
     }
@@ -304,7 +305,7 @@ pub(crate) fn env_of(session: Option<&AskpassSession>) -> Vec<(String, String)> 
 
 impl Drop for AskpassSession {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.shared.shutdown.store(true, Ordering::SeqCst);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -313,19 +314,22 @@ impl Drop for AskpassSession {
 
 /// 연결을 받는 즉시 응답 스레드에 넘긴다. 토큰을 보내지 않고 붙들고 있는 연결 하나가 진짜
 /// helper의 차례를 막지 못하게 하려는 것이다. 답할 횟수를 다 쓰면 더 받지 않는다.
-fn serve(listener: &TcpListener, shared: &Arc<Shared>, shutdown: &AtomicBool) {
-    while shared.remaining.load(Ordering::SeqCst) > 0 && !shutdown.load(Ordering::SeqCst) {
+fn serve(listener: &TcpListener, shared: &Arc<Shared>) {
+    let mut workers: Vec<JoinHandle<()>> = Vec::new();
+    while shared.remaining.load(Ordering::SeqCst) > 0 && !shared.shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
                 if shared.open.fetch_add(1, Ordering::SeqCst) >= MAX_OPEN_CONNECTIONS {
                     shared.open.fetch_sub(1, Ordering::SeqCst);
                     continue;
                 }
+                // C9-21: keep live handlers bounded and join them before the session ends.
+                workers.retain(|worker| !worker.is_finished());
                 let shared = Arc::clone(shared);
-                std::thread::spawn(move || {
+                workers.push(std::thread::spawn(move || {
                     answer(stream, &shared);
                     shared.open.fetch_sub(1, Ordering::SeqCst);
-                });
+                }));
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(ACCEPT_POLL);
@@ -333,25 +337,59 @@ fn serve(listener: &TcpListener, shared: &Arc<Shared>, shutdown: &AtomicBool) {
             Err(_) => std::thread::sleep(ACCEPT_POLL),
         }
     }
+    for worker in workers {
+        let _ = worker.join();
+    }
 }
 
 /// 토큰 한 줄을 받아 맞고 답할 횟수가 남아 있으면 값을 한 줄 돌려준다. 틀린 토큰에는 아무것도
 /// 쓰지 않는다.
-fn answer(stream: TcpStream, shared: &Shared) -> bool {
-    let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(TOKEN_READ_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(HELPER_IO_TIMEOUT));
-    let mut line = Zeroizing::new(String::new());
-    let Ok(reader) = stream.try_clone() else {
-        return false;
-    };
-    if BufReader::new(reader.take(MAX_TOKEN_LINE))
-        .read_line(&mut line)
-        .is_err()
+fn answer(mut stream: TcpStream, shared: &Shared) -> bool {
+    if stream.set_nonblocking(false).is_err()
+        || stream.set_read_timeout(Some(ACCEPT_POLL)).is_err()
+        || stream.set_write_timeout(Some(HELPER_IO_TIMEOUT)).is_err()
     {
         return false;
     }
-    if line.trim_end() != shared.token.as_str() {
+    // C9-21: poll cancellation between reads and bound the whole token exchange.
+    // A per-read timeout alone lets a trickling peer postpone session cleanup.
+    let started = Instant::now();
+    let mut bytes = Zeroizing::new([0_u8; MAX_TOKEN_LINE as usize]);
+    let mut used = 0;
+    loop {
+        if shared.shutdown.load(Ordering::SeqCst) || started.elapsed() >= TOKEN_READ_TIMEOUT {
+            return false;
+        }
+        match stream.read(&mut bytes[used..]) {
+            Ok(0) => break,
+            Ok(count) => {
+                if let Some(newline) = bytes[used..used + count]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                {
+                    used += newline + 1;
+                    break;
+                }
+                used += count;
+                if used == bytes.len() {
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => return false,
+        }
+    }
+    let Ok(line) = std::str::from_utf8(&bytes[..used]) else {
+        return false;
+    };
+    // C9-21: an accepted connection must not redeem its token after shutdown.
+    if shared.shutdown.load(Ordering::SeqCst) || line.trim_end() != shared.token.as_str() {
         return false;
     }
     // 횟수는 값을 쓰기 **전에** 줄인다. 동시에 온 두 연결이 마지막 한 번을 함께 가져가지 않게 한다.
@@ -373,7 +411,6 @@ fn answer(stream: TcpStream, shared: &Shared) -> bool {
     if !decremented {
         return false;
     }
-    let mut stream = stream;
     let mut reply = Zeroizing::new(String::with_capacity(shared.secret.len() + 1));
     reply.push_str(&shared.secret);
     reply.push('\n');
@@ -560,6 +597,103 @@ pub(crate) mod tests {
         let first = run_helper(&value, "Enter passphrase for key '/k': ").expect("answer");
         assert_eq!(first.as_str(), "only once");
         assert!(run_helper(&value, "Enter passphrase for key '/k': ").is_err());
+    }
+
+    fn wait_until(check: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !check() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "handler did not reach expected state"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// C9-21/G4: dropping a session also releases the secret held by an idle handler.
+    #[test]
+    fn c9_21_drop_joins_idle_handlers_and_releases_the_secret() {
+        let session = AskpassSession::start_with_executable(
+            Zeroizing::new("test passphrase".to_owned()),
+            CONNECT_ANSWERS,
+            PathBuf::from("/bin/agent-manager"),
+        )
+        .expect("start");
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, session.port)).expect("connect");
+        stream
+            .set_read_timeout(Some(HELPER_IO_TIMEOUT))
+            .expect("timeout");
+        wait_until(|| session.shared.open.load(Ordering::SeqCst) == 1);
+        let weak = Arc::downgrade(&session.shared);
+        drop(session);
+        assert!(
+            weak.upgrade().is_none(),
+            "handler retained the session secret after drop"
+        );
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        assert!(response.is_empty());
+    }
+
+    /// C9-21: shutdown rejects a valid token even on an already accepted socket.
+    #[test]
+    fn c9_21_shutdown_rejects_a_delayed_token() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("listen");
+        let mut client =
+            TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        client
+            .set_read_timeout(Some(HELPER_IO_TIMEOUT))
+            .expect("timeout");
+        let shared = Shared {
+            token: Zeroizing::new("test token".to_owned()),
+            secret: Zeroizing::new("test passphrase".to_owned()),
+            remaining: AtomicUsize::new(CONNECT_ANSWERS),
+            shutdown: AtomicBool::new(true),
+            open: AtomicUsize::new(1),
+        };
+        writeln!(client, "{}", shared.token.as_str()).expect("token");
+        assert!(!answer(server, &shared));
+        let mut response = String::new();
+        let _ = client.read_to_string(&mut response);
+        assert!(
+            response.is_empty(),
+            "shutdown handler returned a passphrase"
+        );
+        assert_eq!(shared.remaining.load(Ordering::SeqCst), CONNECT_ANSWERS);
+    }
+
+    /// C9-21: trickled input cannot restart the whole-token timeout indefinitely.
+    #[test]
+    fn c9_21_token_deadline_bounds_a_trickling_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("listen");
+        let mut client =
+            TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        client
+            .set_write_timeout(Some(ACCEPT_POLL))
+            .expect("timeout");
+        let shared = Arc::new(Shared {
+            token: Zeroizing::new("test token".to_owned()),
+            secret: Zeroizing::new("test passphrase".to_owned()),
+            remaining: AtomicUsize::new(CONNECT_ANSWERS),
+            shutdown: AtomicBool::new(false),
+            open: AtomicUsize::new(1),
+        });
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || answer(server, &worker_shared));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() && Instant::now() < deadline {
+            let _ = client.write_all(b"x");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let finished = worker.is_finished();
+        // Always release the reader before asserting, including on a broken implementation.
+        drop(client);
+        let answered = worker.join().expect("reader exited");
+        assert!(finished, "trickled input extended the whole-token deadline");
+        assert!(!answered);
+        assert_eq!(shared.remaining.load(Ordering::SeqCst), CONNECT_ANSWERS);
     }
 
     /// C9-21. 응답 횟수가 0인 세션은 키 암호 프롬프트에도 값을 내주지 않는다.

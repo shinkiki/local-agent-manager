@@ -23,11 +23,14 @@ ENV HOME=/home/agent AGENT_MANAGER_USER=agent
 # 공유 폴더가 전용 사용자 소유로 준비된 상태를 모사한다. 소유가 맞지 않는 경우는
 # 아래 "쓰기 불가 경고" 사례가 따로 본다.
 RUN mkdir -p /data /workspace && chown 1000:1000 /workspace
-RUN printf '#!/bin/sh\necho "DBUS_SESSION_BUS_ADDRESS=stub;"\necho "DBUS_SESSION_BUS_PID=1;"\n' > /usr/local/bin/dbus-launch \
- && printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/gnome-keyring-daemon \
+# dbus-launch·gnome-keyring-daemon 스텁은 자기가 받은 환경의 볼트 암호와 stdin을 stderr로 알린다.
+# 둘 다 서버보다 오래 사는 프로세스라 환경에 암호가 남으면 같은 uid가 /proc/<pid>/environ으로 읽는다.
+RUN printf '#!/bin/sh\necho "DBUS-LAUNCH KEYRING_PASSWORD=${KEYRING_PASSWORD-unset}" >&2\necho "DBUS_SESSION_BUS_ADDRESS=stub;"\necho "DBUS_SESSION_BUS_PID=1;"\n' > /usr/local/bin/dbus-launch \
+ && printf '#!/bin/sh\necho "KEYRING-DAEMON $* KEYRING_PASSWORD=${KEYRING_PASSWORD-unset} STDIN=$(cat)" >&2\nexit 0\n' > /usr/local/bin/gnome-keyring-daemon \
+ && printf '#!/bin/sh\n# 버스 흉내. 키링 감시·기동 대기가 묻는 두 질문에 "주인 있음·열림"으로 답한다.\ncase "$*" in\n  *NameHasOwner*) echo "   boolean true" ;;\n  *) echo "   variant       boolean false" ;;\nesac\n' > /usr/local/bin/dbus-send \
  && printf '#!/bin/sh\n# 시크릿 서비스 흉내. store는 stdin을 파일로 받고 lookup은 그 파일을 돌려준다.\n# KEYRING_PROBE_MODE로 세 가지 고장을 만든다 — locked(store 실패), swallow(store는\n# 성공하고 값은 사라짐), hang(프롬프터 없는 컨테이너에서 멈춰 서는 경우).\n# 진짜 gnome-keyring을 넣지는 않으므로 "빈 키링 첫 기동"과 default collection 별칭 문제는\n# 이 시험의 범위 밖이고, 실기기 실측으로만 확인된다.\nf=/tmp/secret-tool-probe\ncase "$1" in\n  store)\n    [ "${KEYRING_PROBE_MODE}" = "locked" ] && exit 1\n    [ "${KEYRING_PROBE_MODE}" = "hang" ] && sleep 120\n    cat > "$f"\n    [ "${KEYRING_PROBE_MODE}" = "swallow" ] && : > "$f"\n    exit 0 ;;\n  lookup) [ -s "$f" ] || exit 1; cat "$f"; exit 0 ;;\n  clear) rm -f "$f"; exit 0 ;;\nesac\nexit 0\n' > /usr/local/bin/secret-tool \
  && printf '#!/bin/sh\necho "RUN-UID=$(id -u) RUN-GID=$(id -g) HOME=$HOME"\necho "GROUPS=$(id -G)"\necho "ARGV=$*"\necho "KEYRING_PASSWORD=${KEYRING_PASSWORD-unset}"\nstat -c "OWN %%u:%%g %%n" /data /home/agent /workspace\n' > /usr/local/bin/agent-manager-server \
- && chmod +x /usr/local/bin/dbus-launch /usr/local/bin/gnome-keyring-daemon /usr/local/bin/secret-tool /usr/local/bin/agent-manager-server
+ && chmod +x /usr/local/bin/dbus-launch /usr/local/bin/dbus-send /usr/local/bin/gnome-keyring-daemon /usr/local/bin/secret-tool /usr/local/bin/agent-manager-server
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
@@ -72,6 +75,10 @@ expect "서버 argv 유지" "--app-data-dir /data --tailscale-host h --tailscale
 expect "볼륨 소유권 이전" "OWN 1000:1000 /data" "${default_out}"
 # 잠금 해제가 끝난 볼트 암호가 서버 환경(→ 에이전트 CLI·터미널)으로 넘어가지 않는다.
 expect "볼트 암호는 서버 환경에 남지 않는다" "KEYRING_PASSWORD=unset" "${default_out}"
+# 잠금 해제 전에 지운다. 오래 사는 버스·키링 데몬도 암호를 환경으로 받지 않고, 키링은 stdin으로만 받는다.
+daemons_out="$(run 2>&1)"
+expect "D-Bus 환경에 볼트 암호가 없다" "DBUS-LAUNCH KEYRING_PASSWORD=unset" "${daemons_out}"
+expect "키링 데몬은 암호를 stdin으로만 받는다" "KEYRING-DAEMON --unlock --components=secrets KEYRING_PASSWORD=unset STDIN=x" "${daemons_out}"
 
 # gid 100은 이미지에 이미 있는 users 그룹이다. 시놀로지 공유 폴더의 기본 gid이므로
 # 중복을 거절하면 가장 흔한 배포가 뜨지 않는다.

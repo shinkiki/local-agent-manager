@@ -3651,8 +3651,13 @@ fn parse_status_porcelain_v2(text: &str) -> ParsedStatus {
     let mut head = GitHead::default();
     let mut upstream: Option<GitUpstream> = None;
     let mut entries = Vec::new();
-    let mut truncated = false;
-    let mut tokens = text.split('\0').peekable();
+    // C16: 캡처 상한은 항목 상한보다 먼저 닿을 수 있다. NUL로 끝난 레코드만
+    // 읽어 잘린 파일 이름이 다른 경로로 표시·선택되지 않게 한다.
+    let mut truncated =
+        text.len() >= MAX_CAPTURED_OUTPUT_BYTES || (!text.is_empty() && !text.ends_with('\0'));
+    let mut tokens = text
+        .split_inclusive('\0')
+        .filter_map(|record| record.strip_suffix('\0'));
     while let Some(token) = tokens.next() {
         if token.is_empty() {
             continue;
@@ -3715,11 +3720,14 @@ fn parse_status_porcelain_v2(text: &str) -> ParsedStatus {
                 if fields.len() < 10 {
                     continue;
                 }
-                let original = tokens.next().unwrap_or_default().to_owned();
+                let Some(original) = tokens.next().filter(|path| !path.is_empty()) else {
+                    truncated = true;
+                    break;
+                };
                 let mut xy = fields[1].chars();
                 GitStatusEntry {
                     path: fields[9].to_owned(),
-                    original_path: Some(original),
+                    original_path: Some(original.to_owned()),
                     index_status: GitChangeKind::from_porcelain(xy.next().unwrap_or('.')),
                     worktree_status: GitChangeKind::from_porcelain(xy.next().unwrap_or('.')),
                     is_submodule: fields[2].starts_with('S'),
@@ -4295,6 +4303,59 @@ u UU N... 100644 100644 100644 100644 a b c d.rs\0\
         let parsed = parse_status_porcelain_v2(&text);
         assert_eq!(parsed.entries.len(), MAX_STATUS_ENTRIES);
         assert!(parsed.truncated);
+    }
+
+    #[test]
+    fn c16_status_discards_incomplete_records() {
+        for tail in [
+            "? partial.txt",
+            "1 .M N... 100644 100644 100644 aaaa aaaa partial.txt",
+            "u UU N... 100644 100644 100644 100644 a b c partial.txt",
+            "2 R. N... 100644 100644 100644 aaaa aaaa R100 new.txt",
+            "2 R. N... 100644 100644 100644 aaaa aaaa R100 new.txt\0",
+            "2 R. N... 100644 100644 100644 aaaa aaaa R100 new.txt\0old.txt",
+        ] {
+            let parsed = parse_status_porcelain_v2(&format!("? complete.txt\0{tail}"));
+            assert!(parsed.truncated, "{tail:?}");
+            assert_eq!(parsed.entries.len(), 1, "{tail:?}");
+            assert_eq!(parsed.entries[0].path, "complete.txt");
+        }
+        assert!(!parse_status_porcelain_v2("").truncated);
+        assert!(!parse_status_porcelain_v2("? complete.txt\0").truncated);
+    }
+
+    #[test]
+    fn c16_status_marks_capture_limit_at_record_boundary() {
+        let record = format!("? {}\0", "x".repeat(253));
+        assert_eq!(MAX_CAPTURED_OUTPUT_BYTES % record.len(), 0);
+        let count = MAX_CAPTURED_OUTPUT_BYTES / record.len();
+        assert!(count < MAX_STATUS_ENTRIES);
+        let parsed = parse_status_porcelain_v2(&record.repeat(count));
+        assert_eq!(parsed.entries.len(), count);
+        assert!(parsed.truncated);
+    }
+
+    /// V2/C16: 실제 Git의 바이트 상한이 항목 상한보다 먼저 닿아도 생략을 알린다.
+    #[cfg(unix)]
+    #[test]
+    fn c16_status_reports_capped_git_output_without_partial_paths() {
+        let Some(repo) = init_repo() else {
+            return;
+        };
+        let git = runner(&repo);
+        for index in 0..1_200 {
+            let name = format!("{index:04}-{}", "x".repeat(220));
+            std::fs::write(repo.root.join(name), "").expect("untracked file");
+        }
+        let status = status_with(&git).expect("status");
+        assert!(status.truncated);
+        assert!(!status.entries.is_empty());
+        assert!(status.entries.len() < 1_200);
+        assert!(status.entries.iter().all(|entry| {
+            entry.index_status == GitChangeKind::Untracked
+                && entry.path.len() == 225
+                && repo.root.join(&entry.path).is_file()
+        }));
     }
 
     #[test]

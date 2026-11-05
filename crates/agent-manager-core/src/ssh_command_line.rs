@@ -329,6 +329,17 @@ struct StageBuilder {
 }
 
 impl StageBuilder {
+    /// C9-20. 파일 대상과 FD 병합 모두 같은 단계별 상한을 거친다.
+    fn push_redirect(&mut self, redirect: RemoteRedirect) -> Result<(), CoreError> {
+        if self.redirects.len() >= MAX_STAGE_REDIRECTS {
+            return Err(CoreError::InvalidInput(format!(
+                "한 단계에 붙일 수 있는 리다이렉션은 {MAX_STAGE_REDIRECTS}개까지입니다"
+            )));
+        }
+        self.redirects.push(redirect);
+        Ok(())
+    }
+
     fn accept(
         &mut self,
         word: Word,
@@ -336,16 +347,11 @@ impl StageBuilder {
     ) -> Result<(), CoreError> {
         match pending.take() {
             Some(redirect) => {
-                if self.redirects.len() >= MAX_STAGE_REDIRECTS {
-                    return Err(CoreError::InvalidInput(format!(
-                        "한 단계에 붙일 수 있는 리다이렉션은 {MAX_STAGE_REDIRECTS}개까지입니다"
-                    )));
-                }
-                self.redirects.push(RemoteRedirect {
+                self.push_redirect(RemoteRedirect {
                     fd: redirect.fd,
                     kind: redirect.kind,
                     target: RedirectTarget::File(word),
-                });
+                })?;
             }
             None => self.argv.push(word),
         }
@@ -482,16 +488,11 @@ fn open_redirect(
             if !matches!(characters.peek(), None | Some(' ') | Some('\t') | Some('|')) {
                 return Err(refuse(">& 뒤에는 파이프 번호 하나만 옵니다."));
             }
-            if stage.redirects.len() >= MAX_STAGE_REDIRECTS {
-                return Err(CoreError::InvalidInput(format!(
-                    "한 단계에 붙일 수 있는 리다이렉션은 {MAX_STAGE_REDIRECTS}개까지입니다"
-                )));
-            }
-            stage.redirects.push(RemoteRedirect {
+            stage.push_redirect(RemoteRedirect {
                 fd,
                 kind: RedirectKind::Merge,
                 target: RedirectTarget::Fd(target),
-            });
+            })?;
         }
         _ => {
             *pending = Some(PendingRedirect {
@@ -678,6 +679,36 @@ mod tests {
         // 정본을 다시 읽어도 같은 뜻이어야 한다 — 원격 셸이 읽는 것이 그 정본이다.
         assert_eq!(render("echo 2 >out.log"), "echo 2 >out.log");
         assert!(refused("app >").contains("대상이 없습니다"));
+    }
+
+    /// C9-20/V2. 파일 대상과 FD 병합은 모두 단계당 같은 개수까지만 허용한다.
+    #[test]
+    fn c9_20_redirect_limits_cover_file_and_descriptor_targets() {
+        for redirect in [">out", ">>out", "<in", "2>&1"] {
+            let allowed = format!("app {}", [redirect; MAX_STAGE_REDIRECTS].join(" "));
+            let line = parse_remote_command_line(&allowed).expect("상한까지 허용");
+            assert_eq!(line.stages()[0].redirects().len(), MAX_STAGE_REDIRECTS);
+            let error = parse_remote_command_line(&format!("{allowed} {redirect}"))
+                .expect_err("상한 초과 거절");
+            assert!(matches!(error, CoreError::InvalidInput(_)));
+            assert!(error.to_string().contains("리다이렉션은 4개까지"));
+        }
+    }
+
+    /// C9-20/V2. 종류를 섞어도 상한을 공유하고 다음 파이프 단계에서는 새로 센다.
+    #[test]
+    fn c9_20_mixed_redirect_limits_restart_per_pipeline_stage() {
+        let stage = "app <in >out >>out 2>&1";
+        let line = parse_remote_command_line(&format!("{stage} | {stage}"))
+            .expect("단계마다 상한까지 허용");
+        assert_eq!(line.stages().len(), 2);
+        for stage in line.stages() {
+            assert_eq!(stage.redirects().len(), 4);
+        }
+        for extra in [">out", "2>&1"] {
+            assert!(refused(&format!("{stage} {extra}")).contains("리다이렉션은 4개까지"));
+            assert!(refused(&format!("{stage} | {stage} {extra}")).contains("리다이렉션은 4개까지"));
+        }
     }
 
     /// 명령을 잇거나 새로 만드는 문법은 하나도 지나가지 못한다. 파이프를 열어도 `ls; rm -rf /`

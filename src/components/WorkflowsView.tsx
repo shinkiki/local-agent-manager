@@ -59,6 +59,7 @@ import { errorText } from "../lib/errorText";
 
 import { formatDateTime } from "../lib/format";
 import { relatedSkillKeys } from "../lib/workflowSkillOwnership";
+import { indexPreferredRounds } from "../lib/workflowPreferredRounds";
 export type WorkflowsTabId = "catalog" | "recurring" | "automation";
 
 /**
@@ -180,21 +181,6 @@ function useAiaAvailability(active: boolean): boolean | null {
 }
 
 type WorkflowCatalogState = ReturnType<typeof useWorkflowCatalog>;
-
-/**
- * 워크플로마다 표시·실행에 쓸 대표 회차를 고른다. 스케줄러 순서는 그대로 지키되, 같은
- * 워크플로에 켜진 회차가 하나라도 있으면 먼저 만난 일시정지 회차 대신 그것을 쓴다.
- */
-function indexPreferredRounds(schedules: readonly ScheduledRequest[]): Map<string, ScheduledRequest> {
-  const rounds = new Map<string, ScheduledRequest>();
-  for (const schedule of schedules) {
-    const workflowId = schedule.workflow?.workflowId;
-    if (!workflowId) continue;
-    const known = rounds.get(workflowId);
-    if (!known || (schedule.enabled && !known.enabled)) rounds.set(workflowId, schedule);
-  }
-  return rounds;
-}
 
 /**
  * 고른 계약 하나를 읽어 입력 폼을 세우는 자리. 선택 id·상세·읽는 중·입력값·계약 스키마와

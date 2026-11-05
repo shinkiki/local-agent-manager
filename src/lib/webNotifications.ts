@@ -164,8 +164,8 @@ const EXPIRY_NOTICE_KEY = "agentManager.credentialExpiryNotified";
 /**
  * 마지막으로 남긴 기록의 프로세스 사본. 저장소가 막힌 브라우저(쿠키 전면 차단·사파리
  * 프라이빗)에서는 읽기가 늘 `null`이라, 이 사본이 없으면 계정 폴링마다 같은 만료를
- * 다시 알린다. 저장소가 살아 있으면 저장값이 이긴다 — 앱을 다시 연 뒤에도 기억이
- * 이어져야 하는 쪽은 저장소다.
+ * 다시 알린다. 읽기는 되지만 쓰기만 실패하면 낡은 저장값이 남으므로, 이미 알린 사슬은
+ * 저장값과 이 사본 양쪽에서 찾는다. 앱을 다시 열었을 때는 저장값으로 기억을 잇는다.
  */
 let lastExpiryRecord: string | null = null;
 
@@ -205,8 +205,12 @@ export async function notifyExpiringCredentials(
       .map(credentialExpiryNoticeKey),
   );
   // 계정 폴링마다 불리므로 달라졌을 때만 쓴다. 창에 들고 나는 일은 며칠에 한 번이다.
-  if (record === seen) return;
-  const fresh = accountsToNotifyForExpiry(accounts, notifiedExpiryChains(seen), now)
+  if (record === seen) {
+    lastExpiryRecord = record;
+    return;
+  }
+  const notified = new Set([...notifiedExpiryChains(seen), ...notifiedExpiryChains(lastExpiryRecord)]);
+  const fresh = accountsToNotifyForExpiry(accounts, notified, now)
     .flatMap((account) => (account.credentialExpiresAt === null ? [] : [{
       id: account.id,
       displayName: account.displayName,

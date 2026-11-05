@@ -32,6 +32,13 @@ const DB_OPERATIONS: &[&str] = &[
     "run_db_statement",
 ];
 
+const INDEX_OPERATIONS: &[&str] = &[
+    "list_agent_index_sources",
+    "search_index",
+    "read_index_excerpt",
+    "refresh_agent_index_source",
+];
+
 const SSH_OPERATIONS: &[&str] = &[
     "list_agent_ssh_endpoints",
     "check_ssh_endpoint",
@@ -139,6 +146,11 @@ pub enum AgentBuiltinToolNote {
         available: usize,
         unusable: usize,
     },
+    #[serde(rename_all = "camelCase")]
+    IndexSources {
+        available: usize,
+        unusable: usize,
+    },
     CypressEnabled,
     CypressDisabled,
     /// 실행마다 붙여 주지 못해 CLI 전역 설정으로 받는 공급자의 상태. 앱이 그 설정을 맞춰
@@ -192,6 +204,9 @@ impl RegisteredTargets {
 
 #[derive(Clone, Default)]
 struct BuiltinToolState {
+    index_enabled: bool,
+    index: RegisteredTargets,
+    index_registered_in_antigravity: bool,
     cypress_enabled: bool,
     db: RegisteredTargets,
     ssh: RegisteredTargets,
@@ -225,6 +240,17 @@ pub fn load_agent_builtin_tools(app_data_dir: &Path) -> AgentBuiltinToolsCatalog
         "데이터베이스 활성 상태",
         &mut issues,
     );
+    let index_view = or_note(
+        crate::get_index_sources(app_data_dir, true),
+        "인덱스 활성 상태",
+        &mut issues,
+    );
+    let index_usable = index_view
+        .sources
+        .iter()
+        .filter(|s| s.indexed_at.is_some() && Path::new(&s.path).is_dir())
+        .count();
+    let index = RegisteredTargets::new(index_usable, index_view.sources.len() - index_usable);
     let (mcp_attachable, mcp_pending) = or_note(
         crate::external_plugins::ExternalPluginRegistry::new(app_data_dir.to_path_buf())
             .summary()
@@ -242,6 +268,9 @@ pub fn load_agent_builtin_tools(app_data_dir: &Path) -> AgentBuiltinToolsCatalog
     }
     catalog_from_state(
         BuiltinToolState {
+            index_enabled: index_view.enabled,
+            index,
+            index_registered_in_antigravity: antigravity.index,
             cypress_enabled,
             db,
             ssh,
@@ -267,6 +296,7 @@ fn or_note<T: Default>(result: Result<T, CoreError>, subject: &str, issues: &mut
 /// Antigravity CLI 전역 설정에서 지금 프록시를 가리키는 등록.
 #[derive(Default)]
 struct AntigravityRegistrations {
+    index: bool,
     plugins: Vec<String>,
     cypress: bool,
 }
@@ -322,6 +352,7 @@ fn registrations_pointing_at(
         .collect();
     let cypress_url = format!("{base}{}", crate::system_mcp::CYPRESS_PATH);
     AntigravityRegistrations {
+        index: urls.contains(&format!("{base}{}", crate::system_mcp::INDEX_PATH).as_str()),
         plugins,
         cypress: urls.contains(&cypress_url.as_str()),
     }
@@ -351,6 +382,19 @@ fn catalog_from_state(state: BuiltinToolState, issues: Vec<String>) -> AgentBuil
                 routes: vec![
                     route("aiaSystem", DB_OPERATIONS),
                     route("systemSkillCli", &["db list", "db query", "db exec"]),
+                ],
+            },
+            AgentBuiltinToolDefinition {
+                id: "index".to_owned(),
+                display_name: "인덱스".to_owned(),
+                routes: vec![
+                    route("aiaSystem", INDEX_OPERATIONS),
+                    route("directMcp", INDEX_OPERATIONS),
+                    route("externalMcpConfig", INDEX_OPERATIONS),
+                    route(
+                        "systemSkillCli",
+                        &["index list", "index search", "index read", "index refresh"],
+                    ),
                 ],
             },
             AgentBuiltinToolDefinition {
@@ -447,6 +491,28 @@ fn agent_view(
                 note: AgentBuiltinToolNote::DbConnections {
                     available: state.db.usable,
                     unusable: state.db.unusable,
+                },
+            },
+            AgentBuiltinToolView {
+                id: "index".to_owned(),
+                enabled: state.index_enabled,
+                available: state.index_enabled && state.index.available(),
+                access_method: if provider.is_none() {
+                    "aiaSystem"
+                } else if antigravity {
+                    if state.index_registered_in_antigravity {
+                        "externalMcpConfig"
+                    } else {
+                        "systemSkillCli"
+                    }
+                } else {
+                    "directMcp"
+                }
+                .to_owned(),
+                enablement_requires_new_chat: provider.is_some(),
+                note: AgentBuiltinToolNote::IndexSources {
+                    available: state.index.usable,
+                    unusable: state.index.unusable,
                 },
             },
             AgentBuiltinToolView {
@@ -584,6 +650,9 @@ mod tests {
     fn catalog_exposes_the_same_tools_with_provider_specific_access() {
         let catalog = catalog_from_state(
             BuiltinToolState {
+                index_enabled: false,
+                index: RegisteredTargets::default(),
+                index_registered_in_antigravity: false,
                 cypress_enabled: true,
                 db: RegisteredTargets::new(1, 0),
                 ssh: RegisteredTargets::new(2, 1),
@@ -602,7 +671,7 @@ mod tests {
                     .iter()
                     .map(|tool| tool.id.as_str())
                     .collect::<Vec<_>>(),
-                vec!["ssh", "db", "cypress", "mcp", "mermaid"]
+                vec!["ssh", "db", "index", "cypress", "mcp", "mermaid"]
             );
         }
         let aia = &catalog.agents[0];
@@ -815,5 +884,26 @@ mod tests {
         let mut without_cypress = config.clone();
         without_cypress.get_mut("cypress").unwrap().disabled = true;
         assert!(!registrations_pointing_at(base, &without_cypress, &attachable).cypress);
+    }
+    #[test]
+    fn index_catalog_reports_direct_mcp_and_restart_requirement() {
+        let catalog = catalog_from_state(
+            BuiltinToolState {
+                index_enabled: true,
+                index: RegisteredTargets::new(1, 1),
+                ..BuiltinToolState::default()
+            },
+            Vec::new(),
+        );
+        let codex = tool(&catalog, "codex", "index");
+        assert!(codex.enabled && codex.available && codex.enablement_requires_new_chat);
+        assert_eq!(codex.access_method, "directMcp");
+        assert_eq!(tool(&catalog, "aia", "index").access_method, "aiaSystem");
+        assert_eq!(
+            tool(&catalog, "antigravity", "index").access_method,
+            "systemSkillCli"
+        );
+        let off = catalog_from_state(BuiltinToolState::default(), Vec::new());
+        assert!(!tool(&off, "codex", "index").enabled);
     }
 }

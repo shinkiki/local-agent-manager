@@ -180,6 +180,15 @@ fn has_transcript_shape(spec: &CleanupRootSpec, provider: Option<ProviderId>, pa
     }
 }
 
+/// C11-3: 원문은 일반 파일만, 채팅 첨부는 디렉터리만 회수한다. 링크와 특수 파일은
+/// 확장자가 원문처럼 보여도 허용하지 않는다.
+fn has_removable_type(spec: &CleanupRootSpec, metadata: &fs::Metadata) -> bool {
+    match spec.kind {
+        CleanupRootKind::ProviderTranscript => metadata.is_file(),
+        CleanupRootKind::ChatAttachment => metadata.is_dir(),
+    }
+}
+
 /// 이 경로의 실체를 회수할 수 있는지. 등록된 루트 **안**에 있고, 그 루트가 허용하는
 /// **모양**이어야 한다. 공유 공급자 홈에 있는 원문은 첫 조건에서 걸러져 툼스톤만 받고,
 /// 계정 프로필의 `auth.json` 같은 이웃 파일은 둘째 조건에서 걸러진다.
@@ -192,8 +201,12 @@ fn removable_under(
     let (Some(root), Ok(canonical)) = (root, fs::canonicalize(path)) else {
         return false;
     };
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
     canonical != root
         && canonical.starts_with(root)
+        && has_removable_type(spec, &metadata)
         && has_transcript_shape(spec, provider, &canonical)
 }
 
@@ -1081,7 +1094,7 @@ fn move_to_trash(
     }
     // 담긴 자리와 모양을 여기서 한 번 더 본다. 판정과 실행이 갈라져도 자격증명 같은 이웃
     // 파일이 휴지통으로 넘어가지 않게 하는 마지막 문이다(`C11-3`).
-    if !metadata.is_dir() && !has_transcript_shape(spec, provider, &canonical) {
+    if !has_removable_type(spec, &metadata) || !has_transcript_shape(spec, provider, &canonical) {
         return Err(CoreError::InvalidInput(
             "정리 대상이 허용된 실체 모양이 아닙니다".to_owned(),
         ));
@@ -1847,6 +1860,109 @@ mod tests {
             assert!(matches!(error, CoreError::InvalidInput(_)), "{neighbour}");
             assert!(path.is_file(), "{neighbour}가 그대로 있어야 한다");
         }
+    }
+
+    #[test]
+    fn c11_3_transcript_directories_are_not_removable() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let profile = temp.path().join("credential-profiles/codex/account");
+        fs::create_dir_all(&profile).expect("profile");
+        let spec = root_spec(CleanupRootKind::ProviderTranscript);
+        let root = cleanup_root(temp.path(), spec).unwrap().unwrap();
+        for name in ["rollout.jsonl", "sessions"] {
+            let target = profile.join(name);
+            fs::create_dir(&target).expect("directory");
+            let neighbour = target.join("auth.json");
+            fs::write(&neighbour, b"unrelated content").expect("neighbour");
+            assert!(!removable_under(
+                Some(&root),
+                spec,
+                Some(ProviderId::Codex),
+                &target
+            ));
+            // C11-3: 판정을 건너뛰거나 판정 뒤 파일이 디렉터리로 바뀌어도 옮기지 않는다.
+            assert!(matches!(
+                move_to_trash(
+                    temp.path(),
+                    &root,
+                    spec,
+                    Some(ProviderId::Codex),
+                    &target,
+                    "codex:test",
+                    "group"
+                ),
+                Err(CoreError::InvalidInput(_))
+            ));
+            assert_eq!(fs::read(&neighbour).unwrap(), b"unrelated content");
+        }
+        assert!(!temp.path().join(TRASH_RELATIVE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c11_3_transcript_sockets_and_symlinks_are_not_removable() {
+        // macOS의 긴 TMPDIR 아래에서는 소켓 경로가 SUN_LEN(104)을 넘는다 — 짧은 /tmp에서 만든다.
+        let temp = tempfile::Builder::new()
+            .tempdir_in("/tmp")
+            .expect("temp directory");
+        let profile = temp.path().join("credential-profiles/codex/account");
+        fs::create_dir_all(&profile).expect("profile");
+        let spec = root_spec(CleanupRootKind::ProviderTranscript);
+        let root = cleanup_root(temp.path(), spec).unwrap().unwrap();
+        let socket = profile.join("socket.jsonl");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket");
+        let transcript = profile.join("rollout.jsonl");
+        fs::write(&transcript, b"{}").expect("transcript");
+        let link = profile.join("link.jsonl");
+        std::os::unix::fs::symlink(&transcript, &link).expect("link");
+        for target in [&socket, &link] {
+            assert!(!removable_under(
+                Some(&root),
+                spec,
+                Some(ProviderId::Codex),
+                target
+            ));
+            assert!(matches!(
+                move_to_trash(
+                    temp.path(),
+                    &root,
+                    spec,
+                    Some(ProviderId::Codex),
+                    target,
+                    "codex:test",
+                    "group"
+                ),
+                Err(CoreError::InvalidInput(_))
+            ));
+            assert!(fs::symlink_metadata(target).is_ok());
+        }
+        assert_eq!(fs::read(&transcript).unwrap(), b"{}");
+        assert!(!temp.path().join(TRASH_RELATIVE).exists());
+    }
+
+    #[test]
+    fn c11_3_chat_attachments_still_move_as_directories() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let target = temp.path().join("chat-inputs/chat-id");
+        fs::create_dir_all(&target).expect("attachments");
+        fs::write(target.join("input.txt"), b"input").expect("attachment");
+        let spec = root_spec(CleanupRootKind::ChatAttachment);
+        let root = cleanup_root(temp.path(), spec).unwrap().unwrap();
+        assert!(removable_under(Some(&root), spec, None, &target));
+        assert_eq!(
+            move_to_trash(
+                temp.path(),
+                &root,
+                spec,
+                None,
+                &target,
+                "chat-input:chat-id",
+                "group"
+            )
+            .unwrap(),
+            Some(5)
+        );
+        assert!(!target.exists());
     }
 
     #[test]

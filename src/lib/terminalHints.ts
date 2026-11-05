@@ -24,7 +24,10 @@ const MAX_CODES = 3;
 const MAX_BUFFER_CHARS = 64 * 1024;
 
 // CSI(ESC [ … 글자), OSC(ESC ] … BEL/ST), 글자집합 지정(ESC ( x), 캐리지 리턴.
-const ANSI_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\r/g;
+// CSI 매개변수 바이트는 ECMA-48의 0x30–0x3F 전체(`0-9 : ; < = > ?`)다. 숫자·`;`·`?`만 받으면
+// `ESC[38:5:4m`(콜론 색)이나 `ESC[>1u`(키보드 모드)가 남고, 주소 한가운데 걸린 그 ESC에서
+// 주소가 잘려 열면 404가 난다.
+const ANSI_PATTERN = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\r/g;
 const URL_PATTERN = /https?:\/\/[^\s<>"'`\u0000-\u001f]+/g;
 /** 꼬리에 붙기 쉬운 문장 부호. 주소 자체의 일부인 경우는 드물고, 붙은 채 열면 404가 난다. */
 const TRAILING_PUNCTUATION = /[.,;:!?)\]}'"]+$/;

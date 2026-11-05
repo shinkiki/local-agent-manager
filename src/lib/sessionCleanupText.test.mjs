@@ -102,3 +102,9 @@ test("바이트 표기는 단위를 올려 가며 읽는다", () => {
   assert.equal(formatBytes(1536), "1.5KB");
   assert.equal(formatBytes(490 * 1024 * 1024), "490MB");
 });
+
+test("formatBytes는 유효하지 않은 바이트 값(NaN, Infinity)에 0B를 반환한다", () => {
+  assert.equal(formatBytes(Number.NaN), "0B");
+  assert.equal(formatBytes(Number.POSITIVE_INFINITY), "0B");
+  assert.equal(formatBytes(Number.NEGATIVE_INFINITY), "0B");
+});

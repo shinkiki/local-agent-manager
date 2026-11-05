@@ -147,7 +147,9 @@ function hasNewerResume(items: ChatAttentionItem[], interrupted: ChatAttentionIt
   return items.some((item) => {
     if (item.createdAt <= interrupted.createdAt || (item.kind !== "running" && item.kind !== "completed")) return false;
     if (item.chatId === interrupted.chatId) return true;
-    return interrupted.providerSessionId !== null && item.providerSessionId === interrupted.providerSessionId;
+    return item.source === interrupted.source
+      && interrupted.providerSessionId !== null
+      && item.providerSessionId === interrupted.providerSessionId;
   });
 }
 

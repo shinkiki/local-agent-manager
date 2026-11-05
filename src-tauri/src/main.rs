@@ -13,9 +13,9 @@ fn main() {
     match args.first().map(String::as_str) {
         None => agent_manager_tauri_lib::run(),
         Some("--backend") => run_cli(args.into_iter().skip(1)),
-        Some("db" | "ssh" | "sessions" | "secret" | "migrate-keychain-v2") => {
-            run_cli(args.into_iter())
-        }
+        Some(
+            "db" | "ssh" | "runners" | "sessions" | "secret" | "index" | "migrate-keychain-v2",
+        ) => run_cli(args.into_iter()),
         Some("-h" | "--help") if args.len() == 1 => println!("{USAGE}"),
         Some("-V" | "--version") if args.len() == 1 => {
             println!("Agent Manager {}", env!("CARGO_PKG_VERSION"));
@@ -32,6 +32,8 @@ const USAGE: &str = "Usage: agent-manager [COMMAND]\n\
     Commands:\n\
       db ...                  데이터베이스 목록·조회·변경\n\
       ssh ...                 SSH 연결 조회·실행\n\
+      runners list            분산처리 실행기 목록(외부 도구용)\n\
+      index ...               소스·문서 인덱스 검색·범위 읽기·갱신\n\
       sessions ...            정책 범위 내 세션 조회\n\
       secret ...              비밀값 요청·대행 실행\n\
       migrate-keychain-v2 ...  기존 키체인 마이그레이션\n\

@@ -558,13 +558,18 @@ fn spawn_capped(
     // stdin을 주기 **전에** 묶는다. 러너가 job을 읽고 브라우저를 띄우면 그 손자는 묶기 전에
     // 태어난 셈이라 윈도우 job 밖에 남는다(C7-5).
     let group = ProcessGroup::attach(&child);
-    if let (Some(payload), Some(mut stdin)) = (stdin_payload, child.stdin.take()) {
-        // 자식이 다 읽기 전에 죽어도 쓰기 오류로 우리가 죽으면 안 된다.
-        let _ = stdin.write_all(&payload);
-        drop(stdin);
-    }
-    let output_readers = CappedOutputReaders::spawn(child.stdout.take(), child.stderr.take());
     let started = Instant::now();
+    let output_readers = CappedOutputReaders::spawn(child.stdout.take(), child.stderr.take());
+    // C7-5/C7-8: 잡이 파이프보다 크고 러너가 stdin을 읽지 않아도 제한시간과 중지는
+    // 계속 검사해야 한다. 출력부터 비우고 별도 스레드로 전송해 양방향 정체도 피한다.
+    let stdin_writer = stdin_payload
+        .zip(child.stdin.take())
+        .map(|(payload, mut stdin)| {
+            thread::spawn(move || {
+                // 자식이 다 읽기 전에 죽어도 쓰기 오류로 우리가 죽으면 안 된다.
+                let _ = stdin.write_all(&payload);
+            })
+        });
     let mut timed_out = false;
     let status = loop {
         match child.try_wait()? {
@@ -586,6 +591,9 @@ fn spawn_capped(
         }
     };
     let (stdout, stderr) = output_readers.finish();
+    if let Some(writer) = stdin_writer {
+        let _ = writer.join();
+    }
     Ok(CappedOutcome {
         success: status.map(|status| status.success()).unwrap_or(false),
         timed_out,
@@ -1488,6 +1496,86 @@ pub(crate) fn environment_hint(output: &str, timed_out: bool) -> Option<String> 
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    const STDIN_FIXTURE_ENV: &str = "AGENT_MANAGER_CYPRESS_STDIN_FIXTURE";
+    const STDIN_FIXTURE_BYTES: usize = 2 * 1024 * 1024;
+
+    /// 평소 시험에서는 지나가고, 자식으로 호출됐을 때만 stdin을 처리한다.
+    #[test]
+    fn stdin_fixture_helper() {
+        let Ok(mode) = std::env::var(STDIN_FIXTURE_ENV) else {
+            return;
+        };
+        if mode == "blocked" {
+            // 회귀해도 시험이 멈추지 않도록 스스로 끝난다. 부모의 제한시간보다 길다.
+            thread::sleep(Duration::from_secs(3));
+        } else {
+            use std::io::Read;
+            let mut input = Vec::new();
+            std::io::stdin().read_to_end(&mut input).expect("stdin EOF");
+            assert_eq!(input, vec![b'x'; STDIN_FIXTURE_BYTES]);
+            println!("complete stdin and EOF");
+        }
+    }
+
+    fn stdin_fixture_command(mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("시험 바이너리"));
+        command
+            .args([
+                "--exact",
+                "cypress_runs::tests::stdin_fixture_helper",
+                "--nocapture",
+            ])
+            .env(STDIN_FIXTURE_ENV, mode);
+        command
+    }
+
+    #[test]
+    fn c7_5_timeout_remains_active_while_stdin_is_blocked() {
+        let outcome = spawn_capped(
+            stdin_fixture_command("blocked"),
+            Some(vec![b'x'; STDIN_FIXTURE_BYTES]),
+            Duration::from_millis(300),
+            true,
+            &AtomicBool::new(false),
+        )
+        .expect("실행");
+        assert!(outcome.timed_out, "stdin 전송이 제한시간 검사를 막았습니다");
+        assert!(!outcome.success);
+    }
+
+    #[test]
+    fn c7_8_stop_remains_active_while_stdin_is_blocked() {
+        let outcome = spawn_capped(
+            stdin_fixture_command("blocked"),
+            Some(vec![b'x'; STDIN_FIXTURE_BYTES]),
+            Duration::from_secs(10),
+            true,
+            &AtomicBool::new(true),
+        )
+        .expect("실행");
+        assert!(
+            !outcome.success,
+            "중지 요청이 있는데 자식이 정상 종료했습니다"
+        );
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.exit_code, None);
+    }
+
+    #[test]
+    fn c7_3_stdin_delivery_keeps_the_full_payload_and_closes_the_pipe() {
+        let outcome = spawn_capped(
+            stdin_fixture_command("read"),
+            Some(vec![b'x'; STDIN_FIXTURE_BYTES]),
+            Duration::from_secs(10),
+            true,
+            &AtomicBool::new(false),
+        )
+        .expect("실행");
+        assert!(outcome.success, "{}", outcome.stderr);
+        assert!(!outcome.timed_out);
+        assert!(outcome.stdout.contains("complete stdin and EOF"));
+    }
 
     /// C7-5. 제한 시간은 러너만이 아니라 러너가 띄운 손자(브라우저)까지 끝내야 한다. 손자가
     /// 출력 파이프를 쥔 채 살아남으면 `finish`가 그 손자가 끝날 때까지 돌아오지 않는다.

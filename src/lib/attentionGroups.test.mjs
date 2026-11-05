@@ -163,3 +163,26 @@ test("회차 결정 대기는 목표 ID를 뽑고 워크플로 묶음·지우기
   assert.deepEqual(groups[0].folders, []);
   assert.equal(attentionNotificationDetail(decision), "회차 결정 대기: M10 · 사람이 답할 결정 2건");
 });
+
+test("서로 다른 목표의 회차 결정 알림은 목표별로 독립된 묶음이 된다", () => {
+  const decisionA = item({
+    id: "round-decision:goal-alpha:1",
+    chatId: "",
+    cwd: "",
+    kind: "roundDecision",
+    title: "회차 결정 대기: 목표 Alpha",
+    detail: "사람이 답할 결정 1건",
+  });
+  const decisionB = item({
+    id: "round-decision:goal-beta:2",
+    chatId: "",
+    cwd: "",
+    kind: "roundDecision",
+    title: "회차 결정 대기: 목표 Beta",
+    detail: "사람이 답할 결정 2건",
+  });
+  const groups = groupAttentionItems([decisionB, decisionA]);
+  assert.equal(groups.length, 2);
+  assert.equal(groups[0].lead.title, "회차 결정 대기: 목표 Beta");
+  assert.equal(groups[1].lead.title, "회차 결정 대기: 목표 Alpha");
+});

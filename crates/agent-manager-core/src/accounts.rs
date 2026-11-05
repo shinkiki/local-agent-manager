@@ -5378,7 +5378,10 @@ struct CodexIdentityFields<'a> {
 }
 
 fn codex_identity(secret: &str) -> Result<AccountIdentity, CoreError> {
-    let value: CodexIdentitySecret<'_> = serde_json::from_str(secret)?;
+    // G4: 타입 오류에는 자격증명의 문자열 값이 포함될 수 있어 원문 오류를 버린다.
+    let value: CodexIdentitySecret<'_> = serde_json::from_str(secret).map_err(|_| {
+        CoreError::Runtime("Codex 인증 JSON에서 계정 신원을 읽지 못했습니다".to_owned())
+    })?;
     let account_id = value
         .tokens
         .as_ref()
@@ -5480,7 +5483,10 @@ struct ClaudeIdentityFields<'a> {
 }
 
 fn claude_identity_from_secret(secret: &str) -> Result<AccountIdentity, CoreError> {
-    let credentials: ClaudeIdentitySecret<'_> = serde_json::from_str(secret)?;
+    // G4: 자격증명을 담을 수 있는 역직렬화 오류는 어댑터 밖으로 내보내지 않는다.
+    let credentials: ClaudeIdentitySecret<'_> = serde_json::from_str(secret).map_err(|_| {
+        CoreError::Runtime("Claude 인증 JSON에서 계정 신원을 읽지 못했습니다".to_owned())
+    })?;
     let fields = credentials.oauth.as_ref().unwrap_or(&credentials.root);
     let provider_account_id = fields
         .account_id
@@ -8540,6 +8546,79 @@ mod tests {
     }
 
     #[test]
+    fn g4_identity_parse_errors_never_echo_credential_values() {
+        let marker = "g4-credential-value-sentinel";
+        for (provider, container) in [
+            (ProviderId::Codex, "tokens"),
+            (ProviderId::Claude, "claudeAiOauth"),
+        ] {
+            for secret in [
+                json!({container: marker}).to_string(),
+                json!(marker).to_string(),
+                format!("{{\"{marker}\":"),
+            ] {
+                let error = match provider {
+                    ProviderId::Codex => codex_identity(&secret),
+                    ProviderId::Claude => claude_identity_from_secret(&secret),
+                    _ => unreachable!(),
+                }
+                .err()
+                .expect("malformed credential identity must fail");
+                assert!(!error.to_string().contains(marker));
+                assert!(!format!("{error:?}").contains(marker));
+                assert!(matches!(error, CoreError::Runtime(_)));
+                let name = if provider == ProviderId::Codex {
+                    "Codex"
+                } else {
+                    "Claude"
+                };
+                assert_eq!(
+                    error.to_string(),
+                    format!("{name} 인증 JSON에서 계정 신원을 읽지 못했습니다")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn g4_codex_home_snapshot_keeps_malformed_credentials_out_of_errors() {
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join(".codex");
+        fs::create_dir(&codex_home).unwrap();
+        let auth = codex_home.join("auth.json");
+        let marker = "g4-home-credential-sentinel";
+        let secret = json!({"tokens": marker}).to_string();
+        fs::write(&auth, &secret).unwrap();
+        let supervisor = AccountSupervisor::open_with(
+            data.path(),
+            home.path(),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+
+        supervisor
+            .observe_home_credential(ProviderId::Codex, true)
+            .unwrap();
+        let snapshot = supervisor.snapshot().unwrap();
+        let view = &snapshot
+            .providers
+            .iter()
+            .find(|p| p.provider == ProviderId::Codex)
+            .unwrap()
+            .home;
+        assert_eq!(view.state, HomeCredentialState::Error);
+        assert!(view.provider_account_id.is_none());
+        assert!(view.retry_at.is_some());
+        assert_eq!(
+            view.error.as_deref(),
+            Some("Codex 인증 JSON에서 계정 신원을 읽지 못했습니다")
+        );
+        assert!(!serde_json::to_string(&snapshot).unwrap().contains(marker));
+        assert_eq!(fs::read_to_string(&auth).unwrap(), secret);
+    }
+
+    #[test]
     fn codex_identity_uses_account_id_without_exposing_tokens() {
         let identity =
             codex_identity(r#"{"tokens":{"account_id":"acct-1","access_token":"secret"}}"#)
@@ -9311,7 +9390,8 @@ done
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    // 리눅스는 keyring 크레이트 대신 Secret Service를 직접 부른다(os_keychain/secret_service.rs).
+    #[cfg(windows)]
     #[test]
     fn production_keyring_backend_persists_until_deleted() {
         assert!(matches!(

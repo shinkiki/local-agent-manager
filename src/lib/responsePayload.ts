@@ -7,14 +7,23 @@
  * 성공"이 된다 — 명령 POST는 `null`을 성공 값으로 돌려주고, 접근 상태 조회는 버전이
  * 없는 응답으로 읽어 "API 버전이 호환되지 않습니다"라는 엉뚱한 원인을 띄웠다. 그래서
  * 신호가 끊긴 경우에는 원래 오류를 다시 던지고, 무엇으로 알릴지는 호출부가 정한다.
+ *
+ * 같은 이유로 **본문을 받다 연결이 끊긴 것도 null이 아니다.** null은 받은 본문이 비었거나
+ * JSON이 아닐 때(`SyntaxError`)만이다. 수신 실패까지 삼키면 성공 응답이 도중에 끊겼을 때
+ * 명령이 "본문 없는 성공"으로 끝난다.
  */
 export async function readJsonPayload<T>(response: Response, signal?: AbortSignal): Promise<T | null> {
   try {
     return await response.json() as T;
   } catch (cause) {
-    if (signal?.aborted) throw cause;
+    if (signal?.aborted || !isUnparsableBody(cause)) throw cause;
     return null;
   }
+}
+
+/** 본문은 다 받았지만 비었거나 JSON이 아니어서 난 오류인지. 그 밖은 수신 실패다. */
+function isUnparsableBody(cause: unknown): boolean {
+  return cause instanceof SyntaxError;
 }
 
 /** 본문을 받는 동안의 진행. `total`은 전체 크기를 믿을 수 있을 때만 있다. */
@@ -50,7 +59,7 @@ export function responseBodyTotal(headers: Headers): number | null {
 /**
  * `readJsonPayload`와 같되 본문을 조각으로 받으며 받은 만큼을 알린다. 큰 세션 원문은 원격
  * 연결에서 받는 데만 몇 초가 걸려, 화면이 실제로 얼마나 받았는지를 보일 수 있게 한다.
- * 스트림을 읽을 수 없는 환경이면 그냥 한 번에 읽는다. 실패·중단의 뜻은 `readJsonPayload`와 같다.
+ * 스트림을 읽을 수 없는 환경이면 그냥 한 번에 읽는다. 실패·중단·수신 실패의 뜻은 `readJsonPayload`와 같다.
  */
 export async function readJsonPayloadWithProgress<T>(
   response: Response,
@@ -82,7 +91,7 @@ export async function readJsonPayloadWithProgress<T>(
     }
     return JSON.parse(new TextDecoder().decode(bytes)) as T;
   } catch (cause) {
-    if (signal?.aborted) throw cause;
+    if (signal?.aborted || !isUnparsableBody(cause)) throw cause;
     return null;
   }
 }

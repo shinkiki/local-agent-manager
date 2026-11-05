@@ -176,14 +176,16 @@ pub(crate) fn redact(text: &str) -> String {
 }
 
 /// 40자 이상 이어지는 base64·hex꼴 토큰을 지운다. 토큰·서명·키 본문이 이 모양으로 온다.
+/// URL-safe base64(RFC 4648 §5)의 `-`·`_`도 같은 알파벳으로 본다 — GitHub `ghp_…` 토큰과
+/// JWT 조각이 이 모양이라, 빠뜨리면 같은 비밀값이 글자 집합만 바꿔 진단을 통과한다(G4).
 fn mask_long_tokens(line: &str) -> String {
     line.split(' ')
         .map(|token| {
             let body = token.trim_matches(|value: char| !value.is_ascii_alphanumeric());
             let secretish = body.chars().count() >= 40
-                && body
-                    .chars()
-                    .all(|value| value.is_ascii_alphanumeric() || matches!(value, '+' | '/' | '='));
+                && body.chars().all(|value| {
+                    value.is_ascii_alphanumeric() || matches!(value, '+' | '/' | '=' | '-' | '_')
+                });
             if secretish {
                 "[생략된 값]".to_owned()
             } else {
@@ -251,6 +253,12 @@ mod tests {
         assert!(cleaned.contains("[생략된 키 블록]"));
         assert!(cleaned.contains("[생략된 값]"));
         assert!(cleaned.contains("real error"));
+        // URL-safe base64 토큰도 같은 비밀값이다(G4).
+        let urlsafe = "auth ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ab and eyJhbGciOiJIUzI1NiJ9-_abcdefghijklmnopqrstuvwxyz";
+        let cleaned = redact(urlsafe);
+        assert!(!cleaned.contains("ghp_AbCd"), "{cleaned}");
+        assert!(!cleaned.contains("eyJhbGci"), "{cleaned}");
+        assert!(cleaned.starts_with("auth [생략된 값] and"), "{cleaned}");
         assert!(redact(&"x".repeat(MAX_MESSAGE_CHARS * 2)).chars().count() <= MAX_MESSAGE_CHARS);
 
         // 출력 본문은 줄 모양을 지키되 키 블록만은 빼낸다. 사용자가 요청한 값을 토큰처럼

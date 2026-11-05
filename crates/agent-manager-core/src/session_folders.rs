@@ -622,6 +622,69 @@ mod tests {
     }
 
     #[test]
+    fn noop_reorder_preserves_app_data_until_a_sibling_moves_g7_v2() {
+        let app_data = tempfile::tempdir().expect("app data directory");
+        with_metadata(app_data.path(), |metadata| {
+            metadata.folders = vec![
+                SessionFolder {
+                    sort_order: 10,
+                    ..folder("a", None)
+                },
+                SessionFolder {
+                    sort_order: 40,
+                    ..folder("b", None)
+                },
+                SessionFolder {
+                    sort_order: 70,
+                    ..folder("only", Some("a"))
+                },
+            ];
+            Ok(())
+        })
+        .expect("seed legacy sibling order");
+        let store_path = app_data.path().join("manager-state.json");
+        let original = std::fs::read(&store_path).expect("original metadata bytes");
+        let ids = |folders: &[SessionFolder]| {
+            folders
+                .iter()
+                .map(|folder| folder.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // G7/V2: a no-op may normalize the returned view, but must not persist
+        // those incidental edits to the app-owned store.
+        for (id, direction) in [
+            ("a", FolderMoveDirection::Up),
+            ("b", FolderMoveDirection::Down),
+            ("only", FolderMoveDirection::Up),
+            ("only", FolderMoveDirection::Down),
+        ] {
+            let view = reorder_session_folder(app_data.path(), id, direction)
+                .expect("boundary reorder succeeds without moving a folder");
+            assert_eq!(ids(&view), vec!["a", "only", "b"]);
+            assert_eq!(
+                std::fs::read(&store_path).expect("metadata after no-op"),
+                original,
+                "{id} {direction} must preserve the stored metadata"
+            );
+        }
+
+        // A real sibling move must still save its order; always skipping writes
+        // would satisfy the no-op assertions while silently losing user changes.
+        let moved = reorder_session_folder(app_data.path(), "a", FolderMoveDirection::Down)
+            .expect("a moves below b");
+        assert_eq!(ids(&moved), vec!["b", "a", "only"]);
+        assert_ne!(
+            std::fs::read(&store_path).expect("changed metadata"),
+            original
+        );
+        assert_eq!(
+            ids(&list_session_folders(app_data.path()).expect("persisted folder order")),
+            vec!["b", "a", "only"]
+        );
+    }
+
+    #[test]
     fn sanitize_lifts_only_cycle_members_and_keeps_their_descendants_nested() {
         let mut folders = vec![
             folder("a", Some("b")),

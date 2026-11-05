@@ -30,7 +30,7 @@ export const UI_GUIDE_VIEW_TABS: Partial<Record<ViewId, readonly string[]>> = {
   settings: ["connections", "aia", "service", "language", "display"],
   chat: ["conversation", "activity", "schedules"],
   workflows: ["catalog", "recurring", "automation"],
-  addons: ["mcp", "ssh", "db", "cypress", "mermaid", "claude"],
+  addons: ["mcp", "ssh", "db", "runners", "index", "cypress", "mermaid", "claude"],
   projects: ["files", "git", "overlay", "settings"],
   storage: ["data", "library", "secrets"],
 };

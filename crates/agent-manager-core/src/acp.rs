@@ -866,17 +866,29 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_grade_falls_back_to_cancel_instead_of_a_wider_one() {
-        // 하네스가 always 를 주지 않는 상황에서 세션 허용을 고르면, 1회 허용으로 슬쩍
-        // 바꾸지 않고 취소로 답한다. 조용히 다른 등급으로 실행하는 것이 더 나쁘다.
-        let mut request = captured_request();
-        request
-            .options
-            .retain(|option| option.kind != "allow_always");
-        assert_eq!(
-            request.outcome_for(ChatApprovalDecision::AcceptForSession),
-            AcpPermissionOutcome::Cancelled,
-        );
+    fn c14_4_every_missing_permission_grade_cancels_instead_of_substituting() {
+        // C14-4: 1회 허용이 없다고 세션 허용으로 넓히거나, 거절이 없다고 허용하면 안 된다.
+        for (decision, missing_kind) in [
+            (ChatApprovalDecision::Accept, "allow_once"),
+            (ChatApprovalDecision::AcceptAll, "allow_once"),
+            (ChatApprovalDecision::AcceptForSession, "allow_always"),
+            (ChatApprovalDecision::Decline, "reject_once"),
+        ] {
+            let mut request = captured_request();
+            request.options.retain(|option| option.kind != missing_kind);
+            for options in [request.options.clone(), Vec::new()] {
+                request.options = options;
+                assert!(
+                    request.option_for(decision).is_none(),
+                    "{decision:?} must not substitute a missing {missing_kind}"
+                );
+                assert_eq!(
+                    request.outcome_for(decision),
+                    AcpPermissionOutcome::Cancelled,
+                    "{decision:?} must cancel without {missing_kind}"
+                );
+            }
+        }
     }
 
     #[test]

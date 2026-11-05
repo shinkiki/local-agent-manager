@@ -33,13 +33,11 @@ import { readStoredText, writeStoredText } from "../lib/storedText";
 import { displayPath } from "../lib/displayPath";
 import type { ProjectRegistryEntry } from "../types";
 import {
-  SKILL_AGENT_VALUES,
-  SKILL_KIND_VALUES,
-  SKILL_STATE_VALUES,
   adapterSummary,
   filterSkillEntries,
   isProjectOriginFilter,
   matchesSkillQuery,
+  parseStoredSkillFilters,
   providerLabel,
   publishHadFailure,
   publishSummary,
@@ -58,12 +56,9 @@ import {
 } from "../lib/skillLibrary";
 import { matchesNeedle } from "../lib/menuSearch";
 import type {
-  SkillAgentFilter,
   SkillDivergentInstall,
   SkillFilterCounts,
-  SkillKindFilter,
   SkillLibraryFilters,
-  SkillStateFilter,
 } from "../lib/skillLibrary";
 import type {
   CommonSkillDetail,
@@ -212,7 +207,7 @@ export function SkillLibraryPanel({ active = true, translations, automation, onA
   const { text } = useI18n();
   const { confirm, confirmDialog } = useConfirm();
   const [query, setQuery] = useState("");
-  const [filters, setFilters] = useStoredFilters(LIBRARY_FILTERS_KEY, parseLibraryFilters);
+  const [filters, setFilters] = useStoredFilters(LIBRARY_FILTERS_KEY, parseStoredSkillFilters);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [bulkDeployOpen, setBulkDeployOpen] = useState(false);
@@ -2931,18 +2926,6 @@ export function useStoredFilters<F extends object>(
     writeStoredText(key, JSON.stringify(filters));
   }, [key, filters]);
   return [filters, setFilters];
-}
-
-function parseLibraryFilters(stored: Partial<SkillLibraryFilters> | null): SkillLibraryFilters {
-  return {
-    kind: SKILL_KIND_VALUES.includes(stored?.kind as SkillKindFilter) ? stored?.kind as SkillKindFilter : "all",
-    state: SKILL_STATE_VALUES.includes(stored?.state as SkillStateFilter) ? stored?.state as SkillStateFilter : "all",
-    agent: SKILL_AGENT_VALUES.includes(stored?.agent as SkillAgentFilter) ? stored?.agent as SkillAgentFilter : "all",
-    origin: typeof stored?.origin === "string"
-      && (["all", "personal", "project"].includes(stored.origin) || stored.origin.startsWith("project:"))
-      ? stored.origin
-      : "all",
-  };
 }
 
 /**

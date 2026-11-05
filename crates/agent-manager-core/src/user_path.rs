@@ -509,6 +509,41 @@ mod tests {
         assert!(!temp.path().join("gone").exists(), "아무것도 만들지 않는다");
     }
 
+    /// C6-5: 만들 자리에 폴더가 아닌 항목이 이미 있으면 `Conflict`다. "없음" 접두사로
+    /// 답하면 화면이 그 자리를 다시 만들자고 묻고, 성공으로 답하면 파일을 폴더로 믿는다.
+    #[test]
+    fn create_refuses_a_non_directory_already_at_the_target() {
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        let app_data = temp.path().join("app-data");
+        fs::create_dir(&app_data).expect("app data");
+        let file = temp.path().join("note.md");
+        fs::write(&file, b"x").expect("file");
+
+        for result in [
+            create_user_directory(&app_data, &file.to_string_lossy()).map(|_| ()),
+            plan_user_directory(&app_data, &file.to_string_lossy()).map(|_| ()),
+        ] {
+            let error = result.expect_err("file at target");
+            assert!(matches!(error, CoreError::Conflict(_)), "{error}");
+        }
+        assert_eq!(fs::read(&file).expect("file kept"), b"x");
+
+        // 끊어진 링크도 폴더가 아니다. 링크 너머에 폴더를 만들지 않는다.
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("dangling");
+            std::os::unix::fs::symlink(temp.path().join("gone"), &link).expect("symlink");
+            for result in [
+                create_user_directory(&app_data, &link.to_string_lossy()).map(|_| ()),
+                plan_user_directory(&app_data, &link.to_string_lossy()).map(|_| ()),
+            ] {
+                let error = result.expect_err("dangling link at target");
+                assert!(matches!(error, CoreError::Conflict(_)), "{error}");
+            }
+            assert!(!temp.path().join("gone").exists(), "아무것도 만들지 않는다");
+        }
+    }
+
     #[test]
     fn create_refuses_the_app_data_directory_and_parent_traversal() {
         let temp = tempfile::tempdir().expect("temp directory must exist");

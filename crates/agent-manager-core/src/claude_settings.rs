@@ -884,6 +884,13 @@ fn mutate_settings_entry(
     }
     let mut bytes = serde_json::to_vec_pretty(&Value::Object(root))?;
     bytes.push(b'\n');
+    // C8-2: 들여쓰기와 개행으로 커진 출력도 다음 조회의 읽기 한도를 지켜야 한다.
+    if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+        return Err(CoreError::InvalidInput(format!(
+            "Claude 설정 저장 결과가 {}바이트 제한을 넘었습니다",
+            MAX_SETTINGS_BYTES
+        )));
+    }
     if document.status.exists {
         let original = fs::read(target)?;
         save_backup(app_data_dir, BACKUP_STORE, "json", target, &original)?;
@@ -1161,6 +1168,90 @@ mod tests {
             fs::read_to_string(target).unwrap(),
             r#"{"enabledPlugins":{}}"#
         );
+    }
+
+    #[test]
+    fn c8_2_serialized_settings_over_limit_leave_the_original_and_backups_untouched() {
+        for skill_override in [false, true] {
+            let (_root, home, app_data) = fixture();
+            let settings = home.join(".claude/settings.json");
+            let mut document = serde_json::json!({
+                "enabledPlugins": {"demo@official": false},
+                "skillOverrides": {"personal-skill": "on"},
+                "padding": "",
+            });
+            let overhead = serde_json::to_vec_pretty(&document).unwrap().len() + 1;
+            // true는 false보다 한 바이트 짧아져도 저장 결과가 한도를 넘어야 한다.
+            document["padding"] =
+                Value::String("x".repeat(MAX_SETTINGS_BYTES as usize - overhead + 2));
+            let original = serde_json::to_vec(&document).unwrap();
+            assert!(original.len() <= MAX_SETTINGS_BYTES as usize);
+            fs::write(&settings, &original).unwrap();
+            assert!(read_scope_document(&settings).status.parse_error.is_none());
+
+            let result = if skill_override {
+                set_claude_skill_override_with_home(
+                    &app_data,
+                    &home,
+                    None,
+                    &SetClaudeSkillOverrideRequest {
+                        override_key: "personal-skill".to_owned(),
+                        scope: ClaudeSettingsWriteScope::User,
+                        project_path: None,
+                        value: Some(SkillOverrideValue::Off),
+                    },
+                )
+            } else {
+                set_claude_plugin_enabled_with_home(
+                    &app_data,
+                    &home,
+                    None,
+                    &plugin_request(Some(true)),
+                )
+            };
+            assert!(matches!(result, Err(CoreError::InvalidInput(_))));
+            assert_eq!(fs::read(&settings).unwrap(), original);
+            assert!(read_scope_document(&settings).status.parse_error.is_none());
+            assert!(!app_data.join(BACKUP_STORE).exists());
+        }
+    }
+
+    #[test]
+    fn c8_2_serialized_settings_at_the_limit_remain_readable() {
+        let (_root, home, app_data) = fixture();
+        let settings = home.join(".claude/settings.json");
+        let mut document = serde_json::json!({
+            "enabledPlugins": {"demo@official": true},
+            "padding": "",
+        });
+        let overhead = serde_json::to_vec_pretty(&document).unwrap().len() + 1;
+        document["padding"] = Value::String("x".repeat(MAX_SETTINGS_BYTES as usize - overhead));
+        document["enabledPlugins"]["demo@official"] = Value::Bool(false);
+        fs::write(&settings, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        let snapshot = set_claude_plugin_enabled_with_home(
+            &app_data,
+            &home,
+            None,
+            &plugin_request(Some(true)),
+        )
+        .expect("an output exactly at the limit is accepted");
+        assert!(snapshot.scopes.user.parse_error.is_none());
+        assert!(snapshot.plugins[0].effective_enabled);
+        assert_eq!(fs::metadata(&settings).unwrap().len(), MAX_SETTINGS_BYTES);
+        let original = fs::read(&settings).unwrap();
+
+        // false adds one byte to true; the trailing newline is part of the C8-2 limit.
+        assert!(matches!(
+            set_claude_plugin_enabled_with_home(
+                &app_data,
+                &home,
+                None,
+                &plugin_request(Some(false)),
+            ),
+            Err(CoreError::InvalidInput(_))
+        ));
+        assert_eq!(fs::read(&settings).unwrap(), original);
     }
 
     #[test]

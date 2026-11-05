@@ -44,8 +44,8 @@ use crate::resource_repository::{
 };
 use crate::session_management::session_string_enum;
 use crate::skill_meta::{
-    load_skill_meta, record_skill_origin, remove_skill_meta, SkillMetaEntry, SkillMetaStore,
-    SkillOriginMeta,
+    ensure_skill_meta_readable, load_skill_meta, record_skill_origin, remove_skill_meta,
+    SkillMetaEntry, SkillMetaStore, SkillOriginMeta,
 };
 use crate::skill_trash::{
     store_trash_item, SkillTrashItem, SkillTrashItemDraft, SkillTrashItemKind,
@@ -2578,6 +2578,11 @@ fn import_skill_to_common_from_paths(
         )));
     }
 
+    // G7: 출처 기록은 원본을 쓴 뒤에 하므로, 그때 깨진 메타 저장본으로 실패해 원본만
+    // 남는 일이 없게 쓰기 전에 먼저 확인한다.
+    if let Some(app_data_dir) = app_data_dir {
+        ensure_skill_meta_readable(app_data_dir)?;
+    }
     let stage = skill_stage_paths(root, &key)?.stage;
     // 가져오기는 공급자 고유 키를 걷어내지 않는다. 공통 원본은 모든 키를 보존하고
     // 게시할 때 대상 공급자에 맞춰 투영한다.
@@ -5231,6 +5236,38 @@ mod tests {
         assert_eq!(source.key, "db-ops");
         assert!(common_dir(home, "db-ops").join("SKILL.md").is_file());
         assert!(installed.join("SKILL.md").is_file(), "원본 설치본은 남는다");
+    }
+
+    #[test]
+    fn g7_import_with_unparsable_skill_meta_writes_no_common_source() {
+        let home_dir = TempDir::new().expect("home");
+        let data_dir = TempDir::new().expect("data");
+        let home = home_dir.path();
+        let project = home.join("workspace/proj-a");
+        fs::create_dir_all(&project).expect("project dir");
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::json!({ "projects": { project.to_string_lossy(): {} } }).to_string(),
+        )
+        .expect("claude.json");
+        let installed = install_dir(&project, ".claude/skills", "proj-skill");
+        write_skill(&installed, "proj-skill", "Project skill");
+        let meta_path = data_dir.path().join("skill-meta.json");
+        fs::write(&meta_path, b"{broken").expect("corrupt meta");
+
+        import_skill_to_common_from_home(
+            home,
+            Some(data_dir.path()),
+            &ImportCommonSkillRequest {
+                skill_id: installed_skill_id(&installed),
+            },
+        )
+        .expect_err("깨진 메타 저장본이면 가져오기 전에 멈춘다");
+        assert!(
+            !common_dir(home, "proj-skill").exists(),
+            "원본만 남는 반쪽 상태가 생기면 안 된다"
+        );
+        assert_eq!(fs::read(&meta_path).expect("meta"), b"{broken");
     }
 
     #[test]

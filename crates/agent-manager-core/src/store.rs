@@ -710,13 +710,13 @@ pub(crate) use crate::chat_runtime_store::{
     remove_managed_chat_runtime_lease, runtime_failures_for, upsert_managed_chat_runtime_lease,
     ManagedChatRuntimeLease,
 };
-/// 문서 루트의 등록·해제와 보호 경계 판정은 [`crate::doc_roots`]가 맡는다. 호출부가
-/// 쓰던 `store::` 경로를 그대로 두려고 여기서 다시 내보낸다.
-pub(crate) use crate::doc_roots::is_restricted_doc_root;
 pub use crate::doc_roots::{
     add_doc_root, doc_root_paths, ensure_doc_root_agent_enabled, list_doc_roots, remove_doc_root,
     update_doc_root, UpdateDocRootRequest,
 };
+/// 문서 루트의 등록·해제와 보호 경계 판정은 [`crate::doc_roots`]가 맡는다. 호출부가
+/// 쓰던 `store::` 경로를 그대로 두려고 여기서 다시 내보낸다.
+pub(crate) use crate::doc_roots::{is_restricted_doc_root, is_restricted_outside_aia_workspace};
 /// 문서 루트 안의 파일 트리 읽기·쓰기는 [`crate::document_tree`]가 맡는다. 호출부가
 /// 쓰던 `store::` 경로를 그대로 두려고 여기서 다시 내보낸다.
 pub use crate::document_tree::{
@@ -734,8 +734,8 @@ pub use crate::session_folders::{
 /// 세션 보완 저장소는 [`crate::supplement_store`]가 맡는다. 호출부가 쓰던
 /// `store::` 경로를 그대로 두려고 여기서 다시 내보낸다.
 pub(crate) use crate::supplement_store::{
-    captured_turns_by_session, captured_turns_for, persist_captured_turn,
-    persist_captured_turn_if_absent, persist_system_prompt, prune_supplements_for,
+    captured_turn, captured_turns_by_session, captured_turns_for, persist_captured_turn,
+    persist_captured_turns_if_absent, persist_system_prompt, prune_supplements_for,
     supplement_storage_stats, supplement_store_path, CapturedTranscriptTurn, SupplementOrigin,
 };
 

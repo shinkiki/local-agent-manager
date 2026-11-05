@@ -205,6 +205,20 @@ test('대상이 한 번도 돌지 않은 측정은 clean 이 아니라 broken �
   assert.equal(verdict(summary), 'broken');
 });
 
+// 시험 바이너리가 도중에 죽으면(abort·SIGSEGV) 결과 줄도 실패 이름도 없이 0 이 아닌 코드만
+// 남는다. 실패 이름이 없다고 통과로 세면 다른 실행이 통과했을 때 clean 이 나온다.
+test('실패 이름 없이 비정상 종료한 실행은 clean 이 아니라 broken 이다', () => {
+  const crashed = parseCargoTestOutput(
+    'running 2084 tests\n........\nerror: test failed, to rerun pass `-p agent-manager-core --lib`\n\nCaused by:\n  process didn\'t exit successfully (signal: 6, SIGABRT: process abort signal)\n',
+    101,
+  );
+  assert.equal(crashed.buildError, false);
+  const summary = summarizeRuns([parseCargoTestOutput(PASSING, 0), crashed], TARGET);
+  assert.equal(summary.abnormalExitRuns, 1);
+  assert.deepEqual(failureKinds(summary), [{ kind: '원인 모를 비정상 종료', count: 1 }]);
+  assert.equal(verdict(summary), 'broken');
+});
+
 test('실패 종류 전후 비교가 사라진 종류와 새로 생긴 종류를 가른다', () => {
   const before = [
     { kind: '대상 시험 실패', count: 2 },

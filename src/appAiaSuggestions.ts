@@ -148,7 +148,13 @@ function useAiaRuntimeAnalysis({ aiaProviderId, aiaOpen, popoutRequest, snapshot
       aiaEventBudgetStore.save(nextBudget);
       aiaAnalysisRunningRef.current = true;
       void analyzeAiaEvent(aiaEventSummaryLine(event))
-        .then((analysis) => setAiaAnalysisSuggestion({ event, suggestion: runtimeAnalysisSuggestion(event, analysis) }))
+        .then((analysis) => {
+          // 분석을 기다리는 동안 해소된 사건을 늦은 응답으로 다시 띄우지 않는다(V4).
+          const baseline = aiaEventBaselineRef.current;
+          if (baseline && aiaEventStillActive(event, baseline)) {
+            setAiaAnalysisSuggestion({ event, suggestion: runtimeAnalysisSuggestion(event, analysis) });
+          }
+        })
         .catch(() => undefined)
         .finally(() => { aiaAnalysisRunningRef.current = false; });
     }, waitMs || 1);

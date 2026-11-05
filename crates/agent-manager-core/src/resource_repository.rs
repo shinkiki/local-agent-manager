@@ -354,11 +354,11 @@ fn walk_merge(source: &Path, destination: &Path, walk: MergeWalk) -> Result<(), 
     match walk {
         MergeWalk::Validate => {
             ensure_directory(&source_metadata, &source_rejection)?;
-            if !destination.exists() {
-                // 대상이 없으면 충돌할 상대도 없다. 아래 항목의 심볼릭 링크는 Apply가 거른다.
-                return Ok(());
-            }
-            if !fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.is_dir()) {
+            // G10 / C3-8: 새 대상 아래도 원본 링크를 먼저 검사해야 다른 리소스를
+            // 복사한 뒤에야 거부하는 부분 이전을 막는다.
+            if destination.exists()
+                && !fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.is_dir())
+            {
                 return Err(CoreError::Conflict(format!(
                     "새 저장소 경로 유형이 다릅니다: {}",
                     destination.display()
@@ -872,6 +872,89 @@ mod tests {
                 "# review\n"
             );
             assert_eq!(fs::read_dir(&outside).expect("outside contents").count(), 0);
+        }
+    }
+
+    /// G10 / C3-8: 새 대상의 더 깊은 원본 링크도 전체 복사 전에 거부한다.
+    #[cfg(unix)]
+    #[test]
+    fn g10_c3_8_migration_preflight_rejects_nested_links_before_copying_any_resource() {
+        for existing_target in [false, true] {
+            for link_kind in ["file", "directory", "dangling"] {
+                let temp = tempfile::tempdir().expect("temp");
+                let app_data = temp.path().join("app-data");
+                let previous = prepare_repository_root(&default_repository_root(&app_data))
+                    .expect("previous repository");
+                let skill = previous.join("skills/review");
+                let policy = previous.join("instructions/policy");
+                fs::create_dir(&skill).expect("skill");
+                fs::write(skill.join("SKILL.md"), "# review\n").expect("skill source");
+                fs::create_dir_all(policy.join("nested")).expect("policy");
+                fs::write(policy.join("AGENTS.md"), "# policy\n").expect("policy source");
+                let outside = temp.path().join("outside");
+                match link_kind {
+                    "file" => fs::write(&outside, "outside\n").expect("outside file"),
+                    "directory" => fs::create_dir(&outside).expect("outside directory"),
+                    _ => {}
+                }
+                let link = policy.join("nested/link");
+                std::os::unix::fs::symlink(&outside, &link).expect("source link");
+                let custom = temp.path().join("custom");
+                let target_policy = custom.join("instructions/policy");
+                if existing_target {
+                    fs::create_dir_all(&target_policy).expect("existing target");
+                    fs::write(target_policy.join("keep.md"), "keep\n").expect("target file");
+                }
+
+                assert!(matches!(
+                    set_resource_repository(
+                        &app_data,
+                        &SetResourceRepositoryRequest {
+                            root_path: Some(custom.to_string_lossy().into_owned()),
+                            migrate_existing: true,
+                        },
+                    ),
+                    Err(CoreError::InvalidInput(_))
+                ));
+                assert_eq!(
+                    fs::read_dir(custom.join("skills"))
+                        .expect("skills target")
+                        .count(),
+                    0,
+                    "failed preflight must not copy earlier skills: {existing_target}/{link_kind}"
+                );
+                if existing_target {
+                    assert_eq!(
+                        fs::read_to_string(target_policy.join("keep.md")).unwrap(),
+                        "keep\n"
+                    );
+                    assert_eq!(fs::read_dir(&target_policy).unwrap().count(), 1);
+                } else {
+                    assert!(!target_policy.exists());
+                }
+                assert!(!settings_path(&app_data).exists());
+                assert_eq!(
+                    fs::canonicalize(repository_root(&app_data)).expect("repository root"),
+                    previous
+                );
+                assert_eq!(
+                    fs::read_to_string(skill.join("SKILL.md")).unwrap(),
+                    "# review\n"
+                );
+                assert_eq!(
+                    fs::read_to_string(policy.join("AGENTS.md")).unwrap(),
+                    "# policy\n"
+                );
+                assert_eq!(
+                    fs::read_link(&link).expect("source link unchanged"),
+                    outside
+                );
+                match link_kind {
+                    "file" => assert_eq!(fs::read_to_string(&outside).unwrap(), "outside\n"),
+                    "directory" => assert_eq!(fs::read_dir(&outside).unwrap().count(), 0),
+                    _ => assert!(!outside.exists()),
+                }
+            }
         }
     }
 

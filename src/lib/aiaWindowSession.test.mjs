@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { enableAiaWindowSessions, forgetAiaWindowSession, ownedAiaWindowChatId, rememberAiaWindowSession, selectAiaWindowSession } from "./aiaWindowSession.ts";
+import { enableAiaWindowSessions, enableAiaWindowSessionsQuietly, forgetAiaWindowSession, ownedAiaWindowChatId, rememberAiaWindowSession, selectAiaWindowSession } from "./aiaWindowSession.ts";
 
 function storage() {
   const values = new Map();
@@ -70,4 +70,25 @@ test("저장소가 막히면 소유를 주장하지 않는다", () => {
   assert.equal(ownedAiaWindowChatId(null, { shared: blocked, local: blocked }), null);
   // 저장소 자체가 없는 실행(node)에서도 기본 인자가 던지지 않는다.
   assert.equal(ownedAiaWindowChatId(null), null);
+});
+
+test("팝아웃을 여는 자리의 플래그 켜기는 저장소가 던져도 창 열기를 막지 않는다", () => {
+  // 쿠키 전면 차단 브라우저 — 저장소가 접근만으로 던진다. 플래그는 힌트이고 창 열기가 본업이다.
+  const blocked = { getItem: () => { throw new Error("blocked"); }, setItem: () => { throw new Error("blocked"); }, removeItem: () => {} };
+  assert.doesNotThrow(() => enableAiaWindowSessionsQuietly({ shared: blocked, local: blocked }));
+  // 저장소 자체가 없는 실행(node)에서도 기본 인자가 던지지 않는다.
+  assert.doesNotThrow(() => enableAiaWindowSessionsQuietly());
+  // 실제 결함 모양 — `window.localStorage`는 **닿기만 해도** 던진다. 기본 인자가 그 접근을 안에서 해야
+  // 호출부가 `window.localStorage`를 인자로 적던 때로 되돌아가면 이 단언이 잡는다.
+  globalThis.window = { get localStorage() { throw new Error("SecurityError: storage blocked"); }, get sessionStorage() { throw new Error("SecurityError: storage blocked"); } };
+  try {
+    assert.doesNotThrow(() => enableAiaWindowSessionsQuietly());
+  } finally {
+    delete globalThis.window;
+  }
+  // 정상 저장소에서는 구버전 복원 갈래가 닫힌다 — 조용히 넘기는 것이 플래그를 빠뜨리는 것은 아니다.
+  const shared = storage(), local = storage();
+  assert.equal(selectAiaWindowSession(chats, shared, local, null)?.chatId, "two");
+  enableAiaWindowSessionsQuietly({ shared, local });
+  assert.equal(selectAiaWindowSession(chats, shared, local, null), null);
 });

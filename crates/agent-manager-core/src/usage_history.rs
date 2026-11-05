@@ -103,7 +103,7 @@ impl Default for HistoryStore {
 impl UsageCycleRecord {
     /// 관측된 초기화 시각이 이 레코드의 허용 오차 내 같은 주기를 가리키는지 확인한다.
     fn matches_cycle(&self, window_label: &str, resets_at: i64, tolerance: i64) -> bool {
-        self.window_label == window_label && (self.resets_at - resets_at).abs() <= tolerance
+        self.window_label == window_label && self.resets_at.abs_diff(resets_at) <= tolerance as u64
     }
 
     /// 동일 주기의 새 관측값으로 최대 소진율과 관측 시각을 갱신한다.
@@ -398,6 +398,69 @@ mod tests {
         assert_eq!(series.cycles[0].first_observed_at, reset - 6 * DAY);
         assert_eq!(series.cycles[0].last_observed_at, reset - 2 * DAY);
         assert_eq!(series.cycles[1].peak_used_percent, 10.0);
+    }
+
+    #[test]
+    fn g7_v2_distant_reset_times_stay_separate_without_overflow() {
+        for (first, second) in [
+            (i64::MIN, i64::MAX),
+            (i64::MAX, i64::MIN),
+            (i64::MIN, 0),
+            (0, i64::MIN),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            record_usage(dir.path(), "a", &usage(vec![("7일", 20.0, Some(first))], 1));
+            // 두 번째 관측은 디스크에서 첫 주기를 다시 읽어 비교한다.
+            record_usage(
+                dir.path(),
+                "a",
+                &usage(vec![("7일", 80.0, Some(second))], 2),
+            );
+            let history = snapshot(dir.path(), &["a".to_owned()]).expect("snapshot");
+            let cycles = &history.accounts[0].cycles;
+            assert_eq!(cycles.len(), 2, "distant resets: {first}, {second}");
+            assert!(cycles[0].resets_at < cycles[1].resets_at);
+            for (reset, peak, at) in [(first, 20.0, 1), (second, 80.0, 2)] {
+                let cycle = cycles
+                    .iter()
+                    .find(|cycle| cycle.resets_at == reset)
+                    .unwrap();
+                assert_eq!(cycle.peak_used_percent, peak);
+                assert_eq!(cycle.first_observed_at, at);
+                assert_eq!(cycle.last_observed_at, at);
+            }
+        }
+    }
+
+    #[test]
+    fn v2_cycle_matching_preserves_tolerance_boundaries() {
+        let tolerance = SAME_CYCLE_TOLERANCE_MS;
+        for (first, second, expected_count) in [
+            (0, tolerance, 1),
+            (tolerance, 0, 1),
+            (0, tolerance + 1, 2),
+            (tolerance + 1, 0, 2),
+            (i64::MIN, i64::MIN, 1),
+            (i64::MAX, i64::MAX, 1),
+            (i64::MIN, i64::MIN + tolerance, 1),
+            (i64::MAX, i64::MAX - tolerance, 1),
+        ] {
+            let mut store = HistoryStore::default();
+            apply(&mut store, "a", &usage(vec![("7일", 20.0, Some(first))], 1));
+            apply(
+                &mut store,
+                "a",
+                &usage(vec![("7일", 80.0, Some(second))], 2),
+            );
+            let cycles = &store.accounts["a"].cycles;
+            assert_eq!(cycles.len(), expected_count, "resets: {first}, {second}");
+            if expected_count == 1 {
+                assert_eq!(cycles[0].resets_at, second);
+                assert_eq!(cycles[0].peak_used_percent, 80.0);
+                assert_eq!(cycles[0].first_observed_at, 1);
+                assert_eq!(cycles[0].last_observed_at, 2);
+            }
+        }
     }
 
     #[test]

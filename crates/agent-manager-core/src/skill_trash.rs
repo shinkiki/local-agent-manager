@@ -460,6 +460,87 @@ mod tests {
         );
     }
 
+    // C3-12/C3-13: manifest-only recovery must retain both a conflicting link and its source.
+    #[cfg(unix)]
+    #[test]
+    fn c3_12_c3_13_manifest_only_link_restore_preserves_collisions_and_target() {
+        let temp = tempdir().expect("temporary directory");
+        let app_data = temp.path().join("app-data");
+        let source = temp.path().join("shared");
+        fs::create_dir(&source).expect("shared skill");
+        fs::write(source.join("SKILL.md"), b"shared payload").expect("shared content");
+        let install_root = temp.path().join("skills");
+        fs::create_dir(&install_root).expect("install root");
+        let link = install_root.join("linked");
+        let target = Path::new("../shared");
+        std::os::unix::fs::symlink(target, &link).expect("installed link");
+        let item = store_trash_item(
+            &app_data,
+            &link,
+            SkillTrashItemDraft {
+                group_id: "group".to_owned(),
+                key: "linked".to_owned(),
+                kind: SkillTrashItemKind::Link,
+                link_target: Some(target.to_string_lossy().into_owned()),
+                provider: Some(ProviderId::Claude),
+                scope: None,
+                shared: true,
+                deleted_by: "test".to_owned(),
+                content_digest: None,
+                file_count: 0,
+                total_bytes: 0,
+                name: "linked".to_owned(),
+                description: String::new(),
+            },
+        )
+        .expect("store link");
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert_eq!(
+            fs::read(source.join("SKILL.md")).unwrap(),
+            b"shared payload"
+        );
+
+        // Model the supported fallback where only the manifest retained the link target.
+        let (entry_dir, content) = trash_store::entry_paths(&trash_root(&app_data), &item.id);
+        assert_eq!(fs::read_link(&content).unwrap(), target);
+        fs::remove_file(&content).expect("manifest-only entry");
+        let conflict_target = Path::new("../missing");
+        std::os::unix::fs::symlink(conflict_target, &link).expect("dangling conflict");
+        assert!(!link.exists(), "the conflicting link is dangling");
+
+        let skipped = restore_skill_trash(&app_data, &item.id).expect("restore with conflict");
+        assert_eq!(skipped.results.len(), 1);
+        assert_eq!(
+            skipped.results[0].outcome,
+            SkillTrashRestoreOutcome::Skipped
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), conflict_target);
+        assert_eq!(
+            list_skill_trash(&app_data).unwrap().items,
+            vec![item.clone()]
+        );
+        assert_eq!(
+            fs::read(source.join("SKILL.md")).unwrap(),
+            b"shared payload"
+        );
+
+        fs::remove_file(&link).expect("clear conflicting link");
+        let restored = restore_skill_trash(&app_data, &item.id).expect("retry restore");
+        assert_eq!(restored.results.len(), 1);
+        assert_eq!(
+            restored.results[0].outcome,
+            SkillTrashRestoreOutcome::Restored
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert_eq!(fs::read(link.join("SKILL.md")).unwrap(), b"shared payload");
+        assert_eq!(
+            fs::read(source.join("SKILL.md")).unwrap(),
+            b"shared payload"
+        );
+        assert!(!entry_dir.exists());
+        assert!(list_skill_trash(&app_data).unwrap().items.is_empty());
+    }
+
     #[test]
     fn skill_trash_lifecycle_and_restore() {
         let temp = tempdir().expect("임시 디렉터리 생성");

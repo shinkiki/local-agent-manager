@@ -11,8 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -932,10 +931,9 @@ fn validate_password(password: &str) -> Result<(), CoreError> {
 }
 
 fn hash_password(password: &str) -> Result<String, CoreError> {
-    use rand_core::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
+    // argon2 0.6부터 PasswordHasher::hash_password가 OS 난수로 16바이트 소금을 직접 만든다(C20-2).
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|hash| hash.to_string())
         .map_err(|error| CoreError::Runtime(format!("비밀번호를 해시하지 못했습니다: {error}")))
 }
@@ -1033,6 +1031,35 @@ mod tests {
         assert!(!directory.path().join(LOGIN_SETTINGS_FILE_NAME).exists());
         let view = auth.settings_view().expect("view");
         assert!(!view.password_configured && !view.otp_configured);
+    }
+
+    /// argon2 0.5가 쓴 PHC 문자열(설정 파일에 이미 저장된 해시)이 0.6으로 올린 뒤에도 그대로
+    /// 검증된다. 참조 구현의 공개 시험 벡터(비밀번호 `password`, 소금 `somesalt`)를 고정값으로 쓴다.
+    #[test]
+    fn stored_phc_hash_from_previous_argon2_still_verifies() {
+        let stored =
+            "$argon2id$v=19$m=256,t=2,p=1$c29tZXNhbHQ$nf65EOgLrQMR/uIPnA4rEsF5h7TKyQwu9U1bMCHGi/4";
+        assert!(verify_password_hash(stored, "password"));
+        assert!(!verify_password_hash(stored, "Password"));
+        assert!(!verify_password_hash("not a phc string", "password"));
+    }
+
+    /// 새 해시는 기본 매개변수(m=19456, t=2, p=1)와 16바이트 소금을 유지하고 호출마다 소금이 다르다.
+    #[test]
+    fn fresh_hash_keeps_default_params_and_random_salt() {
+        let first = hash_password("correct horse battery").expect("hash");
+        let second = hash_password("correct horse battery").expect("hash");
+        assert!(
+            first.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+            "{first}"
+        );
+        assert_ne!(first, second);
+        let salt = PasswordHash::new(&first)
+            .expect("parse")
+            .salt
+            .expect("salt");
+        assert_eq!(salt.len(), 16, "소금은 복호화한 바이트 수로 16이어야 한다");
+        assert!(verify_password_hash(&first, "correct horse battery"));
     }
 
     #[test]

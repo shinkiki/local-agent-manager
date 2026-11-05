@@ -525,12 +525,18 @@ fn excerpt(text: &str, needle: &str) -> String {
 
 /// Captured replies can change independently of the provider transcript. Each
 /// session's own supplements go into its version, so one active chat does not
-/// invalidate the rest; the turn identity, time and length change whenever a reply is
-/// added or replaced.
+/// invalidate the rest. G7: replacements can keep the same timestamp and byte length,
+/// and changing the origin to `SystemPrompt` removes the reply from searchable text.
 fn supplement_digest(turns: &[CapturedTranscriptTurn]) -> String {
     let mut hasher = DefaultHasher::new();
     for turn in turns {
-        (&turn.turn_id, turn.completed_at, turn.text.len()).hash(&mut hasher);
+        (
+            &turn.turn_id,
+            turn.completed_at,
+            &turn.text,
+            std::mem::discriminant(&turn.origin),
+        )
+            .hash(&mut hasher);
     }
     format!("{:016x}", hasher.finish())
 }
@@ -1079,6 +1085,66 @@ mod tests {
             )
             .expect("count");
         assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn g7_search_reindexes_replaced_supplement_text_and_origin() {
+        let app = tempfile::tempdir().expect("app data");
+        let home = tempfile::tempdir().expect("home");
+        let session = claude_session(home.path(), "search-session-replaced", &[]);
+        let sessions = [session];
+        let save = |text: &str, origin, revision| {
+            crate::store::persist_captured_turn(
+                app.path(),
+                ProviderId::Claude,
+                &sessions[0].id,
+                "turn-replaced-0001",
+                1,
+                text.to_owned(),
+                origin,
+            )
+            .expect("save supplement");
+            // Make the outer file stamp distinct even on a coarse-resolution filesystem;
+            // this test targets the per-session digest, not file-stamp granularity.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(crate::store::supplement_store_path(app.path()))
+                .expect("supplement file")
+                .set_modified(UNIX_EPOCH + Duration::from_secs(revision))
+                .expect("set store timestamp");
+        };
+        let old = "before reply";
+        let new = "latest reply";
+        assert_eq!(old.len(), new.len());
+        save(old, crate::store::SupplementOrigin::Chat, 1);
+        assert_eq!(
+            ask(app.path(), home.path(), &sessions, old).matches.len(),
+            1
+        );
+        // Warm the memo as well as the persisted index before replacing the reply.
+        assert_eq!(
+            ask(app.path(), home.path(), &sessions, old).matches.len(),
+            1
+        );
+
+        save(new, crate::store::SupplementOrigin::Chat, 2);
+        assert!(ask(app.path(), home.path(), &sessions, old)
+            .matches
+            .is_empty());
+        let found = ask(app.path(), home.path(), &sessions, new);
+        assert_eq!(found.matches.len(), 1, "{found:?}");
+        assert!(found.matches[0].snippet.contains(new));
+
+        // System instructions are markers, not conversation text to index (G7).
+        save(new, crate::store::SupplementOrigin::SystemPrompt, 3);
+        assert!(ask(app.path(), home.path(), &sessions, new)
+            .matches
+            .is_empty());
+        save(new, crate::store::SupplementOrigin::Chat, 4);
+        assert_eq!(
+            ask(app.path(), home.path(), &sessions, new).matches.len(),
+            1
+        );
     }
 
     #[test]

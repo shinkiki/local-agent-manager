@@ -108,3 +108,37 @@ test("managerSnapshotSyncWithDefaults는 전체 및 증분 동기화에 공통 �
   assert.deepEqual(deltaSync.removedSessions, [{ source: "claude", id: "s3" }]);
 });
 
+// V4: 인계 표시는 스냅샷의 메타를 읽는다. 빈 기본값만 검사하면 실제 인계 기록을
+// 버리는 회귀가 통과하므로, 최초 조회·전체 재동기화·변경분과 최근 목록을 함께 고정한다.
+for (const kind of ["snapshot", "full", "delta"]) {
+  test(`V4: ${kind} 응답은 인계 출처와 대상 순서를 세션·최근 목록에 보존한다`, () => {
+    const meta = {
+      handoffOrigin: { source: "claude", id: "original" },
+      handoffTargets: [
+        { source: "antigravity", id: "target-1" },
+        { source: "local", id: "target-2" },
+      ],
+    };
+    const session = { source: "codex", id: "handed-off", meta };
+    const listKey = kind === "delta" ? "changedSessions" : "sessions";
+    const input = {
+      ...(kind === "snapshot" ? {} : { kind }),
+      [listKey]: [session],
+      dashboard: {
+        sessionsBySource: {}, tokens: {}, disk: {}, weekly: [], recent: [session],
+      },
+    };
+    const original = structuredClone(input);
+    const result = kind === "snapshot"
+      ? managerSnapshotWithDefaults(input)
+      : managerSnapshotSyncWithDefaults(input);
+
+    for (const item of [result[listKey][0], result.dashboard.recent[0]]) {
+      assert.deepEqual(item.meta.handoffOrigin, meta.handoffOrigin);
+      assert.deepEqual(item.meta.handoffTargets, meta.handoffTargets);
+      assert.equal(item.meta.favorite, false, "기본값도 같은 응답에서 채워진다");
+    }
+    assert.deepEqual(input, original, "수신한 원본 스냅샷을 수정하지 않는다");
+  });
+}
+

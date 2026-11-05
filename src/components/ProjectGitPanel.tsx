@@ -57,6 +57,7 @@ import { EmptyState, ErrorBanner, LoadingState, Modal, NoticeBanner, useBusyActi
 import { MarkdownPreview } from "./MarkdownPreview";
 import { useRequestGeneration } from "./DocumentTreePane";
 import { GitDiffModal } from "./GitDiffModal";
+import { readProjectViewPref, writeProjectViewPref } from "../lib/projectViewPrefs";
 
 /**
  * 프로젝트 화면의 형상관리 탭(C16). 부모가 활성 등록 프로젝트를 골라 `projectPath`로 넘기고,
@@ -1303,25 +1304,11 @@ function BranchComparisonSection({ repository, git }: { repository: GitRepositor
 const COMPARISON_OPEN_KEY = "agent-manager.git-comparison-open.v1";
 
 function readComparisonOpen(projectPath: string): boolean {
-  if (typeof window === "undefined") return false;
-  try {
-    const parsed: unknown = JSON.parse(window.localStorage.getItem(COMPARISON_OPEN_KEY) ?? "{}");
-    return parsed !== null && typeof parsed === "object" && (parsed as Record<string, unknown>)[projectPath] === true;
-  } catch {
-    return false;
-  }
+  return readProjectViewPref(COMPARISON_OPEN_KEY, projectPath) === true;
 }
 
 function writeComparisonOpen(projectPath: string, open: boolean): void {
-  try {
-    const parsed: unknown = JSON.parse(window.localStorage.getItem(COMPARISON_OPEN_KEY) ?? "{}");
-    const all = parsed !== null && typeof parsed === "object" ? { ...(parsed as Record<string, unknown>) } : {};
-    if (open) all[projectPath] = true;
-    else delete all[projectPath];
-    window.localStorage.setItem(COMPARISON_OPEN_KEY, JSON.stringify(all));
-  } catch {
-    // 저장소를 쓸 수 없어도 이번 실행의 펼침은 그대로 둔다.
-  }
+  writeProjectViewPref(COMPARISON_OPEN_KEY, projectPath, open ? true : undefined);
 }
 
 /** 경로를 폴더(흐리게)와 파일 이름(진하게)으로 가른다. 긴 경로에서 이름이 먼저 읽히게 한다. */
@@ -1421,27 +1408,12 @@ interface BranchContextMenuState {
 const BRANCH_FOLDERS_KEY = "agent-manager.git-branch-folders.v1";
 
 function readExpandedBranchFolders(projectPath: string): string[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const parsed: unknown = JSON.parse(window.localStorage.getItem(BRANCH_FOLDERS_KEY) ?? "{}");
-    if (parsed === null || typeof parsed !== "object") return [];
-    const stored = (parsed as Record<string, unknown>)[projectPath];
-    return Array.isArray(stored) ? stored.filter((path): path is string => typeof path === "string") : [];
-  } catch {
-    return [];
-  }
+  const stored = readProjectViewPref(BRANCH_FOLDERS_KEY, projectPath);
+  return Array.isArray(stored) ? stored.filter((path): path is string => typeof path === "string") : [];
 }
 
 function writeExpandedBranchFolders(projectPath: string, paths: string[]): void {
-  try {
-    const parsed: unknown = JSON.parse(window.localStorage.getItem(BRANCH_FOLDERS_KEY) ?? "{}");
-    const all = parsed !== null && typeof parsed === "object" ? { ...(parsed as Record<string, unknown>) } : {};
-    if (paths.length === 0) delete all[projectPath];
-    else all[projectPath] = paths;
-    window.localStorage.setItem(BRANCH_FOLDERS_KEY, JSON.stringify(all));
-  } catch {
-    // 저장소를 쓸 수 없어도 이번 실행의 펼침은 그대로 둔다.
-  }
+  writeProjectViewPref(BRANCH_FOLDERS_KEY, projectPath, paths.length === 0 ? undefined : paths);
 }
 
 function BranchesSection({ repository, locked, confirm, git }: {

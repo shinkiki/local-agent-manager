@@ -2,11 +2,6 @@ import type { ChatAttentionItem, ChatAttentionSnapshot } from "../types";
 import { clampPreviewText } from "./aiaPreviewText.ts";
 import { recountAttention } from "./chatAttention.ts";
 
-/** AIA 프로필 알림 항목인지 여부. */
-function isAiaAttention(item: ChatAttentionItem): boolean {
-  return item.profile === "aia";
-}
-
 /**
  * AIA 창이 가져갈 알림인지 — 프로필이 AIA이고 **이 창이 소유한 대화**의 것인지.
  *
@@ -17,7 +12,7 @@ function isAiaAttention(item: ChatAttentionItem): boolean {
  * 알림 목록에 그대로 남아 세션 화면으로 열린다(`appChatAttention`의 `openAttentionItem`).
  */
 function isOwnAiaAttention(item: ChatAttentionItem, ownedChatId: string | null): boolean {
-  return isAiaAttention(item) && ownedChatId !== null && item.chatId === ownedChatId;
+  return item.profile === "aia" && ownedChatId !== null && item.chatId === ownedChatId;
 }
 
 /** 대화 턴이 완료되었거나 실패하여 종료된 상태인지 여부. */
@@ -44,7 +39,7 @@ export function withoutAiaAttention(snapshot: ChatAttentionSnapshot, ownedChatId
  * 그래서 대화를 버릴 때 그 대화의 알림도 함께 걷는다.
  */
 export function aiaAttentionForChat(items: ChatAttentionItem[], chatId: string): ChatAttentionItem[] {
-  return items.filter((item) => isAiaAttention(item) && item.chatId === chatId);
+  return items.filter((item) => isOwnAiaAttention(item, chatId));
 }
 
 export function selectAiaAttention(items: ChatAttentionItem[], ownedChatId: string | null): ChatAttentionItem | null {

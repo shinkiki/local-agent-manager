@@ -201,8 +201,8 @@ pub(crate) fn build_project_registry(
 /// 않는다. 설정·메모리 파일 수정만으로 모든 AIA 세션이 그 프로젝트에 묶이면 필터가
 /// 쓸모없어진다.
 ///
-/// 스냅샷을 다시 짤 때마다 돈다. 후보는 먼저 프로젝트 경로 문자열과 견주고, 문자열로 맞는
-/// 프로젝트가 없을 때만 정규화(파일시스템 조회)한다.
+/// 스냅샷을 다시 짤 때마다 돈다. 존재하는 후보는 정규 경로로 판정해 심볼릭 링크의
+/// 실제 대상을 따른다. 정규화할 수 없는 옛 경로만 프로젝트 경로 문자열과 견준다.
 pub(crate) fn apply_related_projects(
     sessions: &mut [SessionSummary],
     registry: &[ProjectRegistryEntry],
@@ -294,15 +294,18 @@ pub(crate) fn apply_related_projects(
                             .any(|alias| path_is_within(candidate, alias))
                 })
                 .filter(|root| !nests.contains(*root));
-            let root = match by_text {
-                Some(root) => root,
-                None => {
-                    let key = resolver.resolve_key(candidate);
-                    let Some(root) = roots.iter().find(|root| key.starts_with(root)) else {
-                        continue;
-                    };
-                    root
-                }
+            // G10: 문자열상 프로젝트 안쪽이어도 심볼릭 링크의 대상은 다른 곳일 수 있다.
+            // 정규화 성공 시 그 결과만 믿고, 사라진 경로의 기존 별칭 판정은 유지한다.
+            let root = match resolver.canonical(candidate) {
+                Some(key) => roots.iter().find(|root| key.starts_with(root)),
+                None => by_text.or_else(|| {
+                    roots
+                        .iter()
+                        .find(|root| Path::new(candidate).starts_with(root))
+                }),
+            };
+            let Some(root) = root else {
+                continue;
             };
             let unrelated = match own.as_deref() {
                 Some(own) if explicit => own == root.as_path(),
@@ -592,6 +595,65 @@ mod tests {
         ];
         relate(&mut sessions, &[], &fx.home);
         assert_eq!(sessions[0].related_projects, vec![text(&sub)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_related_projects_follow_the_symlink_target() {
+        let fx = related_fixture();
+        let link = fx.app.join("tools-link");
+        std::os::unix::fs::symlink(&fx.tools, &link).expect("symlink");
+        for explicit in [false, true] {
+            let mut aia = session("aia", ProviderId::Claude, Some(&fx.aia), false, None);
+            aia.aia_workspace = true;
+            if explicit {
+                aia.meta.linked_project_paths = vec![text(&link)];
+            } else {
+                aia.written_dirs = vec![text(&link)];
+            }
+            let mut sessions = vec![
+                aia,
+                session("app", ProviderId::Claude, Some(&fx.app), false, None),
+                session("tools", ProviderId::Codex, Some(&fx.tools), false, None),
+            ];
+            relate(&mut sessions, &[], &fx.home);
+            assert_eq!(sessions[0].related_projects, vec![text(&fx.tools)]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_related_projects_do_not_reassign_an_inactive_symlink_target() {
+        let fx = related_fixture();
+        let link = fx.app.join("off-link");
+        std::os::unix::fs::symlink(&fx.off, &link).expect("symlink");
+        let mut aia = session("aia", ProviderId::Claude, Some(&fx.aia), false, None);
+        aia.aia_workspace = true;
+        aia.written_dirs = vec![text(&link)];
+        let mut sessions = vec![
+            aia,
+            session("app", ProviderId::Claude, Some(&fx.app), false, None),
+            session("off", ProviderId::Codex, Some(&fx.off), false, None),
+        ];
+        relate(&mut sessions, &[&fx.off], &fx.home);
+        assert!(sessions[0].related_projects.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_related_projects_keep_missing_paths_under_a_known_alias() {
+        let fx = related_fixture();
+        let alias = fx.home.join("tools-alias");
+        std::os::unix::fs::symlink(&fx.tools, &alias).expect("symlink");
+        let mut aia = session("aia", ProviderId::Claude, Some(&fx.aia), false, None);
+        aia.aia_workspace = true;
+        aia.written_dirs = vec![text(&alias.join("removed"))];
+        let mut sessions = vec![
+            aia,
+            session("tools", ProviderId::Codex, Some(&alias), false, None),
+        ];
+        relate(&mut sessions, &[], &fx.home);
+        assert_eq!(sessions[0].related_projects, vec![text(&alias)]);
     }
 
     #[test]
