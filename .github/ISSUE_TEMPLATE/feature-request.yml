@@ -1,0 +1,31 @@
+name: Feature request / 기능 요청
+description: Suggest something that would make Agent Manager more useful in your workflow. / 작업 흐름에 도움이 될 기능을 제안해 주세요.
+title: "[Request] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: situation
+    attributes:
+      label: What are you trying to get done? / 어떤 일을 하려고 하나요?
+      description: Describe the situation rather than the solution first. / 해결책보다 상황을 먼저 적어 주세요.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: How do you handle it today? / 지금은 어떻게 하고 있나요?
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help? / 어떤 기능이 있으면 좋을까요?
+    validations:
+      required: true
+  - type: checkboxes
+    id: agents
+    attributes:
+      label: Agents you use / 사용 중인 에이전트
+      options:
+        - label: Claude Code
+        - label: OpenAI Codex
+        - label: Google Antigravity
+        - label: Local LLM / 로컬 LLM

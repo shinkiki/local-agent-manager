@@ -1,0 +1,83 @@
+name: Install or first-use problem / 설치·첫 사용 문제
+description: Something blocked you between download and continuing a session, or did not work as expected. / 내려받기부터 세션 이어가기까지 막혔거나 예상과 다르게 동작했어요.
+title: "[Problem] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying Agent Manager. Short answers are fine.
+        Please remove tokens, account emails, personal paths, and private conversation text before posting.
+
+        Agent Manager를 써 봐 주셔서 고맙습니다. 짧게 적어 주셔도 됩니다.
+        올리기 전에 토큰·계정 이메일·개인 경로·비공개 대화 내용은 지워 주세요.
+  - type: dropdown
+    id: category
+    attributes:
+      label: Where did it happen? / 어느 단계였나요?
+      options:
+        - Install or launch / 설치·실행
+        - CLI connection or sign-in / CLI 연결·로그인
+        - Finding or reading sessions / 세션 찾기·읽기
+        - Continuing a session or chatting / 세션 이어가기·채팅
+        - Recurring requests / 반복 요청
+        - Remote access / 원격 접속
+        - Hard to use or confusing / 쓰기 어렵거나 헷갈림
+        - Something else / 기타
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system / 운영체제
+      options:
+        - macOS (Apple Silicon)
+        - Windows x64
+        - Other / 기타
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version / OS 버전
+      placeholder: "macOS 15.5, Windows 11 24H2"
+  - type: input
+    id: app-version
+    attributes:
+      label: Agent Manager version / 앱 버전
+      description: Shown in the app's settings, or the file name you downloaded. / 앱 설정이나 내려받은 파일 이름에 있습니다.
+      placeholder: "0.5.0"
+    validations:
+      required: true
+  - type: checkboxes
+    id: agents
+    attributes:
+      label: Agents you use / 사용 중인 에이전트
+      options:
+        - label: Claude Code
+        - label: OpenAI Codex
+        - label: Google Antigravity
+        - label: Local LLM (Ollama, OpenCode, ...) / 로컬 LLM
+  - type: textarea
+    id: goal
+    attributes:
+      label: What were you trying to do? / 무엇을 하려고 했나요?
+      placeholder: "Find yesterday's Codex session in my api project and continue it. / 어제 api 프로젝트에서 쓰던 Codex 세션을 찾아 이어가려고 했어요."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect? / 어떻게 될 거라 기대했나요?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened, and at which step did you get stuck? / 실제로는 어떻게 됐고 어느 단계에서 막혔나요?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshot or error message (optional) / 화면이나 오류 메시지(선택)
+      description: Remove sensitive information first. / 민감한 정보는 먼저 지워 주세요.

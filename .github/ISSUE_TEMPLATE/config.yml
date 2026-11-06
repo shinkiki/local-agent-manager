@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security issue / 보안 문제
+    url: https://github.com/shinkiki/local-agent-manager/blob/main/.github/SECURITY.md
+    about: Report vulnerabilities privately, not in a public issue. / 취약점은 공개 이슈가 아니라 비공개로 제보해 주세요.
+  - name: Getting started and troubleshooting / 시작하기와 문제 해결
+    url: https://github.com/shinkiki/local-agent-manager/blob/main/docs/getting-started.md
+    about: Check the common install, CLI, and session issues first. / 설치·CLI·세션 문제의 흔한 원인을 먼저 확인해 보세요.

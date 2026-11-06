@@ -1,0 +1,44 @@
+name: First-week feedback / 첫 주 사용 후기
+description: Three short questions after you have used Agent Manager for about a week. / 일주일쯤 써 보신 뒤 짧은 질문 세 개에 답해 주세요.
+title: "[Feedback] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Honest answers, including "I stopped using it", are the most useful.
+        "더 이상 안 쓰게 됐다"는 답도 그대로 적어 주시면 가장 도움이 됩니다.
+  - type: input
+    id: app-version
+    attributes:
+      label: Agent Manager version and OS / 앱 버전과 운영체제
+      placeholder: "0.5.0, macOS 15.5"
+    validations:
+      required: true
+  - type: textarea
+    id: stuck
+    attributes:
+      label: After installing, where did you get stuck while finding your existing sessions? / 설치한 뒤 기존 세션을 찾는 과정에서 어디서 막혔나요?
+      placeholder: "Nowhere / 막힌 곳 없음 — or the step and what you saw / 또는 막힌 단계와 보인 화면"
+    validations:
+      required: true
+  - type: textarea
+    id: easier
+    attributes:
+      label: Compared with how you worked before, what became easiest? / 기존 방식과 비교해 가장 편해진 작업은 무엇인가요?
+    validations:
+      required: true
+  - type: textarea
+    id: come-back
+    attributes:
+      label: If you use it next week too, which feature would bring you back? / 다음 주에도 쓴다면 어떤 기능 때문에 다시 실행할 것 같나요?
+      placeholder: "Or why you would not / 또는 다시 쓰지 않을 이유"
+    validations:
+      required: true
+  - type: dropdown
+    id: still-using
+    attributes:
+      label: Are you still using it after a week? / 일주일 뒤에도 쓰고 있나요?
+      options:
+        - Yes, most days / 네, 거의 매일
+        - Sometimes / 가끔
+        - No / 아니요
