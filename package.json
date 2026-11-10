@@ -47,7 +47,7 @@
     "@shikijs/core": "^4.5.0",
     "@shikijs/engine-javascript": "^4.5.0",
     "@shikijs/langs": "^4.4.3",
-    "@shikijs/themes": "^4.5.0",
+    "@shikijs/themes": "^4.6.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.8.4",
     "@tauri-apps/plugin-opener": "^2.7.2",
