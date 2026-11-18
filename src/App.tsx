@@ -19,13 +19,14 @@ import { errorText } from "./lib/errorText";
 import { ChatAttentionCenter } from "./components/ChatAttentionCenter";
 import { NewProjectsModal } from "./components/NewProjectsModal";
 import { DashboardView } from "./components/DashboardView";
-import { ErrorBanner, HelpHint, LoadingState, LogoMark, useConfirm } from "./components/Shared";
+import { ErrorBanner, HelpHint, LoadingState, LogoMark, useConfirm, type ErrorBannerTone } from "./components/Shared";
 import {
   getAntigravityUsage,
   getManagerSnapshot,
   getManagerSnapshotSync,
   getProviderAccounts,
   BackendBusyError,
+  BackendTimeoutError,
   getCatalogHealth,
   getCliUpdateStatus,
   getSchedulerSnapshot,
@@ -230,7 +231,7 @@ function App() {
   const [, setChatLocation] = useState<ConversationLocation>({ view: "chat" });
   const navigationEpoch = useRef(0);
   const [selectedSession, setSelectedSession] = useState<SessionSummary | null>(null);
-  const { error, setError } = useAppErrorBanner();
+  const { error, errorTone, setError } = useAppErrorBanner();
   const { toasts, pushToast, dismissToast } = useAppToasts();
   const [reconnecting, setReconnecting] = useState(false);
   const [appRefreshing, setAppRefreshing] = useState(false);
@@ -262,7 +263,10 @@ function App() {
       if (!snapshotRef.current) setError(cause.message);
       return;
     }
-    setError(errorText(cause));
+    // 응답이 늦었거나 다른 갱신과 겹친 것은 다시 하면 풀리는 지연이라 빨간 실패가 아니라
+    // 노란 주의로 세운다. NAS가 바쁠 때 배경 색인 갱신이 이 길로 자주 온다.
+    const delayed = cause instanceof BackendTimeoutError || cause instanceof BackendBusyError;
+    setError(errorText(cause), delayed ? "caution" : "error");
   }, []);
 
   /**
@@ -833,7 +837,7 @@ function App() {
           </div>
         </div>}
         {error && <div className="content-error">
-          <ErrorBanner message={error} />
+          <ErrorBanner message={error} tone={errorTone} />
           {view === "sessions" && <button className="button secondary" type="button" onClick={() => { void reconcileSessionList(); }}>{text("목록 갱신 재시도", "Retry list refresh")}</button>}
         </div>}
         <main className="view-content">
@@ -940,11 +944,12 @@ const MIN_ERROR_VISIBLE_MS = 7_000;
  */
 function useAppErrorBanner() {
   const [error, setErrorMessage] = useState<string | null>(null);
+  const [errorTone, setErrorTone] = useState<ErrorBannerTone>("error");
   const shownAt = useRef(0);
   const clearTimer = useRef<number | null>(null);
   const current = useRef<string | null>(null);
 
-  const setError = useCallback((message: string | null) => {
+  const setError = useCallback((message: string | null, tone: ErrorBannerTone = "error") => {
     if (clearTimer.current !== null) {
       window.clearTimeout(clearTimer.current);
       clearTimer.current = null;
@@ -953,6 +958,7 @@ function useAppErrorBanner() {
       shownAt.current = Date.now();
       current.current = message;
       setErrorMessage(message);
+      setErrorTone(tone);
       return;
     }
     if (current.current === null) return;
@@ -973,7 +979,7 @@ function useAppErrorBanner() {
     if (clearTimer.current !== null) window.clearTimeout(clearTimer.current);
   }, []);
 
-  return { error, setError };
+  return { error, errorTone, setError };
 }
 
 /**

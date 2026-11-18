@@ -360,15 +360,21 @@ fn probe_login_shell_path() -> Option<Vec<PathBuf>> {
 }
 
 #[cfg(unix)]
+fn login_shell_path_script() -> String {
+    // 프로필이 stdout에 무엇을 찍든(배너·fetch 출력) 표식 사이만 읽는다. 셸 변수
+    // 확장은 셸마다 달라(fish의 `$PATH`는 목록) 값을 직접 찍지 않고 `printenv`로 받는다.
+    // G8: 전체 환경을 받은 뒤 거르지 않고 필요한 PATH 하나만 출력하게 한다.
+    format!(
+        "printf '\n{marker}\nPATH='; /usr/bin/printenv PATH; printf '\n{marker}\n'",
+        marker = LOGIN_SHELL_PATH_MARKER
+    )
+}
+
+#[cfg(unix)]
 fn probe_login_shell_path_with(shell: &Path, timeout: Duration) -> Option<Vec<PathBuf>> {
     use std::os::unix::process::CommandExt;
 
-    // 프로필이 stdout에 무엇을 찍든(배너·fetch 출력) 표식 사이만 읽는다. 셸 변수
-    // 확장은 셸마다 달라(fish의 `$PATH`는 목록) 값을 직접 찍지 않고 `env`로 받는다.
-    let script = format!(
-        "printf '\n{marker}\n'; /usr/bin/env; printf '\n{marker}\n'",
-        marker = LOGIN_SHELL_PATH_MARKER
-    );
+    let script = login_shell_path_script();
     let mut command = Command::new(shell);
     command
         .args(["-i", "-l", "-c", &script])
@@ -432,7 +438,7 @@ fn login_shell_executable() -> Option<PathBuf> {
         })
 }
 
-/// 표식 사이의 `env` 출력에서 `PATH=` 줄만 읽는다. 표식 앞의 프로필 잡음과 표식이
+/// 표식 사이의 `PATH=` 줄만 읽는다. 표식 앞의 프로필 잡음과 표식이
 /// 하나뿐인 잘린 출력은 모두 무시한다.
 #[cfg(unix)]
 fn parse_login_shell_path(output: &str) -> Option<Vec<PathBuf>> {
@@ -1006,6 +1012,40 @@ mod tests {
                 added.display()
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn g8_login_shell_probe_does_not_collect_unrelated_environment() {
+        // 실제 환경은 읽지 않고 고정된 가짜 값만 자식 프로세스에 전달한다.
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(login_shell_path_script())
+            .env_clear()
+            .env("PATH", "/fixture/node bin:/usr/bin")
+            .env("UNRELATED_TEST_VALUE", "fixture-value\nPATH=/unrelated")
+            .output()
+            .expect("fixture shell must run");
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).expect("fixture output must be UTF-8");
+        assert!(
+            !output.contains("UNRELATED_TEST_VALUE="),
+            "G8: unrelated environment variable reached stdout"
+        );
+        assert_eq!(
+            output,
+            format!(
+                "\n{marker}\nPATH=/fixture/node bin:/usr/bin\n\n{marker}\n",
+                marker = LOGIN_SHELL_PATH_MARKER
+            )
+        );
+        assert_eq!(
+            parse_login_shell_path(&output),
+            Some(vec![
+                PathBuf::from("/fixture/node bin"),
+                PathBuf::from("/usr/bin"),
+            ])
+        );
     }
 
     /// 로그인 셸 출력에서 표식 사이의 `PATH=` 줄만 읽는다. 프로필이 표식 앞에 찍는

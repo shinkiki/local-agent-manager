@@ -1555,6 +1555,44 @@ mod tests {
             );
         }
 
+        /// G4/C4-8: 손실된 조각을 건너뛴 자격증명을 공급자에게 돌려주지 않는다.
+        #[test]
+        fn g4_c4_8_missing_chunk_never_returns_partial_credentials() {
+            let document = long_document(180);
+            let count = split_keychain_secret(&document, 64).len();
+            assert!(count >= 3, "첫·중간·마지막 조각을 모두 검사한다");
+
+            for missing_index in 0..count {
+                let keychain = FakeKeychain::default();
+                write(&keychain, &document).expect("저장");
+                let header = keychain
+                    .read(SERVICE, ACCOUNT)
+                    .expect("머리 읽기")
+                    .expect("머리");
+                let (generation, stored_count) = parse_keychain_chunk_header(&header)
+                    .expect("머리 해석")
+                    .expect("조각 안내");
+                assert_eq!(stored_count, count);
+                keychain
+                    .delete(
+                        SERVICE,
+                        &keychain_chunk_account(ACCOUNT, generation, missing_index),
+                    )
+                    .expect("한 조각 손실");
+                let before = keychain.state.lock().expect("lock").entries.clone();
+
+                let error = read_chunked_secret(&keychain, SERVICE, ACCOUNT)
+                    .expect_err("조각이 하나라도 빠지면 불완전한 값을 반환하지 않는다");
+                assert!(matches!(error, CoreError::Runtime(message)
+                    if message == "OS 보안 저장소의 자격증명 조각이 없습니다"));
+                assert_eq!(
+                    keychain.state.lock().expect("lock").entries,
+                    before,
+                    "실패한 읽기는 남은 조각과 머리 항목을 바꾸지 않는다"
+                );
+            }
+        }
+
         #[test]
         fn deleting_removes_the_header_and_every_chunk() {
             let keychain = FakeKeychain::default();

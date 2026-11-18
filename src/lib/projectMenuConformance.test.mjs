@@ -607,6 +607,26 @@ test('testNamed 가 .mjs 시험의 옵션 객체 skip·todo 도 꺼진 것으로
   assert.equal(evaluateCheck(check, { [file]: 'test.concurrent("제목", () => {});' }).ok, true);
 });
 
+test('V2 testNamed 는 skip·todo 중 하나라도 켜지면 옵션 순서와 무관하게 거절한다', () => {
+  const file = 'src/lib/projectAiaHandoff.test.mjs';
+  const check = { id: 'A2.test', kind: 'testNamed', title: 'x', file, name: '제목' };
+  for (const options of [
+    'skip: false, todo: true',
+    'todo: false, skip: true',
+    'skip: false, todo: "나중에"',
+    'todo: false, skip: "나중에"',
+  ]) {
+    const source = `test("제목", { ${options} }, () => {});`;
+    const result = evaluateCheck(check, { [file]: source });
+    assert.equal(result.ok, false, source);
+    assert.match(result.reason, /skip\/todo/);
+  }
+  for (const options of ['skip: false, todo: false', 'todo: false, skip: false']) {
+    const source = `test("제목", { ${options} }, () => { const data = { skip: true, todo: true }; });`;
+    assert.equal(evaluateCheck(check, { [file]: source }).ok, true, source);
+  }
+});
+
 // 같은 조임이 round-92fd9f3d 가 손으로 고친 자리를 구조로 막는다 — name 이 제목이 아니라
 // 식별자면(import 줄이나 다른 단언 안에만 있으면) 그 점검은 아무것도 지키지 못한다.
 test('testNamed 가 .mjs 에서 제목 자리가 아닌 일치를 시험으로 세지 않는다', () => {

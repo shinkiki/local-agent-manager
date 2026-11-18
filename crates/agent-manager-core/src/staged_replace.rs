@@ -207,6 +207,52 @@ mod tests {
         assert!(!stage.exists());
     }
 
+    // C3-9/C5-4: even without a backup, a failed swap must preserve an occupied
+    // target and discard a prepared replacement that actually exists.
+    fn assert_failed_backupless_swap_discards_stage(kind: StagedKind) {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let target = root.path().join("occupied");
+        let stage = root.path().join(".stage");
+        fs::create_dir(&target).expect("target directory");
+        fs::write(target.join("original.md"), b"old").expect("target content");
+        // A nonempty directory blocks both file and directory rename, including
+        // when the tests run as root; no permission or timing assumption is needed.
+        match kind {
+            StagedKind::File => fs::write(&stage, b"new").expect("stage file"),
+            StagedKind::Directory => {
+                fs::create_dir_all(stage.join("nested")).expect("stage directory");
+                fs::write(stage.join("nested/new.md"), b"new").expect("stage content");
+            }
+        }
+
+        let error = StagedReplace {
+            kind,
+            stage: &stage,
+            target: &target,
+            backup: None,
+        }
+        .commit()
+        .expect_err("the target is a nonempty directory");
+
+        assert!(matches!(error, CoreError::Io(_)));
+        assert_eq!(
+            fs::read(target.join("original.md")).expect("original"),
+            b"old"
+        );
+        assert_eq!(fs::read_dir(&target).expect("target entries").count(), 1);
+        assert!(!stage.exists(), "{kind} stage must be discarded");
+    }
+
+    #[test]
+    fn c3_9_c5_4_failed_backupless_swap_discards_file_stage() {
+        assert_failed_backupless_swap_discards_stage(StagedKind::File);
+    }
+
+    #[test]
+    fn c3_9_c5_4_failed_backupless_swap_discards_directory_stage() {
+        assert_failed_backupless_swap_discards_stage(StagedKind::Directory);
+    }
+
     #[test]
     fn staged_kind_constants_and_display() {
         assert_eq!(StagedKind::ALL, [StagedKind::File, StagedKind::Directory]);

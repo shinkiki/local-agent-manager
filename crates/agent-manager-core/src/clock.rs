@@ -14,8 +14,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// 시스템 시계가 에포크 이전이면 `0`, `i64`를 넘기면 `i64::MAX`로 붙잡는다.
 /// 넘침에 의한 역행은 막지만 시스템 시계 보정에 따른 역행은 그대로 반영한다.
 pub(crate) fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    system_time_ms(SystemTime::now())
+}
+
+fn system_time_ms(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
         .map(epoch_duration_ms)
         .unwrap_or(0)
 }
@@ -35,6 +38,23 @@ mod tests {
     fn now_ms_reads_a_plausible_epoch_millisecond() {
         let now = now_ms();
         assert!(now > YEAR_2020_MS, "epoch millisecond expected, got {now}");
+    }
+
+    #[test]
+    fn g7_v2_system_time_ms_preserves_pre_epoch_fallback() {
+        // G7/V2: persisted timestamps keep the documented zero fallback without
+        // changing the host clock or depending on the time this test runs.
+        for (time, expected) in [
+            (UNIX_EPOCH - Duration::from_secs(1), 0),
+            (UNIX_EPOCH - Duration::from_millis(1), 0),
+            (UNIX_EPOCH, 0),
+            (
+                UNIX_EPOCH + Duration::new(1_577_836_800, 123_456_789),
+                YEAR_2020_MS + 123,
+            ),
+        ] {
+            assert_eq!(system_time_ms(time), expected, "{time:?}");
+        }
     }
 
     #[test]

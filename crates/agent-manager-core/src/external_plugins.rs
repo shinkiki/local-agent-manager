@@ -3598,15 +3598,17 @@ fn parse_pasted_callback(
     }
     query
         .code
-        .filter(|code| !code.is_empty())
         .ok_or_else(|| CoreError::InvalidInput("주소에 인증 코드(code)가 없습니다".to_owned()))
 }
 
+/// 콜백 주소의 query를 읽는다. 빈 `code=`는 코드가 없는 것으로 읽어 리스너 경로와 붙여 넣기
+/// 경로가 같은 판정을 내린다 — 빈 코드를 받아들이면 브라우저에 완료 화면을 보여 준 뒤 토큰
+/// 교환에서야 실패한다.
 fn callback_query(url: &Url) -> CallbackQuery {
     let mut query = CallbackQuery::default();
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
-            "code" => query.code = Some(value.into_owned()),
+            "code" => query.code = Some(value.into_owned()).filter(|code| !code.is_empty()),
             "state" => query.state = Some(value.into_owned()),
             "error" => {
                 query.error = Some(value.into_owned());
@@ -5079,6 +5081,88 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let code = wait_for_callback(&listener, "s1", &paste, &cancel).expect("pasted code");
         assert_eq!(code, "pasted-code");
+    }
+
+    /// loopback 리스너에 요청 하나를 보내고 응답의 상태 줄을 돌려준다. `wait_for_callback`이
+    /// 호출 스레드를 막으므로 요청은 다른 스레드에서 보낸다.
+    fn send_callback_request(addr: SocketAddr, target: &str) -> thread::JoinHandle<String> {
+        let target = target.to_owned();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            // 응답이 없으면 매달리지 않고 실패하게 한다.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("read timeout");
+            stream
+                .write_all(format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes())
+                .expect("request");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("response");
+            response.lines().next().unwrap_or_default().to_owned()
+        })
+    }
+
+    fn empty_paste() -> CallbackPaste {
+        CallbackPaste {
+            redirect_uri: "http://127.0.0.1:1/callback".to_owned(),
+            state: "s1".to_owned(),
+            code: Mutex::new(None),
+        }
+    }
+
+    /// 브라우저 콜백: 다른 경로는 404로 흘려보내고 대기를 이어 가며, state가 맞는 code를 받으면
+    /// 200으로 끝낸다.
+    #[test]
+    fn callback_wait_accepts_a_matching_code_after_ignoring_other_paths() {
+        let listener =
+            TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let favicon = send_callback_request(addr, "/favicon.ico");
+        let cancel = AtomicBool::new(false);
+        let paste = empty_paste();
+        let waiter = thread::spawn({
+            let listener = listener.try_clone().expect("clone listener");
+            move || wait_for_callback(&listener, "s1", &paste, &cancel)
+        });
+        assert!(favicon
+            .join()
+            .expect("favicon thread")
+            .starts_with("HTTP/1.1 404"));
+        let ok = send_callback_request(addr, "/callback?code=abc&state=s1");
+        assert_eq!(waiter.join().expect("wait thread").expect("code"), "abc");
+        assert!(ok.join().expect("ok thread").starts_with("HTTP/1.1 200"));
+    }
+
+    /// 브라우저 콜백 거절: 서버 오류, state 불일치, 빈 code는 모두 400으로 답하고 실패로 끝낸다.
+    /// 빈 `code=`는 붙여 넣기 경로와 같이 "코드 없음"이다 — 받아들이면 교환 단계에서야 실패한다.
+    #[test]
+    fn callback_wait_rejects_errors_state_mismatch_and_empty_code() {
+        for target in [
+            "/callback?error=access_denied&state=s1",
+            "/callback?code=abc&state=other",
+            "/callback?code=&state=s1",
+            "/callback?state=s1",
+        ] {
+            let listener =
+                TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("listener");
+            let addr = listener.local_addr().expect("addr");
+            let client = send_callback_request(addr, target);
+            let cancel = AtomicBool::new(false);
+            let paste = empty_paste();
+            let outcome = wait_for_callback(&listener, "s1", &paste, &cancel);
+            assert!(
+                matches!(outcome, Err(CoreError::Conflict(_))),
+                "{target}: {outcome:?}"
+            );
+            assert!(
+                client
+                    .join()
+                    .expect("client thread")
+                    .starts_with("HTTP/1.1 400"),
+                "{target}"
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -98,9 +98,18 @@ fn open_lock_file(path: &Path) -> Result<File, CoreError> {
     let file = options.open(path)?;
     // G10: FIFO 같은 특수 파일은 열 때 기다리지 않고, 권한을 바꾸기 전에 거절한다.
     // 경로가 교체되어도 실제로 연 대상을 검사하도록 파일 서술자에서 종류를 읽는다.
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(CoreError::InvalidInput(
             "백엔드 소유권 잠금은 일반 파일이어야 합니다".to_owned(),
+        ));
+    }
+    // G7/G10: O_NOFOLLOW는 하드 링크를 막지 않는다. 미리 놓인 다른 파일의 링크를
+    // 잠금으로 받으면 아래 chmod가 앱 데이터 밖 원본의 권한까지 바꾸므로 거절한다.
+    #[cfg(unix)]
+    if metadata.nlink() > 1 {
+        return Err(CoreError::InvalidInput(
+            "백엔드 소유권 잠금은 하드 링크가 아닌 파일이어야 합니다".to_owned(),
         ));
     }
     #[cfg(unix)]
@@ -182,6 +191,33 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g7_g10_hardlinked_lock_is_refused_without_changing_its_target() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        // 같은 파일시스템 안의 별도 폴더를 써서 하드 링크를 만들 수 있게 한다.
+        let app_data = directory.path().join("app-data");
+        fs::create_dir(&app_data).expect("app data directory");
+        let target = directory.path().join("foreign");
+        fs::write(&target, b"foreign").expect("foreign file");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).expect("target mode");
+        let lock_path = app_data.join(BACKEND_OWNERSHIP_LOCK_FILE);
+        fs::hard_link(&target, &lock_path).expect("planted hard link");
+
+        assert!(matches!(
+            BackendOwnershipLease::acquire(&app_data),
+            Err(CoreError::InvalidInput(_))
+        ));
+        assert_eq!(fs::read(&target).expect("target contents"), b"foreign");
+        let metadata = fs::metadata(&target).expect("target metadata");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+        assert_eq!(metadata.nlink(), 2, "refusal must keep both links intact");
+        assert_eq!(
+            fs::metadata(&lock_path).expect("lock metadata").ino(),
+            metadata.ino()
+        );
     }
 
     #[cfg(unix)]

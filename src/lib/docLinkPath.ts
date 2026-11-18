@@ -7,19 +7,20 @@ function stripLinkBrackets(target: string): string {
   return trimmed.startsWith("<") && trimmed.endsWith(">") ? trimmed.slice(1, -1).trim() : trimmed;
 }
 
-// 링크 표기에서 퍼센트 인코딩을 풀고 구분자·쿼리·프래그먼트와 `:12` 같은 줄 번호 꼬리를
-// 떼어 경로만 남긴다. 디코드할 수 없는 링크는 비교하지 않고 버린다(null).
+// 링크 표기에서 쿼리·프래그먼트를 먼저 떼어낸 뒤 경로의 퍼센트 인코딩만 풀고
+// 구분자와 `:12` 같은 줄 번호 꼬리를 정리해 경로만 남긴다. 디코드할 수 없는 링크는 비교하지 않고 버린다(null).
 function decodeLinkPath(target: string): string | null {
+  const pathOnly = target.split(/[?#]/, 1)[0];
   let decoded: string;
   try {
-    decoded = decodeURIComponent(target);
+    decoded = decodeURIComponent(pathOnly);
   } catch {
     return null;
   }
-  return decoded.replace(/\\/g, "/").split(/[?#]/, 1)[0].replace(/:\d+$/, "");
+  return decoded.replace(/\\/g, "/").replace(/:\d+$/, "");
 }
 
-/** 꺾쇠를 벗기고 디코딩과 쿼리·해시 제거를 거쳐 순수 링크 경로만 추출한다. */
+/** 꺾쇠와 쿼리·해시를 벗긴 뒤 디코딩해 순수 링크 경로만 추출한다. */
 export function parseLinkPath(href: string): string | null {
   return decodeLinkPath(stripLinkBrackets(href));
 }

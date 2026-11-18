@@ -141,7 +141,17 @@ pub fn duplicate_document_file(
         .ok_or_else(path_outside_root)?;
     let mut reader = File::open(&source)?;
     for attempt in 1..=DUPLICATE_NAME_ATTEMPTS {
-        let target = parent.join(duplicate_name(&file_name, attempt));
+        let candidate = duplicate_name(&file_name, attempt);
+        // 접미를 붙인 이름이 한 칸 상한을 넘으면 파일 시스템이 ENAMETOOLONG 으로 거절하는데,
+        // 그 원시 오류는 화면이 분류하지 못한다(C6-2 와 같은 모양). 뒤의 시도는 이름이 더
+        // 길어질 뿐이므로 여기서 입력 오류로 끝낸다.
+        if candidate.len() > MAX_ENTRY_NAME_BYTES {
+            return Err(CoreError::InvalidInput(
+                "원본 이름이 길어 복제본 이름을 만들 수 없습니다. 이름을 줄인 뒤 다시 시도하세요."
+                    .to_owned(),
+            ));
+        }
+        let target = parent.join(candidate);
         let mut writer = match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -559,6 +569,25 @@ mod tests {
         assert_eq!(duplicate_name("Makefile", 1), "Makefile 복사본");
         fs::create_dir_all(f.docs.join("dir")).unwrap();
         assert!(duplicate_document_file(&f.app_data, &f.root_id, "dir").is_err());
+    }
+
+    // 원본 이름이 상한에 가까우면 복제본 이름(` 복사본` 접미)이 파일 시스템 한 칸 상한을
+    // 넘는다. 원시 ENAMETOOLONG 은 화면이 분류하지 못하므로(C6-2 와 같은 모양) 만들기 전에
+    // 입력 오류로 거절해야 한다.
+    #[test]
+    fn duplicate_refuses_name_that_would_exceed_entry_limit() {
+        let f = fixture();
+        let long_name = format!("{}.md", "a".repeat(MAX_ENTRY_NAME_BYTES - 3));
+        assert_eq!(long_name.len(), MAX_ENTRY_NAME_BYTES);
+        fs::write(f.docs.join(&long_name), "body").unwrap();
+
+        let result = duplicate_document_file(&f.app_data, &f.root_id, &long_name);
+
+        assert!(
+            matches!(result, Err(CoreError::InvalidInput(_))),
+            "입력 오류가 아니라 {result:?} 가 나왔습니다"
+        );
+        assert_eq!(fs::read_dir(&f.docs).unwrap().count(), 1);
     }
 
     #[test]

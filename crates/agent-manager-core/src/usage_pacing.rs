@@ -444,16 +444,15 @@ pub(crate) fn record_usage_sample(app_data_dir: &Path, account_id: &str, usage: 
                     .series
                     .entry(series_key(account_id, &window.label))
                     .or_default();
-                // 같은 갱신 시각이 두 번 들어오면 뒤엣것만 남긴다. 사용량 갱신은 조회
-                // 결과를 그대로 저장하므로 같은 시각의 표본이 겹칠 수 있다.
-                if series.last().is_some_and(|last| last.at >= at) {
-                    series.pop();
-                }
+                // G7: 지연된 조회도 실측 근거다. 같은 시각의 표본만 교체하고, 최신
+                // 표본을 지우지 않는다. 정렬은 과거 버전이 남긴 역순도 함께 바로잡는다.
+                series.retain(|sample| sample.at != at);
                 series.push(UsageSample {
                     at,
                     used_percent: window.used_percent,
                     resets_at: window.resets_at,
                 });
+                series.sort_by_key(|sample| sample.at);
                 trim_series(series, &run_spans);
             }
             true
@@ -7151,6 +7150,7 @@ mod tests {
                 }),
                 active_from: None,
                 active_until: None,
+                lean_context: false,
             },
             created_at: NOW,
             updated_at: NOW,
@@ -7260,6 +7260,7 @@ mod tests {
             interactive_approvals: false,
             profile: ChatProfile::Standard,
             system_tools: false,
+            lean_context: false,
             settings: BTreeMap::new(),
             aia_runtime: None,
             record_session: false,
@@ -11499,6 +11500,110 @@ mod tests {
         assert!(before.used_percent < after.used_percent);
         // 표본은 시간순을 유지한다.
         assert!(series.windows(2).all(|pair| pair[0].at < pair[1].at));
+    }
+
+    #[test]
+    fn g7_v2_delayed_samples_preserve_measurements_and_replace_only_the_same_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reset = Some(NOW + 50 * HOUR);
+        // 조회 완료와 저장 순서는 다를 수 있다. 과거 시각의 정정도 최신 표본을 잃지 않는다.
+        for (minute, percent) in [
+            (0, 10.0),
+            (20, 30.0),
+            (40, 50.0),
+            (10, 20.0),
+            (30, 40.0),
+            (0, 11.0),
+            (20, 33.0),
+            (40, 55.0),
+        ] {
+            let mut view = usage(vec![
+                ("7일", percent, reset),
+                ("5시간", percent / 2.0, reset),
+            ]);
+            view.updated_at = Some(NOW + minute * 60_000);
+            record_usage_sample(dir.path(), "claude-a", &view);
+        }
+        let store = load_store(dir.path()).expect("load");
+        for (label, divisor) in [("7일", 1.0), ("5시간", 2.0)] {
+            let series = &store.series[&series_key("claude-a", label)];
+            let saved: Vec<_> = series
+                .iter()
+                .map(|sample| (sample.at, sample.used_percent, sample.resets_at))
+                .collect();
+            assert_eq!(
+                saved,
+                [(0, 11.0), (10, 20.0), (20, 33.0), (30, 40.0), (40, 55.0)]
+                    .map(|(minute, percent)| (NOW + minute * 60_000, percent / divisor, reset))
+            );
+        }
+    }
+
+    #[test]
+    fn g7_v2_late_bracketing_sample_survives_the_cap_without_losing_the_latest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = PacingStore::default();
+        let started = NOW + 15 * 60_000;
+        let ended = NOW + 25 * 60_000;
+        store.runs.push(run_record(
+            "run-0",
+            "s-qa",
+            None,
+            "claude-a",
+            started,
+            Some(ended),
+        ));
+        save_store(dir.path(), &store).expect("seed store");
+        for minute in 20..(20 + MAX_SAMPLES_PER_SERIES as i64) {
+            let mut view = usage(vec![("7일", 30.0, Some(NOW + 50 * HOUR))]);
+            view.updated_at = Some(NOW + minute * 60_000);
+            record_usage_sample(dir.path(), "claude-a", &view);
+        }
+        let mut late = usage(vec![("7일", 10.0, Some(NOW + 50 * HOUR))]);
+        late.updated_at = Some(NOW + 10 * 60_000);
+        record_usage_sample(dir.path(), "claude-a", &late);
+        let store = load_store(dir.path()).expect("load");
+        let series = &store.series[&series_key("claude-a", "7일")];
+        assert_eq!(series.len(), MAX_SAMPLES_PER_SERIES);
+        assert!(series.windows(2).all(|pair| pair[0].at < pair[1].at));
+        assert_eq!(series.first().expect("before run").at, NOW + 10 * 60_000);
+        assert_eq!(
+            series.last().expect("latest").at,
+            NOW + (19 + MAX_SAMPLES_PER_SERIES as i64) * 60_000
+        );
+        let after = series
+            .iter()
+            .find(|sample| sample.at >= ended)
+            .expect("after run");
+        assert_eq!(after.at, ended);
+    }
+
+    #[test]
+    fn g7_v2_recording_normalizes_an_existing_out_of_order_series() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = PacingStore::default();
+        store.series.insert(
+            series_key("claude-a", "7일"),
+            samples(&[
+                (NOW + 20 * 60_000, 30.0),
+                (NOW + 40 * 60_000, 50.0),
+                (NOW + 10 * 60_000, 20.0),
+            ]),
+        );
+        save_store(dir.path(), &store).expect("seed old order");
+        let mut view = usage(vec![("7일", 40.0, None)]);
+        view.updated_at = Some(NOW + 30 * 60_000);
+        record_usage_sample(dir.path(), "claude-a", &view);
+        let store = load_store(dir.path()).expect("load");
+        let saved: Vec<_> = store.series[&series_key("claude-a", "7일")]
+            .iter()
+            .map(|sample| (sample.at, sample.used_percent))
+            .collect();
+        assert_eq!(
+            saved,
+            [(10, 20.0), (20, 30.0), (30, 40.0), (40, 50.0)]
+                .map(|(minute, percent)| (NOW + minute * 60_000, percent))
+        );
     }
 
     #[test]

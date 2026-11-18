@@ -770,6 +770,8 @@ fn drain_stream(stream: Option<impl Read + Send + 'static>) -> Receiver<String> 
         let mut chunk = [0_u8; 8 * 1024];
         loop {
             match stream.read(&mut chunk) {
+                // C4-6: 일시적인 읽기 중단은 인증 응답의 끝이 아니므로 다시 읽는다.
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Ok(0) | Err(_) => break,
                 Ok(read) => {
                     let room = PROBE_MAX_STREAM_BYTES.saturating_sub(kept.len());
@@ -847,6 +849,34 @@ fn antigravity_probe_outcome(response: &ProbeResponse) -> ProbeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c4_6_probe_output_retries_interrupted_reads() {
+        struct InterruptedOutput {
+            reads: usize,
+        }
+
+        impl Read for InterruptedOutput {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                let bytes: &[u8] = match self.reads {
+                    // 연속 중단과 일부 응답을 읽은 뒤의 중단을 함께 재현한다.
+                    1 | 2 | 4 => return Err(std::io::ErrorKind::Interrupted.into()),
+                    3 => b"Logged in using ",
+                    5 => b"ChatGPT",
+                    _ => b"",
+                };
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+
+        let receiver = drain_stream(Some(InterruptedOutput { reads: 0 }));
+        let output = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("중단 이후에도 인증 응답을 끝까지 회수한다");
+        assert_eq!(output, "Logged in using ChatGPT");
+    }
 
     #[test]
     fn profile_dir_rejects_identifiers_that_escape_the_root() {
@@ -1175,14 +1205,16 @@ mod tests {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
 
         let started = Instant::now();
-        let outcome = run_probe_command(&script, &[], &[], Duration::from_secs(2));
+        // 전체 시험이 병렬로 프로세스를 띄우는 부하에서는 셸이 손자 pid를 적기까지 2초를
+        // 넘기기도 해서, 시한을 넉넉히 둔다. 보려는 것은 시한 뒤 반드시 돌아오는지다.
+        let outcome = run_probe_command(&script, &[], &[], Duration::from_secs(5));
         assert!(
             matches!(outcome, Err(ref failure) if failure.contains("시간 안에 끝나지")),
             "timed-out probe must report the deadline, got {:?}",
             outcome.as_ref().err()
         );
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < Duration::from_secs(15),
             "probe must return soon after its deadline"
         );
 

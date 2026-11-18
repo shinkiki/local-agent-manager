@@ -378,4 +378,53 @@ mod tests {
             Some("http://127.0.0.1:5217".to_owned())
         );
     }
+
+    #[test]
+    fn v2_serve_target_requires_the_exact_https_root_proxy() {
+        // V2: 충돌 감지와 실패 복원은 현재 호스트의 443 루트 프록시만 소유 대상으로 본다.
+        let proxy = serde_json::json!({"Proxy": "http://127.0.0.1:9000"});
+        for (case, document) in [
+            ("no Serve configuration", serde_json::json!({})),
+            (
+                "other host",
+                serde_json::json!({"Web": {"other.example.ts.net:443": {
+                    "Handlers": {"/": proxy}
+                }}}),
+            ),
+            (
+                "other HTTPS port",
+                serde_json::json!({"Web": {"device.example.ts.net:8443": {
+                    "Handlers": {"/": proxy}
+                }}}),
+            ),
+            (
+                "subpath only",
+                serde_json::json!({"Web": {"device.example.ts.net:443": {
+                    "Handlers": {"/other": proxy}
+                }}}),
+            ),
+            (
+                "root is a file handler",
+                serde_json::json!({"Web": {"device.example.ts.net:443": {
+                    "Handlers": {"/": {"Path": "/srv/public"}, "/other": proxy}
+                }}}),
+            ),
+            (
+                "non-string proxy",
+                serde_json::json!({"Web": {"device.example.ts.net:443": {
+                    "Handlers": {"/": {"Proxy": 5217}}
+                }}}),
+            ),
+        ] {
+            assert_eq!(
+                parse_serve_target(
+                    "device.example.ts.net",
+                    &serde_json::to_vec(&document).expect("Serve JSON"),
+                )
+                .expect(case),
+                None,
+                "{case} must not supply the managed root proxy"
+            );
+        }
+    }
 }

@@ -111,13 +111,7 @@ impl Failure {
             (Some(kind), Self::Service(_)) => {
                 // G4/C4-8: D-Bus·경로·암호화 오류의 원문은 비밀값을 포함할 수 있다.
                 // 분류 코드는 보존하되 외부에서 받은 본문은 오류 안내에도 싣지 않는다.
-                let reason = match kind {
-                    Kind::Locked => "OS 보안 저장소(키링)가 잠겨 있거나 답하지 않습니다",
-                    Kind::Unavailable => {
-                        "OS 보안 저장소(키링)에 연결하거나 요청을 처리하지 못했습니다"
-                    }
-                };
-                failure_for(kind, &format!("{prefix}: {reason}"))
+                failure_for(kind, prefix)
             }
             _ => CoreError::Runtime(format!(
                 "{prefix}: OS 보안 저장소에 같은 이름의 항목이 여러 개 있습니다"
@@ -126,10 +120,15 @@ impl Failure {
     }
 }
 
-fn failure_for(kind: Kind, message: &str) -> CoreError {
+fn failure_for(kind: Kind, prefix: &str) -> CoreError {
+    let reason = match kind {
+        Kind::Locked => "OS 보안 저장소(키링)가 잠겨 있거나 답하지 않습니다",
+        Kind::Unavailable => "OS 보안 저장소(키링)에 연결하거나 요청을 처리하지 못했습니다",
+    };
+    let message = format!("{prefix}: {reason}");
     CoreError::Coded(match kind {
-        Kind::Locked => AppError::conflict(KEYCHAIN_LOCKED_CODE, message.to_owned()),
-        Kind::Unavailable => AppError::conflict(KEYCHAIN_UNAVAILABLE_CODE, message.to_owned()),
+        Kind::Locked => AppError::conflict(KEYCHAIN_LOCKED_CODE, message),
+        Kind::Unavailable => AppError::conflict(KEYCHAIN_UNAVAILABLE_CODE, message),
     })
 }
 
@@ -238,10 +237,7 @@ fn run<T>(
     operation: impl Fn(&SecretService) -> Result<T, Failure>,
 ) -> Result<T, CoreError> {
     if let Some(kind) = held_failure(Instant::now()) {
-        return Err(failure_for(
-            kind,
-            &format!("{prefix}: OS 보안 저장소(키링)가 잠겨 있거나 답하지 않습니다"),
-        ));
+        return Err(failure_for(kind, prefix));
     }
     if !no_prompt() {
         let result =

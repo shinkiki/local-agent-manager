@@ -101,12 +101,19 @@ pub fn resolve_existing_directory(raw: &str) -> Result<PathBuf, CoreError> {
 /// `fs::canonicalize`의 실패를 그대로 흘리지 않고, 사용자가 고칠 수 있는 세 가지 사실
 /// (없다·폴더가 아니다·권한이 없다)로 나눈다. 화면의 오류 분류가 이 문구를 읽는다.
 pub fn resolve_existing_directory_path(requested: &Path) -> Result<PathBuf, CoreError> {
+    canonical_existing_path(requested)?
+        .ok_or_else(|| CoreError::InvalidInput(format!("폴더가 아닙니다: {}", shown(requested))))
+}
+
+/// 정규화한 경로가 폴더면 `Some`, 있지만 폴더가 아니면 `None`. "없다"와 "권한이 없다"는
+/// [`resolve_existing_directory_path`]와 같은 오류로 나간다. 폴더가 아닌 경우를 오류가
+/// 아닌 값으로 돌려주는 것은, 그 경우를 부르는 쪽마다 다르게 답해야 하기 때문이다 — 입력
+/// 검사에서는 `InvalidInput`이고, 만들 자리에서는 `Conflict`다(C6-5).
+fn canonical_existing_path(requested: &Path) -> Result<Option<PathBuf>, CoreError> {
     let display = shown(requested);
     match fs::canonicalize(requested) {
-        Ok(canonical) if canonical.is_dir() => Ok(canonical),
-        Ok(_) => Err(CoreError::InvalidInput(format!(
-            "폴더가 아닙니다: {display}"
-        ))),
+        Ok(canonical) if canonical.is_dir() => Ok(Some(canonical)),
+        Ok(_) => Ok(None),
         Err(error) if error.kind() == ErrorKind::NotFound => Err(CoreError::NotFound(format!(
             "{MISSING_DIRECTORY_PREFIX}{display}"
         ))),
@@ -154,14 +161,23 @@ fn plan_user_directory_paths(app_data_dir: &Path, raw: &str) -> Result<Directory
         ));
     }
     // 이미 있으면 만들 것이 없다. 확인 대화 뒤의 재시도가 두 번 도착해도 결과가 같다.
-    if let Ok(existing) = fs::symlink_metadata(&requested) {
-        if !existing.file_type().is_dir() {
-            return Err(CoreError::Conflict(format!(
+    // "항목이 있는가"는 링크를 따라가지 않는 `symlink_metadata`로 먼저 묻는다 — 없는 자리는
+    // 아래 만들기 계획으로 가야 하고, 끊어진 링크 자리는 만들기 계획이 아니라 거절이다.
+    if fs::symlink_metadata(&requested).is_ok() {
+        let conflict = || {
+            CoreError::Conflict(format!(
                 "그 자리에 폴더가 아닌 항목이 이미 있습니다: {}",
                 shown(&requested)
-            )));
-        }
-        let canonical = resolve_existing_directory_path(&requested)?;
+            ))
+        };
+        // 항목의 종류는 가리키는 곳으로 판정한다. 폴더로 가는 링크는 그 폴더가 이미 있는
+        // 것이라 그대로 돌려주고(C6-5), 파일·끊어진 링크·파일로 가는 링크는 폴더가 아닌
+        // 항목이다. "없음" 접두사로 답하면 화면이 그 자리를 다시 만들자고 묻는다(C6-4).
+        let canonical = match canonical_existing_path(&requested) {
+            Ok(Some(canonical)) => canonical,
+            Ok(None) | Err(CoreError::NotFound(_)) => return Err(conflict()),
+            Err(error) => return Err(error),
+        };
         return Ok(DirectoryPlan {
             anchor: canonical.clone(),
             creates: Vec::new(),
@@ -236,6 +252,16 @@ fn plan_user_directory_paths(app_data_dir: &Path, raw: &str) -> Result<Directory
 /// 공급자 홈과 Agent Manager 앱 데이터는 문서 루트와 같은 기준
 /// (`store::is_restricted_doc_root`)으로 중간 칸까지 막는다.
 pub fn create_user_directory(app_data_dir: &Path, raw: &str) -> Result<PathBuf, CoreError> {
+    create_user_directory_with_resolver(app_data_dir, raw, resolve_existing_directory_path)
+}
+
+// C6-4/C6-4a: 재검사 실패 뒤의 정리를 경쟁 타이밍 없이 검증할 수 있도록,
+// 공개 진입점이 쓰는 실제 경로 해석기를 인자로 받는다.
+fn create_user_directory_with_resolver(
+    app_data_dir: &Path,
+    raw: &str,
+    mut resolve: impl FnMut(&Path) -> Result<PathBuf, CoreError>,
+) -> Result<PathBuf, CoreError> {
     let plan = plan_user_directory_paths(app_data_dir, raw)?;
     if plan.exists {
         return Ok(plan.target);
@@ -249,7 +275,7 @@ pub fn create_user_directory(app_data_dir: &Path, raw: &str) -> Result<PathBuf, 
             return Err(CoreError::Io(error));
         }
         created.push(next.clone());
-        let canonical = match resolve_existing_directory_path(&next) {
+        let canonical = match resolve(&next) {
             Ok(path) => path,
             Err(error) => {
                 rollback_created(&created);
@@ -401,6 +427,150 @@ mod tests {
         assert_eq!(made, fs::canonicalize(&nested).expect("canonical nested"));
     }
 
+    /// C6-4a: 마지막 생성이 실패하면 기존 부모·파일을 남기고 이번 호출이 만든 두 칸만 되돌린다.
+    #[test]
+    fn c6_4a_create_failure_removes_only_new_segments_and_preserves_the_error() {
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        let app_data = temp.path().join("app-data");
+        fs::create_dir(&app_data).expect("app data");
+        let anchor = temp.path().join("existing");
+        fs::create_dir(&anchor).expect("existing anchor");
+        let anchor = fs::canonicalize(anchor).expect("canonical existing anchor");
+        let kept = anchor.join("keep.txt");
+        fs::write(&kept, b"keep").expect("existing content");
+        let first = anchor.join("new");
+        let second = first.join("nested");
+        // NUL은 OS에 전달할 수 없는 이름이다. 권한·경쟁 타이밍 없이 셋째 칸만 실패시킨다.
+        let target = second.join("invalid\0name");
+        let plan = plan_user_directory_paths(&app_data, &target.to_string_lossy()).expect("plan");
+        assert_eq!(
+            plan.creates,
+            [first.clone(), second.clone(), target.clone()]
+        );
+        assert!(!first.exists(), "계획만으로는 만들지 않는다");
+        let expected = fs::create_dir(&target).expect_err("NUL is invalid");
+
+        let error = create_user_directory(&app_data, &target.to_string_lossy())
+            .expect_err("third segment fails");
+        let CoreError::Io(actual) = error else {
+            panic!("원래 파일시스템 오류를 반환한다: {error}");
+        };
+        assert_eq!(actual.kind(), expected.kind());
+        assert_eq!(actual.raw_os_error(), expected.raw_os_error());
+        assert!(!second.exists(), "이번에 만든 자식을 지운다");
+        assert!(!first.exists(), "자식부터 부모 순서로 지운다");
+        assert!(anchor.is_dir(), "기존 부모는 남긴다");
+        assert!(app_data.is_dir(), "다른 기존 폴더는 남긴다");
+        assert_eq!(fs::read(&kept).expect("existing content kept"), b"keep");
+    }
+
+    /// G10/C6-4a: 둘째 칸의 재검사가 실패해도 원래 오류를 보존하고 새 칸만 역순으로 거둔다.
+    #[test]
+    fn c6_4a_recheck_error_rolls_back_all_created_segments() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let anchor = fs::canonicalize(temp.path()).expect("canonical anchor");
+        let app_data = anchor.join("app-data");
+        fs::create_dir(&app_data).expect("app data");
+        let kept = anchor.join("keep.txt");
+        fs::write(&kept, b"existing content").expect("existing content");
+        let first = anchor.join("new");
+        let second = first.join("nested");
+        let target = second.join("last");
+        let expected = format!("{MISSING_DIRECTORY_PREFIX}{}", shown(&second));
+        let mut calls = 0;
+
+        let error =
+            create_user_directory_with_resolver(&app_data, &target.to_string_lossy(), |next| {
+                calls += 1;
+                assert!(next.is_dir(), "생성 뒤에 재검사한다");
+                if calls == 2 {
+                    assert_eq!(next, second);
+                    return Err(CoreError::NotFound(expected.clone()));
+                }
+                resolve_existing_directory_path(next)
+            })
+            .expect_err("second recheck fails");
+
+        assert!(matches!(&error, CoreError::NotFound(message) if message == &expected));
+        assert_eq!(calls, 2, "실패 뒤 다음 칸은 검사하지 않는다");
+        assert!(!target.exists(), "마지막 칸은 만들지 않는다");
+        assert!(!second.exists(), "이번에 만든 자식을 지운다");
+        assert!(!first.exists(), "부모도 역순으로 지운다");
+        assert!(anchor.is_dir(), "기존 부모는 남긴다");
+        assert!(app_data.is_dir(), "다른 기존 폴더는 남긴다");
+        assert_eq!(
+            fs::read(kept).expect("existing file kept"),
+            b"existing content"
+        );
+    }
+
+    /// G10/C6-4: 재검사 경로가 바뀌면 그곳에 다음 칸을 만들지 않고 생성한 칸을 거둔다.
+    #[test]
+    fn c6_4_recheck_path_change_stops_creation_and_rolls_back() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let anchor = fs::canonicalize(temp.path()).expect("canonical anchor");
+        let app_data = anchor.join("app-data");
+        fs::create_dir(&app_data).expect("app data");
+        let outside = anchor.join("outside");
+        fs::create_dir(&outside).expect("existing destination");
+        let kept = outside.join("keep.txt");
+        fs::write(&kept, b"outside content").expect("outside content");
+        let first = anchor.join("new");
+        let second = first.join("nested");
+        let target = second.join("last");
+        let mut calls = 0;
+
+        let error =
+            create_user_directory_with_resolver(&app_data, &target.to_string_lossy(), |next| {
+                calls += 1;
+                assert!(next.is_dir(), "생성 뒤에 재검사한다");
+                if calls == 2 {
+                    assert_eq!(next, second);
+                    return resolve_existing_directory_path(&outside);
+                }
+                resolve_existing_directory_path(next)
+            })
+            .expect_err("canonical path changed");
+
+        assert!(matches!(&error, CoreError::InvalidInput(message)
+            if message == &format!("만드는 도중에 경로가 승인한 자리를 벗어났습니다: {}", shown(&second))));
+        assert_eq!(calls, 2, "변경된 경로에서 다음 칸은 검사하지 않는다");
+        assert!(!target.exists(), "계획의 마지막 칸은 만들지 않는다");
+        assert!(
+            !outside.join("last").exists(),
+            "변경된 위치에도 만들지 않는다"
+        );
+        assert!(!second.exists(), "이번에 만든 자식을 지운다");
+        assert!(!first.exists(), "부모도 역순으로 지운다");
+        assert!(anchor.is_dir(), "기존 부모는 남긴다");
+        assert!(app_data.is_dir(), "다른 기존 폴더는 남긴다");
+        assert_eq!(
+            fs::read(kept).expect("outside file kept"),
+            b"outside content"
+        );
+    }
+
+    /// C6-4a: 생성 뒤 내용이 생긴 부모는 보호하되 비어 있는 자식은 정리한다.
+    #[test]
+    fn c6_4a_rollback_preserves_new_content_and_removes_empty_descendants() {
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        let populated = temp.path().join("populated");
+        let empty = populated.join("empty");
+        fs::create_dir(&populated).expect("created parent");
+        fs::create_dir(&empty).expect("created child");
+        let kept = populated.join("keep.txt");
+        fs::write(&kept, b"concurrent content").expect("content added after creation");
+
+        rollback_created(&[populated.clone(), empty.clone()]);
+
+        assert!(!empty.exists(), "비어 있는 자식은 정리한다");
+        assert!(
+            populated.is_dir(),
+            "내용이 생긴 부모는 재귀 삭제하지 않는다"
+        );
+        assert_eq!(fs::read(kept).expect("content kept"), b"concurrent content");
+    }
+
     /// C6-4b: 확인 대화가 나열할 목록은 만들기와 같은 함수에서 나온다.
     #[test]
     fn the_plan_lists_every_segment_that_will_be_created() {
@@ -542,6 +712,49 @@ mod tests {
             }
             assert!(!temp.path().join("gone").exists(), "아무것도 만들지 않는다");
         }
+    }
+
+    /// C6-5: 폴더로 가는 링크는 그 폴더가 이미 있는 것이다. 링크 자체는 폴더가 아니라고
+    /// `Conflict`로 답하면, 모듈 폴더를 링크로 둔 작업공간 등록이 그 자리에서 막힌다. 파일로
+    /// 가는 링크는 여전히 폴더가 아닌 항목이고, 어느 경우에도 아무것도 만들지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_an_existing_directory_counts_as_that_directory() {
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        let app_data = temp.path().join("app-data");
+        fs::create_dir(&app_data).expect("app data");
+        let real = temp.path().join("real");
+        fs::create_dir(&real).expect("real directory");
+        let link = temp.path().join("linked");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let canonical_real = fs::canonicalize(&real).expect("canonical");
+
+        let plan = plan_user_directory(&app_data, &link.to_string_lossy()).expect("plan");
+        assert!(plan.exists);
+        assert!(plan.creates.is_empty());
+        // 계획이 말하는 자리는 링크가 아니라 링크가 가리키는 폴더다 — 등록부에 남는 값이다.
+        assert_eq!(plan.target, shown(&canonical_real));
+        assert_eq!(
+            create_user_directory(&app_data, &link.to_string_lossy()).expect("existing"),
+            canonical_real
+        );
+        assert!(fs::symlink_metadata(&link)
+            .expect("link kept")
+            .file_type()
+            .is_symlink());
+
+        let file = temp.path().join("note.md");
+        fs::write(&file, b"x").expect("file");
+        let file_link = temp.path().join("file-link");
+        std::os::unix::fs::symlink(&file, &file_link).expect("symlink to file");
+        for result in [
+            create_user_directory(&app_data, &file_link.to_string_lossy()).map(|_| ()),
+            plan_user_directory(&app_data, &file_link.to_string_lossy()).map(|_| ()),
+        ] {
+            let error = result.expect_err("link to a file at target");
+            assert!(matches!(error, CoreError::Conflict(_)), "{error}");
+        }
+        assert_eq!(fs::read(&file).expect("file kept"), b"x");
     }
 
     #[test]

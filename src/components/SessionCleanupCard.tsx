@@ -11,63 +11,29 @@ import { clearSessionCleanupTombstones, getSessionCleanupStatus, runSessionClean
 import { useI18n } from "../lib/i18n";
 import { canClearTombstones, canRunCleanup, cleanupBlockedReason, formatBytes, hasAnyCondition, previewSummary, reasonHint, receiptFailed, receiptSummary, shrinkFactor, type CleanupAccess } from "../lib/sessionCleanup";
 import type { SessionCleanupPolicy, SessionCleanupPreview, SessionCleanupReceipt, SessionCleanupStatus } from "../types";
-import { AppToggle, ErrorBanner, useConfirm } from "./Shared";
+import { AppToggle, ErrorBanner, useBusyAction, useConfirm } from "./Shared";
 import { errorText } from "../lib/errorText";
 import { createLatestGate } from "../lib/latestRequest";
 
 import { formatDateTime } from "../lib/format";
-/*
- * 아래 두 껍데기(`useCardTask`·`useLoadOnActiveEntry`)는 SettingsView.tsx의
- * 같은 이름 함수를 그대로 옮겨 적은 것이다. 설정 화면의 다른 카드들이 아직 그쪽 것을 쓰고,
- * 이 카드가 설정 화면 모듈 전체를 끌어오지 않게 하려고 여기 한 벌을 더 둔다. 공용 자리
- * (`src/lib/`)로 걷어 올리는 일은 별도 작업이다.
- */
 /**
- * 설정 화면 카드들의 "한 번에 한 동작" 껍데기 — busy 키를 걸고, 지난 오류·안내를 지우고,
- * 무엇으로 끝나든 busy를 푼다. 라이브러리 저장소·세션 자동정리·CLI 연결 세 카드가 같은 모양을
- * 각자 적어 두고 있었다. 다른 것은 busy 키의 갈래와 실패 문구를 어디에 적느냐뿐이라 껍데기만
- * 여기로 모으고, 그 둘은 부르는 쪽이 정하게 남긴다.
- *
- * 되돌리기 어려운 동작 앞의 확인창도 이 껍데기가 맡는다. 세션 자동정리 셋(켜기·지금 정리·
- * 기록 비우기)과 계정 둘(리셋 크레딧·등록 삭제)이 "묻고, 거절하면 아무것도 하지 않는다"를
- * 각자 `const accepted = await confirm(...)`과 `if (!accepted) return;`으로 적어 두어, 한
- * 자리에서 빠뜨려도 드러나지 않았다. `confirm`에 null을 주면 묻지 않는 것이라, 켤 때만 묻는
- * 자리는 삼항 하나로 방향을 고르면 된다(`useBackendTask`와 같은 모양).
- *
- * `run`은 성공하면 null을, 실패하면 실패 문구를 돌려준다. 확인창에서 거절하면 아무것도 하지
- * 않고 null을 돌려준다 — busy도 걸지 않고 지난 오류·안내도 그대로 둔다. 기본은 실패 문구를
- * 카드의 오류 배너(`error`)에 적고, `quiet`를 켜면 배너를 건드리지 않고 문구만 돌려준다 — 편집 대화상자 안처럼
- * 실패를 다른 자리에 적어야 하는 호출이 쓴다. 성공했을 때 무엇을 적을지는 이 껍데기가 정하지
- * 않는다: 세션 정리 회차처럼 예외 없이 끝나고도 영수증의 실패 건수로 오류를 적어야 하는 작업이
- * 있어, 성패를 대신 판단할 수 없다.
- *
- * 백엔드 서비스 카드의 `useBackendTask`는 한 카드가 네 개를 따로 쥐고 동시에 돌리는 다른
- * 모양이라 여기로 합치지 않는다 — 합치면 포트 저장과 Tailscale 토글이 서로를 잠근다.
+ * C11: 카드별 확인창과 안내 초기화만 덧붙이고, 작업 상태·오류·완료 처리는
+ * 공용 useBusyAction에 맡긴다. 취소하면 기존 안내와 오류를 그대로 둔다.
  */
 function useCardTask<Key extends string>(clearNotice: () => void) {
-  const [busy, setBusy] = useState<Key | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const run = async (
+  const { busy, error, setError, run } = useBusyAction<Key>();
+  const runCardTask = async (
     key: Key,
     action: () => Promise<void>,
-    options: { quiet?: boolean; confirm?: (() => Promise<boolean>) | null } = {},
-  ): Promise<string | null> => {
-    if (options.confirm && !(await options.confirm())) return null;
-    setBusy(key);
-    setError(null);
-    clearNotice();
-    try {
+    options: { confirm?: (() => Promise<boolean>) | null } = {},
+  ): Promise<void> => {
+    if (options.confirm && !(await options.confirm())) return;
+    await run(key, async () => {
+      clearNotice();
       await action();
-      return null;
-    } catch (cause) {
-      const message = errorText(cause);
-      if (!options.quiet) setError(message);
-      return message;
-    } finally {
-      setBusy(null);
-    }
+    });
   };
-  return { busy, error, setError, run };
+  return { busy, error, setError, run: runCardTask };
 }
 
 /**

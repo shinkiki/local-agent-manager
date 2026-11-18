@@ -97,7 +97,23 @@ impl CliInterface {
 
 /// 탐지된 실행 파일에 `--help`를 실행해 인터페이스를 조사한다.
 pub(crate) fn probe_cli_interface(executable: &Path) -> Result<CliInterface, CoreError> {
-    let outcome = run_capped(executable, HELP_ARGS, HELP_COMMAND_TIMEOUT)?;
+    probe_cli_interface_with_timeout(executable, HELP_COMMAND_TIMEOUT)
+}
+
+fn probe_cli_interface_with_timeout(
+    executable: &Path,
+    timeout: Duration,
+) -> Result<CliInterface, CoreError> {
+    // V2: 부모가 먼저 끝나도 자손의 출력 파이프까지 제한 시간 안에 회수한다.
+    let outcome = run_capped_with(
+        executable,
+        HELP_ARGS,
+        timeout,
+        &CappedOptions {
+            own_process_group: true,
+            ..CappedOptions::default()
+        },
+    )?;
     if outcome.timed_out {
         return Err(CoreError::Runtime(format!(
             "{} --help 실행 시간이 초과되었습니다",
@@ -607,6 +623,35 @@ Options:
   --mode                          Set the agent execution mode for this session (accept-edits, plan)
   --output-format                 Output format for print mode (text, json, stream-json) (default text)
 "#;
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_help_probe_times_out_when_an_exited_parent_leaves_an_output_pipe_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let executable = directory.path().join("help-cli");
+        // 고정 도움말은 파싱에 충분하다. 부모는 즉시 끝나고 손자만 출력 파이프를 쥔다.
+        // 변이에서도 손자가 스스로 끝나므로 시험이 영원히 대기하지 않는다.
+        std::fs::write(
+            &executable,
+            "#!/bin/sh
+printf '%s\n' '--alpha --beta --gamma --delta'
+sleep 2 &
+",
+        )
+        .expect("write CLI fixture");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("make CLI fixture executable");
+
+        let error = probe_cli_interface_with_timeout(&executable, Duration::from_millis(500))
+            .expect_err("inherited output pipe must remain subject to the help timeout");
+        assert!(
+            matches!(error, CoreError::Runtime(ref message)
+                if message.contains("--help 실행 시간이 초과되었습니다")),
+            "unexpected help probe error: {error}"
+        );
+    }
 
     #[test]
     fn commander_help_yields_permission_mode_choices() {

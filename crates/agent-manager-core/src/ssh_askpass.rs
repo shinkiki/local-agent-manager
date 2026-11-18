@@ -392,23 +392,14 @@ fn answer(mut stream: TcpStream, shared: &Shared) -> bool {
     if shared.shutdown.load(Ordering::SeqCst) || line.trim_end() != shared.token.as_str() {
         return false;
     }
-    // 횟수는 값을 쓰기 **전에** 줄인다. 동시에 온 두 연결이 마지막 한 번을 함께 가져가지 않게 한다.
-    let mut current = shared.remaining.load(Ordering::SeqCst);
-    let decremented = loop {
-        let Some(next) = current.checked_sub(1) else {
-            break false;
-        };
-        match shared.remaining.compare_exchange_weak(
-            current,
-            next,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) => break true,
-            Err(actual) => current = actual,
-        }
-    };
-    if !decremented {
+    // C9-21: 횟수는 값을 쓰기 **전에** 줄인다. 마지막 한 번을 두 연결이 함께 가져가지 못한다.
+    if shared
+        .remaining
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            current.checked_sub(1)
+        })
+        .is_err()
+    {
         return false;
     }
     let mut reply = Zeroizing::new(String::with_capacity(shared.secret.len() + 1));

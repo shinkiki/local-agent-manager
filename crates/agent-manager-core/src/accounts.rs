@@ -171,11 +171,12 @@ pub struct AccountUsageWindow {
     /// (`governing_windows`). 옛 저장본에는 없는 필드라 기본값 false로 읽는다.
     #[serde(default)]
     pub model_scoped: bool,
-    /// 모델군 창들을 합쳐 만든 계정 대표 창(Antigravity의 `5시간`·`7일`). 가장 빡빡한
-    /// 모델군을 복사한 것이라 소진 판정에 그대로 넣으면 한 모델군의 소진이 계정 전체를
-    /// 막는다 — `model_scoped`를 판정에서 빼 둔 이유가 대표 창을 통해 되살아난다.
-    /// 화면과 대표 소진율(`tightest_window_headroom`)에는 그대로 쓰고 실행 게이트·
-    /// 자동전환 판정에서만 뺀다(`account_exhausted`). 옛 저장본에는 없다.
+    /// 모델군 창들을 합쳐 만든 계정 대표 창(Antigravity의 `5시간`·`7일`). 아직 열린
+    /// 모델군 중 가장 빡빡한 쪽을 복사한 것이고, 모든 모델군이 찼을 때만 100%다
+    /// (`antigravity_usage::combined_usage`). 모델군 창의 복사본이라 소진 판정에 그대로
+    /// 넣으면 같은 소진을 두 번 센다. 화면과 대표 소진율(`tightest_window_headroom`)에는
+    /// 그대로 쓰고 실행 게이트·자동전환 판정에서만 뺀다(`account_exhausted`). 옛 저장본에는
+    /// 없다.
     #[serde(default)]
     pub aggregate: bool,
 }
@@ -353,7 +354,7 @@ struct HomeObservation {
 /// 같은 시각과 같은 만료 계산을 보게 묶어 둔다.
 #[derive(Debug, Clone, Copy)]
 struct HomeObserveContext {
-    /// 액세스 토큰 만료 시각(Claude만). 이어 쓰는 관측도 이 값만은 다시 계산한다.
+    /// 액세스 토큰 만료 시각(Claude·Antigravity). 이어 쓰는 관측도 이 값만은 다시 계산한다.
     access_token_expires_at: Option<i64>,
     next_read_at: i64,
     now: i64,
@@ -1730,6 +1731,7 @@ impl AccountSupervisor {
         let context = HomeObserveContext {
             access_token_expires_at: match provider {
                 ProviderId::Claude => claude_access_token_expires_at(secret),
+                ProviderId::Antigravity => antigravity_access_token_expires_at(secret),
                 _ => None,
             },
             next_read_at: now.saturating_add(HOME_OBSERVE_INTERVAL_MS),
@@ -7242,12 +7244,19 @@ fn normalize_account_label(label: Option<&str>) -> Result<Option<String>, CoreEr
 /// 방금 저장한 사용량이 100% 도달(=자동전환 트리거)인지 판정한다.
 ///
 /// "전환을 고려할 만한가"는 "계정이 통째로 막혔는가"([`account_exhausted`])와 다른 질문이라
-/// 대표 창 하나로 느슨하게 본다. 모델군 쿼터를 가진 계정에서 대표 창은 빡빡한 모델군의
-/// 복사본이므로, 한 모델군만 차도 신호가 뜬다 — 그 모델군 실행은 여기서 더 못 돌고,
-/// 게이트가 모델군을 알아본 뒤로는 한도 오류(`AgentLimited`)조차 나지 않아 이 신호가
-/// 아니면 활성 계정이 리셋까지 그대로 앉아 있게 된다. 실제로 옮길지는 후보가 정한다.
+/// 창 하나만 차도 신호로 느슨하게 본다. 모델군 쿼터를 가진 계정(대표 창이 `aggregate`)은
+/// 모델군 창도 함께 본다 — 대표 창은 아직 열린 모델군을 따르므로 한 모델군이 차도 100%가
+/// 되지 않는다. 그 모델군 실행은 여기서 더 못 돌고, 게이트가 모델군을 알아본 뒤로는 한도
+/// 오류(`AgentLimited`)조차 나지 않아 이 신호가 아니면 활성 계정이 리셋까지 그대로 앉아
+/// 있게 된다. 실제로 옮길지는 후보가 정한다. 모델 한정 창만 가진 공급자(Claude `Fable
+/// 7일`)는 종전대로 대표 창만 본다.
 fn usage_indicates_exhaustion(usage: &AccountUsageView) -> bool {
-    governing_windows(&usage.windows).any(|window| window.used_percent >= 100.0)
+    let grouped = usage.windows.iter().any(|window| window.aggregate);
+    usage
+        .windows
+        .iter()
+        .filter(|window| grouped || !window.model_scoped)
+        .any(|window| window.used_percent >= 100.0)
 }
 
 /// 창 라벨에서 모델군 이름을 뗀다(`Claude and GPT models · 7일` → `Claude and GPT models`).
@@ -7897,8 +7906,8 @@ fn select_by_max_headroom(
 /// 알 수 없으므로 여유를 아는 계정 다음 순서로 밀고 그 안에서는 등록 순으로 본다.
 /// 보존된 수치만 있는 계정은 그 사이에 둔다.
 ///
-/// 막힌 모델군이 있으면 그 모델군의 여유로 줄을 세운다. 계정 대표 여유는 가장 빡빡한
-/// 모델군의 것이라, Gemini가 90%고 Claude/GPT가 비어 있는 계정은 Claude/GPT 회차를 옮길
+/// 막힌 모델군이 있으면 그 모델군의 여유로 줄을 세운다. 계정 대표 여유는 열린 모델군 중
+/// 가장 빡빡한 것이라, Gemini가 90%고 Claude/GPT가 비어 있는 계정은 Claude/GPT 회차를 옮길
 /// 자리인데도 여유 10%로 읽혀 뒤로 밀린다.
 fn max_headroom_rank(
     account: &AccountRecord,
@@ -10132,8 +10141,17 @@ done
 
     const HOUR_MS: i64 = 60 * 60_000;
 
-    /// 모델군마다 쿼터가 따로인 공급자의 사용량. 계정 대표 창은 빡빡한 쪽의 복사본이다
-    /// (`antigravity_usage::combined_usage`와 같은 모양).
+    /// 두 모델군의 계정 대표 소진율 — 열린 모델군 중 가장 많이 쓴 쪽, 모두 찼으면 100%.
+    fn representative_percent(gemini: f64, third_party: f64) -> f64 {
+        [gemini, third_party]
+            .into_iter()
+            .filter(|used| *used < 100.0)
+            .reduce(f64::max)
+            .unwrap_or(100.0)
+    }
+
+    /// 모델군마다 쿼터가 따로인 공급자의 사용량. 계정 대표 창은 열린 모델군 중 빡빡한
+    /// 쪽의 복사본이다(`antigravity_usage::combined_usage`와 같은 모양).
     fn model_group_usage(gemini: f64, third_party: f64, resets_at: i64) -> AccountUsageView {
         let window = |label: &str, used: f64, scoped: bool, aggregate: bool| AccountUsageWindow {
             label: label.to_owned(),
@@ -10145,7 +10163,12 @@ done
         AccountUsageView {
             status: AccountUsageStatus::Ok,
             windows: vec![
-                window("7일", gemini.max(third_party), false, true),
+                window(
+                    "7일",
+                    representative_percent(gemini, third_party),
+                    false,
+                    true,
+                ),
                 window("Gemini Models · 7일", gemini, true, false),
                 window("Claude and GPT models · 7일", third_party, true, false),
             ],
@@ -10273,6 +10296,15 @@ done
             resets_at: Some(third_party_reset),
             model_scoped: true,
             aggregate: false,
+        });
+        // 두 모델군이 모두 5시간 길이에서 막혔으므로 대표 5시간 창이 찬다(`combined_usage`와
+        // 같은 모양). Claude/GPT 주간은 비어 있어 대표 주간 창은 그대로다.
+        usage.windows.push(AccountUsageWindow {
+            label: "5시간".to_owned(),
+            used_percent: 100.0,
+            resets_at: Some(third_party_reset),
+            model_scoped: false,
+            aggregate: true,
         });
 
         let windows_for =
@@ -11055,6 +11087,38 @@ done
         assert!(usage.retry_at.is_none());
         let error = usage.error.unwrap_or_default();
         assert!(error.contains("갱신하지 않습니다"), "예상과 다름: {error}");
+    }
+
+    /// Antigravity 홈 자격증명의 액세스 토큰 만료 시각이 홈 관측 뷰에 반영되는지 확인한다.
+    #[test]
+    fn home_observation_records_antigravity_access_token_expiry() {
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let expiry = "2026-11-12T03:00:00Z";
+        let expected_ms = chrono::DateTime::parse_from_rfc3339(expiry)
+            .unwrap()
+            .timestamp_millis();
+        let secret = antigravity_secret("sub-antigravity", "anti@example.com", expiry);
+        write_antigravity_credentials(home.path(), &secret).unwrap();
+
+        let supervisor = AccountSupervisor::open_with_credential_probe(
+            data.path(),
+            home.path(),
+            Arc::new(MemoryVault::default()),
+            Arc::new(unavailable_credential_probe),
+        )
+        .unwrap();
+
+        supervisor.observe_home_credentials(true).unwrap();
+
+        let snapshot = supervisor.snapshot().unwrap();
+        let antigravity = snapshot
+            .providers
+            .iter()
+            .find(|state| state.provider == ProviderId::Antigravity)
+            .unwrap();
+        assert_eq!(antigravity.home.state, HomeCredentialState::Verified);
+        assert_eq!(antigravity.home.access_token_expires_at, Some(expected_ms));
     }
 
     /// 확인된 신원은 저장소 값이 같은 동안 다시 묻지 않고, 조회 실패는 저장소가 그대로인
@@ -13115,7 +13179,7 @@ done
         }
     }
 
-    /// 모델군마다 쿼터가 따로인 계정. 대표 창은 빡빡한 모델군의 복사본이다.
+    /// 모델군마다 쿼터가 따로인 계정. 대표 창은 열린 모델군 중 빡빡한 쪽의 복사본이다.
     fn model_group_account(id: &str, gemini: f64, third_party: f64) -> AccountRecord {
         let window = |label: &str, used: f64, scoped: bool, aggregate: bool| AccountUsageWindow {
             label: label.to_owned(),
@@ -13127,7 +13191,12 @@ done
         let usage = AccountUsageView {
             status: AccountUsageStatus::Ok,
             windows: vec![
-                window("7일", gemini.max(third_party), false, true),
+                window(
+                    "7일",
+                    representative_percent(gemini, third_party),
+                    false,
+                    true,
+                ),
                 window("Gemini Models · 7일", gemini, true, false),
                 window("Claude and GPT models · 7일", third_party, true, false),
             ],

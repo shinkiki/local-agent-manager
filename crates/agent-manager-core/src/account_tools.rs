@@ -296,7 +296,7 @@ fn list_account_tools_in(
             .or_insert_with(|| collect_provider_tools(provider, roots));
 
         let owner_account_id = provider_home_owner_account_id(accounts, provider, tools);
-        let owns_home = owner_account_id.as_deref() == Some(account.id.as_str());
+        let owns_home = owner_account_id == Some(account.id.as_str());
 
         views.push(AccountToolsView {
             account_id: account.id.clone(),
@@ -335,11 +335,12 @@ fn list_account_tools_in(
 /// 공급자 홈을 점유한 등록 계정을 찾는다. 설정 파일이 직접 기록한 공급자 계정 ID를
 /// 우선하고, 없거나 등록 계정과 맞지 않을 때만 자격증명 어댑터가 관측한 활성 계정을
 /// 쓴다. 두 근거의 우선순위가 계정별 표시 루프 안에 섞이지 않도록 판정을 한곳에 둔다.
-fn provider_home_owner_account_id(
-    accounts: &AccountSnapshot,
+/// G5: 판별에 필요한 비밀 없는 ID는 스냅샷에서 빌리고 별도 복제하지 않는다.
+fn provider_home_owner_account_id<'a>(
+    accounts: &'a AccountSnapshot,
     provider: ProviderId,
     tools: &ProviderTools,
-) -> Option<String> {
+) -> Option<&'a str> {
     tools
         .owner_provider_account_id
         .as_ref()
@@ -351,14 +352,14 @@ fn provider_home_owner_account_id(
                     candidate.provider == provider
                         && &candidate.provider_account_id == provider_account_id
                 })
-                .map(|candidate| candidate.id.clone())
+                .map(|candidate| candidate.id.as_str())
         })
         .or_else(|| {
             accounts
                 .providers
                 .iter()
                 .find(|state| state.provider == provider)
-                .and_then(|state| state.observed_active_account_id.clone())
+                .and_then(|state| state.observed_active_account_id.as_deref())
         })
 }
 

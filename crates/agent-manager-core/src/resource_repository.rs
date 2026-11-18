@@ -152,12 +152,35 @@ fn settings_path(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join(SETTINGS_FILE)
 }
 
+fn read_regular_json_bytes(path: &Path) -> Option<Vec<u8>> {
+    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+        return None;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // G10: 사전 검사 뒤 심볼릭 링크·FIFO로 바뀌어도 링크를 따라가거나 열기에서 기다리지 않는다.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).ok()?;
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).ok()?;
+    Some(bytes)
+}
+
 fn read_json_or_default<T>(path: &Path) -> T
 where
     T: DeserializeOwned + Default,
 {
-    fs::read(path)
-        .ok()
+    read_regular_json_bytes(path)
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
@@ -576,6 +599,12 @@ pub(crate) fn resource_manifest_path(directory: &Path) -> PathBuf {
 }
 
 pub(crate) fn load_resource_manifest(directory: &Path) -> ResourcePlatformManifest {
+    // G10 / C3-8: `.agent-manager` 폴더 자체가 심볼릭 링크면 그 안의 일반 파일도 따라가지 않는다.
+    if !fs::symlink_metadata(directory.join(".agent-manager"))
+        .is_ok_and(|metadata| metadata.file_type().is_dir())
+    {
+        return ResourcePlatformManifest::default();
+    }
     read_json_or_default(&resource_manifest_path(directory))
 }
 
@@ -1006,5 +1035,112 @@ mod tests {
         paths.restore_backup(&destination);
         assert!(destination.exists());
         assert!(!paths.backup.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_c3_1_repository_settings_ignore_symlinks_directories_and_fifos() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let app_data = temp.path().join("app-data");
+        fs::create_dir_all(&app_data).expect("app data");
+        let outside = temp.path().join("outside-settings.json");
+        let custom = temp.path().join("outside-repo");
+        fs::write(
+            &outside,
+            serde_json::to_vec(&StoredRepositorySettings {
+                root_path: Some(custom.to_string_lossy().into_owned()),
+            })
+            .expect("json"),
+        )
+        .expect("outside settings");
+
+        let path = settings_path(&app_data);
+        symlink(&outside, &path).expect("settings symlink");
+        assert_eq!(
+            repository_root(&app_data),
+            default_repository_root(&app_data)
+        );
+        assert!(!load_resource_repository_settings(&app_data).unwrap().custom);
+
+        fs::remove_file(&path).expect("remove symlink");
+        symlink(temp.path().join("missing.json"), &path).expect("dangling symlink");
+        assert_eq!(
+            repository_root(&app_data),
+            default_repository_root(&app_data)
+        );
+
+        fs::remove_file(&path).expect("remove dangling symlink");
+        fs::create_dir(&path).expect("settings directory");
+        assert_eq!(
+            repository_root(&app_data),
+            default_repository_root(&app_data)
+        );
+
+        fs::remove_dir(&path).expect("remove directory");
+        let c_path = CString::new(path.as_os_str().as_bytes()).expect("cstring");
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            repository_root(&app_data),
+            default_repository_root(&app_data)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_c3_8_resource_manifest_ignores_symlinked_file_parent_and_fifo() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let resource = temp.path().join("skill");
+        let meta_dir = resource.join(".agent-manager");
+        fs::create_dir_all(&meta_dir).expect("meta dir");
+
+        let outside_dir = temp.path().join("outside-meta");
+        fs::create_dir_all(&outside_dir).expect("outside dir");
+        let outside_manifest = outside_dir.join("resource.json");
+        let restricted = ResourcePlatformManifest {
+            schema_version: 1,
+            platforms: vec![HostPlatform::Macos],
+            variants: BTreeMap::new(),
+            variant_deletes: BTreeMap::new(),
+        };
+        fs::write(
+            &outside_manifest,
+            serde_json::to_vec(&restricted).expect("manifest json"),
+        )
+        .expect("outside manifest");
+
+        let manifest_path = resource_manifest_path(&resource);
+        symlink(&outside_manifest, &manifest_path).expect("manifest symlink");
+        assert_eq!(
+            load_resource_manifest(&resource),
+            ResourcePlatformManifest::default()
+        );
+
+        fs::remove_dir_all(&meta_dir).expect("remove meta dir");
+        symlink(&outside_dir, &meta_dir).expect("meta dir symlink");
+        assert_eq!(
+            load_resource_manifest(&resource),
+            ResourcePlatformManifest::default()
+        );
+
+        fs::remove_file(&meta_dir).expect("remove meta dir symlink");
+        fs::create_dir_all(&meta_dir).expect("recreate meta dir");
+        let c_path = CString::new(manifest_path.as_os_str().as_bytes()).expect("cstring");
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            load_resource_manifest(&resource),
+            ResourcePlatformManifest::default()
+        );
+
+        fs::remove_file(&manifest_path).expect("remove fifo");
+        fs::copy(&outside_manifest, &manifest_path).expect("regular manifest");
+        assert_eq!(load_resource_manifest(&resource), restricted);
     }
 }

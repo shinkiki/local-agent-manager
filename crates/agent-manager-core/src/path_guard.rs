@@ -389,6 +389,36 @@ mod tests {
     }
 
     #[test]
+    fn g10_root_boundary_rejects_siblings_with_the_same_name_prefix() {
+        let (_dir, parent) = temp_root();
+        let root = parent.join("allowed");
+        let sibling = parent.join("allowed-other");
+        fs::create_dir(&root).expect("allowed root");
+        fs::create_dir(&sibling).expect("sibling outside root");
+        let sibling_file = sibling.join("existing.md");
+        fs::write(&sibling_file, "outside").expect("sibling file");
+
+        // G10/C3-7/C5-8: a shared string prefix does not make a path a descendant.
+        // Check both existing targets and a tail resolved from an existing ancestor.
+        for target in [
+            sibling.clone(),
+            sibling_file,
+            sibling.join("missing/file.md"),
+        ] {
+            match assert_within_root(&root, &target, LABELS) {
+                Err(CoreError::InvalidInput(message)) => {
+                    assert_eq!(message, format!("{}: {}", LABELS.escaped, target.display()));
+                }
+                other => panic!("a sibling must stay outside the root: {other:?}"),
+            }
+        }
+
+        assert_within_root(&root, &root, LABELS).expect("root itself");
+        assert_within_root(&root, &root.join("missing/file.md"), LABELS)
+            .expect("missing descendant inside root");
+    }
+
+    #[test]
     fn cur_dir_policy_constants_and_display() {
         assert_eq!(
             CurDirPolicy::ALL,

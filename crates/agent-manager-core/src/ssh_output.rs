@@ -178,22 +178,24 @@ pub(crate) fn redact(text: &str) -> String {
 /// 40자 이상 이어지는 base64·hex꼴 토큰을 지운다. 토큰·서명·키 본문이 이 모양으로 온다.
 /// URL-safe base64(RFC 4648 §5)의 `-`·`_`도 같은 알파벳으로 본다 — GitHub `ghp_…` 토큰과
 /// JWT 조각이 이 모양이라, 빠뜨리면 같은 비밀값이 글자 집합만 바꿔 진단을 통과한다(G4).
-fn mask_long_tokens(line: &str) -> String {
-    line.split(' ')
-        .map(|token| {
+pub(crate) fn mask_long_tokens(line: &str) -> String {
+    // G4/C9-16: 탭 등도 토큰 경계지만 원래 진단의 공백 모양은 유지한다.
+    line.split_inclusive(char::is_whitespace)
+        .map(|chunk| {
+            let token = chunk.trim_end_matches(char::is_whitespace);
             let body = token.trim_matches(|value: char| !value.is_ascii_alphanumeric());
             let secretish = body.chars().count() >= 40
                 && body.chars().all(|value| {
                     value.is_ascii_alphanumeric() || matches!(value, '+' | '/' | '=' | '-' | '_')
                 });
             if secretish {
-                "[생략된 값]".to_owned()
+                let separator = &chunk[token.len()..];
+                format!("[생략된 값]{separator}")
             } else {
-                token.to_owned()
+                chunk.to_owned()
             }
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect()
 }
 
 /// 출력을 상한까지 자르고 잘렸는지 함께 돌려준다.
@@ -295,6 +297,36 @@ mod tests {
         assert!(truncated);
         assert_eq!(capped.chars().count(), MAX_OUTPUT_CHARS);
         assert_eq!(cap_output("short"), ("short".to_owned(), false));
+    }
+
+    // G4/C9-16: 공백 종류가 달라도 토큰이 진단 응답으로 나가면 안 된다.
+    #[test]
+    fn g4_c9_16_masks_tokens_at_every_whitespace_boundary() {
+        let secret = "Ab0+/_-Z".repeat(6);
+        for separator in [
+            " ", "\t", "\n", "\r", "\u{b}", "\u{c}", "\u{85}", "\u{a0}", "\u{2003}", "\u{2028}",
+            "\u{2029}", "\u{3000}",
+        ] {
+            let line = format!("before{separator}({secret}){separator}after");
+            assert_eq!(
+                mask_long_tokens(&line),
+                format!("before{separator}[생략된 값]{separator}after"),
+                "separator {separator:?}"
+            );
+            let diagnostic = redact(&line);
+            assert!(!diagnostic.contains(&secret), "separator {separator:?}");
+            assert!(diagnostic.contains("[생략된 값]"));
+        }
+        // 분류 임계값과 일반 문구·공백은 그대로 둔다.
+        let short = "a".repeat(39);
+        let long = "a".repeat(40);
+        assert_eq!(
+            mask_long_tokens(&format!("{short}\t{long}")),
+            format!("{short}\t[생략된 값]")
+        );
+        for ordinary in ["", "\t  ", "normal\t  한글\u{2003}value"] {
+            assert_eq!(mask_long_tokens(ordinary), ordinary);
+        }
     }
 
     /// 실패 문구는 stderr가 가리키는 원인에 따라 다음 행동까지 알려 준다.

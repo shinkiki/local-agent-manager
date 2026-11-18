@@ -1054,7 +1054,10 @@ pub fn run_with_chat_secrets(
     for name in &placeholder_refs {
         injected.push(format!("{PLACEHOLDER_OPEN}{name}{PLACEHOLDER_CLOSE}"));
     }
-    drop(taken);
+    // C15-1/C15-5: 실행 중 삭제·교체·대화 종료가 있어도 이미 전달한 값은
+    // 출력에서 가려야 한다. 실행에 묶인 복사본은 정화가 끝나면 함께 지운다.
+    let mut secrets: Vec<_> = taken.into_iter().map(|(_, value)| value).collect();
+    secrets.extend(store.values_for_scrub(chat_id));
     // C15-4: 제한 시간은 실행 전체를 묶는다. 자식이 띄운 손자가 출력 파이프를 물려받은 채
     // 살아 있으면 회수가 끝나지 않으므로, 그룹으로 띄워 제한 시간에 함께 끝낸다.
     #[cfg(unix)]
@@ -1114,7 +1117,8 @@ pub fn run_with_chat_secrets(
         let _ = writer.join();
     }
     let (stdout, stderr) = output_reader.join().unwrap_or_default();
-    let secrets = store.values_for_scrub(chat_id);
+    // 실행 도중 새로 등록한 값도 기존처럼 정화한다.
+    secrets.extend(store.values_for_scrub(chat_id));
     let (stdout, stdout_cut) = tail(
         &scrub(&String::from_utf8_lossy(&stdout), &secrets),
         OUTPUT_TAIL_CHARS,
@@ -1534,6 +1538,104 @@ mod tests {
         assert!(!receipt.stdout.contains("hunter2secret"));
         assert!(receipt.stdout.contains(REDACTED), "{}", receipt.stdout);
         assert_eq!(receipt.injected, vec!["MY_TOKEN".to_owned()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c15_5_running_command_scrubs_values_after_the_store_changes() {
+        for change in ["replace", "discard", "discard_chat", "expire"] {
+            let store = store();
+            for (name, value) in [
+                ("TOKEN", "injected-fixture-value"),
+                ("OTHER", "unreferenced-fixture-value"),
+            ] {
+                store
+                    .store(CHAT, name, "회귀 시험", value, ChatSecretSource::User)
+                    .expect("store");
+            }
+            let temporary = tempfile::tempdir().expect("tempdir");
+            let ready = temporary.path().join("ready");
+            let resume = temporary.path().join("resume");
+            let mut env = BTreeMap::new();
+            env.insert("MY_TOKEN".to_owned(), "TOKEN".to_owned());
+            let mut request = run_request(
+                vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    // 마커 파일에는 비밀값을 쓰지 않고, 가림 대상은 파이프로만 보낸다.
+                    r#"printf ready > "$1"
+while [ ! -f "$2" ]; do sleep 0.01; done
+printf 'env=%s arg=%s other=unreferenced-fixture-value current=rotated-fixture-value\n' "$MY_TOKEN" "$3"
+cat
+printf '%s unreferenced-fixture-value rotated-fixture-value\n' "$MY_TOKEN" >&2"#
+                        .to_owned(),
+                    "c15-test".to_owned(),
+                    ready.to_string_lossy().into_owned(),
+                    resume.to_string_lossy().into_owned(),
+                    "{{secret:TOKEN}}".to_owned(),
+                ],
+                env,
+            );
+            request.stdin = Some("in={{secret:TOKEN}}\n".to_owned());
+            request.timeout_seconds = Some(10);
+            let receipt = std::thread::scope(|scope| {
+                let run = scope.spawn(|| run_with_chat_secrets(&store, CHAT, request));
+                let started = Instant::now();
+                while !ready.exists()
+                    && !run.is_finished()
+                    && started.elapsed() < Duration::from_secs(5)
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let ready_seen = ready.exists();
+                match change {
+                    "replace" => {
+                        for name in ["TOKEN", "OTHER"] {
+                            store
+                                .store(
+                                    CHAT,
+                                    name,
+                                    "회귀 시험",
+                                    "rotated-fixture-value",
+                                    ChatSecretSource::User,
+                                )
+                                .expect("replace");
+                        }
+                    }
+                    "discard" => {
+                        store.discard(CHAT, "TOKEN").expect("discard token");
+                        store.discard(CHAT, "OTHER").expect("discard other");
+                    }
+                    "discard_chat" => store.discard_chat(CHAT),
+                    "expire" => {
+                        for entry in store.lock().expect("lock").iter_mut() {
+                            if entry.chat_id == CHAT {
+                                entry.expires_at = 0;
+                            }
+                        }
+                        assert!(store.snapshot(CHAT).secrets.is_empty());
+                    }
+                    _ => unreachable!(),
+                }
+                std::fs::write(&resume, b"resume").expect("resume");
+                let receipt = run.join().expect("join").expect("run");
+                assert!(ready_seen, "{change}: child did not reach the barrier");
+                receipt
+            });
+            assert!(receipt.success, "{change}: command failed");
+            for output in [&receipt.stdout, &receipt.stderr] {
+                assert!(!output.contains("injected-fixture-value"), "{change}");
+                assert!(!output.contains("unreferenced-fixture-value"), "{change}");
+                assert!(output.contains(REDACTED), "{change}");
+                if change == "replace" {
+                    assert!(!output.contains("rotated-fixture-value"));
+                }
+            }
+            assert!(receipt
+                .stdout
+                .contains(&format!("env={REDACTED} arg={REDACTED}")));
+            assert!(receipt.stdout.contains(&format!("in={REDACTED}")));
+        }
     }
 
     /// C15-4: 제한 시간은 자식 하나가 아니라 실행 전체를 묶는다. 자식이 먼저 끝나도 파이프를

@@ -538,6 +538,48 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn c3_12_g10_fallback_copy_preserves_nested_files_and_symlinks() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("source");
+        let nested = source.join("nested");
+        fs::create_dir_all(&nested).expect("nested source directory");
+        fs::write(nested.join("payload.txt"), b"payload").expect("source file");
+
+        let outside = directory.path().join("outside.txt");
+        fs::write(&outside, b"outside payload").expect("external target");
+        let links = [
+            ("live", outside.as_path()),
+            ("dangling", Path::new("../missing-target")),
+        ];
+        for (name, target) in links {
+            std::os::unix::fs::symlink(target, nested.join(name)).expect("source link");
+        }
+
+        let destination = directory.path().join("copy");
+        // C3-12/G10: exercise the rename fallback without requiring a second volume.
+        copy_directory_recursive(&source, &destination).expect("copy without following links");
+
+        for root in [&source, &destination] {
+            assert_eq!(
+                fs::read(root.join("nested/payload.txt")).expect("nested payload"),
+                b"payload"
+            );
+            for (name, target) in links {
+                assert_eq!(
+                    fs::read_link(root.join("nested").join(name)).expect("preserved link"),
+                    target
+                );
+            }
+            assert!(!root.join("missing-target").exists());
+        }
+        assert_eq!(
+            fs::read(&outside).expect("external payload"),
+            b"outside payload"
+        );
+    }
+
     #[test]
     fn purge_refuses_an_item_id_that_escapes_the_trash_root() {
         let directory = tempfile::tempdir().expect("temporary directory");

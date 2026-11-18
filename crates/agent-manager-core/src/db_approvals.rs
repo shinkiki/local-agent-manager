@@ -469,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn c10_12_a_token_rejects_a_different_connection_id() {
+    fn c10_12_a_token_rejects_a_different_connection_id_without_consuming_it() {
         let store = DbApprovalStore::new();
         let ticket = open(&store, "UPDATE t SET a = 1");
         store.resolve("chat", &ticket.id, true).expect("resolve");
@@ -486,10 +486,23 @@ mod tests {
             )
             .expect_err("different connection");
         assert!(matches!(error, CoreError::Conflict(ref msg) if msg.contains("다른 연결")));
+        let decision = store
+            .consume(
+                "chat",
+                DbApprovalConsume {
+                    approval_id: &ticket.id,
+                    connection_id: "kbf",
+                    sql: "UPDATE t SET a = 1",
+                    kind: DbApprovalKind::Dml,
+                },
+            )
+            .expect("the original approval survives the mismatched request");
+        assert_eq!(decision.id, ticket.id);
+        assert!(decision.granted);
     }
 
     #[test]
-    fn c10_12_a_token_rejects_a_different_statement_kind() {
+    fn c10_12_a_token_rejects_a_different_statement_kind_without_consuming_it() {
         let store = DbApprovalStore::new();
         let ticket = open(&store, "UPDATE t SET a = 1");
         store.resolve("chat", &ticket.id, true).expect("resolve");
@@ -508,6 +521,19 @@ mod tests {
         assert!(
             matches!(error, CoreError::Conflict(ref msg) if msg.contains("dml 문장으로 받은 것"))
         );
+        let decision = store
+            .consume(
+                "chat",
+                DbApprovalConsume {
+                    approval_id: &ticket.id,
+                    connection_id: "kbf",
+                    sql: "UPDATE t SET a = 1",
+                    kind: DbApprovalKind::Dml,
+                },
+            )
+            .expect("the original approval survives the mismatched request");
+        assert_eq!(decision.id, ticket.id);
+        assert!(decision.granted);
     }
 
     #[test]

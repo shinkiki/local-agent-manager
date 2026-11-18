@@ -66,7 +66,10 @@ export function workflowModelInputIsLadder(name: string): boolean {
 
 /** 페이싱 계약에서 공급자 모델 ID를 받는 예약 입력 이름. */
 export function workflowModelInputProvider(name: string): ProviderId | null {
-  return WORKFLOW_MODEL_INPUT_PROVIDERS[name] ?? null;
+  // V2/V4: 계약의 일반 입력 이름이 Object.prototype 속성과 같아도 모델 칸으로 읽지 않는다.
+  return Object.prototype.hasOwnProperty.call(WORKFLOW_MODEL_INPUT_PROVIDERS, name)
+    ? WORKFLOW_MODEL_INPUT_PROVIDERS[name]
+    : null;
 }
 
 /**

@@ -180,8 +180,11 @@ export function nodeTestDeclaration(text: string, name: string): 'ok' | 'skipped
     const head = bodyAt < 0 ? after : after.slice(0, bodyAt);
     // `skip: false` 는 끈 것이 아니다. 부정 선행(`(?!false)`)으로 적으면 `\s*` 가 빈 문자열로
     // 되감겨 공백 앞에서 성립해 버리므로, 값을 집어 와서 비교한다.
-    const option = /\{[\s\S]*?\b(skip|todo)\s*:\s*([^,}\s]+)/.exec(head);
-    if (option && option[2] !== 'false') continue;
+    // V2: 첫 옵션이 false여도 뒤의 다른 옵션이 시험을 끌 수 있다.
+    const options = /\{([\s\S]*)/.exec(head)?.[1] ?? '';
+    const disabled = [...options.matchAll(/\b(?:skip|todo)\s*:\s*([^,}\s]+)/g)]
+      .some((option) => option[1] !== 'false');
+    if (disabled) continue;
     return 'ok';
   }
   return sawTitle ? 'skipped' : 'missing';

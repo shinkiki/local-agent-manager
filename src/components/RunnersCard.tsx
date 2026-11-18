@@ -5,6 +5,7 @@ import {
   checkRunner,
   deleteRunner,
   deleteRunnerProject,
+  getProjectRegistry,
   listRunners,
   saveRunner,
   setRunnerEnabled,
@@ -12,10 +13,10 @@ import {
 } from "../lib/ipc";
 import { useI18n } from "../lib/i18n";
 import type { RunnerCheckReceipt, RunnerProject, RunnerSkipCode, RunnerSshServerOption, RunnersSnapshot, RunnerView } from "../types";
-import { ErrorBanner, useBusyAction, useConfirm } from "./Shared";
+import { AppToggle, ErrorBanner, useBusyAction, useConfirm } from "./Shared";
 import { errorText } from "../lib/errorText";
 import { createLatestGate } from "../lib/latestRequest";
-import { parseWholeNumber, wholeNumberWithin } from "../lib/runnerFields";
+import { parseWholeNumber, runnerPathKey, runnerProjectName, wholeNumberWithin } from "../lib/runnerFields";
 
 /** 백엔드 저장 형식(u32)의 끝. 브라우저 자리 상한이 이 값이면 상한이 없다는 뜻이다. */
 const U32_MAX = 4_294_967_295;
@@ -37,6 +38,14 @@ interface ProjectDraft {
   name: string;
   root: string;
   exclude: string;
+  /** 프로젝트 목록에서 고른 줄. 경로는 그 프로젝트 폴더로 정해져 있어 이름·제외 폴더만 고친다. */
+  fixedRoot: boolean;
+}
+
+/** 프로젝트 화면의 활성 프로젝트 하나(인덱스 애드온의 적용 프로젝트와 같은 목록). */
+interface RegistryProject {
+  path: string;
+  name: string;
 }
 
 /** 서버 이름이 없으면 접속 대상을 이름 대신 보인다. SSH 탭과 같은 규칙이다. */
@@ -134,6 +143,9 @@ export function RunnersCard({ active, openTab }: { active: boolean; openTab?: (t
   const [draft, setDraft] = useState<RunnerDraft | null>(null);
   const [projectDraft, setProjectDraft] = useState<ProjectDraft | null>(null);
   const [receipts, setReceipts] = useState<Record<string, RunnerCheckReceipt>>({});
+  // null 은 아직 못 읽음 — 그동안 저장된 줄을 직접 등록 쪽으로 잘못 나누지 않는다.
+  const [registry, setRegistry] = useState<RegistryProject[] | null>(null);
+  const [registryFailed, setRegistryFailed] = useState(false);
   const loadedRef = useRef(false);
 
   // 목록을 고치는 응답은 마지막에 시작한 요청 것만 반영한다(DbConnectionsCard와 같은 이유).
@@ -156,12 +168,28 @@ export function RunnersCard({ active, openTab }: { active: boolean; openTab?: (t
     }
   }, [snapshotGate, setError]);
 
+  // 고를 수 있는 프로젝트는 인덱스 애드온과 같은 기준(활성이면서 폴더가 있는 프로젝트)이다.
+  // 목록을 못 읽어도 직접 등록은 되므로 실행기 오류와 따로 둔다.
+  const [registryGate] = useState(createLatestGate);
+  const loadRegistry = useCallback(async () => {
+    const isCurrent = registryGate.begin();
+    try {
+      const entries = await getProjectRegistry();
+      if (!isCurrent()) return;
+      setRegistry(entries.filter((entry) => entry.active && entry.exists).map((entry) => ({ path: entry.path, name: entry.name })));
+      setRegistryFailed(false);
+    } catch {
+      if (isCurrent()) setRegistryFailed(true);
+    }
+  }, [registryGate]);
+
   useEffect(() => {
     if (!active) { loadedRef.current = false; return; }
     if (loadedRef.current) return;
     loadedRef.current = true;
     void load();
-  }, [active, load]);
+    void loadRegistry();
+  }, [active, load, loadRegistry]);
 
   const run = async (token: string, action: () => Promise<void>) => {
     if (busy !== null) return;
@@ -250,10 +278,10 @@ export function RunnersCard({ active, openTab }: { active: boolean; openTab?: (t
     if (draft?.id === runner.id) setDraft(null);
   });
 
-  const openProjectEditor = (project: RunnerProject | null) => {
+  const openProjectEditor = (project: RunnerProject | null, fixedRoot = false) => {
     setProjectDraft(project
-      ? { id: project.id, name: project.name, root: project.root, exclude: project.exclude.join(", ") }
-      : { id: "", name: "", root: "", exclude: "" });
+      ? { id: project.id, name: project.name, root: project.root, exclude: project.exclude.join(", "), fixedRoot }
+      : { id: "", name: "", root: "", exclude: "", fixedRoot: false });
   };
 
   const saveProject = () => run("project-save", async () => {
@@ -283,6 +311,37 @@ export function RunnersCard({ active, openTab }: { active: boolean; openTab?: (t
     if (projectDraft?.id === project.id) setProjectDraft(null);
   });
 
+  /** 프로젝트 목록의 한 줄에 대응하는 등록 줄. 둘 다 정규 경로라 경로로 짝짓는다. */
+  const registeredFor = (path: string) => snapshot?.projects.find((project) => runnerPathKey(project.root) === runnerPathKey(path));
+
+  /**
+   * 프로젝트 목록의 스위치. 켜면 그 폴더를 이름을 지어 한 줄로 추가하고, 끄면 그 줄을 뺀다.
+   * 제외 폴더를 적어 둔 줄은 끄면 그 설정도 사라지므로 한 번 묻는다.
+   */
+  const toggleRegistryProject = (option: RegistryProject) => run(`project-toggle:${option.path}`, async () => {
+    if (!snapshot) return;
+    const saved = registeredFor(option.path);
+    if (!saved) {
+      const name = runnerProjectName(option.name, option.path, snapshot.projects.map((project) => project.name));
+      await applyLatest(addRunnerProject({ id: null, name, root: option.path, exclude: [] }));
+      return;
+    }
+    if (saved.exclude.length > 0) {
+      const ok = await confirm({
+        title: text("이 프로젝트를 보내지 않을까요?", "Stop sending this project?"),
+        message: text(
+          `${option.name}의 검증 명령을 더 이상 실행기로 보내지 않고, 적어 둔 제외 폴더(${saved.exclude.join(", ")})도 지웁니다. 폴더 자체는 그대로입니다.`,
+          `Verification commands from ${option.name} will no longer go to runners, and its excluded folders (${saved.exclude.join(", ")}) are cleared. The folder itself is unchanged.`,
+        ),
+        confirmLabel: text("보내지 않기", "Stop sending"),
+        tone: "danger",
+      });
+      if (!ok) return;
+    }
+    await applyLatest(deleteRunnerProject(saved.id));
+    if (projectDraft?.id === saved.id) setProjectDraft(null);
+  });
+
   const selectedServer = snapshot?.sshServers.find((server) => server.id === draft?.serverId) ?? null;
   const serverHint = draft?.serverMissing && !draft.serverId
     ? text("가리키던 SSH 서버가 지워졌습니다. 서버를 다시 고르세요.", "The SSH server this runner pointed at was removed. Pick a server again.")
@@ -290,6 +349,42 @@ export function RunnersCard({ active, openTab }: { active: boolean; openTab?: (t
       "이 서버는 에이전트 사용이 꺼져 있어 회차가 쓰지 않습니다. SSH 탭에서 켜세요.",
       "Agent use is off for this server, so rounds will skip it. Turn it on in the SSH tab.",
     );
+
+  /** 경로 `child`가 `parent` 아래(같은 경로 제외)에 있는지. 루트(`/`)는 아무것도 품지 않는 것으로 본다. */
+  const isInside = (child: string, parent: string) => {
+    const [inner, outer] = [runnerPathKey(child), runnerPathKey(parent)];
+    return outer !== "" && (inner.startsWith(`${outer}/`) || inner.startsWith(`${outer}\\`));
+  };
+  /**
+   * 프로젝트 목록의 어느 프로젝트 폴더와도 같지 않은 줄. 하위 폴더·다른 저장소·비활성 프로젝트가 여기 남는다.
+   * 목록을 읽는 중이면 비워 두고, 끝내 못 읽었으면 모든 줄을 여기서 고치게 한다.
+   */
+  const manualProjects = registry === null
+    ? (registryFailed ? snapshot?.projects ?? [] : [])
+    : (snapshot?.projects ?? []).filter((project) =>
+      !registry.some((option) => runnerPathKey(option.path) === runnerPathKey(project.root)));
+
+  const projectEditor = projectDraft && (
+    <div className="db-connection-editor">
+      <Field label={text("이름", "Name")} hint={text("영문 소문자·숫자·.·_·- 만 씁니다. 원격 작업 폴더 이름으로 쓰입니다. 예: dead-route-game", "Lowercase letters, digits, . _ - only. Used as the remote work folder name. e.g. dead-route-game")}>
+        <input value={projectDraft.name} maxLength={64} placeholder="dead-route-game" onChange={(event) => setProjectDraft({ ...projectDraft, name: event.target.value })} />
+      </Field>
+      {projectDraft.fixedRoot
+        ? <Field label={text("폴더 경로", "Folder path")} hint={text("프로젝트 폴더로 정해져 있습니다. 다른 폴더는 직접 등록으로 추가하세요.", "Fixed to the project folder. Add other folders by path.")}>
+          <code className="db-connection-target">{projectDraft.root}</code>
+        </Field>
+        : <Field label={text("폴더 경로", "Folder path")} hint={text("심볼릭 링크는 풀어서 저장합니다.", "Symbolic links are resolved before saving.")}>
+          <input value={projectDraft.root} placeholder="/workspace/dead-route-game" onChange={(event) => setProjectDraft({ ...projectDraft, root: event.target.value })} />
+        </Field>}
+      <Field label={text("제외 폴더", "Excluded folders")} hint={text("폴더 바로 아래 이름을 쉼표로 나눠 적습니다. 예: _land", "Names directly under the folder, comma-separated. e.g. _land")}>
+        <input value={projectDraft.exclude} placeholder="_land" onChange={(event) => setProjectDraft({ ...projectDraft, exclude: event.target.value })} />
+      </Field>
+      <div className="db-connection-editor-actions">
+        <button className="button compact" type="button" onClick={() => setProjectDraft(null)}>{text("취소", "Cancel")}</button>
+        <button className="button compact primary" type="button" data-ui-anchor="addons.runners.project-save" disabled={!projectDraft.name.trim() || !projectDraft.root.trim() || busy !== null} onClick={() => void saveProject()}>{text("저장", "Save")}</button>
+      </div>
+    </div>
+  );
 
   return (
     <section className="settings-card db-connections-card" data-ui-anchor="addons.runners-content">
@@ -309,7 +404,7 @@ export function RunnersCard({ active, openTab }: { active: boolean; openTab?: (t
         : <>
           <div className="ssh-key-location">
             <span><strong>{text("등록된 실행기", "Registered")}</strong><code>{snapshot.runners.length}</code></span>
-            <button className="button compact" type="button" disabled={busy !== null} onClick={() => void load()}><RefreshCw size={13} />{text("새로고침", "Refresh")}</button>
+            <button className="button compact" type="button" disabled={busy !== null} onClick={() => { void load(); void loadRegistry(); }}><RefreshCw size={13} />{text("새로고침", "Refresh")}</button>
           </div>
           {snapshot.runners.length === 0
             ? <div className="plugin-empty-state"><i><Network size={25} /></i><div><strong>{text("등록된 실행기가 없습니다", "No runners yet")}</strong><small>{text("SSH 탭에 등록한 서버를 골라 실행기로 추가합니다.", "Add a server registered in the SSH tab as a runner.")}</small></div></div>
@@ -374,10 +469,46 @@ export function RunnersCard({ active, openTab }: { active: boolean; openTab?: (t
           <div className="ssh-key-location">
             <span><strong>{text("보낼 프로젝트 폴더", "Project folders to send")}</strong><code>{snapshot.projects.length}</code></span>
           </div>
-          {snapshot.projects.length === 0
-            ? <div className="plugin-empty-state"><i><FolderGit2 size={25} /></i><div><strong>{text("등록된 폴더가 없습니다", "No folders yet")}</strong><small>{text("여기 적은 폴더의 검증 명령만 실행기로 갑니다.", "Only verification commands from folders listed here go to runners.")}</small></div></div>
+          <p className="runner-projects-note">{text(
+            "켠 프로젝트 폴더의 검증 명령만 실행기로 갑니다. 프로젝트 화면의 활성 프로젝트가 여기 나타나므로 경로를 따로 적지 않아도 됩니다. 원격 작업 폴더 이름은 프로젝트 이름에서 지으며 편집에서 바꾸거나 제외 폴더를 적을 수 있습니다.",
+            "Only verification commands from the project folders you turn on go to runners. Active projects from the Projects view appear here, so there is no path to enter. The remote work folder name comes from the project name; use Edit to change it or list excluded folders.",
+          )}</p>
+          <ul className="project-registry-list runner-project-rows" data-ui-anchor="addons.runners.projects">
+            {registryFailed && <li className="project-registry-row"><span className="runner-project-note warn" role="status">{text("프로젝트 목록을 불러오지 못했습니다. 새로고침하거나 아래에서 경로로 직접 추가하세요.", "Could not load the project list. Refresh, or add a folder by path below.")}</span></li>}
+            {registry === null
+              ? !registryFailed && <li className="project-registry-row"><span className="runner-project-note" role="status">{text("프로젝트 목록을 불러오는 중…", "Loading projects…")}</span></li>
+              : registry.length === 0
+              ? <li className="project-registry-row"><span className="runner-project-note" role="status">{text("활성 프로젝트가 없습니다. 프로젝트 화면에 활성 프로젝트가 생기면 여기에 나타납니다.", "No active projects. Active projects appear here once they show up in the Projects view.")}</span></li>
+              : registry.map((option) => {
+                const saved = registeredFor(option.path);
+                const nested = saved ? undefined : manualProjects.find((project) => isInside(project.root, option.path));
+                const note = saved
+                  ? `${text("보내는 중", "Sending")} · ${text("이름", "Name")} ${saved.name}${saved.exclude.length > 0 ? ` · ${text("제외", "Excluded")} ${saved.exclude.join(", ")}` : ""}`
+                  : nested
+                    ? text(`하위 폴더 ${nested.name}만 직접 등록되어 있습니다`, `Only its subfolder ${nested.name} is added directly`)
+                    : text("보내지 않음", "Not sent");
+                return <li key={option.path} className={`project-registry-row${saved ? "" : " inactive"}`}>
+                  <div className="project-registry-main">
+                    <div className="project-registry-name"><strong>{option.name}</strong></div>
+                    <span className="project-registry-path" title={option.path}>{option.path}</span>
+                    <span className="runner-project-note">{note}</span>
+                  </div>
+                  <span className="runner-project-actions">
+                    {saved && <button className="button compact" type="button" disabled={busy !== null} aria-label={text(`${option.name} 편집`, `Edit ${option.name}`)} onClick={() => openProjectEditor(saved, true)}>{text("편집", "Edit")}</button>}
+                    <AppToggle checked={saved !== undefined} disabled={busy !== null} label={text(`${option.name} 실행기로 보내기`, `Send ${option.name} to runners`)} onChange={() => void toggleRegistryProject(option)} />
+                  </span>
+                </li>;
+              })}
+          </ul>
+          {projectDraft?.fixedRoot && projectEditor}
+
+          <div className="ssh-key-location">
+            <span><strong>{text("직접 등록한 폴더", "Folders added by path")}</strong><code>{manualProjects.length}</code></span>
+          </div>
+          {manualProjects.length === 0
+            ? <div className="plugin-empty-state"><i><FolderGit2 size={25} /></i><div><strong>{text("직접 등록한 폴더가 없습니다", "No folders added by path")}</strong><small>{text("프로젝트 목록에 없는 폴더(프로젝트의 하위 폴더·다른 저장소 등)만 경로로 추가합니다.", "Add by path only folders that are not in the project list (a project's subfolder, another repository, etc.).")}</small></div></div>
             : <div className="plugin-list db-connection-list">
-              {snapshot.projects.map((project) => (
+              {manualProjects.map((project) => (
                 <article className="db-connection-row" key={project.id}>
                   <div className="db-connection-head"><strong>{project.name}</strong></div>
                   <code className="db-connection-target">{project.root}</code>
@@ -389,29 +520,15 @@ export function RunnersCard({ active, openTab }: { active: boolean; openTab?: (t
                 </article>
               ))}
             </div>}
-          {projectDraft === null
+          {projectDraft === null || projectDraft.fixedRoot
             ? <div className="settings-update-body">
               <span className="settings-update-status">
-                <strong>{text("새 프로젝트 폴더", "New project folder")}</strong>
+                <strong>{text("새 폴더", "New folder")}</strong>
                 <small>{text("이 기계에 있는 절대 경로 폴더여야 합니다. 홈 자체·자격증명 폴더·앱 데이터(AIA 작업공간 하위 제외)는 쓸 수 없습니다.", "Must be an absolute path to a folder on this machine. Your home itself, credential folders and app data (except under the AIA workspace) are not allowed.")}</small>
               </span>
               <button className="button compact primary" type="button" data-ui-anchor="addons.runners.project-add" disabled={busy !== null} onClick={() => openProjectEditor(null)}><Plus size={13} />{text("폴더 추가", "Add folder")}</button>
             </div>
-            : <div className="db-connection-editor">
-              <Field label={text("이름", "Name")} hint={text("영문 소문자·숫자·.·_·- 만 씁니다. 예: dead-route-game", "Lowercase letters, digits, . _ - only. e.g. dead-route-game")}>
-                <input value={projectDraft.name} maxLength={64} placeholder="dead-route-game" onChange={(event) => setProjectDraft({ ...projectDraft, name: event.target.value })} />
-              </Field>
-              <Field label={text("폴더 경로", "Folder path")} hint={text("심볼릭 링크는 풀어서 저장합니다.", "Symbolic links are resolved before saving.")}>
-                <input value={projectDraft.root} placeholder="/workspace/dead-route-game" onChange={(event) => setProjectDraft({ ...projectDraft, root: event.target.value })} />
-              </Field>
-              <Field label={text("제외 폴더", "Excluded folders")} hint={text("폴더 바로 아래 이름을 쉼표로 나눠 적습니다. 예: _land", "Names directly under the folder, comma-separated. e.g. _land")}>
-                <input value={projectDraft.exclude} placeholder="_land" onChange={(event) => setProjectDraft({ ...projectDraft, exclude: event.target.value })} />
-              </Field>
-              <div className="db-connection-editor-actions">
-                <button className="button compact" type="button" onClick={() => setProjectDraft(null)}>{text("취소", "Cancel")}</button>
-                <button className="button compact primary" type="button" disabled={!projectDraft.name.trim() || !projectDraft.root.trim() || busy !== null} onClick={() => void saveProject()}>{text("저장", "Save")}</button>
-              </div>
-            </div>}
+            : projectEditor}
         </>}
       {confirmDialog}
     </section>

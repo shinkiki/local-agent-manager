@@ -750,6 +750,69 @@ pub fn resolve_round_decision(
     index: usize,
     answer: &str,
 ) -> Result<RoundReport, CoreError> {
+    resolve_round_decision_with(app_data_dir, report_id, index, answer, |_, _| Ok(()))
+}
+
+/// 회차 보고 연결(무인 회차 전용 통로)로 들어온 답. 사람 결정은 받지 않고, 목표의 결정 방식이
+/// 허락한 답만 적는다 — 추천적용이면 추천안 원문, 완전자동이면 아무 답, 수동이면 없음.
+/// 회차 지침에만 맡기면 통로를 연 순간 사람이 정할 결정까지 회차가 닫을 수 있어 여기서 막는다.
+/// 거절은 `Conflict` 다 — 인자 모양이 틀린 것이 아니라 지금 상태가 허락하지 않는 것이라,
+/// 인자 예시를 붙여 다른 모양으로 다시 부르게 만들지 않는다.
+pub fn resolve_round_decision_by_round(
+    app_data_dir: &Path,
+    report_id: &str,
+    index: usize,
+    answer: &str,
+) -> Result<RoundReport, CoreError> {
+    let goal_id = get_round_report(app_data_dir, report_id)?
+        .goal_id
+        .ok_or_else(|| {
+            CoreError::Conflict(
+                "회차 목표에 묶이지 않은 보고의 결정은 사람이 화면에서 답합니다".to_owned(),
+            )
+        })?;
+    let mode = get_round_goal(app_data_dir, &goal_id)?.decision_mode;
+    resolve_round_decision_with(
+        app_data_dir,
+        report_id,
+        index,
+        answer,
+        |decision, answer| round_may_answer(mode, decision, answer),
+    )
+}
+
+fn round_may_answer(
+    mode: RoundDecisionMode,
+    decision: &RoundDecision,
+    answer: &str,
+) -> Result<(), CoreError> {
+    if decision.requires_human {
+        return Err(CoreError::Conflict(
+            "사람이 정할 결정이라 회차가 답할 수 없습니다".to_owned(),
+        ));
+    }
+    match mode {
+        RoundDecisionMode::Manual => Err(CoreError::Conflict(
+            "결정 방식이 수동인 목표라 회차가 답할 수 없습니다".to_owned(),
+        )),
+        RoundDecisionMode::Recommended
+            if decision.recommendation.as_deref().map(str::trim) != Some(answer) =>
+        {
+            Err(CoreError::Conflict(
+                "추천적용 목표에서는 추천안 원문만 답으로 적을 수 있습니다".to_owned(),
+            ))
+        }
+        RoundDecisionMode::Recommended | RoundDecisionMode::Automatic => Ok(()),
+    }
+}
+
+fn resolve_round_decision_with(
+    app_data_dir: &Path,
+    report_id: &str,
+    index: usize,
+    answer: &str,
+    allow: impl Fn(&RoundDecision, &str) -> Result<(), CoreError>,
+) -> Result<RoundReport, CoreError> {
     let answer = required_text(answer, MAX_ITEM_CHARS, "결정")?;
     let report_id = report_id.trim().to_owned();
     let store = REPORTS_STORE.update(app_data_dir, |store: &mut ReportsStore| {
@@ -759,8 +822,12 @@ pub fn resolve_round_decision(
             .find(|report| report.id == report_id)
             .ok_or_else(|| CoreError::NotFound(format!("회차 보고 {report_id} 이(가) 없습니다")))?;
         let decision = report.decisions.get_mut(index).ok_or_else(|| {
-            CoreError::NotFound(format!("보고에 {}번째 결정이 없습니다", index + 1))
+            CoreError::NotFound(format!(
+                "보고에 {}번째 결정이 없습니다",
+                index.saturating_add(1)
+            ))
         })?;
+        allow(decision, &answer)?;
         if let Some(resolved) = &decision.resolved {
             if resolved == &answer {
                 return Ok(false);
@@ -970,6 +1037,53 @@ mod tests {
         );
         delete_round_report(dir.path(), &report.id).unwrap();
         assert!(get_round_report(dir.path(), &report.id).is_err());
+    }
+
+    #[test]
+    fn v2_g7_out_of_range_decision_indices_preserve_reports() {
+        let dir = temp_dir();
+        let goal = create_round_goal(dir.path(), goal_input()).unwrap();
+        update_round_goal(
+            dir.path(),
+            &goal.id,
+            RoundGoalPatch {
+                decision_mode: Some(RoundDecisionMode::Automatic),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let report = record_round_report(
+            dir.path(),
+            RoundReportInput {
+                goal_id: Some(goal.id),
+                title: "결정 번호 경계".to_owned(),
+                decisions: vec![RoundDecision {
+                    question: "어떻게 진행할까".to_owned(),
+                    options: vec!["계속한다".to_owned()],
+                    recommendation: None,
+                    resolved: None,
+                    requires_human: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let before = std::fs::read(REPORTS_STORE.path(dir.path())).unwrap();
+        for resolve in [resolve_round_decision, resolve_round_decision_by_round] {
+            for index in [1, usize::MAX - 1, usize::MAX] {
+                let result = resolve(dir.path(), &report.id, index, "계속한다");
+                assert!(matches!(result, Err(CoreError::NotFound(message))
+                    if message.contains("결정이 없습니다") && !message.contains("0번째")));
+                // G7/V2: 범위 밖 입력은 기존 보고를 바꾸거나 저장소를 못 쓰게 만들지 않는다.
+                assert_eq!(
+                    std::fs::read(REPORTS_STORE.path(dir.path())).unwrap(),
+                    before
+                );
+            }
+        }
+        let answered =
+            resolve_round_decision_by_round(dir.path(), &report.id, 0, "계속한다").unwrap();
+        assert_eq!(answered.decisions[0].resolved.as_deref(), Some("계속한다"));
     }
 
     #[test]
@@ -1237,5 +1351,112 @@ mod tests {
         )
         .expect_err("null char must be rejected");
         assert!(matches!(err, CoreError::InvalidInput(_)));
+    }
+
+    // 회차 보고 연결로 온 답: 사람 결정·수동 목표는 거절, 추천적용은 추천안 원문만.
+    #[test]
+    fn a_round_answers_only_what_the_goal_decision_mode_allows() {
+        let dir = temp_dir();
+        let goal = create_round_goal(dir.path(), goal_input()).unwrap();
+        let decision = |requires_human: bool| RoundDecision {
+            question: "주기를 바꿀까".to_owned(),
+            options: vec!["바꾼다".to_owned(), "둔다".to_owned()],
+            recommendation: Some("둔다".to_owned()),
+            resolved: None,
+            requires_human,
+        };
+        let report = record_round_report(
+            dir.path(),
+            RoundReportInput {
+                goal_id: Some(goal.id.clone()),
+                title: "결정 둘".to_owned(),
+                decisions: vec![decision(true), decision(false)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let set_mode = |mode| {
+            update_round_goal(
+                dir.path(),
+                &goal.id,
+                RoundGoalPatch {
+                    decision_mode: Some(mode),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        };
+        let by_round =
+            |index, answer| resolve_round_decision_by_round(dir.path(), &report.id, index, answer);
+
+        // 수동(기본)이면 회차는 어떤 결정에도 답하지 못한다.
+        assert!(matches!(by_round(1, "둔다"), Err(CoreError::Conflict(_))));
+        set_mode(RoundDecisionMode::Automatic);
+        // 완전자동이어도 사람 결정은 남는다.
+        assert!(matches!(by_round(0, "둔다"), Err(CoreError::Conflict(_))));
+        set_mode(RoundDecisionMode::Recommended);
+        assert!(matches!(by_round(1, "바꾼다"), Err(CoreError::Conflict(_))));
+        // 거절된 답은 아무것도 적지 않는다.
+        let stored = get_round_report(dir.path(), &report.id).unwrap();
+        assert!(stored.decisions.iter().all(|d| d.resolved.is_none()));
+        let answered = by_round(1, " 둔다 ").unwrap();
+        assert_eq!(answered.decisions[1].resolved.as_deref(), Some("둔다"));
+        assert!(answered.decisions[0].resolved.is_none());
+        // 완전자동이면 추천안이 아닌 구체적인 답도 적는다(사람 결정은 아님).
+        let second = record_round_report(
+            dir.path(),
+            RoundReportInput {
+                goal_id: Some(goal.id.clone()),
+                title: "추천 없음".to_owned(),
+                decisions: vec![
+                    RoundDecision {
+                        recommendation: None,
+                        ..decision(false)
+                    },
+                    decision(false),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_round_decision_by_round(dir.path(), &second.id, 0, "둔다"),
+            Err(CoreError::Conflict(_))
+        ));
+        set_mode(RoundDecisionMode::Automatic);
+        let free =
+            resolve_round_decision_by_round(dir.path(), &second.id, 1, "주기를 반으로 줄인다")
+                .unwrap();
+        assert_eq!(
+            free.decisions[1].resolved.as_deref(),
+            Some("주기를 반으로 줄인다")
+        );
+        // 사람 경로는 그대로 — 사람 결정도 화면에서 답한다.
+        let human = resolve_round_decision(dir.path(), &report.id, 0, "바꾼다").unwrap();
+        assert_eq!(human.decisions[0].resolved.as_deref(), Some("바꾼다"));
+    }
+
+    #[test]
+    fn a_round_cannot_answer_a_report_without_a_goal() {
+        let dir = temp_dir();
+        let report = record_round_report(
+            dir.path(),
+            RoundReportInput {
+                title: "목표 없음".to_owned(),
+                decisions: vec![RoundDecision {
+                    question: "?".to_owned(),
+                    options: vec!["a".to_owned()],
+                    recommendation: Some("a".to_owned()),
+                    resolved: None,
+                    requires_human: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_round_decision_by_round(dir.path(), &report.id, 0, "a"),
+            Err(CoreError::Conflict(_))
+        ));
     }
 }

@@ -50,6 +50,8 @@ export interface ChatSocketRuntime extends ChatSocketAttemptTarget {
   backendInstanceId: string;
   /** 되살릴 수 없는 실패로 재연결을 포기한 이유. 이후 조작 시도에 이 이유를 그대로 알린다. */
   stoppedReason: string | null;
+  /** 접근 확인부터 attach의 첫 state까지 진행 중인 재연결이 있는지. */
+  reconnecting: boolean;
 }
 
 /**
@@ -69,6 +71,7 @@ function createChatSocketRuntime(
     detached: false,
     takenOver: false,
     stoppedReason: null,
+    reconnecting: false,
     activeChatId: null,
     lastSession: null,
     eventBatch: createChatEventBatch(onEvent),
@@ -205,6 +208,10 @@ function handleChatReconnectFailure(runtime: ChatSocketRuntime, cause: unknown):
 }
 
 async function reconnectChatSocket(runtime: ChatSocketRuntime, chatId: string): Promise<void> {
+  // V4: 끊긴 동안의 전송이 새 타이머를 걸어도 확인·attach는 하나만 진행한다.
+  // 성공 뒤 남은 예약도 현재의 정상 소켓을 새 소켓으로 교체하지 않는다.
+  if (runtime.reconnecting || runtime.detached || writableChatSocket(runtime)) return;
+  runtime.reconnecting = true;
   try {
     // attach를 보내기 전에 프로세스가 그대로인지 확인한다. 교체된 뒤에는 attach가
     // 영원히 실패하므로, 재기동을 연결 장애로 오해하고 무한히 두드리지 않는다.
@@ -223,5 +230,7 @@ async function reconnectChatSocket(runtime: ChatSocketRuntime, chatId: string): 
     runtime.reconnectWatch.reset();
   } catch (cause) {
     handleChatReconnectFailure(runtime, cause);
+  } finally {
+    runtime.reconnecting = false;
   }
 }

@@ -34,6 +34,13 @@ pub(crate) fn acquire(
 ) -> Result<StoreLock, CoreError> {
     fs::create_dir_all(app_data_dir)?;
     let file = open_private_file(&app_data_dir.join(lock_file_name), false)?;
+    // G10: FIFO 같은 특수 파일은 권한이나 잠금을 잡기 전에 거절한다.
+    // 경로가 교체되어도 실제로 연 대상을 검사하도록 파일 서술자 메타데이터에서 종류를 읽는다.
+    if !file.metadata()?.is_file() {
+        return Err(CoreError::InvalidInput(format!(
+            "{label} 잠금은 일반 파일이어야 합니다"
+        )));
+    }
     FileExt::lock(&file)
         .map_err(|error| CoreError::Runtime(format!("{label} 잠금을 얻지 못했습니다: {error}")))?;
     Ok(StoreLock { file })
@@ -86,6 +93,29 @@ mod tests {
             !missing.exists(),
             "a dangling link must not create its target"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_lock_file_guards_reject_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let app_data_dir = tempfile::tempdir().expect("app data directory");
+        let lock_path = app_data_dir.path().join("store.lock");
+        let fifo_path =
+            std::ffi::CString::new(lock_path.as_os_str().as_bytes()).expect("FIFO path");
+        // SAFETY: fifo_path is a valid, NUL-terminated path retained for this call.
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+
+        let result = acquire(app_data_dir.path(), "store.lock", "테스트 저장소");
+
+        let metadata = fs::symlink_metadata(&lock_path).expect("unchanged FIFO");
+        assert!(metadata.file_type().is_fifo());
+        assert!(matches!(
+            result,
+            Err(CoreError::InvalidInput(message)) if message.contains("일반 파일이어야 합니다")
+        ));
     }
 
     #[test]

@@ -18,8 +18,13 @@ use serde_json::Value;
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 
-use crate::app_data_file::{ensure_schema_version, write_private_json};
+use crate::app_data_file::{ensure_schema_version, read_private_json, write_private_json};
 use crate::clock::now_ms;
+use crate::document_conversation::{
+    compile_key_pattern, split_changes_by_key, validate_conversation, validate_inline_content,
+    ConversationStartReason, ConversationTurnOutcome, DocumentConversationConfig,
+    DocumentInlineContent, MAX_LIVE_CONVERSATIONS_PER_TRIGGER,
+};
 use crate::domain::wire_enum;
 use crate::file_kind::ensure_not_symlink;
 use crate::path_guard::relative_path_key;
@@ -44,6 +49,16 @@ const MAX_PATTERNS: usize = 32;
 const MAX_PATTERN_LEN: usize = 512;
 const MAX_EVENT_PATHS: usize = 200;
 const MAX_STORED_RUNS: usize = 500;
+/// 대화 이어 보내기 트리거의 서킷 브레이커. 새 채팅은 방마다 하나씩 열리고 앱이 다시
+/// 뜨면 모든 방이 새로 열리므로 키 없는 트리거(5회)보다 넉넉히(살아 있는 대화 상한의 두 배
+/// 남짓) 두고, 이어 보낸 턴은 따로 센다 — 재귀 변경이 같은 방에 턴을
+/// 계속 밀어 넣는 경우를 막는다.
+const CONVERSATION_CIRCUIT_MAX_NEW_CHATS: usize = 20;
+const CONVERSATION_CIRCUIT_MAX_TURNS: usize = 60;
+/// 오래 쉰 대화 정리 주기.
+const CONVERSATION_SWEEP_INTERVAL_MS: i64 = 60_000;
+/// 이어 보낸 턴의 실행 기록 이름. 쿨다운·서킷 브레이커가 새 채팅과 갈라 센다.
+const CONTINUE_CHAT_ACTION: &str = "continueChat";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,6 +125,19 @@ pub struct DocumentChatAction {
     pub skill: Option<DocumentSkillBinding>,
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
+    /// 새 채팅을 가벼운 문맥으로 띄울지(Claude 전용, [`crate::ChatStartRequest::lean_context`]).
+    /// 바인딩한 스킬 본문은 프롬프트에 통째로 실리므로 다른 스킬 목록·계정 연동 MCP·
+    /// 서브에이전트가 필요 없는 무인 처리에 쓴다. 꺼진 저장본은 이 필드가 없던 때와
+    /// 바이트까지 같다. 실행 능력을 줄이기만 하므로 승인 지문(스킬·워크플로)과 무관하다.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lean_context: bool,
+    /// 대화 이어 보내기. 경로에서 뽑은 대화 키마다 살아 있는 채팅 하나에 다음 변경을 새
+    /// 턴으로 보낸다([`crate::document_conversation`]). 없으면 변경 묶음마다 새 채팅이다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<DocumentConversationConfig>,
+    /// 바뀐 파일의 내용을 프롬프트에 싣는다(파일 하나 `maxBytes` 이하·UTF-8·일반 파일만).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_content: Option<DocumentInlineContent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -434,6 +462,51 @@ pub trait DocumentActionExecutor: Send + Sync + 'static {
         action: &DocumentTriggerAction,
         context: &DocumentActionContext,
     ) -> Result<DocumentActionReceipt, DocumentActionError>;
+
+    /// 대화 이어 보내기 트리거의 키 하나(`context.batch`는 그 키의 변경만 든다). 대화를
+    /// 모르는 실행기는 매번 새 채팅을 띄운 것으로 답한다.
+    fn execute_conversation_turn(
+        &self,
+        action: &DocumentTriggerAction,
+        context: &DocumentActionContext,
+        _turn: &DocumentConversationTurn,
+    ) -> Result<ConversationTurnOutcome, DocumentActionError> {
+        let receipt = self.execute_action(action, context)?;
+        Ok(ConversationTurnOutcome::Started {
+            chat_id: receipt.result_id.unwrap_or_default(),
+            reason: ConversationStartReason::New,
+            result: receipt.result,
+        })
+    }
+
+    /// 오래 쉰 대화와 주인 잃은 대화를 끈다. 감시 고리가 주기적으로 부른다. `running`에 든
+    /// 트리거는 지금 실행 중이라 건너뛴다 — 실행이 막 이어 보낸 턴을 끄지 않게.
+    fn sweep_conversations(
+        &self,
+        _triggers: &[DocumentTrigger],
+        _running: &HashSet<String>,
+        _now: i64,
+    ) {
+    }
+}
+
+/// 대화 키 하나의 이번 턴을 실행기에 넘길 때의 조건.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentConversationTurn {
+    pub key: String,
+    /// 새 채팅을 띄울 때만 거는 쿨다운(같은 키의 앞 채팅 시작 기준).
+    pub cooldown_ms: i64,
+    /// 이번 실행에서 새 채팅을 더 띄워도 되는지(한 번에 여는 새 대화 상한).
+    pub allow_new: bool,
+    pub now: i64,
+}
+
+/// 대화 이어 보내기를 켠 새 채팅 트리거의 대화 설정.
+fn conversation_config(trigger: &DocumentTrigger) -> Option<&DocumentConversationConfig> {
+    match &trigger.input.action {
+        DocumentTriggerAction::StartChat(chat) => chat.conversation.as_ref(),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -481,12 +554,36 @@ enum PendingActionGate {
     Launch,
 }
 
+/// 대화 트리거가 미룬 변경과 다시 보낼 수 있는 시각.
+#[derive(Debug, Default)]
+struct HeldConversationChanges {
+    until: i64,
+    paths: HashSet<String>,
+}
+
+impl HeldConversationChanges {
+    /// 지금 띄울 만한가. 시각이 지났거나, 대기열에 미룬 것 말고 새 변경이 들어왔으면 띄운다 —
+    /// 쿨다운에 걸린 방 하나가 다른 방의 이어 보내기까지 붙잡지 않게.
+    fn ready(&self, pending: Option<&DocumentChangeBatch>, now: i64) -> bool {
+        now >= self.until
+            || pending.is_some_and(|batch| {
+                batch
+                    .changes
+                    .iter()
+                    .any(|change| !self.paths.contains(&change.relative_path))
+            })
+    }
+}
+
 #[derive(Default)]
 struct RuntimeState {
     pending_roots: HashMap<String, PendingRootBatch>,
     pending_actions: HashMap<String, DocumentChangeBatch>,
     inflight_actions: HashMap<String, DocumentChangeBatch>,
     running: HashSet<String>,
+    /// 대화 트리거가 새 채팅 쿨다운으로 미룬 변경. 재시작하면 비고, 그때는 바로 다시 시도한다.
+    held: HashMap<String, HeldConversationChanges>,
+    last_conversation_sweep_at: i64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -544,6 +641,8 @@ impl DocumentAutomationSupervisor {
                     pending_actions,
                     inflight_actions: HashMap::new(),
                     running: HashSet::new(),
+                    held: HashMap::new(),
+                    last_conversation_sweep_at: 0,
                 }),
             }),
         };
@@ -636,6 +735,7 @@ impl DocumentAutomationSupervisor {
         let mut runtime = lock_runtime(&self.inner)?;
         runtime.pending_actions.remove(id);
         runtime.inflight_actions.remove(id);
+        runtime.held.remove(id);
         save_pending_state(&self.inner.app_data_dir, &runtime)?;
         Ok(())
     }
@@ -937,6 +1037,29 @@ impl DocumentAutomationSupervisor {
             }
         }
         self.dispatch_mature_batches(now)?;
+        self.sweep_conversations(now)?;
+        Ok(())
+    }
+
+    /// 대화 트리거가 살려 둔 채팅 중 오래 쉰 것을 주기적으로 끈다. 새 변경이 올 때만 끄면
+    /// 조용해진 방의 채팅이 앱이 다시 뜰 때까지 남는다.
+    fn sweep_conversations(&self, now: i64) -> Result<(), CoreError> {
+        // 새 실행은 이 감시 고리(같은 스레드)에서만 뜨므로, 여기서 본 실행 중 목록 밖의
+        // 트리거는 정리하는 동안 새로 돌지 않는다.
+        let running = {
+            let mut runtime = lock_runtime(&self.inner)?;
+            if now.saturating_sub(runtime.last_conversation_sweep_at)
+                < CONVERSATION_SWEEP_INTERVAL_MS
+            {
+                return Ok(());
+            }
+            runtime.last_conversation_sweep_at = now;
+            runtime.running.clone()
+        };
+        let triggers = self.load_triggers()?;
+        self.inner
+            .executor
+            .sweep_conversations(&triggers, &running, now);
         Ok(())
     }
 
@@ -1037,6 +1160,15 @@ impl DocumentAutomationSupervisor {
             .filter(|id| !runtime.running.contains(*id))
             .filter_map(|id| {
                 let trigger = triggers.get(id)?;
+                if conversation_config(trigger).is_some() {
+                    // 대화 트리거의 쿨다운은 새 채팅을 띄울 때만 실행 안에서 건다. 이어
+                    // 보내기는 트리거별 실행 직렬화(`running`)로 키별 순서가 지켜진다.
+                    return runtime
+                        .held
+                        .get(id)
+                        .is_none_or(|held| held.ready(runtime.pending_actions.get(id), now))
+                        .then(|| id.clone());
+                }
                 let last = latest_run_started_at(&self.inner.app_data_dir, id).ok()?;
                 (last
                     .is_none_or(|started| now.saturating_sub(started) >= trigger.input.cooldown_ms))
@@ -1062,12 +1194,17 @@ impl DocumentAutomationSupervisor {
             // 워크플로·스킬이 바뀐 경우 이벤트를 버리지 않고 재승인 뒤 이어서 실행한다.
             return Ok(PendingActionGate::Hold);
         }
-        let recent = recent_run_count(
-            &self.inner.app_data_dir,
-            id,
-            now.saturating_sub(CIRCUIT_WINDOW_MS),
-        )?;
-        if recent >= CIRCUIT_MAX_RUNS {
+        let since = now.saturating_sub(CIRCUIT_WINDOW_MS);
+        let app_data_dir = &self.inner.app_data_dir;
+        let tripped = if conversation_config(trigger).is_some() {
+            recent_run_count_where(app_data_dir, id, since, Some(false))?
+                >= CONVERSATION_CIRCUIT_MAX_NEW_CHATS
+                || recent_run_count_where(app_data_dir, id, since, Some(true))?
+                    >= CONVERSATION_CIRCUIT_MAX_TURNS
+        } else {
+            recent_run_count_where(app_data_dir, id, since, None)? >= CIRCUIT_MAX_RUNS
+        };
+        if tripped {
             return Ok(PendingActionGate::CircuitBreak);
         }
         Ok(PendingActionGate::Launch)
@@ -1099,9 +1236,13 @@ impl DocumentAutomationSupervisor {
             let trigger = store.require_trigger_mut(trigger_id)?;
             trigger.input.enabled = false;
             trigger.status = DocumentTriggerStatus::Paused;
-            trigger.status_reason = Some(
-                "10분 동안 5회 실행되어 재귀 변경 가능성 때문에 자동 일시정지했습니다".to_owned(),
-            );
+            trigger.status_reason = Some(if conversation_config(trigger).is_some() {
+                format!(
+                    "10분 동안 새 채팅 {CONVERSATION_CIRCUIT_MAX_NEW_CHATS}회 또는 이어 보낸 턴 {CONVERSATION_CIRCUIT_MAX_TURNS}회에 닿아 재귀 변경 가능성 때문에 자동 일시정지했습니다"
+                )
+            } else {
+                "10분 동안 5회 실행되어 재귀 변경 가능성 때문에 자동 일시정지했습니다".to_owned()
+            });
             trigger.updated_at = now_ms();
             Ok(())
         })
@@ -1194,6 +1335,15 @@ fn validate_action_shape(action: &DocumentTriggerAction) -> Result<(), CoreError
             Err(CoreError::InvalidInput(
                 "workflowId와 승인한 version이 필요합니다".to_owned(),
             ))
+        }
+        DocumentTriggerAction::StartChat(chat) => {
+            if let Some(conversation) = &chat.conversation {
+                validate_conversation(conversation)?;
+            }
+            if let Some(inline) = &chat.inline_content {
+                validate_inline_content(inline)?;
+            }
+            Ok(())
         }
         _ => Ok(()),
     }
@@ -1499,19 +1649,49 @@ fn launch_trigger(
     batch: DocumentChangeBatch,
 ) {
     thread::spawn(move || {
-        let _ = execute_trigger(&inner, &trigger, batch.clone());
+        let conversation = !batch.test && conversation_config(&trigger).is_some();
+        let outcome = if conversation {
+            Some(execute_conversation_trigger(&inner, &trigger, &batch))
+        } else {
+            let _ = execute_trigger(&inner, &trigger, batch.clone());
+            None
+        };
         if let Ok(mut runtime) = inner.runtime.lock() {
             runtime.running.remove(&trigger.id);
             runtime.inflight_actions.remove(&trigger.id);
-            let retain_for_review = load_trigger_status(&inner, &trigger.id).is_ok_and(|status| {
-                matches!(
-                    status,
-                    DocumentTriggerStatus::NeedsReview
-                        | DocumentTriggerStatus::Degraded
-                        | DocumentTriggerStatus::Restricted
-                )
-            });
-            if retain_for_review {
+            if let Some(outcome) = outcome {
+                // 대화 트리거는 처리하지 못한 변경만 되돌린다. 묶음 전체를 되돌리면 이미
+                // 이어 보낸 턴이 다시 나간다.
+                let held_paths = outcome
+                    .leftover
+                    .as_ref()
+                    .map(|rest| {
+                        rest.changes
+                            .iter()
+                            .map(|change| change.relative_path.clone())
+                            .collect::<HashSet<_>>()
+                    })
+                    .unwrap_or_default();
+                if let Some(rest) = outcome.leftover {
+                    // 되돌리는 변경이 더 오래됐다. 그것을 바탕에 두고 실행 중에 쌓인 새
+                    // 변경을 그 위에 합쳐야 지움·생성 순서가 뒤집히지 않는다.
+                    let newer = runtime.pending_actions.remove(&trigger.id);
+                    runtime.pending_actions.insert(trigger.id.clone(), rest);
+                    if let Some(newer) = newer {
+                        merge_action_batch(&mut runtime.pending_actions, &trigger.id, newer);
+                    }
+                }
+                match outcome.hold_until {
+                    Some(until) => runtime.held.insert(
+                        trigger.id.clone(),
+                        HeldConversationChanges {
+                            until,
+                            paths: held_paths,
+                        },
+                    ),
+                    None => runtime.held.remove(&trigger.id),
+                };
+            } else if trigger_retains_for_review(&inner, &trigger.id) {
                 merge_action_batch(&mut runtime.pending_actions, &trigger.id, batch);
             }
             if let Err(error) = save_pending_state(&inner.app_data_dir, &runtime) {
@@ -1519,6 +1699,232 @@ fn launch_trigger(
             }
         }
     });
+}
+
+/// 실행이 재승인·저하·제한으로 멈춰 쌓인 변경을 버리지 않고 남겨야 하는지.
+fn trigger_retains_for_review(inner: &Arc<DocumentAutomationInner>, trigger_id: &str) -> bool {
+    load_trigger_status(inner, trigger_id).is_ok_and(|status| {
+        matches!(
+            status,
+            DocumentTriggerStatus::NeedsReview
+                | DocumentTriggerStatus::Degraded
+                | DocumentTriggerStatus::Restricted
+        )
+    })
+}
+
+/// 대화 트리거 실행 하나의 뒷정리 몫.
+#[derive(Debug, Default)]
+struct ConversationRunOutcome {
+    /// 이번에 처리하지 못해 대기열로 되돌릴 변경(쿨다운으로 미룸·재승인 대기).
+    leftover: Option<DocumentChangeBatch>,
+    /// 미룬 변경을 다시 보낼 수 있는 가장 이른 시각.
+    hold_until: Option<i64>,
+}
+
+/// 원래 묶음에서 일부 변경만 든 묶음. 키가 있으면 사건 id에 키를 붙여 멱등 키가 키마다
+/// 갈리게 한다.
+fn sub_batch(
+    batch: &DocumentChangeBatch,
+    changes: Vec<DocumentChange>,
+    key: Option<&str>,
+) -> DocumentChangeBatch {
+    DocumentChangeBatch {
+        event_id: match key {
+            Some(key) => format!("{}:{key}", batch.event_id),
+            None => batch.event_id.clone(),
+        },
+        root_id: batch.root_id.clone(),
+        root_path: batch.root_path.clone(),
+        detected_at: batch.detected_at,
+        total_count: changes.len(),
+        omitted_count: 0,
+        changes,
+        test: batch.test,
+    }
+}
+
+/// 대화 이어 보내기 트리거 실행. 묶음을 대화 키로 나눠, 키 없는 변경은 지금처럼 새 채팅
+/// 하나로, 키 있는 변경은 키마다 실행기에 넘긴다(이어 보내기 또는 새로 띄우기). 키마다
+/// 실행 기록을 하나씩 남긴다.
+fn execute_conversation_trigger(
+    inner: &Arc<DocumentAutomationInner>,
+    trigger: &DocumentTrigger,
+    batch: &DocumentChangeBatch,
+) -> ConversationRunOutcome {
+    let mut outcome = ConversationRunOutcome::default();
+    let Some(config) = conversation_config(trigger) else {
+        return outcome;
+    };
+    let regex = match compile_key_pattern(&config.key_pattern) {
+        Ok(regex) => regex,
+        Err(error) => {
+            let _ = record_finished_run(
+                inner,
+                trigger,
+                batch,
+                trigger.input.action.kind_name(),
+                Err(error.to_string()),
+            );
+            return outcome;
+        }
+    };
+    let (unkeyed, keyed) = split_changes_by_key(&regex, batch.changes.clone());
+    let now = now_ms();
+    let mut leftover = Vec::new();
+    let mut hold_until: Option<i64> = None;
+    let mut halted = false;
+    if !unkeyed.is_empty() {
+        let ready_at = latest_new_chat_started_at(&inner.app_data_dir, &trigger.id)
+            .ok()
+            .flatten()
+            .map(|started| started.saturating_add(trigger.input.cooldown_ms));
+        if ready_at.is_some_and(|ready_at| now < ready_at) {
+            hold_until = ready_at;
+            leftover.extend(unkeyed);
+        } else {
+            let sub = sub_batch(batch, unkeyed.clone(), None);
+            let failed = execute_trigger(inner, trigger, sub)
+                .is_ok_and(|run| run.status == DocumentTriggerRunStatus::Failed);
+            if failed && trigger_retains_for_review(inner, &trigger.id) {
+                halted = true;
+                leftover.extend(unkeyed);
+            }
+        }
+    }
+    // 서킷 브레이커는 실행 앞에서 한 번 보므로, 한 실행이 그 상한을 넘겨 새 채팅을 열지
+    // 않게 남은 몫까지만 연다. 넘친 방은 미뤄 다음 실행의 브레이커 판정을 받는다.
+    let new_chat_budget = CONVERSATION_CIRCUIT_MAX_NEW_CHATS
+        .saturating_sub(
+            recent_run_count_where(
+                &inner.app_data_dir,
+                &trigger.id,
+                now.saturating_sub(CIRCUIT_WINDOW_MS),
+                Some(false),
+            )
+            .unwrap_or(0),
+        )
+        .min(MAX_LIVE_CONVERSATIONS_PER_TRIGGER);
+    let mut new_chats = 0usize;
+    for (key, changes) in keyed {
+        if halted {
+            leftover.extend(changes);
+            continue;
+        }
+        let sub = sub_batch(batch, changes.clone(), Some(&key));
+        let context = DocumentActionContext {
+            trigger_id: trigger.id.clone(),
+            trigger_name: trigger.input.name.clone(),
+            idempotency_key: format!("document-trigger:{}:{}", trigger.id, sub.event_id),
+            batch: sub.clone(),
+        };
+        let turn = DocumentConversationTurn {
+            key: key.clone(),
+            cooldown_ms: trigger.input.cooldown_ms,
+            allow_new: new_chats < new_chat_budget,
+            // 앞 키가 새 채팅을 띄우는 데 걸린 시간만큼 낡지 않게 키마다 잰다.
+            now: now_ms(),
+        };
+        match inner
+            .executor
+            .execute_conversation_turn(&trigger.input.action, &context, &turn)
+        {
+            Ok(ConversationTurnOutcome::Deferred { retry_at, .. }) => {
+                hold_until = Some(hold_until.map_or(retry_at, |until| until.min(retry_at)));
+                leftover.extend(changes);
+            }
+            Ok(ConversationTurnOutcome::Continued { chat_id }) => {
+                let _ = record_finished_run(
+                    inner,
+                    trigger,
+                    &sub,
+                    CONTINUE_CHAT_ACTION,
+                    Ok((
+                        Some(chat_id),
+                        serde_json::json!({"conversation": {"key": key, "mode": "continued"}}),
+                    )),
+                );
+            }
+            Ok(ConversationTurnOutcome::Started {
+                chat_id,
+                reason,
+                result,
+            }) => {
+                new_chats += 1;
+                let _ = record_finished_run(
+                    inner,
+                    trigger,
+                    &sub,
+                    trigger.input.action.kind_name(),
+                    Ok((
+                        Some(chat_id),
+                        serde_json::json!({
+                            "conversation": {"key": key, "mode": "started", "reason": reason},
+                            "delivery": result,
+                        }),
+                    )),
+                );
+            }
+            Err(error) => {
+                let _ = record_finished_run(
+                    inner,
+                    trigger,
+                    &sub,
+                    trigger.input.action.kind_name(),
+                    Err(error.message.clone()),
+                );
+                if let Some(status) = DocumentTriggerStatus::from_action_error_kind(error.kind) {
+                    let _ =
+                        update_trigger_failure_status(inner, &trigger.id, status, error.message);
+                    halted = true;
+                    leftover.extend(changes);
+                }
+            }
+        }
+    }
+    if !leftover.is_empty() {
+        let mut rest = sub_batch(batch, leftover, None);
+        rest.event_id = format!("doc-event-{}", Uuid::new_v4().simple());
+        outcome.leftover = Some(rest);
+    }
+    outcome.hold_until = hold_until;
+    outcome
+}
+
+/// 이미 끝난 실행 하나를 기록한다. 대화 턴은 바로 끝나므로 진행 중 기록을 따로 남기지 않는다.
+fn record_finished_run(
+    inner: &Arc<DocumentAutomationInner>,
+    trigger: &DocumentTrigger,
+    batch: &DocumentChangeBatch,
+    action: &str,
+    result: Result<(Option<String>, Value), String>,
+) -> Result<(), CoreError> {
+    let now = now_ms();
+    let (status, result_id, result, error) = match result {
+        Ok((result_id, result)) => (
+            DocumentTriggerRunStatus::Completed,
+            result_id,
+            Some(result),
+            None,
+        ),
+        Err(error) => (DocumentTriggerRunStatus::Failed, None, None, Some(error)),
+    };
+    save_run(
+        &inner.app_data_dir,
+        &DocumentTriggerRun {
+            id: format!("doc-run-{}", Uuid::new_v4().simple()),
+            trigger_id: trigger.id.clone(),
+            event_id: batch.event_id.clone(),
+            action: action.to_owned(),
+            status,
+            started_at: now,
+            finished_at: Some(now),
+            result_id,
+            result,
+            error,
+            test: batch.test,
+        },
+    )
 }
 
 fn execute_trigger(
@@ -1617,13 +2023,13 @@ fn load_trigger_status(
 
 fn load_pending_store(app_data_dir: &Path) -> Result<DurablePendingStore, CoreError> {
     let path = app_data_dir.join(PENDING_STORE_FILE_NAME);
-    if !path.is_file() {
+    // G10: 앱 데이터 밖 저장본을 가리키는 링크는 대기열로 복원하지 않는다.
+    let Some(store) = read_private_json::<DurablePendingStore>(&path)? else {
         return Ok(DurablePendingStore {
             schema_version: PENDING_STORE_SCHEMA_VERSION,
             ..DurablePendingStore::default()
         });
-    }
-    let store = serde_json::from_slice::<DurablePendingStore>(&fs::read(path)?)?;
+    };
     ensure_schema_version(
         store.schema_version,
         PENDING_STORE_SCHEMA_VERSION,
@@ -2025,14 +2431,49 @@ fn latest_run_started_at(app_data_dir: &Path, trigger_id: &str) -> Result<Option
     )
 }
 
-fn recent_run_count(app_data_dir: &Path, trigger_id: &str, since: i64) -> Result<usize, CoreError> {
+/// 이 트리거가 마지막으로 새 채팅(이어 보낸 턴이 아닌 실행)을 시작한 시각.
+fn latest_new_chat_started_at(
+    app_data_dir: &Path,
+    trigger_id: &str,
+) -> Result<Option<i64>, CoreError> {
     let connection = open_database(app_data_dir)?;
-    let count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM trigger_runs
-         WHERE trigger_id = ?1 AND is_test = 0 AND started_at >= ?2",
-        params![trigger_id, since],
+    query_optional(
+        &connection,
+        "SELECT started_at FROM trigger_runs
+         WHERE trigger_id = ?1 AND is_test = 0 AND action != ?2
+         ORDER BY started_at DESC LIMIT 1",
+        params![trigger_id, CONTINUE_CHAT_ACTION],
         |row| row.get(0),
-    )?;
+    )
+}
+
+/// 최근 실행 수. `continued`가 있으면 이어 보낸 턴(`Some(true)`)이나 그 밖의 실행
+/// (`Some(false)`)만 센다.
+fn recent_run_count_where(
+    app_data_dir: &Path,
+    trigger_id: &str,
+    since: i64,
+    continued: Option<bool>,
+) -> Result<usize, CoreError> {
+    let connection = open_database(app_data_dir)?;
+    let filter = match continued {
+        None => "",
+        Some(true) => " AND action = ?3",
+        Some(false) => " AND action != ?3",
+    };
+    let sql = format!(
+        "SELECT COUNT(*) FROM trigger_runs
+         WHERE trigger_id = ?1 AND is_test = 0 AND started_at >= ?2{filter}"
+    );
+    let count: i64 = if continued.is_some() {
+        connection.query_row(
+            &sql,
+            params![trigger_id, since, CONTINUE_CHAT_ACTION],
+            |row| row.get(0),
+        )?
+    } else {
+        connection.query_row(&sql, params![trigger_id, since], |row| row.get(0))?
+    };
     Ok(count.max(0) as usize)
 }
 
@@ -2408,6 +2849,62 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn g10_pending_store_does_not_restore_external_symlink_content() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let app_data = temp.path().join("app-data");
+        fs::create_dir(&app_data).expect("app data");
+        let path = app_data.join(PENDING_STORE_FILE_NAME);
+        let external = temp.path().join("external-pending.json");
+        let stored = DurablePendingStore {
+            schema_version: PENDING_STORE_SCHEMA_VERSION,
+            pending_roots: HashMap::from([(
+                "external-root".to_owned(),
+                PendingRootBatch {
+                    root_path: "/external-docs".to_owned(),
+                    ..PendingRootBatch::default()
+                },
+            )]),
+            ..DurablePendingStore::default()
+        };
+        let bytes = serde_json::to_vec(&stored).expect("serialize");
+        fs::write(&external, &bytes).expect("external store");
+
+        // A regular app-owned file must still restore its saved queue.
+        fs::write(&path, &bytes).expect("regular store");
+        let restored = load_pending_store(&app_data).expect("regular queue");
+        assert_eq!(
+            restored.pending_roots["external-root"].root_path,
+            "/external-docs"
+        );
+        fs::remove_file(&path).expect("remove regular store");
+        symlink(&external, &path).expect("link external queue");
+
+        let restored = load_pending_store(&app_data).expect("ignore linked queue");
+        assert_eq!(restored.schema_version, PENDING_STORE_SCHEMA_VERSION);
+        assert!(
+            restored.pending_roots.is_empty(),
+            "external queue must not be imported"
+        );
+        assert!(restored.pending_actions.is_empty());
+        assert!(restored.inflight_actions.is_empty());
+        assert_eq!(fs::read(&external).expect("external unchanged"), bytes);
+        assert_eq!(fs::read_link(&path).expect("link unchanged"), external);
+
+        fs::remove_file(&external).expect("remove external store");
+        assert!(load_pending_store(&app_data)
+            .expect("ignore dangling link")
+            .pending_roots
+            .is_empty());
+        assert_eq!(
+            fs::read_link(&path).expect("dangling link unchanged"),
+            external
+        );
+    }
+
+    #[test]
     fn restart_merges_inflight_before_newer_pending_batch() {
         let temp = tempfile::tempdir().expect("temp");
         let app_data = temp.path().join("app-data");
@@ -2734,5 +3231,357 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// 가벼운 문맥은 opt-in 이다. 옛 트리거(필드 없음)는 꺼짐으로 읽히고, 꺼진 값은
+    /// 저장본에 쓰이지 않아 기존 트리거 파일이 바이트까지 같다.
+    #[test]
+    fn start_chat_lean_context_defaults_off_and_is_omitted_when_off() {
+        let old = serde_json::json!({
+            "type": "startChat",
+            "source": "claude",
+            "mode": "fullAccess",
+            "prompt": "받은 편지함 처리"
+        });
+        let action: DocumentTriggerAction = serde_json::from_value(old.clone()).expect("old");
+        let DocumentTriggerAction::StartChat(chat) = &action else {
+            panic!("startChat");
+        };
+        assert!(!chat.lean_context);
+        assert!(serde_json::to_value(&action)
+            .expect("serialize")
+            .get("leanContext")
+            .is_none());
+
+        let mut lean = old;
+        lean["leanContext"] = serde_json::json!(true);
+        let action: DocumentTriggerAction = serde_json::from_value(lean).expect("lean");
+        let DocumentTriggerAction::StartChat(chat) = &action else {
+            panic!("startChat");
+        };
+        assert!(chat.lean_context);
+        assert_eq!(
+            serde_json::to_value(&action).expect("serialize")["leanContext"],
+            serde_json::json!(true)
+        );
+    }
+
+    /// 대화 트리거 시험용 실행기. 키 없는 새 채팅과 키별 턴을 순서대로 기록하고,
+    /// `defer`에 든 키는 쿨다운으로 미룬 것처럼 답한다.
+    struct ConversationExecutor {
+        calls: Mutex<mpsc::Sender<(Option<String>, Vec<String>)>>,
+        defer: Mutex<HashSet<String>>,
+        continued: Mutex<HashSet<String>>,
+    }
+
+    impl DocumentActionExecutor for ConversationExecutor {
+        fn execute_action(
+            &self,
+            _action: &DocumentTriggerAction,
+            context: &DocumentActionContext,
+        ) -> Result<DocumentActionReceipt, DocumentActionError> {
+            let paths = context
+                .batch
+                .changes
+                .iter()
+                .map(|change| change.relative_path.clone())
+                .collect();
+            self.calls
+                .lock()
+                .expect("calls")
+                .send((None, paths))
+                .expect("send");
+            Ok(DocumentActionReceipt {
+                result_id: Some("plain-chat".to_owned()),
+                result: None,
+            })
+        }
+
+        fn execute_conversation_turn(
+            &self,
+            _action: &DocumentTriggerAction,
+            context: &DocumentActionContext,
+            turn: &DocumentConversationTurn,
+        ) -> Result<ConversationTurnOutcome, DocumentActionError> {
+            if self.defer.lock().expect("defer").contains(&turn.key) {
+                return Ok(ConversationTurnOutcome::Deferred {
+                    retry_at: turn.now + 60_000,
+                    reason: ConversationStartReason::ChatGone,
+                });
+            }
+            let paths = context
+                .batch
+                .changes
+                .iter()
+                .map(|change| change.relative_path.clone())
+                .collect();
+            self.calls
+                .lock()
+                .expect("calls")
+                .send((Some(turn.key.clone()), paths))
+                .expect("send");
+            let chat_id = format!("chat-{}", turn.key);
+            if self
+                .continued
+                .lock()
+                .expect("continued")
+                .insert(turn.key.clone())
+            {
+                Ok(ConversationTurnOutcome::Started {
+                    chat_id,
+                    reason: ConversationStartReason::New,
+                    result: None,
+                })
+            } else {
+                Ok(ConversationTurnOutcome::Continued { chat_id })
+            }
+        }
+    }
+
+    fn conversation_trigger(root_id: String) -> DocumentTriggerInput {
+        let action: DocumentTriggerAction = serde_json::from_value(serde_json::json!({
+            "type": "startChat",
+            "source": "claude",
+            "mode": "workspace",
+            "prompt": "받은 편지함 처리",
+            "conversation": {"keyPattern": "^incoming/([a-z0-9-]+)/chat/([0-9]+)/"},
+        }))
+        .expect("action");
+        DocumentTriggerInput {
+            include: vec!["incoming/**".to_owned()],
+            exclude: Vec::new(),
+            cooldown_ms: 30_000,
+            action,
+            ..trigger_input(root_id)
+        }
+    }
+
+    fn wait_idle(supervisor: &DocumentAutomationSupervisor) {
+        for _ in 0..200 {
+            if lock_runtime(&supervisor.inner)
+                .expect("runtime")
+                .running
+                .is_empty()
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("trigger run did not finish");
+    }
+
+    #[test]
+    fn conversation_trigger_splits_a_batch_by_room_and_continues_without_cooldown() {
+        let temp = tempfile::tempdir().expect("temp");
+        let app_data = temp.path().join("app-data");
+        let root = temp.path().join("inbox");
+        for dir in ["incoming/s/chat/1", "incoming/s/chat/2", "incoming/s/2026"] {
+            fs::create_dir_all(root.join(dir)).expect("dir");
+        }
+        let root_id = register_root(&app_data, &root);
+        let (sender, calls) = mpsc::channel();
+        let executor = Arc::new(ConversationExecutor {
+            calls: Mutex::new(sender),
+            defer: Mutex::new(HashSet::new()),
+            continued: Mutex::new(HashSet::new()),
+        });
+        let supervisor = DocumentAutomationSupervisor::new_without_background_runner(
+            app_data.clone(),
+            executor.clone(),
+        )
+        .expect("supervisor");
+        let trigger = supervisor
+            .create_trigger(conversation_trigger(root_id))
+            .expect("trigger");
+
+        let start = now_ms();
+        fs::write(root.join("incoming/s/chat/1/0001-a.json"), "a").expect("a");
+        fs::write(root.join("incoming/s/chat/1/0002-c.json"), "c").expect("c");
+        fs::write(root.join("incoming/s/chat/2/0001-b.json"), "b").expect("b");
+        fs::write(root.join("incoming/s/2026/notice.json"), "n").expect("n");
+        supervisor.poll_once_for_test(start).expect("poll");
+        supervisor
+            .poll_once_for_test(start + DEFAULT_DEBOUNCE_MS + 1)
+            .expect("dispatch");
+        wait_idle(&supervisor);
+        let mut received = calls.try_iter().collect::<Vec<_>>();
+        received.sort();
+        assert_eq!(
+            received,
+            vec![
+                (None, vec!["incoming/s/2026/notice.json".to_owned()]),
+                (
+                    Some("s/1".to_owned()),
+                    vec![
+                        "incoming/s/chat/1/0001-a.json".to_owned(),
+                        "incoming/s/chat/1/0002-c.json".to_owned()
+                    ]
+                ),
+                (
+                    Some("s/2".to_owned()),
+                    vec!["incoming/s/chat/2/0001-b.json".to_owned()]
+                ),
+            ]
+        );
+
+        // 쿨다운(30초) 안의 다음 메시지도 이어 보내기는 바로 나간다.
+        fs::write(root.join("incoming/s/chat/1/0003-d.json"), "d").expect("d");
+        let next = now_ms();
+        supervisor.poll_once_for_test(next).expect("poll");
+        supervisor
+            .poll_once_for_test(next + DEFAULT_DEBOUNCE_MS + 1)
+            .expect("dispatch");
+        wait_idle(&supervisor);
+        assert_eq!(
+            calls.try_iter().collect::<Vec<_>>(),
+            vec![(
+                Some("s/1".to_owned()),
+                vec!["incoming/s/chat/1/0003-d.json".to_owned()]
+            )]
+        );
+        let runs = load_runs(&app_data, 20).expect("runs");
+        let actions = runs
+            .iter()
+            .filter(|run| run.trigger_id == trigger.id)
+            .map(|run| run.action.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| **action == CONTINUE_CHAT_ACTION)
+                .count(),
+            1
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| **action == "startChat")
+                .count(),
+            3
+        );
+        let continued = runs
+            .iter()
+            .find(|run| run.action == CONTINUE_CHAT_ACTION)
+            .expect("continued run");
+        assert_eq!(continued.result_id.as_deref(), Some("chat-s/1"));
+        assert_eq!(
+            continued.result.as_ref().expect("result")["conversation"]["mode"],
+            "continued"
+        );
+        // 이어 보낸 턴은 새 채팅 쿨다운·서킷 브레이커의 새 채팅 수에 들지 않는다.
+        assert_eq!(
+            recent_run_count_where(&app_data, &trigger.id, 0, Some(true)).expect("count"),
+            1
+        );
+        assert_eq!(
+            recent_run_count_where(&app_data, &trigger.id, 0, Some(false)).expect("count"),
+            3
+        );
+    }
+
+    #[test]
+    fn deferred_rooms_return_to_the_queue_and_wait_for_the_hold() {
+        let temp = tempfile::tempdir().expect("temp");
+        let app_data = temp.path().join("app-data");
+        let root = temp.path().join("inbox");
+        fs::create_dir_all(root.join("incoming/s/chat/7")).expect("dir");
+        let root_id = register_root(&app_data, &root);
+        let (sender, calls) = mpsc::channel();
+        let executor = Arc::new(ConversationExecutor {
+            calls: Mutex::new(sender),
+            defer: Mutex::new(HashSet::from(["s/7".to_owned()])),
+            continued: Mutex::new(HashSet::new()),
+        });
+        let supervisor = DocumentAutomationSupervisor::new_without_background_runner(
+            app_data.clone(),
+            executor.clone(),
+        )
+        .expect("supervisor");
+        let trigger = supervisor
+            .create_trigger(conversation_trigger(root_id))
+            .expect("trigger");
+        let start = now_ms();
+        fs::write(root.join("incoming/s/chat/7/0001-a.json"), "a").expect("a");
+        supervisor.poll_once_for_test(start).expect("poll");
+        supervisor
+            .poll_once_for_test(start + DEFAULT_DEBOUNCE_MS + 1)
+            .expect("dispatch");
+        wait_idle(&supervisor);
+        assert!(calls.try_recv().is_err());
+        {
+            let runtime = lock_runtime(&supervisor.inner).expect("runtime");
+            let pending = runtime.pending_actions.get(&trigger.id).expect("held back");
+            assert_eq!(
+                pending.changes[0].relative_path,
+                "incoming/s/chat/7/0001-a.json"
+            );
+            assert!(runtime.held.contains_key(&trigger.id));
+        }
+        // 보류 시각 전에는 다시 띄우지 않는다.
+        supervisor
+            .dispatch_pending_actions(now_ms())
+            .expect("held dispatch");
+        wait_idle(&supervisor);
+        assert!(calls.try_recv().is_err());
+        assert!(load_runs(&app_data, 10).expect("runs").is_empty());
+
+        // 미룬 방이 있어도 다른 방의 새 변경은 바로 나간다(미룬 방은 다시 미뤄진다).
+        fs::create_dir_all(root.join("incoming/s/chat/8")).expect("dir 8");
+        fs::write(root.join("incoming/s/chat/8/0001-b.json"), "b").expect("b");
+        let other = now_ms();
+        supervisor.poll_once_for_test(other).expect("poll");
+        supervisor
+            .poll_once_for_test(other + DEFAULT_DEBOUNCE_MS + 1)
+            .expect("dispatch other room");
+        wait_idle(&supervisor);
+        assert_eq!(
+            calls.try_iter().collect::<Vec<_>>(),
+            vec![(
+                Some("s/8".to_owned()),
+                vec!["incoming/s/chat/8/0001-b.json".to_owned()]
+            )]
+        );
+
+        executor.defer.lock().expect("defer").clear();
+        supervisor
+            .dispatch_pending_actions(now_ms() + 61_000)
+            .expect("retry dispatch");
+        wait_idle(&supervisor);
+        assert_eq!(
+            calls.try_iter().collect::<Vec<_>>(),
+            vec![(
+                Some("s/7".to_owned()),
+                vec!["incoming/s/chat/7/0001-a.json".to_owned()]
+            )]
+        );
+    }
+
+    #[test]
+    fn conversation_and_inline_content_fields_are_validated_and_optional() {
+        let old: DocumentTriggerAction = serde_json::from_value(serde_json::json!({
+            "type": "startChat", "source": "claude", "mode": "workspace", "prompt": "p"
+        }))
+        .expect("old");
+        let DocumentTriggerAction::StartChat(chat) = &old else {
+            panic!("startChat");
+        };
+        assert!(chat.conversation.is_none() && chat.inline_content.is_none());
+        let serialized = serde_json::to_value(&old).expect("serialize");
+        assert!(serialized.get("conversation").is_none());
+        assert!(serialized.get("inlineContent").is_none());
+
+        let mut bad = serialized.clone();
+        bad["conversation"] = serde_json::json!({"keyPattern": "^incoming/"});
+        let bad: DocumentTriggerAction = serde_json::from_value(bad).expect("parse");
+        assert!(validate_action_shape(&bad).is_err());
+        let mut bad = serialized.clone();
+        bad["inlineContent"] = serde_json::json!({"maxBytes": 40_000});
+        let bad: DocumentTriggerAction = serde_json::from_value(bad).expect("parse");
+        assert!(validate_action_shape(&bad).is_err());
+        let mut good = serialized;
+        good["conversation"] = serde_json::json!({"keyPattern": "^incoming/([a-z0-9-]+)/chat/([0-9]+)/", "idleMs": 900000, "maxTurns": 40});
+        good["inlineContent"] = serde_json::json!({"maxBytes": 8192});
+        let good: DocumentTriggerAction = serde_json::from_value(good).expect("parse");
+        assert!(validate_action_shape(&good).is_ok());
     }
 }

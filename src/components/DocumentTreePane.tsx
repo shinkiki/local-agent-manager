@@ -18,8 +18,9 @@ import {
 } from "../lib/documentWorkspace";
 import type { DocumentEntry, DocumentEntryPage } from "../types";
 import { ErrorBanner, LoadingState } from "./Shared";
-import { errorText } from "../lib/errorText";
 import { useI18n } from "../lib/i18n";
+import { createRequestGeneration, type RequestGeneration } from "../lib/latestRequest";
+export type { RequestGeneration, LatestRequestHandlers } from "../lib/latestRequest";
 
 const PAGE_SIZE = 200;
 const SEARCH_DELAY_MS = 180;
@@ -579,76 +580,11 @@ function DocumentMoreButton({
 }
 
 /**
- * 늦게 도착한 응답을 버리는 요청 세대 한 벌. 트리 페이징과 파일 검색이 각자 `useRef(0)`를
- * 두고 `++ref.current`로 세대를 열고 `id === ref.current`로 대조했다. 같은 규칙이 한 파일에
- * 두 벌 있어, 한쪽에서 세대를 올리는 자리를 빠뜨려도 다른 쪽을 보고는 알 수 없었다.
- *
- * 문서 화면의 문서 이동(`DocsView`의 `useDocNavigation`)도 같은 규칙을 손으로 또 한 벌
- * 적고 있었으므로 내보내 함께 쓴다. 제자리는 `src/lib`의 독립 모듈이지만, 트리 창은 이
- * 규칙을 가장 촘촘히 쓰는 자리이자 문서 화면이 이미 들여오는 파일이라 새 의존 방향을
- * 만들지 않는다.
- *
- * 세대 번호는 상태가 아니라 ref다(바뀌어도 다시 그리지 않는다). 돌려주는 묶음은 첫 렌더에
- * 한 번만 만들어 신원이 고정되므로, 이 묶음을 보는 `useCallback`·`useEffect`의 의존 목록에
- * 넣어도 매 렌더마다 다시 만들어지지 않는다.
- *
- * 세대를 `isCurrent`로 직접 대조하던 세 자리(트리 페이징·파일 검색·문서 이동)는 한 요청을
- * try/catch/finally 세 갈래에서 각자 대조했다. 대조를 세 번 적는 모양이라 한 갈래만
- * 빠뜨려도 — 실제로 문서 이동의 `catch`는 이른 `return` 대신 `if`로 감싸 두 모양이
- * 섞여 있었다 — 늦게 온 응답이 새 선택을 덮는지 여부가 자리마다 달라진다. `latest`가 그
- * 세 갈래를 한 벌로 묶어, 부르는 쪽은 최신 응답에 무엇을 할지만 적는다. 세대를 직접
- * 대조하는 창구(`isCurrent`)는 그 뒤로 아무도 쓰지 않아 계약에서 뺐다 — 남겨 두면 세
- * 갈래를 손으로 다시 적는 길이 열려 있는 셈이다.
+ * V4. 렌더 사이에 요청 세대의 신원을 유지한다. 비동기 처리는 최신 요청 모듈이 맡는다.
+ * 기존 가져오기 경로는 문서·프로젝트 화면에서 그대로 쓴다.
  */
-export interface RequestGeneration {
-  /** 지금까지의 요청을 모두 무효로 하고 새 세대를 열어 그 번호를 돌려준다. */
-  open: () => number;
-  /** 지금 세대. 이미 열려 있는 세대에 얹는 후속 요청(더 보기·하위 폴더)이 쓴다. */
-  current: () => number;
-  /**
-   * 한 요청을 끝까지 지킨다. 응답을 기다리는 동안 세대가 바뀌었으면 성공·실패·뒷정리
-   * 어느 것도 하지 않는다.
-   */
-  latest: <T>(
-    generation: number,
-    work: () => Promise<T>,
-    handlers: LatestRequestHandlers<T>,
-  ) => Promise<void>;
-}
-
-/** `latest`가 최신 요청일 때만 부르는 세 자리. */
-export interface LatestRequestHandlers<T> {
-  /** 최신 응답이 도착했을 때. */
-  onResult: (value: T) => void;
-  /** 최신 요청이 실패했을 때. 오류 문구는 여기 닿기 전에 이미 풀어 둔다. */
-  onError: (message: string) => void;
-  /** 성공·실패와 무관한 뒷정리(진행 표시 끄기). 늦게 온 응답에서는 부르지 않는다. */
-  onSettled?: () => void;
-}
-
 export function useRequestGeneration(): RequestGeneration {
-  const generationRef = useRef(0);
-  const [api] = useState<RequestGeneration>(() => {
-    const isCurrent = (generation: number) => generation === generationRef.current;
-    return {
-      open: () => ++generationRef.current,
-      current: () => generationRef.current,
-      latest: async <T,>(
-        generation: number,
-        work: () => Promise<T>,
-        { onResult, onError, onSettled }: LatestRequestHandlers<T>,
-      ) => {
-        try {
-          const value = await work();
-          if (isCurrent(generation)) onResult(value);
-        } catch (cause) {
-          if (isCurrent(generation)) onError(errorText(cause));
-        } finally {
-          if (isCurrent(generation)) onSettled?.();
-        }
-      },
-    };
-  });
+  const [api] = useState(createRequestGeneration);
   return api;
 }
 

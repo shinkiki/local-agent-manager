@@ -80,11 +80,15 @@ export function SavedSecretsCard({ active, reloadSignal = 0 }: {
   // 다시 읽기는 첫 효과·신호·새로고침 버튼이 함께 부른다. 늦게 도착한 앞선 목록이 저장·수정·
   // 삭제·토글 뒤 목록을 덮지 않도록 마지막으로 시작한 읽기만 반영한다.
   const [loadGate] = useState(createLatestGate);
+  // C17-4: 탭을 떠나거나 목록이 바뀐 뒤 온 값·오류는 다시 표시하지 않는다.
+  const [revealGate] = useState(createLatestGate);
   const load = useCallback(async () => {
     const isLatest = loadGate.begin();
+    revealGate.begin();
     try {
       const snapshot = await listSavedSecrets();
       if (!isLatest()) return;
+      revealGate.begin();
       setSecrets(snapshot.secrets);
       setRevealed({});
       setError(null);
@@ -92,19 +96,25 @@ export function SavedSecretsCard({ active, reloadSignal = 0 }: {
       if (!isLatest()) return;
       setError(errorText(cause));
     }
-  }, [loadGate]);
+  }, [loadGate, revealGate]);
 
   useEffect(() => {
     if (!active) {
       loadGate.begin();
+      revealGate.begin();
       setRevealed({});
       return;
     }
     void load();
-  }, [active, reloadSignal, load, loadGate]);
+    return () => {
+      loadGate.begin();
+      revealGate.begin();
+    };
+  }, [active, reloadSignal, load, loadGate, revealGate]);
 
   const apply = (next: SavedSecretView[]) => {
     loadGate.begin();
+    revealGate.begin();
     setSecrets(next);
     setRevealed({});
     setError(null);
@@ -119,12 +129,15 @@ export function SavedSecretsCard({ active, reloadSignal = 0 }: {
       });
       return;
     }
+    const isLatest = revealGate.begin();
     setBusy(name);
     try {
       const view = await readSavedSecretValue({ name });
+      if (!isLatest()) return;
       setRevealed((current) => ({ ...current, [name]: view.value }));
       setError(null);
     } catch (cause) {
+      if (!isLatest()) return;
       setError(errorText(cause));
     } finally {
       setBusy(null);

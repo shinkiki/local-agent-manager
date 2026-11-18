@@ -1116,6 +1116,38 @@ fn tightest_window<'a>(
     windows.max_by(|left, right| left.used_percent.total_cmp(&right.used_percent))
 }
 
+/// 이 모델군들에서 `label` 창 중 가장 많이 쓴 창.
+fn tightest_labeled<'a>(
+    usages: &[&'a AccountUsageView],
+    label: &str,
+) -> Option<&'a AccountUsageWindow> {
+    tightest_window(
+        usages
+            .iter()
+            .filter_map(|usage| window_by_label(usage, label)),
+    )
+}
+
+/// 계정 대표 창의 라벨. 짧은 창이 앞이다 — [`blocked_for`]가 이 순서로 창 길이를 견준다.
+const REPRESENTATIVE_LABELS: [&str; 2] = ["5시간", "7일"];
+
+/// 이 모델군이 `label` 창 길이에서 막혔는지 — 그 창이나 그보다 긴 창이 다 찼는지(100%,
+/// 소진 판정 `accounts::account_exhausted`와 같은 기준). 주간 창이 찬 모델군은 5시간 창이
+/// 남아도 못 돌지만, 5시간 창이 잠깐 찬 모델군의 주간 수치는 그대로 이번 주의 값이다.
+fn blocked_for(usage: &AccountUsageView, label: &str) -> bool {
+    let rank = |label: &str| {
+        REPRESENTATIVE_LABELS
+            .iter()
+            .position(|known| *known == label)
+    };
+    let Some(this) = rank(label) else {
+        return false;
+    };
+    usage.windows.iter().any(|window| {
+        window.used_percent >= 100.0 && rank(&window.label).is_some_and(|other| other >= this)
+    })
+}
+
 /// 소진율과 리셋 시각은 그대로 두고 라벨과 모델 한정 여부만 바꿔 창을 복제한다.
 fn relabeled_window(
     window: &AccountUsageWindow,
@@ -1152,13 +1184,33 @@ fn combined_usage(groups: &[CliUsageGroup]) -> AccountUsageView {
         .filter(|group| resource_for_group(group).is_some())
         .map(|group| (group, usage_from_group(group)))
         .collect();
+    // 대표 창은 **그 창 길이에서 아직 열린** 모델군 중 가장 빡빡한 쪽이다. 찬 모델군까지
+    // 넣으면 한 모델군의 소진이 계정 대표 수치를 100%로 묶어, 다른 모델군이 거의 비어
+    // 있어도 화면·자동전환 여유 순위가 이 계정을 다 쓴 것으로 읽는다. 실행 게이트도 모든
+    // 모델군이 찼을 때만 계정을 막는다(`accounts::account_exhausted`).
+    //
+    // 열린 모델군은 창 길이마다 따로 가른다([`blocked_for`]). `7일`은 주간 창이 찬 모델군만
+    // 빼고 5시간 창이 잠깐 찬 모델군은 남긴다 — 5시간마다 대표 주간 수치와 리셋 시각이 다른
+    // 모델군으로 오가면 누적 이력에 같은 주의 주기가 겹쳐 쌓인다. 모두 막혔을 때만 전체에서
+    // 고르고, 열린 모델군이 그 창을 보고하지 않으면 대표 창을 만들지 않는다 — 찬 모델군의
+    // 값으로 채우면 열린 모델군을 두고도 계정이 다 쓴 것으로 읽힌다.
+    //
+    // 창을 하나도 보고하지 않은 모델군은 열렸다고 셀 근거가 없으므로 뺀다. 세면 실제 모델군이
+    // 모두 막혀도 `open`이 비지 않아 대표 창이 사라지고, 소진 판정이 계정을 연 것으로 읽는다.
+    let all: Vec<&AccountUsageView> = group_usages
+        .iter()
+        .map(|(_, usage)| usage)
+        .filter(|usage| !usage.windows.is_empty())
+        .collect();
     let mut windows = Vec::new();
-    for label in ["5시간", "7일"] {
-        if let Some(tightest) = tightest_window(
-            group_usages
-                .iter()
-                .filter_map(|(_, usage)| window_by_label(usage, label)),
-        ) {
+    for label in REPRESENTATIVE_LABELS {
+        let open: Vec<&AccountUsageView> = all
+            .iter()
+            .copied()
+            .filter(|usage| !blocked_for(usage, label))
+            .collect();
+        let candidates = if open.is_empty() { &all } else { &open };
+        if let Some(tightest) = tightest_labeled(candidates, label) {
             // 모델군 창의 복사본이라는 사실을 실어 보낸다. 소진 판정이 이 창을 세면 한
             // 모델군이 찬 계정이 다른 모델군의 여유를 두고도 통째로 막힌다.
             windows.push(AccountUsageWindow {
@@ -1474,6 +1526,56 @@ mod tests {
         .expect("CLI fixture")
     }
 
+    /// V2/G6: 공식 CLI의 실패·다른 명령·빈 응답을 사용량 표본으로 받아들이지 않는다.
+    #[test]
+    fn v2_cli_usage_parser_rejects_unusable_envelopes() {
+        let valid = json!({
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {"groups": [{"name": "Gemini Models", "buckets": []}]}
+            }
+        });
+        let mut failure = valid.clone();
+        failure["status"] = json!("FAILURE");
+        let mut other_command = valid.clone();
+        other_command["command"]["name"] = json!("login");
+        let rejected = [
+            ("not json".to_owned(), "JSON을 해석하지 못했습니다"),
+            (
+                json!({"status": "SUCCESS"}).to_string(),
+                "command가 없습니다",
+            ),
+            (failure.to_string(), "성공 상태가 아닙니다"),
+            (other_command.to_string(), "성공 상태가 아닙니다"),
+            (
+                json!({"status": "SUCCESS", "command": {"name": "usage"}}).to_string(),
+                "모델 그룹이 없습니다",
+            ),
+            (
+                json!({"status": "SUCCESS", "command": {"name": "usage", "data": {}}}).to_string(),
+                "모델 그룹이 없습니다",
+            ),
+            (
+                json!({"status": "SUCCESS", "command": {"name": "usage", "data": {"groups": []}}})
+                    .to_string(),
+                "모델 그룹이 없습니다",
+            ),
+        ];
+        for (response, reason) in rejected {
+            let error = parse_cli_usage_groups(&response)
+                .expect_err("unusable response must not become a usage sample")
+                .to_string();
+            assert!(error.contains(reason), "{response}: {error}");
+        }
+
+        let groups = parse_cli_usage_groups(&valid.to_string()).expect("valid usage response");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "Gemini Models");
+        assert!(groups[0].buckets.is_empty());
+        assert!(groups[0].updated_at > 0);
+    }
+
     fn cache_entry(saved_at: Instant) -> CliUsageCacheEntry {
         CliUsageCacheEntry {
             saved_at,
@@ -1595,6 +1697,127 @@ mod tests {
         // 소진을 두 번 세지 않는다(`accounts::account_exhausted`).
         assert!(combined.windows[..2].iter().all(|window| window.aggregate));
         assert!(combined.windows[2..].iter().all(|window| !window.aggregate));
+    }
+
+    #[test]
+    fn a_full_model_group_does_not_pin_the_account_representative() {
+        // 2026-11-07 실측 모양: Claude/GPT 주간이 다 찼고 Argon·Gemini 는 여유가 있다. 대표
+        // 창이 찬 모델군을 복사하면 계정이 100%로 보여 남은 모델군의 쿼터가 가려진다.
+        let groups = parse_cli_usage_groups(
+            r#"{
+                "status":"SUCCESS",
+                "command":{"name":"usage","data":{"groups":[
+                    {"name":"Gemini Models","buckets":[
+                        {"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.97,"reset_time":"2026-09-10T00:00:00Z"},
+                        {"id":"gemini-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":0.9,"reset_time":"2026-09-04T15:00:00Z"}
+                    ]},
+                    {"name":"Claude and GPT models","buckets":[
+                        {"id":"3p-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0,"reset_time":"2026-09-05T00:00:00Z"},
+                        {"id":"3p-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":0.6,"reset_time":"2026-09-04T15:00:00Z"}
+                    ]},
+                    {"name":"Gemini 4 Argon","buckets":[
+                        {"id":"argon-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.57,"reset_time":"2026-09-09T00:00:00Z"}
+                    ]}
+                ]}}
+            }"#,
+        )
+        .expect("CLI fixture");
+        let combined = combined_usage(&groups);
+        let weekly = window_by_label(&combined, "7일").expect("대표 주간 창");
+        assert!(weekly.aggregate);
+        assert!(
+            (weekly.used_percent - 43.0).abs() < 1e-9,
+            "남은 모델군 중 가장 빡빡한 Argon"
+        );
+        assert_eq!(weekly.resets_at, parse_reset_time("2026-09-09T00:00:00Z"));
+        // 찬 모델군은 5시간 창에 여유가 있어도 지금 못 돈다 — 대표 5시간도 열린 모델군에서 온다.
+        let five_hour = window_by_label(&combined, "5시간").expect("대표 5시간 창");
+        assert!((five_hour.used_percent - 10.0).abs() < 1e-9);
+        // 모델군 창은 그대로 남아 찬 모델군이 화면에서 사라지지 않는다.
+        let full = window_by_label(&combined, "Claude and GPT models · 7일").expect("모델군 창");
+        assert!((full.used_percent - 100.0).abs() < 1e-9);
+    }
+
+    /// `(모델군, [(창, 남은 비율)])`로 CLI 응답을 만든다. 리셋 시각은 창마다 고정이다.
+    fn usage_groups(spec: &[(&str, &[(&str, f64)])]) -> Vec<CliUsageGroup> {
+        let groups: Vec<String> = spec
+            .iter()
+            .map(|(name, buckets)| {
+                let buckets: Vec<String> = buckets
+                    .iter()
+                    .map(|(window, remaining)| {
+                        format!(
+                            r#"{{"id":"{name}-{window}","name":"Limit","window":"{window}","remaining_fraction":{remaining},"reset_time":"2026-09-08T00:00:00Z"}}"#
+                        )
+                    })
+                    .collect();
+                format!(r#"{{"name":"{name}","buckets":[{}]}}"#, buckets.join(","))
+            })
+            .collect();
+        parse_cli_usage_groups(&format!(
+            r#"{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups":[{}]}}}}}}"#,
+            groups.join(",")
+        ))
+        .expect("CLI fixture")
+    }
+
+    #[test]
+    fn the_representative_skips_groups_blocked_at_that_window_length() {
+        // 5시간 창만 잠깐 찬 모델군의 주간 수치는 그대로 대표 주간 값이다 — 빼면 5시간마다
+        // 대표 주간 창이 다른 모델군으로 오가 누적 이력에 같은 주의 주기가 겹쳐 쌓인다.
+        let combined = combined_usage(&usage_groups(&[
+            ("Gemini Models", &[("weekly", 0.2), ("5h", 0.0)]),
+            ("Claude and GPT models", &[("weekly", 0.8), ("5h", 0.7)]),
+        ]));
+        let weekly = window_by_label(&combined, "7일").expect("대표 주간 창");
+        assert!((weekly.used_percent - 80.0).abs() < 1e-9);
+        let five_hour = window_by_label(&combined, "5시간").expect("대표 5시간 창");
+        assert!(
+            (five_hour.used_percent - 30.0).abs() < 1e-9,
+            "5시간이 찬 Gemini 는 지금 못 돈다"
+        );
+
+        // 열린 모델군(Argon)이 5시간 창을 보고하지 않으면 대표 5시간 창은 없다. 막힌 모델군의
+        // 값으로 채우면 Argon 을 두고도 계정이 다 쓴 것으로 읽힌다.
+        let combined = combined_usage(&usage_groups(&[
+            ("Gemini Models", &[("weekly", 0.9), ("5h", 0.0)]),
+            ("Claude and GPT models", &[("weekly", 0.0), ("5h", 0.5)]),
+            ("Gemini 4 Argon", &[("weekly", 0.57)]),
+        ]));
+        assert!(window_by_label(&combined, "5시간").is_none());
+        let weekly = window_by_label(&combined, "7일").expect("대표 주간 창");
+        assert!((weekly.used_percent - 43.0).abs() < 1e-9);
+
+        // 창을 하나도 보고하지 않은 모델군은 열린 것으로 세지 않는다. 세면 실제 모델군이 모두
+        // 찼는데도 대표 창이 사라져 소진 판정이 계정을 연 것으로 읽는다.
+        let combined = combined_usage(&usage_groups(&[
+            ("Gemini Models", &[("weekly", 0.0)]),
+            ("Claude and GPT models", &[("weekly", 0.0)]),
+            ("Gemini 4 Argon", &[]),
+        ]));
+        let weekly = window_by_label(&combined, "7일").expect("대표 주간 창");
+        assert!((weekly.used_percent - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn every_model_group_full_keeps_the_account_representative_full() {
+        let groups = parse_cli_usage_groups(
+            r#"{
+                "status":"SUCCESS",
+                "command":{"name":"usage","data":{"groups":[
+                    {"name":"Gemini Models","buckets":[
+                        {"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0,"reset_time":"2026-09-10T00:00:00Z"}
+                    ]},
+                    {"name":"Claude and GPT models","buckets":[
+                        {"id":"3p-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0,"reset_time":"2026-09-05T00:00:00Z"}
+                    ]}
+                ]}}
+            }"#,
+        )
+        .expect("CLI fixture");
+        let combined = combined_usage(&groups);
+        let weekly = window_by_label(&combined, "7일").expect("대표 주간 창");
+        assert!((weekly.used_percent - 100.0).abs() < 1e-9);
     }
 
     #[test]

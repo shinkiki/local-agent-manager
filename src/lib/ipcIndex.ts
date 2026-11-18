@@ -15,8 +15,21 @@ export interface IndexSource {
   projects: string[] | null;
   /** 프로젝트 적용으로 자동 등록된 폴더면 그 프로젝트 경로. 직접 등록한 폴더는 `null`. */
   projectPath: string | null;
-  /** 프로젝트 폴더의 첫 색인이 실패한 이유. 백엔드가 30분 뒤 다시 시도한다. */
+  /** 마지막 갱신 실패. 이전 성공 색인은 유지하고 수동 재시도는 즉시 허용한다. */
   lastError: string | null;
+  exclusionCounts?: { reason: IndexExclusionReason; count: number }[];
+  refreshState?: "pending" | "indexing" | "ready" | "failed";
+  progress?: { startedAt: number; scannedEntries: number; readFiles: number } | null;
+  lastAttemptAt?: number | null;
+  nextRetryAt?: number | null;
+  lastDurationMs?: number | null;
+  readFiles?: number;
+}
+export type IndexExclusionReason = "hiddenPath" | "sensitivePath" | "dependencyOrBuild" | "unsupportedType" | "symlink" | "nonRegular" | "tooLarge" | "binary" | "invalidUtf8" | "longLine" | "credentials" | "credentialLines";
+export interface IndexExclusions {
+  items: { relativePath: string; reason: IndexExclusionReason }[];
+  total: number;
+  nextOffset: number | null;
 }
 /** `all`이면 활성 프로젝트 폴더를 모두(새 프로젝트 포함) 자동 등록, `selected`면 고른 것만. */
 export type IndexProjectMode = "all" | "selected";
@@ -46,7 +59,10 @@ export interface IndexSearchResult {
   staleFiles: string[];
   truncated: boolean;
   untrusted: boolean;
+  partialSources?: string[];
+  pendingSources?: string[];
 }
+export const getIndexExclusions = (id: string, offset = 0) => call<IndexExclusions>("get_index_exclusions", { request: { id, offset, limit: 20 } });
 export const getIndexSources = () => call<IndexSnapshot>("get_index_sources");
 export const addIndexSource = (request: { name: string; path: string }) =>
   notifyBuiltinTools(call<IndexSnapshot>("add_index_source", { request }));
@@ -63,7 +79,7 @@ export const removeIndexSource = (id: string) =>
 export const refreshIndexSource = (id: string) =>
   notifyBuiltinTools(call<IndexSnapshot>("refresh_index_source", { request: { id } }, { timeoutMs: 120_000 }));
 /** `project`를 주면 그 프로젝트의 에이전트가 보는 폴더에서만 찾는다. */
-export const searchIndex = (request: { query: string; sourceId?: string; limit?: number; project?: string }) =>
+export const searchIndex = (request: { query: string; sourceId?: string; limit?: number; project?: string; mode?: "prefix" | "exact"; pathPrefix?: string; extension?: string }) =>
   call<IndexSearchResult>("search_index", { request });
 export const readIndexExcerpt = (request: { sourceId: string; relativePath: string; digest: string; startLine: number; endLine: number }) =>
   call<IndexHit>("read_index_excerpt", { request });

@@ -5,6 +5,9 @@ mod accounts;
 mod acp;
 mod agent_builtin_tools;
 mod aia_onboarding;
+mod aia_peer_cli;
+mod aia_peer_exchange;
+mod aia_peers;
 mod aia_suggestions;
 mod antigravity_mcp_sync;
 mod antigravity_usage;
@@ -37,6 +40,7 @@ mod db_exec;
 mod db_sql;
 mod doc_roots;
 mod document_automation;
+mod document_conversation;
 mod document_entry_ops;
 mod document_tree;
 mod domain;
@@ -50,6 +54,9 @@ mod index_cli;
 mod instruction_links;
 mod instruction_trash;
 mod json_store;
+mod k8s_cli;
+mod k8s_clusters;
+mod k8s_exec;
 mod linked_file;
 mod local_llm;
 mod login_auth;
@@ -143,6 +150,25 @@ pub use aia_onboarding::{
     AiaOnboardingIcon, AiaOnboardingPack, AiaOnboardingPackSource, AiaOnboardingPackSummary,
     AiaOnboardingSkillTemplate, AiaOnboardingStep, AiaOnboardingTemplateFile, LANE_SKILL_KEY,
 };
+pub use aia_peer_cli::run_aia_peer_cli;
+pub use aia_peer_exchange::{
+    hello as aia_peer_hello, list_exchanges as list_aia_peer_exchanges,
+    wait_for_exchange as wait_for_aia_peer_exchange, AiaPeerCheckReceipt, AskAiaPeerRequest,
+    ExchangeDirection as AiaPeerExchangeDirection, ExchangeRef as AiaPeerExchangeRef,
+    ExchangeState as AiaPeerExchangeState, ExchangeView as AiaPeerExchangeView,
+    ImportPeerSkillRequest, ListExchangesRequest as ListAiaPeerExchangesRequest,
+    PeerAskRequest as AiaPeerAskRequest, PeerAskResponse as AiaPeerAskResponse,
+    PeerExchangeStatus as AiaPeerExchangeStatus, PeerHello as AiaPeerHello, PeerSkillImportReceipt,
+    PeerSkillsRequest, PeerSkillsView,
+};
+pub use aia_peers::{
+    get_aia_peers, list_agent_aia_peers, local_skill_listing as aia_peer_local_skill_listing,
+    remove_aia_peer, set_aia_peer, set_aia_peer_agent_enabled, set_aia_peer_policy,
+    AgentAiaPeerSkip, AgentAiaPeerView, AgentAiaPeersView, AgentLocalPeer, AiaPeerDefaults,
+    AiaPeerDevice, AiaPeerPolicy, AiaPeerRef, AiaPeerView, AiaPeersSnapshot, PeerSkillBundle,
+    PeerSkillFile, PeerSkillListing, PeerSkillState, PeerSkillSummary, PeerSkillUnavailable,
+    PeerSkillView, SetAiaPeerAgentEnabledRequest, SetAiaPeerPolicyRequest, SetAiaPeerRequest,
+};
 pub use aia_suggestions::{
     load_aia_suggestion_catalog, AiaSuggestionBundledSkillTemplate, AiaSuggestionCatalog,
     AiaSuggestionCatalogDefinition, AiaSuggestionCatalogIssue, AiaSuggestionDefinition,
@@ -227,9 +253,13 @@ pub use document_automation::{
     DocumentActionContext, DocumentActionError, DocumentActionErrorKind, DocumentActionExecutor,
     DocumentActionOption, DocumentActionReceipt, DocumentAutomationOptions,
     DocumentAutomationSnapshot, DocumentAutomationSupervisor, DocumentChange, DocumentChangeBatch,
-    DocumentChangeKind, DocumentChatAction, DocumentOfflineChangeReport, DocumentSkillBinding,
-    DocumentTrigger, DocumentTriggerAction, DocumentTriggerInput, DocumentTriggerRun,
-    DocumentTriggerRunStatus, DocumentTriggerStatus, DocumentWorkflowAction,
+    DocumentChangeKind, DocumentChatAction, DocumentConversationTurn, DocumentOfflineChangeReport,
+    DocumentSkillBinding, DocumentTrigger, DocumentTriggerAction, DocumentTriggerInput,
+    DocumentTriggerRun, DocumentTriggerRunStatus, DocumentTriggerStatus, DocumentWorkflowAction,
+};
+pub use document_conversation::{
+    ConversationStartReason, ConversationTurnOutcome, DocumentConversationConfig,
+    DocumentInlineContent,
 };
 pub use document_entry_ops::{
     create_document_entry, delete_document_entry, duplicate_document_file, move_document_entry,
@@ -263,10 +293,12 @@ pub use external_processes::{
     ExternalProcessFailure, ExternalProviderProcess, TerminateExternalProcessesReport,
 };
 pub use index_addon::{
-    add_index_source, get_index_sources, list_agent_index_sources, read_index_excerpt,
-    refresh_index_source, remove_index_source, search_index, set_index_projects,
-    set_index_settings, set_index_source_enabled, set_index_source_projects, AddIndexSourceRequest,
-    AgentIndexRequest, AgentIndexSourceRequest, IndexProjectMode, IndexSourceRequest,
+    add_index_source, get_index_exclusions, get_index_sources, list_agent_index_sources,
+    read_index_excerpt, refresh_index_source, remove_index_source, search_index,
+    set_index_projects, set_index_settings, set_index_source_enabled, set_index_source_projects,
+    AddIndexSourceRequest, AgentIndexRequest, AgentIndexSourceRequest, IndexExclusion,
+    IndexExclusionCount, IndexExclusionReason, IndexExclusions, IndexExclusionsRequest,
+    IndexProgress, IndexProjectMode, IndexRefreshState, IndexSearchMode, IndexSourceRequest,
     ReadIndexExcerptRequest, SearchIndexRequest, SetIndexProjectsRequest, SetIndexSettingsRequest,
     SetIndexSourceEnabledRequest, SetIndexSourceProjectsRequest,
 };
@@ -275,6 +307,19 @@ pub use instruction_trash::{
     list_instruction_trash, purge_instruction_trash, restore_instruction_trash,
     InstructionTrashItem, InstructionTrashItemKind, InstructionTrashOverview,
     InstructionTrashRestoreReceipt,
+};
+pub use k8s_cli::run_k8s_cli;
+pub use k8s_clusters::{
+    cluster_defaults as k8s_cluster_defaults, get_k8s_clusters, list_agent_k8s_clusters,
+    remove_k8s_cluster, set_k8s_cluster, set_k8s_cluster_enabled, AgentK8sClusterSkip,
+    AgentK8sClusterView, AgentK8sClustersView, K8sAuthKind, K8sClusterDefaults, K8sClusterRef,
+    K8sClusterView, K8sClustersSnapshot, SetK8sClusterEnabledRequest, SetK8sClusterRequest,
+};
+pub use k8s_exec::{
+    check_agent_k8s_cluster, check_k8s_cluster, get_k8s_events, get_k8s_logs, get_k8s_resource,
+    list_k8s_resources, K8sAccessRule, K8sClusterCheckReceipt, K8sEventRow, K8sEventsReceipt,
+    K8sEventsRequest, K8sGetRequest, K8sListRequest, K8sLogsReceipt, K8sLogsRequest,
+    K8sNodeSummary, K8sResourceList, K8sResourceReceipt,
 };
 pub use linked_file::{
     copy_linked_file_source, save_linked_file_download, LinkedFile, LinkedFileCopy,
@@ -375,10 +420,10 @@ pub use resource_repository::{
 pub use rounds::{
     create_round_goal, delete_round_goal, delete_round_report, get_round_goal, get_round_report,
     list_round_goals, list_round_reports, record_round_report, resolve_round_decision,
-    round_decision_automation_brief, update_round_goal, RoundDecision,
-    RoundDecisionAutomationBrief, RoundDecisionMode, RoundFailureKind, RoundGoal, RoundGoalInput,
-    RoundGoalPatch, RoundGoalStatus, RoundMeasure, RoundOutcome, RoundReport, RoundReportInput,
-    RoundReportQuery,
+    resolve_round_decision_by_round, round_decision_automation_brief, update_round_goal,
+    RoundDecision, RoundDecisionAutomationBrief, RoundDecisionMode, RoundFailureKind, RoundGoal,
+    RoundGoalInput, RoundGoalPatch, RoundGoalStatus, RoundMeasure, RoundOutcome, RoundReport,
+    RoundReportInput, RoundReportQuery,
 };
 pub use saved_secrets::{
     list_saved_secrets, remove_saved_secret, save_secret, set_saved_secret_agent_enabled,

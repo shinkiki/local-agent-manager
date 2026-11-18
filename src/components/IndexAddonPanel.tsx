@@ -6,6 +6,7 @@ import { useI18n } from "../lib/i18n";
 import { errorText } from "../lib/errorText";
 import { AppToggle, ErrorBanner, useBusyAction, useConfirm } from "./Shared";
 import { IndexProjectsSection, indexPathKey as pathKey, sameIndexPath as samePath } from "./IndexProjectsSection";
+import { IndexExclusionsPanel } from "./IndexExclusionsPanel";
 import "./IndexAddonPanel.css";
 
 interface ProjectOption { path: string; name: string; listed: boolean }
@@ -49,6 +50,10 @@ export function IndexAddonPanel({ active }: { active: boolean }) {
   const [name, setName] = useState("");
   const [path, setPath] = useState("");
   const [query, setQuery] = useState("");
+  const [searchMode, setSearchMode] = useState<"prefix" | "exact">("prefix");
+  const [pathPrefix, setPathPrefix] = useState("");
+  const [extension, setExtension] = useState("");
+  const [diagnosticsId, setDiagnosticsId] = useState<string | null>(null);
   const [sourceId, setSourceId] = useState("");
   const [previewProject, setPreviewProject] = useState("");
   const [result, setResult] = useState<IndexSearchResult | null>(null);
@@ -59,7 +64,7 @@ export function IndexAddonPanel({ active }: { active: boolean }) {
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => {
-    if (!active || busy !== null) return;
+    if (!active) return;
     let cancelled = false;
     const load = () => {
       const current = ++revision.current;
@@ -68,7 +73,7 @@ export function IndexAddonPanel({ active }: { active: boolean }) {
       }).catch((cause) => { if (!cancelled && current === revision.current) setError(errorText(cause)); });
     };
     load();
-    const timer = window.setInterval(load, 15_000);
+    const timer = window.setInterval(load, busy === null ? 15_000 : 1_000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [active, busy, setError]);
   useEffect(() => {
@@ -105,7 +110,7 @@ export function IndexAddonPanel({ active }: { active: boolean }) {
     setResult(null);
     const current = ++resultRevision.current;
     void run("search", async () => {
-      const next = await searchIndex({ query, ...(sourceId ? { sourceId } : {}), ...(previewProject ? { project: previewProject } : {}), limit: 8 });
+      const next = await searchIndex({ query, mode: searchMode, ...(pathPrefix.trim() ? { pathPrefix } : {}), ...(extension.trim() ? { extension } : {}), ...(sourceId ? { sourceId } : {}), ...(previewProject ? { project: previewProject } : {}), limit: 8 });
       if (mounted.current && current === resultRevision.current) setResult(next);
     });
   };
@@ -132,6 +137,7 @@ export function IndexAddonPanel({ active }: { active: boolean }) {
   };
   const saveProjects = (mode: IndexProjectMode, projects: string[]) => update("projects", () => setIndexProjects(mode, projects));
   const sources = snapshot?.sources ?? [];
+  const diagnosticSource = sources.find((source) => source.id === diagnosticsId);
   // 프로젝트 적용으로 생긴 폴더는 적용 프로젝트 목록에서 다룬다. 여기에는 직접 등록한 폴더만 둔다.
   const manualSources = sources.filter((source) => source.projectPath === null);
   const enabled = sources.filter((source) => source.agentEnabled);
@@ -157,14 +163,14 @@ export function IndexAddonPanel({ active }: { active: boolean }) {
             {error ? <ErrorBanner message={error} /> : null}
             <div className="index-addon-toggles">
               <label className="index-addon-check"><input type="checkbox" checked={snapshot?.enabled ?? false} disabled={busy !== null || snapshot === null} onChange={() => update("settings", () => setIndexSettings(!snapshot?.enabled, snapshot?.autoRefresh ?? false))} />{text("인덱스 사용", "Enable index")}</label>
-              <label className="index-addon-check"><input type="checkbox" checked={snapshot?.autoRefresh ?? false} disabled={busy !== null || !snapshot?.enabled} onChange={() => update("settings", () => setIndexSettings(true, !snapshot?.autoRefresh))} />{text("자동 갱신 (1분마다)", "Auto refresh (every minute)")}</label>
+              <label className="index-addon-check"><input type="checkbox" checked={snapshot?.autoRefresh ?? false} disabled={busy !== null || !snapshot?.enabled} onChange={() => update("settings", () => setIndexSettings(true, !snapshot?.autoRefresh))} />{text("자동 갱신 (변경 감지)", "Auto refresh (detect changes)")}</label>
             </div>
-            <p>{text("자동 갱신은 에이전트 사용이 켜진 폴더에 적용됩니다. 폴더별 갱신 버튼은 언제든 직접 사용할 수 있습니다.", "Auto refresh applies to folders with agent use enabled. You can manually refresh any folder at any time.")}</p>
+            <p>{text("에이전트 사용이 켜진 폴더의 변경을 5초마다 확인하고 변경된 파일을 갱신합니다. 10분마다 전체 내용을 다시 대조합니다. 폴더별 갱신 버튼으로 즉시 전체 내용을 확인할 수도 있습니다.", "Changes in agent-enabled folders are checked every 5 seconds; changed files are refreshed. All contents are reconciled every 10 minutes. Use a folder’s refresh button to reconcile immediately.")}</p>
             {!snapshot?.enabled && snapshot !== null ? <p role="status">{text("인덱스 사용이 꺼져 있습니다. 저장된 색인은 유지하며 에이전트 검색과 자동 갱신을 중지합니다.", "Index is off. Stored indexes are kept; agent search and auto refresh are stopped.")}</p> : null}
           </div>
         </section>
 
-        <IndexProjectsSection snapshot={snapshot} projects={registry} registryFailed={registryFailed} busy={busy !== null} onSave={saveProjects} onRefresh={(source) => update(source.id, () => refreshIndexSource(source.id))} />
+        <IndexProjectsSection snapshot={snapshot} projects={registry} registryFailed={registryFailed} busy={busy !== null} onSave={saveProjects} onRefresh={(source) => update(source.id, () => refreshIndexSource(source.id))} onShowExclusions={(source) => setDiagnosticsId(source.id)} />
 
         <section className="settings-subsection">
           <header><div>
@@ -195,6 +201,9 @@ export function IndexAddonPanel({ active }: { active: boolean }) {
                   return <li key={source.id}>
                     <div className="index-addon-source-title"><strong>{source.name}</strong><code>{source.path}</code></div>
                     <small>{source.indexedAt === null ? text("색인 전", "Not indexed") : <>{text("최근 갱신", "Last refreshed")}: {new Date(source.indexedAt).toLocaleString()}</>} · {text("파일", "Files")} {source.files} · {text("조각", "Chunks")} {source.chunks} · {text("제외 파일", "Excluded files")} {source.excluded} · {text("적용", "Applies to")}: {scopeLabel(source)}</small>
+                    {source.progress ? <p role="status">{text(`색인 중 · 확인 ${source.progress.scannedEntries}개 · 본문 읽기 ${source.progress.readFiles}개`, `Indexing · ${source.progress.scannedEntries} entries checked · ${source.progress.readFiles} files read`)}</p> : null}
+                    {source.lastError ? <p role="status">{text(`갱신 실패: ${source.lastError}`, `Refresh failed: ${source.lastError}`)}{source.nextRetryAt ? ` · ${text("다음 재시도", "Next retry")} ${new Date(source.nextRetryAt).toLocaleString()}` : ""}</p> : null}
+                    {typeof source.readFiles === "number" && source.lastDurationMs != null ? <small>{text(`마지막 처리 ${source.lastDurationMs}ms · 본문 읽기 ${source.readFiles}개`, `Last run ${source.lastDurationMs}ms · ${source.readFiles} files read`)}</small> : null}
                     {source.truncated ? <p role="status">{text("색인 상한에 도달해 일부 파일이 빠졌습니다. 더 작은 하위 폴더를 등록해 주세요.", "The indexing limit was reached. Register a smaller subfolder to include all files.")}</p> : null}
                     <div className="index-addon-source-controls">
                       <label className="index-addon-check"><input type="checkbox" checked={source.agentEnabled} disabled={busy !== null} onChange={() => {
@@ -202,7 +211,8 @@ export function IndexAddonPanel({ active }: { active: boolean }) {
                         update(source.id, () => setIndexSourceEnabled(source.id, !source.agentEnabled));
                       }} />{text("에이전트 사용", "Agent use")}</label>
                       <span className="index-addon-source-actions">
-                        <button type="button" className="button compact" disabled={busy !== null} onClick={() => update(source.id, () => refreshIndexSource(source.id))}><RefreshCw size={14} />{busy === source.id ? text("처리 중…", "Working…") : text("인덱스 갱신", "Refresh index")}</button>
+                        <button type="button" className="button compact" onClick={() => setDiagnosticsId(source.id)}>{text("제외 사유", "Exclusions")}</button>
+                        <button type="button" className="button compact" disabled={busy !== null || source.refreshState === "indexing"} onClick={() => update(source.id, () => refreshIndexSource(source.id))}><RefreshCw size={14} />{busy === source.id ? text("처리 중…", "Working…") : source.lastError ? text("다시 시도", "Retry") : text("인덱스 갱신", "Refresh index")}</button>
                         <button type="button" className="button compact" disabled={busy !== null} onClick={() => {
                           void (async () => {
                             if (!await confirm({ title: text("인덱스 폴더 제거", "Remove index folder"), message: text("등록과 저장된 인덱스를 제거합니다. 원본 파일은 유지합니다.", "Remove the registration and stored index. Source files are kept."), items: [source.path], confirmLabel: text("제거", "Remove") })) return;
@@ -248,6 +258,7 @@ export function IndexAddonPanel({ active }: { active: boolean }) {
           </div>
         </section>
 
+        {diagnosticSource ? <IndexExclusionsPanel key={`${diagnosticSource.id}:${diagnosticSource.excluded}`} source={diagnosticSource} onClose={() => setDiagnosticsId(null)} /> : null}
         <section className="settings-subsection" aria-label={text("인덱스 검색", "Index search")}>
           <header><div>
             <strong>{text("검색 미리보기", "Search preview")}</strong>
@@ -264,9 +275,14 @@ export function IndexAddonPanel({ active }: { active: boolean }) {
                 {previewOptions.map((project) => <option key={project.path} value={project.path}>{project.name}</option>)}
               </select></label>
               <label><span>{text("검색어", "Search query")}</span><input value={query} maxLength={256} onChange={(event) => { setQuery(event.target.value); clearResult(); }} /></label>
+              <label><span>{text("일치 방식", "Match mode")}</span><select value={searchMode} onChange={(event) => { setSearchMode(event.target.value as "prefix" | "exact"); clearResult(); }}><option value="prefix">{text("단어 접두어", "Word prefix")}</option><option value="exact">{text("식별자·구문 정확 일치", "Exact identifier or phrase")}</option></select></label>
+              <label><span>{text("경로 접두어", "Path prefix")}</span><input value={pathPrefix} maxLength={512} placeholder="src/" spellCheck={false} onChange={(event) => { setPathPrefix(event.target.value); clearResult(); }} /></label>
+              <label><span>{text("확장자", "Extension")}</span><input value={extension} maxLength={17} placeholder="tsx" spellCheck={false} onChange={(event) => { setExtension(event.target.value); clearResult(); }} /></label>
               <button className="button" disabled={busy !== null || !query.trim() || enabled.length === 0 || !snapshot?.enabled}><Search size={15} />{text("검색", "Search")}</button>
             </form>
             {result ? <div className="index-addon-results" aria-live="polite">
+              {result.partialSources?.length ? <p role="status">{text("일부 검색 대상 폴더는 상한에 도달해 일부만 색인되었습니다.", "Some source folders reached the indexing limit and are only partly indexed.")}</p> : null}
+              {result.pendingSources?.length ? <p role="status">{text("아직 색인하지 않은 검색 대상 폴더가 있습니다.", "Some source folders have not been indexed yet.")}</p> : null}
               {result.staleFiles.length > 0 ? <p role="status">{text("원본이 변경된 파일은 결과에서 제외했습니다. 해당 폴더의 인덱스를 갱신해 주세요.", "Changed source files were excluded. Refresh the corresponding folder index.")}</p> : null}
               {result.truncated ? <p>{text("결과 상한에 도달했습니다. 검색 범위를 좁혀 주세요.", "Result limit reached. Narrow your search.")}</p> : null}
               {result.hits.length === 0 ? <p>{text("인덱스 검색 결과가 없습니다.", "No index results found.")}</p> : result.hits.map((hit) => <article className="index-addon-hit" key={`${hit.sourceId}/${hit.relativePath}:${hit.startLine}`}>

@@ -827,6 +827,10 @@ fn window_from_show(body: &Value) -> Option<u32> {
 fn num_ctx_from_parameters(parameters: &str) -> Option<u32> {
     parameters.lines().find_map(|line| {
         let rest = line.trim().strip_prefix("num_ctx")?;
+        // V2: 키와 값은 공백으로 구분한다. 접두사가 같은 다른 키를 값으로 읽지 않는다.
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
         rest.trim().parse::<u32>().ok()
     })
 }
@@ -994,6 +998,40 @@ mod tests {
             },
         });
         assert_eq!(super::window_from_show(&body), Some(16_384));
+    }
+
+    #[test]
+    fn v2_num_ctx_requires_a_whitespace_delimited_key() {
+        for parameters in ["num_ctx32768", "num_ctx+32768", "num_ctx_extra 32768"] {
+            assert_eq!(num_ctx_from_parameters(parameters), None, "{parameters:?}");
+        }
+        for parameters in [
+            "  num_ctx  16384  ",
+            "\tnum_ctx\t16384\r\n",
+            "num_ctx\u{a0}16384",
+            "num_ctx32768\nnum_ctx 16384",
+            "num_ctx invalid\nnum_ctx 16384",
+        ] {
+            assert_eq!(
+                num_ctx_from_parameters(parameters),
+                Some(16_384),
+                "{parameters:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_context_window_ignores_a_number_attached_to_the_key() {
+        let mut body = serde_json::json!({
+            "parameters": "num_ctx32768",
+            "model_info": { "model.context_length": 65536u64 },
+        });
+        assert_eq!(window_from_show(&body), Some(65_536));
+        body["parameters"] = json!("num_ctx32768\nnum_ctx 16384");
+        assert_eq!(window_from_show(&body), Some(16_384));
+        body["parameters"] = json!("num_ctx32768");
+        body["model_info"] = json!({});
+        assert_eq!(window_from_show(&body), None);
     }
 
     /// 서빙 값이 없으면 아키텍처 값으로 물러난다. 둘 다 없으면 비운다.

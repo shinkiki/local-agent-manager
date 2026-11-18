@@ -1377,6 +1377,55 @@ fn load_common_skill_detail_from_root(
     })
 }
 
+/// C23. 공통 원본 하나를 다른 기기에 보낼 수 있는 모양으로 내보낸다 — 상대 경로와 본문만.
+/// 실행 비트·수정 시각은 싣지 않는다. 실행 비트가 지문에 들어가면 같은 내용의 사본이
+/// 기기마다 다른 지문을 갖게 되어 "같음" 판정이 깨진다. 피어 비교 지문은 받는 쪽이
+/// 경로·본문만으로 따로 낸다(`aia_peers::transfer_digest`).
+///
+/// 본문이 UTF-8 이 아닌 파일(그림·바이너리)은 거절한다. 이 통로는 지침과 스크립트를
+/// 옮기는 자리이고, 그런 파일이 섞인 스킬은 사용자가 저장소 폴더를 직접 옮겨야 한다.
+pub(crate) struct ExportedSkillFile {
+    pub path: String,
+    pub content: String,
+}
+
+pub(crate) const MAX_EXPORTED_SKILL_FILES: usize = 200;
+pub(crate) const MAX_EXPORTED_SKILL_BYTES: u64 = 2 * 1024 * 1024;
+
+pub(crate) fn export_common_skill_files(
+    app_data_dir: &Path,
+    key: &str,
+) -> Result<(CommonSkillSource, Vec<ExportedSkillFile>), CoreError> {
+    let key = validate_skill_key(key)?;
+    let root = repository_skills_root(app_data_dir);
+    let directory = existing_common_skill_dir(&root, &key, MISSING_COMMON_SOURCE)?;
+    let (source, content) = read_common_source(&directory, &key)?;
+    if content.truncated || content.files.len() > MAX_EXPORTED_SKILL_FILES {
+        return Err(CoreError::TooLarge(MAX_EXPORTED_SKILL_FILES as u64));
+    }
+    if content.total_bytes > MAX_EXPORTED_SKILL_BYTES {
+        return Err(CoreError::TooLarge(MAX_EXPORTED_SKILL_BYTES));
+    }
+    let mut files = Vec::with_capacity(content.files.len());
+    for entry in &content.files {
+        let relative = entry.relative.to_string_lossy().replace('\\', "/");
+        if relative.starts_with(".agent-manager") {
+            continue;
+        }
+        let bytes = fs::read(directory.join(&entry.relative))?;
+        let text = String::from_utf8(bytes).map_err(|_| {
+            CoreError::InvalidInput(format!(
+                "'{key}' 스킬의 {relative} 은(는) 텍스트 파일이 아니라 피어로 보낼 수 없습니다"
+            ))
+        })?;
+        files.push(ExportedSkillFile {
+            path: relative,
+            content: text,
+        });
+    }
+    Ok((source, files))
+}
+
 /// AIA 즉시 트리거용 공통 원본 지문 목록. 공급자 설치본 스캔 없이 공통 루트만
 /// 읽어 짧은 주기 폴링 비용을 낮춘다. 읽지 못한 디렉터리는 조용히 건너뛴다 —
 /// 변경 감지는 읽을 수 있는 원본만 기준으로 판단한다.
@@ -2277,6 +2326,19 @@ struct ProjectedSkillFile {
     executable: bool,
 }
 
+impl ProjectedSkillFile {
+    // C3-9: 지문과 설치본 비교는 같은 공급자 투영 바이트를 사용한다.
+    fn read_projected_bytes(&self, adapter: &SkillAdapter) -> Result<Vec<u8>, CoreError> {
+        if is_skill_md(&self.relative) {
+            Ok(adapter
+                .project_skill_md(&read_text_limited(&self.source, MAX_SKILL_MD_BYTES)?)
+                .into_bytes())
+        } else {
+            Ok(fs::read(&self.source)?)
+        }
+    }
+}
+
 fn projected_skill_files(
     source_directory: &Path,
     content: &SkillContent,
@@ -2357,13 +2419,7 @@ fn projected_skill_digest(
         hasher.update(file.relative.to_string_lossy().as_bytes());
         hasher.update([0]);
         hasher.update([u8::from(file.executable)]);
-        let bytes = if is_skill_md(&file.relative) {
-            adapter
-                .project_skill_md(&read_text_limited(&file.source, MAX_SKILL_MD_BYTES)?)
-                .into_bytes()
-        } else {
-            fs::read(&file.source)?
-        };
+        let bytes = file.read_projected_bytes(adapter)?;
         hasher.update(bytes.len().to_le_bytes());
         hasher.update(bytes);
     }
@@ -2371,9 +2427,29 @@ fn projected_skill_digest(
 }
 
 fn checked_resource_manifest(directory: &Path) -> Result<ResourcePlatformManifest, CoreError> {
-    let path = resource_manifest_path(directory);
-    if !path.exists() {
+    // G10 / C3-8: 메타 파일뿐 아니라 그 부모 폴더의 링크도 읽기 전에 거절한다.
+    let metadata = match fs::symlink_metadata(directory.join(".agent-manager")) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ResourcePlatformManifest::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(CoreError::InvalidInput(
+            "스킬 OS 메타 폴더는 심볼릭 링크가 아닌 디렉터리여야 합니다".to_owned(),
+        ));
+    }
+    if !metadata.is_dir() {
         return Ok(ResourcePlatformManifest::default());
+    }
+    let path = resource_manifest_path(directory);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ResourcePlatformManifest::default());
+        }
+        Err(error) => return Err(error.into()),
     }
     regular_file_metadata(
         &path,
@@ -3791,14 +3867,7 @@ fn compare_skill_install_from_paths(
         let source_side = projected
             .get(path)
             .map(|file| -> Result<(Vec<u8>, bool), CoreError> {
-                let bytes = if path == Path::new("SKILL.md") {
-                    skill_adapter
-                        .project_skill_md(&read_text_limited(&file.source, MAX_SKILL_MD_BYTES)?)
-                        .into_bytes()
-                } else {
-                    fs::read(&file.source)?
-                };
-                Ok((bytes, file.executable))
+                Ok((file.read_projected_bytes(skill_adapter)?, file.executable))
             })
             .transpose()?;
         let install_side = install_files
@@ -5686,6 +5755,84 @@ mod tests {
             .expect("projected files");
         assert!(!projected.contains_key(Path::new("scripts/run.sh")));
         assert!(projected.contains_key(Path::new("scripts/run.ps1")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c3_8_manifest_rejects_symlinked_metadata_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().expect("root");
+        let directory = root.path().join("skill");
+        let outside = root.path().join("outside");
+        fs::create_dir(&directory).expect("skill directory");
+        fs::create_dir(&outside).expect("external metadata directory");
+        fs::write(outside.join("resource.json"), "{}").expect("external manifest");
+        let metadata_directory = directory.join(".agent-manager");
+        for target in [&outside, &root.path().join("missing")] {
+            symlink(target, &metadata_directory).expect("metadata directory symlink");
+            assert!(matches!(
+                checked_resource_manifest(&directory),
+                Err(CoreError::InvalidInput(_))
+            ));
+            fs::remove_file(&metadata_directory).expect("remove metadata link");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c3_8_manifest_rejects_symlinked_metadata_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().expect("root");
+        let directory = root.path().join("skill");
+        fs::create_dir_all(directory.join(".agent-manager")).expect("metadata directory");
+        let outside = root.path().join("resource.json");
+        fs::write(&outside, "{}").expect("external manifest");
+        let manifest = resource_manifest_path(&directory);
+        for target in [&outside, &root.path().join("missing.json")] {
+            symlink(target, &manifest).expect("manifest symlink");
+            assert!(matches!(
+                checked_resource_manifest(&directory),
+                Err(CoreError::InvalidInput(_))
+            ));
+            fs::remove_file(&manifest).expect("remove manifest link");
+        }
+    }
+
+    #[test]
+    fn c3_8_manifest_preserves_regular_and_absent_metadata() {
+        let root = TempDir::new().expect("root");
+        let directory = root.path();
+        let metadata_directory = directory.join(".agent-manager");
+        assert_eq!(
+            checked_resource_manifest(directory).expect("absent metadata directory"),
+            ResourcePlatformManifest::default()
+        );
+        fs::write(&metadata_directory, "legacy marker").expect("non-directory metadata");
+        assert_eq!(
+            checked_resource_manifest(directory).expect("non-directory metadata"),
+            ResourcePlatformManifest::default()
+        );
+        fs::remove_file(&metadata_directory).expect("remove metadata file");
+        fs::create_dir(&metadata_directory).expect("metadata directory");
+        assert_eq!(
+            checked_resource_manifest(directory).expect("absent manifest"),
+            ResourcePlatformManifest::default()
+        );
+        let manifest = ResourcePlatformManifest {
+            platforms: vec![HostPlatform::Macos],
+            ..ResourcePlatformManifest::default()
+        };
+        fs::write(
+            resource_manifest_path(directory),
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("regular manifest");
+        assert_eq!(
+            checked_resource_manifest(directory).expect("regular manifest"),
+            manifest
+        );
     }
 
     #[test]

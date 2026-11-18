@@ -1139,6 +1139,59 @@ mod tests {
 
     use super::*;
 
+    // G7/E8: exercise the persisted audit through the locked writer and catalog reader.
+    #[test]
+    fn e8_audit_rotation_preserves_records_at_size_boundary() {
+        for size in [
+            MAX_AUDIT_FILE_BYTES - 1,
+            MAX_AUDIT_FILE_BYTES,
+            MAX_AUDIT_FILE_BYTES + 1,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let registry = McpInterfaceRegistry::new(temp.path().to_path_buf());
+            let current = temp.path().join(AUDIT_FILE);
+            let previous = temp.path().join(PREVIOUS_AUDIT_FILE);
+            let older = b"older audit generation\n";
+            fs::write(&previous, older).unwrap();
+            let mut original =
+                serde_json::to_vec(&McpAuditEvent::new("probe", None, None, "succeeded")).unwrap();
+            original.resize(size as usize - 1, b' ');
+            original.push(b'\n');
+            fs::write(&current, &original).unwrap();
+
+            registry
+                .record_audit("probe", None, None, "failed")
+                .unwrap();
+
+            let rotated = size >= MAX_AUDIT_FILE_BYTES;
+            let archived = fs::read(&previous).unwrap();
+            // Boolean assertions keep a broken rotation from dumping a 2 MiB log.
+            assert!(
+                archived == if rotated { original.as_slice() } else { older },
+                "previous audit contents changed at size {size}"
+            );
+            if !rotated {
+                assert!(
+                    fs::read(&current).unwrap().starts_with(&original),
+                    "current audit prefix changed below the rotation threshold"
+                );
+            }
+            let catalog = registry.catalog().unwrap();
+            let outcomes = catalog["recentAudit"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["outcome"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            let expected = if rotated {
+                vec!["failed"]
+            } else {
+                vec!["succeeded", "failed"]
+            };
+            assert_eq!(outcomes, expected, "recent audit at size {size}");
+        }
+    }
+
     #[test]
     fn event_stream_media_type_ignores_case_and_parameters() {
         assert!(is_event_stream("text/event-stream"));

@@ -61,6 +61,16 @@ const SYSTEM_SKILLS: &[SystemSkill] = &[
         extras: &[],
     },
     SystemSkill {
+        key: "k8s-clusters",
+        skill_md: include_str!("../skills/k8s-clusters/SKILL.md"),
+        extras: &[],
+    },
+    SystemSkill {
+        key: "aia-peers",
+        skill_md: include_str!("../skills/aia-peers/SKILL.md"),
+        extras: &[],
+    },
+    SystemSkill {
         key: "chat-secrets",
         skill_md: include_str!("../skills/chat-secrets/SKILL.md"),
         extras: &[],
@@ -347,22 +357,16 @@ fn links_in_skill_copy(dir: &Path, skill: &SystemSkill) -> bool {
     let is_link = |path: &Path| {
         fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
     };
-    let mut targets = vec![
-        dir.to_path_buf(),
-        dir.join("SKILL.md"),
-        dir.join(OWNERSHIP_FILE),
-        dir.join(BUNDLE_FILE),
-    ];
-    for extra in skill.extras {
-        let mut path = dir.join(extra.path);
-        while path != dir {
-            targets.push(path.clone());
-            if !path.pop() {
-                break;
-            }
-        }
-    }
-    targets.iter().any(|path| is_link(path))
+    is_link(dir)
+        || ["SKILL.md", OWNERSHIP_FILE, BUNDLE_FILE]
+            .iter()
+            .any(|name| is_link(&dir.join(name)))
+        || skill.extras.iter().any(|extra| {
+            let path = dir.join(extra.path);
+            path.ancestors()
+                .take_while(|path| *path != dir)
+                .any(is_link)
+        })
 }
 
 fn write_skill(dir: &Path, skill: &SystemSkill, expected: &str) -> Result<(), CoreError> {

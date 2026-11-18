@@ -357,13 +357,22 @@ fn validated_destination(destination: &Path) -> Result<PathBuf, CoreError> {
         ));
     }
     let destination = parent.join(file_name);
-    if destination
-        .symlink_metadata()
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(CoreError::InvalidInput(
-            "심볼릭 링크 위치에는 파일을 저장할 수 없습니다".to_owned(),
-        ));
+    if let Ok(metadata) = destination.symlink_metadata() {
+        if metadata.file_type().is_symlink() {
+            return Err(CoreError::InvalidInput(
+                "심볼릭 링크 위치에는 파일을 저장할 수 없습니다".to_owned(),
+            ));
+        }
+        if metadata.is_dir() {
+            return Err(CoreError::InvalidInput(
+                "폴더 위치에는 파일을 저장할 수 없습니다".to_owned(),
+            ));
+        }
+        if !metadata.is_file() {
+            return Err(CoreError::InvalidInput(
+                "일반 파일 위치에만 저장할 수 있습니다".to_owned(),
+            ));
+        }
     }
     Ok(destination)
 }
@@ -858,6 +867,52 @@ mod tests {
             Err(CoreError::InvalidInput(_))
         ));
         assert_eq!(fs::read(target).expect("target bytes"), b"original");
+    }
+
+    #[test]
+    fn rejects_directory_download_destinations() {
+        let temp = tempdir().expect("temp directory");
+        let dir = temp.path().join("existing_dir");
+        fs::create_dir(&dir).expect("create existing dir");
+        let download = LinkedFileDownload {
+            relative_path: "source.xlsx".to_owned(),
+            bytes: b"replacement".to_vec(),
+            size_bytes: 11,
+        };
+
+        match save_linked_file_download(&download, &dir) {
+            Err(CoreError::InvalidInput(message)) => {
+                assert_eq!(message, "폴더 위치에는 파일을 저장할 수 없습니다");
+            }
+            other => panic!("폴더 위치는 InvalidInput으로 거절해야 합니다: {other:?}"),
+        }
+        assert_eq!(staging_leftovers(temp.path()), 0);
+    }
+
+    #[test]
+    fn copy_source_rejects_directory_destinations_without_staging() {
+        let temp = tempdir().expect("temp directory");
+        let root = temp.path().join("workspace");
+        fs::create_dir_all(&root).expect("workspace directory");
+        fs::write(root.join("sample.txt"), b"sample").expect("source file");
+        let source = read_linked_file_source_from(&root, &root, "sample.txt", u64::MAX)
+            .expect("resolve source");
+
+        let dir = temp.path().join("existing_dir");
+        fs::create_dir(&dir).expect("create existing dir");
+
+        let mut progress_called = false;
+        match copy_linked_file_source(&source, &dir, &mut |_| progress_called = true, &|| false) {
+            Err(CoreError::InvalidInput(message)) => {
+                assert_eq!(message, "폴더 위치에는 파일을 저장할 수 없습니다");
+            }
+            other => panic!("폴더 위치는 InvalidInput으로 거절해야 합니다: {other:?}"),
+        }
+        assert!(
+            !progress_called,
+            "사전 검증 실패 시 복사를 진행하지 않아야 합니다"
+        );
+        assert_eq!(staging_leftovers(temp.path()), 0);
     }
 
     #[cfg(unix)]

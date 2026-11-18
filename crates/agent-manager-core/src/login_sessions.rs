@@ -386,6 +386,56 @@ mod tests {
     }
 
     #[test]
+    fn c20_3_revocation_by_token_persists_and_preserves_other_sessions() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = LoginSessionStore::open(directory.path()).expect("open");
+        let a = store
+            .issue(LoginChannel::Remote, "session_a", NOW)
+            .expect("issue a");
+        let b = store
+            .issue(LoginChannel::Desktop, "session_b", NOW)
+            .expect("issue b");
+        let token_a = a.token.to_string();
+        let token_b = b.token.to_string();
+
+        assert!(store.revoke_by_token(&token_a).expect("revoke by token"));
+        assert!(
+            !store
+                .revoke_by_token(&token_a)
+                .expect("revoke already revoked token"),
+            "이미 취소된 토큰은 false를 돌려주어야 한다"
+        );
+        assert!(
+            !store
+                .revoke_by_token("unknown_token")
+                .expect("revoke nonexistent token"),
+            "존재하지 않는 토큰은 false를 돌려주어야 한다"
+        );
+        assert!(
+            store.touch(&token_a, NOW + 1).is_none(),
+            "취소된 세션은 조회되지 않아야 한다"
+        );
+        assert!(
+            store.touch(&token_b, NOW + 1).is_some(),
+            "다른 세션은 유지되어야 한다"
+        );
+
+        // 재기동 후에도 토큰 취소가 영속화되어 유지되는지 확인
+        let mut reopened = LoginSessionStore::open(directory.path()).expect("reopen");
+        assert!(
+            reopened.touch(&token_a, NOW + 2).is_none(),
+            "재기동 후에도 취소된 세션은 조회되지 않아야 한다"
+        );
+        assert!(
+            reopened.touch(&token_b, NOW + 2).is_some(),
+            "재기동 후에도 다른 세션은 유지되어야 한다"
+        );
+        let listed = reopened.list(NOW + 2, None);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, b.id);
+    }
+
+    #[test]
     fn c20_3_continuous_use_is_persisted_each_minute_and_survives_reopen() {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut store = LoginSessionStore::open(directory.path()).expect("open");

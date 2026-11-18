@@ -264,6 +264,11 @@ pub struct ScheduledRequestInput {
     /// 사용자가 종료 시각을 뒤로 미루면 그대로 다시 돈다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_until: Option<i64>,
+    /// 채팅 회차를 가벼운 문맥으로 띄울지(Claude 전용, [`crate::ChatStartRequest::lean_context`]).
+    /// 꺼진 저장본은 이 필드가 없던 때와 바이트까지 같고, 워크플로 회차에서는 비워진다.
+    /// 다른 칸처럼 수정 요청에서 빠지면 꺼짐으로 저장된다.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lean_context: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2352,6 +2357,7 @@ fn run_start_request(
         aia_runtime: None,
         record_session: false,
         settings: Default::default(),
+        lean_context: schedule.input.lean_context,
         startup_cancel: Some(Arc::clone(&control.cancelled)),
     }
 }
@@ -2810,6 +2816,7 @@ fn clear_chat_request_fields(input: &mut ScheduledRequestInput) {
     input.model = None;
     input.local_connection_id = None;
     input.reasoning_effort = None;
+    input.lean_context = false;
     input.session_strategy = ScheduleSessionStrategy::NewChat;
 }
 
@@ -3454,6 +3461,7 @@ mod tests {
             workflow: None,
             active_from: None,
             active_until: None,
+            lean_context: false,
         }
     }
 
@@ -3509,6 +3517,45 @@ mod tests {
         request.cwd = "   ".to_owned();
         let saved = validate_input(request).expect("empty cwd is allowed");
         assert!(saved.cwd.is_empty());
+    }
+
+    /// 가벼운 문맥: 옛 저장본은 꺼짐으로 읽히고, 꺼진 값은 저장본에 쓰이지 않아(바이트
+    /// 불변) 켠 값만 남는다. 워크플로 회차는 채팅을 띄우지 않으므로 비운다.
+    #[test]
+    fn lean_context_is_opt_in_and_cleared_for_workflow_schedules() {
+        let request = input(Path::new("/unused"));
+        let mut value = serde_json::to_value(&request).expect("serialize");
+        assert!(value.get("leanContext").is_none());
+        value.as_object_mut().expect("object").remove("leanContext");
+        let old: ScheduledRequestInput = serde_json::from_value(value.clone()).expect("old");
+        assert!(!old.lean_context);
+        value["leanContext"] = json!(true);
+        let lean: ScheduledRequestInput = serde_json::from_value(value).expect("lean");
+        assert!(lean.lean_context);
+        assert_eq!(
+            serde_json::to_value(&lean).expect("serialize")["leanContext"],
+            json!(true)
+        );
+
+        let mut workflow = lean.clone();
+        workflow.workflow = Some(ScheduleWorkflowAction {
+            workflow_id: "wf".to_owned(),
+            approved_version: 1,
+            arguments: json!({}),
+            pacing: None,
+        });
+        clear_chat_request_fields(&mut workflow);
+        assert!(!workflow.lean_context);
+
+        let control = Arc::new(ActiveRunControl {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            chat_id: Mutex::new(None),
+            last_heartbeat_at: AtomicI64::new(0),
+        });
+        let schedule = stored_schedule("s-lean", lean, 1);
+        let start = run_start_request(&schedule, None, "run-1", None, &control);
+        assert!(start.lean_context);
+        assert!(start.unattended);
     }
 
     #[test]

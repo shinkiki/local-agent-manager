@@ -721,6 +721,68 @@ mod tests {
         assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    /// C9-17/V2: 같은 요청이 마지막 대기 자리를 두고 경쟁해도 모두 같은 카드를 받는다.
+    #[test]
+    fn c9_17_racing_duplicate_requests_share_the_last_pending_slot() {
+        for scope in [SshApprovalScope::OneShot, SshApprovalScope::Persist] {
+            let store = std::sync::Arc::new(SshApprovalStore::new());
+            let mut existing_ids = Vec::new();
+            for index in 0..MAX_PENDING_PER_CHAT - 1 {
+                let command = format!("uptime -{index}");
+                let (ticket, _) = store
+                    .open(CHAT, open_request(&command, scope))
+                    .expect("마지막 한 자리만 남김");
+                existing_ids.push(ticket.id);
+            }
+
+            let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let store = std::sync::Arc::clone(&store);
+                let gate = std::sync::Arc::clone(&gate);
+                handles.push(std::thread::spawn(move || {
+                    gate.wait();
+                    store
+                        .open(CHAT, open_request("docker ps", scope))
+                        .map_err(|error| error.to_string())
+                }));
+            }
+            // 모든 스레드가 끝난 뒤 결과를 검사한다.
+            let results: Vec<_> = handles
+                .into_iter()
+                .map(|handle| handle.join().expect("요청 스레드"))
+                .collect();
+            let opened: Vec<_> = results
+                .into_iter()
+                .collect::<Result<_, _>>()
+                .expect("상한에 닿아도 같은 요청은 재사용");
+            let first = &opened[0];
+            for result in &opened {
+                assert_eq!(result, first, "동시 요청의 토큰과 카드가 같음");
+            }
+
+            let pending = store.pending_cards(CHAT);
+            assert_eq!(pending.len(), MAX_PENDING_PER_CHAT);
+            assert_eq!(
+                pending.iter().filter(|card| card.id == first.0.id).count(),
+                1
+            );
+            for id in existing_ids {
+                assert!(pending.iter().any(|card| card.id == id), "기존 카드 보존");
+            }
+            let repeated = store
+                .open(CHAT, open_request("docker ps", scope))
+                .expect("가득 찬 상태에서도 재사용");
+            assert_eq!(&repeated, first);
+            assert!(
+                store
+                    .open(CHAT, open_request("docker info", scope))
+                    .is_err(),
+                "다른 요청은 상한을 넘길 수 없음"
+            );
+        }
+    }
+
     /// C9-17. 같은 명령을 두 번 요청해도 카드는 하나이고, 용도가 다르면 각자의 카드를
     /// 받는다. 대화당 대기 건수에는 상한이 있다.
     #[test]

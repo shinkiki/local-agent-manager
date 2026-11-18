@@ -101,6 +101,26 @@ export {
   setDbConnectionEnabled,
 } from "./ipcDbConnections";
 export {
+  checkK8sCluster,
+  getK8sClusters,
+  removeK8sCluster,
+  setK8sCluster,
+  setK8sClusterEnabled,
+} from "./ipcK8sClusters";
+export {
+  askAiaPeer,
+  checkAiaPeer,
+  getAiaPeerExchange,
+  getAiaPeers,
+  importAiaPeerSkill,
+  listAiaPeerExchanges,
+  listAiaPeerSkills,
+  removeAiaPeer,
+  setAiaPeer,
+  setAiaPeerAgentEnabled,
+  setAiaPeerPolicy,
+} from "./ipcAiaPeers";
+export {
   getLocalLlmConnections,
   probeLocalLlmConnection,
   removeLocalLlmConnection,
@@ -173,6 +193,7 @@ export {
 } from "./ipcCypress";
 export {
   BackendBusyError,
+  BackendTimeoutError,
   RemoteConnectionError,
   getWebAccessStatus,
 } from "./ipcTransport";

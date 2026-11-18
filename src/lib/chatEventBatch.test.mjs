@@ -140,3 +140,32 @@ test("appends of different tool cards and a final snapshot keep their order", ()
   ]);
   assert.equal(frame.callbacks.size, 0);
 });
+
+for (const delivery of ["frame", "flush"]) {
+  test(`V4: ${delivery} preserves tool descriptions and the latest name and status`, () => {
+    const frame = fixture();
+    const events = [];
+    const batch = createChatEventBatch((event) => events.push(event), frame.scheduler);
+    const chunks = [
+      { type: "tool", id: "exec-1", name: "명령", status: "pending", detail: null, output: null, append: true },
+      { type: "tool", id: "exec-1", name: "명령 실행", status: "running", detail: "npm ", output: "첫 줄\n", append: true },
+      { type: "tool", id: "exec-1", name: "", status: "completed", detail: "test", output: "둘째 줄", append: true },
+      { type: "tool", id: "exec-1", name: "", status: "completed", detail: null, output: null, append: true },
+    ];
+    const originalChunks = structuredClone(chunks);
+
+    for (const chunk of chunks) batch.push(chunk);
+    assert.deepEqual(events, [], "도구 조각은 전달 경계까지 모아 둔다");
+    const turn = { type: "turn", id: "turn-1", status: "completed" };
+    if (delivery === "frame") frame.runFrame();
+    else batch.push(turn);
+
+    const merged = {
+      type: "tool", id: "exec-1", name: "명령 실행", status: "completed",
+      detail: "npm test", output: "첫 줄\n둘째 줄", append: true,
+    };
+    assert.deepEqual(events, delivery === "frame" ? [merged] : [merged, turn]);
+    assert.deepEqual(chunks, originalChunks, "병합이 호출자의 원본 조각을 고치지 않는다");
+    assert.equal(frame.callbacks.size, 0, "전달 뒤에는 프레임 예약을 남기지 않는다");
+  });
+}

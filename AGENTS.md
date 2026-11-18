@@ -60,6 +60,9 @@ Apply to every change. The only permitted deviations are the numbered exceptions
   the classification table that the AIA catalog grade test and `projectMenuConformance` read; the
   request boundary no longer consults it. `--remote-write` / `--no-remote-write` are accepted and
   ignored with a warning for one release so existing NAS images keep starting.
+  The one path that needs no sign-in on `remote` is `/api/peer/*` (`C23-2`): it is a narrow
+  device-to-device API gated by tailnet membership and the feature's own `enabled` switch, not a
+  way into the command surface.
 
 ## 3. Direct-mutation exceptions
 
@@ -94,6 +97,8 @@ row being here at all.
 | C20 | access-channel login adapter (`login_auth.rs`, `login_sessions.rs`, `login_totp.rs`) | `login-settings-v1.json` (user ID, argon2id hash, per-channel requirements, last OTP step), `login-sessions-v1.json` (session SHA-256 only) and the OTP secret — OS Keychain item `Agent Manager Login`/`totp`, falling back to the `0600` file `login-otp-secret` only where no secure store exists | nothing provider-owned is touched; `--reset-login` (or deleting the three files) returns to "no login required". Sessions expire (30 days idle, 90 days absolute) and can be revoked from the settings card | the whole card is reachable from any signed-in channel; changing a method needs the current password (or OTP) again (`C20-4`) |
 | C19 | local overlay adapter (`project_overlays.rs`) | 앱 데이터의 `<app data>/git-overlays/`, 그리고 스냅샷·적용 시점에만 **등록된 활성 프로젝트** 작업 트리의 선택된 추적 파일 | patch를 먼저 쓰고 digest까지 확인한 뒤에만 되돌리고, 재적용은 `git apply --check`가 통과할 때만 한다. 세트 삭제는 앱 소유 휴지통으로 옮긴다 | 읽기는 열려 있고, 세트 저장·삭제와 작업 트리를 바꾸는 스냅샷·적용 모두 write mode에서 원격 가능(2026-10-02 사용자 결정) |
 | C21 | distributed runner settings (`runners.rs`) | `runners-v1.json` in the app data directory — runner rows that point at a C9 connection server by id (slots, browsers, enabled, note) and the project folders whose verification commands may be sent; nothing on the runner machines, in `~/.ssh` or in the project folders. The app executes nothing on runners beyond the C9-11 check; the external consumers described in `C21-4`/`C21-5` do | the store is secret-free app data; deleting a row (or the file) returns to "no runners", and the consumer runs the work elsewhere | yes — list, edits and the connection check are reachable from any signed-in channel; AIA gets the C9-bounded read and check only (`C21-3`) |
+| C22 | Kubernetes cluster adapter (`k8s_clusters.rs`, `k8s_exec.rs`, `k8s_cli.rs`) | the Kubernetes API servers the user registered and enabled for agents — **read requests only** (GET and the side-effect-free `SelfSubjectRulesReview`), plus cluster metadata in the app data directory and the OS Keychain item derived from the cluster id | nothing on a cluster is changed, so there is nothing to recover there; the metadata is secret-free and deleting a row also deletes its Keychain item | yes — registration, the agent-use toggle, the check and every read are reachable from any signed-in channel (C20) |
+| C23 | AIA peer conversation (`aia_peers.rs`, `aia_peer_exchange.rs`, `aia_peer_cli.rs`) | `aia-peers-v1.json` (policy, peer rows, skill-import ledger) and the receipt log `aia-peer-exchanges-v1.jsonl` in the app data directory; **unattended AIA chats** started on this device to answer a peer's question; and, on an explicit import, one common skill directory in the C3 repository | nothing on the peer device is changed; the policy is closed by default and deleting a row returns to "no peers"; an import is the C3 staged replace and refuses a locally edited copy without `overwrite` | yes — policy, peer rows, the agent-use toggle, the check, asking and importing are reachable from any signed-in channel (C20); the **inbound** path is reachable without any session, by tailnet membership alone (`C23-2`) |
 
 ### C1 — credential adapter
 
@@ -1617,6 +1622,159 @@ folders to other machines. The app only stores the settings and exposes them rea
   `slots`; `0` (the default) means no browser runs are sent there, so a machine without Cypress
   installed is never picked. The app still executes nothing on runners beyond the C9-11 check; this
   clause, like C21-4, is enforced in the consumer.
+
+
+### C22 — Kubernetes clusters (`k8s_clusters.rs`, `k8s_exec.rs`, `k8s_cli.rs`)
+
+User request, 2026-11-10: an Add-ons → Kubernetes tab so agents can inspect k3s (and any other
+conformant) clusters without holding a kubeconfig. Same shape as C10: the app owns the
+credential and makes the calls; the agent passes a cluster id, a kind and names.
+
+- **C22-1** A cluster is an app-owned record (name, environment label, API server URL, CA bundle and
+  its SHA-256 fingerprint, auth kind, namespace scope, agent-use flag, note) in
+  `k8s-clusters-v1.json` (G7), bounded to 32 entries. The server must be `https://`, or `http://`
+  on a loopback host only (`kubectl proxy`); embedded credentials, queries and fragments are
+  refused. A pasted kubeconfig is parsed once and discarded. Kubeconfigs that point at files
+  (`certificate-authority`, `client-certificate`, `client-key`, `token-file`), run programs
+  (`exec`, `auth-provider`), disable verification (`insecure-skip-tls-verify`), or use
+  `tls-server-name`/`proxy-url`/basic auth are refused — the app would otherwise follow user files,
+  launch arbitrary binaries, or accept a man-in-the-middle. Parse errors never echo the source.
+- **C22-2** The credential — a bearer token, or a client certificate and key — lives only in the
+  OS Keychain under the `Agent Manager Kubernetes` service, keyed by cluster id; app data records
+  the storage time. It is `Zeroizing`, has a redacting `Debug`, and never appears in an IPC
+  response, receipt, error, or log. A registered CA replaces the system trust store for that
+  cluster (`tls_certs_only`); redirects are not followed so a bearer token cannot be carried to
+  another host. The Keychain item also records what the credential is **bound** to — server, CA
+  fingerprint, namespace scope and agent use — and every call that takes the credential out
+  refuses when the app-data record disagrees. App data is not trusted alone because a shell agent
+  can point `<CLI> k8s --app-data-dir` at a forged store; the binding is rewritten only by the
+  app's own save and toggle. Editing the server or CA without entering the credential again is
+  refused, and the agent-use flag changes only through the toggle (a save keeps the stored value).
+- **C22-3** Agents reach a cluster only when the user turned on agent use and a credential is
+  stored. `list_agent_k8s_clusters` / `<CLI> k8s list` carry the environment, server and namespace
+  scope — never a credential — and report enabled-but-unusable clusters with a reason. Every
+  agent read re-reads the stored record (`agent_cluster_of`). The screen check
+  (`check_k8s_cluster`, not in the AIA catalog) runs regardless of agent use; the agent check
+  (`check_agent_k8s_cluster`, `<CLI> k8s check`) does not.
+- **C22-4** Namespace scope narrows this app's execution path, not the cluster's RBAC (as in
+  C9-16/C10-10). With a scope set, namespaced kinds require a namespace inside it and an
+  all-namespaces read is refused; cluster-scoped kinds (Node, Namespace, PersistentVolume, …) are
+  not scoped. Namespace, resource, pod and container names are validated against Kubernetes name
+  rules before they become path segments, so `/`, `..` or `?` cannot redirect the request.
+- **C22-5** Kinds resolve from a built-in table of common kinds and kubectl short names; anything
+  else (CRDs) is found through API discovery, bounded to 80 groups, and an explicit `apiVersion`
+  skips the scan. Subresources are never matched.
+- **C22-6** The check reads `/version`, up to 50 nodes, and a `SelfSubjectRulesReview` for the
+  first scoped namespace (or `default`). `broadAccess` is reported when a rule grants every verb
+  on every resource, so the screen and AIA can recommend a narrower ServiceAccount.
+- **C22-7** Results are sanitized before they leave the adapter: `managedFields` and the
+  `last-applied-configuration` annotation are dropped from every object; Secret `data`/`stringData`
+  values become `<가려짐: N바이트>` (list rows carry key names only); any `{name, value}` pair
+  whose name contains PASS, SECRET, TOKEN, APIKEY, API_KEY, PRIVATE or CREDENTIAL, or whose value
+  is a URL carrying `user:password@`, has its `value` masked; and in container `args`/`command`
+  the value of `--token=…`/`password: …`-shaped items, the item after a bare `--password`-style
+  flag, and credential URLs are masked. Objects are capped at 256 KB (status dropped first), lists at 500 rows and
+  any JSON body at 16 MB; truncation is reported.
+- **C22-8** Logs are capped by `tailLines` (default 200, max 5,000) and 256 KB (`limitBytes`
+  plus a local read cap). Per line, key blocks and the C9 long-token rule are applied, then runs
+  of token characters are scanned regardless of surrounding punctuation: three-segment JWTs, and
+  runs of 32+ characters that are all hex or mix upper case, lower case and digits, are removed.
+  Pod names and UUIDs (lower case and digits only) survive, and so does line shape. `apiVersion`
+  segments must start alphanumeric and contain no `..`, so a request cannot climb above
+  `/api`/`/apis`. Events report `truncated` when the server still had more to send. Events are sorted newest first and capped at 100 rows with
+  the same message redaction. Server error bodies are reduced to the Status message, redacted,
+  and annotated for 401/403/404.
+- **C22-9** There are no write operations: no apply, patch, scale, restart, delete, exec,
+  port-forward or attach. Adding one is a new clause with its own approval design (preview via
+  server-side dry run), not an extension of these reads.
+- **C22-10** Shell-capable agents use the bundled `k8s-clusters` system skill. Every `<CLI> k8s`
+  subcommand (`list`, `check`, `resources`, `get`, `logs`, `events`) runs in that process against
+  the same policy code; a repeated or unknown flag is refused.
+
+### C23 — AIA peer conversation (`aia_peers.rs`, `aia_peer_exchange.rs`, `aia_peer_cli.rs`)
+
+User request, 2026-11-15: an Add-ons → AIA 대화 tab so the AIA on one device can ask the AIA on
+another device and read the answer, and fetch a common skill from that device when it needs one.
+Two decisions shape it. Membership, not pairing: authenticating every pair of devices grows with
+the square of the device count, so the inbound side trusts **tailnet membership** — the same
+`tailscale-user-login` check the remote channel already performs — and holds no credential at all.
+No sync: skills are listed and fetched on demand, and an import leaves a provenance record that
+later tells "peer newer" from "edited here".
+
+- **C23-1** Policy and peers live in `aia-peers-v1.json` (G7): `enabled` (default **off**),
+  `allowLocal` (default off), `maxDepth` (1–4, default 2), `maxConcurrent` (1–8, default 1),
+  `timeoutMs` (1–30 min, default 10), `deviceName`, up to 32 peer rows (id, name, URL, agent-use
+  flag, note, the two skill-list revisions) and the skill-import ledger. A peer URL is `https://`
+  with no path, userinfo, query or fragment; plain `http://` is accepted for loopback hosts only
+  (a second backend in tests). The device identity is the backend `store_id` plus a name that
+  defaults to the Tailscale host. No row holds a secret, so the store is plain app data and
+  removing a row restores "no peers"; the import ledger is kept because the skills it describes
+  are still here.
+- **C23-2** The inbound API is `/api/peer/hello`, `/api/peer/ask`, `/api/peer/exchange/<id>`,
+  `/api/peer/skills` and `/api/peer/skills/<key>`. It is exempt from the C20 login gate
+  (`enforce_login_for`) and accepts only the `Remote` channel — which `classify_channel` admits
+  solely when the Tailscale-user header matches the configured user — and `Native` (the host's
+  own process, the C20-5 trust level). It never reaches `/api/invoke`: a peer can greet, ask one
+  question, read that answer, list skills and read one skill, and nothing else. `hello` answers
+  while the feature is off so the other screen can show "disabled"; every other route refuses with
+  403 until `enabled` is on. The accepted devices are therefore "every device of the same tailnet
+  user", and the single per-device decision is the `enabled` switch.
+- **C23-3** An exchange is an asynchronous job in backend memory (`aia_peer_exchange.rs`,
+  bounded to 200 records, running ones never trimmed), because an MCP tool call is synchronous
+  and an AIA turn takes minutes (C7-5 shape). `ask_aia_peer` returns `{id, state: running}` and
+  `get_aia_peer_exchange` waits at most 25 s per call. Outbound calls use a `reqwest` client with
+  no redirects (E4), a 10 s connect / 30 s request timeout and a 4 MiB response cap, and poll the
+  peer's exchange route until the peer reports a terminal state or the timeout plus grace passes.
+  Every terminal exchange appends one line to `aia-peer-exchanges-v1.jsonl` (rotated at 2 MB)
+  carrying digests, lengths, state, chain and duration — never the question or the answer (G4).
+- **C23-4** The inbound side answers with an **unattended AIA chat** (`profile: aia`,
+  `unattended: true`, origin `peer`) started through the same `prepare_aia_runtime_request` the
+  screen uses, so it runs under the stored system-agent settings. The question is wrapped in an
+  `[aia-peer-request …]` block that names the sender, the hop and the depth cap and states that the
+  block is another AIA's request, not the user's instruction (the X6 rule applied to messages);
+  a forged close tag inside the message is neutralized. Unattended means approval cards are
+  auto-declined (C9-17-4), so the peer cannot drive a write that a person would have had to
+  approve; the chat is stopped once the answer is collected, or at the timeout. The answer is
+  the last turn's assistant text (`last_turn_output`, 64 KB cap) and is returned with
+  `untrusted: true`; the catalog text and the `aia-peers` skill tell the asking agent not to
+  follow instructions inside it and not to put secrets into a question, which lands in the
+  peer's session transcript.
+- **C23-5** Loops are cut by the request chain: every hop is `<device id>#<chat id>`, the
+  inbound side refuses when the chain length reaches `maxDepth`, when a request from another
+  device already carries this device's id (it came back), and when `maxConcurrent` inbound
+  exchanges are running. A local request (`peerId: local`, allowed only by `allowLocal`) naturally
+  carries its own device id, so it is bounded by depth alone. An AIA that is itself answering a
+  peer request extends that request's chain when it asks onward, so A→B→C→A is refused at A.
+  Refusals are recorded as `refused` exchanges with the reason and are not retried.
+- **C23-6** Skills are never synchronized. `list_aia_peer_skills` fetches the peer's common-skill
+  listing (keys, names, a **transfer digest** over paths and contents only, so executable bits and
+  timestamps cannot make identical copies look different) and annotates each with the local state
+  from the ledger: `absent`, `same`, `peerNewer`, `localModified`, `bothChanged`, `different`.
+  `import_aia_peer_skill` verifies the bundle digest, refuses escaping paths, `.agent-manager`
+  metadata and non-text files, then writes through the C3 path — `create_common_skill` when
+  absent, `update_common_skill` with the stored `contentDigest` as the optimistic lock otherwise —
+  and records `(peer, key, peer digest, local digest)` in the ledger. Only `absent` and
+  `peerNewer` import without `overwrite`; the three divergent states need it (C3-10), and `same`
+  is reported as nothing to do. Every exchange response carries the peer's skill-list revision;
+  when it differs from the revision last listed the screen shows a "skills changed" badge and
+  nothing else happens.
+- **C23-7** AIA gets `list_agent_aia_peers`, `get_aia_peer_exchange`, `list_aia_peer_exchanges`
+  and `list_aia_peer_skills` as reads and `check_aia_peer`, `ask_aia_peer` and
+  `import_aia_peer_skill` as executes, all refused while the feature or that peer's agent-use flag
+  is off (`agent_peer_of`). The policy, peer rows and the toggle are screen-only
+  (`show_ui_guide addons.peers`). Shell-capable agents use the bundled `aia-peers` skill:
+  `<CLI> peer list` reads the store, and `check`, `ask`, `exchange`, `exchanges`, `skills` and
+  `import` relay to the running backend because the exchange state and the outbound client live
+  there; the CLI never contacts a peer itself. `AGENT_MANAGER_CHAT_ID` only names the asking chat
+  for the chain and grants nothing.
+- **C23-8** Not in scope, by decision: replicating provider credentials between peers (refresh
+  rotation would need continuous sync and it breaks G4 — a device without a login asks a device
+  with one instead), a hub or transitive trust (a device is reachable only if this user's tailnet
+  admits it and this device lists it), devices outside the tailnet (the backend accepts no other
+  ingress today), and any write operation on the peer. Accepted and stated: a tailnet device that
+  turns the feature on answers questions from every other device of the same tailnet user, with
+  whatever the unattended AIA can read; the depth, concurrency and timeout caps and the `enabled`
+  switch are the controls.
 
 ## 4. External MCP interfaces (`mcp_registry.rs`)
 

@@ -59,7 +59,8 @@ import { SessionReadPolicyFields } from "./SessionReadPolicyFields";
 import { ACTIVE_ACCOUNT_CHOICE, accountById, defaultAccountIdFor, initialScheduleAccountId, providerManagesAccounts, selectableAccountsFor } from "./ChatScheduleAccounts";
 import { initialScheduleEditorModelSelection } from "../lib/schedulerSnapshot";
 import { localConnectionIdForRequest } from "../lib/localConnections";
-import { buildWorkflowArguments, validateScheduleWorkflowDraft, workflowInputDefaults, workflowInputEntries, workflowInputsFromArguments } from "../lib/scheduleWorkflow";
+import { validateScheduleWorkflowDraft, workflowInputDefaults, workflowInputEntries, workflowInputsFromArguments } from "../lib/scheduleWorkflow";
+import { workflowScheduleInput, type ScheduleEnvelope } from "../lib/scheduleWorkflowInput";
 import { describeActiveWindow, fromDatetimeLocalValue, toDatetimeLocalValue } from "../lib/scheduleWindow";
 import { useProviderOptions } from "../lib/providerOptions";
 import { useCatalogReasoningOptions } from "./ChatRuntimeSettingsMenu";
@@ -246,6 +247,7 @@ export function ScheduleEditor({ providers, accounts, projects, models, workflow
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">(schedule?.reasoningEffort ?? currentSession?.reasoningEffort ?? "");
   const [mode, setMode] = useState<ChatMode>(schedule?.mode ?? currentSession?.mode ?? "workspace");
   const [approvalMode, setApprovalMode] = useState<ChatApprovalMode>(effectiveApprovalMode(initialSource, schedule?.approvalMode ?? currentSession?.approvalMode ?? defaultApprovalMode(initialSource)));
+  const [leanContext, setLeanContext] = useState(schedule?.leanContext ?? false);
   const recurrenceDraft = useScheduleRecurrenceDraft(schedule);
   const [strategy, setStrategy] = useState(schedule?.sessionStrategy ?? "newChat");
   const [failurePolicy, setFailurePolicy] = useState<ResumeFailurePolicy>(schedule?.resumeFailurePolicy ?? "retryThenNewChat");
@@ -323,7 +325,7 @@ export function ScheduleEditor({ providers, accounts, projects, models, workflow
       input = workflowScheduleInput(envelope, { name, source, workflow: selectedWorkflow!, schema: workflowSchema, inputs: workflowInputs, saved: savedWorkflow });
     } else {
       input = chatScheduleInput(envelope, {
-        name, prompt, source, accountId, cwd, model, localConnectionId, reasoningEffort, strategy, currentSession,
+        name, prompt, source, accountId, cwd, model, localConnectionId, reasoningEffort, strategy, currentSession, leanContext,
         sessionPolicy, sessionOrigin, sessionRecommendation,
         savedProviderSessionId: schedule?.providerSessionId ?? null,
         hasSavedSessionReference: Boolean(schedule?.sessionReference),
@@ -368,7 +370,7 @@ export function ScheduleEditor({ providers, accounts, projects, models, workflow
       return save({ ...input, cwd: created.path });
     }
   };
-  return <form className="schedule-editor" onSubmit={submit}><header><div><strong>{schedule ? "반복 요청 수정" : "새 반복 요청"}</strong><span>{recurrenceDraft.timezone}</span></div><button type="button" onClick={onCancel} aria-label="닫기"><X size={16} /></button></header><div className="schedule-editor-grid"><label><span>이름</span><input value={name} onChange={(event) => setName(event.target.value)} maxLength={SCHEDULE_NAME_MAX} placeholder={text(`비워두면 요청 앞부분 사용 · 최대 ${SCHEDULE_NAME_MAX}자`, `Leave empty to use the start of the request · up to ${SCHEDULE_NAME_MAX} characters`)} /></label><label><span>실행 대상</span><select value={target} onChange={(event) => { setTarget(event.target.value as "chat" | "workflow"); setError(null); }}><option value="chat">에이전트 요청</option><option value="workflow">시스템 워크플로</option></select></label>{target === "chat" && <><ScheduleChatTargetFields providers={providers} projects={projects} accounts={accounts} source={source} onSourceChange={setSource} managesAccounts={managesAccounts} accountId={accountId} providerAccounts={providerAccounts} activeAccountId={actualActiveAccountId} onAccountIdChange={setAccountId} prompt={prompt} onPromptChange={setPrompt} cwd={cwd} onCwdChange={setCwd} /><RuntimeSettings source={source} mode={mode} onModeChange={setMode} approvalMode={approvalMode} onApprovalModeChange={setApprovalMode} model={model} onModelChange={setModel} localConnectionId={localConnectionId} onLocalConnectionChange={setLocalConnectionId} catalog={providerOptions} recent={recentModels} reasoningEffort={reasoningEffort} onReasoningChange={setReasoningEffort} reasoningOptions={reasoningOptions} defaultEffort={defaultEffortFor(providerOptions, model)} compact unattended /><ScheduleSystemToolsNotice source={source} /></>}{target === "workflow" && <ScheduleWorkflowFields workflows={workflows} workflowId={workflowId} savedWorkflow={savedWorkflow} selected={selectedWorkflow} schema={workflowSchema} inputs={workflowInputs} onWorkflowIdChange={setWorkflowId} onInputChange={(fieldName, next) => setWorkflowInputs((current) => ({ ...current, [fieldName]: next }))} />}<ScheduleRecurrenceFields {...recurrenceDraft.fields} />{target === "chat" && <ScheduleSessionStrategyFields strategy={strategy} onStrategyChange={setStrategy} failurePolicy={failurePolicy} onFailurePolicyChange={setFailurePolicy} />}<label className="check-filter"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /> 저장 후 활성화</label></div><ScheduleAdvancedSection open={advancedOpen} onToggle={() => setAdvancedOpen((open) => !open)} target={target} activeWindow={activeWindow.fields} onFromChange={activeWindow.onFromChange} onUntilChange={activeWindow.onUntilChange} sessionPolicy={sessionPolicy} sessionOrigin={sessionOrigin} sessionRecommendation={sessionRecommendation} projects={projects} onSessionPolicyChange={setSessionPolicy} />{target === "chat" && managesAccounts && providerAccounts.length === 0 && <ErrorBanner message={text("선택한 공급자에 사용 가능한 계정이 없습니다. 설정에서 계정을 추가하세요.", "The selected provider has no usable account. Add one in Settings.")} />}{error && <ErrorBanner message={error} />}<footer><button className="button" type="button" onClick={onCancel}>취소</button><button className="button primary" type="submit" disabled={saving || activeWindow.inverted || sessionPeriodInverted || (target === "workflow" ? !workflowId : (managesAccounts && !accountId) || !prompt.trim())}>{saving ? "저장 중…" : "저장"}</button></footer>{confirmDialog}</form>;
+  return <form className="schedule-editor" onSubmit={submit}><header><div><strong>{schedule ? "반복 요청 수정" : "새 반복 요청"}</strong><span>{recurrenceDraft.timezone}</span></div><button type="button" onClick={onCancel} aria-label="닫기"><X size={16} /></button></header><div className="schedule-editor-grid"><label><span>이름</span><input value={name} onChange={(event) => setName(event.target.value)} maxLength={SCHEDULE_NAME_MAX} placeholder={text(`비워두면 요청 앞부분 사용 · 최대 ${SCHEDULE_NAME_MAX}자`, `Leave empty to use the start of the request · up to ${SCHEDULE_NAME_MAX} characters`)} /></label><label><span>실행 대상</span><select value={target} onChange={(event) => { setTarget(event.target.value as "chat" | "workflow"); setError(null); }}><option value="chat">에이전트 요청</option><option value="workflow">시스템 워크플로</option></select></label>{target === "chat" && <><ScheduleChatTargetFields providers={providers} projects={projects} accounts={accounts} source={source} onSourceChange={setSource} managesAccounts={managesAccounts} accountId={accountId} providerAccounts={providerAccounts} activeAccountId={actualActiveAccountId} onAccountIdChange={setAccountId} prompt={prompt} onPromptChange={setPrompt} cwd={cwd} onCwdChange={setCwd} /><RuntimeSettings source={source} mode={mode} onModeChange={setMode} approvalMode={approvalMode} onApprovalModeChange={setApprovalMode} model={model} onModelChange={setModel} localConnectionId={localConnectionId} onLocalConnectionChange={setLocalConnectionId} catalog={providerOptions} recent={recentModels} reasoningEffort={reasoningEffort} onReasoningChange={setReasoningEffort} reasoningOptions={reasoningOptions} defaultEffort={defaultEffortFor(providerOptions, model)} compact unattended /><ScheduleSystemToolsNotice source={source} />{source === "claude" && <label className="check-filter"><input type="checkbox" checked={leanContext} onChange={(event) => setLeanContext(event.target.checked)} /> {text("가벼운 문맥: 셸·파일 도구만 (스킬 목록·서브에이전트·웹 도구·claude.ai 커넥터 생략, 연결된 MCP는 유지)", "Lean context: shell and file tools only (skips skill listing, subagents, web tools, claude.ai connectors; attached MCP stays)")}</label>}</>}{target === "workflow" && <ScheduleWorkflowFields workflows={workflows} workflowId={workflowId} savedWorkflow={savedWorkflow} selected={selectedWorkflow} schema={workflowSchema} inputs={workflowInputs} onWorkflowIdChange={setWorkflowId} onInputChange={(fieldName, next) => setWorkflowInputs((current) => ({ ...current, [fieldName]: next }))} />}<ScheduleRecurrenceFields {...recurrenceDraft.fields} />{target === "chat" && <ScheduleSessionStrategyFields strategy={strategy} onStrategyChange={setStrategy} failurePolicy={failurePolicy} onFailurePolicyChange={setFailurePolicy} />}<label className="check-filter"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /> 저장 후 활성화</label></div><ScheduleAdvancedSection open={advancedOpen} onToggle={() => setAdvancedOpen((open) => !open)} target={target} activeWindow={activeWindow.fields} onFromChange={activeWindow.onFromChange} onUntilChange={activeWindow.onUntilChange} sessionPolicy={sessionPolicy} sessionOrigin={sessionOrigin} sessionRecommendation={sessionRecommendation} projects={projects} onSessionPolicyChange={setSessionPolicy} />{target === "chat" && managesAccounts && providerAccounts.length === 0 && <ErrorBanner message={text("선택한 공급자에 사용 가능한 계정이 없습니다. 설정에서 계정을 추가하세요.", "The selected provider has no usable account. Add one in Settings.")} />}{error && <ErrorBanner message={error} />}<footer><button className="button" type="button" onClick={onCancel}>취소</button><button className="button primary" type="submit" disabled={saving || activeWindow.inverted || sessionPeriodInverted || (target === "workflow" ? !workflowId : (managesAccounts && !accountId) || !prompt.trim())}>{saving ? "저장 중…" : "저장"}</button></footer>{confirmDialog}</form>;
 }
 
 /**
@@ -417,50 +419,6 @@ function ScheduleSessionStrategyFields({ strategy, onStrategyChange, failurePoli
   return <><label><span>세션 방식</span><select value={strategy} onChange={(event) => onStrategyChange(event.target.value as "newChat" | "continue")}><option value="newChat">매번 새 채팅</option><option value="continue">동일 대화 이어가기</option></select></label>{strategy === "continue" && <label><span>재개 실패 시</span><select value={failurePolicy} onChange={(event) => onFailurePolicyChange(event.target.value as ResumeFailurePolicy)}><option value="pause">작업 일시정지</option><option value="newChat">즉시 새 대화</option><option value="retryThenNewChat">한 번 재시도 후 새 대화</option></select></label>}</>;
 }
 
-/** 두 실행 대상이 함께 채우는 봉투 — 주기·권한·활성 창·활성화. */
-type ScheduleEnvelope = Pick<ScheduledRequestInput, "mode" | "approvalMode" | "recurrence" | "resumeFailurePolicy" | "enabled" | "activeFrom" | "activeUntil">;
-
-/**
- * 폼 값에서 저장 입력을 만드는 두 갈래. 편집기의 제출 처리는 막을 이유를 보고, 확인을
- * 받고, 저장하는 순서만 남기고 어떤 칸이 어떤 값이 되는지는 여기서 정한다. 두 갈래가
- * 같은 함수 안에 이어 붙어 있으면 한쪽 칸을 고치다 다른 쪽 분기를 함께 읽어야 했다.
- *
- * 무엇을 막을지(워크플로 인자 검사, 활성 창 역전)는 옮기지 않았다. 막는 문장은 화면에
- * 그대로 뜨는 값이라 상태를 쥔 쪽에 둔다.
- */
-function workflowScheduleInput(envelope: ScheduleEnvelope, draft: {
-  name: string;
-  source: ProviderId;
-  workflow: SystemWorkflowSummary;
-  schema: ReturnType<typeof workflowInputEntries>;
-  inputs: Record<string, string>;
-  saved: ScheduledRequest["workflow"] | null;
-}): ScheduledRequestInput {
-  return {
-    ...envelope,
-    name: draft.name.trim() || draft.workflow.displayName || draft.workflow.id,
-    prompt: "",
-    source: draft.source,
-    accountId: "",
-    useActiveAccount: false,
-    cwd: "",
-    model: null,
-    reasoningEffort: null,
-    sessionStrategy: "newChat",
-    providerSessionId: null,
-    sessionReference: null,
-    // 지금 등록된 버전을 승인 버전으로 고정한다. 이후 워크플로가 바뀌면 백엔드가 그
-    // 회차를 실행하지 않고 반복 요청을 멈춘다.
-    // 병렬 실행 설정은 페이싱 탭의 회차 편집기가 소유한다. 여기서 다시 저장해도 지우지 않는다.
-    workflow: {
-      workflowId: draft.workflow.id,
-      approvedVersion: draft.workflow.version ?? 0,
-      arguments: buildWorkflowArguments(draft.schema, draft.inputs),
-      pacing: draft.saved?.workflowId === draft.workflow.id ? draft.saved.pacing ?? null : null,
-    },
-  };
-}
-
 function chatScheduleInput(envelope: ScheduleEnvelope, draft: {
   name: string;
   prompt: string;
@@ -472,6 +430,7 @@ function chatScheduleInput(envelope: ScheduleEnvelope, draft: {
   reasoningEffort: ReasoningEffort | "";
   strategy: ScheduledRequestInput["sessionStrategy"];
   currentSession: ChatSessionInfo | null;
+  leanContext: boolean;
   sessionPolicy: SessionReadPolicy;
   sessionOrigin: SessionReadOrigin;
   sessionRecommendation: SessionReadPolicy | null;
@@ -500,6 +459,8 @@ function chatScheduleInput(envelope: ScheduleEnvelope, draft: {
       ? { policy: clampSessionReadPolicy(draft.sessionPolicy), origin: draft.sessionOrigin, aiaRecommendation: draft.sessionRecommendation }
       : null,
     workflow: null,
+    // Claude 회차에만 효과가 있다. 꺼진 값은 백엔드도 저장본에 쓰지 않으므로 보내지 않는다.
+    ...(draft.leanContext && draft.source === "claude" ? { leanContext: true } : {}),
   };
 }
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::env;
 use std::fs;
@@ -21,6 +21,7 @@ use crate::tailscale_cli::{
     configure_serve, detect_tailscale_identity, disable_serve, read_serve_target, rollback_serve,
     serve_target, validate_tailscale_host, TailscaleIdentity,
 };
+use crate::ChatPhase;
 use crate::{
     add_doc_root, create_session_folder, delete_session_folder, ensure_doc_root_agent_enabled,
     inspect_local_environment, list_doc_roots, list_doc_tree, list_document_entries,
@@ -723,13 +724,7 @@ impl DocumentActionExecutor for RuntimeLayers {
         action: &DocumentTriggerAction,
         context: &DocumentActionContext,
     ) -> Result<DocumentActionReceipt, DocumentActionError> {
-        self.validate_action(action).map_err(|error| match action {
-            DocumentTriggerAction::ExecuteWorkflow(_)
-            | DocumentTriggerAction::StartChat(DocumentChatAction { skill: Some(_), .. }) => {
-                DocumentActionError::needs_review(error.to_string())
-            }
-            _ => DocumentActionError::failed(error.to_string()),
-        })?;
+        self.validate_action_for_run(action)?;
         let summary = document_event_prompt(context);
         match action {
             DocumentTriggerAction::RunSchedule { schedule_id } => {
@@ -747,43 +742,13 @@ impl DocumentActionExecutor for RuntimeLayers {
                 })
             }
             DocumentTriggerAction::StartChat(action) => {
-                let skill_binding = action
-                    .skill
-                    .as_ref()
-                    .map(|skill| self.validate_skill(&skill.skill_id, &skill.content_digest))
-                    .transpose()?;
-                let skill_prompt = skill_binding
-                    .map(|(name, body)| {
-                        format!("\n\n[사용자가 승인한 등록 스킬: {name}]\n{body}\n[등록 스킬 끝]")
-                    })
-                    .unwrap_or_default();
-                let mut chat: ChatStartRequest = serde_json::from_value(json!({
-                    "source": action.source,
-                    "accountId": action.account_id,
-                    "cwd": context.batch.root_path,
-                    "model": action.model,
-                    "reasoningEffort": action.reasoning_effort,
-                    "mode": action.mode,
-                    "approvalMode": action.approval_mode,
-                    "resumeSessionId": null,
-                    "handoffOrigin": null,
-                    "unattended": true,
-                    "profile": "standard",
-                    "settings": action.settings,
-                }))
-                .map_err(|error| DocumentActionError::failed(error.to_string()))?;
-                // 출처를 남긴다. 사용자가 설정한 문서 자동화가 띄운 런타임이라 사용자 직접
-                // 시작으로 표시한다 — 출처가 없으면 같은 경로의 페이싱 회차가 옛 런타임으로
-                // 보고 결과 회수 전에 끈다.
-                chat.origin = Some(ChatOrigin::direct(ChatOriginKind::User));
-                let delivery = crate::start_chat(
-                    &self.app_data_dir,
-                    &self.chats,
-                    StartChatRequest {
-                        chat,
-                        message: format!("{summary}{skill_prompt}\n\n{}", action.prompt),
-                        idempotency_key: context.idempotency_key.clone(),
-                    },
+                let skill_prompt = self.document_skill_prompt(action)?;
+                let inline = document_inline_prompt(action, context);
+                let delivery = self.start_document_chat(
+                    action,
+                    &context.batch.root_path,
+                    format!("{summary}{inline}{skill_prompt}\n\n{}", action.prompt),
+                    &context.idempotency_key,
                 )?;
                 Ok(DocumentActionReceipt {
                     result_id: Some(delivery.chat_id.clone()),
@@ -814,6 +779,232 @@ impl DocumentActionExecutor for RuntimeLayers {
             }
         }
     }
+
+    fn execute_conversation_turn(
+        &self,
+        action: &DocumentTriggerAction,
+        context: &DocumentActionContext,
+        turn: &crate::DocumentConversationTurn,
+    ) -> Result<crate::ConversationTurnOutcome, DocumentActionError> {
+        let DocumentTriggerAction::StartChat(chat) = action else {
+            return Err(DocumentActionError::failed(
+                "대화 이어 보내기는 새 채팅 트리거에서만 씁니다",
+            ));
+        };
+        let Some(config) = chat.conversation.as_ref() else {
+            return Err(DocumentActionError::failed(
+                "대화 이어 보내기 설정이 없습니다",
+            ));
+        };
+        // 이어 보내는 턴도 승인 지문을 확인한다. 스킬이 바뀌었으면 옛 본문으로 이어 가지 않는다.
+        self.validate_action_for_run(action)?;
+        let summary = document_event_prompt(context);
+        let inline = document_inline_prompt(chat, context);
+        let follow = format!("{summary}{inline}");
+        let fingerprint =
+            crate::document_conversation::settings_fingerprint(chat, &context.batch.root_path);
+        let chats = DocumentConversationChats {
+            layers: self,
+            start: Some((chat, &context.batch.root_path)),
+        };
+        crate::document_conversation::run_turn(
+            &self.app_data_dir,
+            &chats,
+            &crate::document_conversation::ConversationTurn {
+                trigger_id: &context.trigger_id,
+                key: &turn.key,
+                fingerprint: &fingerprint,
+                config,
+                cooldown_ms: turn.cooldown_ms,
+                now: turn.now,
+                allow_new: turn.allow_new,
+                idempotency_key: &context.idempotency_key,
+            },
+            || {
+                let skill_prompt = self.document_skill_prompt(chat)?;
+                Ok(format!(
+                    "{follow}\n\n[대화 키: {} — 같은 키의 다음 변경은 이 채팅에 새 턴으로 이어서 옵니다. 다른 키의 변경은 이 채팅으로 오지 않습니다]{skill_prompt}\n\n{}",
+                    turn.key, chat.prompt
+                ))
+            },
+            &follow,
+        )
+    }
+
+    fn sweep_conversations(
+        &self,
+        triggers: &[crate::DocumentTrigger],
+        running: &std::collections::HashSet<String>,
+        now: i64,
+    ) {
+        let idle_by_trigger = triggers
+            .iter()
+            .filter_map(|trigger| match &trigger.input.action {
+                DocumentTriggerAction::StartChat(DocumentChatAction {
+                    conversation: Some(config),
+                    ..
+                }) => Some((trigger.id.as_str(), config.idle_ms)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        let chats = DocumentConversationChats {
+            layers: self,
+            start: None,
+        };
+        if let Err(error) = crate::document_conversation::sweep_idle(
+            &self.app_data_dir,
+            &chats,
+            now,
+            |trigger_id| idle_by_trigger.get(trigger_id).copied(),
+            |trigger_id| running.contains(trigger_id),
+        ) {
+            eprintln!("[document-automation] 대화 정리 실패: {error}");
+        }
+    }
+}
+
+/// 문서 트리거 새 채팅이 띄운 채팅을 대화 이어 보내기 쪽에서 다루는 손잡이.
+struct DocumentConversationChats<'a> {
+    layers: &'a RuntimeLayers,
+    /// 새 채팅을 띄울 때 쓰는 액션과 작업 경로. 정리(sweep)에서는 띄우지 않으므로 없다.
+    start: Option<(&'a DocumentChatAction, &'a str)>,
+}
+
+impl crate::document_conversation::ConversationChats for DocumentConversationChats<'_> {
+    fn chat_state(
+        &self,
+        chat_id: &str,
+    ) -> Option<crate::document_conversation::ConversationChatState> {
+        let chat = self
+            .layers
+            .chats
+            .all_chats()
+            .ok()?
+            .into_iter()
+            .find(|chat| chat.chat_id == chat_id)?;
+        (!matches!(chat.state, ChatPhase::Stopped | ChatPhase::Failed)).then_some(
+            crate::document_conversation::ConversationChatState {
+                turn_count: chat.turn_count,
+                last_activity_at: chat.last_activity_at,
+                busy: chat.state != ChatPhase::Ready,
+            },
+        )
+    }
+
+    fn send_turn(&self, chat_id: &str, text: &str) -> Result<(), CoreError> {
+        // 턴이 돌고 있으면 채팅 대기열에 순서대로 쌓이고, 턴이 끝나면 차례로 나간다.
+        self.layers
+            .chats
+            .send_managed(chat_id, text, true)
+            .map(|_| ())
+    }
+
+    fn start_chat(
+        &self,
+        text: &str,
+        idempotency_key: &str,
+    ) -> Result<(String, Option<Value>), DocumentActionError> {
+        let Some((action, root_path)) = self.start else {
+            return Err(DocumentActionError::failed(
+                "대화 정리 중에는 새 채팅을 띄우지 않습니다",
+            ));
+        };
+        let delivery =
+            self.layers
+                .start_document_chat(action, root_path, text.to_owned(), idempotency_key)?;
+        Ok((
+            delivery.chat_id.clone(),
+            serde_json::to_value(delivery).ok(),
+        ))
+    }
+
+    fn stop_chat(&self, chat_id: &str) {
+        if let Err(error) = self.layers.chats.stop(chat_id) {
+            eprintln!("[document-automation] 대화 채팅 {chat_id} 종료 실패: {error}");
+        }
+    }
+}
+
+impl RuntimeLayers {
+    /// 실행 직전 승인 지문 검증. 스킬·워크플로가 승인 뒤 바뀌었으면 재승인 대기로 돌린다.
+    fn validate_action_for_run(
+        &self,
+        action: &DocumentTriggerAction,
+    ) -> Result<(), DocumentActionError> {
+        self.validate_action(action).map_err(|error| match action {
+            DocumentTriggerAction::ExecuteWorkflow(_)
+            | DocumentTriggerAction::StartChat(DocumentChatAction { skill: Some(_), .. }) => {
+                DocumentActionError::needs_review(error.to_string())
+            }
+            _ => DocumentActionError::failed(error.to_string()),
+        })
+    }
+
+    /// 새 채팅 첫 메시지에 싣는 승인한 스킬 본문. 스킬이 없으면 빈 문자열.
+    fn document_skill_prompt(&self, action: &DocumentChatAction) -> Result<String, CoreError> {
+        Ok(action
+            .skill
+            .as_ref()
+            .map(|skill| self.validate_skill(&skill.skill_id, &skill.content_digest))
+            .transpose()?
+            .map(|(name, body)| {
+                format!("\n\n[사용자가 승인한 등록 스킬: {name}]\n{body}\n[등록 스킬 끝]")
+            })
+            .unwrap_or_default())
+    }
+
+    /// 문서 트리거의 새 무인 채팅을 띄우고 첫 메시지를 보낸다.
+    fn start_document_chat(
+        &self,
+        action: &DocumentChatAction,
+        root_path: &str,
+        message: String,
+        idempotency_key: &str,
+    ) -> Result<crate::StartChatDelivery, DocumentActionError> {
+        let mut chat: ChatStartRequest = serde_json::from_value(json!({
+            "source": action.source,
+            "accountId": action.account_id,
+            "cwd": root_path,
+            "model": action.model,
+            "reasoningEffort": action.reasoning_effort,
+            "mode": action.mode,
+            "approvalMode": action.approval_mode,
+            "resumeSessionId": null,
+            "handoffOrigin": null,
+            "unattended": true,
+            "profile": "standard",
+            "settings": action.settings,
+            "leanContext": action.lean_context,
+        }))
+        .map_err(|error| DocumentActionError::failed(error.to_string()))?;
+        // 출처를 남긴다. 사용자가 설정한 문서 자동화가 띄운 런타임이라 사용자 직접
+        // 시작으로 표시한다 — 출처가 없으면 같은 경로의 페이싱 회차가 옛 런타임으로
+        // 보고 결과 회수 전에 끈다.
+        chat.origin = Some(ChatOrigin::direct(ChatOriginKind::User));
+        Ok(crate::start_chat(
+            &self.app_data_dir,
+            &self.chats,
+            StartChatRequest {
+                chat,
+                message,
+                idempotency_key: idempotency_key.to_owned(),
+            },
+        )?)
+    }
+}
+
+/// `inlineContent`가 켜져 있으면 바뀐 파일 내용을 신뢰할 수 없는 입력 경계 안에 싣는다.
+fn document_inline_prompt(action: &DocumentChatAction, context: &DocumentActionContext) -> String {
+    action
+        .inline_content
+        .map(|inline| {
+            crate::document_conversation::inline_contents(
+                Path::new(&context.batch.root_path),
+                &context.batch.changes,
+                inline.max_bytes,
+            )
+        })
+        .unwrap_or_default()
 }
 
 fn document_event_prompt(context: &DocumentActionContext) -> String {
@@ -1994,6 +2185,17 @@ pub fn run_remote_server_from_args(
         crate::run_db_cli(args.into_iter().skip(1))?;
         return Ok(());
     }
+    // C22-10. Kubernetes 스킬이 부르는 읽기 작업. 지금은 모두 읽기라 이 프로세스에서 끝난다.
+    if args.first().map(String::as_str) == Some("k8s") {
+        crate::run_k8s_cli(args.into_iter().skip(1))?;
+        return Ok(());
+    }
+    // C23-6. AIA 대화 스킬이 부르는 목록·질문·교환 회수·스킬 가져오기. 목록만 이 프로세스에서
+    // 끝나고 나머지는 교환 상태를 쥔 백엔드로 넘어간다.
+    if args.first().map(String::as_str) == Some("peer") {
+        crate::run_aia_peer_cli(args.into_iter().skip(1))?;
+        return Ok(());
+    }
     // C15. 비밀값 스킬이 부르는 목록·요청·대행 실행. 값은 백엔드 메모리에만 있으므로
     // 셋 다 떠 있는 백엔드로 넘어간다.
     if args.first().map(String::as_str) == Some("secret") {
@@ -2730,6 +2932,11 @@ fn enforce_login_for(method: &Method, path: &str, access: RequestAccess) -> Resu
     if path == "/api/access" || path == "/api/login" || path == "/api/logout" {
         return Ok(());
     }
+    // C23. 피어 통로는 로그인 세션이 아니라 테일넷 회원 자격(원격 채널 분류)이 지킨다.
+    // 여기서 풀어 주고 `peer_api_response`가 채널·정책을 다시 본다.
+    if path.starts_with("/api/peer/") {
+        return Ok(());
+    }
     Err(ApiError::from(crate::login_auth::login_required(
         access.login_required,
     )))
@@ -3230,6 +3437,10 @@ async fn route(
         });
     }
 
+    if path.starts_with("/api/peer/") {
+        return peer_api_response(request, &config, access).await;
+    }
+
     if method == Method::GET {
         if let Some(ids) = path.strip_prefix("/api/chat-attachment/") {
             return chat_attachment_download_response(&config, ids);
@@ -3335,6 +3546,192 @@ async fn linked_file_download_route(
 /// 넘긴다. 인증 뒤에는 모든 채널이 같은 권한이다(G11); 콜백형 OAuth 시작만 실행 지점
 /// (`ExternalPluginRegistry::begin_oauth`)이 호출 채널을 보고 거절한다. 관리 스냅숏은 캐시 응답을 그대로
 /// 돌려주고, 로그인 세션 명령은 현재 세션을 알아야 해서 디스패처 앞에서 갈라진다.
+/// C23. 피어 통로. 테일넷 사용자 확인을 지난 원격 채널(또는 호스트 자신의 네이티브 호출)만
+/// 받고 로그인 세션은 묻지 않는다 — 회원 자격은 테일넷이 증명했고, 이 통로가 하는 일은
+/// 인사·질문 하나·그 답·스킬 목록·스킬 하나뿐이라 일반 명령(`/api/invoke`)에는 닿지 않는다.
+/// 인사만 기능이 꺼져 있어도 답한다(꺼져 있다는 사실을 상대 화면이 보여 줄 수 있게).
+async fn peer_api_response(
+    request: Request<Incoming>,
+    config: &Config,
+    access: RequestAccess,
+) -> HttpResponse {
+    use crate::aia_peer_exchange::{
+        ASK_PATH, EXCHANGE_PATH_PREFIX, HELLO_PATH, SKILLS_PATH, SKILL_PATH_PREFIX,
+    };
+    if !matches!(
+        access.channel,
+        AccessChannel::Remote | AccessChannel::Native
+    ) {
+        return error_response(ApiError::forbidden(
+            "피어 통로는 테일넷을 지난 원격 요청만 받습니다",
+        ));
+    }
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let app_data_dir = config.app_data_dir.clone();
+    let tailscale_host = config.tailscale_host.clone();
+    if method == Method::GET && path == HELLO_PATH {
+        return match run_blocking("피어 인사 작업이 중단되었습니다", move || {
+            Ok(crate::aia_peer_hello(
+                &app_data_dir,
+                tailscale_host.as_deref(),
+            )?)
+        })
+        .await
+        {
+            Ok(hello) => json_response(StatusCode::OK, &hello),
+            Err(error) => error_response(error),
+        };
+    }
+    let enabled = match crate::aia_peers::policy(&app_data_dir) {
+        Ok(policy) => policy.enabled,
+        Err(error) => return error_response(error.into()),
+    };
+    if !enabled {
+        return error_response(ApiError::forbidden(
+            "이 기기의 AIA 대화가 꺼져 있어 피어 요청을 받지 않습니다",
+        ));
+    }
+    if method == Method::POST && path == ASK_PATH {
+        if !has_json_content_type(request.headers()) {
+            return unsupported_json_content_type_response();
+        }
+        let params = match read_json_body(request.into_body()).await {
+            Ok(params) => params,
+            Err(error) => return error_response(error),
+        };
+        let chats = config.chats.clone();
+        let translations = config.translations.clone();
+        return match run_blocking(
+            "피어 요청 수신 작업이 중단되었습니다",
+            move || {
+                let ask: crate::AiaPeerAskRequest = parse_params(params)?;
+                let start = aia_peer_start_request(&translations)?;
+                let context = crate::aia_peer_exchange::ExchangeContext {
+                    app_data_dir: &app_data_dir,
+                    chats: &chats,
+                    tailscale_host: tailscale_host.as_deref(),
+                };
+                Ok(crate::aia_peer_exchange::accept_inbound(
+                    context, start, ask, false,
+                )?)
+            },
+        )
+        .await
+        {
+            Ok(response) => json_response(StatusCode::OK, &response),
+            Err(error) => error_response(error),
+        };
+    }
+    if method == Method::GET {
+        if let Some(id) = path.strip_prefix(EXCHANGE_PATH_PREFIX) {
+            let id = id.to_owned();
+            return match run_blocking(
+                "피어 교환 조회 작업이 중단되었습니다",
+                move || {
+                    let device = crate::aia_peers::device_identity(
+                        &app_data_dir,
+                        tailscale_host.as_deref(),
+                    )?;
+                    let revision = crate::aia_peer_local_skill_listing(&app_data_dir)
+                        .map(|listing| listing.revision)
+                        .unwrap_or_default();
+                    crate::aia_peer_exchange::inbound_status(&id, &device, &revision).ok_or_else(
+                        || {
+                            ApiError::not_found(
+                                "그 교환을 찾지 못했습니다. 백엔드가 다시 떴을 수 있습니다",
+                            )
+                        },
+                    )
+                },
+            )
+            .await
+            {
+                Ok(status) => json_response(StatusCode::OK, &status),
+                Err(error) => error_response(error),
+            };
+        }
+        if path == SKILLS_PATH {
+            return match run_blocking(
+                "피어 스킬 목록 작업이 중단되었습니다",
+                move || Ok(crate::aia_peer_local_skill_listing(&app_data_dir)?),
+            )
+            .await
+            {
+                Ok(listing) => json_response(StatusCode::OK, &listing),
+                Err(error) => error_response(error),
+            };
+        }
+        if let Some(key) = path.strip_prefix(SKILL_PATH_PREFIX) {
+            let key = key.to_owned();
+            return match run_blocking(
+                "피어 스킬 묶음 작업이 중단되었습니다",
+                move || {
+                    Ok(crate::aia_peer_exchange::serve_skill_bundle(
+                        &app_data_dir,
+                        &key,
+                    )?)
+                },
+            )
+            .await
+            {
+                Ok(bundle) => json_response(StatusCode::OK, &bundle),
+                Err(error) => error_response(error),
+            };
+        }
+    }
+    error_response(ApiError::not_found("피어 통로에 없는 경로입니다"))
+}
+
+/// C23. 피어 요청에 답할 무인 AIA 의 시작 요청. AIA 실행설정은 화면이 띄울 때와 같은
+/// 저장본에서 입히고(`prepare_aia_runtime_request`), 출처만 `peer` 로 찍는다.
+fn aia_peer_start_request(
+    translations: &TranslationSupervisor,
+) -> Result<ChatStartRequest, CoreError> {
+    let settings = translations.snapshot()?.settings;
+    let provider = settings.aia_provider().ok_or_else(|| {
+        CoreError::Conflict(
+            "시스템 설정에서 시스템 에이전트를 선택해야 피어 요청에 답할 수 있습니다".to_owned(),
+        )
+    })?;
+    let request: ChatStartRequest = serde_json::from_value(json!({
+        "source": provider,
+        "cwd": "",
+        "model": null,
+        "mode": "workspace",
+        "unattended": true,
+        "profile": "aia",
+    }))?;
+    let mut request = prepare_aia_runtime_request(translations, request)?;
+    request.origin = Some(ChatOrigin::direct(ChatOriginKind::Peer));
+    Ok(request)
+}
+
+/// C23. 피어를 누가 쓰는가에 따라 다른 문. AIA 는 기능과 그 피어의 에이전트 사용이 켜져
+/// 있어야 하고, 화면은 등록된 피어면 된다(연결 확인·스킬 열람은 사람의 행동이다).
+fn aia_peer_for_actor(
+    actor: SessionReadActor,
+    app_data_dir: &Path,
+    id: &str,
+) -> Result<crate::aia_peers::AiaPeerRecord, CoreError> {
+    if actor == SessionReadActor::Aia {
+        crate::aia_peers::agent_peer_of(app_data_dir, id)
+    } else {
+        crate::aia_peers::peer_of(app_data_dir, id)
+    }
+}
+
+/// C23. CLI 릴레이는 자기 대화 id 를 본문으로 보낸다(`AGENT_MANAGER_CHAT_ID`). AIA 시스템
+/// 인터페이스로 온 호출은 컨텍스트의 대화로 고정되고 본문 값은 무시한다. 이 값은 요청 사슬에
+/// 어느 대화가 물었는지 적는 데만 쓰이고 권한을 주지 않는다.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AskAiaPeerEnvelope {
+    request: crate::AskAiaPeerRequest,
+    #[serde(default)]
+    chat_id: Option<String>,
+}
+
 async fn invoke_command_response(
     request: Request<Incoming>,
     config: &Config,
@@ -4308,6 +4705,22 @@ pub(crate) fn is_write_command(command: &str) -> bool {
             | "run_db_query"
             | "run_db_statement"
             | "relay_db_statement"
+            | "set_k8s_cluster"
+            | "set_k8s_cluster_enabled"
+            | "remove_k8s_cluster"
+            | "check_k8s_cluster"
+            | "check_agent_k8s_cluster"
+            | "set_aia_peer_policy"
+            | "set_aia_peer"
+            | "remove_aia_peer"
+            | "set_aia_peer_agent_enabled"
+            | "check_aia_peer"
+            | "ask_aia_peer"
+            | "import_aia_peer_skill"
+            | "list_k8s_resources"
+            | "get_k8s_resource"
+            | "get_k8s_logs"
+            | "get_k8s_events"
             | "set_chat_secret"
             | "read_chat_secret_value"
             | "remove_chat_secret"
@@ -5633,6 +6046,14 @@ fn dispatch_command(
             to_value(crate::get_index_sources(app_data_dir, false)?)
         }
         "get_index_sources" => to_value(crate::get_index_sources(app_data_dir, false)?),
+        "get_index_exclusions" => {
+            let args: RequestEnvelope<crate::index_addon::IndexExclusionsRequest> =
+                parse_params(params)?;
+            to_value(crate::index_addon::get_index_exclusions(
+                app_data_dir,
+                args.request,
+            )?)
+        }
         "list_agent_index_sources" => {
             let args: OptionalRequestEnvelope<crate::AgentIndexRequest> =
                 parse_optional_params(params)?;
@@ -5702,6 +6123,153 @@ fn dispatch_command(
         }
         // C10-7. 에이전트 사용을 켠 연결 목록. 접속 자격증명은 실리지 않는다.
         "list_agent_db_connections" => to_value(crate::list_agent_db_connections(app_data_dir)?),
+        "get_k8s_clusters" => to_value(crate::get_k8s_clusters(app_data_dir)?),
+        "set_k8s_cluster" => {
+            let args: RequestEnvelope<crate::SetK8sClusterRequest> = parse_params(params)?;
+            to_value(crate::set_k8s_cluster(app_data_dir, args.request)?)
+        }
+        "set_k8s_cluster_enabled" => {
+            let args: RequestEnvelope<crate::SetK8sClusterEnabledRequest> = parse_params(params)?;
+            to_value(crate::set_k8s_cluster_enabled(app_data_dir, args.request)?)
+        }
+        "remove_k8s_cluster" => {
+            let args: RequestEnvelope<crate::K8sClusterRef> = parse_params(params)?;
+            to_value(crate::remove_k8s_cluster(app_data_dir, args.request)?)
+        }
+        "check_k8s_cluster" => {
+            let args: RequestEnvelope<crate::K8sClusterRef> = parse_params(params)?;
+            to_value(crate::check_k8s_cluster(app_data_dir, args.request)?)
+        }
+        "check_agent_k8s_cluster" => {
+            let args: RequestEnvelope<crate::K8sClusterRef> = parse_params(params)?;
+            to_value(crate::check_agent_k8s_cluster(app_data_dir, args.request)?)
+        }
+        "list_agent_k8s_clusters" => to_value(crate::list_agent_k8s_clusters(app_data_dir)?),
+        // C23. AIA 대화 — 피어 목록·정책은 화면이 고치고, 묻기·교환 회수·스킬 가져오기는 AIA 와
+        // CLI 릴레이가 쓴다. 교환 자체는 백엔드 메모리의 비동기 작업이다.
+        "get_aia_peers" => to_value(crate::get_aia_peers(
+            app_data_dir,
+            service.tailscale_host.as_deref(),
+        )?),
+        "set_aia_peer_policy" => {
+            let args: OptionalRequestEnvelope<crate::SetAiaPeerPolicyRequest> =
+                parse_optional_params(params)?;
+            to_value(crate::set_aia_peer_policy(
+                app_data_dir,
+                service.tailscale_host.as_deref(),
+                args.request,
+            )?)
+        }
+        "set_aia_peer" => {
+            let args: RequestEnvelope<crate::SetAiaPeerRequest> = parse_params(params)?;
+            to_value(crate::set_aia_peer(
+                app_data_dir,
+                service.tailscale_host.as_deref(),
+                args.request,
+            )?)
+        }
+        "remove_aia_peer" => {
+            let args: RequestEnvelope<crate::AiaPeerRef> = parse_params(params)?;
+            to_value(crate::remove_aia_peer(
+                app_data_dir,
+                service.tailscale_host.as_deref(),
+                args.request,
+            )?)
+        }
+        "set_aia_peer_agent_enabled" => {
+            let args: RequestEnvelope<crate::SetAiaPeerAgentEnabledRequest> = parse_params(params)?;
+            to_value(crate::set_aia_peer_agent_enabled(
+                app_data_dir,
+                service.tailscale_host.as_deref(),
+                args.request,
+            )?)
+        }
+        "list_agent_aia_peers" => to_value(crate::list_agent_aia_peers(
+            app_data_dir,
+            service.tailscale_host.as_deref(),
+        )?),
+        "check_aia_peer" => {
+            let args: RequestEnvelope<crate::AiaPeerRef> = parse_params(params)?;
+            let peer = aia_peer_for_actor(context.actor, app_data_dir, &args.request.id)?;
+            to_value(crate::aia_peer_exchange::check_peer(app_data_dir, &peer))
+        }
+        "ask_aia_peer" => {
+            let args: AskAiaPeerEnvelope = parse_params(params)?;
+            let asker = context
+                .aia_chat_id
+                .map(str::to_owned)
+                .or(args.chat_id)
+                .filter(|id| !id.trim().is_empty());
+            let exchange_context = crate::aia_peer_exchange::ExchangeContext {
+                app_data_dir,
+                chats,
+                tailscale_host: service.tailscale_host.as_deref(),
+            };
+            let (target, start) = if args.request.peer_id == crate::aia_peers::LOCAL_PEER_ID {
+                (
+                    crate::aia_peer_exchange::AskTarget::Local,
+                    Some(aia_peer_start_request(context.translations)?),
+                )
+            } else {
+                (
+                    crate::aia_peer_exchange::AskTarget::Remote(crate::aia_peers::agent_peer_of(
+                        app_data_dir,
+                        &args.request.peer_id,
+                    )?),
+                    None,
+                )
+            };
+            to_value(crate::aia_peer_exchange::ask(
+                exchange_context,
+                target,
+                start,
+                &args.request.message,
+                asker.as_deref(),
+                args.request.timeout_ms,
+            )?)
+        }
+        "get_aia_peer_exchange" => {
+            let args: crate::AiaPeerExchangeRef = parse_params(params)?;
+            to_value(crate::wait_for_aia_peer_exchange(&args.id, args.wait_ms)?)
+        }
+        "list_aia_peer_exchanges" => {
+            let args: OptionalRequestEnvelope<crate::ListAiaPeerExchangesRequest> =
+                parse_optional_params(params)?;
+            to_value(crate::list_aia_peer_exchanges(args.request.limit))
+        }
+        "list_aia_peer_skills" => {
+            let args: RequestEnvelope<crate::PeerSkillsRequest> = parse_params(params)?;
+            let peer = aia_peer_for_actor(context.actor, app_data_dir, &args.request.peer_id)?;
+            to_value(crate::aia_peer_exchange::peer_skills(app_data_dir, &peer)?)
+        }
+        "import_aia_peer_skill" => {
+            let args: RequestEnvelope<crate::ImportPeerSkillRequest> = parse_params(params)?;
+            let peer = aia_peer_for_actor(context.actor, app_data_dir, &args.request.peer_id)?;
+            let snapshot = session_catalog.manager_snapshot()?;
+            to_value(crate::aia_peer_exchange::import_peer_skill(
+                app_data_dir,
+                &snapshot.sessions,
+                &peer,
+                &args.request.key,
+                args.request.overwrite,
+            )?)
+        }
+        "list_k8s_resources" => {
+            let args: RequestEnvelope<crate::K8sListRequest> = parse_params(params)?;
+            to_value(crate::list_k8s_resources(app_data_dir, args.request)?)
+        }
+        "get_k8s_resource" => {
+            let args: RequestEnvelope<crate::K8sGetRequest> = parse_params(params)?;
+            to_value(crate::get_k8s_resource(app_data_dir, args.request)?)
+        }
+        "get_k8s_logs" => {
+            let args: RequestEnvelope<crate::K8sLogsRequest> = parse_params(params)?;
+            to_value(crate::get_k8s_logs(app_data_dir, args.request)?)
+        }
+        "get_k8s_events" => {
+            let args: RequestEnvelope<crate::K8sEventsRequest> = parse_params(params)?;
+            to_value(crate::get_k8s_events(app_data_dir, args.request)?)
+        }
         // C10-9. 읽기 전용 트랜잭션 안에서 조회 한 문장을 실행한다.
         "run_db_query" => {
             let args: RequestEnvelope<crate::DbQueryRequest> = parse_params(params)?;
@@ -6719,7 +7287,12 @@ fn dispatch_session_command(
         }
         "resolve_round_decision" => {
             let args: RequestEnvelope<ResolveRoundDecisionArg> = parse_params(params)?;
-            let report = crate::resolve_round_decision(
+            let resolve = if args.request.by_round {
+                crate::resolve_round_decision_by_round
+            } else {
+                crate::resolve_round_decision
+            };
+            let report = resolve(
                 app_data_dir,
                 &args.request.id,
                 args.request.index,
@@ -8253,6 +8826,9 @@ struct ResolveRoundDecisionArg {
     id: String,
     index: usize,
     answer: String,
+    /// 회차 보고 라우트가 싣는 표식. 켜져 있으면 회차용 규칙으로만 답한다.
+    #[serde(default)]
+    by_round: bool,
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(params: Value) -> Result<T, ApiError> {
@@ -8318,15 +8894,22 @@ fn static_response(static_dir: &Path, request_path: &str, head: bool) -> HttpRes
     } else {
         static_dir.join(relative)
     };
-    let resolved = fs::canonicalize(&requested)
-        .ok()
-        .filter(|path| path.starts_with(static_dir) && path.is_file());
+    // G10: document fallback must obey the same boundary as a directly requested file.
+    let resolve_file = |requested: &Path| {
+        fs::canonicalize(requested)
+            .ok()
+            .filter(|path| path.starts_with(static_dir) && path.is_file())
+    };
+    let resolved = resolve_file(&requested);
+    let fallback = resolved.is_none();
     let Some(path) = resolved.or_else(|| {
         // 재배포 후 오래된 앱 셸이 요청하는 사라진 자산(예: /assets/index-OLD.js)에
         // index.html을 200으로 돌려주면 브라우저가 HTML을 스크립트·스타일로
         // 실행하려다 깨진다. 확장자가 있는 요청은 404로 끝내고 문서 탐색으로
         // 보이는 경로만 앱 셸로 넘긴다.
-        (!looks_like_file_request(relative)).then(|| static_dir.join("index.html"))
+        (!looks_like_file_request(relative))
+            .then(|| resolve_file(&static_dir.join("index.html")))
+            .flatten()
     }) else {
         return error_response(ApiError::not_found("정적 파일을 찾을 수 없습니다"));
     };
@@ -8338,17 +8921,23 @@ fn static_response(static_dir: &Path, request_path: &str, head: bool) -> HttpRes
             )));
         }
     };
-    let content_type = content_type(&path);
+    // Keep the app shell's HTML type and no-store policy even for an in-root link.
+    let content_type = if fallback {
+        content_type(Path::new("index.html"))
+    } else {
+        content_type(&path)
+    };
     let mut response = response(
         StatusCode::OK,
         content_type,
         if head { Vec::new() } else { body },
     );
     // 서비스워커와 manifest는 갱신이 즉시 반영돼야 하므로 index.html처럼 캐시하지 않는다.
-    let uncached = matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some("index.html" | "sw.js" | "manifest.webmanifest")
-    );
+    let uncached = fallback
+        || matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("index.html" | "sw.js" | "manifest.webmanifest")
+        );
     response.headers_mut().insert(
         CACHE_CONTROL,
         if uncached {
@@ -9752,6 +10341,7 @@ mod tests {
                 }),
                 active_from: None,
                 active_until: None,
+                lean_context: false,
             },
             created_at: 0,
             updated_at: 0,
@@ -10106,6 +10696,75 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "{document}");
             assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
             assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn g10_static_fallback_checks_link_boundaries_and_preserves_shell_headers() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().expect("temporary directory");
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let static_dir = root.join("public");
+        fs::create_dir(&static_dir).expect("static directory");
+        let outside = root.join("outside.txt");
+        fs::write(&outside, "outside marker").expect("outside fixture");
+        let index = static_dir.join("index.html");
+        symlink(&outside, &index).expect("outside index link");
+
+        for request in ["/", "/settings", "/nested/document"] {
+            for head in [false, true] {
+                let response = static_response(&static_dir, request, head);
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "{request}, head={head}"
+                );
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                assert!(!body
+                    .windows(b"outside marker".len())
+                    .any(|part| part == b"outside marker"));
+            }
+        }
+
+        fs::remove_file(&index).expect("remove outside link");
+        let inside = static_dir.join("shell.txt");
+        fs::write(&inside, "app shell").expect("inside fixture");
+        symlink(&inside, &index).expect("inside index link");
+        for head in [false, true] {
+            let response = static_response(&static_dir, "/settings", head);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                body.as_ref(),
+                if head {
+                    b"".as_slice()
+                } else {
+                    b"app shell".as_slice()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn g10_static_fallback_requires_a_regular_existing_app_shell() {
+        let directory = tempdir().expect("temporary directory");
+        let static_dir = fs::canonicalize(directory.path()).expect("canonical static dir");
+        for head in [false, true] {
+            assert_eq!(
+                static_response(&static_dir, "/settings", head).status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+        fs::create_dir(static_dir.join("index.html")).expect("non-file shell");
+        for head in [false, true] {
+            assert_eq!(
+                static_response(&static_dir, "/settings", head).status(),
+                StatusCode::NOT_FOUND
+            );
         }
     }
 
@@ -10525,6 +11184,14 @@ mod tests {
         // 워크플로별 페이싱 토글은 정책 파일만 바꾸고 토글로 되돌리므로 원격 write에 허용한다.
         assert!(is_write_command("set_system_workflow_pacing"));
         assert!(is_write_command("patch_session_meta"));
+        // C23. 묻기·확인·가져오기는 바깥으로 나가거나 저장소를 바꾸고, 목록·교환 회수는 읽기다.
+        assert!(is_write_command("ask_aia_peer"));
+        assert!(is_write_command("check_aia_peer"));
+        assert!(is_write_command("import_aia_peer_skill"));
+        assert!(is_write_command("set_aia_peer_policy"));
+        assert!(!is_write_command("list_agent_aia_peers"));
+        assert!(!is_write_command("get_aia_peer_exchange"));
+        assert!(!is_write_command("list_aia_peer_skills"));
         // 프로젝트 활성 여부는 앱 소유 메타이고 토글로 되돌릴 수 있어 원격 write에 허용한다.
         assert!(is_write_command("set_project_active"));
         // C6-6: 폴더 만들기는 변경이지만 호스트 전용이 아니다. 원격 편집 권한은 설정의
@@ -12032,6 +12699,9 @@ mod tests {
             (Method::POST, "/api/login"),
             (Method::POST, "/api/logout"),
             (Method::OPTIONS, "/api/invoke/put_doc"),
+            // C23-2. 피어 통로는 로그인 세션이 아니라 채널 분류와 정책이 지킨다.
+            (Method::GET, "/api/peer/hello"),
+            (Method::POST, "/api/peer/ask"),
         ] {
             assert!(enforce_login_for(&method, path, required).is_ok(), "{path}");
         }

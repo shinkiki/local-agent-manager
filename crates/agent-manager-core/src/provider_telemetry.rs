@@ -493,7 +493,7 @@ fn read_claude_env(loaded: &LoadedFile, spec: &OptionSpec, name: &str) -> Teleme
                 "이 항목에 Agent Manager가 해석하지 못하는 값이 들어 있습니다",
             ),
         },
-        JsonEntry::Value(other) => unknown(spec, Some(other.to_string()), NOT_A_STRING),
+        JsonEntry::Value(other) => unknown(spec, raw_json_scalar(other), NOT_A_STRING),
     }
 }
 
@@ -513,7 +513,17 @@ fn read_gemini_flag(
             "설정의 해당 구획이 객체가 아니라 화면에서 바꾸지 않습니다",
         ),
         JsonEntry::Value(Value::Bool(value)) => known_flag(spec, *value),
-        JsonEntry::Value(other) => unknown(spec, Some(other.to_string()), NOT_A_BOOL),
+        JsonEntry::Value(other) => unknown(spec, raw_json_scalar(other), NOT_A_BOOL),
+    }
+}
+
+/// G4/C13-4: 원시 값 표기는 유지하지만 객체·배열 안의 자격증명은 화면으로 옮기지 않는다.
+fn raw_json_scalar(value: &Value) -> Option<String> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            Some(value.to_string())
+        }
+        Value::Array(_) | Value::Object(_) => None,
     }
 }
 
@@ -963,6 +973,78 @@ mod tests {
         assert!(!option.editable);
         assert_eq!(option.current.as_deref(), Some("maybe"));
         assert!(fixture.set("claude.telemetry", true).is_err());
+    }
+
+    #[test]
+    fn g4_json_compound_values_never_reach_snapshots_or_write_errors() {
+        let marker = "telemetry-json-test-secret";
+        for spec in OPTIONS {
+            let (section, name) = match spec.location {
+                OptionLocation::ClaudeEnv { name } => ("env", name),
+                OptionLocation::GeminiFlag { section, name } => (section, name),
+                _ => continue,
+            };
+            for value in [
+                serde_json::json!({"headers": {"x-api-key": marker}}),
+                serde_json::json!([marker, {"token": marker}]),
+            ] {
+                let fixture = Fixture::new();
+                let roots = fixture.roots();
+                let (path, _) = roots.file_for(spec.location.provider());
+                let original = serde_json::json!({section: {name: value}}).to_string();
+                fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+                fs::write(path, &original).expect("write");
+
+                let option = fixture.option(spec.key);
+                assert!(!option.editable, "{} must stay locked", spec.key);
+                assert!(option.blocked.is_none());
+                assert!(option.current.is_none());
+                assert!(option.note.is_some());
+                let snapshot = load_from(&roots).expect("load");
+                let response = serde_json::to_string(&snapshot).expect("serialize");
+                assert!(!response.contains(marker), "{} leaked", spec.key);
+
+                // C13-5: 차단·해제 모두 거절하고 원본과 백업 저장소를 건드리지 않는다.
+                for blocked in [true, false] {
+                    let error = fixture.set(spec.key, blocked).expect_err("must refuse");
+                    assert!(matches!(error, CoreError::InvalidInput(_)));
+                    assert!(!error.to_string().contains(marker));
+                    assert_eq!(fs::read_to_string(path).expect("read"), original);
+                    assert!(!fixture.app_data.path().join(BACKUP_STORE).exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn c13_4_json_unknown_scalar_values_keep_their_original_display() {
+        for (key, relative, section, name, values) in [
+            (
+                "claude.telemetry",
+                ".claude/settings.json",
+                "env",
+                "DISABLE_TELEMETRY",
+                vec![Value::Null, Value::Bool(false), Value::from(7)],
+            ),
+            (
+                "gemini.telemetry",
+                ".gemini/settings.json",
+                "telemetry",
+                "enabled",
+                vec![Value::Null, Value::from("yes"), Value::from(7)],
+            ),
+        ] {
+            for value in values {
+                let fixture = Fixture::new();
+                fixture.write(
+                    relative,
+                    &serde_json::json!({section: {name: value}}).to_string(),
+                );
+                let option = fixture.option(key);
+                assert!(!option.editable);
+                assert_eq!(option.current, Some(value.to_string()));
+            }
+        }
     }
 
     #[test]

@@ -2,17 +2,26 @@
 //! G4/G10: registered roots, no symlinks, sensitive paths excluded, redaction before persistence.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::session_context::{redact, SessionReadRedaction};
 use crate::CoreError;
+
+mod content;
+#[cfg(test)]
+mod improvement_tests;
+mod native;
+mod refresh;
+mod search;
+mod watch;
+use content::{classify_name, read_text_detailed, ContentRead};
+pub use content::{IndexExclusionCount, IndexExclusionReason};
+pub use search::IndexSearchMode;
 
 const DATABASE: &str = "index-addon-v1.sqlite3";
 const MAX_FILE_BYTES: u64 = 512 * 1024;
@@ -22,6 +31,10 @@ const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RESULT_CHARS: usize = 24_000;
 const MAX_SOURCES: usize = 32;
 const MAX_SELECTED_PROJECTS: usize = 256;
+// G7: rebuild derived chunks when their boundary rules change. 3: credential lines are
+// scrubbed per paragraph instead of excluding the file, and the scrub flags more shapes
+// (compound names, `+=`, method calls), so every stored body must be re-derived once (G4).
+const CHUNK_FORMAT: i64 = 3;
 
 /// 프로젝트 적용으로 새로 생긴 폴더의 첫 색인. 화면 토글 직후와 주기 작업이 같은 폴더를 한꺼번에
 /// 훑지 않도록 한 번에 하나만 돈다(잡고 있으면 다음 주기로 미룬다).
@@ -100,10 +113,60 @@ pub struct IndexSource {
     pub projects: Option<Vec<String>>,
     /// 프로젝트 적용으로 자동 등록된 폴더면 그 프로젝트 경로. 직접 등록한 폴더는 `None`이다.
     pub project_path: Option<String>,
-    /// 프로젝트 폴더의 첫 색인이 실패한 이유. 30분 뒤 다시 시도한다.
+    /// 가장 최근 갱신 실패. 기존 성공 색인은 유지하고 수동 재시도는 즉시 허용한다.
     pub last_error: Option<String>,
+    pub exclusion_counts: Vec<IndexExclusionCount>,
+    pub refresh_state: IndexRefreshState,
+    pub progress: Option<IndexProgress>,
+    pub last_attempt_at: Option<i64>,
+    pub next_retry_at: Option<i64>,
+    pub last_duration_ms: Option<i64>,
+    pub read_files: usize,
     #[serde(skip)]
     error_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IndexRefreshState {
+    Pending,
+    Indexing,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexProgress {
+    pub started_at: i64,
+    pub scanned_entries: usize,
+    pub read_files: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IndexExclusionsRequest {
+    pub id: String,
+    #[serde(default)]
+    pub offset: usize,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexExclusion {
+    pub relative_path: String,
+    pub reason: IndexExclusionReason,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexExclusions {
+    pub items: Vec<IndexExclusion>,
+    pub total: usize,
+    pub next_offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,7 +221,7 @@ pub struct AgentIndexSourceRequest {
     pub project: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchIndexRequest {
     pub query: String,
@@ -169,6 +232,10 @@ pub struct SearchIndexRequest {
     /// [`AgentIndexRequest::project`]와 같다.
     #[serde(default)]
     pub project: Option<String>,
+    #[serde(default)]
+    pub mode: IndexSearchMode,
+    pub path_prefix: Option<String>,
+    pub extension: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -191,6 +258,9 @@ pub struct IndexSearchResult {
     pub stale_files: Vec<String>,
     pub truncated: bool,
     pub untrusted: bool,
+    /// Query result limits and incomplete source indexes are separate facts.
+    pub partial_sources: Vec<String>,
+    pub pending_sources: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +321,9 @@ fn open(app: &Path, write: bool) -> Result<Connection, CoreError> {
         flags | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     connection.busy_timeout(Duration::from_secs(5))?;
+    // G7: query sorting and materialized candidates must never spill source-derived
+    // data into the OS temporary directory. Search bounds its candidate table too.
+    connection.execute_batch("PRAGMA temp_store=MEMORY")?;
     if write {
         connection.execute_batch("PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL, auto_refresh INTEGER NOT NULL);
@@ -264,6 +337,10 @@ fn open(app: &Path, write: bool) -> Result<Connection, CoreError> {
             CREATE TABLE IF NOT EXISTS files (
                 source_id TEXT NOT NULL, path TEXT NOT NULL, digest TEXT NOT NULL,
                 PRIMARY KEY(source_id,path));
+            CREATE TABLE IF NOT EXISTS exclusions (
+                source_id TEXT NOT NULL, ordinal INTEGER NOT NULL, path TEXT NOT NULL, reason TEXT NOT NULL, stamp TEXT,
+                PRIMARY KEY(source_id,ordinal));
+            CREATE INDEX IF NOT EXISTS exclusions_path ON exclusions(source_id,path);
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
                 source_id UNINDEXED, path, start_line UNINDEXED, end_line UNINDEXED,
                 digest UNINDEXED, body, tokenize='unicode61');")?;
@@ -273,6 +350,14 @@ fn open(app: &Path, write: bool) -> Result<Connection, CoreError> {
             ("sources", "missing_since", "INTEGER"),
             ("sources", "last_error", "TEXT"),
             ("sources", "error_at", "INTEGER"),
+            ("sources", "exclusion_counts", "TEXT NOT NULL DEFAULT '[]'"),
+            ("sources", "attempt_at", "INTEGER"),
+            ("sources", "duration_ms", "INTEGER"),
+            ("sources", "read_files", "INTEGER NOT NULL DEFAULT 0"),
+            ("sources", "chunk_format", "INTEGER NOT NULL DEFAULT 0"),
+            ("sources", "full_checked_at", "INTEGER"),
+            ("files", "stamp", "TEXT"),
+            ("files", "redacted_lines", "INTEGER NOT NULL DEFAULT 0"),
             ("settings", "project_mode", "TEXT NOT NULL DEFAULT 'all'"),
             (
                 "settings",
@@ -381,29 +466,66 @@ fn snapshot(
     let (project_mode, selected_projects, project_issues) = project_settings(connection)?;
     let mut stmt = connection.prepare(&format!(
         "SELECT id,name,path,enabled,indexed_at,
-        file_count,chunk_count, excluded,truncated,{},{},{},{}
+        file_count,chunk_count, excluded,truncated,{},{},{},{},{},{},{},{}
         FROM sources s WHERE (?1=0 OR enabled=1) ORDER BY name,id",
         projects_select(connection)?,
         column_or(connection, "sources", "project_path", "NULL")?,
         column_or(connection, "sources", "last_error", "NULL")?,
-        column_or(connection, "sources", "error_at", "NULL")?
+        column_or(connection, "sources", "error_at", "NULL")?,
+        column_or(connection, "sources", "exclusion_counts", "'[]'")?,
+        column_or(connection, "sources", "attempt_at", "NULL")?,
+        column_or(connection, "sources", "duration_ms", "NULL")?,
+        column_or(connection, "sources", "read_files", "0")?
     ))?;
     let sources = stmt
         .query_map([agent_only], |row| {
+            let id: String = row.get(0)?;
+            let indexed_at: Option<i64> = row.get(4)?;
+            let last_error: Option<String> = row.get(11)?;
+            let error_at: Option<i64> = row.get(12)?;
+            let project_path: Option<String> = row.get(10)?;
+            let agent_enabled: bool = row.get(3)?;
+            let progress = watch::progress(connection, &id);
+            let retry_scheduled = enabled
+                && agent_enabled
+                && progress.is_none()
+                && (auto_refresh || (project_path.is_some() && indexed_at.is_none()));
+            let refresh_state = if progress.is_some() {
+                IndexRefreshState::Indexing
+            } else if last_error.is_some() {
+                IndexRefreshState::Failed
+            } else if indexed_at.is_some() {
+                IndexRefreshState::Ready
+            } else {
+                IndexRefreshState::Pending
+            };
             Ok(IndexSource {
-                id: row.get(0)?,
+                id,
                 name: row.get(1)?,
                 path: row.get(2)?,
-                agent_enabled: row.get(3)?,
-                indexed_at: row.get(4)?,
+                agent_enabled,
+                indexed_at,
                 files: row.get(5)?,
                 chunks: row.get(6)?,
                 excluded: row.get(7)?,
                 truncated: row.get(8)?,
                 projects: stored_projects(row.get(9)?),
-                project_path: row.get(10)?,
-                last_error: row.get(11)?,
-                error_at: row.get(12)?,
+                next_retry_at: if retry_scheduled {
+                    error_at
+                        .map(|at| at + retry_delay(project_path.is_some(), indexed_at.is_some()))
+                } else {
+                    None
+                },
+                project_path,
+                last_error,
+                error_at,
+                exclusion_counts: serde_json::from_str(&row.get::<_, String>(13)?)
+                    .unwrap_or_default(),
+                last_attempt_at: row.get(14)?,
+                last_duration_ms: row.get(15)?,
+                read_files: row.get(16)?,
+                refresh_state,
+                progress,
             })
         })?
         .filter(|source| {
@@ -518,8 +640,18 @@ pub fn set_index_projects(
 const MISSING_GRACE_MS: i64 = 24 * 60 * 60 * 1000;
 /// 첫 색인이 실패한 폴더를 다시 시도하기까지 기다리는 시간. 매 주기 같은 실패로 훑지 않는다.
 const FAILED_RETRY_MS: i64 = 30 * 60 * 1000;
-/// 자동 갱신이 프로젝트 폴더를 다시 훑는 최소 간격. 저장소 전체라 직접 등록한 폴더(1분)보다 길다.
+/// 전체 내용을 다시 대조하는 간격. 그 사이 파일 변경은 감시 대기열이 반영한다.
 const PROJECT_REFRESH_MS: i64 = 10 * 60 * 1000;
+
+fn retry_delay(project: bool, indexed: bool) -> i64 {
+    if !project {
+        60 * 1000
+    } else if indexed {
+        PROJECT_REFRESH_MS
+    } else {
+        FAILED_RETRY_MS
+    }
+}
 
 /// 등록부의 프로젝트와 적용 설정에 맞춰 프로젝트 폴더를 등록·삭제한다. 인덱스가 꺼져 있으면
 /// 아무것도 바꾸지 않는다. 자동 등록 폴더는 에이전트 사용이 켜진 채 그 프로젝트(하위 폴더·
@@ -640,6 +772,7 @@ pub fn sync_index_projects(app: &Path, projects: &[IndexProject]) -> Result<(), 
         if explicit || expired {
             tx.execute("DELETE FROM chunks WHERE source_id=?1", [&id])?;
             tx.execute("DELETE FROM files WHERE source_id=?1", [&id])?;
+            tx.execute("DELETE FROM exclusions WHERE source_id=?1", [&id])?;
             tx.execute("DELETE FROM sources WHERE id=?1", [&id])?;
         } else if missing_since.is_none() {
             tx.execute(
@@ -723,17 +856,7 @@ fn index_pending_project_sources_locked(app: &Path) {
         if source.error_at.is_some_and(|at| now - at < FAILED_RETRY_MS) {
             continue;
         }
-        let failure = refresh_source(app, &source.id, true, false, None).err();
-        if let Ok(connection) = open(app, true) {
-            let _ = connection.execute(
-                "UPDATE sources SET last_error=?1,error_at=?2 WHERE id=?3",
-                params![
-                    failure.as_ref().map(|error| error.to_string()),
-                    failure.as_ref().map(|_| now),
-                    source.id
-                ],
-            );
-        }
+        let _ = refresh_source(app, &source.id, true, false, None);
     }
 }
 
@@ -809,21 +932,42 @@ where
 {
     let projects = std::sync::Arc::new(projects);
     tokio::spawn(async move {
+        let mut watcher = watch::WatchQueue::default();
+        let mut next_sync = std::time::Instant::now();
         loop {
             let app = app.clone();
             let projects = std::sync::Arc::clone(&projects);
-            let _ = tokio::task::spawn_blocking(move || {
-                let list = if index_enabled(&app) {
-                    projects()
-                } else {
-                    None
-                };
-                index_cycle(&app, list);
+            let sync = std::time::Instant::now() >= next_sync;
+            if sync {
+                next_sync = std::time::Instant::now() + Duration::from_secs(60);
+            }
+            watcher = tokio::task::spawn_blocking(move || {
+                if sync {
+                    let list = if index_enabled(&app) {
+                        projects()
+                    } else {
+                        None
+                    };
+                    index_cycle(&app, list);
+                }
+                refresh_changed_sources(&app, &mut watcher);
+                watcher
             })
-            .await;
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            .await
+            .unwrap_or_default();
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     })
+}
+
+fn refresh_changed_sources(app: &Path, watcher: &mut watch::WatchQueue) {
+    if let Ok(view) = get_index_sources(app, true) {
+        for id in watcher.poll(app, &view) {
+            if refresh_source(app, &id, true, true, None).is_ok() {
+                watcher.complete(&id);
+            }
+        }
+    }
 }
 
 fn refresh_automatic_sources(app: &Path) {
@@ -834,31 +978,34 @@ fn refresh_automatic_sources(app: &Path) {
         return;
     }
     let now = crate::clock::now_ms();
+    let Ok(connection) = open(app, false) else {
+        return;
+    };
     for source in view.sources {
-        // 프로젝트 폴더는 저장소 전체라 더 길게 띄운다. 첫 색인 전 폴더는 첫 색인 쪽이 맡고,
-        // 실패한 폴더도 마지막 시도부터 같은 간격을 둔다(매 주기 같은 실패로 훑지 않도록).
-        if source.project_path.is_some() {
-            let Some(indexed_at) = source.indexed_at else {
-                continue;
-            };
-            let last = source.error_at.map_or(indexed_at, |at| at.max(indexed_at));
-            if now - last < PROJECT_REFRESH_MS {
+        if source.progress.is_some() || source.next_retry_at.is_some_and(|at| at > now) {
+            continue;
+        }
+        // The initial project index has its own scheduler. Both manual and project
+        // sources otherwise wait for reconciliation; changes are queued by the watcher.
+        if source.project_path.is_some() && source.indexed_at.is_none() {
+            continue;
+        }
+        if let Some(indexed_at) = source.indexed_at {
+            let full_at = connection
+                .query_row(
+                    "SELECT full_checked_at FROM sources WHERE id=?1",
+                    [&source.id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .ok()
+                .flatten()
+                .unwrap_or(indexed_at);
+            // A due failed attempt retries independently of the last successful full check.
+            if source.error_at.is_none() && now - full_at < PROJECT_REFRESH_MS {
                 continue;
             }
         }
-        let failure = refresh_source(app, &source.id, true, true, None).err();
-        if source.project_path.is_some() && (failure.is_some() || source.last_error.is_some()) {
-            if let Ok(connection) = open(app, true) {
-                let _ = connection.execute(
-                    "UPDATE sources SET last_error=?1,error_at=?2 WHERE id=?3",
-                    params![
-                        failure.as_ref().map(|error| error.to_string()),
-                        failure.as_ref().map(|_| now),
-                        source.id
-                    ],
-                );
-            }
-        }
+        let _ = refresh_source(app, &source.id, true, true, None);
     }
 }
 
@@ -882,7 +1029,11 @@ pub fn list_agent_index_sources(
 }
 
 fn validate_root(app: &Path, path: &str) -> Result<PathBuf, CoreError> {
-    let input = Path::new(path.trim());
+    validate_root_path(app, Path::new(path.trim()))
+}
+
+// G10: walked paths must be validated without trimming or lossy string conversion.
+fn validate_root_path(app: &Path, input: &Path) -> Result<PathBuf, CoreError> {
     if !input.is_absolute() || crate::path_guard::has_parent_dir(input) {
         return Err(invalid(
             "인덱스 폴더는 상위 이동이 없는 절대 경로여야 합니다",
@@ -999,9 +1150,70 @@ pub fn remove_index_source(app: &Path, id: &str) -> Result<IndexSnapshot, CoreEr
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.execute("DELETE FROM chunks WHERE source_id=?1", [id])?;
     tx.execute("DELETE FROM files WHERE source_id=?1", [id])?;
+    tx.execute("DELETE FROM exclusions WHERE source_id=?1", [id])?;
     tx.execute("DELETE FROM sources WHERE id=?1", [id])?;
     tx.commit()?;
     snapshot(&connection, false, None)
+}
+
+/// G4: diagnostics return only relative paths and closed reason codes, never rejected text.
+pub fn get_index_exclusions(
+    app: &Path,
+    request: IndexExclusionsRequest,
+) -> Result<IndexExclusions, CoreError> {
+    let connection = open(app, false)?;
+    connection.execute_batch("BEGIN")?;
+    let caller = caller_roots(request.project.as_deref());
+    source(
+        &connection,
+        &request.id,
+        request.project.is_some(),
+        caller.as_deref(),
+    )?;
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='exclusions')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(IndexExclusions {
+            items: Vec::new(),
+            total: 0,
+            next_offset: None,
+        });
+    }
+    let total: usize = connection.query_row(
+        "SELECT count(*) FROM exclusions WHERE source_id=?1",
+        [&request.id],
+        |r| r.get(0),
+    )?;
+    let limit = request.limit.unwrap_or(20).clamp(1, 100);
+    let offset = request.offset.min(total);
+    let mut statement = connection.prepare(
+        "SELECT path,reason FROM exclusions WHERE source_id=?1 ORDER BY path,rowid LIMIT ?2 OFFSET ?3",
+    )?;
+    let items = statement
+        .query_map(params![request.id, limit, offset], |row| {
+            let raw: String = row.get(1)?;
+            let reason = serde_json::from_value(serde_json::Value::String(raw)).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            Ok(IndexExclusion {
+                relative_path: row.get(0)?,
+                reason,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let next = offset + items.len();
+    Ok(IndexExclusions {
+        items,
+        total,
+        next_offset: (next < total).then_some(next),
+    })
 }
 
 fn source(
@@ -1036,83 +1248,12 @@ fn source(
 
 /// Explicit text/code allowlist: credentials, hidden state, binaries and generated trees never open.
 fn allowed_name(name: &str, directory: bool) -> bool {
-    let lower = name.to_lowercase();
-    if lower.starts_with('.')
-        || lower.starts_with("id_")
-        || ["credential", "secret", "token", "password"]
-            .iter()
-            .any(|part| lower.contains(part))
-    {
-        return false;
-    }
-    if directory {
-        return ![
-            "node_modules",
-            "target",
-            "dist",
-            "build",
-            "vendor",
-            "coverage",
-            "__pycache__",
-            "venv",
-        ]
-        .contains(&lower.as_str());
-    }
-    if [
-        "package-lock.json",
-        "pnpm-lock.yaml",
-        "yarn.lock",
-        "cargo.lock",
-        "auth.json",
-        "config.json",
-    ]
-    .contains(&lower.as_str())
-    {
-        return false;
-    }
-    matches!(
-        Path::new(&lower).extension().and_then(|s| s.to_str()),
-        Some(
-            "rs" | "ts"
-                | "tsx"
-                | "js"
-                | "jsx"
-                | "mjs"
-                | "cjs"
-                | "py"
-                | "go"
-                | "java"
-                | "kt"
-                | "swift"
-                | "c"
-                | "h"
-                | "cpp"
-                | "hpp"
-                | "cs"
-                | "rb"
-                | "php"
-                | "vue"
-                | "svelte"
-                | "html"
-                | "css"
-                | "scss"
-                | "md"
-                | "mdx"
-                | "txt"
-                | "rst"
-                | "adoc"
-                | "sql"
-                | "json"
-                | "yaml"
-                | "yml"
-                | "toml"
-                | "xml"
-        )
-    )
+    classify_name(name, directory).is_none()
 }
 
 fn resolve_file(app: &Path, root: &Path, relative: &str) -> Result<PathBuf, CoreError> {
-    if relative.is_empty() || relative.contains('\\') {
+    // G10: backslashes are literal filename characters on Unix, separators on Windows.
+    if relative.is_empty() || (cfg!(windows) && relative.contains('\\')) {
         return Err(invalid("정규 상대 파일 경로가 필요합니다"));
     }
     let components = Path::new(relative).components().collect::<Vec<_>>();
@@ -1141,131 +1282,9 @@ fn resolve_file(app: &Path, root: &Path, relative: &str) -> Result<PathBuf, Core
 }
 
 fn read_text(path: &Path) -> Result<Option<(String, String)>, CoreError> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options.open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
-        return Ok(None);
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_FILE_BYTES || bytes.contains(&0) {
-        return Ok(None);
-    }
-    let digest = format!("{:x}", Sha256::digest(&bytes));
-    let Ok(text) = String::from_utf8(bytes) else {
-        return Ok(None);
-    };
-    if text.lines().any(|line| line.len() > 4_000) || text.contains("-----BEGIN ") {
-        return Ok(None);
-    }
-    // G4: assignments can span tokens, lines or objects. Exclude the entire file
-    // rather than persist a partially masked credential. Also applied to range reads.
-    if has_structured_credentials(&text) {
-        return Ok(None);
-    }
-    Ok(Some((text, digest)))
-}
-
-fn has_structured_credentials(text: &str) -> bool {
-    const KEYS: &[&str] = &[
-        "access_token",
-        "accesstoken",
-        "api_key",
-        "apikey",
-        "auth_token",
-        "authtoken",
-        "client_secret",
-        "clientsecret",
-        "id_token",
-        "password",
-        "passwd",
-        "private_key",
-        "refresh_token",
-        "refreshtoken",
-        "secret",
-        "session_token",
-        "token",
-    ];
-    fn secret_json(value: &serde_json::Value) -> bool {
-        match value {
-            serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
-                KEYS.contains(&key.to_ascii_lowercase().as_str()) || secret_json(value)
-            }),
-            serde_json::Value::Array(values) => values.iter().any(secret_json),
-            _ => false,
-        }
-    }
-    // JSON escapes in keys must not bypass the text scanner.
-    if serde_json::from_str::<serde_json::Value>(text).is_ok_and(|value| secret_json(&value)) {
-        return true;
-    }
-    let bytes = text.as_bytes();
-    let mut position = 0;
-    while position < bytes.len() {
-        if !bytes[position].is_ascii_alphabetic() && bytes[position] != b'_' {
-            position += 1;
-            continue;
-        }
-        let start = position;
-        while position < bytes.len()
-            && (bytes[position].is_ascii_alphanumeric() || bytes[position] == b'_')
-        {
-            position += 1;
-        }
-        let key = text[start..position].to_ascii_lowercase();
-        if !KEYS.contains(&key.as_str()) {
-            continue;
-        }
-        let mut end = position;
-        // Quoted JSON/TOML/YAML keys and whitespace before the assignment.
-        if end < bytes.len() && matches!(bytes[end], b'"' | b'\'') {
-            end += 1;
-        }
-        while end < bytes.len() && bytes[end].is_ascii_whitespace() {
-            end += 1;
-        }
-        if end >= bytes.len() || !matches!(bytes[end], b':' | b'=') {
-            continue;
-        }
-        if bytes[end] == b':' && is_type_annotation(&text[end + 1..]) {
-            continue;
-        }
-        // G4: a punctuation-containing value can be split by the session redactor,
-        // leaving part of a credential visible. Exclude the complete file for every
-        // recognized assignment, including compact ones, rather than guessing its end.
-        return true;
-    }
-    false
-}
-
-/// A Rust parameter or field type (`token: &str)`, `password: Option<String> }`) names a
-/// slot, not a value. Only an exact type spelling closed by `,` `)` `}` on the same line
-/// qualifies, so `let token: String = "…"` and every YAML/TOML value stay excluded (G4).
-fn is_type_annotation(rest: &str) -> bool {
-    const TYPES: &[&str] = &[
-        "&str",
-        "&String",
-        "String",
-        "Option<String>",
-        "Option<&str>",
-        "&[u8]",
-        "Vec<u8>",
-    ];
-    let rest = rest.trim_start_matches([' ', '\t']);
-    TYPES.iter().any(|ty| {
-        rest.strip_prefix(ty).is_some_and(|after| {
-            matches!(
-                after.trim_start_matches([' ', '\t']).bytes().next(),
-                Some(b',' | b')' | b'}')
-            )
-        })
+    Ok(match read_text_detailed(path)? {
+        ContentRead::Text { text, digest, .. } => Some((text, digest)),
+        ContentRead::Excluded(_) => None,
     })
 }
 
@@ -1299,271 +1318,14 @@ fn refresh_source_with_limit(
     caller: Option<&[PathBuf]>,
     max_files: usize,
 ) -> Result<IndexSnapshot, CoreError> {
-    let mut connection = open(app, true)?;
-    // Scan outside the write transaction so the user can disable the add-on during a rebuild.
-    if automatic && !settings(&connection)?.1 {
-        return Err(invalid("자동 갱신이 꺼져 있습니다"));
-    }
-    let (_, path) = source(&connection, id, agent_only, caller)?;
-    let root = validate_root(app, &path)?;
-    let mut queue = vec![root.clone()];
-    let mut seen = BTreeSet::new();
-    let mut scanned = 0;
-    let mut excluded = 0;
-    let mut total_bytes = 0;
-    let mut truncated = false;
-    let mut staged = Vec::new();
-    'scan: while let Some(directory) = queue.pop() {
-        let safe_directory = validate_root(app, &directory.to_string_lossy())?;
-        if !safe_directory.starts_with(&root) {
-            return Err(invalid("인덱스 폴더 밖 경로입니다"));
-        }
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
-            scanned += 1;
-            if scanned % 64 == 0 {
-                source(&connection, id, agent_only, caller)?;
-                if automatic && !settings(&connection)?.1 {
-                    return Err(invalid("자동 갱신이 꺼져 있습니다"));
-                }
-            }
-            if scanned > MAX_SCAN || seen.len() >= max_files {
-                truncated = true;
-                break 'scan;
-            }
-            let meta = fs::symlink_metadata(entry.path())?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                excluded += 1;
-                continue;
-            };
-            if meta.file_type().is_symlink() || !allowed_name(name, meta.is_dir()) {
-                excluded += 1;
-                continue;
-            }
-            if meta.is_dir() {
-                queue.push(entry.path());
-                continue;
-            }
-            if !meta.is_file() {
-                excluded += 1;
-                continue;
-            }
-            let relative = entry
-                .path()
-                .strip_prefix(&root)
-                .map_err(|_| invalid("폴더 밖 경로입니다"))?
-                .to_string_lossy()
-                .replace('\\', "/");
-            let safe = resolve_file(app, &root, &relative)?;
-            let Some((text, digest)) = read_text(&safe)? else {
-                excluded += 1;
-                continue;
-            };
-            total_bytes += text.len() as u64;
-            if total_bytes > MAX_TOTAL_BYTES {
-                truncated = true;
-                break 'scan;
-            }
-            seen.insert(relative.clone());
-            let previous: Option<String> = connection
-                .query_row(
-                    "SELECT digest FROM files WHERE source_id=?1 AND path=?2",
-                    params![id, relative],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if previous.as_ref() == Some(&digest) {
-                continue;
-            }
-            staged.push((
-                relative,
-                digest,
-                redact(&text, SessionReadRedaction::Credentials),
-            ));
-        }
-    }
-    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let (_, current_path) = source(&tx, id, agent_only, caller)?;
-    if current_path != path || (automatic && !settings(&tx)?.1) {
-        return Err(CoreError::Conflict(
-            "갱신 중 인덱스 설정이 변경되었습니다".to_owned(),
-        ));
-    }
-    for (relative, digest, clean) in staged {
-        tx.execute(
-            "DELETE FROM chunks WHERE source_id=?1 AND path=?2",
-            params![id, relative],
-        )?;
-        let lines = clean.lines().collect::<Vec<_>>();
-        let mut start = 0;
-        while start < lines.len() {
-            let mut end = start;
-            let mut bytes = 0;
-            while end < lines.len()
-                && end - start < 50
-                && (end == start || bytes + lines[end].len() < 6_000)
-            {
-                bytes += lines[end].len() + 1;
-                end += 1;
-            }
-            tx.execute("INSERT INTO chunks(source_id,path,start_line,end_line,digest,body) VALUES(?1,?2,?3,?4,?5,?6)",params![id,relative,start+1,end,digest,lines[start..end].join("\n")])?;
-            start = end;
-        }
-        tx.execute(
-            "INSERT OR REPLACE INTO files(source_id,path,digest) VALUES(?1,?2,?3)",
-            params![id, relative, digest],
-        )?;
-    }
-    // G7: even a partial scan replaces the previous subset. Retaining unseen rows
-    // would accumulate unlimited stale entries across repeated truncated refreshes.
-    {
-        let mut stmt = tx.prepare("SELECT path FROM files WHERE source_id=?1")?;
-        let old = stmt
-            .query_map([id], |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
-        for path in old.into_iter().filter(|p| !seen.contains(p)) {
-            tx.execute(
-                "DELETE FROM chunks WHERE source_id=?1 AND path=?2",
-                params![id, path],
-            )?;
-            tx.execute(
-                "DELETE FROM files WHERE source_id=?1 AND path=?2",
-                params![id, path],
-            )?;
-        }
-    }
-    tx.execute(
-        "UPDATE sources SET indexed_at=?1,excluded=?2,truncated=?3,
-        file_count=(SELECT count(*) FROM files WHERE source_id=?4),
-        chunk_count=(SELECT count(*) FROM chunks WHERE source_id=?4) WHERE id=?4",
-        params![crate::clock::now_ms(), excluded, truncated, id],
-    )?;
-    tx.commit()?;
-    snapshot(&connection, agent_only, caller)
-}
-
-fn match_query(query: &str) -> Result<String, CoreError> {
-    if query.len() > 512 {
-        return Err(invalid("검색어는 512바이트 이하여야 합니다"));
-    }
-    let terms = query
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|s| !s.is_empty())
-        .take(16)
-        .map(|s| format!("\"{}\"*", s))
-        .collect::<Vec<_>>();
-    if terms.is_empty() {
-        return Err(invalid("검색어를 입력해 주세요"));
-    }
-    Ok(terms.join(" AND "))
+    refresh::run(app, id, agent_only, automatic, caller, max_files)
 }
 
 pub fn search_index(
     app: &Path,
     request: SearchIndexRequest,
 ) -> Result<IndexSearchResult, CoreError> {
-    let query = match_query(&request.query)?;
-    let mut result = IndexSearchResult {
-        hits: Vec::new(),
-        stale_files: Vec::new(),
-        truncated: false,
-        untrusted: true,
-    };
-    if !app.join(DATABASE).try_exists()? {
-        return Ok(result);
-    }
-    let connection = open(app, false)?;
-    // Read transaction gives enablement and the index one consistent snapshot.
-    connection.execute_batch("BEGIN")?;
-    if !settings(&connection)?.0 {
-        return Err(invalid(
-            "인덱스 사용이 꺼져 있습니다. 애드온 → 인덱스에서 켜 주세요",
-        ));
-    }
-    let caller = caller_roots(request.project.as_deref());
-    if let Some(id) = &request.source_id {
-        source(&connection, id, true, caller.as_deref())?;
-    }
-    // 적용 범위는 순위를 매기기 전에 걸러야 다른 프로젝트 폴더가 상한을 채우지 않는다.
-    let allowed = match caller.as_deref() {
-        None => None,
-        Some(_) => Some(serde_json::to_string(
-            &snapshot(&connection, true, caller.as_deref())?
-                .sources
-                .into_iter()
-                .map(|source| source.id)
-                .collect::<Vec<_>>(),
-        )?),
-    };
-    let mut stmt = connection.prepare(
-        "SELECT c.source_id,s.name,s.path,c.path,c.start_line,c.end_line,c.digest,c.body
-        FROM chunks c JOIN sources s ON s.id=c.source_id WHERE chunks MATCH ?1 AND s.enabled=1
-        AND (?2 IS NULL OR s.id=?2)
-        AND (?3 IS NULL OR s.id IN (SELECT value FROM json_each(?3)))
-        ORDER BY bm25(chunks) LIMIT 201",
-    )?;
-    let rows = stmt.query_map(params![query, request.source_id, allowed], |r| {
-        Ok((
-            r.get::<_, String>(2)?,
-            IndexHit {
-                source_id: r.get(0)?,
-                source_name: r.get(1)?,
-                relative_path: r.get(3)?,
-                start_line: r.get(4)?,
-                end_line: r.get(5)?,
-                digest: r.get(6)?,
-                excerpt: r.get(7)?,
-                untrusted: true,
-            },
-        ))
-    })?;
-    let limit = request.limit.unwrap_or(8).clamp(1, 20);
-    let mut checked = HashMap::new();
-    let mut chars = 0;
-    for (candidate, row) in rows.enumerate() {
-        if candidate >= 200 {
-            result.truncated = true;
-            break;
-        }
-        let (path, hit) = row?;
-        if result.hits.len() >= limit {
-            result.truncated = true;
-            break;
-        }
-        let key = format!("{}/{}", hit.source_id, hit.relative_path);
-        let fresh = *checked.entry(key.clone()).or_insert_with(|| {
-            validate_root(app, &path)
-                .and_then(|root| resolve_file(app, &root, &hit.relative_path))
-                .and_then(|path| read_text(&path))
-                .ok()
-                .flatten()
-                .is_some_and(|(_, digest)| digest == hit.digest)
-        });
-        if !fresh {
-            if !result.stale_files.contains(&key) {
-                chars += key.chars().count();
-                if chars > MAX_RESULT_CHARS {
-                    result.truncated = true;
-                    break;
-                }
-                result.stale_files.push(key);
-            }
-            continue;
-        }
-        chars += hit.excerpt.chars().count()
-            + hit.relative_path.chars().count()
-            + hit.source_name.chars().count()
-            + 160;
-        if chars > MAX_RESULT_CHARS {
-            result.truncated = true;
-            break;
-        }
-        result.hits.push(hit);
-    }
-
-    Ok(result)
+    search::run(app, request)
 }
 
 pub fn read_index_excerpt(
@@ -1655,6 +1417,7 @@ mod tests {
                 source_id: None,
                 limit: None,
                 project: None,
+                ..Default::default()
             },
         )
         .unwrap()
@@ -1863,12 +1626,15 @@ mod tests {
         assert!(get_index_sources(&app, false).unwrap().sources.is_empty());
         assert!(search(&app, "test").hits.is_empty());
         assert!(!app.exists());
-        assert!(match_query("\" OR *").unwrap().contains("\"OR\"*"));
-        assert!(match_query("  ").is_err());
+        assert!(search::match_query("\" OR *", IndexSearchMode::Prefix)
+            .unwrap()
+            .contains("\"OR\"*"));
+        assert!(search::match_query("  ", IndexSearchMode::Prefix).is_err());
     }
     #[test]
     fn g7_global_disable_blocks_cached_tools_and_stops_auto_refresh() {
         let (_temp, app, root, id) = setup();
+        let mut watcher = watch::WatchQueue::default();
         fs::write(root.join("guide.md"), "initial marker").unwrap();
         set_index_source_enabled(
             &app,
@@ -1879,6 +1645,7 @@ mod tests {
         )
         .unwrap();
         refresh_automatic_sources(&app);
+        refresh_changed_sources(&app, &mut watcher);
         assert!(get_index_sources(&app, false).unwrap().sources[0]
             .indexed_at
             .is_none());
@@ -1891,6 +1658,7 @@ mod tests {
         )
         .unwrap();
         refresh_automatic_sources(&app);
+        refresh_changed_sources(&app, &mut watcher);
         assert_eq!(search(&app, "initial").hits.len(), 1);
         let hit = search(&app, "initial").hits.remove(0);
         set_index_settings(
@@ -1903,6 +1671,7 @@ mod tests {
         .unwrap();
         fs::write(root.join("guide.md"), "replacement marker").unwrap();
         refresh_automatic_sources(&app);
+        refresh_changed_sources(&app, &mut watcher);
         assert!(!index_enabled(&app));
         assert!(get_index_sources(&app, true).unwrap().sources.is_empty());
         assert!(search_index(
@@ -1912,6 +1681,7 @@ mod tests {
                 source_id: None,
                 limit: None,
                 project: None,
+                ..Default::default()
             }
         )
         .is_err());
@@ -1937,6 +1707,7 @@ mod tests {
         )
         .unwrap();
         refresh_automatic_sources(&app);
+        refresh_changed_sources(&app, &mut watcher);
         assert_eq!(search(&app, "replacement").hits.len(), 1);
     }
 
@@ -1966,6 +1737,7 @@ mod tests {
                     source_id: None,
                     limit: None,
                     project,
+                    ..Default::default()
                 },
             )
             .unwrap()
@@ -2501,7 +2273,10 @@ mod tests {
         let stale = crate::clock::now_ms() - PROJECT_REFRESH_MS - 1;
         open(&app, true)
             .unwrap()
-            .execute("UPDATE sources SET indexed_at=?1", [stale])
+            .execute(
+                "UPDATE sources SET indexed_at=?1,full_checked_at=?1",
+                [stale],
+            )
             .unwrap();
         refresh_automatic_sources(&app);
         let failed = get_index_sources(&app, false).unwrap().sources.remove(0);

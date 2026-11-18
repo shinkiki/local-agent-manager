@@ -26,10 +26,11 @@ pub(crate) fn is_slug_body(value: &str) -> bool {
 /// 모든 자리가 이 한 함수로 같은 글자를 만든다 — sha2 0.10 의 `{:x}` 서식에 기대면
 /// digest 0.11 에서 그 서식이 사라질 때 자리마다 따로 깨진다.
 pub(crate) fn lower_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     out
 }
@@ -81,6 +82,14 @@ mod tests {
             super::lower_hex(&Sha256::digest(b"abc")),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn g7_lower_hex_preserves_every_byte_value() {
+        // G7: persisted digests keep the existing lowercase, zero-padded format.
+        let bytes: Vec<u8> = (u8::MIN..=u8::MAX).collect();
+        let expected: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(lower_hex(&bytes), expected);
     }
 
     #[test]

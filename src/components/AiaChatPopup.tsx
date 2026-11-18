@@ -15,7 +15,7 @@ import { enableAiaWindowSessions, forgetAiaWindowSession, rememberAiaWindowSessi
 import { openPopoutWindow } from "../lib/popoutWindow";
 import { submitComposerOnEnter } from "../lib/composerKeys";
 import { attachPastedFiles, useComposerSendState, type ChatComposerDraftHandles } from "./ChatComposer";
-import { aiaChatsForProvider, aiaRuntimeNeedsRestart, aiaStaleSendAction, supportsAiaSystemTools, type AiaRuntimeSettings } from "../lib/aiaRuntime";
+import { aiaChatsForProvider, aiaRuntimeNeedsRestart, aiaStaleRuntimeNotice, aiaStaleSendAction, supportsAiaSystemTools, type AiaRuntimeSettings } from "../lib/aiaRuntime";
 import { aiaAttentionTargetAction } from "../lib/aiaAttention";
 import { getLiveChats } from "../lib/ipc";
 import type {
@@ -490,22 +490,7 @@ export function AiaChatPopup({ open, provider, runtime, providerName, providerCo
   // 예전 실행설정으로 시작한 대화에 요청을 보내려 할 때 할 일. 사용자가 쓴 메시지와 앱이
   // 자동으로 보내는 요청 모두 이 판단을 지나야 옛 설정 런타임으로 새 요청이 가지 않는다.
   const staleSendAction = aiaStaleSendAction(staleRuntime, phase);
-  const staleRuntimeNotice = !staleRuntime
-    ? null
-    : staleSendAction === "blocked"
-      ? text(
-        "실행설정이 바뀌었습니다. 진행 중인 작업이 끝나거나 중단된 뒤 보내면 새 설정으로 새 대화를 시작합니다.",
-        "The execution settings changed. Once the running task finishes or stops, sending starts a new conversation with the new settings.",
-      )
-      : composerUsable
-        ? text(
-          "예전 실행설정으로 시작한 대화입니다. 보내면 이 대화를 정지하고 새 설정으로 새 대화를 시작합니다.",
-          "This conversation started with the previous execution settings. Sending stops it and starts a new conversation with the new settings.",
-        )
-        : text(
-          "예전 실행설정으로 시작한 대화입니다. 새 설정은 대화를 새로 시작할 때 적용됩니다.",
-          "This conversation started with the previous execution settings. The new settings apply when a new conversation starts.",
-        );
+  const staleRuntimeNotice = aiaStaleRuntimeNotice(staleSendAction, composerUsable, text);
   const pendingApprovals = useMemo(() => pendingChatApprovals(turns), [turns]);
 
   useEffect(() => {

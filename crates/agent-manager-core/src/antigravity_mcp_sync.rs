@@ -440,6 +440,7 @@ fn sync_with(
     let mut ledger = load_ledger(app_data_dir);
     // 사용자가 끄고 켠 것은 설정이 진실이다. 이 앱의 항목만 관찰해 장부에 옮긴다.
     let disabled_before = ledger.disabled.clone();
+    let pending_before = ledger.pending_disable.clone();
     for (name, entry) in &current {
         let ours = entry
             .url
@@ -458,7 +459,6 @@ fn sync_with(
             ledger.pending_disable.remove(name);
         }
     }
-    let pending_before = ledger.pending_disable.clone();
     ledger
         .pending_disable
         .retain(|name| desired.contains_key(name));
@@ -903,6 +903,55 @@ mod tests {
             !argv.contains("mine"),
             "사용자 서버에는 손대지 않는다: {argv}"
         );
+    }
+
+    #[test]
+    fn p12_observed_disable_clears_persisted_retry_and_preserves_user_reenable() {
+        let app_data = tempfile::tempdir().expect("app data");
+        let home = tempfile::tempdir().expect("home");
+        crate::external_plugins::ExternalPluginRegistry::new(app_data.path().to_path_buf())
+            .register(crate::ExternalPluginManifestRequest {
+                id: "mock".to_owned(),
+                display_name: "Mock".to_owned(),
+                names: None,
+                url: Some("http://127.0.0.1:3000/mcp".to_owned()),
+                auth: crate::external_plugins::PluginAuthKind::None,
+                token: None,
+                client_id: None,
+                client_secret: None,
+                scope: None,
+            })
+            .expect("register");
+        std::fs::create_dir_all(home.path().join(".gemini/config")).expect("config dir");
+        let url = plugin_url(BASE, "mock");
+        let mut ledger = Ledger {
+            entries: map(&[("mock", url.clone())]),
+            disabled: BTreeSet::from(["mock".to_owned()]),
+            pending_disable: BTreeSet::from(["mock".to_owned()]),
+            ..Ledger::default()
+        };
+        save_ledger(app_data.path(), &mut ledger).expect("save");
+        let unavailable_cli = home.path().join("agy-must-not-run");
+        for disabled in [true, false] {
+            let config = serde_json::json!({"mcpServers": {
+                "mock": {"serverUrl": url, "disabled": disabled}
+            }})
+            .to_string();
+            std::fs::write(config_path(home.path()), &config).expect("config");
+            // P12/G1: 관찰만으로 장부를 정리하고, 사용자가 다시 켠 뒤에도 CLI를 부르지 않는다.
+            let report = sync_with(app_data.path(), home.path(), &unavailable_cli, BASE, None)
+                .expect("observation only");
+            assert_eq!(report, SyncReport::default());
+            let stored = load_ledger(app_data.path());
+            assert!(stored.pending_disable.is_empty(), "끄기 확인을 저장한다");
+            assert_eq!(stored.disabled.contains("mock"), disabled);
+            assert_eq!(stored.entries.get("mock"), Some(&url));
+            assert_eq!(
+                std::fs::read_to_string(config_path(home.path())).expect("config"),
+                config,
+                "G1: 공급자 설정은 읽기만 한다"
+            );
+        }
     }
 
     /// `add` 뒤 `disable`이 실패해도 사용자가 꺼 둔 의도는 성공을 확인할 때까지 남고, 다음

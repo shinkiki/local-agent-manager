@@ -169,7 +169,20 @@ impl SecretCliOptions {
                 args.next()
                     .ok_or_else(|| CoreError::InvalidInput(format!("{flag} 값이 필요합니다")))
             };
+            // 값을 받는 플래그를 두 번 주면 앞의 값이 조용히 사라져, 에이전트가 고른 경로·
+            // 명령과 다른 것으로 돈다(`--env`와 같은 이유). 어느 쪽이 맞는지 이 프로세스는
+            // 알 수 없으니 거절한다.
+            let duplicate =
+                || CoreError::InvalidInput(format!("{flag}가 두 번 지정됐습니다. 하나만 남기세요"));
             match flag.as_str() {
+                "--name" if name.is_some() => return Err(duplicate()),
+                "--purpose" if purpose.is_some() => return Err(duplicate()),
+                "--stdin" if stdin.is_some() => return Err(duplicate()),
+                "--path" if path.is_some() => return Err(duplicate()),
+                "--content" if content.is_some() => return Err(duplicate()),
+                "--cwd" if cwd.is_some() => return Err(duplicate()),
+                "--timeout" if timeout_seconds.is_some() => return Err(duplicate()),
+                "--app-data-dir" if app_data_dir.is_some() => return Err(duplicate()),
                 "--name" => name = Some(value()?),
                 "--purpose" => purpose = Some(value()?),
                 "--env" => {
@@ -371,6 +384,32 @@ mod tests {
         )
         .expect_err("같은 환경변수를 두 번 주면 거절한다");
         assert!(error.to_string().contains("API_KEY"));
+    }
+
+    /// C15-6. 값을 받는 플래그는 `--env`처럼 두 번 주면 거절한다 — 뒤의 값이 앞을 조용히
+    /// 덮어쓰면 에이전트가 적은 경로·명령과 다른 것으로 돈다.
+    #[test]
+    fn duplicate_value_flag_is_refused() {
+        for flag in [
+            "--name",
+            "--purpose",
+            "--stdin",
+            "--path",
+            "--content",
+            "--cwd",
+            "--timeout",
+            "--app-data-dir",
+        ] {
+            let error = SecretCliOptions::parse(
+                [flag, "1", flag, "2"].into_iter().map(str::to_owned),
+                Some("chat-1".to_owned()),
+            )
+            .expect_err("repeated flag");
+            assert!(
+                matches!(&error, CoreError::InvalidInput(message) if message.contains("두 번")),
+                "{flag}: {error:?}"
+            );
+        }
     }
 
     #[test]

@@ -1215,6 +1215,74 @@ mod tests {
     }
 
     #[test]
+    fn g7_external_cleanup_invalidates_caches_and_preserves_other_sessions() {
+        let app = tempfile::tempdir().expect("app data");
+        let writer = open_index(app.path()).expect("independent cleanup connection");
+        for (key, text) in [
+            ("removed", "shared needle removed"),
+            ("kept", "shared needle kept"),
+        ] {
+            writer
+                .execute(
+                    "INSERT INTO sessions VALUES(?1,?2,?3,0,0)",
+                    params![key, "version", INDEX_RULES],
+                )
+                .expect("session");
+            writer
+                .execute("INSERT INTO blocks VALUES(?1,0,?2,?2)", params![key, text])
+                .expect("searchable text");
+        }
+        // Keep this slot local so other search tests cannot replace the handle and
+        // accidentally invalidate its caches before the external commit does.
+        let mut slot = Some(IndexHandle::open(app.path()).expect("reader"));
+        let handle = ready_handle(&mut slot, app.path()).expect("initial handle");
+        let initial =
+            first_hits(&handle.db, "shared needle", &["removed", "kept"]).expect("initial search");
+        assert_eq!(initial.len(), 2);
+        handle.memo = Some((
+            7,
+            SessionSearchResponse {
+                matches: initial
+                    .into_iter()
+                    .map(|(key, index, text)| SessionSearchMatch {
+                        source: ProviderId::Claude,
+                        id: key,
+                        index: Some(index as usize),
+                        snippet: text,
+                    })
+                    .collect(),
+                checked_sessions: 2,
+                ..SessionSearchResponse::default()
+            },
+        ));
+        assert!(
+            ready_handle(&mut slot, app.path())
+                .expect("unchanged connection")
+                .memo
+                .is_some(),
+            "a read without a commit keeps the cached answer"
+        );
+
+        // This is the separate-connection deletion used when cleanup cannot take
+        // INDEX. G7: the surviving reader must stop caching the deleted text.
+        writer
+            .execute("DELETE FROM sessions WHERE key=?1", ["removed"])
+            .expect("external cleanup");
+        let handle = ready_handle(&mut slot, app.path()).expect("handle after cleanup");
+        assert!(
+            handle.memo.is_none(),
+            "the old answer contains deleted text"
+        );
+        assert!(!handle.rows.contains_key("removed"));
+        assert!(handle.rows.contains_key("kept"));
+        let hits = first_hits(&handle.db, "shared needle", &["removed", "kept"])
+            .expect("search after cleanup");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "kept");
+        assert_eq!(hits[0].2, "shared needle kept");
+    }
+
+    #[test]
     fn a_corrupt_index_file_is_discarded_and_rebuilt() {
         let app = tempfile::tempdir().expect("app data");
         let home = tempfile::tempdir().expect("home");

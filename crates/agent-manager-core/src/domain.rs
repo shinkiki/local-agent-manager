@@ -292,6 +292,8 @@ pub enum ChatOriginKind {
     Aia,
     /// 사용자가 화면에서 직접 시작했다.
     User,
+    /// C23. 다른 기기(또는 같은 기기의 다른 AIA)의 피어 요청에 답하려고 띄운 무인 AIA.
+    Peer,
 }
 
 wire_enum!(trimmed ChatOriginKind, "알 수 없는 채팅 출처 종류입니다", {
@@ -299,6 +301,7 @@ wire_enum!(trimmed ChatOriginKind, "알 수 없는 채팅 출처 종류입니다
     Schedule => "schedule",
     Aia => "aia",
     User => "user",
+    Peer => "peer",
 });
 
 /// 채팅의 출처. 클라이언트가 보낼 수 없고(`ChatStartRequest.origin`은 역직렬화하지 않음)
@@ -2182,6 +2185,7 @@ mod tests {
             ChatOriginKind::Schedule,
             ChatOriginKind::Aia,
             ChatOriginKind::User,
+            ChatOriginKind::Peer,
         ];
         for kind in cases {
             assert_eq!(kind.to_string(), kind.as_str());

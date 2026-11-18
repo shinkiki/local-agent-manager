@@ -1640,6 +1640,68 @@ mod tests {
     }
 
     #[test]
+    fn g7_rejected_reading_bookmark_fields_preserve_saved_metadata() {
+        let temp = tempfile::tempdir().expect("temp directory must exist");
+        let valid = SessionBookmark {
+            label: "가".repeat(120),
+            snippet: "나".repeat(200),
+            anchor: ReadingAnchor {
+                message_key: "다".repeat(200),
+                markdown_line: Some(42),
+            },
+            ..reading_bookmark("11111111-1111-4111-8111-111111111111", "")
+        };
+        let saved = save_bookmarks(temp.path(), vec![valid.clone()])
+            .expect("all string fields accept their character limit");
+        assert_eq!(saved.bookmarks, vec![valid.clone()]);
+        let path = temp.path().join(STORE_FILE_NAME);
+        let before = fs::read(&path).expect("read saved metadata");
+
+        let mut invalid = vec![valid; 5];
+        invalid[0].label.push('가');
+        invalid[1].snippet.push('나');
+        invalid[2].anchor.message_key.push('다');
+        invalid[3].anchor.message_key.clear();
+        invalid[4].id.push('/');
+        for (case, bookmark) in [
+            "overlong label",
+            "overlong snippet",
+            "overlong message key",
+            "empty message key",
+            "invalid identifier",
+        ]
+        .into_iter()
+        .zip(invalid)
+        {
+            // G7: rejecting a bookmark must preserve the whole saved metadata, including
+            // unrelated fields in the same patch, rather than partially applying it.
+            let result = update_session_meta(
+                temp.path(),
+                ProviderId::Codex,
+                "1234567890abcdef",
+                SessionMetaPatch {
+                    favorite: Some(true),
+                    bookmarks: Some(vec![bookmark]),
+                    ..SessionMetaPatch::default()
+                },
+            );
+            assert!(
+                matches!(result, Err(CoreError::InvalidInput(_))),
+                "{case} must fail as InvalidInput: {result:?}"
+            );
+            assert_eq!(
+                fs::read(&path).expect("read unchanged metadata"),
+                before,
+                "{case} must not change saved bytes"
+            );
+            let reloaded = session_meta(temp.path(), ProviderId::Codex, "1234567890abcdef")
+                .expect("reload preserved metadata");
+            assert!(!reloaded.favorite, "{case} must not apply the other field");
+            assert_eq!(reloaded.bookmarks, saved.bookmarks, "{case}");
+        }
+    }
+
+    #[test]
     fn hidden_folder_keeps_its_own_count_and_leaves_the_parent_total() {
         let temp = tempfile::tempdir().expect("temp directory must exist");
         let parent = create_session_folder(temp.path(), "업무", "#51e97d", None)

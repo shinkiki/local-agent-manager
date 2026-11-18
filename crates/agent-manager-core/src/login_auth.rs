@@ -715,12 +715,13 @@ impl LoginAuth {
                     ));
                 }
             }
-            let requirement = inner.settings.channels.get_mut(channel);
+            let mut channels = inner.settings.channels;
+            let requirement = channels.get_mut(channel);
             match method {
                 LoginMethod::Password => requirement.password = enabled,
                 LoginMethod::Otp => requirement.otp = enabled,
             }
-            inner.persist_settings()?;
+            inner.persist_channel_requirements(channels, write_private_json)?;
         }
         self.settings_view()
     }
@@ -741,6 +742,32 @@ impl LoginAuth {
 }
 
 impl Inner {
+    fn persist_channel_requirements(
+        &mut self,
+        channels: ChannelRequirements,
+        persist: impl FnOnce(&Path, &StoredLoginSettings) -> Result<(), CoreError>,
+    ) -> Result<(), CoreError> {
+        let mut settings = self.settings.clone();
+        settings.channels = channels;
+        let path = self.app_data_dir.join(LOGIN_SETTINGS_FILE_NAME);
+        match persist(&path, &settings) {
+            Ok(()) => {
+                self.settings.channels = channels;
+                Ok(())
+            }
+            Err(error) => {
+                // G11/C20-1: 교체 전 실패는 기존 요구를 보존한다. 교체 뒤 폴더 동기화만
+                // 실패했을 수도 있으므로, 읽을 수 있는 저장본은 잠금 안에서 따라간다.
+                if let Ok(Some(stored)) = read_private_json::<StoredLoginSettings>(&path) {
+                    if stored.schema_version == SETTINGS_SCHEMA_VERSION {
+                        self.settings.channels = stored.channels;
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn persist_settings(&self) -> Result<(), CoreError> {
         write_private_json(
             &self.app_data_dir.join(LOGIN_SETTINGS_FILE_NAME),
@@ -1155,6 +1182,112 @@ mod tests {
             .clear_password(LoginChannel::Desktop, &password_reauth("password-123"))
             .expect("clear");
         assert!(!view.password_configured);
+    }
+
+    #[test]
+    fn g11_c20_1_failed_channel_requirement_save_keeps_live_policy() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let auth = open(directory.path());
+        auth.set_password(
+            LoginChannel::Desktop,
+            Some("operator"),
+            "password-123",
+            &Reauth::default(),
+        )
+        .expect("set password");
+        enroll_otp(&auth, &password_reauth("password-123"));
+        let shared = auth.clone();
+        let path = directory.path().join(LOGIN_SETTINGS_FILE_NAME);
+        let backup = directory.path().join("saved-settings.json");
+
+        for channel in LoginChannel::ALL {
+            for method in [LoginMethod::Password, LoginMethod::Otp] {
+                for initial in [true, false] {
+                    auth.set_channel_requirement(channel, method, initial)
+                        .expect("initial requirement");
+                    let before = auth.settings_view().expect("view before failure");
+                    let stored = fs::read(&path).expect("saved settings");
+                    // A directory blocks atomic replacement, including when tests run as root.
+                    fs::rename(&path, &backup).expect("preserve settings");
+                    fs::create_dir(&path).expect("block replacement");
+
+                    auth.set_channel_requirement(channel, method, !initial)
+                        .expect_err("settings replacement must fail");
+                    assert_eq!(shared.requirement(channel), before.channels.get(channel));
+                    assert_eq!(shared.settings_view().expect("live view"), before);
+
+                    fs::remove_dir(&path).expect("remove blocker");
+                    fs::rename(&backup, &path).expect("restore settings");
+                    assert_eq!(fs::read(&path).expect("preserved settings"), stored);
+                    assert_eq!(
+                        open(directory.path()).settings_view().expect("reopen"),
+                        before
+                    );
+
+                    let after = auth
+                        .set_channel_requirement(channel, method, !initial)
+                        .expect("retry after recovery");
+                    let mut expected = before.channels;
+                    let requirement = expected.get_mut(channel);
+                    match method {
+                        LoginMethod::Password => requirement.password = !initial,
+                        LoginMethod::Otp => requirement.otp = !initial,
+                    }
+                    assert_eq!(after.channels, expected);
+                    assert_eq!(shared.settings_view().expect("shared view"), after);
+                    assert_eq!(
+                        open(directory.path()).settings_view().expect("reopen"),
+                        after
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn g11_c20_1_channel_policy_tracks_replacement_when_directory_sync_fails() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let auth = open(directory.path());
+        auth.set_password(
+            LoginChannel::Desktop,
+            Some("operator"),
+            "password-123",
+            &Reauth::default(),
+        )
+        .expect("set password");
+        enroll_otp(&auth, &password_reauth("password-123"));
+
+        for channel in LoginChannel::ALL {
+            for method in [LoginMethod::Password, LoginMethod::Otp] {
+                for initial in [true, false] {
+                    auth.set_channel_requirement(channel, method, initial)
+                        .expect("initial requirement");
+                    let mut channels = auth.settings_view().expect("view").channels;
+                    let requirement = channels.get_mut(channel);
+                    match method {
+                        LoginMethod::Password => requirement.password = !initial,
+                        LoginMethod::Otp => requirement.otp = !initial,
+                    }
+                    let error = auth
+                        .lock()
+                        .persist_channel_requirements(channels, |path, settings| {
+                            write_private_json(path, settings)?;
+                            Err(CoreError::Io(std::io::Error::other(
+                                "simulated directory sync failure",
+                            )))
+                        })
+                        .expect_err("durability error must still reach the caller");
+                    assert!(matches!(error, CoreError::Io(ref error)
+                        if error.to_string() == "simulated directory sync failure"));
+                    let live = auth.settings_view().expect("live view");
+                    assert_eq!(live.channels, channels);
+                    assert_eq!(
+                        open(directory.path()).settings_view().expect("reopen"),
+                        live
+                    );
+                }
+            }
+        }
     }
 
     #[test]

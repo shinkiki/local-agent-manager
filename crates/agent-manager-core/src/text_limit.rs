@@ -179,4 +179,56 @@ mod tests {
         assert_eq!(truncate_bytes_with("abcdef", 1, marker), "a");
         assert_eq!(truncate_bytes_with("가나다라", 1, marker), "");
     }
+
+    /// V2: 전사 바이트 예산은 표시 문구도 포함하며, 정확히 맞는 원문은 그대로 둔다.
+    #[test]
+    fn v2_byte_limit_preserves_exact_fit_and_mixed_utf8_boundaries() {
+        let value = "Aé한🦀Z";
+        let expected = [
+            "",
+            "A",
+            "A",
+            "…",
+            "A…",
+            "A…",
+            "Aé…",
+            "Aé…",
+            "Aé…",
+            "Aé한…",
+            "Aé한…",
+            "Aé한🦀Z",
+            "Aé한🦀Z",
+        ];
+        for (limit, expected) in expected.iter().enumerate() {
+            let actual = truncate_bytes_with(value, limit, "…");
+            assert_eq!(&actual, expected, "limit={limit}");
+            assert!(actual.len() <= limit, "limit={limit}, actual={actual:?}");
+        }
+    }
+
+    /// V2: 빈 표시와 4바이트 표시에서도 한도와 원문 접두부를 보존한다.
+    #[test]
+    fn v2_byte_limit_handles_empty_and_four_byte_markers() {
+        for (value, limit, marker, expected) in [
+            ("Aé한🦀Z", 0, "", ""),
+            ("Aé한🦀Z", 2, "", "A"),
+            ("Aé한🦀Z", 6, "", "Aé한"),
+            ("Aé한🦀Z", 9, "", "Aé한"),
+            ("Aé한🦀Z", 10, "", "Aé한🦀"),
+            ("Aé한🦀Z", 3, "🛑", "Aé"),
+            ("Aé한🦀Z", 4, "🛑", "🛑"),
+            ("Aé한🦀Z", 5, "🛑", "A🛑"),
+            ("Aé한🦀Z", 7, "🛑", "Aé🛑"),
+            ("Aé한🦀Z", 10, "🛑", "Aé한🛑"),
+            ("é", 2, "🛑", "é"),
+            ("", 0, "🛑", ""),
+        ] {
+            let actual = truncate_bytes_with(value, limit, marker);
+            assert_eq!(
+                actual, expected,
+                "value={value:?}, limit={limit}, marker={marker:?}"
+            );
+            assert!(actual.len() <= limit);
+        }
+    }
 }

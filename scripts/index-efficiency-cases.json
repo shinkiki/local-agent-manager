@@ -168,6 +168,146 @@
     "expected": "fn begin_reconcile("
   },
   {
+    "id": "symbol-33",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/local_llm.rs",
+    "query": "plan_steps_default",
+    "expected": "fn plan_steps_default("
+  },
+  {
+    "id": "symbol-34",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/loopback_host.rs",
+    "query": "is_loopback_name",
+    "expected": "fn is_loopback_name("
+  },
+  {
+    "id": "symbol-35",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/mcp_registry.rs",
+    "query": "server_name",
+    "expected": "fn server_name("
+  },
+  {
+    "id": "symbol-36",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/opencode_config.rs",
+    "query": "provider_id_for",
+    "expected": "fn provider_id_for("
+  },
+  {
+    "id": "symbol-37",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/os_keychain.rs",
+    "query": "vault_error",
+    "expected": "fn vault_error("
+  },
+  {
+    "id": "symbol-38",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/plan.rs",
+    "query": "listed_names",
+    "expected": "fn listed_names("
+  },
+  {
+    "id": "symbol-39",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/power.rs",
+    "query": "sleep_prevention_status",
+    "expected": "fn sleep_prevention_status("
+  },
+  {
+    "id": "symbol-40",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/process_output.rs",
+    "query": "read_capped",
+    "expected": "fn read_capped("
+  },
+  {
+    "id": "symbol-41",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/process_signal.rs",
+    "query": "ps_executable",
+    "expected": "fn ps_executable("
+  },
+  {
+    "id": "symbol-42",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/project_instructions.rs",
+    "query": "load_project_instruction_library",
+    "expected": "fn load_project_instruction_library("
+  },
+  {
+    "id": "symbol-43",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/provider_settings_file.rs",
+    "query": "save_backup",
+    "expected": "fn save_backup("
+  },
+  {
+    "id": "symbol-44",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/provider_telemetry.rs",
+    "query": "load_provider_telemetry",
+    "expected": "fn load_provider_telemetry("
+  },
+  {
+    "id": "symbol-45",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/providers.rs",
+    "query": "provider_spec",
+    "expected": "fn provider_spec("
+  },
+  {
+    "id": "symbol-46",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/remote.rs",
+    "query": "run_background_workflow",
+    "expected": "fn run_background_workflow("
+  },
+  {
+    "id": "symbol-47",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/rounds.rs",
+    "query": "new_id",
+    "expected": "fn new_id("
+  },
+  {
+    "id": "symbol-48",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/runners.rs",
+    "query": "load_sources",
+    "expected": "fn load_sources("
+  },
+  {
+    "id": "symbol-49",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/saved_secrets.rs",
+    "query": "agent_enabled_default",
+    "expected": "fn agent_enabled_default("
+  },
+  {
+    "id": "symbol-50",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/scheduler.rs",
+    "query": "run_lease_expiry_ms",
+    "expected": "fn run_lease_expiry_ms("
+  },
+  {
+    "id": "symbol-51",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/session_folders.rs",
+    "query": "list_session_folders",
+    "expected": "fn list_session_folders("
+  },
+  {
+    "id": "symbol-52",
+    "split": "heldout",
+    "path": "crates/agent-manager-core/src/session_management.rs",
+    "query": "default_stop_running_chats",
+    "expected": "fn default_stop_running_chats("
+  },
+  {
     "id": "symbol-25",
     "split": "tuning",
     "path": "crates/agent-manager-core/src/file_kind.rs",
@@ -222,5 +362,105 @@
     "path": "crates/agent-manager-core/src/project_files.rs",
     "query": "list_project_entries",
     "expected": "fn list_project_entries("
+  },
+  {
+    "split": "regression",
+    "id": "regression-ts-declaration",
+    "path": "scripts/fixtures/index-efficiency/declarations.tsx",
+    "query": "parameterWitness",
+    "expected": "export function parameterWitness("
+  },
+  {
+    "split": "regression",
+    "id": "regression-prefix-rank",
+    "path": "scripts/fixtures/index-efficiency/exact.ts",
+    "query": "orchardProbe",
+    "expected": "export function orchardProbe(",
+    "extraPaths": [
+      "scripts/fixtures/index-efficiency/noise.md"
+    ],
+    "firstPath": "scripts/fixtures/index-efficiency/exact.ts"
+  },
+  {
+    "split": "regression",
+    "id": "regression-exact",
+    "path": "scripts/fixtures/index-efficiency/exact.ts",
+    "query": "orchardProbe",
+    "expected": "export function orchardProbe(",
+    "mode": "exact",
+    "extraPaths": [
+      "scripts/fixtures/index-efficiency/noise.md"
+    ],
+    "onlyPaths": [
+      "scripts/fixtures/index-efficiency/exact.ts"
+    ]
+  },
+  {
+    "split": "regression",
+    "id": "regression-path-filter",
+    "path": "scripts/fixtures/index-efficiency/exact.ts",
+    "query": "orchardProbe",
+    "expected": "export function orchardProbe(",
+    "pathPrefix": "scripts/fixtures/index-efficiency/exact.ts",
+    "extraPaths": [
+      "scripts/fixtures/index-efficiency/noise.md"
+    ],
+    "onlyPaths": [
+      "scripts/fixtures/index-efficiency/exact.ts"
+    ]
+  },
+  {
+    "split": "regression",
+    "id": "regression-extension",
+    "path": "scripts/fixtures/index-efficiency/exact.ts",
+    "query": "orchardProbe",
+    "expected": "export function orchardProbe(",
+    "extension": ".ts",
+    "extraPaths": [
+      "scripts/fixtures/index-efficiency/noise.md"
+    ],
+    "onlyPaths": [
+      "scripts/fixtures/index-efficiency/exact.ts"
+    ]
+  },
+  {
+    "split": "regression",
+    "id": "regression-korean",
+    "path": "scripts/fixtures/index-efficiency/guide.md",
+    "query": "기록 갱신",
+    "expected": "기록 갱신 작업"
+  },
+  {
+    "split": "regression",
+    "id": "regression-chunk-boundary",
+    "path": "scripts/fixtures/index-efficiency/guide.md",
+    "query": "orchard 갱신",
+    "expected": "기록 갱신 작업",
+    "maxExcerptLines": 8
+  },
+  {
+    "split": "regression",
+    "id": "regression-compact-context",
+    "path": "scripts/fixtures/index-efficiency/guide.md",
+    "query": "compactEvidenceSentinel",
+    "expected": "compactEvidenceSentinel",
+    "maxExcerptLines": 8
+  },
+  {
+    "split": "regression",
+    "id": "regression-g4-credential-exclusion",
+    "path": "scripts/fixtures/index-efficiency/blocked.yaml",
+    "query": "fixtureCredentialSentinel",
+    "expected": "fixtureCredentialSentinel",
+    "expectHit": false
+  },
+  {
+    "split": "regression",
+    "id": "regression-extension-miss",
+    "path": "scripts/fixtures/index-efficiency/exact.ts",
+    "query": "orchardProbe",
+    "expected": "export function orchardProbe(",
+    "extension": "sql",
+    "expectHit": false
   }
 ]

@@ -719,8 +719,8 @@ fn unsupported_plan(
 /// 있으면 `<prefix>/bin`에 써야 한다. 자체 업데이트(`agy update` 등)는 실행 파일이 놓인 폴더다. Homebrew는 brew가 자기
 /// 권한 모델로 판단하므로 보지 않는다.
 ///
-/// 쓰기 가능 여부는 `access(W_OK)`로만 묻는다. 시험 삼아 파일을 만들어 보면 그 자체가 설치
-/// 폴더에 대한 쓰기다.
+/// 폴더 안의 항목을 교체하려면 쓰기와 탐색 권한이 모두 필요하다. `access(W_OK | X_OK)`로만
+/// 묻고, 시험 삼아 파일을 만들어 설치 폴더에 쓰지는 않는다.
 #[cfg(all(unix, any(target_os = "linux", test)))]
 fn read_only_install_reason(source: CliInstallSource, executable: &Path) -> Option<String> {
     let blocked = install_write_targets(source, executable)
@@ -784,7 +784,7 @@ fn is_writable_by_current_user(path: &Path) -> bool {
         return false;
     };
     // SAFETY: NUL로 끝나는 유효한 C 문자열을 넘기고, access는 그 포인터를 보관하지 않는다.
-    unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+    unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
 }
 
 /// 정규화된 실행 파일 경로의 구조만으로 설치 출처를 판별한다. 경로 문자열을 명령에
@@ -2096,6 +2096,38 @@ mod tests {
             "자체 업데이트도 실행 파일 폴더에 써야 한다"
         );
         let _ = fs::remove_dir_all(&prefix);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_npm_update_requires_search_permission_on_bin_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let prefix = tempfile::tempdir().expect("임시 디렉터리");
+        let executable = prefix.path().join("lib/node_modules/codex/bin/codex.js");
+        fs::create_dir_all(executable.parent().unwrap()).expect("패키지 폴더");
+        let bin = prefix.path().join("bin");
+        fs::create_dir(&bin).expect("bin 폴더");
+        assert_eq!(
+            read_only_install_reason(CliInstallSource::NpmGlobal, &executable),
+            None
+        );
+
+        // root는 디렉터리 탐색 권한도 우회하므로 비root 실행에서만 재현된다.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o600)).expect("탐색 권한 제거");
+        let reason = read_only_install_reason(CliInstallSource::NpmGlobal, &executable);
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).expect("권한 복구");
+
+        let reason = reason.expect("V2: 쓰기만 가능한 bin 폴더는 업데이트 전에 거절해야 한다");
+        assert!(reason.contains(&bin.display().to_string()));
+        assert_eq!(
+            read_only_install_reason(CliInstallSource::NpmGlobal, &executable),
+            None,
+            "V2: 탐색 권한을 복구하면 업데이트를 허용해야 한다"
+        );
     }
 
     #[test]

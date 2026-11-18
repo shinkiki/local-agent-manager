@@ -516,6 +516,10 @@ pub struct ScheduledRequestSummary {
     /// 예약 실행이 시작되는 절대 시각(epoch ms). 없으면 시작 제한이 없다.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_from: Option<i64>,
+    /// 채팅 회차를 가벼운 문맥으로 띄우는지. 수정 요청에서 빠지면 꺼짐으로 저장되므로
+    /// 요약만 보고 고치는 AIA도 켜져 있던 값을 알아야 한다. 꺼져 있으면 싣지 않는다.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub lean_context: bool,
     /// 예약 실행이 끝나는 절대 시각(epoch ms). 이 시각을 지나면 nextRunAt이 있어도
     /// 예약 실행은 나가지 않는다(수동 실행은 그대로 나간다).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1724,6 +1728,8 @@ fn auto_switch_resume_request(
         aia_runtime: info.aia_runtime,
         record_session,
         settings: info.settings,
+        // 계정만 바꿔 다시 붙이는 자리라 줄여 둔 문맥도 그대로 물려준다.
+        lean_context: info.lean_context,
         startup_cancel: None,
     }
 }
@@ -1922,8 +1928,8 @@ pub fn list_system_audit(
         ListWindow { range, limit },
     )?;
     let path = app_data_dir.join(AUDIT_FILE);
-    let mut items = if path.is_file() {
-        BufReader::new(File::open(path)?)
+    let mut items = if let Some(file) = open_audit_log(&path)? {
+        BufReader::new(file)
             .lines()
             .map_while(Result::ok)
             .filter_map(|line| serde_json::from_str::<SystemAuditRecord>(&line).ok())
@@ -1948,6 +1954,43 @@ pub fn list_system_audit(
         next_cursor,
         total,
     })
+}
+
+/// G10: 조회도 감사 기록 추가와 같이 링크를 거부하되 파일을 만들거나 쓰지 않는다.
+fn open_audit_log(path: &Path) -> Result<Option<File>, CoreError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(CoreError::InvalidInput(
+            "감사 기록 파일은 심볼릭 링크일 수 없습니다".to_owned(),
+        ));
+    }
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // 검사 뒤 링크나 FIFO로 바뀌어도 외부 본문을 읽거나 조회가 멈추지 않는다.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(CoreError::InvalidInput(
+            "감사 기록 파일은 일반 파일이어야 합니다".to_owned(),
+        ));
+    }
+    Ok(Some(file))
 }
 
 fn collect_session_summaries(
@@ -2454,6 +2497,7 @@ fn schedule_summary(item: ScheduledRequest) -> ScheduledRequestSummary {
         workflow: input.workflow,
         active_from: input.active_from,
         active_until: input.active_until,
+        lean_context: input.lean_context,
         session_reference_origin: input
             .session_reference
             .as_ref()
@@ -2941,6 +2985,7 @@ mod tests {
             interactive_approvals: false,
             profile: ChatProfile::Aia,
             system_tools: true,
+            lean_context: false,
             settings: aia_runtime.settings.clone(),
             aia_runtime: Some(aia_runtime.clone()),
             record_session: true,
@@ -3165,6 +3210,87 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&log_target).expect("victim"),
             "original\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_audit_listing_refuses_existing_and_dangling_symlink_logs() {
+        let data = tempfile::tempdir().expect("app data");
+        let outside = tempfile::tempdir().expect("outside");
+        append_system_audit(
+            outside.path(),
+            "send_chat_message",
+            &json!({}),
+            SystemAuditPhase::Completed,
+            Some(true),
+            None,
+            Some("foreign-chat"),
+        )
+        .expect("outside record");
+        let foreign_log = outside.path().join(AUDIT_FILE);
+        let original = fs::read(&foreign_log).expect("outside bytes");
+        let log = data.path().join(AUDIT_FILE);
+        for target in [foreign_log.clone(), outside.path().join("missing.jsonl")] {
+            std::os::unix::fs::symlink(&target, &log).expect("log link");
+            assert!(
+                matches!(
+                    list_system_audit(data.path(), SystemAuditListRequest::default()),
+                    Err(CoreError::InvalidInput(_))
+                ),
+                "G10: 감사 기록 조회가 링크 너머의 파일을 읽으면 안 됩니다"
+            );
+            assert!(fs::symlink_metadata(&log)
+                .expect("kept link")
+                .file_type()
+                .is_symlink());
+            fs::remove_file(&log).expect("unlink fixture");
+        }
+        assert_eq!(fs::read(&foreign_log).expect("outside unchanged"), original);
+        assert!(!outside.path().join("missing.jsonl").exists());
+    }
+
+    #[test]
+    fn g7_audit_listing_keeps_missing_and_nonfile_logs_empty_without_writes() {
+        let temp = tempfile::tempdir().expect("temp");
+        let data = temp.path().join("missing-app-data");
+        let list = || list_system_audit(&data, SystemAuditListRequest::default());
+        assert_eq!(list().expect("missing app data").total, 0);
+        assert!(!data.exists());
+        fs::create_dir(&data).expect("app data");
+        assert_eq!(list().expect("missing log").total, 0);
+        let log = data.join(AUDIT_FILE);
+        assert!(!log.exists());
+        fs::create_dir(&log).expect("directory at log path");
+        assert_eq!(list().expect("nonfile log").total, 0);
+        assert!(log.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g7_audit_listing_needs_only_read_permission_and_keeps_log_bytes_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = tempfile::tempdir().expect("app data");
+        append_system_audit(
+            data.path(),
+            "send_chat_message",
+            &json!({}),
+            SystemAuditPhase::Completed,
+            Some(true),
+            None,
+            None,
+        )
+        .expect("record");
+        let log = data.path().join(AUDIT_FILE);
+        let original = fs::read(&log).expect("original bytes");
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o400)).expect("read only");
+        let page = list_system_audit(data.path(), SystemAuditListRequest::default()).expect("list");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].operation, "send_chat_message");
+        assert_eq!(fs::read(&log).expect("same bytes"), original);
+        assert_eq!(
+            fs::metadata(log).expect("metadata").permissions().mode() & 0o777,
+            0o400
         );
     }
 

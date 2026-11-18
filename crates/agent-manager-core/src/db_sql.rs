@@ -294,6 +294,15 @@ impl<'a> SqlScanner<'a> {
             // C10-8. PostgreSQL의 #는 연산자다. 그 뒤의 문장·참조를 숨기면 안 된다.
             let is_hash_comment = character == '#'
                 && matches!(self.engine, DbEngineKind::Mysql | DbEngineKind::Mariadb);
+            // C10-8/C10-10: MySQL·MariaDB의 --2는 주석이 아닌 산술식이다.
+            // 주석으로 지우면 뒤의 문장과 스키마 참조 검사가 빠진다.
+            let is_dash_comment = character == '-'
+                && next == Some('-')
+                && (!matches!(self.engine, DbEngineKind::Mysql | DbEngineKind::Mariadb)
+                    || self
+                        .characters
+                        .get(self.index + 2)
+                        .is_none_or(|character| character.is_ascii_whitespace()));
             // 낱말이 끊기는 자리에서 모아 둔 글자를 확정한다.
             let is_word_char = character.is_ascii_alphanumeric()
                 || matches!(character, '_' | '$' | '.')
@@ -303,7 +312,7 @@ impl<'a> SqlScanner<'a> {
             }
             if self.terminator.is_some()
                 && !character.is_whitespace()
-                && !(character == '-' && next == Some('-'))
+                && !is_dash_comment
                 && !(character == '/' && next == Some('*'))
                 && !is_hash_comment
             {
@@ -319,7 +328,7 @@ impl<'a> SqlScanner<'a> {
                     let tag_len = self.dollar_tag_len().unwrap_or(1);
                     self.skip_dollar_quoted(tag_len)?;
                 }
-                '-' if next == Some('-') => {
+                '-' if is_dash_comment => {
                     self.skip_line_comment();
                 }
                 '#' if is_hash_comment => {
@@ -499,6 +508,74 @@ mod tests {
         )
         .expect_err("two");
         assert!(matches!(error, CoreError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn c10_8_dash_comments_follow_the_engine_whitespace_rule() {
+        for engine in [DbEngineKind::Mysql, DbEngineKind::Mariadb] {
+            for sql in ["SELECT 1--2; SELECT 3", "SELECT 1;--2"] {
+                let error = parse_sql(sql, engine).expect_err("not a comment");
+                assert!(
+                    matches!(error, CoreError::InvalidInput(_)),
+                    "{engine:?}: {sql}"
+                );
+            }
+            for trailing in ["--", "-- ", "--\t"] {
+                let sql = format!("SELECT 1;{trailing}");
+                assert_eq!(
+                    parse_sql(&sql, engine)
+                        .expect("empty trailing comment")
+                        .normalized,
+                    "SELECT 1"
+                );
+            }
+            let parsed = parse_sql("SELECT 1--2;", engine).expect("subtraction");
+            assert_eq!(parsed.normalized, "SELECT 1--2");
+            for space in [" ", "\t"] {
+                let sql = format!("SELECT 1--{space}; SELECT 3");
+                parse_sql(&sql, engine).expect("statement inside a real comment");
+                let trailing = format!("SELECT 1;--{space}comment");
+                assert_eq!(
+                    parse_sql(&trailing, engine)
+                        .expect("trailing comment")
+                        .normalized,
+                    "SELECT 1"
+                );
+            }
+        }
+        for engine in [DbEngineKind::Postgres, DbEngineKind::Sqlite] {
+            parse_sql("SELECT 1--2; SELECT 3", engine).expect("no space required");
+            assert_eq!(
+                parse_sql("SELECT 1;--2", engine)
+                    .expect("trailing comment")
+                    .normalized,
+                "SELECT 1"
+            );
+        }
+        for engine in [
+            DbEngineKind::Mysql,
+            DbEngineKind::Mariadb,
+            DbEngineKind::Postgres,
+            DbEngineKind::Sqlite,
+        ] {
+            for newline in ["\n", "\r\n"] {
+                let sql = format!("SELECT 1--{newline}+2; SELECT 3");
+                assert!(parse_sql(&sql, engine).is_err(), "{engine:?}: {sql:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn c10_10_mysql_subtraction_cannot_hide_schema_references() {
+        for engine in [DbEngineKind::Mysql, DbEngineKind::Mariadb] {
+            let parsed = parse_sql("SELECT 1--2 FROM private.notes", engine).expect("subtraction");
+            assert_eq!(parsed.references, vec!["PRIVATE.NOTES"]);
+            assert!(matches!(
+                ensure_scope(&parsed, &["public.".to_owned()]),
+                Err(CoreError::InvalidInput(_))
+            ));
+            ensure_scope(&parsed, &["private.".to_owned()]).expect("allowed reference");
+        }
     }
 
     #[test]

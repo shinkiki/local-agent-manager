@@ -596,13 +596,18 @@ pub(crate) fn preview_kind_for_path(
     let mut sample = vec![0_u8; usize::try_from(metadata.len().min(8 * 1024)).unwrap_or(8 * 1024)];
     let read = File::open(path)?.read(&mut sample)?;
     sample.truncate(read);
-    Ok(
-        if std::str::from_utf8(&sample).is_ok() && !sample.contains(&0) {
-            DocumentPreviewKind::Text
-        } else {
-            DocumentPreviewKind::Binary
-        },
-    )
+    // 표본 경계가 UTF-8 문자 중간을 자를 수 있다. 뒤에 바이트가 더 있을 때만
+    // 불완전한 끝을 허용하고, 실제 EOF의 잘린 문자나 표본 내부 오류는 거절한다.
+    // 본문을 열 때는 read_document_text가 전체 UTF-8을 다시 검증한다.
+    let valid_utf8 = match std::str::from_utf8(&sample) {
+        Ok(_) => true,
+        Err(error) => error.error_len().is_none() && (read as u64) < metadata.len(),
+    };
+    Ok(if valid_utf8 && !sample.contains(&0) {
+        DocumentPreviewKind::Text
+    } else {
+        DocumentPreviewKind::Binary
+    })
 }
 
 fn node_order(left: &FileNode, right: &FileNode) -> std::cmp::Ordering {
@@ -1110,6 +1115,101 @@ mod tests {
         assert!(opened.content.is_none());
         assert!(opened.downloadable);
         assert_eq!(opened.size_bytes, bytes.len() as u64);
+    }
+
+    /// V2: 표본 경계에서 잘린 정상 문자를 바이너리로 오인하면 본문을 열지 못한다.
+    #[test]
+    fn v2_text_sample_preserves_unicode_crossing_the_limit() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let app_data = temp.path().join("app-data");
+        let docs = temp.path().join("docs");
+        fs::create_dir_all(&docs).expect("document directory");
+        let root = add_doc_root(&app_data, "docs", docs.to_str().expect("path"), false)
+            .expect("registered document root");
+
+        for symbol in ["é", "한", "🦀"] {
+            for sampled_bytes in 1..symbol.len() {
+                let name = format!("text-{}-{sampled_bytes}.txt", symbol.len());
+                let text = format!(
+                    "{}{symbol} trailing text",
+                    "a".repeat(8 * 1024 - sampled_bytes)
+                );
+                fs::write(docs.join(&name), &text).expect("UTF-8 document");
+
+                let listed = list_document_entries(&app_data, &root.root.id, "", None, None)
+                    .expect("document entries");
+                let entry = listed
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .expect("entry");
+                assert_eq!(
+                    entry.preview_kind,
+                    Some(DocumentPreviewKind::Text),
+                    "{name}"
+                );
+
+                let opened =
+                    read_document_file(&app_data, &root.root.id, &name).expect("document preview");
+                assert_eq!(opened.kind, DocumentPreviewKind::Text, "{name}");
+                assert_eq!(opened.content.as_deref(), Some(text.as_str()), "{name}");
+            }
+        }
+    }
+
+    /// V2: 불완전한 실제 EOF, 표본 내부의 잘못된 UTF-8과 NUL은 계속 바이너리다.
+    #[test]
+    fn v2_text_sample_rejects_invalid_utf8_and_nul() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let mut truncated_at_limit = vec![b'a'; 8 * 1024 - 1];
+        truncated_at_limit.push(0xE2);
+        let mut invalid_inside = vec![b'a'; 8 * 1024 + 10];
+        invalid_inside[100] = 0xFF;
+        let mut nul_and_partial = vec![b'a'; 8 * 1024 - 1];
+        nul_and_partial[100] = 0;
+        nul_and_partial.extend_from_slice("한 trailing text".as_bytes());
+        for (name, bytes) in [
+            ("invalid.txt", b"text\xFF".to_vec()),
+            ("truncated.txt", b"text\xE2".to_vec()),
+            ("truncated-at-limit.txt", truncated_at_limit),
+            ("invalid-inside.txt", invalid_inside),
+            ("nul-and-partial.txt", nul_and_partial),
+        ] {
+            let path = temp.path().join(name);
+            fs::write(&path, bytes).expect("binary document");
+            let metadata = fs::metadata(&path).expect("metadata");
+            assert_eq!(
+                preview_kind_for_path(&path, &metadata).expect("preview kind"),
+                DocumentPreviewKind::Binary,
+                "{name}"
+            );
+        }
+    }
+
+    /// V2: 표본 끝만 불완전해도 본문 전체가 잘못된 UTF-8이면 열 때 격하한다.
+    #[test]
+    fn v2_text_sample_still_validates_the_full_document() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let app_data = temp.path().join("app-data");
+        let docs = temp.path().join("docs");
+        fs::create_dir_all(&docs).expect("document directory");
+        let mut bytes = vec![b'a'; 8 * 1024 - 1];
+        bytes.extend_from_slice(&[0xE2, 0xFF]);
+        fs::write(docs.join("mixed.txt"), bytes).expect("mixed document");
+        let root = add_doc_root(&app_data, "docs", docs.to_str().expect("path"), false)
+            .expect("registered document root");
+
+        let listed = list_document_entries(&app_data, &root.root.id, "", None, None)
+            .expect("document entries");
+        assert_eq!(
+            listed.entries[0].preview_kind,
+            Some(DocumentPreviewKind::Text)
+        );
+        let opened =
+            read_document_file(&app_data, &root.root.id, "mixed.txt").expect("document preview");
+        assert_eq!(opened.kind, DocumentPreviewKind::Binary);
+        assert!(opened.content.is_none());
+        assert!(opened.downloadable);
     }
 
     #[test]

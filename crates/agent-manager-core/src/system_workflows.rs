@@ -3800,7 +3800,8 @@ fn resolve_template(template: &Value, ctx: &TemplateContext<'_>) -> Result<Value
     match template {
         Value::Object(map) => {
             if let Some((token, value)) = TemplateToken::detect_resolvable(map) {
-                return resolve_token(token, value.unwrap_or_default(), map, ctx);
+                let path = map.get("path").and_then(Value::as_str).unwrap_or("");
+                return resolve_token(token, value.unwrap_or_default(), path, ctx);
             }
             let mut resolved = Map::new();
             for (key, value) in map {
@@ -3823,7 +3824,7 @@ fn resolve_template(template: &Value, ctx: &TemplateContext<'_>) -> Result<Value
 fn resolve_token(
     token: TemplateToken,
     value: &str,
-    map: &Map<String, Value>,
+    path: &str,
     ctx: &TemplateContext<'_>,
 ) -> Result<Value, CoreError> {
     match token {
@@ -3835,7 +3836,6 @@ fn resolve_token(
                 .results
                 .get(value)
                 .ok_or_else(|| CoreError::Runtime(format!("단계 {value}의 결과가 없습니다")))?;
-            let path = map.get("path").and_then(Value::as_str).unwrap_or("");
             select_path(result, path).cloned()
         }
         TemplateToken::Item => {
@@ -3863,43 +3863,19 @@ fn resolve_token(
 /// `$format` 문자열을 값으로 채운다. 구멍은 등록에서 이미 검증됐으므로 여기서 걸리는 것은
 /// 실행에만 드러나는 것 둘뿐이다 — 결과에 없는 경로와, 글자로 바꿀 수 없는 값.
 ///
-/// `$step` 토큰과 달리 경로가 구멍 안에 함께 있어(`{step.s01.items.0.title}`) 해석도
-/// 여기서 직접 한다.
+/// W8: `{step.s01.items.0.title}`의 단계 이름과 경로만 분리하고, 값 조회와 오류는
+/// 객체 토큰과 같은 해석기를 쓴다.
 fn resolve_format(text: &str, ctx: &TemplateContext<'_>) -> Result<Value, CoreError> {
     let mut out = String::new();
     for part in parse_format(text)? {
         match part {
             FormatPart::Literal(literal) => out.push_str(&literal),
             FormatPart::Hole { token, arg } => {
-                let resolved = match token {
-                    TemplateToken::Input => ctx.inputs.get(&arg).cloned().ok_or_else(|| {
-                        CoreError::InvalidInput(format!("입력 {arg}이(가) 제공되지 않았습니다"))
-                    })?,
-                    TemplateToken::Step => {
-                        let (step, path) = arg.split_once('.').unwrap_or((arg.as_str(), ""));
-                        let result = ctx.results.get(step).ok_or_else(|| {
-                            CoreError::Runtime(format!("단계 {step}의 결과가 없습니다"))
-                        })?;
-                        select_path(result, path)?.clone()
-                    }
-                    TemplateToken::Item => {
-                        let item = ctx.item.ok_or_else(|| {
-                            CoreError::Runtime(
-                                "$item은 forEach 실행 중에만 사용할 수 있습니다".to_owned(),
-                            )
-                        })?;
-                        select_path(item, &arg)?.clone()
-                    }
-                    _ => {
-                        let run = ctx.run.ok_or_else(|| {
-                            CoreError::Runtime(
-                                "$run은 페이싱 회차 봉투 안의 실행에서만 사용할 수 있습니다"
-                                    .to_owned(),
-                            )
-                        })?;
-                        select_path(run, &arg)?.clone()
-                    }
+                let (value, path) = match token {
+                    TemplateToken::Step => arg.split_once('.').unwrap_or((arg.as_str(), "")),
+                    _ => (arg.as_str(), ""),
                 };
+                let resolved = resolve_token(token, value, path, ctx)?;
                 let scope = match token {
                     TemplateToken::Input => "input",
                     TemplateToken::Step => "step",

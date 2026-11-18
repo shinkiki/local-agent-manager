@@ -11,13 +11,16 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::app_data_file::{read_private_json_or_default, write_private_json};
+use crate::app_data_file::{
+    ensure_schema_version, read_private_json_or_default, write_private_json,
+};
 use crate::domain::ProviderId;
 use crate::store_lock;
 use crate::CoreError;
 
 const META_FILE: &str = "skill-meta.json";
 const META_LOCK_FILE: &str = "skill-meta.lock";
+const META_LABEL: &str = "스킬 메타 저장소";
 const META_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,10 +72,26 @@ fn save_skill_meta(app_data_dir: &Path, store: &SkillMetaStore) -> Result<(), Co
     write_private_json(&app_data_dir.join(META_FILE), &next)
 }
 
+/// 갱신 경로가 저장본을 읽는 기준. 해석되지 않는 저장본과 이 버전이 모르는 스키마 버전을
+/// 모두 오류로 돌려준다.
+///
+/// G7: 해석되지 않는 저장본을 빈 값으로 읽고 저장하면 다른 스킬의 출처·자동 동기화가
+/// 모두 지워진다. 더 새 버전의 저장본도 마찬가지다 — 이 버전이 모르는 칸은 읽는 순간
+/// 버려지고 [`save_skill_meta`]가 버전을 1로 되돌려 쓰므로, 갱신은 그 파일을 덮지 않는다
+/// (`JsonStore`를 쓰는 저장소들과 같은 판단). 0은 버전 칸이 없는 저장본이거나 아직 파일이
+/// 없는 기본값이라 받아들인다. 목록 읽기([`load_skill_meta`])는 관대하게 둔다.
+fn read_skill_meta_for_update(app_data_dir: &Path) -> Result<SkillMetaStore, CoreError> {
+    let store: SkillMetaStore = read_private_json_or_default(&app_data_dir.join(META_FILE))?;
+    if store.version > META_VERSION {
+        ensure_schema_version(store.version, META_VERSION, META_LABEL)?;
+    }
+    Ok(store)
+}
+
 /// 갱신 경로와 같은 기준으로 저장본을 읽어 본다. 되돌리기 어려운 쓰기(공통 원본 생성)를
 /// 하기 전에 불러, 그 뒤 출처 기록이 깨진 저장본 때문에 실패하는 반쪽 상태를 막는다.
 pub(crate) fn ensure_skill_meta_readable(app_data_dir: &Path) -> Result<(), CoreError> {
-    read_private_json_or_default::<SkillMetaStore>(&app_data_dir.join(META_FILE)).map(|_| ())
+    read_skill_meta_for_update(app_data_dir).map(|_| ())
 }
 
 fn update_skill_meta<F>(app_data_dir: &Path, mutate: F) -> Result<(), CoreError>
@@ -80,10 +99,8 @@ where
     F: FnOnce(&mut SkillMetaStore) -> bool,
 {
     // G7: atomic replace만으로는 동시 갱신의 유실을 막지 못하므로 읽기부터 저장까지 잠근다.
-    let _lock = store_lock::acquire(app_data_dir, META_LOCK_FILE, "스킬 메타 저장소")?;
-    // G7: 해석되지 않는 저장본을 빈 값으로 읽고 저장하면 다른 스킬의 출처·자동 동기화가
-    // 모두 지워진다. 갱신은 그 파일을 덮지 않고 오류로 돌려준다(목록 읽기는 관대하게 둔다).
-    let mut store: SkillMetaStore = read_private_json_or_default(&app_data_dir.join(META_FILE))?;
+    let _lock = store_lock::acquire(app_data_dir, META_LOCK_FILE, META_LABEL)?;
+    let mut store = read_skill_meta_for_update(app_data_dir)?;
     if mutate(&mut store) {
         save_skill_meta(app_data_dir, &store)?;
     }
@@ -207,6 +224,53 @@ mod tests {
         assert_eq!(fs::read(&path).expect("read store"), corrupt);
         // 읽기는 여전히 막히지 않는다.
         assert!(load_skill_meta(app_data_dir).skills.is_empty());
+    }
+
+    /// G7: 더 새 버전 앱이 쓴 저장본을 갱신하면 이 버전이 모르는 칸이 버려지고 버전이
+    /// 1로 내려간다. 갱신과 사전 검사는 그 파일을 덮지 않고 Conflict 로 거절한다.
+    #[test]
+    fn g7_newer_schema_store_is_not_overwritten_by_updates() {
+        let temp = tempdir().expect("tempdir");
+        let app_data_dir = temp.path();
+        let path = app_data_dir.join(META_FILE);
+        let newer = format!(
+            r#"{{"version":{},"skills":{{"kept":{{"autoSync":true,"futureField":"keep"}}}}}}"#,
+            META_VERSION + 1
+        );
+        fs::write(&path, newer.as_bytes()).expect("write newer store");
+
+        let conflict =
+            |result: Result<(), CoreError>| matches!(result, Err(CoreError::Conflict(_)));
+        assert!(conflict(set_skill_auto_sync(app_data_dir, "other", true)));
+        assert!(conflict(remove_skill_meta(app_data_dir, "kept")));
+        assert!(conflict(record_skill_origin(
+            app_data_dir,
+            "other",
+            SkillOriginMeta {
+                provider: ProviderId::Codex,
+                scope: "personal".into(),
+                project_path: None,
+                archived_at_ms: None,
+            },
+        )));
+        assert!(conflict(ensure_skill_meta_readable(app_data_dir)));
+        assert_eq!(fs::read(&path).expect("read store"), newer.as_bytes());
+    }
+
+    /// 버전 칸이 없는 저장본(0)은 거절하지 않고, 갱신하면 현재 버전으로 저장된다.
+    #[test]
+    fn g7_store_without_a_version_field_is_still_updatable() {
+        let temp = tempdir().expect("tempdir");
+        let app_data_dir = temp.path();
+        let path = app_data_dir.join(META_FILE);
+        fs::write(&path, br#"{"skills":{"kept":{"autoSync":true}}}"#).expect("write legacy");
+
+        ensure_skill_meta_readable(app_data_dir).expect("legacy store is readable");
+        set_skill_auto_sync(app_data_dir, "other", true).expect("legacy store is updatable");
+        let store = load_skill_meta(app_data_dir);
+        assert_eq!(store.version, META_VERSION);
+        assert!(store.skills["kept"].auto_sync);
+        assert!(store.skills["other"].auto_sync);
     }
 
     #[test]

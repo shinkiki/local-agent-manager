@@ -7,12 +7,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::fs;
+use std::io::Read;
 use std::ops::RangeInclusive;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::app_data_file::write_private_json;
+use crate::app_data_file::{open_private_read_file, write_private_json};
 use crate::chat::ReasoningEffort;
 use crate::domain::ProviderId;
 use crate::quiet_hours::{canonical_clock, QuietSchedule};
@@ -555,12 +556,26 @@ fn with_store_lock<T>(
 
 fn load_unlocked(app_data_dir: &Path) -> Result<Option<UsageBudgetPolicy>, CoreError> {
     let path = app_data_dir.join(STORE_FILE);
-    if !path.is_file() {
-        return Ok(None);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let invalid_kind =
+        || CoreError::InvalidInput("사용량 예산 정책 저장본은 일반 파일이어야 합니다".to_owned());
+    // G10: 링크를 따라가지 않는다. 잘못 놓인 경로도 정책 없음으로 보아 초기화하지 않는다.
+    if !metadata.file_type().is_file() {
+        return Err(invalid_kind());
     }
+    let mut file = open_private_read_file(&path)?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid_kind());
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
     // 사용자가 고른 풀·우선순위다. 읽지 못하면 조용히 비우지 않고 실패시킨다 — 빈 정책은
     // "모든 계정·모든 소비자 허용"이라 사용자의 선택과 정반대로 동작한다.
-    let policy: UsageBudgetPolicy = serde_json::from_slice(&fs::read(&path)?).map_err(|error| {
+    let policy: UsageBudgetPolicy = serde_json::from_slice(&bytes).map_err(|error| {
         CoreError::Runtime(format!(
             "사용량 예산 정책 저장본을 읽을 수 없습니다({}): {error}",
             path.display()
@@ -1329,6 +1344,7 @@ mod tests {
                 }),
                 active_from: None,
                 active_until: None,
+                lean_context: false,
             },
             created_at: 0,
             updated_at: 0,
@@ -1418,6 +1434,48 @@ mod tests {
         // 없는 파일은 오류가 아니라 "정책 없음"이다.
         let empty = tempfile::tempdir().expect("tempdir");
         assert_eq!(load_optional(empty.path()).expect("load"), None);
+    }
+
+    #[test]
+    fn g10_budget_store_refuses_a_directory_without_reseeding() {
+        let dir = tempfile::tempdir().expect("app data");
+        let path = dir.path().join(STORE_FILE);
+        fs::create_dir(&path).expect("directory at store path");
+        assert!(matches!(
+            load_optional(dir.path()),
+            Err(CoreError::InvalidInput(_))
+        ));
+        assert!(load_or_seed(dir.path(), || panic!("must not seed over a directory")).is_err());
+        assert!(set_defaults(dir.path(), no_seed, UsageBudgetDefaults::default()).is_err());
+        assert!(path.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_budget_store_refuses_symlinks_without_reading_or_reseeding() {
+        let outside = tempfile::tempdir().expect("outside app data");
+        let target = outside.path().join("policy.json");
+        let bytes = serde_json::to_vec(&UsageBudgetPolicy::default()).expect("valid policy");
+        fs::write(&target, &bytes).expect("outside policy");
+        let missing = outside.path().join("missing.json");
+
+        for destination in [&target, &missing] {
+            let dir = tempfile::tempdir().expect("app data");
+            let path = dir.path().join(STORE_FILE);
+            std::os::unix::fs::symlink(destination, &path).expect("store symlink");
+            assert!(matches!(
+                load_optional(dir.path()),
+                Err(CoreError::InvalidInput(_))
+            ));
+            assert!(load_or_seed(dir.path(), || panic!("must not seed over a symlink")).is_err());
+            assert!(set_defaults(dir.path(), no_seed, UsageBudgetDefaults::default()).is_err());
+            assert_eq!(
+                fs::read_link(&path).expect("symlink preserved"),
+                *destination
+            );
+        }
+        assert_eq!(fs::read(&target).expect("outside policy preserved"), bytes);
+        assert!(!missing.exists());
     }
 
     // 반복 요청을 지운 뒤 남은 소비자 설정은 그 워크플로에 회차가 아직 있는 것처럼 보여

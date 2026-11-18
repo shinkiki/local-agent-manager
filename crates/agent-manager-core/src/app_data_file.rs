@@ -6,7 +6,7 @@
 //! 반쪽짜리 저장 파일이 남으므로, 순서 자체는 이 모듈 한 곳에만 둔다.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -103,6 +103,42 @@ pub(crate) fn sync_dir(_directory: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// 앱 소유 파일을 읽기 전용으로 연다.
+///
+/// G10: 마지막 경로 성분이 심볼릭 링크면 따라가지 않고 `ELOOP`로 거절한다.
+pub(crate) fn open_private_read_file(path: &Path) -> Result<File, CoreError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    Ok(options.open(path)?)
+}
+
+/// 앱 소유 저장 파일을 바이트열로 읽는다. 파일이 없거나 디렉터리·심볼릭 링크면 `None`.
+///
+/// G10: 심볼릭 링크는 따라가지 않고 저장본 없음(`None`)으로 본다. 유닉스에서는
+/// `O_NOFOLLOW`로 열어 판정과 열기 사이의 틈(TOCTOU)까지 닫는다.
+pub(crate) fn read_private_bytes(path: &Path) -> Result<Option<Vec<u8>>, CoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => return Ok(None),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(CoreError::Io(error)),
+    }
+    let mut file = match open_private_read_file(path) {
+        Ok(file) => file,
+        #[cfg(unix)]
+        Err(CoreError::Io(error)) if error.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
+        Err(CoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
 /// 앱 소유 저장 파일이 있으면 JSON으로 해석해 돌려주고, 아직 없으면 `None`.
 ///
 /// 저장소를 가진 모듈마다 "`is_file()`로 없으면 기본값 → 있으면 읽어서 해석"이라는 같은
@@ -110,11 +146,13 @@ pub(crate) fn sync_dir(_directory: &Path) -> Result<(), CoreError> {
 /// 갈리면 첫 실행이 기본값 대신 오류로 죽으므로, 기준은 이 함수 한 곳에만 둔다.
 /// 경로에 폴더가 놓여 있는 경우도 "저장본 없음"으로 본다 — 기존 호출부의 `is_file()`
 /// 판정을 그대로 옮긴 것이다.
+///
+/// G10: 마지막 경로 성분이 심볼릭 링크면 따라가지 않고 거절한다.
 pub(crate) fn read_private_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, CoreError> {
-    if !path.is_file() {
+    let Some(bytes) = read_private_bytes(path)? else {
         return Ok(None);
-    }
-    Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+    };
+    Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
 /// 저장본이 아직 없으면 기본값을 쓰는 [`read_private_json`].
@@ -261,16 +299,30 @@ mod tests {
         let log = directory.path().join("audit.jsonl");
         std::os::unix::fs::symlink(&target, &lock).expect("planted lock symlink");
         std::os::unix::fs::symlink(&target, &log).expect("planted log symlink");
+        let json_target = outside.path().join("foreign.json");
+        fs::write(&json_target, b"{\"value\": \"foreign\"}").expect("foreign json");
+        let json_link = directory.path().join("alias.json");
+        std::os::unix::fs::symlink(&json_target, &json_link).expect("planted json symlink");
 
         for result in [
-            open_private_file(&lock, false),
-            open_private_append_file(&log),
+            open_private_file(&lock, false).map(|_| ()),
+            open_private_append_file(&log).map(|_| ()),
+            open_private_read_file(&json_link).map(|_| ()),
         ] {
             assert!(matches!(
                 result,
                 Err(CoreError::Io(ref error)) if error.raw_os_error() == Some(libc::ELOOP)
             ));
         }
+
+        // G10: read_private_bytes 와 read_private_json 은 심볼릭 링크를 따라가
+        // 대상 파일을 읽지 않고, 디렉터리와 마찬가지로 저장본 없음(None)으로 취급한다.
+        assert_eq!(read_private_bytes(&json_link).expect("read bytes"), None);
+        assert_eq!(
+            read_private_json::<serde_json::Value>(&json_link).expect("read json"),
+            None
+        );
+
         assert_eq!(fs::read(&target).expect("target contents"), b"foreign");
 
         // 가리키는 곳이 없는 링크도 따라가 앱 데이터 밖에 새 파일을 만들지 않는다.
@@ -279,6 +331,18 @@ mod tests {
         std::os::unix::fs::symlink(&missing, &dangling).expect("dangling symlink");
         assert!(open_private_file(&dangling, false).is_err());
         assert!(!missing.exists());
+
+        let dangling_json = directory.path().join("dangling.json");
+        std::os::unix::fs::symlink(&missing, &dangling_json).expect("dangling json symlink");
+        assert!(open_private_read_file(&dangling_json).is_err());
+        assert_eq!(
+            read_private_bytes(&dangling_json).expect("dangling bytes"),
+            None
+        );
+        assert_eq!(
+            read_private_json::<serde_json::Value>(&dangling_json).expect("dangling json"),
+            None
+        );
     }
 
     #[test]

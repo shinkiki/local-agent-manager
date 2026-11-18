@@ -241,16 +241,16 @@ impl SupplementStore {
 }
 
 fn load_supplement_store(app_data_dir: &Path) -> Result<SupplementStore, CoreError> {
-    read_private_json_or_default(&app_data_dir.join(SUPPLEMENT_STORE_FILE_NAME))
+    read_private_json_or_default(&supplement_store_path(app_data_dir))
 }
 
-/// 보완 저장소 파일 위치. 저장소를 읽은 결과를 캐시하는 쪽이 파일 변경을 알아보는 데 쓴다.
+/// G7: 보완 저장소의 읽기·쓰기·크기 조회와 검색 캐시가 함께 쓰는 앱 데이터 내 파일 위치.
 pub(crate) fn supplement_store_path(app_data_dir: &Path) -> std::path::PathBuf {
     app_data_dir.join(SUPPLEMENT_STORE_FILE_NAME)
 }
 
 fn supplement_store_size(app_data_dir: &Path) -> u64 {
-    fs::metadata(app_data_dir.join(SUPPLEMENT_STORE_FILE_NAME))
+    fs::metadata(supplement_store_path(app_data_dir))
         .map(|metadata| metadata.len())
         .unwrap_or(0)
 }
@@ -270,7 +270,7 @@ fn with_supplement_store(
     // 쓰면 끊긴 쓰기가 반쪽 JSON을 남기고 다음 읽기가 그것을 기본값으로 삼아 보관한
     // 응답을 말없이 잃는다. 또 그 자리의 심볼릭 링크를 따라가 앱 데이터 밖 파일을
     // 덮어쓰고, 새 파일은 0600이 아니라 umask 권한으로 생긴다.
-    write_private_json(&app_data_dir.join(SUPPLEMENT_STORE_FILE_NAME), &store)
+    write_private_json(&supplement_store_path(app_data_dir), &store)
 }
 
 fn cap_supplement_text(text: String) -> String {

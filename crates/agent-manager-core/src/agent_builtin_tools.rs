@@ -32,10 +32,29 @@ const DB_OPERATIONS: &[&str] = &[
     "run_db_statement",
 ];
 
+const K8S_OPERATIONS: &[&str] = &[
+    "list_agent_k8s_clusters",
+    "check_agent_k8s_cluster",
+    "list_k8s_resources",
+    "get_k8s_resource",
+    "get_k8s_logs",
+    "get_k8s_events",
+];
+
+const AIA_PEER_OPERATIONS: &[&str] = &[
+    "list_agent_aia_peers",
+    "check_aia_peer",
+    "ask_aia_peer",
+    "get_aia_peer_exchange",
+    "list_aia_peer_exchanges",
+    "list_aia_peer_skills",
+    "import_aia_peer_skill",
+];
 const INDEX_OPERATIONS: &[&str] = &[
     "list_agent_index_sources",
     "search_index",
     "read_index_excerpt",
+    "get_index_exclusions",
     "refresh_agent_index_source",
 ];
 
@@ -146,6 +165,19 @@ pub enum AgentBuiltinToolNote {
         available: usize,
         unusable: usize,
     },
+    /// 쓸 수 있는 Kubernetes 클러스터와, 켜져 있지만 쓸 수 없는 클러스터의 수.
+    #[serde(rename_all = "camelCase")]
+    K8sClusters {
+        available: usize,
+        unusable: usize,
+    },
+    /// C23. 쓸 수 있는 AIA 피어와, 등록됐지만 쓸 수 없는 피어의 수. `enabled` 는 기능 스위치.
+    #[serde(rename_all = "camelCase")]
+    AiaPeers {
+        enabled: bool,
+        available: usize,
+        unusable: usize,
+    },
     #[serde(rename_all = "camelCase")]
     IndexSources {
         available: usize,
@@ -209,7 +241,11 @@ struct BuiltinToolState {
     index_registered_in_antigravity: bool,
     cypress_enabled: bool,
     db: RegisteredTargets,
+    k8s: RegisteredTargets,
     ssh: RegisteredTargets,
+    /// C23. 기능 스위치와 피어 수. 같은 기기 AIA(local)가 열려 있으면 usable 에 센다.
+    peers_enabled: bool,
+    peers: RegisteredTargets,
     /// 사용 중이고 자격증명이 준비돼 실제로 붙는 외부 MCP의 (id, 표시 이름).
     mcp_attachable: Vec<(String, String)>,
     /// 사용 중이지만 인증이 아직 없어 붙지 않는 외부 MCP 수.
@@ -238,6 +274,23 @@ pub fn load_agent_builtin_tools(app_data_dir: &Path) -> AgentBuiltinToolsCatalog
         crate::list_agent_db_connections(app_data_dir)
             .map(|view| RegisteredTargets::new(view.connections.len(), view.skipped.len())),
         "데이터베이스 활성 상태",
+        &mut issues,
+    );
+    let k8s = or_note(
+        crate::list_agent_k8s_clusters(app_data_dir)
+            .map(|view| RegisteredTargets::new(view.clusters.len(), view.skipped.len())),
+        "Kubernetes 활성 상태",
+        &mut issues,
+    );
+    let (peers_enabled, peers) = or_note(
+        crate::list_agent_aia_peers(app_data_dir, None).map(|view| {
+            let local = usize::from(view.local.available);
+            (
+                view.enabled,
+                RegisteredTargets::new(view.peers.len() + local, view.skipped.len()),
+            )
+        }),
+        "AIA 대화 활성 상태",
         &mut issues,
     );
     let index_view = or_note(
@@ -273,7 +326,10 @@ pub fn load_agent_builtin_tools(app_data_dir: &Path) -> AgentBuiltinToolsCatalog
             index_registered_in_antigravity: antigravity.index,
             cypress_enabled,
             db,
+            k8s,
             ssh,
+            peers_enabled,
+            peers,
             mcp_attachable,
             mcp_pending,
             mcp_registered_in_antigravity: antigravity.plugins,
@@ -385,6 +441,43 @@ fn catalog_from_state(state: BuiltinToolState, issues: Vec<String>) -> AgentBuil
                 ],
             },
             AgentBuiltinToolDefinition {
+                id: "k8s".to_owned(),
+                display_name: "Kubernetes".to_owned(),
+                routes: vec![
+                    route("aiaSystem", K8S_OPERATIONS),
+                    route(
+                        "systemSkillCli",
+                        &[
+                            "k8s list",
+                            "k8s check",
+                            "k8s resources",
+                            "k8s get",
+                            "k8s logs",
+                            "k8s events",
+                        ],
+                    ),
+                ],
+            },
+            AgentBuiltinToolDefinition {
+                id: "peer".to_owned(),
+                display_name: "AIA 대화".to_owned(),
+                routes: vec![
+                    route("aiaSystem", AIA_PEER_OPERATIONS),
+                    route(
+                        "systemSkillCli",
+                        &[
+                            "peer list",
+                            "peer check",
+                            "peer ask",
+                            "peer exchange",
+                            "peer exchanges",
+                            "peer skills",
+                            "peer import",
+                        ],
+                    ),
+                ],
+            },
+            AgentBuiltinToolDefinition {
                 id: "index".to_owned(),
                 display_name: "인덱스".to_owned(),
                 routes: vec![
@@ -393,7 +486,13 @@ fn catalog_from_state(state: BuiltinToolState, issues: Vec<String>) -> AgentBuil
                     route("externalMcpConfig", INDEX_OPERATIONS),
                     route(
                         "systemSkillCli",
-                        &["index list", "index search", "index read", "index refresh"],
+                        &[
+                            "index list",
+                            "index search",
+                            "index read",
+                            "index exclusions",
+                            "index refresh",
+                        ],
                     ),
                 ],
             },
@@ -439,14 +538,17 @@ fn agent_view(
     provider: Option<ProviderId>,
     state: &BuiltinToolState,
 ) -> AgentBuiltinToolsView {
-    let (ssh_access, cypress_access, cypress_new_chat) = match provider {
-        None => ("aiaSystem", "aiaSystem", false),
-        Some(ProviderId::Claude | ProviderId::Codex | ProviderId::Local) => {
-            ("systemSkillCli", "directMcp", true)
-        }
+    // C9/C10-13/C22-3. 세 도구는 AIA 시스템 작업 또는 시스템 스킬 CLI로 닿는다.
+    let system_access = if provider.is_none() {
+        "aiaSystem"
+    } else {
+        "systemSkillCli"
+    };
+    let (cypress_access, cypress_new_chat) = match provider {
+        None => ("aiaSystem", false),
+        Some(ProviderId::Claude | ProviderId::Codex | ProviderId::Local) => ("directMcp", true),
         // P12. 앱이 전역 설정에 Cypress를 등록해 두었으면 MCP로, 아니면 스킬+HTTP로 닿는다.
         Some(ProviderId::Antigravity) => (
-            "systemSkillCli",
             if state.cypress_registered_in_antigravity {
                 "externalMcpConfig"
             } else {
@@ -468,7 +570,7 @@ fn agent_view(
                 id: "ssh".to_owned(),
                 enabled: state.ssh.enabled(),
                 available: state.ssh.available(),
-                access_method: ssh_access.to_owned(),
+                access_method: system_access.to_owned(),
                 enablement_requires_new_chat: false,
                 note: AgentBuiltinToolNote::SshEndpoints {
                     available: state.ssh.usable,
@@ -479,8 +581,31 @@ fn agent_view(
                 id: "db".to_owned(),
                 enabled: state.db.enabled(),
                 available: state.db.available(),
-                // SSH와 달리 접근 경로가 공급자에 따라 갈리지 않는다. 자기 셸이 있는
-                // 에이전트도 비밀번호를 받지 못하므로 실행은 언제나 앱을 거친다.
+                // C10-13. 자기 셸이 있는 에이전트도 비밀번호를 받지 못하므로 앱을 거친다.
+                access_method: system_access.to_owned(),
+                enablement_requires_new_chat: false,
+                note: AgentBuiltinToolNote::DbConnections {
+                    available: state.db.usable,
+                    unusable: state.db.unusable,
+                },
+            },
+            AgentBuiltinToolView {
+                id: "k8s".to_owned(),
+                enabled: state.k8s.enabled(),
+                available: state.k8s.available(),
+                // 데이터베이스와 같다. 자기 셸이 있는 에이전트도 kubeconfig 를 받지 못한다.
+                access_method: system_access.to_owned(),
+                enablement_requires_new_chat: false,
+                note: AgentBuiltinToolNote::K8sClusters {
+                    available: state.k8s.usable,
+                    unusable: state.k8s.unusable,
+                },
+            },
+            AgentBuiltinToolView {
+                id: "peer".to_owned(),
+                enabled: state.peers_enabled,
+                available: state.peers_enabled && state.peers.available(),
+                // 데이터베이스와 같다. 교환은 백엔드가 테일넷으로 보내므로 셸이 있어도 릴레이다.
                 access_method: if provider.is_none() {
                     "aiaSystem"
                 } else {
@@ -488,9 +613,10 @@ fn agent_view(
                 }
                 .to_owned(),
                 enablement_requires_new_chat: false,
-                note: AgentBuiltinToolNote::DbConnections {
-                    available: state.db.usable,
-                    unusable: state.db.unusable,
+                note: AgentBuiltinToolNote::AiaPeers {
+                    enabled: state.peers_enabled,
+                    available: state.peers.usable,
+                    unusable: state.peers.unusable,
                 },
             },
             AgentBuiltinToolView {
@@ -655,7 +781,10 @@ mod tests {
                 index_registered_in_antigravity: false,
                 cypress_enabled: true,
                 db: RegisteredTargets::new(1, 0),
+                k8s: RegisteredTargets::new(1, 0),
                 ssh: RegisteredTargets::new(2, 1),
+                peers_enabled: true,
+                peers: RegisteredTargets::new(1, 0),
                 mcp_attachable: vec![("notion".to_owned(), "Notion".to_owned())],
                 mcp_pending: 0,
                 mcp_registered_in_antigravity: Vec::new(),
@@ -671,7 +800,7 @@ mod tests {
                     .iter()
                     .map(|tool| tool.id.as_str())
                     .collect::<Vec<_>>(),
-                vec!["ssh", "db", "index", "cypress", "mcp", "mermaid"]
+                vec!["ssh", "db", "k8s", "peer", "index", "cypress", "mcp", "mermaid"]
             );
         }
         let aia = &catalog.agents[0];
@@ -709,6 +838,20 @@ mod tests {
             "systemSkillCli"
         );
         assert_eq!(tool(&catalog, "aia", "db").access_method, "aiaSystem");
+        // C22. Kubernetes 도 같은 이유로 공급자 채팅은 스킬 CLI, AIA 는 시스템 작업이다.
+        assert_eq!(
+            tool(&catalog, "codex", "k8s").access_method,
+            "systemSkillCli"
+        );
+        assert_eq!(tool(&catalog, "aia", "k8s").access_method, "aiaSystem");
+        assert!(tool(&catalog, "aia", "k8s").available);
+        // C23. AIA 대화도 셸이 있는 에이전트는 CLI 릴레이, AIA 는 시스템 인터페이스다.
+        assert_eq!(
+            tool(&catalog, "codex", "peer").access_method,
+            "systemSkillCli"
+        );
+        assert_eq!(tool(&catalog, "aia", "peer").access_method, "aiaSystem");
+        assert!(tool(&catalog, "aia", "peer").available);
     }
 
     #[test]

@@ -130,6 +130,9 @@ export function StorageSecretsTab({ active }: { active: boolean }) {
   const applySnapshot = (chatId: string, secrets: ChatSecretSummary[]) => {
     // 이 응답이 가장 새 상태다. 진행 중인 목록 읽기가 늦게 와서 되돌리지 못하게 한다.
     loadGate.begin();
+    // C15-1. 수정·삭제 전 값과 아직 오는 중인 값 읽기는 새 스냅샷에 남기지 않는다.
+    revealGate.begin();
+    setRevealed({});
     setOverview((current) => {
       if (!current) return current;
       // 비어 버린 대화는 묶음째 내린다 — 백엔드 목록도 비어 있는 대화를 싣지 않는다.

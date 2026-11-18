@@ -234,13 +234,15 @@ pub fn restore_instruction_trash(
 
     let root = trash_root(app_data_dir);
     let mut results = Vec::new();
-    for item in group {
-        let result = restore_single_item(&root, item);
-        // 되살린 배포 지침 파일은 배포 원장에도 되돌려야 이후 편집이 이 위치를 함께 갱신한다.
+    for item in &group {
+        results.push(restore_single_item(&root, item));
+    }
+    // C5-9/C5-10: 연결 문서도 모두 복구한 뒤 세트 전체의 지문을 원장에 남긴다.
+    // 지침 파일만 먼저 복구한 순간에 기록하면 뒤따르는 문서의 지문이 빠진다.
+    for (item, result) in group.iter().zip(&results) {
         if result.outcome.is_restored() {
             readopt_restored_instruction_deployment(app_data_dir, item);
         }
-        results.push(result);
     }
     Ok(InstructionTrashRestoreReceipt { group_id, results })
 }
@@ -658,6 +660,96 @@ mod tests {
         assert!(list_instruction_trash(&app_data).unwrap().items.is_empty());
         assert!(!outside.join("nested").exists());
         assert_eq!(fs::read(&sentinel).unwrap(), b"external content");
+    }
+
+    // C5-9/C5-10: 지침보다 늦게 복구되는 연결 문서도 배포 원장에 함께 남겨야
+    // 다음 재배포에서 우리가 복구한 문서를 외부 수정으로 오인하지 않는다.
+    #[test]
+    fn c5_9_c5_10_group_restore_records_linked_document_digests() {
+        use crate::project_instructions::{
+            create_project_instruction, CreateProjectInstructionRequest,
+            InstructionProviderFileWrite,
+        };
+        use sha2::{Digest, Sha256};
+
+        let temp = tempdir().unwrap();
+        let app_data = temp.path().join("app_data");
+        let policy = "@docs/guide.md\n";
+        let document = b"linked policy document\n";
+        create_project_instruction(
+            &app_data,
+            &CreateProjectInstructionRequest {
+                key: "shared-policy".to_owned(),
+                name: "Shared policy".to_owned(),
+                description: String::new(),
+                files: vec![InstructionProviderFileWrite {
+                    provider: ProviderId::Codex,
+                    content: policy.to_owned(),
+                }],
+                platforms: Vec::new(),
+            },
+        )
+        .unwrap();
+        let source = crate::resource_repository::repository_instructions_root(&app_data)
+            .join("shared-policy");
+        fs::create_dir(source.join("docs")).unwrap();
+        fs::write(source.join("docs/guide.md"), document).unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("docs")).unwrap();
+        let instruction = project.join("AGENTS.md");
+        let linked = project.join("docs/guide.md");
+        fs::write(&instruction, policy).unwrap();
+        fs::write(&linked, document).unwrap();
+        let mut instruction_draft = draft(
+            "linked-ledger",
+            InstructionTrashItemKind::File,
+            Some(ProviderId::Codex),
+            "AGENTS.md",
+        );
+        instruction_draft.project_path = Some(project.to_string_lossy().into_owned());
+        instruction_draft.total_bytes = policy.len() as u64;
+        let mut linked_draft = instruction_draft.clone();
+        linked_draft.name = "docs/guide.md".to_owned();
+        linked_draft.total_bytes = document.len() as u64;
+        let instruction_item =
+            store_instruction_trash_item(&app_data, &instruction, instruction_draft).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let linked_item = store_instruction_trash_item(&app_data, &linked, linked_draft).unwrap();
+        assert!(instruction_item.deleted_at_ms < linked_item.deleted_at_ms);
+
+        let receipt = restore_instruction_trash(&app_data, &linked_item.id).unwrap();
+        let ids: Vec<_> = receipt
+            .results
+            .iter()
+            .map(|result| result.id.as_str())
+            .collect();
+        assert_eq!(ids, [instruction_item.id.as_str(), linked_item.id.as_str()]);
+        assert!(receipt
+            .results
+            .iter()
+            .all(|result| result.outcome.is_restored()));
+        assert_eq!(fs::read(&instruction).unwrap(), policy.as_bytes());
+        assert_eq!(fs::read(&linked).unwrap(), document);
+        assert!(list_instruction_trash(&app_data).unwrap().items.is_empty());
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(app_data.join("instruction-meta.json")).unwrap())
+                .unwrap();
+        let records = ledger["instructions"]["shared-policy"]["deployments"]
+            .as_array()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["provider"], "codex");
+        assert_eq!(record["scope"], "project");
+        assert_eq!(record["projectPath"], project.to_string_lossy().as_ref());
+        assert_eq!(
+            record["instructionDigest"],
+            format!("{:x}", Sha256::digest(policy.as_bytes()))
+        );
+        assert_eq!(
+            record["linkedDigests"],
+            serde_json::json!({"docs/guide.md": format!("{:x}", Sha256::digest(document))})
+        );
     }
 
     // C3-11: 실체가 사라진 항목은 Failed로 알리고 manifest를 남겨 목록에서 지우지 않는다.

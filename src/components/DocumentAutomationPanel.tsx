@@ -96,6 +96,11 @@ function emptyDraft(providers: ProviderStatus[], rootId: string): TriggerDraft {
     fullAccessAcknowledged: false,
     prompt: "",
     skillId: "",
+    leanContext: false,
+    conversationKeyPattern: "",
+    conversationIdleSeconds: "",
+    conversationMaxTurns: "",
+    inlineMaxBytes: "",
   };
 }
 
@@ -826,6 +831,11 @@ function TriggerChatActionFields({
     model,
     reasoningEffort,
     fullAccessAcknowledged,
+    leanContext,
+    conversationKeyPattern,
+    conversationIdleSeconds,
+    conversationMaxTurns,
+    inlineMaxBytes,
   } = draft;
 
   return (
@@ -870,6 +880,40 @@ function TriggerChatActionFields({
         compact
         unattended
       />
+      {source === "claude" && (
+        <label className="wide check-filter">
+          <input
+            type="checkbox"
+            checked={leanContext}
+            onChange={(event) => onPatch({ leanContext: event.target.checked })}
+          />
+          {text("가벼운 문맥: 셸·파일 도구만 (스킬 목록·서브에이전트·웹 도구·claude.ai 커넥터 생략, 연결된 MCP는 유지)", "Lean context: shell and file tools only (skips skill listing, subagents, web tools, claude.ai connectors; attached MCP stays)")}
+        </label>
+      )}
+      <details className="wide" open={Boolean(conversationKeyPattern || inlineMaxBytes)}>
+        <summary>{text("고급: 대화 이어 보내기·파일 내용 싣기", "Advanced: continue conversations · inline file content")}</summary>
+        <label>
+          {text("대화 키 정규식 (비우면 끔)", "Conversation key regex (empty = off)")}
+          <input
+            value={conversationKeyPattern}
+            onChange={(event) => onPatch({ conversationKeyPattern: event.target.value })}
+            placeholder="^incoming/([a-z0-9-]+)/chat/([0-9]+)/"
+          />
+        </label>
+        <label>
+          {text("유휴 종료(초, 기본 900)", "Idle timeout (seconds, default 900)")}
+          <input inputMode="numeric" value={conversationIdleSeconds} onChange={(event) => onPatch({ conversationIdleSeconds: event.target.value })} placeholder="900" />
+        </label>
+        <label>
+          {text("채팅당 턴 상한(기본 40)", "Max turns per chat (default 40)")}
+          <input inputMode="numeric" value={conversationMaxTurns} onChange={(event) => onPatch({ conversationMaxTurns: event.target.value })} placeholder="40" />
+        </label>
+        <label>
+          {text("파일 내용 싣기 상한(바이트, 비우면 끔, 최대 32768)", "Inline file content limit (bytes, empty = off, max 32768)")}
+          <input inputMode="numeric" value={inlineMaxBytes} onChange={(event) => onPatch({ inlineMaxBytes: event.target.value })} placeholder="8192" />
+        </label>
+        <small>{text("같은 키의 다음 변경은 살아 있는 채팅에 새 턴으로 이어 보내고, 키가 다른 변경은 섞지 않습니다.", "Later changes with the same key continue the live chat as a new turn; changes with different keys never share a chat.")}</small>
+      </details>
       {mode === "fullAccess" && (
         <label className="wide check-filter">
           <input

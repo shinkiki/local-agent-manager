@@ -595,6 +595,8 @@ fn bucket_of(session: &SessionSummary) -> CleanupBucket {
     };
     match origin.kind {
         ChatOriginKind::User | ChatOriginKind::Aia => CleanupBucket::Human,
+        // C23. 피어 요청에 답한 무인 AIA 는 사람이 보던 대화가 아니라 자동화 한 통이다.
+        ChatOriginKind::Peer => CleanupBucket::Automation("aia-peer".to_owned()),
         ChatOriginKind::Schedule | ChatOriginKind::Workflow => {
             // 소비자 id가 페이싱이 쓰는 일정 단위와 같다. 없으면 일정·워크플로 id로,
             // 그것도 없으면 출처를 아는 것만으로 자동화 한 통에 몰아 넣는다.

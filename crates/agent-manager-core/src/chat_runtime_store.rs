@@ -458,6 +458,63 @@ mod tests {
     }
 
     #[test]
+    fn g7_v2_runtime_failures_keep_newest_global_limit_after_reload() {
+        let temp = tempfile::tempdir().expect("app data");
+        // Fill the global limit without exceeding any session's limit. Reverse the
+        // on-disk order so eviction must use timestamps rather than vector position.
+        let failures = (0..MAX_RUNTIME_FAILURES)
+            .rev()
+            .map(|at| RuntimeFailureRecord {
+                source: ProviderId::Claude,
+                session_id: format!("session-{:011}", at / MAX_RUNTIME_FAILURES_PER_SESSION),
+                failure: SessionRuntimeFailure {
+                    id: format!("chat-12345678901:turn-{at:011}:{at}"),
+                    turn_id: format!("turn-{at:011}"),
+                    status: "failed".to_owned(),
+                    code: "runtimeFailed".to_owned(),
+                    message: "synthetic failure".to_owned(),
+                    occurred_at: at as i64,
+                },
+            })
+            .collect();
+        write_private_json(
+            &temp.path().join(CHAT_RUNTIME_STORE_FILE_NAME),
+            &ChatRuntimeStore {
+                leases: Vec::new(),
+                failures,
+            },
+        )
+        .expect("store at capacity");
+
+        persist_runtime_failure(
+            temp.path(),
+            ProviderId::Claude,
+            "session-new-123456",
+            "chat-12345678901",
+            "turn-new-1234567890",
+            "interrupted",
+            "backendCrashed",
+            "newest synthetic failure",
+            MAX_RUNTIME_FAILURES as i64,
+        )
+        .expect("record beyond global capacity");
+
+        let persisted = load_chat_runtime_store(temp.path()).expect("reload bounded store");
+        assert_eq!(persisted.failures.len(), MAX_RUNTIME_FAILURES);
+        for (index, record) in persisted.failures.iter().enumerate() {
+            assert_eq!(
+                record.failure.occurred_at,
+                (index + 1) as i64,
+                "G7/V2: retain the newest records in chronological order"
+            );
+        }
+        assert_eq!(
+            persisted.failures.last().unwrap().failure.turn_id,
+            "turn-new-1234567890"
+        );
+    }
+
+    #[test]
     fn runtime_failure_replaces_the_same_turn_and_filters_by_session() {
         let temp = tempfile::tempdir().expect("temp directory");
         persist_runtime_failure(

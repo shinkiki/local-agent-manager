@@ -283,10 +283,12 @@ export function resetBackendProtocolHandshake(): void {
 
 export function ensureBackendProtocol(): Promise<WebAccessStatus> {
   if (!backendProtocolHandshake) {
-    backendProtocolHandshake = getWebAccessStatus().catch((cause) => {
-      backendProtocolHandshake = null;
+    const handshake = getWebAccessStatus().catch((cause) => {
+      // 주소 교체·로그인 뒤 새 악수가 있으면 이전 요청의 실패가 그것을 지우면 안 된다.
+      if (backendProtocolHandshake === handshake) backendProtocolHandshake = null;
       throw cause;
     });
+    backendProtocolHandshake = handshake;
   }
   return backendProtocolHandshake;
 }

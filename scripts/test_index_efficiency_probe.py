@@ -73,6 +73,42 @@ class SearchMeasurementTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             probe.search_repeat_count('not-a-number')
 
+    def test_g7_filter_and_excerpt_constraints_detect_wrong_evidence(self):
+        case = {**self.case, 'mode': 'exact', 'pathPrefix': 'src/', 'extension': 'rs',
+                'onlyPaths': ['src/sample.rs'], 'maxExcerptLines': 3}
+        row = probe.measure_search(self.rpc([self.result()]), case, b'file', 1)
+        self.assertFalse(row['covered'])
+        self.assertEqual(self.calls[0][1]['arguments']['request']['mode'], 'exact')
+        self.assertEqual(self.calls[0][1]['arguments']['request']['pathPrefix'], 'src/')
+
+    def test_g4_negative_cases_fail_when_any_source_text_is_returned(self):
+        case = {**self.case, 'expectHit': False}
+        self.assertFalse(probe.measure_search(self.rpc([self.result()]), case, b'file', 1)['covered'])
+        self.assertTrue(probe.measure_search(self.rpc([self.result(False)]), case, b'file', 1)['covered'])
+
+
+    def test_g4_negative_cases_require_complete_search_in_every_repeat(self):
+        warnings = {'staleFiles': ['changed.rs'], 'truncated': True,
+                    'partialSources': ['partial'], 'pendingSources': ['pending']}
+        for warning, value in warnings.items():
+            for expect_hit in (False, True):
+                with self.subTest(warning=warning, expect_hit=expect_hit):
+                    incomplete = self.result(expect_hit)
+                    payload = json.loads(incomplete['content'][0]['text'])
+                    payload['result'][warning] = value
+                    incomplete['content'][0]['text'] = json.dumps(payload)
+                    rpc = self.rpc([self.result(expect_hit), incomplete, self.result(expect_hit)])
+                    row = probe.measure_search(rpc, {**self.case, 'expectHit': expect_hit}, b'file', 3)
+                    # A real positive witness survives warnings; absence needs a complete search.
+                    self.assertEqual(row['covered'], expect_hit)
+                    self.assertEqual([sample['covered'] for sample in row['searchSamples']],
+                                     [True, expect_hit, True])
+                    metric = 1 if warning != 'truncated' else True
+                    self.assertEqual(row[warning], metric)
+                    self.assertEqual([sample[warning] for sample in row['searchSamples']],
+                                     [0, metric, 0])
+                    self.assertNotIn('PRIVATE_SOURCE_MARKER', json.dumps(row))  # G4
+
 
 if __name__ == '__main__':
     unittest.main()

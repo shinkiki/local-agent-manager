@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::app_data_file::open_private_append_file;
 use crate::clock::now_ms;
+use crate::file_kind::ensure_regular_file;
 use crate::store_lock;
 use crate::{CoreError, ProviderId};
 
@@ -127,7 +128,16 @@ pub(crate) fn record(
     // G7: 회전과 JSON·개행 추가를 함께 잠가 동시 이어가기 기록이 섞이거나 유실되지 않게 한다.
     let _lock = store_lock::acquire(app_data_dir, RECORD_LOCK_FILE, "이어가기 기록")?;
     let path = app_data_dir.join(RECORD_FILE);
-    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= MAX_RECORD_FILE_BYTES) {
+    // G7/G10: 회전도 경로를 바꾸므로, 기존 기록을 지우기 전에 링크·특수 파일을 거절한다.
+    let record_bytes = match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            ensure_regular_file(&metadata, "이어가기 기록은 일반 파일이어야 합니다")?;
+            metadata.len()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+    if record_bytes >= MAX_RECORD_FILE_BYTES {
         let previous = app_data_dir.join(PREVIOUS_RECORD_FILE);
         if previous.exists() {
             fs::remove_file(&previous)?;
@@ -232,6 +242,54 @@ mod tests {
             b"oldest"
         );
         assert_eq!(fs::read(target).unwrap(), b"outside app data");
+    }
+
+    /// G7/G10: 크기와 관계없이 기록 경로의 링크를 회전하거나 외부 파일에 덧붙이지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn g7_g10_record_symlink_is_rejected_before_rotation() {
+        for size in [Some(MAX_RECORD_FILE_BYTES as usize), Some(5), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let target = outside.path().join("untouched");
+            let payload = size.map(|size| vec![b'x'; size]);
+            if let Some(payload) = &payload {
+                fs::write(&target, payload).unwrap();
+            }
+            let current = dir.path().join(RECORD_FILE);
+            let previous = dir.path().join(PREVIOUS_RECORD_FILE);
+            std::os::unix::fs::symlink(&target, &current).unwrap();
+            fs::write(&previous, b"oldest").unwrap();
+            let entry =
+                ContinuationRecord::new(ProviderId::Codex, None, "old", "new", None, None, 1, 0);
+
+            assert!(matches!(
+                record(dir.path(), &entry),
+                Err(CoreError::InvalidInput(_))
+            ));
+            assert_eq!(fs::read_link(current).unwrap(), target);
+            assert_eq!(fs::read(previous).unwrap(), b"oldest");
+            assert_eq!(fs::read(target).ok(), payload);
+        }
+    }
+
+    #[test]
+    fn g7_g10_record_directory_is_rejected_without_discarding_previous() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join(RECORD_FILE);
+        let previous = dir.path().join(PREVIOUS_RECORD_FILE);
+        fs::create_dir(&current).unwrap();
+        fs::write(current.join("keep"), b"current contents").unwrap();
+        fs::write(&previous, b"oldest").unwrap();
+        let entry =
+            ContinuationRecord::new(ProviderId::Codex, None, "old", "new", None, None, 1, 0);
+
+        assert!(matches!(
+            record(dir.path(), &entry),
+            Err(CoreError::InvalidInput(_))
+        ));
+        assert_eq!(fs::read(current.join("keep")).unwrap(), b"current contents");
+        assert_eq!(fs::read(previous).unwrap(), b"oldest");
     }
 
     #[test]

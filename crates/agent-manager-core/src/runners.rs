@@ -872,6 +872,11 @@ fn parse_runners_cli(mut args: impl Iterator<Item = String>) -> Result<Option<Pa
     let mut app_data_dir = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
+            "--app-data-dir" if app_data_dir.is_some() => {
+                return Err(CoreError::InvalidInput(
+                    "--app-data-dir가 두 번 지정됐습니다. 하나만 남기세요".to_owned(),
+                ));
+            }
             "--app-data-dir" => {
                 let value = args.next().ok_or_else(|| {
                     CoreError::InvalidInput("--app-data-dir 값이 필요합니다".to_owned())
@@ -2004,7 +2009,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// C21-4. CLI 인자: `list`만 받고, `--app-data-dir`는 값이 있어야 하며 모르는 인자는 거절한다.
+    /// C21-4. CLI 인자: `list`만 받고, `--app-data-dir`는 값이 있어야 하며 모르는 인자나
+    /// 중복 지정은 거절한다.
     #[test]
     fn c21_cli_arguments_are_parsed_strictly() {
         let parse = |args: &[&str]| parse_runners_cli(args.iter().map(|arg| (*arg).to_owned()));
@@ -2021,5 +2027,17 @@ pub(crate) mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad:?} 는 거절돼야 합니다");
         }
+        let repeated = parse(&[
+            "list",
+            "--app-data-dir",
+            "/data",
+            "--app-data-dir",
+            "/other",
+        ])
+        .expect_err("repeated flag");
+        assert!(
+            matches!(&repeated, CoreError::InvalidInput(msg) if msg.contains("두 번 지정")),
+            "unexpected error: {repeated:?}"
+        );
     }
 }

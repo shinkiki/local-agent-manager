@@ -208,12 +208,7 @@ impl ToolCatalog {
         {
             return None;
         }
-        let writers: Vec<String> = crate::opencode_config::writing_workspace_tools()
-            .iter()
-            .filter(|name| self.contains(name))
-            .map(|name| (*name).to_owned())
-            .collect();
-        (!writers.is_empty()).then(|| listed_names(&writers))
+        self.listed_workspace_writers()
     }
 
     /// 제목이 파일을 고친다고 말하는데 고른 도구가 **전부** 읽기 전용 작업 공간 도구이면
@@ -231,6 +226,11 @@ impl ToolCatalog {
         if tools.is_empty() || !tools.iter().all(|t| readers.contains(&t.as_str())) {
             return None;
         }
+        self.listed_workspace_writers()
+    }
+
+    /// 계획 전체와 한 단계가 같은 순서·표현으로 고칠 수 있는 도구를 안내한다.
+    fn listed_workspace_writers(&self) -> Option<String> {
         let writers: Vec<String> = crate::opencode_config::writing_workspace_tools()
             .iter()
             .filter(|name| self.contains(name))

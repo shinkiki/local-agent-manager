@@ -120,10 +120,7 @@ impl Held {
         };
         if let Some(reason) = platform::exited(guard) {
             // 상태 확인 자체가 실패했다면 자식이 살아 있을 수도 있으니 버리지 않고 끝낸다.
-            if let Some(guard) = self.guard.take() {
-                platform::release(guard);
-            }
-            self.mechanism = None;
+            self.release();
             self.error = Some(reason);
         }
     }

@@ -153,7 +153,7 @@ pub(crate) fn sudo_prompt_positions(line: &RemoteCommandLine) -> Vec<(usize, usi
             if head == "sudo" {
                 if !sudo_own_options(&argv, token_index)
                     .iter()
-                    .any(|option| *option == "-n" || *option == "--non-interactive")
+                    .any(|option| sudo_option_is_non_interactive(option))
                 {
                     positions.push((stage_index, token_index));
                 }
@@ -236,11 +236,31 @@ fn sudo_option_takes_next_value(token: &str) -> bool {
     }
     let mut flags = token.strip_prefix('-').unwrap_or_default().chars();
     while let Some(flag) = flags.next() {
-        if SUDO_VALUE_OPTIONS
-            .iter()
-            .any(|option| option.len() == 2 && char::from(option.as_bytes()[1]) == flag)
-        {
+        if sudo_short_option_takes_value(flag) {
             return flags.as_str().is_empty();
+        }
+    }
+    false
+}
+
+fn sudo_short_option_takes_value(flag: char) -> bool {
+    SUDO_VALUE_OPTIONS
+        .iter()
+        .any(|option| option.len() == 2 && char::from(option.as_bytes()[1]) == flag)
+}
+
+/// C9-19. `-kn`과 `-nu app`도 비대화형이다. 값을 받는 옵션 뒤의 글자는
+/// 옵션이 아니므로 `-unobody`의 계정 이름에 든 `n`은 판정에 쓰지 않는다.
+fn sudo_option_is_non_interactive(token: &str) -> bool {
+    if token.starts_with("--") {
+        return token == "--non-interactive";
+    }
+    for flag in token.strip_prefix('-').unwrap_or_default().chars() {
+        if flag == 'n' {
+            return true;
+        }
+        if sudo_short_option_takes_value(flag) {
+            break;
         }
     }
     false
@@ -455,6 +475,38 @@ mod tests {
             positions("sudo -- tail -n 50 /var/log/syslog"),
             vec![(0, 0)]
         );
+    }
+
+    /// C9-19. 묶음 옵션의 비대화형 요청은 비밀번호를 받거나 stdin 플래그를 붙이지 않는다.
+    #[test]
+    fn c9_19_clustered_non_interactive_flags_do_not_request_a_password() {
+        for command in [
+            "sudo -kn whoami",
+            "sudo -nu app whoami",
+            "sudo -nuroot whoami",
+            "nohup /usr/bin/sudo -Hn whoami",
+        ] {
+            let line = validate_remote_command(command).expect(command);
+            let positions = sudo_prompt_positions(&line);
+            assert!(positions.is_empty(), "{command}");
+            assert_eq!(
+                line.with_stdin_password_flag(&positions).render(),
+                line.render()
+            );
+        }
+        // 옵션 값·긴 옵션 이름·실행 대상의 인자는 sudo의 짧은 플래그가 아니다.
+        for command in [
+            "sudo -unobody whoami",
+            "sudo -Hunobody whoami",
+            "sudo -p-n whoami",
+            "sudo -u -n whoami",
+            "sudo --user=nobody whoami",
+            "sudo --preserve-env whoami",
+            "sudo -- echo -kn",
+        ] {
+            let line = validate_remote_command(command).expect(command);
+            assert_eq!(sudo_prompt_positions(&line), vec![(0, 0)], "{command}");
+        }
     }
 
     /// C9-19. `-S`는 `sudo` 바로 뒤에 들어가야 한다. 뒤에 오는 토큰은 다시 명령이라,

@@ -1,4 +1,5 @@
 import type {
+  DocumentConversationConfig,
   ChatApprovalMode,
   ChatMode,
   DocumentActionOption,
@@ -40,6 +41,51 @@ export interface DocumentTriggerDraft {
   fullAccessAcknowledged: boolean;
   prompt: string;
   skillId: string;
+  /** 가벼운 문맥(Claude 전용). 꺼져 있으면 저장본에 칸 자체를 쓰지 않는다. */
+  leanContext: boolean;
+  /** 대화 키 정규식. 비우면 대화 이어 보내기를 쓰지 않는다. */
+  conversationKeyPattern: string;
+  /** 대화 유휴 종료(초)와 턴 상한. 비우면 백엔드 기본값(900초·40턴)이다. */
+  conversationIdleSeconds: string;
+  conversationMaxTurns: string;
+  /** 파일 내용 싣기 상한(바이트). 비우면 싣지 않는다. */
+  inlineMaxBytes: string;
+}
+
+/** 숫자 칸 하나를 양수로 읽는다. 비었거나 숫자가 아니면 없음. */
+function positiveNumber(value: string): number | undefined {
+  const parsed = Number(value.trim());
+  return value.trim() && Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function positiveInteger(value: string): number | undefined {
+  const parsed = positiveNumber(value);
+  return parsed === undefined ? undefined : Math.round(parsed);
+}
+
+/** 대화·내용 싣기 칸. 쓰지 않는 칸은 저장본에 남기지 않는다(옛 트리거와 같은 모양). */
+function conversationAndInline(draft: DocumentTriggerDraft): Pick<Extract<DocumentTriggerAction, { type: "startChat" }>, "conversation" | "inlineContent"> {
+  const conversation = conversationFromDraft(draft);
+  const maxBytes = positiveInteger(draft.inlineMaxBytes);
+  return {
+    ...(conversation ? { conversation } : {}),
+    ...(maxBytes ? { inlineContent: { maxBytes } } : {}),
+  };
+}
+
+/** 대화 이어 보내기 칸을 저장 계약으로. 키 규칙이 비면 칸 자체를 보내지 않는다. */
+function conversationFromDraft(draft: DocumentTriggerDraft): DocumentConversationConfig | undefined {
+  const keyPattern = draft.conversationKeyPattern.trim();
+  if (!keyPattern) return undefined;
+  // 초 칸은 소수도 받는다. MCP 로 저장한 1000 의 배수가 아닌 값을 화면에서 다시 저장해도
+  // 그대로 남아야 설정 지문이 바뀌어 살아 있던 대화가 갈아타지 않는다.
+  const idleSeconds = positiveNumber(draft.conversationIdleSeconds);
+  const maxTurns = positiveInteger(draft.conversationMaxTurns);
+  return {
+    keyPattern,
+    ...(idleSeconds ? { idleMs: Math.round(idleSeconds * 1000) } : {}),
+    ...(maxTurns ? { maxTurns } : {}),
+  };
 }
 
 /** 새 트리거가 다시 저장될 때 받는 실행 간격 기본값. 편집 중인 트리거는 자기 값을 지킨다. */
@@ -102,6 +148,11 @@ export function draftFromTrigger(trigger: DocumentTrigger, current: DocumentTrig
     approvalMode: action.approvalMode,
     prompt: action.prompt,
     skillId: action.skill?.skillId ?? "",
+    leanContext: action.leanContext ?? false,
+    conversationKeyPattern: action.conversation?.keyPattern ?? "",
+    conversationIdleSeconds: action.conversation?.idleMs ? String(action.conversation.idleMs / 1000) : "",
+    conversationMaxTurns: action.conversation?.maxTurns ? String(action.conversation.maxTurns) : "",
+    inlineMaxBytes: action.inlineContent?.maxBytes ? String(action.inlineContent.maxBytes) : "",
   };
 }
 
@@ -117,7 +168,7 @@ export function buildDocumentTriggerInput(
 ): DocumentTriggerInput {
   const {
     name, rootId, include, exclude, changeKinds, actionKind, targetId, source, accountId,
-    model, reasoningEffort, mode, approvalMode, prompt,
+    model, reasoningEffort, mode, approvalMode, prompt, leanContext,
   } = draft;
   let action: DocumentTriggerAction;
   if (actionKind === "runSchedule") {
@@ -145,6 +196,9 @@ export function buildDocumentTriggerInput(
       skill: isSkillActionKind(actionKind) && selectedSkill
         ? { skillId: selectedSkill.id, contentDigest: selectedSkill.contentDigest ?? "" }
         : null,
+      // Claude 실행에만 효과가 있다. 꺼진 값은 백엔드도 저장본에 쓰지 않으므로 보내지 않는다.
+      ...(leanContext && source === "claude" ? { leanContext: true } : {}),
+      ...conversationAndInline(draft),
     };
   }
 

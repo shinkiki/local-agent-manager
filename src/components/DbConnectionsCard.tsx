@@ -4,11 +4,17 @@ import { checkDbConnection, getDbConnections, removeDbConnection, setDbConnectio
 import { useI18n } from "../lib/i18n";
 import type { DbConnectionCheckReceipt, DbConnectionsSnapshot, DbConnectionView, DbCredentialSource, DbEngineKind, DbEnvironment, DbWriteMode } from "../types";
 import { ErrorBanner, useBusyAction, useConfirm } from "./Shared";
+import {
+  type DbConnectionDraft,
+  dbConnectionDraftOf,
+  DEFAULT_PORTS,
+  isDbConnectionDraftValid,
+  isFileEngine,
+  toSetDbConnectionRequest,
+  usesLoginPath,
+} from "../lib/dbConnectionDraft";
 import { errorText } from "../lib/errorText";
 import { createLatestGate } from "../lib/latestRequest";
-
-/** 엔진마다 기본 포트가 다르다. 백엔드도 같은 값을 쓰므로 한쪽만 고치지 않는다. */
-const DEFAULT_PORTS: Record<DbEngineKind, string> = { mysql: "3306", mariadb: "3306", postgres: "5432", sqlite: "" };
 
 const ENGINE_LABELS: Record<DbEngineKind, string> = { mysql: "MySQL", mariadb: "MariaDB", postgres: "PostgreSQL", sqlite: "SQLite" };
 
@@ -24,16 +30,6 @@ const WRITE_MODE_OPTIONS: { value: DbWriteMode; ko: string; en: string }[] = [
   { value: "ddlWithApproval", ko: `${WRITE_MODE_LABELS_KO.ddlWithApproval} (CREATE·ALTER)`, en: "Schema changes with approval" },
 ];
 
-/** 파일 하나로 끝나는 엔진은 호스트·포트·사용자가 없다. */
-function isFileEngine(engine: DbEngineKind): boolean {
-  return engine === "sqlite";
-}
-
-/** MySQL 계열만 ~/.mylogin.cnf의 로그인 경로 이름을 참조로 쓴다. */
-function usesLoginPath(engine: DbEngineKind): boolean {
-  return engine === "mysql" || engine === "mariadb";
-}
-
 /**
  * select가 돌려주는 값은 늘 넓은 문자열이다. 선택지는 모두 위 표나 백엔드 기본값에서
  * 그대로 나오므로 되돌려 놓을 이름은 이미 정해져 있고, 좁히는 자리를 이 한 곳으로
@@ -41,71 +37,6 @@ function usesLoginPath(engine: DbEngineKind): boolean {
  */
 function chosen<T extends string>(event: ChangeEvent<HTMLSelectElement>): T {
   return event.target.value as T;
-}
-
-interface Draft {
-  id: string;
-  displayName: string;
-  engine: DbEngineKind;
-  environment: DbEnvironment;
-  host: string;
-  port: string;
-  user: string;
-  database: string;
-  credentialSource: DbCredentialSource;
-  credentialRef: string;
-  secret: string;
-  writeMode: DbWriteMode;
-  schemaScope: string;
-  maskedColumns: string;
-  maxRows: string;
-  note: string;
-}
-
-function draftOf(connection: DbConnectionView | null, snapshot: DbConnectionsSnapshot | null): Draft {
-  if (connection) {
-    return {
-      id: connection.id,
-      displayName: connection.displayName,
-      engine: connection.engine,
-      environment: connection.environment,
-      host: connection.host,
-      port: connection.port ? String(connection.port) : "",
-      user: connection.user,
-      database: connection.database,
-      credentialSource: connection.credentialSource,
-      credentialRef: connection.credentialRef,
-      secret: "",
-      writeMode: connection.writeMode,
-      schemaScope: connection.schemaScope.join("\n"),
-      maskedColumns: connection.maskedColumns.join("\n"),
-      maxRows: String(connection.maxRows),
-      note: connection.note,
-    };
-  }
-  return {
-    id: "",
-    displayName: "",
-    engine: "mariadb",
-    environment: "dev",
-    host: "",
-    port: DEFAULT_PORTS.mariadb,
-    user: "",
-    database: "",
-    credentialSource: "clientFile",
-    credentialRef: "",
-    secret: "",
-    writeMode: "readOnly",
-    schemaScope: "",
-    // 개인정보가 조회 결과로 흘러나가는 흔한 자리를 미리 채워 둔다. 목록은 백엔드가 소유한다.
-    maskedColumns: (snapshot?.defaults.maskedColumns ?? []).join("\n"),
-    maxRows: String(snapshot?.defaults.maxRows ?? 200),
-    note: "",
-  };
-}
-
-function lines(value: string): string[] {
-  return value.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
 }
 
 /** 편집기의 한 칸. 이름표와 보조 설명 자리가 모든 칸에서 같다. */
@@ -134,15 +65,6 @@ function DraftTextField({ label, value, onChange, hint, rows, type, maxLength, i
         : <textarea rows={rows} value={value} onChange={change} />}
     </DraftField>
   );
-}
-
-/** 저장을 걸 수 있는 최소 조건. 백엔드가 다시 검사하지만, 눌러 봐야 아는 실패는 줄인다. */
-function isValid(draft: Draft): boolean {
-  if (!draft.displayName.trim() || !draft.database.trim()) return false;
-  if (isFileEngine(draft.engine)) return true;
-  if (!draft.host.trim() || !draft.user.trim()) return false;
-  if (draft.credentialSource === "clientFile" && usesLoginPath(draft.engine) && !draft.credentialRef.trim()) return false;
-  return true;
 }
 
 /** 목록의 연결 한 줄. 배지·접속 대상·자격증명 요약과 네 가지 동작이 여기서 끝난다. */
@@ -206,10 +128,10 @@ function DbConnectionRow({ connection, receipt, busy, onToggle, onCheck, onEdit,
  * 파일 엔진은 호스트·사용자·자격증명이 없고, 운영 환경은 쓰기 모드를 잠근다.
  */
 function DbConnectionEditor({ draft, snapshot, busy, patchDraft, onCancel, onSave }: {
-  draft: Draft;
+  draft: DbConnectionDraft;
   snapshot: DbConnectionsSnapshot;
   busy: string | null;
-  patchDraft: (patch: Partial<Draft>) => void;
+  patchDraft: (patch: Partial<DbConnectionDraft>) => void;
   onCancel: () => void;
   onSave: () => void;
 }) {
@@ -297,7 +219,7 @@ function DbConnectionEditor({ draft, snapshot, busy, patchDraft, onCancel, onSav
       <DraftTextField label={text("메모", "Note")} value={draft.note} maxLength={200} onChange={(note) => patchDraft({ note })} />
       <div className="db-connection-editor-actions">
         <button className="button compact" type="button" onClick={() => onCancel()}>{text("취소", "Cancel")}</button>
-        <button className="button compact primary" type="button" disabled={!isValid(draft) || busy !== null} onClick={() => onSave()}>{text("저장", "Save")}</button>
+        <button className="button compact primary" type="button" disabled={!isDbConnectionDraftValid(draft) || busy !== null} onClick={() => onSave()}>{text("저장", "Save")}</button>
       </div>
     </div>
   );
@@ -319,11 +241,10 @@ export function DbConnectionsCard({ active }: { active: boolean }) {
   const [snapshot, setSnapshot] = useState<DbConnectionsSnapshot | null>(null);
   const { busy, error, setError, run: runAction } = useBusyAction();
   const [editing, setEditing] = useState<string | null>(null);
-  const [draft, setDraft] = useState<Draft>(draftOf(null, null));
+  const [draft, setDraft] = useState<DbConnectionDraft>(dbConnectionDraftOf(null, null));
   const [receipt, setReceipt] = useState<DbConnectionCheckReceipt | null>(null);
   const loadedRef = useRef(false);
-  const fileEngine = isFileEngine(draft.engine);
-  const patchDraft = (patch: Partial<Draft>) => setDraft({ ...draft, ...patch });
+  const patchDraft = (patch: Partial<DbConnectionDraft>) => setDraft({ ...draft, ...patch });
 
   // 목록을 고치는 응답은 마지막에 시작한 요청 것만 반영한다. 탭에 들어올 때나 새로고침으로
   // 띄운 조회가 그 사이 끝난 토글·저장·삭제보다 늦게 오면 바뀌기 전 목록을 다시 펴고, 다음
@@ -363,34 +284,12 @@ export function DbConnectionsCard({ active }: { active: boolean }) {
 
   const openEditor = (connection: DbConnectionView | null) => {
     setEditing(connection ? connection.id : "new");
-    setDraft(draftOf(connection, snapshot));
+    setDraft(dbConnectionDraftOf(connection, snapshot));
     setReceipt(null);
   };
 
   const save = () => run("save", async () => {
-    const port = Number.parseInt(draft.port.trim(), 10);
-    const maxRows = Number.parseInt(draft.maxRows.trim(), 10);
-    await applyLatest(setDbConnection({
-      id: draft.id,
-      displayName: draft.displayName.trim(),
-      engine: draft.engine,
-      environment: draft.environment,
-      host: fileEngine ? "" : draft.host.trim(),
-      port: fileEngine || !Number.isInteger(port) ? null : port,
-      user: fileEngine ? "" : draft.user.trim(),
-      database: draft.database.trim(),
-      credentialSource: draft.credentialSource,
-      credentialRef: draft.credentialSource === "clientFile" ? draft.credentialRef.trim() : "",
-      // 빈 칸은 "바꾸지 않음"이다. 저장된 비밀번호는 화면으로 돌아오지 않으므로 매번
-      // 다시 입력하게 만들면 편집이 곧 재입력이 된다.
-      secret: draft.credentialSource === "appKeychain" && draft.secret.length > 0 ? draft.secret : null,
-      agentEnabled: snapshot?.connections.find((entry) => entry.id === draft.id)?.agentEnabled ?? false,
-      writeMode: draft.environment === "production" ? "readOnly" : draft.writeMode,
-      schemaScope: lines(draft.schemaScope),
-      maskedColumns: lines(draft.maskedColumns),
-      maxRows: Number.isInteger(maxRows) ? maxRows : null,
-      note: draft.note.trim(),
-    }));
+    await applyLatest(setDbConnection(toSetDbConnectionRequest(draft, snapshot)));
     setEditing(null);
   });
 

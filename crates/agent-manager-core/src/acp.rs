@@ -311,25 +311,22 @@ impl AcpRequests {
     /// 모델은 CLI 인자가 아니라 세션 설정 항목이다. 인자 이름이 `configId`다 —
     /// `optionId`로 보내면 하네스가 `Invalid params`로 거절한다(2026-09-24 실측).
     pub fn set_model(&mut self, session_id: &str, model: &str) -> AcpRequest {
-        self.build(
-            "session/set_config_option",
-            serde_json::json!({
-                "sessionId": session_id,
-                "configId": "model",
-                "value": model,
-            }),
-        )
+        self.set_config_option(session_id, "model", model)
     }
 
     /// 에이전트 선택. 하네스는 이것을 `mode`라 부른다 — 도구 목록과 지침이 여기서 갈린다.
     /// 로컬 모델은 기본 에이전트의 도구 열 개를 감당하지 못해 반드시 지정해야 한다.
     pub fn set_agent(&mut self, session_id: &str, agent: &str) -> AcpRequest {
+        self.set_config_option(session_id, "mode", agent)
+    }
+
+    fn set_config_option(&mut self, session_id: &str, config_id: &str, value: &str) -> AcpRequest {
         self.build(
             "session/set_config_option",
             serde_json::json!({
                 "sessionId": session_id,
-                "configId": "mode",
-                "value": agent,
+                "configId": config_id,
+                "value": value,
             }),
         )
     }

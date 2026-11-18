@@ -67,7 +67,8 @@ description: 사용자가 적은 회차 목표 하나를 스킬·스크립트·�
   도구가 안 보이는 공급자가 있다 — Antigravity CLI 는 실행 단위 MCP 설정이 없어 `aia_system`
   이 붙지 않는다. 그때는 앱 데이터의 `round-report-agent-mcp.json` 에 적힌 주소에 붙어 같은
   이름의 작업을 부른다(`get_round_goals`·`list_round_reports`·`record_round_report`·
-  `update_round_goal` 넷만 열려 있다). 회차 스킬에 이 한 줄을 적어 두지 않으면 그 공급자로
+  `update_round_goal`·`resolve_round_decision` 다섯만 열려 있다. 이 길의 결정 답은 앱이 막는다 —
+  사람 결정·수동 목표는 거절, 추천적용은 추천안 원문만. 결정 방식은 이 길로 바꿀 수 없다). 회차 스킬에 이 한 줄을 적어 두지 않으면 그 공급자로
   도는 회차만 조용히 보고를 빠뜨린다.
   애드온은 Antigravity 에도 쓸 수 있다 — 앱이 외부 MCP 애드온(노션·GitHub 등)과 Cypress 를 Antigravity 전역 MCP 로 자동 등록하고, 도구마다 정한 정책을 똑같이 따른다(허용은 바로 쓰고 차단은 숨긴다). 다른 점은 '확인' 정책 도구다 — 따로 정하지 않은 도구의 기본값이 '확인'이고, Antigravity 는 승인 카드를 띄울 수 없어 그중 상류가 읽기 전용(readOnlyHint)으로 알리지 않는 도구를 열지 않는다. 회차가 그런 쓰기 도구를 써야 하면 그 도구를 '허용'으로 두거나 Claude·Codex 회차로 돌린다. Cypress 는 도구별 정책 없이 켜져 있는 동안 정해진 도구가 모두 열린다.
   회차 스킬은 `aia_system` 의 외부 플러그인 호출·Cypress 작업 대신 그 애드온 MCP 의 같은 이름 도구를 직접 부르게 적고, `aia_system` 에만 있는 작업(지금 실행·페이싱 미리보기 같은 시스템 작업)이 필요한 절차(다음 회차 이어 깨우기 등)는 건너뛰게 적는다.

@@ -3632,11 +3632,7 @@ fn set_global_error(inner: &Arc<TranslationInner>, message: String) {
 fn set_global_phase(inner: &Arc<TranslationInner>, phase: &str, error: Option<String>) {
     mutate_state(inner, |state| {
         let mut changed = false;
-        for menu in [
-            TranslationMenu::Skills,
-            TranslationMenu::Agents,
-            TranslationMenu::Artifacts,
-        ] {
+        for menu in TranslationMenu::ALL {
             if state.settings.translations.enabled(menu) {
                 let status = status_mut(state, menu);
                 if status.phase != phase || status.last_error != error {
@@ -5068,6 +5064,90 @@ mod tests {
             Some("known failure"),
             "changing the provider must not drop stored failures"
         );
+    }
+
+    #[test]
+    fn v2_instructions_pause_when_no_system_provider_is_selected() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let inner = test_inner(directory.path());
+        {
+            let mut state = lock(&inner.state).expect("translation state");
+            state.settings.translations.instructions = true;
+            state.instructions = status_with_phase("queued");
+        }
+
+        synchronize(&inner, None).expect("pause without a provider");
+
+        let state = lock(&inner.state).expect("translation state");
+        assert_eq!(state.instructions.phase, "paused");
+        assert_eq!(
+            state.instructions.last_error.as_deref(),
+            Some("시스템 에이전트를 선택하세요")
+        );
+    }
+
+    #[test]
+    fn v2_global_phases_update_every_enabled_menu_and_preserve_other_state() {
+        for enabled in TranslationMenu::ALL {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let inner = test_inner(directory.path());
+            let original = TranslationStatus {
+                phase: "queued".to_owned(),
+                total: 4,
+                completed: 1,
+                pending: 3,
+                segment_total: 8,
+                segment_completed: 2,
+                current_field: Some("body".to_owned()),
+                updated_at: Some(0),
+                ..TranslationStatus::default()
+            };
+            {
+                let mut state = lock(&inner.state).expect("translation state");
+                state.settings.translations = crate::domain::TranslationMenuSettings {
+                    skills: enabled == TranslationMenu::Skills,
+                    agents: enabled == TranslationMenu::Agents,
+                    artifacts: enabled == TranslationMenu::Artifacts,
+                    instructions: enabled == TranslationMenu::Instructions,
+                };
+                for menu in TranslationMenu::ALL {
+                    *status_mut(&mut state, menu) = original.clone();
+                }
+            }
+            for (phase, error) in [
+                ("paused", Some("provider unavailable".to_owned())),
+                ("error", Some("synchronization failed".to_owned())),
+                ("paused", None),
+            ] {
+                let revision = lock(&inner.state).expect("translation state").revision;
+                if phase == "error" {
+                    set_global_error(&inner, error.clone().expect("error message"));
+                } else {
+                    set_global_phase(&inner, phase, error.clone());
+                }
+                {
+                    let state = lock(&inner.state).expect("translation state");
+                    assert_eq!(state.revision, revision + 1, "{enabled:?}: {phase}");
+                    for menu in TranslationMenu::ALL {
+                        let actual = status_ref(&state, menu);
+                        let mut expected = original.clone();
+                        if menu == enabled {
+                            expected.phase = phase.to_owned();
+                            expected.last_error = error.clone();
+                            assert!(actual.updated_at.is_some_and(|updated| updated > 0));
+                            expected.updated_at = actual.updated_at;
+                        }
+                        assert_eq!(actual, &expected, "{enabled:?}: {menu:?}: {phase}");
+                    }
+                }
+                // V2: repeating an unchanged phase must not trigger a snapshot refresh.
+                set_global_phase(&inner, phase, error);
+                assert_eq!(
+                    lock(&inner.state).expect("translation state").revision,
+                    revision + 1
+                );
+            }
+        }
     }
 
     #[test]

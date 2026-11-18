@@ -8,6 +8,7 @@ import type {
   SystemAutomationSnapshot,
 } from "../types";
 import { canRunSystemAgent, supportsRunScopedMcp } from "./providerIds.ts";
+import type { UiText } from "./i18nLocale.ts";
 
 /** AIA 시작에 실제로 쓰이는 실행설정. 채팅 세션 정보에도 같은 모양으로 실려 온다. */
 export type { AiaRuntimeSettings } from "../types";
@@ -105,6 +106,37 @@ export function aiaStaleSendAction(
 ): AiaStaleSendAction {
   if (!staleRuntime) return "send";
   return phase === "running" || phase === "waitingApproval" ? "blocked" : "restart";
+}
+
+/**
+ * 옛 실행설정 대화 위에 띄우는 안내. `aiaStaleSendAction`의 결과와 작성창을 쓸 수 있는지로
+ * 정해지며, 어긋나지 않은 대화(`send`)에는 아무 안내도 없다.
+ *
+ * 세 갈래는 사용자가 다음에 무엇을 할 수 있는지로 나뉜다 — 턴이 도는 중이면 끝나기를
+ * 기다려야 하고(`blocked`), 작성창을 쓸 수 있으면 보내는 즉시 다시 시작되며, 쓸 수 없으면
+ * 새 대화를 열 때 적용된다. 문구 함수는 호출부에서 넘겨받는다 — 이 자리는 훅을 부를 수 없다.
+ */
+export function aiaStaleRuntimeNotice(
+  action: AiaStaleSendAction,
+  composerUsable: boolean,
+  text: UiText,
+): string | null {
+  if (action === "send") return null;
+  if (action === "blocked") {
+    return text(
+      "실행설정이 바뀌었습니다. 진행 중인 작업이 끝나거나 중단된 뒤 보내면 새 설정으로 새 대화를 시작합니다.",
+      "The execution settings changed. Once the running task finishes or stops, sending starts a new conversation with the new settings.",
+    );
+  }
+  return composerUsable
+    ? text(
+      "예전 실행설정으로 시작한 대화입니다. 보내면 이 대화를 정지하고 새 설정으로 새 대화를 시작합니다.",
+      "This conversation started with the previous execution settings. Sending stops it and starts a new conversation with the new settings.",
+    )
+    : text(
+      "예전 실행설정으로 시작한 대화입니다. 새 설정은 대화를 새로 시작할 때 적용됩니다.",
+      "This conversation started with the previous execution settings. The new settings apply when a new conversation starts.",
+    );
 }
 
 /**

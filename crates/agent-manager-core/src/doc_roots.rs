@@ -330,6 +330,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn c21_workspace_exception_keeps_redirected_provider_boundaries() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let app_data = temp.path().join("app-data");
+        let workspace = app_data.join(crate::chat::AIA_WORKSPACE_DIR);
+        let project = workspace.join("project");
+        let provider_parent = workspace.join("provider-state");
+        let provider = provider_parent.join("provider");
+        let sessions = provider.join("sessions");
+        let similar_name = provider_parent.join("provider-copy");
+        let credentials = app_data.join("credential-profiles");
+        for directory in [&project, &sessions, &similar_name, &credentials] {
+            fs::create_dir_all(directory).expect("fixture directory");
+        }
+        // C21-2: 예외는 앱 데이터에만 적용하고, 옮긴 공급자 홈과 그 상위는 보호한다.
+        // 환경변수나 실제 인증 저장소를 바꾸지 않고 공급자 홈을 인자로 전달한다.
+        let redirected = std::slice::from_ref(&provider);
+        let restricted =
+            |path: &Path| is_restricted_root(&app_data, path, redirected, Some(&workspace));
+        assert!(!restricted(&project));
+        assert!(!restricted(&similar_name));
+        // 문서 루트에는 실행기 전용 예외를 적용하지 않는다.
+        assert!(is_restricted_doc_root_with_provider_dirs(
+            &app_data, &project, redirected,
+        ));
+        for path in [
+            temp.path(),
+            app_data.as_path(),
+            workspace.as_path(),
+            credentials.as_path(),
+            provider_parent.as_path(),
+            provider.as_path(),
+            sessions.as_path(),
+        ] {
+            assert!(restricted(path), "{} must stay protected", path.display());
+        }
+        #[cfg(unix)]
+        {
+            // G10/C21-2: 작업공간 안의 링크도 실체로 판정해 예외로 우회하지 못하게 한다.
+            for (name, target) in [
+                ("provider-link", &provider),
+                ("credential-link", &credentials),
+            ] {
+                let link = workspace.join(name);
+                std::os::unix::fs::symlink(target, &link).expect("protected directory link");
+                assert!(restricted(&link), "{} must stay protected", link.display());
+            }
+            let link = temp.path().join("project-link");
+            std::os::unix::fs::symlink(&project, &link).expect("allowed project link");
+            assert!(!restricted(&link));
+        }
+    }
+
+    #[test]
     fn redirected_provider_homes_are_restricted_document_roots() {
         let temp = tempfile::tempdir().expect("temp directory must exist");
         let app_data = temp.path().join("app-data");

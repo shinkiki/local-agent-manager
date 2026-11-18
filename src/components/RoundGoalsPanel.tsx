@@ -20,9 +20,9 @@ import {
   listRoundReports,
   updateRoundGoal,
 } from "../lib/ipc";
-import { humanPendingDecisionCount } from "../lib/roundDecisions";
+import { humanPendingDecisionCountsByGoal } from "../lib/roundDecisions";
 import { roundDesignPrompt } from "../lib/roundDesign";
-import type { RoundDecisionMode, RoundGoal, RoundGoalInput, RoundGoalStatus, RoundReport } from "../types";
+import type { RoundGoal, RoundGoalInput, RoundGoalStatus, RoundReport } from "../types";
 import { RoundReportsModal, RoundText } from "./RoundReportsModal";
 import { ErrorBanner, useConfirm } from "./Shared";
 
@@ -151,16 +151,8 @@ export function RoundGoalsPanel({ onRequestAiaPrompt, openGoalRequest = null }: 
     if (goal.status === "draft") setStatus(goal, "designing");
   }, [onRequestAiaPrompt, setStatus]);
 
-  const goalModes = useMemo(() => Object.fromEntries((goals ?? []).map((goal) => [goal.id, goal.decisionMode])) as Record<string, RoundDecisionMode>, [goals]);
   // 카드 배지용. 보고 목록은 모달이 목표별로 따로 조회하므로 여기서는 결정 방식에서 사람이 답할 미결 개수만 센다.
-  const pendingByGoal = useMemo(() => {
-    const counts: Record<string, number> = {};
-    for (const report of reports) {
-      if (!report.goalId) continue;
-      counts[report.goalId] = (counts[report.goalId] ?? 0) + humanPendingDecisionCount(report, goalModes[report.goalId] ?? "manual");
-    }
-    return counts;
-  }, [reports, goalModes]);
+  const pendingByGoal = useMemo(() => humanPendingDecisionCountsByGoal(reports, goals ?? []), [reports, goals]);
 
   return (
     // 자동화 탭의 형제(AIA 선제 제안)와 같은 카드 틀을 쓴다. settings-subsection은 카드

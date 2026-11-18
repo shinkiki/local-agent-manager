@@ -16,7 +16,6 @@ use portable_pty::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::app_data_file::open_private_file;
 use crate::catalog::{load_session_summary, SessionCatalog};
 use crate::chat::{chat_string_enum, resolve_executable};
 use crate::credential_profiles::CLAUDE_SECURESTORAGE_CONFIG_DIR;
@@ -1582,8 +1581,23 @@ fn resume_args(source: ProviderId, session_id: &str) -> Vec<String> {
 }
 
 fn acquire_session_lock(lock_dir: &Path, key: &SessionKey) -> Result<File, CoreError> {
-    // G10: 공용 열기(O_NOFOLLOW, 새 파일 0600)를 따라 잠금 자리에 놓인 링크를 거절한다.
-    let file = open_private_file(&key.lock_path(lock_dir), false)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    // G10: 링크를 따라가지 않고, FIFO도 열기에서 기다리지 않게 한다. 새 파일은 0600이다.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let file = options.open(key.lock_path(lock_dir))?;
+    // G10: 경로가 바뀌어도 실제로 연 파일을 검사한 뒤에만 잠근다.
+    if !file.metadata()?.is_file() {
+        return Err(CoreError::InvalidInput(
+            "터미널 잠금은 일반 파일이어야 합니다".to_owned(),
+        ));
+    }
     FileExt::try_lock(&file).map_err(|error| {
         if matches!(error, fs4::TryLockError::WouldBlock) {
             CoreError::Conflict("이 세션의 터미널이 다른 프로세스에서 실행 중입니다".to_owned())
@@ -2039,6 +2053,31 @@ mod tests {
 
         assert!(acquire_session_lock(directory.path(), &key).is_err());
         assert!(!target.exists(), "링크 너머에 잠금 파일이 생겼다");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_session_lock_refuses_fifo_without_replacing_it() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let directory = tempfile::tempdir().expect("lock dir");
+        let key = SessionKey::provider(ProviderId::Codex, "fifo");
+        let path = key.lock_path(directory.path());
+        let fifo_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+        // SAFETY: fifo_path is a valid, NUL-terminated path retained for this call.
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+
+        let result = acquire_session_lock(directory.path(), &key);
+
+        assert!(matches!(
+            result,
+            Err(CoreError::InvalidInput(message)) if message.contains("일반 파일이어야 합니다")
+        ));
+        assert!(fs::symlink_metadata(&path)
+            .expect("unchanged FIFO")
+            .file_type()
+            .is_fifo());
     }
 
     #[test]

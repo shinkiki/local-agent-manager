@@ -656,6 +656,245 @@ export interface DbConnectionCheckReceipt {
   message: string;
 }
 
+export type K8sAuthKind = "token" | "clientCertificate";
+
+/** Kubernetes 클러스터 하나(C22). 토큰·키 값은 어느 필드에도 없고 저장 시각만 있다. */
+export interface K8sClusterView {
+  id: string;
+  displayName: string;
+  environment: DbEnvironment;
+  server: string;
+  caPem: string;
+  caFingerprint: string;
+  authKind: K8sAuthKind;
+  credentialStoredAt: number | null;
+  agentEnabled: boolean;
+  namespaces: string[];
+  note: string;
+  updatedAt: number;
+}
+
+export interface K8sClusterDefaults {
+  environments: DbEnvironment[];
+  authKinds: K8sAuthKind[];
+}
+
+export interface K8sClustersSnapshot {
+  schemaVersion: number;
+  clusters: K8sClusterView[];
+  issues: string[];
+  defaults: K8sClusterDefaults;
+}
+
+/** 저장 요청. kubeconfig 를 주면 서버·CA·자격증명은 그 안의 값이 앞선다. */
+export interface SetK8sClusterRequest {
+  id: string;
+  displayName: string;
+  environment: DbEnvironment;
+  kubeconfig: string | null;
+  context: string;
+  server: string;
+  caPem: string;
+  authKind: K8sAuthKind;
+  token: string | null;
+  clientCertificatePem: string | null;
+  clientKeyPem: string | null;
+  namespaces: string[];
+  note: string;
+}
+
+export interface K8sClusterRef {
+  id: string;
+}
+
+export interface SetK8sClusterEnabledRequest {
+  id: string;
+  enabled: boolean;
+}
+
+export interface K8sNodeSummary {
+  name: string;
+  ready: boolean;
+  roles: string[];
+  kubeletVersion: string;
+  architecture: string;
+  internalIp: string;
+}
+
+export interface K8sAccessRule {
+  verbs: string[];
+  apiGroups: string[];
+  resources: string[];
+}
+
+/** 연결 확인 결과. 버전·노드·이 계정의 권한만 읽고 클러스터에는 아무것도 남기지 않는다. */
+export interface K8sClusterCheckReceipt {
+  id: string;
+  server: string;
+  reachable: boolean;
+  serverVersion: string;
+  platform: string;
+  nodes: K8sNodeSummary[];
+  accessNamespace: string;
+  access: K8sAccessRule[];
+  broadAccess: boolean;
+  message: string;
+}
+
+/** C23. 피어 요청을 받고 보내는 규칙. 기본은 모두 꺼짐이다. */
+export interface AiaPeerPolicy {
+  enabled: boolean;
+  allowLocal: boolean;
+  maxDepth: number;
+  maxConcurrent: number;
+  timeoutMs: number;
+  deviceName: string;
+}
+
+export interface AiaPeerDevice {
+  id: string;
+  name: string;
+}
+
+/** 등록된 피어 한 대. 자격증명은 없다 — 회원 자격은 테일넷이 증명한다. */
+export interface AiaPeerView {
+  id: string;
+  name: string;
+  url: string;
+  agentEnabled: boolean;
+  note: string;
+  updatedAt: number;
+  skillsChanged: boolean;
+}
+
+export interface AiaPeerDefaults {
+  maxDepthMin: number;
+  maxDepthMax: number;
+  maxConcurrentMin: number;
+  maxConcurrentMax: number;
+  timeoutMsMin: number;
+  timeoutMsMax: number;
+}
+
+export interface AiaPeersSnapshot {
+  schemaVersion: number;
+  policy: AiaPeerPolicy;
+  device: AiaPeerDevice;
+  inboundReady: boolean;
+  peers: AiaPeerView[];
+  issues: string[];
+  defaults: AiaPeerDefaults;
+}
+
+export interface SetAiaPeerPolicyRequest {
+  enabled?: boolean;
+  allowLocal?: boolean;
+  maxDepth?: number;
+  maxConcurrent?: number;
+  timeoutMs?: number;
+  deviceName?: string;
+}
+
+export interface SetAiaPeerRequest {
+  id: string | null;
+  name: string;
+  url: string;
+  note: string;
+  agentEnabled: boolean | null;
+}
+
+export interface AiaPeerRef {
+  id: string;
+}
+
+export interface SetAiaPeerAgentEnabledRequest {
+  id: string;
+  enabled: boolean;
+}
+
+/** 연결 확인 영수증. 상대의 인사 한 번이고 상대에는 아무것도 남지 않는다. */
+export interface AiaPeerCheckReceipt {
+  id: string;
+  url: string;
+  reachable: boolean;
+  device: AiaPeerDevice | null;
+  enabled: boolean;
+  protocolVersion: number | null;
+  skillsRevision: string | null;
+  message: string;
+}
+
+export type AiaPeerExchangeDirection = "outbound" | "inbound";
+export type AiaPeerExchangeState = "running" | "completed" | "failed" | "timedOut" | "refused";
+
+/** 교환 한 건. `answer`는 상대 AIA 의 글이라 신뢰하지 않는 데이터다. */
+export interface AiaPeerExchangeView {
+  id: string;
+  direction: AiaPeerExchangeDirection;
+  state: AiaPeerExchangeState;
+  peerId: string;
+  peerName: string;
+  device: AiaPeerDevice;
+  chain: string[];
+  hop: number;
+  questionPreview: string;
+  questionDigest: string;
+  questionChars: number;
+  answer: string | null;
+  truncated: boolean;
+  error: string | null;
+  chatId: string | null;
+  remoteExchangeId: string | null;
+  startedAt: number;
+  finishedAt: number | null;
+  skillsRevision: string | null;
+  untrusted: boolean;
+}
+
+export interface AskAiaPeerRequest {
+  peerId: string;
+  message: string;
+  timeoutMs: number | null;
+}
+
+export type AiaPeerSkillState = "absent" | "same" | "peerNewer" | "localModified" | "bothChanged" | "different";
+
+export interface AiaPeerSkillView {
+  key: string;
+  name: string;
+  description: string;
+  transferDigest: string;
+  fileCount: number;
+  totalBytes: number;
+  state: AiaPeerSkillState;
+  localDigest: string | null;
+  importedAt: number | null;
+}
+
+export interface AiaPeerSkillsView {
+  peerId: string;
+  peerName: string;
+  revision: string;
+  skills: AiaPeerSkillView[];
+  unavailable: { key: string; reason: string }[];
+}
+
+export interface ImportAiaPeerSkillRequest {
+  peerId: string;
+  key: string;
+  overwrite: boolean;
+}
+
+export interface AiaPeerSkillImportReceipt {
+  key: string;
+  peerId: string;
+  stateBefore: AiaPeerSkillState;
+  created: boolean;
+  fileCount: number;
+  transferDigest: string;
+  contentDigest: string;
+}
+
 export interface SshKeyView {
   fileName: string;
   path: string;
@@ -3107,6 +3346,8 @@ export interface ChatSessionInfo {
   profile: ChatProfile;
   /** AIA 런타임이 aia_system MCP를 붙였는지. false면 시스템 도구 없이 대화만 가능하다. */
   systemTools: boolean;
+  /** 가벼운 문맥으로 띄운 Claude 실행인지. 옛 백엔드는 보내지 않는다. */
+  leanContext?: boolean;
   settings?: Record<string, string>;
   /**
    * 이 AIA 대화가 시작할 때 적용한 시스템 에이전트 실행설정. AIA 프로필에서만 오고,
@@ -3390,6 +3631,11 @@ export interface ScheduledRequestInput {
    * 수동 실행은 활성 창과 무관하게 나간다.
    */
   activeUntil?: number | null;
+  /**
+   * 채팅 회차를 가벼운 문맥으로 띄울지(Claude 전용). 스킬·명령 목록, claude.ai 커넥터,
+   * 셸·파일 밖 내장 도구를 빼고, MCP 설정은 그대로 둔다. 보내지 않으면 꺼짐으로 저장된다.
+   */
+  leanContext?: boolean;
 }
 
 export interface ScheduledRequest extends ScheduledRequestInput {
@@ -4397,8 +4643,18 @@ export type DocumentTriggerRunStatus = "running" | "completed" | "failed" | "ski
 
 export type DocumentTriggerAction =
   | { type: "runSchedule"; scheduleId: string }
-  | { type: "startChat"; source: ProviderId; accountId?: string | null; model?: string | null; reasoningEffort?: ReasoningEffort | null; mode: ChatMode; approvalMode: ChatApprovalMode; prompt: string; skill?: { skillId: string; contentDigest: string } | null; settings?: Record<string, string> }
+  | { type: "startChat"; source: ProviderId; accountId?: string | null; model?: string | null; reasoningEffort?: ReasoningEffort | null; mode: ChatMode; approvalMode: ChatApprovalMode; prompt: string; skill?: { skillId: string; contentDigest: string } | null; settings?: Record<string, string>; leanContext?: boolean; conversation?: DocumentConversationConfig | null; inlineContent?: { maxBytes: number } | null }
   | { type: "executeWorkflow"; workflowId: string; approvedVersion: number; arguments?: Record<string, unknown> };
+
+/**
+ * 문서 트리거 대화 이어 보내기. 루트 기준 상대 경로에 keyPattern(정규식)을 대 캡처 그룹을 `/`로
+ * 이은 값이 대화 키이고, 같은 키의 다음 변경은 살아 있는 채팅에 새 턴으로 이어서 보낸다.
+ */
+export interface DocumentConversationConfig {
+  keyPattern: string;
+  idleMs?: number;
+  maxTurns?: number;
+}
 
 export interface DocumentTriggerInput {
   name: string;
@@ -4807,6 +5063,8 @@ export type AgentBuiltinToolNote =
   | { kind: "sshEndpoints"; available: number; unusable: number }
   | { kind: "indexSources"; available: number; unusable: number }
   | { kind: "dbConnections"; available: number; unusable: number }
+  | { kind: "k8sClusters"; available: number; unusable: number }
+  | { kind: "aiaPeers"; enabled: boolean; available: number; unusable: number }
   | { kind: "cypressEnabled" }
   | { kind: "cypressDisabled" }
   | { kind: "mcpExternalConfig"; registered: string[]; missing: string[]; pending: number }

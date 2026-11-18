@@ -97,6 +97,17 @@ function noteLabel(note: AgentBuiltinToolNote, text: (ko: string, en: string) =>
         `사용 가능한 연결 ${note.available}개, 켰지만 사용할 수 없는 연결 ${note.unusable}개`,
         `${note.available} usable connection(s), ${note.unusable} enabled but unusable`,
       );
+    case "k8sClusters":
+      return text(
+        `사용 가능한 클러스터 ${note.available}개, 켰지만 사용할 수 없는 클러스터 ${note.unusable}개`,
+        `${note.available} usable cluster(s), ${note.unusable} enabled but unusable`,
+      );
+    case "aiaPeers":
+      if (!note.enabled) return text("애드온 → AIA 대화에서 기능을 켜야 함", "Turn it on in Add-ons → AIA peers");
+      return text(
+        `물을 수 있는 피어 ${note.available}개, 등록됐지만 사용할 수 없는 피어 ${note.unusable}개`,
+        `${note.available} askable peer(s), ${note.unusable} registered but unusable`,
+      );
     case "cypressEnabled":
       return text("설정에서 사용 중", "Turned on in settings");
     case "cypressDisabled":

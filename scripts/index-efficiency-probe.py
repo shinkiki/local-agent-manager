@@ -38,23 +38,38 @@ def measure_search(rpc, case, original, repeats):
     for _ in range(repeats):
         start = time.monotonic()
         request, response = rpc('tools/call', {'name': 'search_index', 'arguments': {
-            'request': {'query': case['query'], 'limit': 8}}})
+            'request': {'query': case['query'], 'limit': 8, **{
+                key: case[key] for key in ('mode', 'pathPrefix', 'extension') if key in case}}}})
         payload = response['result']
         if payload.get('isError'):
             raise RuntimeError(f"MCP search failed for {case['id']}")
         result = json.loads(payload['content'][0]['text'])['result']
-        covered = any(hit['relativePath'] == case['path'] and case['expected'] in hit['excerpt']
-                      for hit in result['hits'])
+        hits = result['hits']
+        # G4: an incomplete empty search cannot prove that excluded content stayed hidden.
+        complete = not any(result.get(key) for key in (
+            'staleFiles', 'truncated', 'partialSources', 'pendingSources'))
+        covered = (any(hit['relativePath'] == case['path'] and case['expected'] in hit['excerpt']
+                       for hit in hits) if case.get('expectHit', True) else not hits and complete)
+        if 'onlyPaths' in case:
+            covered = covered and all(hit['relativePath'] in case['onlyPaths'] for hit in hits)
+        if 'firstPath' in case:
+            covered = covered and bool(hits) and hits[0]['relativePath'] == case['firstPath']
+        if 'maxExcerptLines' in case:
+            covered = covered and all(len(hit['excerpt'].splitlines()) <= case['maxExcerptLines'] for hit in hits)
         # Retain metrics only, never source excerpts. Include the full JSON envelopes.
         samples.append({'covered': covered, 'requestBytes': len(encoded(request)),
                         'responseBytes': len(encoded(response)),
                         'searchMs': round((time.monotonic() - start) * 1000, 2),
-                        'staleFiles': len(result['staleFiles']), 'truncated': result['truncated']})
+                        'staleFiles': len(result['staleFiles']), 'truncated': result['truncated'],
+                        'partialSources': len(result.get('partialSources', [])),
+                        'pendingSources': len(result.get('pendingSources', []))})
     # Keep first-query bytes and latency comparable with existing single-search reports.
     # A later missing result or safety warning must not disappear in the summary.
     return {'id': case['id'], 'fullFileBytesProxy': len(original), **samples[0],
             'covered': all(sample['covered'] for sample in samples),
             'staleFiles': max(sample['staleFiles'] for sample in samples),
+            'partialSources': max(sample['partialSources'] for sample in samples),
+            'pendingSources': max(sample['pendingSources'] for sample in samples),
             'truncated': any(sample['truncated'] for sample in samples), 'searchSamples': samples}
 
 
@@ -64,7 +79,7 @@ def main():
     parser.add_argument('--corpus', type=Path, required=True, help='same immutable repository snapshot for before/after')
     parser.add_argument('--static-dir', type=Path, default=Path('dist'))
     parser.add_argument('--cases', type=Path, default=Path(__file__).with_name('index-efficiency-cases.json'))
-    parser.add_argument('--split', choices=['tuning', 'heldout'], default='heldout')
+    parser.add_argument('--split', choices=['tuning', 'heldout', 'regression'], default='heldout')
     parser.add_argument('--search-repeats', type=search_repeat_count, default=1,
                         help='1–20 sequential searches per case; extra traffic is reported separately')
     parser.add_argument('--baseline', type=Path)
@@ -76,8 +91,10 @@ def main():
         parser.error('heldout requires at least 20 independent queries')
     corpus = args.corpus.resolve(strict=True)
     originals = {}
-    for case in cases:
-        relative = Path(case['path'])
+    selected_paths = {case['path'] for case in cases}
+    selected_paths.update(path for case in cases for path in case.get('extraPaths', []))
+    for relative_name in sorted(selected_paths):
+        relative = Path(relative_name)
         path = corpus / relative
         if relative.is_absolute() or '..' in relative.parts or path.is_symlink():
             parser.error('unsafe corpus path')
@@ -85,9 +102,10 @@ def main():
         if not resolved.is_relative_to(corpus):
             parser.error('corpus file escapes snapshot')
         content = resolved.read_bytes()
-        if case['expected'] not in content.decode('utf-8'):
+        originals[relative_name] = content
+    for case in cases:
+        if case['expected'] not in originals[case['path']].decode('utf-8'):
             parser.error(f"missing expected target in {case['id']}")
-        originals[case['path']] = content
     fingerprint = digest(encoded({path: digest(body) for path, body in sorted(originals.items())}))
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
@@ -157,6 +175,21 @@ def main():
                 schema_bytes = len(encoded(listing_request)) + len(encoded(listing_response))
                 rows = [measure_search(rpc, case, originals[case['path']], args.search_repeats)
                         for case in cases]
+                diagnostic_metrics = None
+                if args.split == 'regression':
+                    diagnostic_request, diagnostic_response = rpc('tools/call', {
+                        'name': 'get_index_exclusions', 'arguments': {'request': {
+                            'id': source['id'], 'limit': 100}}})
+                    diagnostic_payload = diagnostic_response['result']
+                    if diagnostic_payload.get('isError'):
+                        raise RuntimeError('MCP diagnostics failed')
+                    diagnostic = json.loads(diagnostic_payload['content'][0]['text'])['result']
+                    if (diagnostic['total'] != indexed['excluded'] or len(diagnostic['items']) > 100
+                            or any(set(item) != {'relativePath', 'reason'} for item in diagnostic['items'])
+                            or any(Path(item['relativePath']).is_absolute() for item in diagnostic['items'])):
+                        raise RuntimeError('MCP diagnostics metadata contract failed')
+                    diagnostic_metrics = {'metadataOnly': True, 'excludedEntries': diagnostic['total'],
+                                          'requestResponseBytes': len(encoded(diagnostic_request)) + len(encoded(diagnostic_response))}
                 report = {'metric': 'UTF-8 context bytes proxy; not actual model tokens or billing',
                           'baselineInterface': 'one whole expected file per query, content bytes only',
                           'scope': 'first search, cold schema once; extra repeat traffic reported separately; '
@@ -172,6 +205,9 @@ def main():
                           'schemaBytes': schema_bytes, 'refreshMs': refresh_ms,
                           'indexBytes': (app / 'index-addon-v1.sqlite3').stat().st_size,
                           'excludedFiles': indexed['excluded'], 'partialIndex': indexed['truncated'],
+                          'refreshReadFiles': indexed.get('readFiles'),
+                          'exclusionCounts': indexed.get('exclusionCounts', []),
+                          'diagnostics': diagnostic_metrics,
                           'fullFileBytesProxy': sum(row['fullFileBytesProxy'] for row in rows),
                           'indexedBytesWithColdSchema': schema_bytes + sum(row['requestBytes'] + row['responseBytes'] for row in rows),
                           'rows': rows}
@@ -202,6 +238,8 @@ def main():
                      'fullFileBytesProxy', 'indexedBytesWithColdSchema']}))
     if regressions:
         raise SystemExit('coverage regression; see report')
+    if args.split == 'regression' and report['covered'] != report['cases']:
+        raise SystemExit('regression case failed; see report')
 
 
 if __name__ == '__main__':

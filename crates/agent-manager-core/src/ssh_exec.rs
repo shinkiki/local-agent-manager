@@ -1171,24 +1171,28 @@ fn run_ssh_streaming(
     // 종료 코드는 따로 기다려야 하므로 두 단계로 나뉜다.
     let mut readers_open = true;
     while readers_open {
+        // C9-18. 준비된 출력이 계속 와도 제한 시간은 흐른다. recv_timeout의 Timeout
+        // 분기에서만 확인하면 조용하지 않은 명령은 기한을 지나서도 끝나지 않는다.
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            timed_out = true;
+            // 죽인 뒤 잠깐 남은 줄을 흘린다. 파이프를 물고 있는 손자(ProxyCommand)가
+            // 있거나 대기 출력이 계속 남아도 정리 시간의 상한을 지킨다.
+            let drain_until = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < drain_until {
+                match receiver
+                    .recv_timeout(drain_until.saturating_duration_since(std::time::Instant::now()))
+                {
+                    Ok((stream, bytes)) => relay.push(stream, &bytes),
+                    Err(_) => break,
+                }
+            }
+            break;
+        }
         match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok((stream, bytes)) => relay.push(stream, &bytes),
             Err(mpsc::RecvTimeoutError::Disconnected) => readers_open = false,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if started.elapsed() >= timeout {
-                    let _ = child.kill();
-                    timed_out = true;
-                    // 죽인 뒤 잠깐 남은 줄을 흘린다. 파이프를 물고 있는 손자(ProxyCommand)가
-                    // 있으면 끝까지 기다릴 수 없으므로 기다림에도 상한을 둔다.
-                    let drain_until = std::time::Instant::now() + Duration::from_secs(2);
-                    while let Ok((stream, bytes)) = receiver.recv_timeout(
-                        drain_until.saturating_duration_since(std::time::Instant::now()),
-                    ) {
-                        relay.push(stream, &bytes);
-                    }
-                    readers_open = false;
-                }
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
     if !timed_out {
@@ -2142,6 +2146,57 @@ mod tests {
         .expect("실행");
         assert!(receipt.succeeded);
         assert!(terminal.events().is_empty());
+    }
+
+    /// C9-18/V2. 수신할 출력이 계속 준비돼 있어도 실행과 종료 출력 정리의 기한을 지킨다.
+    #[cfg(unix)]
+    #[test]
+    fn c9_18_streaming_timeout_applies_to_ready_output_and_bounds_draining() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct SlowTerminal(AtomicUsize);
+
+        impl SshTerminalSink for SlowTerminal {
+            fn ssh_terminal_started(&self, _: &str, _: &str) {}
+
+            fn ssh_terminal_output(&self, _: SshOutputStream, _: &str) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                // 다음 줄이 준비될 시간을 줘 무출력 대기에 기대지 않고 재현한다.
+                std::thread::sleep(Duration::from_millis(25));
+            }
+
+            fn ssh_terminal_finished(&self, _: bool, _: bool, _: &str) {}
+        }
+
+        let home = tempfile::tempdir().expect("home");
+        let app_data = tempfile::tempdir().expect("app data");
+        let bin = tempfile::tempdir().expect("bin");
+        let fingerprint = key_fixture(home.path(), true);
+        let endpoint = endpoint_request(&fingerprint);
+        set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &endpoint).expect("저장");
+        let resolved =
+            resolve_endpoint(home.path(), app_data.path(), None, &fingerprint).expect("서버");
+        let chatty = script(
+            bin.path(),
+            "ssh-buffered-output",
+            "i=0; while [ \"$i\" -lt 200 ]; do echo tick; i=$((i + 1)); done",
+        );
+        let terminal = SlowTerminal::default();
+        let outcome = run_ssh_streaming(
+            &chatty,
+            &resolved,
+            "ls /srv",
+            Duration::from_secs(1),
+            &terminal,
+            None,
+        )
+        .expect("실행");
+
+        assert!(outcome.timed_out && !outcome.success, "{outcome:?}");
+        // 전체 출력 소비에는 5초 이상 걸린다. 실행 1초와 정리 2초 뒤에도 모두
+        // 소비했다면 정리 기한 역시 준비된 메시지에 의해 우회된 것이다.
+        assert!(terminal.0.load(Ordering::Relaxed) < 200);
     }
 
     /// C9-18. 화면으로 나가는 총량은 영수증 상한과 같고, 넘으면 한 번만 생략을 알린다.

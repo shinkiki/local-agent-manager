@@ -447,7 +447,7 @@ export function ExternalPluginsCard({ active }: { active: boolean }) {
         ? <div className="plugin-loading-state">{!error && <LoaderCircle size={16} className="spin" />}<span>{error ? text("플러그인 목록을 읽지 못했습니다.", "Could not load plugins.") : text("플러그인을 확인하는 중…", "Checking plugins…")}</span></div>
         : snapshot.plugins.length === 0
           ? <div className="plugin-empty-state">
-              <i><PluginMark brand="notion" size={28} /></i>
+              <i className="plugin-empty-brand"><PluginMark brand="notion" size={28} /></i>
               <div><strong>{text("연결된 플러그인이 없습니다", "No plugins connected")}</strong><small>{text("Notion·Jira·GitHub·Figma 등을 OAuth 또는 토큰으로 연결할 수 있습니다.", "Connect Notion, Jira, GitHub, Figma and more with OAuth or a token.")}</small></div>
             </div>
           : <div className="plugin-list">

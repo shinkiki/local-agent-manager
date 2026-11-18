@@ -197,6 +197,21 @@ mod tests {
         assert!(!pid_exists(pid).expect("종료된 PID 조회"));
     }
 
+    /// C1-7/V2: 권한 거부는 종료 확인이 아니며, 그 밖의 조회 오류도 숨기지 않는다.
+    #[test]
+    fn c1_7_existence_distinguishes_permission_denied_from_probe_failures() {
+        assert!(
+            existence(Err(std::io::Error::from_raw_os_error(libc::EPERM)))
+                .expect("권한이 없는 프로세스도 살아 있다")
+        );
+
+        for errno in [libc::EINVAL, libc::EIO] {
+            let error = existence(Err(std::io::Error::from_raw_os_error(errno)))
+                .expect_err("조회 실패를 종료 여부로 바꾸면 안 된다");
+            assert_eq!(error.raw_os_error(), Some(errno));
+        }
+    }
+
     /// 0과 pid_t로 옮기면 음수가 되는 값은 단일 대상이 아니라 그룹·전체 신호가 된다.
     /// 신호 0(존재 확인)으로만 시험하므로 막지 못해도 아무 프로세스도 끝나지 않는다.
     #[test]

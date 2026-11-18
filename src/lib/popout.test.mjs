@@ -26,6 +26,11 @@ const SAMPLES = [
     windowName: "popout-session-claude-sess-3",
     title: { ko: "세션", en: "Session" },
   },
+  {
+    request: { kind: "gitDiff", projectPath: "/tmp/p", path: "a.ts", originalPath: null, staged: false, commit: null },
+    windowName: "popout-gitDiff--tmp-p-worktree-a-ts",
+    title: { ko: "변경 내용", en: "Diff" },
+  },
 ];
 
 test("독립 AIA 창은 각각 다른 주소와 이름을 갖고 다시 해석된다", () => {
@@ -119,6 +124,9 @@ test("git diff 팝아웃은 프로젝트·경로·대상(스테이지/커밋)을
   const linked = { ...worktree, worktreePath: "/tmp/p/.rounds/wt-R01" };
   assert.deepEqual(parsePopoutRequest(popoutSearch(linked)), linked);
   assert.notEqual(popoutWindowName(linked), popoutWindowName(worktree));
+  // 다른 프로젝트에서 같은 상대 경로·같은 비교 대상을 열어도 창 이름이 겹치지 않는다.
+  const otherProject = { ...worktree, projectPath: "/tmp/other" };
+  assert.notEqual(popoutWindowName(otherProject), popoutWindowName(worktree));
   assert.match(popoutWindowName(commit), /^popout-gitDiff-[0-9A-Za-z_-]+$/);
   assert.equal(parsePopoutRequest("?popout=gitDiff&project=/tmp/p"), null);
   assert.equal(parsePopoutRequest("?popout=gitDiff&project=/tmp/p&path=a&commit=not-a-sha"), null);

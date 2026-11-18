@@ -517,6 +517,15 @@ fn configure_module_search_path(command: &mut Command, module_dir: &Path) {
     command.env("NODE_PATH", module_dir.join("node_modules"));
 }
 
+/// C7-5. 러너가 끝난 뒤 남은 손자(브라우저)가 출력 파이프를 놓을 때까지 기다리는 유예. 이 시간이
+/// 지나면 그룹을 끝낸다 — 실행 제한 시간(20분·8시간)을 그대로 쓰면 이미 끝난 실행의 결과가 그만큼
+/// 늦게 보인다. 러너를 두고 런처를 떼어 띄운 뒤 먼저 끝나는 하네스(C7-5a 계약 위반)는 이 유예 뒤에
+/// 런처도 끝난다. 시험은 짧은 값으로 유예 갈래 자체를 고정한다.
+#[cfg(not(test))]
+const GRANDCHILD_GRACE: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const GRANDCHILD_GRACE: Duration = Duration::from_secs(3);
+
 /// 자식을 프로세스 그룹으로 띄우고 stdin 본문을 준 뒤 상한 시간까지 기다린다. 초과하면 그룹 전체를
 /// 죽여 Cypress가 띄운 브라우저까지 정리한다.
 ///
@@ -570,27 +579,45 @@ fn spawn_capped(
                 let _ = stdin.write_all(&payload);
             })
         });
+    // C7-5: 출력 회수와 stdin 전송도 감시 대상이다. 러너가 먼저 끝나도 러너가 띄운 손자(브라우저)가
+    // 파이프를 물려받은 채 살아 있으면 회수는 그 손자가 끝날 때까지 돌아오지 않는다 — 동기로
+    // 부르면 제한 시간도 중지도 그 단계에는 미치지 못했다. git 실행기가 2026-10-05에 고친 것과
+    // 같은 모양이되, 러너가 끝난 뒤에는 실행 제한 시간(20분·8시간)이 아니라 짧은 유예만 준다.
+    // 그룹 손잡이가 없는 플랫폼에서는 예전처럼 손자가 끝나야 돌아온다.
+    let output_reader = thread::spawn(move || output_readers.finish());
     let mut timed_out = false;
-    let status = loop {
-        match child.try_wait()? {
-            Some(status) => break Some(status),
-            None if stop.load(Ordering::Relaxed) => {
-                kill_group(group.as_ref());
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
+    let mut status = None;
+    let mut exited_at: Option<Instant> = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait()?;
+            if status.is_some() {
+                exited_at = Some(Instant::now());
             }
-            None if started.elapsed() >= timeout => {
-                kill_group(group.as_ref());
-                let _ = child.kill();
-                let _ = child.wait();
-                timed_out = true;
-                break None;
-            }
-            None => thread::sleep(Duration::from_millis(200)),
         }
-    };
-    let (stdout, stderr) = output_readers.finish();
+        let io_finished = output_reader.is_finished()
+            && stdin_writer
+                .as_ref()
+                .is_none_or(|writer| writer.is_finished());
+        if status.is_some() && io_finished {
+            break;
+        }
+        let stop_requested = stop.load(Ordering::Relaxed);
+        let grace_elapsed = exited_at.is_some_and(|at| at.elapsed() >= GRANDCHILD_GRACE);
+        if stop_requested || grace_elapsed || started.elapsed() >= timeout {
+            // 그룹을 끝내면 손자가 쥔 파이프가 닫혀 회수가 돌아온다. 러너가 이미 끝났으면 그
+            // 종료 상태는 그대로 둔다 — 러너가 낸 결과를 남은 손자 하나 때문에 바꾸지 않는다.
+            kill_group(group.as_ref());
+            if status.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+                timed_out = !stop_requested;
+            }
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    let (stdout, stderr) = output_reader.join().unwrap_or_default();
     if let Some(writer) = stdin_writer {
         let _ = writer.join();
     }
@@ -1594,6 +1621,58 @@ mod tests {
             "손자가 살아남아 출력 회수가 막혔습니다: {:?}",
             started.elapsed()
         );
+    }
+
+    /// C7-5. 러너가 **먼저 끝난** 뒤에도 손자가 출력 파이프를 쥐고 있으면 회수가 그 손자를
+    /// 기다린다. 제한 시간은 회수 단계에도 미쳐야 하고, 러너가 낸 종료 상태는 그대로 남는다.
+    #[cfg(unix)]
+    #[test]
+    fn c7_5_timeout_ends_the_grandchild_left_behind_by_an_exited_runner() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "echo runner-done; sleep 30 & exit 0"]);
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        // 제한 시간(20초)보다 유예(3초)가 먼저 온다 — 돌아오는 것은 유예 갈래여야 한다.
+        let outcome =
+            spawn_capped(command, None, Duration::from_secs(20), true, &stop).expect("실행");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "러너가 끝난 뒤 남은 손자가 출력 회수를 막았습니다(유예가 적용되지 않음): {:?}",
+            started.elapsed()
+        );
+        assert!(outcome.success, "러너 자신은 0으로 끝났습니다");
+        assert!(!outcome.timed_out, "러너는 제한 시간 안에 끝났습니다");
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.stdout.contains("runner-done"));
+    }
+
+    /// C7-8. 러너가 끝난 **뒤에** 들어온 중지 요청도 남은 손자의 회수를 멈춰야 하고, 러너가 낸
+    /// 종료 상태는 그대로 남는다. 중지는 러너가 끝나고 나서 켠다 — 처음부터 켜 두면 아직 살아
+    /// 있는 러너를 끝내는 기존 갈래를 지나게 된다.
+    #[cfg(unix)]
+    #[test]
+    fn c7_8_stop_ends_the_grandchild_left_behind_by_an_exited_runner() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & exit 0"]);
+        let stop = Arc::new(AtomicBool::new(false));
+        let raise = Arc::clone(&stop);
+        let raiser = thread::spawn(move || {
+            // 러너(`sh`)가 끝난 뒤, 유예(3초)보다는 앞서 켠다.
+            thread::sleep(Duration::from_millis(1500));
+            raise.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let outcome =
+            spawn_capped(command, None, Duration::from_secs(20), true, &stop).expect("실행");
+        let _ = raiser.join();
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "중지 요청이 있는데 손자를 기다렸습니다: {:?}",
+            started.elapsed()
+        );
+        assert!(outcome.success, "러너 자신은 0으로 끝났습니다");
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(!outcome.timed_out);
     }
 
     /// 2026-10-10 NAS 실측 출력. Xvfb가 없으면 Cypress 자체 점검이 여기서 멈춘다.

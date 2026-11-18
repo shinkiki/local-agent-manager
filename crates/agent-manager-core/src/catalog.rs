@@ -820,8 +820,16 @@ fn state_lock_error(catalog_name: &str) -> CoreError {
 /// 파일 저장뿐이라 정상 상황에서는 밀리초 단위로 끝난다.
 const CATALOG_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// 이미 진행 중인 조정이 끝나기를 기다릴 최대 시간. 초과하면 `Busy`다.
+/// 이미 진행 중인 전체 조정이 끝나기를 기다릴 최대 시간. 초과하면 `Busy`다.
 const RECONCILE_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 세션 한 건 갱신이 진행 중 조정을 기다릴 최대 시간. 초과하면 `Busy`다.
+///
+/// 화면은 이 요청을 15초에 끊는다(`ipcSessions.ts`의 `SESSION_CATALOG_REFRESH_TIMEOUT_MS`).
+/// 전체 조정과 같은 20초를 기다리면 NAS가 바빠 전체 조정이 15초를 넘길 때마다 화면이
+/// 먼저 끊어, 재시도로 넘어가야 할 "바쁨"이 응답 없음 실패로 올라왔다. 그보다 짧게
+/// 끊어 바쁨으로 돌려준다.
+const TARGET_RECONCILE_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 잠금을 `timeout` 안에만 기다린다.
 ///
@@ -871,6 +879,14 @@ impl ReconcileScope {
         }
     }
 
+    /// 이 범위의 요청이 진행 중 조정을 기다려 줄 최대 시간.
+    fn join_timeout(&self) -> Duration {
+        match self {
+            Self::Full => RECONCILE_JOIN_TIMEOUT,
+            Self::Target(..) => TARGET_RECONCILE_JOIN_TIMEOUT,
+        }
+    }
+
     /// 진행 중인 이 범위가 `other` 요청까지 처리해 주는가.
     fn covers(&self, other: &Self) -> bool {
         match self {
@@ -905,7 +921,17 @@ impl ReconcileGate {
         scope: ReconcileScope,
         run: impl FnOnce() -> Result<SessionCatalogUpdate, CoreError>,
     ) -> Result<SessionCatalogUpdate, CoreError> {
-        let deadline = Instant::now() + RECONCILE_JOIN_TIMEOUT;
+        let wait = scope.join_timeout();
+        self.run_within(scope, wait, run)
+    }
+
+    fn run_within(
+        &self,
+        scope: ReconcileScope,
+        wait: Duration,
+        run: impl FnOnce() -> Result<SessionCatalogUpdate, CoreError>,
+    ) -> Result<SessionCatalogUpdate, CoreError> {
+        let deadline = Instant::now() + wait;
         let mut state = self.state.lock().map_err(|_| Self::poisoned())?;
         while let Some(active) = state.active.clone() {
             let joined = active.covers(&scope);
@@ -7437,6 +7463,52 @@ mod tests {
         assert_eq!(scans.load(AtomicOrdering::SeqCst), 2);
     }
 
+    /// 세션 한 건 갱신은 화면이 끊기(15초) 전에 바쁨으로 돌아와야 한다. 그래야 화면이
+    /// 응답 없음 실패 대신 재시도로 넘긴다.
+    #[test]
+    fn a_target_refresh_waits_less_than_the_screen_timeout() {
+        let target = ReconcileScope::Target(ProviderId::Claude, "run".to_owned());
+        assert!(target.join_timeout() < Duration::from_secs(15));
+        assert_eq!(ReconcileScope::Full.join_timeout(), RECONCILE_JOIN_TIMEOUT);
+    }
+
+    /// 대기 예산이 끝나면 진행 중 조정이 덮어 주는 요청이라도 바쁨으로 돌아온다.
+    #[test]
+    fn a_waiter_that_runs_out_of_budget_returns_busy() {
+        let gate = Arc::new(ReconcileGate::default());
+        let (entered, entered_signal) = mpsc::channel::<()>();
+        let (release, blocked) = mpsc::channel::<()>();
+
+        let runner = {
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || {
+                gate.run(ReconcileScope::Full, || {
+                    let _ = entered.send(());
+                    let _ = blocked.recv();
+                    Ok(SessionCatalogUpdate {
+                        revision: 3,
+                        changed: true,
+                    })
+                })
+            })
+        };
+        entered_signal
+            .recv_timeout(Duration::from_secs(5))
+            .expect("첫 조정이 시작되어야 한다");
+
+        let error = gate
+            .run_within(
+                ReconcileScope::Target(ProviderId::Claude, "run".to_owned()),
+                Duration::from_millis(50),
+                || panic!("대기 예산이 끝난 요청은 스캔을 돌리지 않는다"),
+            )
+            .expect_err("바쁨이어야 한다");
+        assert!(matches!(error, CoreError::Busy(_)), "{error}");
+
+        drop(release);
+        assert_eq!(runner.join().expect("runner").expect("full").revision, 3);
+    }
+
     #[test]
     fn a_blocked_skill_scan_gives_up_and_keeps_the_previous_list() {
         let guard = SkillScanGuard::default();
@@ -10194,6 +10266,50 @@ mod tests {
 mod storage_root_tests {
     use super::storage_usage_item;
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_storage_usage_skips_symlink_roots_and_descendants() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let dir = tempfile::tempdir().expect("fixture");
+        let root = dir.path().join("managed");
+        let nested = root.join("nested");
+        let external = dir.path().join("external");
+        fs::create_dir_all(&nested).expect("nested directory");
+        fs::create_dir(&external).expect("external directory");
+        fs::write(root.join("own.txt"), b"abc").expect("root file");
+        fs::write(nested.join("own.txt"), b"12345").expect("nested file");
+        fs::write(external.join("other.txt"), b"external content").expect("external file");
+        let standalone = dir.path().join("standalone.txt");
+        fs::write(&standalone, b"1234567").expect("standalone file");
+
+        let root_link = dir.path().join("root-link");
+        symlink(&root, &root_link).expect("root symlink");
+        symlink(external.join("other.txt"), root.join("file-link")).expect("file symlink");
+        symlink(&external, root.join("directory-link")).expect("directory symlink");
+        symlink(root.join("own.txt"), nested.join("alias")).expect("internal file symlink");
+
+        let links = storage_usage_item(
+            "links",
+            "라벨",
+            "설명",
+            &[
+                root_link,
+                root.join("file-link"),
+                root.join("directory-link"),
+            ],
+        );
+        assert_eq!((links.size_bytes, links.file_count), (0, 0));
+        let item = storage_usage_item(
+            "managed",
+            "라벨",
+            "설명",
+            &[root, standalone, dir.path().join("missing")],
+        );
+        // G10: linked profile resources must not add external files or count aliases twice.
+        assert_eq!((item.size_bytes, item.file_count), (15, 3));
+    }
 
     #[test]
     fn single_path_is_its_own_root() {

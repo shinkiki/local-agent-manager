@@ -541,6 +541,89 @@ mod tests {
         assert!(list_skill_trash(&app_data).unwrap().items.is_empty());
     }
 
+    /// C3-11/C3-13: a collision must leave only the skipped member for a later group retry.
+    #[test]
+    fn c3_11_c3_13_group_restore_preserves_collision_and_retries_remaining_member() {
+        let temp = tempdir().expect("temporary directory");
+        let app_data = temp.path().join("app-data");
+        let shared = temp.path().join("shared/bundle");
+        let installed = temp.path().join("installed/bundle");
+        let unrelated = temp.path().join("shared/other");
+        let store = |path: &Path, group: &str, provider, payload: &[u8]| {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("SKILL.md"), payload).unwrap();
+            store_trash_item(
+                &app_data,
+                path,
+                SkillTrashItemDraft {
+                    group_id: group.to_owned(),
+                    key: path.file_name().unwrap().to_str().unwrap().to_owned(),
+                    kind: SkillTrashItemKind::Directory,
+                    link_target: None,
+                    provider,
+                    scope: None,
+                    shared: true,
+                    deleted_by: "test".to_owned(),
+                    content_digest: None,
+                    file_count: 1,
+                    total_bytes: payload.len() as u64,
+                    name: "test skill".to_owned(),
+                    description: String::new(),
+                },
+            )
+            .unwrap()
+        };
+        // Deletion stores deployments before their shared source, as the library does.
+        let deployment = store(&installed, "bundle", Some(ProviderId::Claude), b"installed");
+        let source = store(&shared, "bundle", None, b"shared");
+        let other = store(&unrelated, "other", None, b"other");
+        fs::create_dir(&installed).unwrap();
+        fs::write(installed.join("SKILL.md"), b"replacement").unwrap();
+
+        let receipt = restore_skill_trash(&app_data, &deployment.id).unwrap();
+        assert_eq!(receipt.group_id, "bundle");
+        assert_eq!(receipt.results.len(), 2);
+        assert_eq!(receipt.results[0].id, source.id);
+        assert_eq!(
+            receipt.results[0].outcome,
+            SkillTrashRestoreOutcome::Restored
+        );
+        assert_eq!(receipt.results[1].id, deployment.id);
+        assert_eq!(
+            receipt.results[1].outcome,
+            SkillTrashRestoreOutcome::Skipped
+        );
+        assert_eq!(fs::read(shared.join("SKILL.md")).unwrap(), b"shared");
+        assert_eq!(
+            fs::read(installed.join("SKILL.md")).unwrap(),
+            b"replacement"
+        );
+        assert!(!unrelated.exists());
+        let remaining = list_skill_trash(&app_data).unwrap().items;
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&deployment));
+        assert!(remaining.contains(&other));
+        let (_, content) = trash_store::entry_paths(&trash_root(&app_data), &deployment.id);
+        assert_eq!(fs::read(content.join("SKILL.md")).unwrap(), b"installed");
+
+        // Remove only the test's replacement, then retry using the surviving member's id.
+        fs::remove_file(installed.join("SKILL.md")).unwrap();
+        fs::remove_dir(&installed).unwrap();
+        let retry = restore_skill_trash(&app_data, &deployment.id).unwrap();
+        assert_eq!(retry.group_id, "bundle");
+        assert_eq!(retry.results.len(), 1);
+        assert_eq!(retry.results[0].id, deployment.id);
+        assert_eq!(retry.results[0].outcome, SkillTrashRestoreOutcome::Restored);
+        assert_eq!(fs::read(installed.join("SKILL.md")).unwrap(), b"installed");
+        assert_eq!(fs::read(shared.join("SKILL.md")).unwrap(), b"shared");
+        assert!(!unrelated.exists());
+        assert_eq!(list_skill_trash(&app_data).unwrap().items, vec![other]);
+        assert!(matches!(
+            restore_skill_trash(&app_data, &source.id),
+            Err(CoreError::NotFound(_))
+        ));
+    }
+
     #[test]
     fn skill_trash_lifecycle_and_restore() {
         let temp = tempdir().expect("임시 디렉터리 생성");

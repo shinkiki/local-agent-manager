@@ -1544,6 +1544,65 @@ mod tests {
             .any(|card| card.source == AiaOnboardingPackSource::Bundled));
     }
 
+    /// W6-4/W6-6: 입력 키는 카드 안의 모든 단계에서 유일해야 한다. 잘못된 팩만
+    /// 건너뛰고, 카드가 다르면 같은 키를 쓰는 정상 팩은 계속 싣는다.
+    #[test]
+    fn w6_field_keys_are_unique_across_steps_but_scoped_to_each_card() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("skills");
+        let mut valid = minimal_pack("valid", "valid-start");
+        let mut extra_step = valid["cards"][0]["steps"][0].clone();
+        extra_step["id"] = json!("details");
+        extra_step["fields"][0]["key"] = json!("otherRepo");
+        valid["cards"][0]["steps"]
+            .as_array_mut()
+            .unwrap()
+            .push(extra_step);
+        let mut second_card = valid["cards"][0].clone();
+        second_card["id"] = json!("valid-other");
+        valid["cards"].as_array_mut().unwrap().push(second_card);
+        write_pack(&root, "valid", &valid);
+
+        let mut invalid = minimal_pack("duplicate-fields", "duplicate-start");
+        let mut duplicate_step = invalid["cards"][0]["steps"][0].clone();
+        duplicate_step["id"] = json!("details");
+        invalid["cards"][0]["steps"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate_step);
+        write_pack(&root, "duplicate-fields", &invalid);
+
+        let catalog = load_aia_onboarding_catalog_from_root(&root).expect("catalog");
+        assert_eq!(catalog.issues.len(), 1, "{:?}", catalog.issues);
+        let issue = &catalog.issues[0];
+        assert_eq!(issue.skill_key, "duplicate-fields");
+        assert!(
+            issue
+                .message
+                .contains("입력 key가 카드 안에서 중복됩니다: repo"),
+            "{issue:?}"
+        );
+        assert!(catalog
+            .packs
+            .iter()
+            .all(|pack| pack.pack_id != "duplicate-fields"));
+        assert!(catalog
+            .cards
+            .iter()
+            .all(|card| card.card.id != "duplicate-start"));
+        let valid_cards: Vec<_> = catalog
+            .cards
+            .iter()
+            .filter(|card| card.skill_key.as_deref() == Some("valid"))
+            .map(|card| card.card.id.as_str())
+            .collect();
+        assert_eq!(valid_cards, ["valid-start", "valid-other"]);
+        assert!(catalog
+            .cards
+            .iter()
+            .any(|card| card.source == AiaOnboardingPackSource::Bundled));
+    }
+
     /// W6: 템플릿은 그 카드가 선언한 입력만 가리킬 수 있다. 없는 키를 조용히 빈 값으로
     /// 치환하면 사용자가 채운 줄 아는 값이 빠진 채 워크플로가 등록된다.
     #[test]

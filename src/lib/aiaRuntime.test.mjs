@@ -6,6 +6,7 @@ import {
   aiaRuntimeNeedsRestart,
   aiaRuntimeProvider,
   aiaRuntimeSettings,
+  aiaStaleRuntimeNotice,
   aiaStaleSendAction,
   canRunSystemAgent,
   sameAiaRuntimeSettings,
@@ -219,4 +220,27 @@ test("a request never goes into a runtime started with other settings", () => {
 test("an in-flight turn or a pending approval is neither cut off nor written into", () => {
   assert.equal(aiaStaleSendAction(true, "running"), "blocked");
   assert.equal(aiaStaleSendAction(true, "waitingApproval"), "blocked");
+});
+
+const ko = (koText) => koText;
+
+test("a conversation on the current settings shows no stale notice", () => {
+  assert.equal(aiaStaleRuntimeNotice("send", true, ko), null);
+  assert.equal(aiaStaleRuntimeNotice("send", false, ko), null);
+});
+
+test("the stale notice says what the user can do next", () => {
+  // 턴이 도는 중: 작성창 상태와 무관하게 끝나기를 기다리라고 알린다.
+  assert.match(aiaStaleRuntimeNotice("blocked", true, ko), /진행 중인 작업이 끝나거나 중단된 뒤/);
+  assert.match(aiaStaleRuntimeNotice("blocked", false, ko), /진행 중인 작업이 끝나거나 중단된 뒤/);
+  // 보낼 수 있으면 보내는 즉시 정지·재시작, 보낼 수 없으면 새 대화 때 적용.
+  assert.match(aiaStaleRuntimeNotice("restart", true, ko), /보내면 이 대화를 정지하고/);
+  assert.match(aiaStaleRuntimeNotice("restart", false, ko), /새 설정은 대화를 새로 시작할 때 적용/);
+});
+
+test("the stale notice carries an English pair for every branch", () => {
+  const en = (_ko, enText) => enText;
+  assert.match(aiaStaleRuntimeNotice("blocked", true, en), /^The execution settings changed/);
+  assert.match(aiaStaleRuntimeNotice("restart", true, en), /Sending stops it/);
+  assert.match(aiaStaleRuntimeNotice("restart", false, en), /apply when a new conversation starts/);
 });

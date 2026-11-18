@@ -1,4 +1,4 @@
-import { isSkillToolName, launchedSkillName, SKILL_CONTEXT_LABEL_PREFIX } from "./skillUsage.ts";
+import { isSkillToolName, launchedSkillName, skillContextLabelName } from "./skillUsage.ts";
 
 export type ActivityFilter = "all" | "tool" | "reasoning" | "skill" | "error";
 
@@ -17,7 +17,7 @@ export type TranscriptActivityBlock = {
 };
 
 function isSkillTranscriptBlock(block: TranscriptActivityBlock): boolean {
-  if (block.kind === "context") return block.label?.startsWith(SKILL_CONTEXT_LABEL_PREFIX) ?? false;
+  if (block.kind === "context") return skillContextLabelName(block.label ?? "") !== null;
   if (block.kind === "tool_use") return isSkillToolName(block.name);
   return block.kind === "tool_result" && launchedSkillName(block.text) !== null;
 }

@@ -1316,43 +1316,97 @@ fn load_codex_model_catalog(
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
     })?;
-    let result = (|| {
-        let mut stdin = take_child_stdin(&mut child, "Codex 모델 목록")?;
-        let stdout = take_child_stdout(&mut child, "Codex 모델 목록")?;
-        let mut reader = BufReader::new(stdout);
-        codex_app_server_initialize(&mut stdin, &mut reader)?;
+    read_codex_model_catalog(&mut child, CODEX_MODELS_TIMEOUT)
+}
 
-        let mut models = Vec::new();
-        let mut cursor: Option<String> = None;
-        for request_id in 2..=5 {
-            write_json_line(
-                &mut stdin,
-                &json!({
-                    "id": request_id,
-                    "method": "model/list",
-                    // 숨김 모델도 받는다. `visibility:"hide"`라도 실행은 되고(2026-09-20 실측:
-                    // gpt-reserve로 222,631토큰 소비 확인) 별도 사용풀 없이 같은 한도를 깎는다.
-                    // 응답에는 visibility 필드가 없어 어느 쪽이 숨김인지 알 수 없으므로,
-                    // 사람이 고를 대상이 아닌 것은 parse_codex_model이 이름으로 거른다.
-                    "params": {"cursor": cursor, "includeHidden": true}
-                }),
-            )?;
-            let page = read_rpc_result(&mut reader, request_id)?;
-            if let Some(items) = page.get("data").and_then(Value::as_array) {
-                models.extend(items.iter().filter_map(parse_codex_model));
-            }
-            cursor = page
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            if cursor.is_none() {
-                break;
-            }
+/// Codex app-server 와 모델 목록을 주고받는 데 쓰는 시간 예산. app-server 는 카탈로그를
+/// 원격에서 받아 오므로, 바깥 망이 막힌 호스트에서는 `model/list` 응답이 영영 오지 않을 수
+/// 있다. Antigravity 조회와 같은 예산을 쓴다.
+const CODEX_MODELS_TIMEOUT: Duration = ANTIGRAVITY_MODELS_TIMEOUT;
+
+/// 띄워 둔 app-server 자식과 initialize·`model/list` 를 주고받아 모델 목록을 받는다.
+///
+/// `read_rpc_result` 는 줄 단위 블로킹 읽기라, 응답이 없으면 호출 스레드가 그 자리에
+/// 멈춘다. 그 교환을 작업 스레드에 두고 여기서는 시한까지만 기다리며, 시한이 지나면
+/// 자식을 회수해 파이프를 닫는다 — 그러면 작업 스레드도 EOF 로 끝난다. 결과가 어느
+/// 쪽으로 나든 자식은 여기서 회수하므로 정상 조회 뒤에도 app-server 가 남지 않는다.
+fn read_codex_model_catalog(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<Vec<ChatModelOption>, CoreError> {
+    let pipes = take_child_stdin(child, "Codex 모델 목록").and_then(|stdin| {
+        take_child_stdout(child, "Codex 모델 목록").map(|stdout| (stdin, stdout))
+    });
+    let (mut stdin, stdout) = match pipes {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            discard_model_catalog_child(child);
+            return Err(error);
         }
-        Ok(models)
-    })();
-    discard_model_catalog_child(&mut child);
-    result
+    };
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    if let Err(error) = std::thread::Builder::new()
+        .name("codex-model-catalog".to_owned())
+        .spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let _ = sender.send(exchange_codex_model_catalog(&mut stdin, &mut reader));
+        })
+    {
+        discard_model_catalog_child(child);
+        return Err(CoreError::Runtime(format!(
+            "Codex 모델 목록 읽기를 시작하지 못했습니다: {error}"
+        )));
+    }
+    let received = receiver.recv_timeout(timeout);
+    discard_model_catalog_child(child);
+    match received {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(CoreError::Runtime(
+            "Codex 모델 목록 조회 시간이 초과되었습니다".to_owned(),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(CoreError::Runtime(
+            "Codex 모델 목록 읽기가 중단되었습니다".to_owned(),
+        )),
+    }
+}
+
+/// app-server 와의 실제 교환. 호출 스레드를 막지 않도록 [`read_codex_model_catalog`] 가
+/// 작업 스레드에서 부른다.
+fn exchange_codex_model_catalog(
+    stdin: &mut std::process::ChildStdin,
+    reader: &mut impl std::io::BufRead,
+) -> Result<Vec<ChatModelOption>, CoreError> {
+    codex_app_server_initialize(stdin, reader)?;
+
+    let mut models = Vec::new();
+    let mut cursor: Option<String> = None;
+    for request_id in 2..=5 {
+        write_json_line(
+            stdin,
+            &json!({
+                "id": request_id,
+                "method": "model/list",
+                // 숨김 모델도 받는다. `visibility:"hide"`라도 실행은 되고(2026-09-20 실측:
+                // gpt-reserve로 222,631토큰 소비 확인) 별도 사용풀 없이 같은 한도를 깎는다.
+                // 응답에는 visibility 필드가 없어 어느 쪽이 숨김인지 알 수 없으므로,
+                // 사람이 고를 대상이 아닌 것은 `apply_model_catalog_filter` 가
+                // `provider_default_hidden_models` 의 이름으로 거른다.
+                "params": {"cursor": cursor, "includeHidden": true}
+            }),
+        )?;
+        let page = read_rpc_result(reader, request_id)?;
+        if let Some(items) = page.get("data").and_then(Value::as_array) {
+            models.extend(items.iter().filter_map(parse_codex_model));
+        }
+        cursor = page
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(models)
 }
 
 /// 모델 카탈로그 조회에서 공급자를 가리키는 이름. 실패 문구가 모두 이 이름으로 시작한다.
@@ -1374,6 +1428,14 @@ fn spawn_model_catalog_child(
     let mut command = Command::new(executable);
     configure_headless_command(&mut command);
     configure(&mut command);
+    // 조회 자식을 제 프로세스 그룹에 둔다. 회수는 그룹 단위로 하므로, 자식이 띄운 손자
+    // (Codex app-server 의 code-mode 호스트 같은 것)가 stdout 을 물려받아도 시한에 같이
+    // 끝나고 파이프가 닫힌다 — 그래야 읽기 스레드가 EOF 로 풀린다.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
     command.spawn().map_err(|error| {
         CoreError::Runtime(format!(
             "{subject} 모델 목록을 시작하지 못했습니다: {error}"
@@ -1417,6 +1479,10 @@ fn wait_for_model_catalog_exit(
 /// Antigravity의 실패 경로가 같은 두 단계를 쓰되, 본래처럼 정리 오류는 조회 결과를
 /// 덮지 않게 한다.
 fn discard_model_catalog_child(child: &mut Child) {
+    // 자식은 `spawn_model_catalog_child` 가 제 그룹의 리더로 띄웠으므로 그룹 전체를 끝내
+    // 손자가 쥔 파이프까지 닫는다. 이미 끝난 자식의 그룹에 보내는 신호는 무해하다.
+    #[cfg(unix)]
+    let _ = crate::process_signal::signal_process_group(child.id(), libc::SIGKILL);
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -2841,6 +2907,114 @@ mod tests {
         })
         .expect("목록 자식 기동");
         (dir, child)
+    }
+
+    /// `codex app-server --stdio` 를 흉내 내는 셸 스크립트 자식. initialize 에는 바로
+    /// 답하고, 그다음 `model/list` 처리는 `after_initialize` 가 정한다.
+    #[cfg(unix)]
+    fn fake_codex_app_server(after_initialize: &str) -> (tempfile::TempDir, Child) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = schema_dir();
+        let script = dir.path().join("codex");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nread -r line\nprintf '{{\"id\":1,\"result\":{{}}}}\\n'\nread -r line\n{after_initialize}\n"
+            ),
+        )
+        .expect("모의 app-server 스크립트");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("실행 권한");
+        let child = spawn_model_catalog_child(&script, CODEX_CATALOG_SUBJECT, |command| {
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+        })
+        .expect("모의 app-server 기동");
+        (dir, child)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_catalog_exchange_reads_the_model_page_and_reclaims_the_child() {
+        let (_dir, mut child) = fake_codex_app_server(
+            "read -r line\nprintf '{\"id\":2,\"result\":{\"data\":[{\"model\":\"gpt-5.6-sol\",\"isDefault\":true}],\"nextCursor\":null}}\\n'",
+        );
+        let models = read_codex_model_catalog(&mut child, Duration::from_secs(5))
+            .expect("모의 app-server 모델 목록");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "gpt-5.6-sol");
+        assert!(models[0].is_default);
+        assert!(child.try_wait().expect("자식 상태").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_catalog_stalled_model_list_times_out_and_reclaims_the_child() {
+        // initialize 에는 답했지만 `model/list` 응답을 영영 내지 않는 app-server.
+        let (_dir, mut child) = fake_codex_app_server("exec /bin/sleep 30");
+        let started = std::time::Instant::now();
+        let error = read_codex_model_catalog(&mut child, Duration::from_millis(300))
+            .expect_err("응답 없는 model/list 는 시한으로 끝나야 한다");
+        assert!(
+            matches!(&error, CoreError::Runtime(message) if message.contains("시간이 초과")),
+            "시한 초과 문구여야 한다: {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "시한 안에 돌아와야 한다"
+        );
+        assert!(child.try_wait().expect("자식 상태").is_some());
+    }
+
+    /// 손자 프로세스가 stdout 을 물려받은 채 멈춘 app-server. 자식(`sh`)만 죽이면 손자가
+    /// 파이프를 쥐고 남아 읽기 스레드가 풀리지 않으므로, 그룹 회수가 손자까지 끝내는지 본다.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codex_catalog_timeout_reclaims_a_grandchild_holding_stdout() {
+        let (dir, mut child) = fake_codex_app_server(
+            "/bin/sleep 30 &\necho $! > \"$(dirname \"$0\")/grandchild.pid\"\nwait",
+        );
+        let error = read_codex_model_catalog(&mut child, Duration::from_secs(1))
+            .expect_err("응답 없는 model/list 는 시한으로 끝나야 한다");
+        assert!(matches!(&error, CoreError::Runtime(message) if message.contains("시간이 초과")));
+        // 부하가 높으면 `echo` 가 시한 안에 못 돌 수 있다. 한 번의 작은 쓰기라 비어 있지 않은
+        // 파일은 완성본이다.
+        let pid_file = dir.path().join("grandchild.pid");
+        let written =
+            crate::chat::poll_until(Duration::from_secs(2), Duration::from_millis(20), || {
+                Ok::<bool, CoreError>(
+                    fs::read_to_string(&pid_file).is_ok_and(|text| !text.trim().is_empty()),
+                )
+            })
+            .expect("손자 pid 기록 대기");
+        assert!(written, "손자 pid 가 기록되지 않았다");
+        let pid: u32 = fs::read_to_string(&pid_file)
+            .expect("손자 pid 기록")
+            .trim()
+            .parse()
+            .expect("손자 pid");
+        // SIGKILL 은 바로 걸리지만 `/proc` 반영은 잠깐 늦을 수 있다. 좀비(`Z`)도 파이프는
+        // 이미 놓은 상태라 끝난 것으로 본다.
+        let gone =
+            crate::chat::poll_until(Duration::from_secs(2), Duration::from_millis(20), || {
+                Ok::<bool, CoreError>(match fs::read_to_string(format!("/proc/{pid}/status")) {
+                    Ok(status) => status
+                        .lines()
+                        .any(|line| line.starts_with("State:") && line.contains("Z (zombie)")),
+                    Err(error) => {
+                        // 항목이 사라지면 NotFound, 열고 읽는 사이에 사라지면 ESRCH 다.
+                        assert!(
+                            error.kind() == std::io::ErrorKind::NotFound
+                                || error.raw_os_error() == Some(libc::ESRCH),
+                            "/proc 조회: {error}"
+                        );
+                        true
+                    }
+                })
+            })
+            .expect("손자 상태 조회");
+        assert!(gone, "손자 프로세스 {pid} 가 그룹 회수 뒤에도 살아 있다");
     }
 
     #[cfg(unix)]

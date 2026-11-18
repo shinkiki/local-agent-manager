@@ -703,6 +703,59 @@ mod tests {
     }
 
     #[test]
+    fn measurement_groups_use_incoming_shorter_cadence_at_the_boundary_v2() {
+        // V2: 짧은 주기의 절반 직전은 같은 회차, 정확히 절반부터는 다음 회차다.
+        for gap in [HOUR - 1, HOUR] {
+            let groups = measurement_groups(
+                &[point(NOW, 8, &[("a", 1)]), point(NOW + gap, 2, &[("a", 2)])],
+                2,
+            );
+            if gap < HOUR {
+                assert_eq!(groups.len(), 1);
+                assert_eq!(groups[0].runs, BTreeMap::from([("a".to_owned(), 3)]));
+                assert_eq!(groups[0].end, NOW + 16 * HOUR);
+            } else {
+                assert_eq!(groups.len(), 2);
+                assert_eq!(groups[0].runs, BTreeMap::from([("a".to_owned(), 1)]));
+                assert_eq!(groups[0].end, NOW + gap);
+                assert_eq!(groups[1].runs, BTreeMap::from([("a".to_owned(), 2)]));
+                assert_eq!(groups[1].start, NOW + gap);
+                assert_eq!(groups[1].end, NOW + gap + 4 * HOUR);
+            }
+            assert_eq!(groups[0].start, NOW);
+        }
+    }
+
+    #[test]
+    fn measurement_groups_keep_the_shortest_recorded_cadence_v2() {
+        // V2: 뒤에 긴 주기가 와도 이미 합친 짧은 주기의 경계는 늘어나지 않는다.
+        // 입력 순서와 관계없이 시각순으로 묶고, 종료 상한에는 가장 긴 주기를 쓴다.
+        let groups = measurement_groups(
+            &[
+                point(NOW + HOUR, 8, &[("a", 4)]),
+                point(NOW, 8, &[("a", 1)]),
+                point(NOW + HOUR / 2, 2, &[("a", 2)]),
+            ],
+            2,
+        );
+        assert_eq!(
+            groups,
+            vec![
+                MeasurementGroup {
+                    start: NOW,
+                    end: NOW + HOUR,
+                    runs: BTreeMap::from([("a".to_owned(), 3)]),
+                },
+                MeasurementGroup {
+                    start: NOW + HOUR,
+                    end: NOW + 17 * HOUR,
+                    runs: BTreeMap::from([("a".to_owned(), 4)]),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn a_gap_longer_than_the_span_cap_closes_the_group_early() {
         // 멈췄다 켜서 72시간 뒤에 다음 기록이 오면 구간은 간격×2(10시간)에서 닫힌다.
         let points = vec![

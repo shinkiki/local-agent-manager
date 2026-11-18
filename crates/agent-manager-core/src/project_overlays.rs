@@ -751,6 +751,8 @@ pub fn save_project_overlay_set(
         )));
     }
 
+    let repository_root = overlay_repository_root(repository_root);
+    let repository_root = repository_root.as_path();
     let mut paths: Vec<String> = Vec::new();
     let mut rejected: Vec<ProjectOverlayRejection> = Vec::new();
     for raw in &request.paths {
@@ -832,9 +834,7 @@ pub fn save_project_overlay_set(
         set_id: set_id.clone(),
         name,
         repository_id: repository_id.clone(),
-        repository_root: overlay_repository_root(repository_root)
-            .to_string_lossy()
-            .into_owned(),
+        repository_root: repository_root.to_string_lossy().into_owned(),
         paths,
         created_at,
         updated_at: now,
@@ -1354,6 +1354,17 @@ pub(crate) fn verify_stored_patch(patch_path: &Path) -> Result<StoredOverlayPatc
 /// 넘기는 값이 되므로, 미끼로는 통과시킬 수 없다.
 pub(crate) const OVERLAY_DIFF_ARGS: [&str; 3] = ["diff", "--binary", "--full-index"];
 
+/// C19-3: 검사와 적용은 같은 정책으로 patch를 읽어야 한다. 저장소의 공백 설정이
+/// 복원을 막거나 저장한 내용을 바꾸지 않도록 사전 검사의 정책을 함께 쓴다.
+const OVERLAY_APPLY_ARGS: [&str; 3] = ["apply", "--binary", "--whitespace=nowarn"];
+
+fn overlay_apply_check_args() -> Vec<&'static str> {
+    OVERLAY_APPLY_ARGS
+        .into_iter()
+        .chain(["--check", "-"])
+        .collect()
+}
+
 /// 되돌림의 argv. `--source=HEAD`는 무엇으로 되돌리는지를 못박고, `--worktree`는 인덱스를
 /// 건드리지 않는다는 뜻이다. 경로는 argv가 아니라 stdin으로 간다(C16-5).
 pub(crate) const OVERLAY_RESTORE_ARGS: [&str; 5] = [
@@ -1581,7 +1592,7 @@ pub fn check_project_overlay_apply(
     // `--check`는 적용하지 않고 적용 가능 여부만 본다. `--binary`는 patch를 뜰 때와 같은
     // 모양으로 읽기 위한 것이고(C19-1), patch는 argv가 아니라 stdin으로만 들어간다(C16-5).
     let outcome = runner.overlay_read_with_input(
-        &["apply", "--check", "--binary", "--whitespace=nowarn", "-"],
+        &overlay_apply_check_args(),
         Some(&patch),
         LOCAL_MUTATION_TIMEOUT,
     )?;
@@ -1813,7 +1824,7 @@ pub(crate) fn apply_project_overlay_with_env(
     // 그 경로가 `ps`에 남고, 여기서는 넘길 이유도 없다. `--check`는 아무것도 쓰지 않으므로
     // 읽기 갈래로 돈다.
     let checked = runner.overlay_read_with_input(
-        &["apply", "--check"],
+        &overlay_apply_check_args(),
         Some(&patch_bytes),
         LOCAL_MUTATION_TIMEOUT,
     )?;
@@ -1838,8 +1849,11 @@ pub(crate) fn apply_project_overlay_with_env(
     }
 
     // 2단계. 검사를 통과했을 때만 적용한다.
-    let applied =
-        runner.overlay_write_with_input(&["apply"], Some(&patch_bytes), LOCAL_MUTATION_TIMEOUT)?;
+    let applied = runner.overlay_write_with_input(
+        &OVERLAY_APPLY_ARGS,
+        Some(&patch_bytes),
+        LOCAL_MUTATION_TIMEOUT,
+    )?;
     if !applied.success {
         return Err(CoreError::Runtime(format!(
             "overlay를 적용하지 못했습니다: {}",
@@ -2085,6 +2099,8 @@ pub fn exclude_project_overlay_paths(
             "한 번에 경로를 {MAX_PATHS_PER_SET}개까지 뺄 수 있습니다"
         )));
     }
+    let repository_root = overlay_repository_root(repository_root);
+    let repository_root = repository_root.as_path();
     let repository_id = overlay_repository_id(repository_root);
     let dir = repository_dir(app_data_dir, &repository_id).join(&set_id);
     let mut set: ProjectOverlaySet = read_private_json(&dir.join(META_FILE))?
@@ -2783,6 +2799,11 @@ mod tests {
             );
         }
 
+        assert_eq!(OVERLAY_APPLY_ARGS[0], "apply");
+        for required in ["--binary", "--whitespace=nowarn"] {
+            assert!(OVERLAY_APPLY_ARGS.contains(&required), "{required}");
+        }
+
         // 되돌리는 쪽: 하위명령은 restore 여야 한다. checkout 은 범위가 넓어 C19-3 이
         // 고른 명령이 아니다.
         assert_eq!(OVERLAY_RESTORE_ARGS[0], "restore");
@@ -2806,7 +2827,11 @@ mod tests {
 
         // 경로는 argv 가 아니라 stdin 으로 간다(C16-5). pathspec 이 argv 에 섞이면
         // `-` 로 시작하는 경로가 git 의 옵션으로 읽힌다.
-        for arg in OVERLAY_DIFF_ARGS.iter().chain(OVERLAY_RESTORE_ARGS.iter()) {
+        for arg in OVERLAY_DIFF_ARGS
+            .iter()
+            .chain(OVERLAY_RESTORE_ARGS.iter())
+            .chain(OVERLAY_APPLY_ARGS.iter())
+        {
             assert!(
                 arg.starts_with('-') || !arg.contains('/'),
                 "argv 에 경로처럼 보이는 인자가 있습니다: {arg}"
@@ -3036,6 +3061,79 @@ mod tests {
         match GitRunner::open_with_env(&repo.app_data, &repo.root, overlay_test_env()) {
             Ok(runner) => runner,
             Err(failure) => panic!("{}", CoreError::from(failure)),
+        }
+    }
+
+    /// C19-3: 사전 검사와 실제 적용이 같은 공백 정책으로 원문을 복원해야 한다.
+    #[test]
+    fn overlay_c19_apply_preserves_whitespace_despite_repository_policy() {
+        for policy in ["error", "fix"] {
+            let Some(repo) = overlay_repo() else {
+                return;
+            };
+            overlay_git(&repo.root, &["config", "apply.whitespace", policy]);
+            overlay_git(&repo.root, &["config", "core.whitespace", "trailing-space"]);
+            let project_path = repo.root.to_string_lossy().into_owned();
+            let edited = "export const port = 8080; \t\n";
+            fs::write(repo.root.join("src/app.ts"), edited).expect("로컬 변경");
+            let saved = save_project_overlay_set(
+                &repo.app_data,
+                &repo.root,
+                &SaveProjectOverlaySetRequest {
+                    project_path: project_path.clone(),
+                    set_id: None,
+                    name: "공백 보존".to_owned(),
+                    paths: vec!["src/app.ts".to_owned()],
+                },
+            )
+            .expect("세트 저장");
+            let set_id = saved.set_id.expect("세트 id");
+            let snapshot = snapshot_project_overlay_with_env(
+                &repo.app_data,
+                &repo.root,
+                &SnapshotProjectOverlayRequest {
+                    project_path: project_path.clone(),
+                    set_id: set_id.clone(),
+                    trigger: None,
+                },
+                overlay_test_env(),
+            )
+            .expect("스냅샷");
+            assert_eq!(snapshot.outcome, ProjectOverlayOutcome::Snapshotted);
+            assert_eq!(
+                fs::read_to_string(repo.root.join("src/app.ts")).expect("원본"),
+                "export const port = 443;\n"
+            );
+            let checked = check_project_overlay_apply(
+                &repo.app_data,
+                &repo.root,
+                &CheckProjectOverlayApplyRequest {
+                    project_path: project_path.clone(),
+                    set_id: set_id.clone(),
+                },
+            )
+            .expect("사전 검사");
+            assert_eq!(checked.outcome, ProjectOverlayOutcome::Applicable);
+            let applied = apply_project_overlay_with_env(
+                &repo.app_data,
+                &repo.root,
+                &ApplyProjectOverlayRequest {
+                    project_path,
+                    set_id,
+                },
+                overlay_test_env(),
+            )
+            .expect("적용");
+            assert!(applied.succeeded, "policy={policy}: {applied:?}");
+            assert_eq!(applied.outcome, ProjectOverlayOutcome::Applied);
+            assert_eq!(
+                fs::read_to_string(repo.root.join("src/app.ts")).expect("복원 내용"),
+                edited,
+                "policy={policy}: 저장한 공백을 바꾸면 안 된다"
+            );
+            assert_eq!(applied.patch_digest, snapshot.patch_digest);
+            assert_eq!(applied.head_before, applied.head_after);
+            overlay_git(&repo.root, &["diff", "--cached", "--exit-code"]);
         }
     }
 
@@ -4710,5 +4808,99 @@ mod tests {
         let from_root = list_project_overlay_sets(&repo.app_data, &repo.root).expect("list root");
         assert_eq!(from_root.sets.len(), 1, "{from_root:?}");
         assert_eq!(from_root.sets[0].set_id, set_id);
+    }
+
+    /// 2026-11-07. 하위 폴더로 등록된 프로젝트에서도 `save_project_overlay_set`과
+    /// `exclude_project_overlay_paths`가 **저장소 최상위**를 기준으로 경로 경계(G10)를
+    /// 검증하는지 고정한다(C19-1, C16-5, G10).
+    ///
+    /// 무엇이 틀려 있었나. 세트에 담기는 경로(`app/service.ts` 등)는 언제나 저장소 최상위
+    /// 기준인데, 두 함수는 `overlay_repository_root`를 부르기 전에 호출부가 넘긴 등록 프로젝트
+    /// 루트(`<repo>/app`)를 그대로 `validate_repo_path`에 넘겼다. 그러면 `assert_within_root`는
+    /// 실제 대상인 `<repo>/app/...` 대신 `<repo>/app/app/...`을 검사한다.
+    /// (1) `<repo>/app/escaped.ts`가 저장소 밖을 가리키는 심볼릭 링크여도 `<repo>/app/app`이
+    ///     없어 상위 조상 `<repo>/app`에서 정규화가 멈추고 G10 검사를 통과해 저장된다.
+    /// (2) 반대로 `<repo>/app/app`이 같은 저장소 안의 `<repo>/shared`를 가리키는 심볼릭
+    ///     링크이면, 정상 추적 파일인 `app/service.ts`를 저장·제외할 때 `<repo>/app/app/service.ts`
+    ///     가 `<repo>/shared/service.ts`로 풀려 `<repo>/app` 밖이라며 잘못 거절된다.
+    #[cfg(unix)]
+    #[test]
+    fn project_overlay_c19_subfolder_save_and_exclude_validate_paths_against_repository_root() {
+        let Some(repo) = overlay_repo() else {
+            return;
+        };
+        let project = repo.root.join("app");
+        let shared = repo.root.join("shared");
+        fs::create_dir_all(&project).expect("app dir");
+        fs::create_dir_all(&shared).expect("shared dir");
+        fs::write(project.join("service.ts"), "export const port = 443;\n").expect("seed");
+        overlay_git(&repo.root, &["add", "-A"]);
+        overlay_git(&repo.root, &["commit", "-q", "-m", "app"]);
+
+        // 저장소 밖을 가리키는 심볼릭 링크(<repo>/app/escaped.ts -> <outside>/secret.env).
+        let outside = repo.app_data.join("outside-target");
+        fs::create_dir_all(&outside).expect("outside dir");
+        let outside_file = outside.join("secret.env");
+        fs::write(&outside_file, "SECRET=1\n").expect("outside file");
+        std::os::unix::fs::symlink(&outside_file, project.join("escaped.ts"))
+            .expect("escape symlink");
+
+        let project_path = project.to_string_lossy().into_owned();
+
+        // (1) 하위 폴더 입구에서도 저장소 밖을 가리키는 심볼릭 링크는 저장 단계에서 거절돼야 한다(G10).
+        let escaped = save_project_overlay_set(
+            &repo.app_data,
+            &project,
+            &SaveProjectOverlaySetRequest {
+                project_path: project_path.clone(),
+                set_id: None,
+                name: "탈출 링크".to_owned(),
+                paths: vec!["app/escaped.ts".to_owned()],
+            },
+        )
+        .expect("거절 영수증");
+        assert!(
+            !escaped.succeeded,
+            "탈출 심볼릭 링크가 저장을 통과했다: {escaped:?}"
+        );
+        assert_eq!(escaped.outcome, ProjectOverlayOutcome::Rejected);
+        assert_eq!(escaped.rejected.len(), 1);
+        assert_eq!(escaped.rejected[0].path, "app/escaped.ts");
+
+        // (2) `<repo>/app/app -> <repo>/shared` 링크가 있어도 저장소 최상위 기준 경로인
+        // `app/service.ts`의 저장과 제외는 `<repo>/app/service.ts`를 보므로 거절되지 않아야 한다.
+        std::os::unix::fs::symlink(&shared, project.join("app")).expect("in-repo symlink");
+
+        let saved = save_project_overlay_set(
+            &repo.app_data,
+            &project,
+            &SaveProjectOverlaySetRequest {
+                project_path: project_path.clone(),
+                set_id: None,
+                name: "정상 하위 폴더 경로".to_owned(),
+                paths: vec!["app/service.ts".to_owned(), "untouched.ts".to_owned()],
+            },
+        )
+        .expect("정상 저장");
+        assert!(saved.succeeded, "정상 경로가 거절됐다: {saved:?}");
+        assert_eq!(saved.outcome, ProjectOverlayOutcome::Saved);
+        let set_id = saved.set_id.expect("set id");
+
+        let excluded = exclude_project_overlay_paths(
+            &repo.app_data,
+            &project,
+            &ExcludeProjectOverlayPathsRequest {
+                project_path,
+                set_id,
+                paths: vec!["app/service.ts".to_owned()],
+            },
+        )
+        .expect("정상 제외");
+        assert!(
+            excluded.succeeded,
+            "정상 경로 제외가 거절됐다: {excluded:?}"
+        );
+        assert_eq!(excluded.outcome, ProjectOverlayOutcome::Saved);
+        assert_eq!(excluded.affected, vec!["app/service.ts".to_owned()]);
     }
 }

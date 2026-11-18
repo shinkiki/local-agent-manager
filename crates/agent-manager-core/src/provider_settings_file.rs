@@ -259,6 +259,41 @@ mod tests {
     }
 
     #[test]
+    fn g10_c8_2_c13_5_atomic_write_refuses_symlink_targets() {
+        for dangling in [false, true] {
+            let directory = tempfile::tempdir().expect("임시 디렉터리");
+            let original = directory.path().join("original.json");
+            let target = directory.path().join("settings.json");
+            if !dangling {
+                fs::write(&original, b"original").unwrap();
+            }
+            std::os::unix::fs::symlink(&original, &target).unwrap();
+
+            // C8-2/C13-5: recheck at write time, even after an earlier read was accepted.
+            let result = GUARD.atomic_write(&target, b"changed");
+
+            assert!(
+                matches!(result, Err(CoreError::InvalidInput(message)) if message == RULES.symlink)
+            );
+            assert!(fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(fs::read_link(&target).unwrap(), original);
+            if dangling {
+                assert!(!original.exists());
+            } else {
+                assert_eq!(fs::read(&original).unwrap(), b"original");
+            }
+            assert_eq!(
+                fs::read_dir(directory.path()).unwrap().count(),
+                if dangling { 1 } else { 2 },
+                "거부한 쓰기는 임시 파일도 남기면 안 된다"
+            );
+        }
+    }
+
+    #[test]
     fn ensure_parent_creates_one_private_directory_c8_3() {
         let root = tempfile::tempdir().expect("임시 디렉터리");
         let parent = root.path().join("provider");

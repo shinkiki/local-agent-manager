@@ -169,13 +169,14 @@ fn load_settings_unlocked(app_data_dir: &Path) -> Result<BackendServiceSettings,
 /// 확인하는 저장소 동일성이 남의 파일에 묶인다. 판정과 열기 사이의 틈은 유닉스에서
 /// `O_NOFOLLOW`로 닫는다.
 fn read_settings_bytes(path: &Path) -> Result<Option<Vec<u8>>, CoreError> {
+    let rejection = "백엔드 서비스 설정은 일반 파일이어야 합니다";
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(CoreError::InvalidInput(
                 "백엔드 서비스 설정 파일 자리에 심볼릭 링크가 있어 읽지 않습니다".to_owned(),
             ));
         }
-        Ok(_) => {}
+        Ok(metadata) => crate::file_kind::ensure_regular_file(&metadata, rejection)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     }
@@ -184,10 +185,14 @@ fn read_settings_bytes(path: &Path) -> Result<Option<Vec<u8>>, CoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        // G10: 사전 검사 뒤 FIFO로 바뀌어도 열기에서 기다리지 않는다.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
+    let mut file = options.open(path)?;
+    // G10: 경로의 사전 검사뿐 아니라 실제 열린 파일도 읽기 전에 확인한다.
+    crate::file_kind::ensure_regular_file(&file.metadata()?, rejection)?;
     let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut options.open(path)?, &mut bytes)?;
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
     Ok(Some(bytes))
 }
 
@@ -462,6 +467,53 @@ mod tests {
             Err(CoreError::InvalidInput(_))
         ));
         assert!(!outside.path().join("missing.json").exists());
+    }
+
+    #[test]
+    fn g10_settings_directory_is_refused_without_replacing_it() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(SETTINGS_FILE_NAME);
+        fs::create_dir(&path).expect("settings directory");
+        let marker = path.join("keep.txt");
+        fs::write(&marker, b"keep").expect("directory content");
+
+        for result in [
+            load_backend_service_settings(directory.path()),
+            save_backend_service_settings(directory.path(), 5188),
+        ] {
+            assert!(
+                matches!(result, Err(CoreError::InvalidInput(_))),
+                "{result:?}"
+            );
+        }
+        assert_eq!(fs::read(&marker).expect("unchanged content"), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_settings_fifo_is_refused_without_replacing_it() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(SETTINGS_FILE_NAME);
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+        // SAFETY: c_path는 호출 동안 유지되는 NUL 종료 경로다.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        for result in [
+            load_backend_service_settings(directory.path()),
+            save_backend_service_settings(directory.path(), 5188),
+        ] {
+            assert!(
+                matches!(result, Err(CoreError::InvalidInput(_))),
+                "{result:?}"
+            );
+        }
+        assert!(fs::symlink_metadata(&path)
+            .expect("unchanged FIFO")
+            .file_type()
+            .is_fifo());
     }
 
     #[cfg(unix)]

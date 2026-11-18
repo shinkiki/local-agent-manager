@@ -1,6 +1,6 @@
 [package]
 name = "agent-manager-core"
-version = "0.5.0"
+version = "0.6.0"
 description = "Platform-independent domain and application core for Agent Manager"
 edition = "2021"
 publish = false
@@ -10,6 +10,8 @@ repository = "https://github.com/shinkiki/local-agent-manager"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 문서 트리거 대화 키(`conversation.keyPattern`). 이미 Cargo.lock 에 있는 1.x 를 직접 쓴다.
+regex = "1"
 sha2 = "0.10"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
@@ -23,7 +25,7 @@ same-file = "1"
 # Windows `fs::canonicalize`가 돌려주는 `\\?\` 확장 경로를 자식 프로세스(Cypress·Node)에 넘기기
 # 전에 벗긴다. 접두어를 안전하게 뗄 수 있을 때만 떼고, 다른 플랫폼에서는 그대로다.
 dunce = "1"
-rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint", "functions"] }
 # C10. 데이터베이스 기본도구의 내장 드라이버. 둘 다 순수 Rust 동기 클라이언트라 사용자
 # 기기에 클라이언트를 설치하지 않아도 되고, Core의 동기 호출 경로에 그대로 맞는다.
 mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
@@ -39,6 +41,8 @@ chrono-tz = { version = "0.10", features = ["serde"] }
 cron = "0.17"
 bytes = "1"
 base64 = "0.22"
+# C22. kubeconfig 는 YAML 이다. serde_yaml 이 보관(archived)된 뒤 이어받은 판을 쓴다.
+serde_norway = "0.9"
 futures-util = "0.3"
 flate2 = "1"
 http-body-util = "0.1"
@@ -82,6 +86,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 
 [dev-dependencies]
 tempfile = "3"
+# C22 시험용 개인키를 저장소에 두지 않고 시험마다 만든다(이미 rustls 를 통해 들어와 있는 판).
+ring = "0.17"
 
 # 리눅스: 새 Secret Service 통로가 예전 keyring 통로의 항목을 찾고, 예전 판이 새 항목을 읽는지
 # 시험한다(os_keychain::tests::secret_service_phase).

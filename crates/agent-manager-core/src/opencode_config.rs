@@ -234,9 +234,12 @@ pub fn apply(
     plugin_shell: bool,
 ) -> Result<PathBuf, CoreError> {
     let path = config_path(home);
-    let existing = match fs::read_to_string(&path) {
-        Ok(text) if text.trim().is_empty() => Value::Null,
-        Ok(text) => {
+    let existing = match read_config_text(&path).map_err(|error| {
+        CoreError::Runtime(format!("{}를 읽지 못했습니다: {error}", path.display()))
+    })? {
+        None => Value::Null,
+        Some(text) if text.trim().is_empty() => Value::Null,
+        Some(text) => {
             let value: Value = serde_json::from_str(&text).map_err(|error| {
                 CoreError::Runtime(format!(
                     "{}를 읽지 못했습니다: {error}. 파일을 고치거나 옮긴 뒤 다시 시도하세요",
@@ -256,13 +259,6 @@ pub fn apply(
                 )));
             }
             value
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Null,
-        Err(error) => {
-            return Err(CoreError::Runtime(format!(
-                "{}를 읽지 못했습니다: {error}",
-                path.display()
-            )))
         }
     };
     // 지워진 연결을 먼저 걷어낸다. [`merged`]가 남은 공급자를 보고 에이전트 항을 둘지
@@ -288,6 +284,29 @@ pub fn apply(
         .as_bytes(),
     )?;
     Ok(path)
+}
+
+/// G10/C14-2: 실제 부재만 초기화하고, 사용자 설정의 링크·특수 파일은 읽거나 바꾸지 않는다.
+fn read_config_text(path: &Path) -> Result<Option<String>, CoreError> {
+    const REJECTION: &str = "OpenCode 설정 경로는 심볼릭 링크가 아닌 일반 파일이어야 합니다";
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => crate::file_kind::ensure_regular_file(&metadata, REJECTION)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // 사전 검사 뒤 링크·FIFO로 바뀌어도 따라 읽거나 작성자를 기다리지 않는다.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    crate::file_kind::ensure_regular_file(&file.metadata()?, REJECTION)?;
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut file, &mut text)?;
+    Ok(Some(text))
 }
 
 /// 시스템 묶음 에이전트. 작업 공간 도구를 끄고 MCP 도구만 남긴다. 둘을 함께 열면
@@ -2057,6 +2076,115 @@ mod tests {
         assert!(format!("{error}").contains("읽지 못했습니다"));
         // 원본이 그대로 남아 있어야 한다.
         assert_eq!(fs::read_to_string(&path).expect("읽기"), "{ 깨진 json");
+    }
+
+    #[test]
+    fn g10_c14_2_apply_preserves_a_directory_at_the_config_path() {
+        let home = tempfile::tempdir().expect("home");
+        let path = config_path(home.path());
+        fs::create_dir_all(&path).expect("directory");
+        let sentinel = path.join("keep");
+        fs::write(&sentinel, b"unchanged").expect("sentinel");
+        let error = apply(
+            home.path(),
+            &connection("http://x/v1", true),
+            &[],
+            None,
+            &[],
+            false,
+        )
+        .expect_err("directory is not a config");
+        assert!(error.to_string().contains("일반 파일"));
+        assert_eq!(fs::read(&sentinel).expect("sentinel"), b"unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_c14_2_apply_preserves_live_and_dangling_config_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        for live in [true, false] {
+            for enabled in [true, false] {
+                let home = tempfile::tempdir().expect("home");
+                let outside = tempfile::tempdir().expect("outside");
+                let target = outside.path().join("config.json");
+                let original = br#"{"permission":{"edit":"ask"},"marker":"outside-config"}"#;
+                if live {
+                    fs::write(&target, original).expect("outside config");
+                }
+                let path = config_path(home.path());
+                fs::create_dir_all(path.parent().expect("parent")).expect("parent");
+                symlink(&target, &path).expect("config symlink");
+                let error = apply(
+                    home.path(),
+                    &connection("http://x/v1", enabled),
+                    &[],
+                    None,
+                    &[],
+                    false,
+                )
+                .expect_err("a config symlink must not be read or replaced");
+                assert!(error.to_string().contains("일반 파일"));
+                assert!(!error.to_string().contains("outside-config"));
+                assert_eq!(fs::read_link(&path).expect("preserved symlink"), target);
+                if live {
+                    assert_eq!(fs::read(&target).expect("outside config"), original);
+                } else {
+                    assert!(!target.exists());
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_c14_2_apply_refuses_a_fifo_without_waiting_or_replacing_it() {
+        use std::io::Write;
+        use std::os::unix::{
+            ffi::OsStrExt,
+            fs::{FileTypeExt, OpenOptionsExt},
+        };
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let home = tempfile::tempdir().expect("home");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("parent")).expect("parent");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+        // SAFETY: c_path is a valid, NUL-terminated path retained for this call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let reader_home = home.path().to_owned();
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = apply(
+                &reader_home,
+                &connection("http://x/v1", true),
+                &[],
+                None,
+                &[],
+                false,
+            );
+            let _ = sender.send(result);
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(2));
+        if result.is_err() {
+            // Unblock a regressed reader before failing so Cargo never keeps a waiting thread.
+            let mut peer = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+                .expect("FIFO cleanup writer");
+            peer.write_all(b"{}").expect("unblock reader");
+        }
+        reader.join().expect("reader thread");
+        let error = result
+            .expect("config read must not wait for a FIFO writer")
+            .expect_err("FIFO is not a config");
+        assert!(error.to_string().contains("일반 파일"));
+        assert!(fs::symlink_metadata(&path)
+            .expect("preserved FIFO")
+            .file_type()
+            .is_fifo());
     }
 
     #[test]

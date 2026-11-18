@@ -750,6 +750,13 @@ pub struct ChatStartRequest {
     /// 스키마 기반 동적 실행설정. provider별 화이트리스트를 통과한 항목만 CLI에 전달된다.
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
+    /// 가벼운 문맥(Claude 전용). 켜면 스킬·명령 목록, 계정 연동(claude.ai) 커넥터, 셸·파일
+    /// 밖의 내장 도구를 빼고 띄운다 — [`claude_lean_context_args`]. MCP 설정은 그대로다.
+    /// 프롬프트에 필요한 스킬 본문을 이미 넣어 주는 무인 실행(문서 트리거·반복 요청)이
+    /// 호출마다 다시 읽는 고정 문맥을 줄이려는 선택이다. 능력을 줄이기만 하는 값이라
+    /// 클라이언트가 보내도 된다. 다른 공급자에서는 무시한다.
+    #[serde(default)]
+    pub lean_context: bool,
     #[serde(default, skip_deserializing, skip_serializing)]
     pub startup_cancel: Option<Arc<AtomicBool>>,
 }
@@ -877,6 +884,8 @@ pub struct ChatSessionInfo {
     pub profile: ChatProfile,
     /// AIA 런타임이 aia_system MCP를 붙였는지. false면 시스템 도구 없이 대화만 가능하다.
     pub system_tools: bool,
+    /// 가벼운 문맥으로 띄운 Claude 실행인지([`ChatStartRequest::lean_context`]).
+    pub lean_context: bool,
     pub settings: BTreeMap<String, String>,
     /// 이 AIA 대화가 시작할 때 적용한 시스템 에이전트 실행설정. AIA 프로필에서만 채워진다.
     /// 화면은 저장본과 비교해 달라졌으면 정지 후 새 설정으로 다시 시작한다.
@@ -1873,6 +1882,9 @@ struct ChatRuntime {
     /// 그대로 든다 — 붙이는 판단과 화면에 적는 값이 갈라지면 도구를 쥐고도 "없음"으로
     /// 보인다(2026-09-27).
     system_tools: bool,
+    /// 가벼운 문맥으로 띄우는지. Claude 하네스일 때만 참이 된다 — 시작 요청의 값을 그대로
+    /// 들면 화면이 효과 없는 Codex 실행에도 "가벼운 문맥"을 적는다.
+    lean_context: bool,
     mode: ChatMode,
     approval_mode: ChatApprovalMode,
     resuming: bool,
@@ -2123,6 +2135,13 @@ struct RuntimeState {
     /// 컨텍스트 압축 카드는 앱이 띄운 것이라 세지 않는다. 거짓이면 아직 첫 응답 전이라 요청
     /// 알림이 첫 토큰 대기를 무장한다. 참이 된 뒤의 요청 알림은 도중의 재요청이라 무시한다.
     turn_assistant_started: bool,
+    /// 이 턴에서 Claude CLI가 `rate_limit_event`로 요청이 한도에 막혔다(`status: rejected`)고
+    /// 알린 한도 종류(`five_hour`·`seven_day` 등, 모르면 빈 문자열). 실패 결과의 문구가 한도
+    /// 판정을 통과하지 못해도 이 신호가 있으면 한도로 다룬다([`handle_claude_result`]).
+    claude_rate_limit_rejected: Option<String>,
+    /// `system/init`의 MCP 설정 오류를 이미 알렸는가. CLI는 턴마다 init을 다시 보내므로
+    /// 실행당 한 번만 알린다.
+    claude_init_errors_reported: bool,
     /// 실패 턴을 앱 소유 실행 이력에 남길 때 함께 기록할 마지막 오류.
     last_error: Option<String>,
     /// 사용자가 승인 카드에서 "세션 동안 허용"을 골라 이 실행에만 적용된 권한 모드.
@@ -2232,6 +2251,8 @@ impl RuntimeState {
             response_progress_seq: 0,
             claude_request_seq: 0,
             turn_assistant_started: false,
+            claude_rate_limit_rejected: None,
+            claude_init_errors_reported: false,
             last_error: None,
             session_mode: None,
             plan_auto_approval: false,
@@ -2313,6 +2334,7 @@ impl RuntimeState {
         self.active_turn_started_at = Some(now_ms());
         self.last_activity_at = Some(now_ms());
         self.turn_assistant_started = false;
+        self.claude_rate_limit_rejected = None;
         self.last_turn_status = None;
         self.reset_captured_output();
         self.active_turn_input = Some(input_text.to_owned());
@@ -4816,6 +4838,7 @@ impl ChatSupervisor {
             approval_mode,
             resuming,
             unattended: request.unattended,
+            lean_context: request.lean_context && request.source.harness() == Harness::Claude,
             pin_account: request.pin_account,
             profile,
             decision_policy: request.decision_policy,
@@ -6633,9 +6656,23 @@ impl ChatRuntime {
         baseline: WatchdogBaseline,
         kind: TurnWatchdogKind,
     ) {
+        self.spawn_turn_progress_watchdog_with_grace(turn_id, baseline, kind, Duration::ZERO);
+    }
+
+    /// [`Self::spawn_turn_progress_watchdog`]에 `grace`만큼 한도를 늘린 것. CLI가 다음 요청까지
+    /// 스스로 쉬겠다고 알린 시간은 굳은 것이 아니므로 그만큼 더 기다린다.
+    fn spawn_turn_progress_watchdog_with_grace(
+        self: &Arc<Self>,
+        turn_id: &str,
+        baseline: WatchdogBaseline,
+        kind: TurnWatchdogKind,
+        grace: Duration,
+    ) {
         let runtime = Arc::clone(self);
         let turn_id = turn_id.to_owned();
-        thread::spawn(move || run_turn_progress_watchdog(&runtime, &turn_id, baseline, kind));
+        thread::spawn(move || {
+            run_turn_progress_watchdog(&runtime, &turn_id, baseline, kind, grace)
+        });
     }
 
     /// CLI가 `system/status: requesting`으로 API 요청을 보냈다고 알렸다.
@@ -8203,6 +8240,7 @@ impl ChatRuntime {
                 ),
             profile: self.profile,
             system_tools: self.system_tools,
+            lean_context: self.lean_context,
             settings: self.dynamic_settings.clone(),
             aia_runtime: self.aia_runtime.clone(),
             record_session: self.record_session,
@@ -8785,10 +8823,19 @@ impl TurnWatchdogKind {
         }
     }
 
+    /// 기본 한도로 만든 문구. 시험이 문구 계약을 확인하는 자리다.
+    #[cfg(test)]
+    fn message(self) -> String {
+        self.message_after(self.timeout())
+    }
+
+    /// 실제로 기다린 한도로 문구를 만든다. 재시도 대기만큼 늘린 워치독
+    /// ([`handle_claude_api_retry`])이 늘어난 시간을 그대로 적게 한다.
+    ///
     /// 두 문구 모두 "응답을 시작하지"를 담는다 — [`runtime_failure_code`]가 그 조각으로
     /// `responseTimeout`을 가린다. 한쪽만 바꾸면 같은 실패가 다른 코드로 기록된다.
-    fn message(self) -> String {
-        let seconds = self.timeout().as_secs();
+    fn message_after(self, timeout: Duration) -> String {
+        let seconds = timeout.as_secs();
         match self {
             Self::Start => format!(
                 "CLI가 {seconds}초 동안 응답을 시작하지 않아 세션을 강제 종료합니다. 작업 경로의 \
@@ -8810,8 +8857,15 @@ fn run_turn_progress_watchdog(
     turn_id: &str,
     baseline: WatchdogBaseline,
     kind: TurnWatchdogKind,
+    grace: Duration,
 ) {
-    run_turn_progress_watchdog_with_timeout(runtime, turn_id, baseline, kind, kind.timeout());
+    run_turn_progress_watchdog_with_timeout(
+        runtime,
+        turn_id,
+        baseline,
+        kind,
+        kind.timeout().saturating_add(grace),
+    );
 }
 
 /// [`run_turn_progress_watchdog`]의 본문. 한도를 따로 받아 시험이 짧게 돌린다.
@@ -8830,7 +8884,7 @@ fn run_turn_progress_watchdog_with_timeout(
                 && state.claude_request_seq == baseline.request_seq
                 && state.active_turn_id.as_deref() == Some(turn_id)
         },
-        &kind.message(),
+        &kind.message_after(timeout),
         "failed",
     );
 }
@@ -9081,6 +9135,8 @@ fn spawn_managed_chat_child(
     apply_account_credential_env(&mut command, runtime)?;
     apply_local_llm_api_key_env(&mut command, runtime)?;
     apply_prompt_cache_env(&mut command, runtime);
+    apply_unattended_retry_env(&mut command, runtime);
+    apply_lean_context_env(&mut command, runtime);
     configure_managed_chat_command(&mut command);
     command
         .spawn()
@@ -9111,6 +9167,58 @@ fn apply_prompt_cache_env(command: &mut Command, runtime: &ChatRuntime) {
     if uses_short_prompt_cache(runtime) {
         command.env(CLAUDE_FORCE_5M_PROMPT_CACHE_ENV, "1");
     }
+}
+
+/// Claude CLI 무인 재시도 모드 스위치(2.1.199~, 2.1.311 번들에서 확인). 켜면 과부하(529)와
+/// 한도 아닌 429를 횟수 제한 없이 다시 시도하고, 총 대기 시간은
+/// [`CLAUDE_RETRY_WATCHDOG_MAX_WAIT_ENV`]가 묶는다. 끄면 529가 세 번 이어질 때 턴이 실패한다.
+const CLAUDE_RETRY_WATCHDOG_ENV: &str = "CLAUDE_CODE_RETRY_WATCHDOG";
+const CLAUDE_RETRY_WATCHDOG_MAX_WAIT_ENV: &str = "CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS";
+/// 사용량 한도(`anthropic-ratelimit-unified-status: rejected`)를 기다리는 상한(2.1.301~).
+/// 비우면 재설정 시각(최대 6시간)까지 기다린다.
+const CLAUDE_RETRY_WATCHDOG_MAX_USAGE_LIMIT_WAIT_ENV: &str =
+    "CLAUDE_CODE_RETRY_WATCHDOG_MAX_USAGE_LIMIT_WAIT_MS";
+/// 요청 하나가 과부하 재시도로 기다릴 수 있는 총 시간. 회차 하나가 과부하 시간대를 넘길 만큼
+/// 길되, 멈춘 회차가 반복 요청의 다음 틱을 몇 시간씩 막지 않을 만큼 짧게 둔다.
+const CLAUDE_RETRY_WATCHDOG_MAX_WAIT: Duration = Duration::from_secs(30 * 60);
+/// 사용량 한도 대기 상한. 0을 넣으면 안 된다 — CLI가 이 값을 최소 1로 검사해(2.1.311 번들
+/// `int({min:1})`) 0은 버리고 상한 없음(재설정까지 최대 6시간)으로 돌아간다. 1밀리초면 한도
+/// 응답에서 곧바로 실패로 끝난다(초과 사용분이 허용된 계정만 1밀리초 안에서 한 번 다시 묻는다).
+const CLAUDE_RETRY_WATCHDOG_NO_USAGE_LIMIT_WAIT_MS: &str = "1";
+
+/// 무인 실행이 과부하에 쉽게 지지 않게 CLI 재시도 모드를 켠다 — Claude 일반 무인 실행만.
+///
+/// 사람이 보는 채팅은 오래 기다리기보다 실패를 보고 다시 보내는 편이 낫고, AIA는 대화형이라
+/// 뺀다. 무인 회차는 529가 세 번 이어지면 그대로 실패로 끝나 다음 틱까지 일을 잃었다.
+///
+/// 사용량 한도는 기다리지 않는다([`CLAUDE_RETRY_WATCHDOG_NO_USAGE_LIMIT_WAIT_MS`]). CLI가
+/// 재설정까지 몇 시간 잠들면 앱의 계정 자동전환·입력 보존·반복 요청 대기(`WaitingForUsage`)가
+/// 한도 응답을 받지 못해 돌지 않는다. 상한이 다 차면 CLI는 한도 응답으로 실패해 지금까지와
+/// 같은 경로를 탄다.
+///
+/// 재시도 사이 대기는 보통 최대 5분이고 `retry-after`가 붙은 429는 더 길 수 있어 첫 토큰
+/// 워치독(300초)과 겹친다. 그래서
+/// `system/api_retry`가 오면 워치독을 그 대기만큼 늦춘다([`handle_claude_api_retry`]).
+/// 환경 변수라 이 기능을 모르는 옛 CLI는 그냥 무시한다.
+fn uses_unattended_retry_watchdog(runtime: &ChatRuntime) -> bool {
+    runtime.source == ProviderId::Claude
+        && runtime.profile == ChatProfile::Standard
+        && runtime.unattended
+}
+
+fn apply_unattended_retry_env(command: &mut Command, runtime: &ChatRuntime) {
+    if !uses_unattended_retry_watchdog(runtime) {
+        return;
+    }
+    command.env(CLAUDE_RETRY_WATCHDOG_ENV, "1");
+    command.env(
+        CLAUDE_RETRY_WATCHDOG_MAX_WAIT_ENV,
+        CLAUDE_RETRY_WATCHDOG_MAX_WAIT.as_millis().to_string(),
+    );
+    command.env(
+        CLAUDE_RETRY_WATCHDOG_MAX_USAGE_LIMIT_WAIT_ENV,
+        CLAUDE_RETRY_WATCHDOG_NO_USAGE_LIMIT_WAIT_MS,
+    );
 }
 
 /// 기동 직후 자식의 표준 입력을 회수한다. 세 공급자 기동 경로와 모델 목록 조회가
@@ -11443,6 +11551,14 @@ fn claude_stream_cli_args(runtime: &ChatRuntime, resume: bool) -> Vec<String> {
     push_flag(&mut args, "--input-format", "stream-json");
     push_flag(&mut args, "--output-format", "stream-json");
     args.push("--include-partial-messages".to_owned());
+    // 작업 폴더·추가 폴더·git 상태 같은 기기별 칸을 시스템 프롬프트에서 첫 사용자 메시지로
+    // 옮긴다(2.1.98~). 그 칸이 시스템 프롬프트에 있으면 폴더가 다른 기동마다 그 뒤의
+    // `--append-system-prompt`까지 캐시가 빗나간다. 실측(2026-11-17, 2.1.311, 다른 폴더에서
+    // 연속 기동, 덧붙인 지시 약 1.3만 토큰): 캐시 쓰기 19,223 → 1,514, 읽기 0 → 18,333.
+    // 옮긴 칸은 세션 기록·스트림에 남지 않아 화면 말풍선에 보이지 않는다(같은 날 확인).
+    args.push("--exclude-dynamic-system-prompt-sections".to_owned());
+    // 가변 인자 `--tools` 뒤에 언제나 `--permission-mode`가 오도록 이 자리에 둔다.
+    args.extend(claude_lean_context_args(runtime));
     push_flag(
         &mut args,
         "--permission-mode",
@@ -11516,6 +11632,52 @@ fn claude_stream_cli_args(runtime: &ChatRuntime, resume: bool) -> Vec<String> {
         );
     }
     args
+}
+
+/// 가벼운 문맥에서 남기는 내장 도구. 셸과 파일 도구만 둔다 — 무인 실행이 실제로 쓰는
+/// 것은 이것뿐이고, 나머지(서브에이전트·예약·워크트리·웹 등)는 스키마만 매번 읽힌다.
+///
+/// `ToolSearch`는 빼면 안 된다. 이 도구가 없으면 CLI가 지연 로딩을 끄고 붙은 MCP 도구
+/// 스키마를 전부 프롬프트에 싣는다(2.1.311 실측: 도구 30개짜리 MCP 하나로 7.2k → 22.6k
+/// 토큰). 플러그인·aia_system이 붙은 실행에서는 줄이려던 것보다 더 커진다.
+const CLAUDE_LEAN_CONTEXT_TOOLS: &str = "Bash,Read,Write,Edit,Glob,Grep,ToolSearch";
+
+/// 가벼운 문맥에서 claude.ai 계정 연동 커넥터(Gmail·Google Docs 등) 자동 적재를 끄는 환경
+/// 변수. CLI 2.1.311 번들에서 `ENABLE_CLAUDEAI_MCP_SERVERS`가 거짓 값이면 커넥터 목록을
+/// 받지 않는 것을 확인했다. 커넥터는 첫 호출 뒤 비동기로 붙어 두 번째 호출부터 도구 목록과
+/// 안내문(실측 +4.7k 토큰)을 더하고 캐시 프리픽스를 깬다.
+const CLAUDE_AI_CONNECTORS_ENV: &str = "ENABLE_CLAUDEAI_MCP_SERVERS";
+
+/// 가벼운 문맥 인자. 2.1.311 실측(2턴 호출의 고정 문맥): 기본 24.2k(둘째 호출 28.9k) →
+/// 이 인자들과 [`CLAUDE_AI_CONNECTORS_ENV`]로 7.2k.
+/// - `--disable-slash-commands`: 설치된 스킬·명령 목록(skill_listing)을 뺀다(-4.4k).
+/// - `--tools`: 내장 도구를 [`CLAUDE_LEAN_CONTEXT_TOOLS`]로 줄인다(서브에이전트 목록 포함 -12.6k).
+///
+/// MCP 설정은 건드리지 않는다. `--mcp-config`로 넘기는 외부 플러그인·aia_system은 그대로
+/// 붙고, `--strict-mcp-config`는 지금처럼 AIA 프로필에만 붙는다(P5·X7 — 일반 채팅은 사용자의
+/// MCP 서버를 지킨다). claude.ai 커넥터만 환경 변수로 끈다. 실측에서 strict와 환경 변수는
+/// 커넥터를 똑같이 걷어 냈다.
+///
+/// 계획 모드는 `ExitPlanMode`가 있어야 계획을 끝낼 수 있어 그때만 더한다.
+fn claude_lean_context_args(runtime: &ChatRuntime) -> Vec<String> {
+    if !runtime.lean_context {
+        return Vec::new();
+    }
+    let mut tools = CLAUDE_LEAN_CONTEXT_TOOLS.to_owned();
+    if runtime.mode == ChatMode::Plan {
+        tools.push_str(",ExitPlanMode");
+    }
+    vec![
+        "--tools".to_owned(),
+        tools,
+        "--disable-slash-commands".to_owned(),
+    ]
+}
+
+fn apply_lean_context_env(command: &mut Command, runtime: &ChatRuntime) {
+    if runtime.lean_context {
+        command.env(CLAUDE_AI_CONNECTORS_ENV, "false");
+    }
 }
 
 /// 일반 채팅에 붙는 외부 플러그인의 Claude MCP 설정. 플러그인이 없거나 AIA면 None.
@@ -12090,7 +12252,13 @@ fn adopt_claude_continuation(runtime: &Arc<ChatRuntime>, value: &Value) {
         if state.phase != ChatPhase::Ready {
             return;
         }
-        state.claim_turn("")
+        // 이어지는 작업의 한도 거절은 이 턴의 내용 프레임보다 먼저 온다(백그라운드 알림이 깨운
+        // 요청의 429: `rate_limit_event` → 오류 `assistant` → `result`). 턴을 여는 것이 그 신호를
+        // 지우면 결과 판정이 문구에만 기대게 된다.
+        let rejected = state.claude_rate_limit_rejected.take();
+        let turn_id = state.claim_turn("");
+        state.claude_rate_limit_rejected = rejected;
+        turn_id
     };
     runtime.emit_turn_started(turn_id);
     runtime.emit_state();
@@ -12100,6 +12268,181 @@ fn adopt_claude_continuation(runtime: &Arc<ChatRuntime>, value: &Value) {
 /// 갱신한다. 이름은 Claude·Codex 양쪽 카드가 같이 쓴다.
 const CONTEXT_COMPACTION_CARD_ID: &str = "context-compaction";
 const CONTEXT_COMPACTION_CARD_NAME: &str = "컨텍스트 압축";
+
+/// CLI가 재시도할 수 있는 API 오류(과부하 529·한도 아닌 429·연결 오류)를 받고 `retry_delay_ms`
+/// 뒤 다시 묻겠다고 알렸다(`system/api_retry`).
+///
+/// 첫 응답 전이라면 기다리는 중인 첫 토큰 워치독을 물리고, 그 대기만큼 늘린 새 워치독을
+/// 건다. 무인 재시도 모드([`uses_unattended_retry_watchdog`])는 한 번에 보통 최대 5분(`retry-after`가
+/// 붙은 429는 더 길게) 쉬어 300초 워치독과 겹치므로, 이대로 두면 CLI가 정상적으로 기다리는 턴을 앱이 굳었다고 죽인다.
+/// 모델이 이미 답을 내기 시작한 뒤의 재시도는 워치독이 없으므로 안내만 남긴다.
+///
+/// 안내는 시스템 말풍선 하나에 줄을 더한다(턴마다 같은 id). 오류 이벤트로 내면 응답 진행으로
+/// 세여 첫 토큰 워치독이 풀리고, 반복 요청은 그 문구를 실패 사유로 잡는다.
+fn handle_claude_api_retry(runtime: &Arc<ChatRuntime>, value: &Value) {
+    if let Some((turn_id, baseline, grace)) = note_claude_api_retry(runtime, value) {
+        runtime.spawn_turn_progress_watchdog_with_grace(
+            &turn_id,
+            baseline,
+            TurnWatchdogKind::Response,
+            grace,
+        );
+    }
+}
+
+/// [`handle_claude_api_retry`]의 본문. 안내를 남기고, 워치독을 새로 걸어야 하면 그 기준과 늘릴
+/// 시간을 돌려준다 — 스레드는 부르는 쪽이 띄운다(시험이 수 분짜리 스레드를 남기지 않게).
+fn note_claude_api_retry(
+    runtime: &ChatRuntime,
+    value: &Value,
+) -> Option<(String, WatchdogBaseline, Duration)> {
+    let delay = Duration::from_millis(
+        value
+            .get("retry_delay_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    );
+    let armed = runtime
+        .note_claude_request_started()
+        .map(|(turn_id, baseline)| (turn_id, baseline, delay));
+    let turn_id = runtime
+        .with_state(|state| state.active_turn_id.clone())
+        .flatten()?;
+    let attempt = value.get("attempt").and_then(Value::as_u64).unwrap_or(0);
+    let cause = match value.get("error_status").and_then(Value::as_u64) {
+        Some(529) => "API 과부하(529)".to_owned(),
+        Some(429) => "요청 제한(429)".to_owned(),
+        Some(status) => format!("API 오류({status})"),
+        None => "연결 오류".to_owned(),
+    };
+    // 무인 재시도 모드의 `max_retries`는 사실상 상한이 아니라(시간이 묶는다) 적지 않는다.
+    runtime.emit_message_delta(
+        format!("api-retry-{turn_id}"),
+        "system",
+        "message",
+        format!(
+            "{cause}로 {}초 뒤 다시 요청합니다(재시도 {attempt}번째).\n",
+            delay.as_secs().max(1)
+        ),
+    );
+    armed
+}
+
+/// `rate_limit_event`에서 요청이 한도에 막혔다는 신호만 이 턴에 적어 둔다. 판정은 턴을 닫는
+/// [`handle_claude_result`]가 한다 — 같은 이벤트가 `allowed_warning`처럼 경고만 실어 오기도
+/// 하고, 실측(2026-11-17)에서는 `status: allowed`인데 `overageStatus: rejected`인 프레임도
+/// 왔다. 초과 사용분 거절은 구독 한도 안의 요청을 막지 않으므로 `status`만 본다.
+fn note_claude_rate_limit_event(runtime: &ChatRuntime, value: &Value) {
+    let Some(info) = value.get("rate_limit_info") else {
+        return;
+    };
+    let rejected = claude_hard_rate_limit_rejection(info);
+    // 가장 최근 신호를 따른다. 한도가 풀려 `allowed`가 다시 오면 앞서 적어 둔 거절을 지운다 —
+    // 이어지는 작업 턴은 거절 신호를 Ready 구간 너머로 옮기므로(`adopt_claude_continuation`)
+    // 남겨 두면 한참 뒤 다른 이유로 실패한 턴까지 한도로 적힌다.
+    runtime.with_state(|state| state.claude_rate_limit_rejected = rejected);
+}
+
+/// 요청이 실제로 막힌 구독 한도 거절이면 그 한도 종류(모르면 빈 문자열).
+fn claude_hard_rate_limit_rejection(info: &Value) -> Option<String> {
+    if info.str_field("status") != Some("rejected") {
+        return None;
+    }
+    // 구독 한도가 찼어도 초과 사용분으로 계속 처리하는 중이면 요청이 막힌 것이 아니다. 그 턴이
+    // 다른 이유(과부하 상한·턴 수 상한·잘못된 요청)로 실패했는데 한도로 적으면 계정을 쓸데없이
+    // 넘기고 반복 요청을 대기로 묶는다.
+    let flag = |key: &str| info.get(key).and_then(Value::as_bool) == Some(true);
+    if flag("isUsingOverage")
+        || flag("overageInUse")
+        || matches!(
+            info.str_field("overageStatus"),
+            Some("allowed" | "allowed_warning")
+        )
+    {
+        return None;
+    }
+    let limit_type = info.str_field("rateLimitType").unwrap_or_default();
+    // 모델 하나의 주간 창은 대체 모델(`--fallback-model`)로 이어 갈 수 있어 이 신호만으로
+    // 실행 전체의 한도라 볼 수 없다. 이 경우는 지금까지처럼 문구 판정에 맡긴다.
+    if matches!(limit_type, "seven_day_opus" | "seven_day_sonnet") {
+        return None;
+    }
+    Some(limit_type.to_owned())
+}
+
+/// 실패 결과를 한도로 볼지 정하고, 한도라면 뒤따르는 모든 판정이 같은 결론을 내도록 문구를
+/// 맞춘다.
+///
+/// 한도 판정은 지금 문구 하나에 걸려 있다 — 채팅 상태의 입력 보관([`RuntimeState::apply_error_event`]),
+/// 계정 자동전환 신고, 반복 요청의 사용량 대기(`scheduler`), 세션 실패 갈래(`SessionFailureKind`)가
+/// 모두 [`is_usage_limit_message`]로 같은 문구를 다시 읽는다. CLI가 문구를 바꿔도 `rate_limit_event`는
+/// 그대로이므로, 그 신호로 한도를 확인했는데 문구가 판정을 통과하지 못하면 정해 둔 표식을
+/// 덧붙인다. 네 자리를 따로 고치면 한 자리만 빠뜨려도 회차가 대기 대신 실패로 끝난다.
+fn claude_failure_with_limit_signal(message: &str, rejected: Option<&str>) -> (String, bool) {
+    if is_usage_limit_message(message) {
+        return (message.to_owned(), true);
+    }
+    match rejected {
+        Some(limit_type) => {
+            let scope = if limit_type.is_empty() {
+                String::new()
+            } else {
+                format!(" ({limit_type})")
+            };
+            (format!("{message} — usage limit reached{scope}"), true)
+        }
+        None => (message.to_owned(), false),
+    }
+}
+
+/// `system/init`이 알린 설정 오류를 실행당 한 번 대화에 남긴다. `--mcp-config`로 넘긴 서버가
+/// 형식 검사에서 떨어지면(`mcp_server_errors`, 2.1.219~) CLI는 그 서버만 빼고 조용히 계속한다 —
+/// 회차가 `aia_system`이나 Cypress 도구 없이 돌다 엉뚱한 이유로 실패한다. 플러그인 적재
+/// 실패(`plugin_errors`)도 같다.
+///
+/// 시스템 말풍선으로 남긴다. 오류 이벤트는 응답 진행으로 세여 첫 토큰 워치독을 풀어 버린다.
+fn report_claude_init_errors(runtime: &ChatRuntime, value: &Value) {
+    let mut lines = Vec::new();
+    for error in value.array_field("mcp_server_errors").into_iter().flatten() {
+        lines.push(format!(
+            "- MCP 서버 {}: {} ({})",
+            error.str_field("name").unwrap_or("?"),
+            error.str_field("message").unwrap_or_default(),
+            error.str_field("type").unwrap_or_default(),
+        ));
+    }
+    for error in value.array_field("plugin_errors").into_iter().flatten() {
+        let name = error
+            .str_field("name")
+            .or_else(|| error.str_field("plugin"))
+            .or_else(|| error.str_field("path"))
+            .unwrap_or("?");
+        let message = error
+            .str_field("message")
+            .or_else(|| error.str_field("error"))
+            .map(str::to_owned)
+            .unwrap_or_else(|| json_text(error));
+        lines.push(format!("- 플러그인 {name}: {message}"));
+    }
+    if lines.is_empty() {
+        return;
+    }
+    let first = runtime
+        .with_state(|state| !std::mem::replace(&mut state.claude_init_errors_reported, true))
+        .unwrap_or(false);
+    if !first {
+        return;
+    }
+    runtime.emit_message_delta(
+        "claude-init-errors",
+        "system",
+        "message",
+        format!(
+            "CLI가 설정 일부를 불러오지 못하고 빼 둔 채 시작했습니다. 해당 도구 없이 진행됩니다.\n{}",
+            lines.join("\n")
+        ),
+    );
+}
 
 /// Claude print 모드의 `system/status` 프레임. 압축 시작은 `status: "compacting"`으로,
 /// 끝은 `compact_result: "success" | "failed"`(실패면 `compact_error`)로 온다. CLI는 그
@@ -12177,9 +12520,12 @@ fn handle_stream_cli_message(runtime: &Arc<ChatRuntime>, value: Value) {
         }
         "command_lifecycle" => handle_claude_command_lifecycle(runtime, &value),
         "result" => handle_claude_result(runtime, &value),
+        "rate_limit_event" => note_claude_rate_limit_event(runtime, &value),
         "system" => match value.str_field("subtype") {
             // 컨텍스트 압축 경계 이후의 실제 크기는 다음 턴 usage로만 알 수 있다.
             Some("compact_boundary") => runtime.update_context_usage(None, None, true),
+            Some("api_retry") => handle_claude_api_retry(runtime, &value),
+            Some("init") => report_claude_init_errors(runtime, &value),
             // 모델을 부르러 나갔다는 알림. 첫 응답 전이면 시작 워치독을 물러나게 한다.
             Some("status") if value.str_field("status") == Some("requesting") => {
                 if let Some((turn_id, baseline)) = runtime.note_claude_request_started() {
@@ -12303,14 +12649,23 @@ fn handle_claude_result(runtime: &Arc<ChatRuntime>, value: &Value) {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let interrupted = take_claude_interrupt_pending(runtime);
-    let failure_message = failed
+    let rejected = runtime
+        .with_state(|state| state.claude_rate_limit_rejected.take())
+        .flatten();
+    let (failure_message, usage_limited) = match failed
         .then(|| {
             value
                 .str_field("result")
                 .unwrap_or("CLI 응답이 실패했습니다")
         })
-        .filter(|_| !interrupted);
-    let usage_limited = failure_message.is_some_and(is_usage_limit_message);
+        .filter(|_| !interrupted)
+    {
+        Some(message) => {
+            let (message, limited) = claude_failure_with_limit_signal(message, rejected.as_deref());
+            (Some(message), limited)
+        }
+        None => (None, false),
+    };
     runtime.discard_pending_approvals();
     let completed_status = if had_denials {
         "completedWithDenials"
@@ -12952,7 +13307,11 @@ fn send_managed_process_signal(
 #[cfg(unix)]
 fn wait_for_managed_process_exit(pid: u32, timeout: Duration) -> Result<bool, CoreError> {
     poll_until(timeout, EXIT_POLL_INTERVAL, || {
-        Ok(capture_managed_process_identity(pid)?.is_none())
+        let leader_exited = capture_managed_process_identity(pid)?.is_none();
+        let group_exited = !process_signal::process_group_exists(pid)?;
+        // 복구도 대표 PID뿐 아니라 같은 그룹의 보조 프로세스까지 끝나야 완료다.
+        // 대표가 먼저 끝나면 남은 그룹에 SIGKILL을 보낼 기회를 잃지 않아야 한다.
+        Ok(leader_exited && group_exited)
     })
 }
 
@@ -17433,6 +17792,53 @@ mod tests {
         assert!(!process_signal::process_group_exists(pid).expect("process group lookup"));
     }
 
+    /// V2: 복구는 대표 PID가 사라져도 같은 그룹의 보조 프로세스를 기다린다.
+    #[cfg(unix)]
+    #[test]
+    fn v2_crash_recovery_waits_for_group_members_after_the_leader_exits() {
+        struct Children(Vec<Child>);
+        impl Drop for Children {
+            fn drop(&mut self) {
+                for child in &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let mut children = Children(Vec::new());
+        children.0.push(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("group leader"),
+        );
+        let pid = children.0[0].id();
+        children.0.push(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(pid.try_into().expect("valid group ID"))
+                .spawn()
+                .expect("group member"),
+        );
+        let running = wait_for_managed_process_exit(pid, Duration::ZERO).expect("running group");
+        children.0[0].kill().expect("stop leader");
+        children.0[0].wait().expect("reap leader");
+        let leader_only_exited =
+            wait_for_managed_process_exit(pid, Duration::ZERO).expect("remaining member");
+        children.0[1].kill().expect("stop member");
+        children.0[1].wait().expect("reap member");
+        let all_exited = wait_for_managed_process_exit(pid, Duration::ZERO).expect("empty group");
+
+        assert!(!running, "a running leader must prevent completion");
+        assert!(
+            !leader_only_exited,
+            "a remaining group member must prevent crash recovery completion"
+        );
+        assert!(all_exited, "an empty group must complete recovery");
+    }
+
     #[cfg(unix)]
     #[test]
     fn crash_recovery_never_signals_a_pid_with_mismatched_identity() {
@@ -18366,6 +18772,316 @@ mod tests {
         let mut codex = fixture_runtime(ProviderId::Codex);
         codex.unattended = true;
         assert_eq!(env_of(&codex), None, "Claude CLI 전용 스위치");
+    }
+
+    #[test]
+    fn unattended_claude_runs_retry_through_overload_but_not_through_usage_limits() {
+        let env_of = |runtime: &ChatRuntime| {
+            let mut command = Command::new("true");
+            apply_unattended_retry_env(&mut command, runtime);
+            command
+                .get_envs()
+                .filter_map(|(key, value)| {
+                    Some((key.to_str()?.to_owned(), value?.to_str()?.to_owned()))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let mut round = fixture_runtime(ProviderId::Claude);
+        round.unattended = true;
+        round.resuming = true;
+        let env = env_of(&round);
+        assert_eq!(
+            env.get(CLAUDE_RETRY_WATCHDOG_ENV).map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            env.get(CLAUDE_RETRY_WATCHDOG_MAX_WAIT_ENV)
+                .map(String::as_str),
+            Some("1800000"),
+            "이어 가는 회차도 과부하는 견딘다"
+        );
+        assert_eq!(
+            env.get(CLAUDE_RETRY_WATCHDOG_MAX_USAGE_LIMIT_WAIT_ENV)
+                .map(String::as_str),
+            Some("1"),
+            "0은 CLI가 버려 6시간 대기로 돌아간다 — 한도는 앱의 자동전환이 맡는다"
+        );
+
+        assert!(
+            env_of(&fixture_runtime(ProviderId::Claude)).is_empty(),
+            "사람 채팅"
+        );
+        let mut aia = fixture_runtime(ProviderId::Claude);
+        aia.unattended = true;
+        aia.profile = ChatProfile::Aia;
+        assert!(env_of(&aia).is_empty(), "AIA");
+        let mut codex = fixture_runtime(ProviderId::Codex);
+        codex.unattended = true;
+        assert!(env_of(&codex).is_empty(), "Claude CLI 전용 스위치");
+    }
+
+    #[test]
+    fn claude_moves_per_machine_prompt_sections_out_of_the_system_prompt() {
+        let runtime = fixture_runtime(ProviderId::Claude);
+        assert!(claude_stream_cli_args(&runtime, false)
+            .iter()
+            .any(|arg| arg == "--exclude-dynamic-system-prompt-sections"));
+    }
+
+    #[test]
+    fn api_retry_before_the_first_response_extends_the_watchdog_by_the_retry_delay() {
+        let runtime = Arc::new(fixture_runtime(ProviderId::Claude));
+        {
+            let mut state = runtime.test_state();
+            state.phase = ChatPhase::Running;
+            state.active_turn_id = Some("turn-1".to_owned());
+            state.response_progress_seq = 3;
+            state.claude_request_seq = 1;
+        }
+        let frame = json!({
+            "type": "system", "subtype": "api_retry", "attempt": 2, "max_retries": 10,
+            "retry_delay_ms": 240_000, "error_status": 529,
+        });
+        let (turn_id, baseline, grace) = note_claude_api_retry(&runtime, &frame)
+            .expect("첫 응답 전 재시도는 워치독을 다시 건다");
+        assert_eq!(turn_id, "turn-1");
+        assert_eq!(baseline.request_seq, 2);
+        assert_eq!(grace, Duration::from_secs(240));
+        // 앞 요청 기준의 첫 토큰 워치독은 물러난다 — CLI가 쉬는 동안 세션을 죽이지 않는다.
+        run_turn_progress_watchdog_with_timeout(
+            &runtime,
+            "turn-1",
+            WatchdogBaseline {
+                progress_seq: 3,
+                request_seq: 1,
+            },
+            TurnWatchdogKind::Response,
+            Duration::from_millis(10),
+        );
+        let state = runtime.test_state();
+        assert_eq!(state.phase, ChatPhase::Running);
+        assert_eq!(
+            state.response_progress_seq, 3,
+            "재시도 안내는 모델의 진행이 아니다"
+        );
+        assert!(replay_has!(
+            state.replay,
+            ChatEvent::MessageDelta { id, role, delta, .. }
+                if id == "api-retry-turn-1" && role == "system" && delta.contains("529") && delta.contains("240초")
+        ));
+        drop(state);
+
+        // 모델이 답을 내기 시작한 뒤의 재시도는 안내만 남긴다.
+        runtime.test_state().turn_assistant_started = true;
+        assert!(note_claude_api_retry(&runtime, &frame).is_none());
+        assert!(TurnWatchdogKind::Response
+            .message_after(Duration::from_secs(540))
+            .contains("540초"));
+        assert_eq!(
+            runtime_failure_code(
+                "failed",
+                &TurnWatchdogKind::Response.message_after(Duration::from_secs(540))
+            ),
+            "responseTimeout"
+        );
+    }
+
+    fn running_claude_turn_with_queue() -> Arc<ChatRuntime> {
+        let runtime = Arc::new(fixture_runtime(ProviderId::Claude));
+        let mut state = runtime.test_state();
+        state.phase = ChatPhase::Running;
+        state.active_turn_id = Some("turn-1".to_owned());
+        state.active_turn_input = Some("끊긴 요청".to_owned());
+        drop(state);
+        runtime
+    }
+
+    #[test]
+    fn a_rejected_rate_limit_event_makes_an_unrecognised_failure_a_usage_limit() {
+        let runtime = running_claude_turn_with_queue();
+        handle_stream_cli_message(
+            &runtime,
+            json!({"type": "rate_limit_event", "rate_limit_info": {
+                "status": "rejected", "rateLimitType": "seven_day", "resetsAt": 1_795_000_000,
+            }}),
+        );
+        handle_stream_cli_message(
+            &runtime,
+            json!({"type": "result", "is_error": true, "result": "Request was blocked."}),
+        );
+
+        let state = runtime.test_state();
+        assert_eq!(state.phase, ChatPhase::Stopped, "한도처럼 런타임을 닫는다");
+        let error = state.last_error.clone().expect("오류");
+        assert!(
+            is_usage_limit_message(&error),
+            "문구만 읽는 반복 요청·세션 갈래도 한도로 판정해야 한다: {error}"
+        );
+        assert!(error.contains("seven_day"), "{error}");
+        assert_eq!(
+            state
+                .limit_interrupted_inputs
+                .iter()
+                .map(|held| held.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["끊긴 요청"]
+        );
+        assert!(
+            state.claude_rate_limit_rejected.is_none(),
+            "턴이 닫히면 비운다"
+        );
+    }
+
+    #[test]
+    fn overage_rejection_alone_does_not_turn_a_failure_into_a_usage_limit() {
+        let runtime = running_claude_turn_with_queue();
+        // 실측 프레임(2026-11-17): 구독 한도 안이라 요청은 허용, 초과 사용분만 거절.
+        handle_stream_cli_message(
+            &runtime,
+            json!({"type": "rate_limit_event", "rate_limit_info": {
+                "status": "allowed", "resetsAt": 1_794_898_800, "rateLimitType": "five_hour",
+                "overageStatus": "rejected",
+            }}),
+        );
+        handle_stream_cli_message(
+            &runtime,
+            json!({"type": "result", "is_error": true, "result": "Request was blocked."}),
+        );
+
+        let state = runtime.test_state();
+        assert_ne!(state.phase, ChatPhase::Stopped);
+        assert_eq!(state.last_error.as_deref(), Some("Request was blocked."));
+        assert!(state.limit_interrupted_inputs.is_empty());
+    }
+
+    #[test]
+    fn rejections_served_by_overage_or_a_single_model_window_stay_text_judged() {
+        for info in [
+            json!({"status": "rejected", "rateLimitType": "five_hour", "isUsingOverage": true}),
+            json!({"status": "rejected", "rateLimitType": "five_hour", "overageStatus": "allowed"}),
+            json!({"status": "rejected", "rateLimitType": "seven_day_opus"}),
+        ] {
+            let runtime = running_claude_turn_with_queue();
+            handle_stream_cli_message(
+                &runtime,
+                json!({"type": "rate_limit_event", "rate_limit_info": info}),
+            );
+            handle_stream_cli_message(
+                &runtime,
+                json!({"type": "result", "is_error": true, "result": "Reached max turns (40)"}),
+            );
+            let state = runtime.test_state();
+            assert_eq!(
+                state.last_error.as_deref(),
+                Some("Reached max turns (40)"),
+                "{info}"
+            );
+            assert_ne!(state.phase, ChatPhase::Stopped, "{info}");
+        }
+    }
+
+    #[test]
+    fn a_rejection_before_a_continuation_turn_survives_opening_that_turn() {
+        let runtime = Arc::new(fixture_runtime(ProviderId::Claude));
+        runtime.test_state().phase = ChatPhase::Ready;
+        // 백그라운드 알림이 깨운 요청이 한도에 막힌 순서 그대로.
+        handle_stream_cli_message(
+            &runtime,
+            json!({"type": "rate_limit_event", "rate_limit_info": {
+                "status": "rejected", "rateLimitType": "five_hour",
+            }}),
+        );
+        handle_stream_cli_message(
+            &runtime,
+            json!({"type": "assistant", "error": "rate_limit", "message": {
+                "content": [{"type": "text", "text": "Request was blocked."}],
+            }}),
+        );
+        assert_eq!(
+            runtime.test_state().phase,
+            ChatPhase::Running,
+            "이어지는 작업이 턴을 열었다"
+        );
+        handle_stream_cli_message(
+            &runtime,
+            json!({"type": "result", "is_error": true, "result": "Request was blocked."}),
+        );
+        let state = runtime.test_state();
+        assert_eq!(state.phase, ChatPhase::Stopped);
+        assert!(state
+            .last_error
+            .as_deref()
+            .is_some_and(is_usage_limit_message));
+    }
+
+    #[test]
+    fn a_later_allowed_frame_clears_an_earlier_rejection() {
+        let runtime = running_claude_turn_with_queue();
+        for status in ["rejected", "allowed"] {
+            handle_stream_cli_message(
+                &runtime,
+                json!({"type": "rate_limit_event", "rate_limit_info": {
+                    "status": status, "rateLimitType": "five_hour",
+                }}),
+            );
+        }
+        assert!(runtime.test_state().claude_rate_limit_rejected.is_none());
+        handle_stream_cli_message(
+            &runtime,
+            json!({"type": "result", "is_error": true, "result": "Reached max turns (40)"}),
+        );
+        assert_ne!(runtime.test_state().phase, ChatPhase::Stopped);
+    }
+
+    #[test]
+    fn a_rejection_from_an_earlier_turn_does_not_leak_into_the_next_one() {
+        let mut state = RuntimeState::new(None);
+        state.claude_rate_limit_rejected = Some("five_hour".to_owned());
+        state.claim_turn("다음 요청");
+        assert!(state.claude_rate_limit_rejected.is_none());
+    }
+
+    #[test]
+    fn mcp_config_errors_from_init_are_reported_once_without_counting_as_progress() {
+        let runtime = Arc::new(fixture_runtime(ProviderId::Claude));
+        {
+            let mut state = runtime.test_state();
+            state.phase = ChatPhase::Running;
+            state.active_turn_id = Some("turn-1".to_owned());
+            state.response_progress_seq = 5;
+        }
+        let init = json!({
+            "type": "system", "subtype": "init", "session_id": "s-1",
+            "mcp_server_errors": [{"name": "aia_system", "type": "url_missing_type", "message": "url entry has no type"}],
+        });
+        handle_stream_cli_message(&runtime, init.clone());
+        handle_stream_cli_message(&runtime, init);
+        handle_stream_cli_message(
+            &runtime,
+            json!({"type": "system", "subtype": "init", "session_id": "s-1", "mcp_server_errors": []}),
+        );
+
+        let state = runtime.test_state();
+        assert_eq!(
+            state.response_progress_seq, 5,
+            "첫 토큰 워치독을 풀면 안 된다"
+        );
+        assert!(!state.turn_assistant_started);
+        // 같은 id·kind 의 연속 델타는 리플레이에서 한 항목으로 합쳐지므로 항목 수가 아니라
+        // 본문에 서버 이름이 몇 번 실렸는지로 중복을 잡는다.
+        let mentions: usize = state
+            .replay
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::MessageDelta {
+                    id, role, delta, ..
+                } if id == "claude-init-errors" && role == "system" => {
+                    Some(delta.matches("aia_system").count())
+                }
+                _ => None,
+            })
+            .sum();
+        assert_eq!(mentions, 1, "턴마다 오는 init에 매번 알리지 않는다");
     }
 
     #[test]
@@ -19826,6 +20542,7 @@ mod tests {
     fn fixture_runtime_with_mode(source: ProviderId, mode: ChatMode) -> ChatRuntime {
         ChatRuntime {
             system_tools: false,
+            lean_context: false,
             chat_id: "chat".to_owned(),
             manager_instance_id: "test-manager".to_owned(),
             started_at: 0,
@@ -20178,6 +20895,139 @@ mod tests {
                 .as_deref(),
             Some(a.as_str())
         );
+    }
+
+    /// 가벼운 문맥은 opt-in 이다. 꺼진 실행의 인자는 예전과 같아야 한다.
+    #[test]
+    fn lean_context_off_keeps_claude_args_unchanged() {
+        let runtime = fixture_runtime(ProviderId::Claude);
+        assert!(!runtime.lean_context);
+        let args = claude_stream_cli_args(&runtime, false);
+        for flag in ["--tools", "--disable-slash-commands", "--strict-mcp-config"] {
+            assert!(!args.iter().any(|argument| argument == flag), "{flag}");
+        }
+        let mut command = Command::new("/cli");
+        apply_lean_context_env(&mut command, &runtime);
+        assert!(command.get_envs().next().is_none());
+    }
+
+    /// 가벼운 문맥: 스킬·명령 목록과 셸·파일 밖 내장 도구를 빼되, 명시한 MCP 설정(외부
+    /// 플러그인·aia_system)은 그대로 붙이고 일반 채팅에 strict 를 더하지 않는다(P5·X7).
+    /// `ToolSearch`가 빠지면 MCP 도구 스키마가 전부 프롬프트에 실리므로 꼭 남는다.
+    #[test]
+    fn lean_context_trims_tools_and_skill_listing_but_keeps_explicit_mcp_config() {
+        let mut runtime = fixture_runtime(ProviderId::Claude);
+        runtime.lean_context = true;
+        runtime.unattended = true;
+        runtime.plugin_mcp_servers = vec![(
+            CYPRESS_MCP_SERVER_ID.to_owned(),
+            "http://127.0.0.1:1/cypress".to_owned(),
+        )];
+        runtime.system_mcp_url = Some("http://127.0.0.1:1/system/chat".to_owned());
+        let args = claude_stream_cli_args(&runtime, false);
+
+        let tools = args
+            .iter()
+            .position(|argument| argument == "--tools")
+            .expect("--tools");
+        let listed: Vec<&str> = args[tools + 1].split(',').collect();
+        for tool in [
+            "Bash",
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+            "ToolSearch",
+        ] {
+            assert!(listed.contains(&tool), "{tool}");
+        }
+        assert!(!listed.contains(&"Agent"));
+        assert!(!listed.contains(&"ExitPlanMode"));
+        // 값이 여러 개인 옵션이라 목록 다음에는 반드시 플래그가 와야 한다.
+        assert!(args[tools + 2].starts_with("--"));
+        assert_eq!(
+            args.iter()
+                .filter(|argument| *argument == "--disable-slash-commands")
+                .count(),
+            1
+        );
+
+        let config = args
+            .iter()
+            .position(|argument| argument == "--mcp-config")
+            .expect("--mcp-config");
+        let config_json: Value = serde_json::from_str(&args[config + 1]).expect("json");
+        assert!(config_json["mcpServers"][CYPRESS_MCP_SERVER_ID].is_object());
+        assert!(config_json["mcpServers"]["aia_system"].is_object());
+        assert!(args[config + 2].starts_with("--"));
+        assert!(!args
+            .iter()
+            .any(|argument| argument == "--strict-mcp-config"));
+
+        // 무인 실행에는 승인 통로가 없다. 줄인 도구 목록이 그 규칙을 바꾸지 않는다.
+        assert!(!args
+            .iter()
+            .any(|argument| argument == "--permission-prompt-tool"));
+
+        // 이어 가는 재기동도 같은 문맥으로 뜬다.
+        let resumed = claude_stream_cli_args(&runtime, true);
+        assert!(resumed.iter().any(|argument| argument == "--tools"));
+
+        let mut command = Command::new("/cli");
+        apply_lean_context_env(&mut command, &runtime);
+        let envs: Vec<_> = command.get_envs().collect();
+        assert_eq!(
+            envs,
+            vec![(
+                std::ffi::OsStr::new(CLAUDE_AI_CONNECTORS_ENV),
+                Some(std::ffi::OsStr::new("false"))
+            )]
+        );
+    }
+
+    /// AIA 프로필의 aia_system 설정과 strict 는 가벼운 문맥에서도 한 번만 붙고, 계획
+    /// 모드는 계획을 끝낼 `ExitPlanMode`를 받는다.
+    #[test]
+    fn lean_context_keeps_aia_strict_mcp_once_and_plan_exit() {
+        let mut aia = aia_runtime(ProviderId::Claude, Some("http://127.0.0.1:1/mcp/x"));
+        aia.lean_context = true;
+        let args = claude_stream_cli_args(&aia, false);
+        assert_eq!(
+            args.iter()
+                .filter(|argument| *argument == "--strict-mcp-config")
+                .count(),
+            1
+        );
+        let config = args
+            .iter()
+            .position(|argument| argument == "--mcp-config")
+            .expect("--mcp-config");
+        assert!(args[config + 1].contains("aia_system"));
+        assert!(args.iter().any(|argument| argument == "--tools"));
+
+        let mut plan = fixture_runtime_with_mode(ProviderId::Claude, ChatMode::Plan);
+        plan.lean_context = true;
+        let args = claude_stream_cli_args(&plan, false);
+        let tools = args
+            .iter()
+            .position(|argument| argument == "--tools")
+            .expect("--tools");
+        assert!(args[tools + 1]
+            .split(',')
+            .any(|tool| tool == "ExitPlanMode"));
+    }
+
+    /// 옛 시작 요청(필드 없음)은 꺼짐으로 읽힌다.
+    #[test]
+    fn lean_context_defaults_to_off_for_old_start_requests() {
+        let base = json!({"source": "claude", "model": null, "mode": "workspace"});
+        let old: ChatStartRequest = serde_json::from_value(base.clone()).expect("old request");
+        assert!(!old.lean_context);
+        let mut lean = base;
+        lean["leanContext"] = json!(true);
+        let lean: ChatStartRequest = serde_json::from_value(lean).expect("lean request");
+        assert!(lean.lean_context);
     }
 
     fn aia_runtime(source: ProviderId, mcp_url: Option<&str>) -> ChatRuntime {
@@ -20720,6 +21570,7 @@ mod tests {
             account_id: None,
             capture_id: None,
             settings: BTreeMap::new(),
+            lean_context: false,
             startup_cancel: None,
         }
     }

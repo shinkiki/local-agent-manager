@@ -520,6 +520,45 @@ mod tests {
         );
     }
 
+    /// C16-11/C17-6: a failed git-token read must preserve an earlier use, not
+    /// merely leave a never-used entry empty. No OS keychain is accessed.
+    #[test]
+    fn c16_11_c17_6_failed_git_value_read_preserves_existing_usage() {
+        for keychain_error in [false, true] {
+            let directory = stored_secret();
+            let mut store: SavedSecretStore = STORE.read(directory.path()).expect("metadata");
+            store.secrets[0].last_used_at = Some(42);
+            STORE
+                .save_unlocked(directory.path(), &store)
+                .expect("previous usage");
+            let before = std::fs::read(STORE.path(directory.path())).expect("metadata before");
+            let mut read_called = false;
+            let result = take_for_git_remote_with(directory.path(), "API_KEY", || {
+                read_called = true;
+                if keychain_error {
+                    Err(CoreError::Runtime("synthetic keychain failure".to_owned()))
+                } else {
+                    Ok(None)
+                }
+            });
+            assert!(
+                read_called,
+                "C16-11: the registered value must be requested"
+            );
+            if keychain_error {
+                assert!(matches!(result, Err(CoreError::Runtime(message))
+                    if message == "synthetic keychain failure"));
+            } else {
+                assert!(result.expect("missing keychain item").is_none());
+            }
+            assert_eq!(
+                std::fs::read(STORE.path(directory.path())).expect("metadata after"),
+                before,
+                "C17-6/G7: a failed read must not rewrite the previous usage",
+            );
+        }
+    }
+
     #[test]
     fn c16_11_git_usage_timestamp_write_failure_does_not_discard_the_value() {
         let directory = stored_secret();

@@ -127,17 +127,17 @@ export function findingId(input: { file: string; symptom: string; symbol?: strin
 /** 장부를 항목 id 집합으로 누른다. 같은 id 가 두 번 적혀 있으면 함께 돌려준다. */
 export function ledgerIndex(ledger: LedgerEntry[] = []): { reviewed: Set<string>; duplicates: string[] } {
   const reviewed = new Set<string>();
-  const duplicates: string[] = [];
+  const duplicates = new Set<string>();
   for (const entry of ledger) {
     const itemId = String(entry?.itemId ?? '').trim();
     if (itemId.length === 0) continue;
     if (reviewed.has(itemId)) {
-      if (!duplicates.includes(itemId)) duplicates.push(itemId);
+      duplicates.add(itemId);
       continue;
     }
     reviewed.add(itemId);
   }
-  return { reviewed, duplicates };
+  return { reviewed, duplicates: [...duplicates] };
 }
 
 /**

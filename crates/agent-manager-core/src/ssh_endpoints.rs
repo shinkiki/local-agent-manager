@@ -877,8 +877,17 @@ fn check_ssh_endpoint_with(
     ]);
     let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
     let env = crate::ssh_askpass::env_of(askpass.as_ref());
-    let outcome =
-        crate::cli_interface::run_capped_with_env(executable, &borrowed, CHECK_TIMEOUT, &env)?;
+    // C9-11. SSH가 띄운 프록시 등이 출력 파이프를 쥔 채 남아도 제한 시간을 지킨다.
+    let outcome = crate::cli_interface::run_capped_with(
+        executable,
+        &borrowed,
+        CHECK_TIMEOUT,
+        &crate::cli_interface::CappedOptions {
+            env: &env,
+            own_process_group: true,
+            ..crate::cli_interface::CappedOptions::default()
+        },
+    )?;
     drop(askpass);
 
     Ok(SshEndpointCheckReceipt {
@@ -2727,6 +2736,72 @@ mod tests {
             check_message(false, true, ""),
             "정해진 시간 안에 접속하지 못했습니다"
         );
+    }
+
+    /// C9-11. 부모가 먼저 끝나도 출력 파이프를 쥔 후손 때문에 확인이 멈추지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn c9_11_check_timeout_reaps_descendants_after_the_ssh_parent_exits() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let home = tempfile::tempdir().expect("home");
+        let app_data = tempfile::tempdir().expect("app data");
+        let helper = tempfile::tempdir().expect("mock ssh");
+        let fingerprint = fixture(home.path(), true);
+        set_ssh_key_endpoint_for_test(home.path(), app_data.path(), &request(&fingerprint, true))
+            .expect("save");
+        let reference = SshServerRef {
+            server_id: sid(app_data.path(), &fingerprint),
+        };
+        let executable = helper.path().join("ssh");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ncd {} || exit 1\n(while [ ! -f stop ]; do printf x >> heartbeat; sleep 0.05; done) &\nexit 0\n",
+                shell_quote(&helper.path().to_string_lossy()),
+            ),
+        )
+        .expect("mock ssh script");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).expect("executable");
+
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result =
+                check_ssh_endpoint_with(home.path(), app_data.path(), &executable, &reference);
+            let _ = sender.send((result, started.elapsed()));
+        });
+        let limit = CHECK_TIMEOUT + Duration::from_secs(3);
+        let first = receiver.recv_timeout(limit);
+        let returned_before_cleanup = first.is_ok();
+        let heartbeat = || {
+            fs::read(helper.path().join("heartbeat"))
+                .unwrap_or_default()
+                .len()
+        };
+        let at_return = heartbeat();
+        std::thread::sleep(Duration::from_millis(150));
+        let after_return = heartbeat();
+        // 회귀한 구현에서도 후손이 스스로 끝나게 해 시험 자체가 영원히 막히지 않는다.
+        fs::write(helper.path().join("stop"), b"1").expect("cleanup descendants");
+        let (result, elapsed) = first.unwrap_or_else(|_| {
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("result after cleanup")
+        });
+        worker.join().expect("check worker");
+        let receipt = result.expect("check receipt");
+        assert!(at_return > 0, "mock ssh did not start its descendant");
+        assert!(returned_before_cleanup, "check waited for external cleanup");
+        assert!(receipt.timed_out, "descendant escaped the check timeout");
+        assert!(!receipt.reachable, "timed out check reported success");
+        assert!(
+            elapsed < limit,
+            "check exceeded timeout allowance: {elapsed:?}"
+        );
+        assert_eq!(at_return, after_return, "descendant survived the check");
     }
 
     /// C9-13. 명령 정책은 저장본에 그대로 남고, 스킬 목록에 규칙과 방식이 함께 실린다.

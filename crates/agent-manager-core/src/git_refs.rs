@@ -56,9 +56,8 @@ pub(crate) fn local_branches(
         if let Some(git_dir) = git_dir(&directory.join(".git")) {
             let common = common_git_dir(&git_dir);
             let mut names = Vec::new();
-            collect_loose_branches(&common.join("refs/heads"), "", 0, limit, &mut names);
-            collect_packed_branches(&common.join("packed-refs"), limit, &mut names);
-            names.retain(|name| accept(name));
+            collect_loose_branches(&common.join("refs/heads"), "", 0, limit, accept, &mut names);
+            collect_packed_branches(&common.join("packed-refs"), limit, accept, &mut names);
             names.sort();
             names.dedup();
             names.truncate(limit);
@@ -107,6 +106,7 @@ fn collect_loose_branches(
     prefix: &str,
     depth: usize,
     limit: usize,
+    accept: &dyn Fn(&str) -> bool,
     out: &mut Vec<String>,
 ) {
     if depth > MAX_REFS_WALK_DEPTH || out.len() >= limit {
@@ -130,17 +130,22 @@ fn collect_loose_branches(
         };
         match entry.file_type() {
             Ok(kind) if kind.is_dir() => {
-                collect_loose_branches(&entry.path(), &full, depth + 1, limit, out)
+                collect_loose_branches(&entry.path(), &full, depth + 1, limit, accept, out)
             }
-            Ok(_) => out.push(full),
-            Err(_) => continue,
+            Ok(_) if accept(&full) => out.push(full),
+            Ok(_) | Err(_) => continue,
         }
     }
 }
 
 /// `packed-refs`는 `<sha> refs/heads/<이름>` 줄의 모음이다. 주석(`#`)과 태그 역참조(`^`)는
 /// 건너뛰고 로컬 브랜치만 고른다.
-fn collect_packed_branches(path: &Path, limit: usize, out: &mut Vec<String>) {
+fn collect_packed_branches(
+    path: &Path,
+    limit: usize,
+    accept: &dyn Fn(&str) -> bool,
+    out: &mut Vec<String>,
+) {
     let Ok(metadata) = fs::metadata(path) else {
         return;
     };
@@ -162,7 +167,7 @@ fn collect_packed_branches(path: &Path, limit: usize, out: &mut Vec<String>) {
         };
         if let Some(branch) = reference.trim().strip_prefix("refs/heads/") {
             // V2: a packed ref may also have a loose copy; count that branch only once.
-            if !branch.is_empty() && !out.iter().any(|name| name == branch) {
+            if !branch.is_empty() && accept(branch) && !out.iter().any(|name| name == branch) {
                 out.push(branch.to_owned());
             }
         }
@@ -318,6 +323,39 @@ mod tests {
             local_branches(root.path(), 500, &|name| name.starts_with("keep-")),
             vec!["keep-1".to_owned(), "keep-2".to_owned()],
             "호출부가 거절할 이름은 목록에 오르지 않는다"
+        );
+    }
+
+    #[test]
+    fn v2_rejected_loose_and_packed_refs_do_not_consume_the_listing_limit() {
+        let root = tempdir().expect("temp");
+        let git = root.path().join(".git");
+        let heads = git.join("refs/heads");
+        fs::create_dir_all(heads.join("feature")).expect("heads");
+        for name in ["feature/drop-loose-1", "drop-loose-2"] {
+            fs::write(heads.join(name), "9f0b2c1d\n").expect("loose ref");
+        }
+        fs::write(
+            git.join("packed-refs"),
+            "9f0b2c1d refs/heads/drop-packed\n\
+             9f0b2c1d refs/heads/keep-2\n\
+             9f0b2c1d refs/heads/keep-1\n",
+        )
+        .expect("packed refs");
+
+        assert_eq!(
+            local_branches(root.path(), 2, &|name| name.starts_with("keep-")),
+            vec!["keep-1".to_owned(), "keep-2".to_owned()],
+            "거절된 낱개·묶음 참조가 상한을 먼저 채워 유효한 브랜치를 가리지 않아야 한다"
+        );
+
+        fs::write(heads.join("feature/keep-nested"), "9f0b2c1d\n").expect("nested loose ref");
+        assert_eq!(
+            local_branches(root.path(), 2, &|name| {
+                name == "feature/keep-nested" || name == "keep-1"
+            }),
+            vec!["feature/keep-nested".to_owned(), "keep-1".to_owned()],
+            "상위 폴더 이름이 조건에 맞지 않아도 하위 잎 브랜치는 거절된 낱개 참조 뒤에서 수집돼야 한다"
         );
     }
 }

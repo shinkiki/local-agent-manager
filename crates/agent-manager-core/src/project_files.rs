@@ -332,9 +332,10 @@ pub fn search_project_files(
     // 저장소가 잠겨 있거나 저장소가 아니어도 이 칸은 답할 수 있다 —
     // `list_project_overlay_sets`가 그렇게 설계된 조회다(C19-1).
     let overlay_paths = overlay_paths_in_project(app_data_dir, root);
+    let offset = project_search_offset(root, status.as_ref());
     let hits = entries
         .into_iter()
-        .map(|entry| project_search_hit(root, entry, status.as_ref(), &overlay_paths))
+        .map(|entry| project_search_hit(&offset, entry, status.as_ref(), &overlay_paths))
         .collect();
     Ok(ProjectFileSearchPage {
         query: needle,
@@ -345,6 +346,27 @@ pub fn search_project_files(
         searched_contents: search_contents,
         excluded,
     })
+}
+
+/// C16-1/C16-9/G10: 요청 전체가 공유하는 저장소 기준 위치를 검색당 한 번 계산한다.
+fn project_search_offset(root: &Path, status: Option<&GitStatus>) -> String {
+    // 저장소 루트 대비 프로젝트의 자리. git 상태를 읽어야만 알 수 있으므로, 읽지 못하면
+    // 빈 값으로 두고 프로젝트가 곧 저장소 루트인 흔한 경우에 맞춘다 — 하위 폴더 프로젝트에서
+    // git이 잠겨 있는 동안 overlay 표시가 비는 것은, 그 때문에 검색이 죽는 것보다 낫다.
+    status
+        .and_then(|status| {
+            // 양쪽을 같은 표기로 맞춘 뒤에 뗀다. `root`는 디스패처가 정규화해 넘긴 경로라
+            // Windows에서 `\\?\C:\...` 꼴이고 `GitStatus::project_path`는 자식에게 보여 줄
+            // 표기(`child_facing`)로 `\\?\`가 떨어져 있다. 그대로 `strip_prefix`하면 하위 폴더
+            // 프로젝트에서 **언제나** 실패해 offset이 비고, git 상태 칸과 overlay 칸이 둘 다
+            // 조용히 비어 버린다(2026-10-04 실측).
+            normalized_relative(
+                &path_guard::child_facing(Path::new(&status.project_path)),
+                &path_guard::child_facing(root),
+            )
+            .ok()
+        })
+        .unwrap_or_default()
 }
 
 /// 한 결과 줄에 git 상태와 overlay 포함 여부를 붙인다(F4).
@@ -363,28 +385,11 @@ pub fn search_project_files(
 /// 루트가 등록 프로젝트 루트라는 사실은 이 기준을 바꾸지 않는다 — 그 검증은 경로를 변환하지
 /// 않고 받아들이기만 한다.
 fn project_search_hit(
-    root: &Path,
+    offset: &str,
     entry: DocumentEntry,
     status: Option<&GitStatus>,
     overlay_paths: &BTreeSet<String>,
 ) -> ProjectFileSearchHit {
-    // 저장소 루트 대비 프로젝트의 자리. git 상태를 읽어야만 알 수 있으므로, 읽지 못하면
-    // 빈 값으로 두고 프로젝트가 곧 저장소 루트인 흔한 경우에 맞춘다 — 하위 폴더 프로젝트에서
-    // git이 잠겨 있는 동안 overlay 표시가 비는 것은, 그 때문에 검색이 죽는 것보다 낫다.
-    let offset = status
-        .and_then(|status| {
-            // 양쪽을 같은 표기로 맞춘 뒤에 뗀다. `root`는 디스패처가 정규화해 넘긴 경로라
-            // Windows에서 `\\?\C:\...` 꼴이고 `GitStatus::project_path`는 자식에게 보여 줄
-            // 표기(`child_facing`)로 `\\?\`가 떨어져 있다. 그대로 `strip_prefix`하면 하위 폴더
-            // 프로젝트에서 **언제나** 실패해 offset이 비고, git 상태 칸과 overlay 칸이 둘 다
-            // 조용히 비어 버린다(2026-10-04 실측).
-            normalized_relative(
-                &path_guard::child_facing(Path::new(&status.project_path)),
-                &path_guard::child_facing(root),
-            )
-            .ok()
-        })
-        .unwrap_or_default();
     let repo_relative = if offset.is_empty() {
         entry.relative_path.clone()
     } else {
@@ -570,10 +575,16 @@ fn project_entry(
         size_bytes: metadata.len(),
         modified_at: modified_ms(metadata),
         is_directory: metadata.is_dir(),
-        preview_kind: metadata
-            .is_file()
-            .then(|| preview_kind_for_path(path, metadata))
-            .transpose()?,
+        preview_kind: if metadata.is_file() {
+            match preview_kind_for_path(path, metadata) {
+                Ok(kind) => Some(kind),
+                // C16-9: 판별 중 사라지거나 읽을 수 없는 파일도 이름으로는 남긴다.
+                Err(CoreError::Io(error)) if is_skippable_walk_error(&error) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        },
     })
 }
 
@@ -761,11 +772,12 @@ mod tests {
         let overlay_paths = BTreeSet::from([r"app\local/main.rs".to_owned()]);
         let entry =
             project_entry(&root, &path, &fs::metadata(&path).expect("metadata")).expect("entry");
-        let hit = project_search_hit(&root, entry.clone(), Some(&status), &overlay_paths);
+        let offset = project_search_offset(&root, Some(&status));
+        let hit = project_search_hit(&offset, entry.clone(), Some(&status), &overlay_paths);
         assert_eq!(hit.git_status, Some(GitChangeKind::Modified));
         assert!(hit.in_overlay);
         let wrong_paths = BTreeSet::from(["app/local/main.rs".to_owned()]);
-        assert!(!project_search_hit(&root, entry, Some(&status), &wrong_paths).in_overlay);
+        assert!(!project_search_hit(&offset, entry, Some(&status), &wrong_paths).in_overlay);
     }
 
     #[test]
@@ -791,6 +803,79 @@ mod tests {
             assert!(read_project_file(&root, "alias/main.rs").is_err());
             assert!(list_project_entries(&root, "alias", None, None).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c16_9_unreadable_preview_preserves_listing_and_name_hits() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, root, app_data) = project();
+        let sealed = root.join("sealed.txt");
+        fs::write(&sealed, "private text\n").expect("sealed file");
+        fs::write(root.join("ok.txt"), "readable text\n").expect("readable file");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).expect("chmod");
+        let probe = fs::read(&sealed);
+        // root처럼 모드 000도 읽는 사용자는 권한 거부의 전제가 성립하지 않는다.
+        if probe.is_ok() {
+            fs::set_permissions(&sealed, fs::Permissions::from_mode(0o644)).expect("restore");
+            eprintln!("skipped: this user reads a mode-000 file (uid 0?)");
+            return;
+        }
+        let listed = list_project_entries(&root, "", None, None);
+        let searches: Vec<_> = [false, true]
+            .into_iter()
+            .map(|contents| search_project_files(&app_data, &root, ".txt", None, contents))
+            .collect();
+        let read = read_project_file(&root, "sealed.txt");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o644)).expect("restore");
+        assert_eq!(
+            probe.expect_err("unreadable file").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let check = |entries: &[DocumentEntry]| {
+            let sealed = entries
+                .iter()
+                .find(|entry| entry.name == "sealed.txt")
+                .expect("sealed entry");
+            assert_eq!(sealed.preview_kind, None);
+            assert!(!sealed.is_directory);
+            let readable = entries
+                .iter()
+                .find(|entry| entry.name == "ok.txt")
+                .expect("readable entry");
+            assert_eq!(readable.preview_kind, Some(DocumentPreviewKind::Text));
+        };
+        check(&listed.expect("list must preserve unreadable entry").entries);
+        for search in searches {
+            let search = search.expect("name match must survive preview failure");
+            let entries: Vec<_> = search.entries.into_iter().map(|hit| hit.entry).collect();
+            check(&entries);
+        }
+        assert!(
+            matches!(read, Err(CoreError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn c16_9_disappeared_preview_preserves_metadata() {
+        let (_dir, root, _app_data) = project();
+        let path = root.join("vanished.txt");
+        fs::write(&path, "text\n").expect("file");
+        let metadata = fs::metadata(&path).expect("metadata before removal");
+        fs::remove_file(&path).expect("remove before preview");
+        let entry = project_entry(&root, &path, &metadata).expect("keep known metadata");
+        assert_eq!(entry.name, "vanished.txt");
+        assert_eq!(entry.relative_path, "vanished.txt");
+        assert_eq!(entry.size_bytes, metadata.len());
+        assert_eq!(entry.preview_kind, None);
+        assert!(!entry.is_directory);
+        // G10: 미리보기 오류를 건너뛰어도 루트 밖 경로를 허용하지 않는다.
+        assert!(project_entry(
+            &root,
+            &root.parent().unwrap().join("outside.txt"),
+            &metadata
+        )
+        .is_err());
     }
 
     /// F1 / 정확성. 읽을 수 없는 하위 폴더 하나가 검색 전체를 실패시키면 안 된다 — 그 폴더

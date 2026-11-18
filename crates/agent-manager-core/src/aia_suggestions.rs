@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -14,8 +14,6 @@ use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 use serde_json::Value;
-#[cfg(test)]
-use std::path::PathBuf;
 
 use crate::domain::wire_enum;
 use crate::resource_repository::repository_skills_root;
@@ -53,7 +51,8 @@ const BUNDLED_MANIFEST: &str =
 
 /// 같은 프로세스에서 공통 팩 파일이 일시적으로 손상됐을 때 사용하는 마지막 정상본.
 /// 홈 경로까지 키에 포함해 테스트·복수 사용자 환경의 캐시가 섞이지 않게 한다.
-static LAST_KNOWN_GOOD: OnceLock<Mutex<HashMap<String, AiaSuggestionPack>>> = OnceLock::new();
+type PackCache = HashMap<(PathBuf, String), AiaSuggestionPack>;
+static LAST_KNOWN_GOOD: OnceLock<Mutex<PackCache>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -771,13 +770,12 @@ fn digest_effective_packs(packs: &[AiaSuggestionEffectivePack]) -> Result<String
     Ok(crate::identifier::lower_hex(&hasher.finalize()))
 }
 
-fn cache_key(home: &Path, skill_key: &str) -> String {
-    format!("{}\0{skill_key}", home.to_string_lossy())
+fn cache_key(home: &Path, skill_key: &str) -> (PathBuf, String) {
+    // G10: 표시용 문자열로 바꾸면 서로 다른 비UTF-8 경로가 같은 키가 된다.
+    (home.to_path_buf(), skill_key.to_owned())
 }
 
-fn lock_pack_cache(
-    cache: &Mutex<HashMap<String, AiaSuggestionPack>>,
-) -> MutexGuard<'_, HashMap<String, AiaSuggestionPack>> {
+fn lock_pack_cache(cache: &Mutex<PackCache>) -> MutexGuard<'_, PackCache> {
     cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1032,6 +1030,68 @@ mod tests {
             entry.source == AiaSuggestionPackSource::LastKnownGood
                 && entry.pack.pack_id == "custom-pack"
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g10_last_known_good_keeps_distinct_non_utf8_roots_separate() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().expect("temp");
+        // APFS(macOS 기본 파일시스템)는 UTF-8이 아닌 이름을 EILSEQ로 거절해 이 상태를 만들 수
+        // 없다. 그런 파일시스템에서는 건너뛰고, 계약은 그런 이름을 받는 리눅스에서 지킨다.
+        let probe = temp.path().join(OsString::from_vec(b"probe-\xff".to_vec()));
+        match fs::create_dir(&probe) {
+            Ok(()) => fs::remove_dir(&probe).expect("remove probe"),
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                eprintln!("skipped: filesystem rejects non-UTF-8 names");
+                return;
+            }
+            Err(error) => panic!("non-UTF-8 name probe: {error}"),
+        }
+        let first_root = temp.path().join(OsString::from_vec(b"root-\x80".to_vec()));
+        let second_root = temp.path().join(OsString::from_vec(b"root-\x81".to_vec()));
+        assert_ne!(first_root, second_root);
+        assert_eq!(first_root.to_string_lossy(), second_root.to_string_lossy());
+        let first_manifest = write_pack(
+            &first_root,
+            "custom-pack",
+            &pack_json("custom-pack", "first-tip", "첫 저장소"),
+        );
+        let second_manifest = write_pack(&second_root, "custom-pack", "{ invalid");
+        load_aia_suggestion_catalog_from_home(&first_root).expect("seed first root");
+
+        // G7/G10: 자체 정상본이 없는 저장소는 다른 경로의 캐시를 빌릴 수 없다.
+        let uncached = load_aia_suggestion_catalog_from_home(&second_root).expect("uncached root");
+        assert_eq!(uncached.issues.len(), 1);
+        assert!(!uncached.issues[0].using_last_known_good);
+        assert!(uncached
+            .packs
+            .iter()
+            .all(|entry| entry.pack.pack_id != "custom-pack"));
+
+        fs::write(
+            &second_manifest,
+            pack_json("custom-pack", "second-tip", "둘째 저장소"),
+        )
+        .expect("valid second pack");
+        load_aia_suggestion_catalog_from_home(&second_root).expect("seed second root");
+        fs::write(&first_manifest, "{ invalid").expect("break first pack");
+        fs::write(&second_manifest, "{ invalid").expect("break second pack");
+
+        for (root, expected_tip) in [(&first_root, "first-tip"), (&second_root, "second-tip")] {
+            let catalog = load_aia_suggestion_catalog_from_home(root).expect("own fallback");
+            assert_eq!(catalog.issues.len(), 1);
+            assert!(catalog.issues[0].using_last_known_good);
+            let own_pack = catalog
+                .packs
+                .iter()
+                .find(|entry| entry.pack.pack_id == "custom-pack")
+                .expect("own pack");
+            assert_eq!(own_pack.source, AiaSuggestionPackSource::LastKnownGood);
+            assert_eq!(own_pack.pack.suggestions[0].id, expected_tip);
+        }
     }
 
     #[test]

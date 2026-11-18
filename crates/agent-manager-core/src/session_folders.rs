@@ -685,6 +685,70 @@ mod tests {
     }
 
     #[test]
+    fn subtree_move_depth_limit_preserves_store_on_rejection_g7_v2() {
+        let app_data = tempfile::tempdir().expect("app data directory");
+        with_metadata(app_data.path(), |metadata| {
+            metadata.folders = vec![
+                folder("source", None),
+                folder("leaf", Some("source")),
+                folder("target-1", None),
+                folder("target-2", Some("target-1")),
+                folder("target-3", Some("target-2")),
+                folder("target-4", Some("target-3")),
+            ];
+            Ok(())
+        })
+        .expect("seed independent source and target trees");
+        let store_path = app_data.path().join("manager-state.json");
+        let original = std::fs::read(&store_path).expect("original metadata bytes");
+
+        // G7/V2: the source itself would fit at level five, but its leaf would
+        // reach level six. Reject the whole patch before persisting any field.
+        update_session_folder(
+            app_data.path(),
+            "source",
+            Some("renamed"),
+            Some("#ABCDEF"),
+            Some(Some("target-4")),
+            Some(true),
+        )
+        .expect_err("the moved subtree must fit, including its deepest descendant");
+        assert_eq!(
+            std::fs::read(&store_path).expect("metadata after rejected move"),
+            original
+        );
+        let unchanged = list_session_folders(app_data.path()).expect("reload rejected move");
+        let source = unchanged.iter().find(|f| f.id == "source").unwrap();
+        assert_eq!(source.parent_id, None);
+        assert_eq!(source.name, "source");
+        assert!(!source.hidden);
+
+        // A one-level shallower destination puts the leaf exactly at the limit.
+        // Accepting it guards against an overstrict check or rejecting all moves.
+        let moved = update_session_folder(
+            app_data.path(),
+            "source",
+            Some("renamed"),
+            Some("#ABCDEF"),
+            Some(Some("target-3")),
+            Some(true),
+        )
+        .expect("a subtree ending at level five must move");
+        let reloaded = list_session_folders(app_data.path()).expect("reload accepted move");
+        assert_eq!(reloaded.len(), 6);
+        let source = reloaded.iter().find(|f| f.id == "source").unwrap();
+        assert_eq!(source, &moved);
+        assert_eq!(source.parent_id.as_deref(), Some("target-3"));
+        assert_eq!(source.depth, MAX_SESSION_FOLDER_DEPTH - 2);
+        assert_eq!(source.name, "renamed");
+        assert_eq!(source.color, "#abcdef");
+        assert!(source.hidden);
+        let leaf = reloaded.iter().find(|f| f.id == "leaf").unwrap();
+        assert_eq!(leaf.parent_id.as_deref(), Some("source"));
+        assert_eq!(leaf.depth, MAX_SESSION_FOLDER_DEPTH - 1);
+    }
+
+    #[test]
     fn sanitize_lifts_only_cycle_members_and_keeps_their_descendants_nested() {
         let mut folders = vec![
             folder("a", Some("b")),

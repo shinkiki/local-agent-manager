@@ -1125,6 +1125,52 @@ mod tests {
         assert_eq!(std::fs::read(STORE.path(dir.path())).expect("read"), before);
     }
 
+    /// C10-1/G7: 정원을 넘는 등록은 저장소를 그대로 두고, 기존 연결 수정은 허용한다.
+    #[test]
+    fn c10_1_registration_capacity_rejects_overflow_but_allows_updates() {
+        let dir = TempDir::new().expect("temp");
+        let mut payload = request("capacity");
+        payload.credential_source = "none".to_owned();
+        payload.credential_ref.clear();
+        for index in 0..64 {
+            payload.display_name = format!("capacity-{index:02}");
+            set_db_connection(dir.path(), payload.clone()).expect("register within capacity");
+        }
+        let full = get_db_connections(dir.path()).expect("read full store");
+        assert_eq!(full.connections.len(), 64);
+        let before = std::fs::read(STORE.path(dir.path())).expect("stored bytes");
+
+        payload.display_name = "overflow".to_owned();
+        let error = set_db_connection(dir.path(), payload.clone()).expect_err("capacity exceeded");
+        assert!(matches!(error, CoreError::InvalidInput(_)));
+        assert_eq!(
+            std::fs::read(STORE.path(dir.path())).expect("read rejected store"),
+            before
+        );
+
+        let original = &full.connections[0];
+        payload.id = original.id.clone();
+        payload.display_name = original.display_name.clone();
+        payload.note = "updated at capacity".to_owned();
+        let updated = set_db_connection(dir.path(), payload).expect("update at capacity");
+        assert_eq!(updated.connections.len(), 64);
+        assert_eq!(
+            connection_of(dir.path(), &original.id)
+                .expect("updated connection")
+                .note,
+            "updated at capacity"
+        );
+        let others = |snapshot: &DbConnectionsSnapshot| {
+            snapshot
+                .connections
+                .iter()
+                .filter(|connection| connection.id != original.id)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(others(&updated), others(&full));
+    }
+
     #[test]
     fn c10_11_production_connections_cannot_take_a_write_mode() {
         let dir = TempDir::new().expect("temp");

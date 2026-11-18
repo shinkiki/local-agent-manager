@@ -30,6 +30,10 @@ function draft(overrides = {}) {
     fullAccessAcknowledged: true,
     prompt: "변경 파일을 검토해줘",
     skillId: "",
+    conversationKeyPattern: "",
+    conversationIdleSeconds: "",
+    conversationMaxTurns: "",
+    inlineMaxBytes: "",
     ...overrides,
   };
 }
@@ -179,4 +183,48 @@ test("a stored chat trigger survives the load-then-save round trip without chang
   const saved = buildDocumentTriggerInput(loaded, stored);
   const { id: _id, status: _s, statusReason: _r, createdAt: _c, updatedAt: _u, ...expected } = stored;
   assert.deepEqual(saved, expected);
+});
+
+test("lean context is saved only for Claude chats and survives the load-then-save round trip", () => {
+  const lean = buildDocumentTriggerInput(draft({ source: "claude", approvalMode: "manual", leanContext: true }), null);
+  assert.equal(lean.action.leanContext, true);
+  const codex = buildDocumentTriggerInput(draft({ leanContext: true }), null);
+  assert.equal("leanContext" in codex.action, false);
+  const off = buildDocumentTriggerInput(draft({ source: "claude", leanContext: false }), null);
+  assert.equal("leanContext" in off.action, false);
+  const stored = storedTrigger({
+    type: "startChat", source: "claude", accountId: null, model: null, reasoningEffort: null,
+    mode: "workspace", approvalMode: "manual", prompt: "받은 편지함", skill: null, settings: {}, leanContext: true,
+  });
+  const loaded = draftFromTrigger(stored, draft());
+  assert.equal(loaded.leanContext, true);
+  const { id: _id, status: _s, statusReason: _r, createdAt: _c, updatedAt: _u, ...expected } = stored;
+  assert.deepEqual(buildDocumentTriggerInput(loaded, stored), expected);
+});
+
+test("conversation and inline content are optional and survive the load-then-save round trip", () => {
+  const off = buildDocumentTriggerInput(draft({ conversationKeyPattern: "  ", inlineMaxBytes: "" }), null);
+  assert.equal("conversation" in off.action, false);
+  assert.equal("inlineContent" in off.action, false);
+  const on = buildDocumentTriggerInput(draft({
+    conversationKeyPattern: " ^incoming/([a-z0-9-]+)/chat/([0-9]+)/ ",
+    conversationIdleSeconds: "600",
+    conversationMaxTurns: "",
+    inlineMaxBytes: "8192",
+  }), null);
+  assert.deepEqual(on.action.conversation, { keyPattern: "^incoming/([a-z0-9-]+)/chat/([0-9]+)/", idleMs: 600000 });
+  assert.deepEqual(on.action.inlineContent, { maxBytes: 8192 });
+  const stored = storedTrigger({
+    type: "startChat", source: "claude", accountId: null, model: null, reasoningEffort: null,
+    mode: "workspace", approvalMode: "manual", prompt: "받은 편지함", skill: null, settings: {}, leanContext: true,
+    conversation: { keyPattern: "^incoming/([a-z0-9-]+)/chat/([0-9]+)/", idleMs: 900000, maxTurns: 40 },
+    inlineContent: { maxBytes: 8192 },
+  });
+  const loaded = draftFromTrigger(stored, draft());
+  assert.equal(loaded.conversationIdleSeconds, "900");
+  const odd = storedTrigger({ ...stored.action, conversation: { keyPattern: "^a/(b)/", idleMs: 10500 } });
+  const oddSaved = buildDocumentTriggerInput(draftFromTrigger(odd, draft()), odd);
+  assert.equal(oddSaved.action.conversation.idleMs, 10500);
+  const { id: _id, status: _s, statusReason: _r, createdAt: _c, updatedAt: _u, ...expected } = stored;
+  assert.deepEqual(buildDocumentTriggerInput(loaded, stored), expected);
 });

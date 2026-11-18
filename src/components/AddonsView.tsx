@@ -1,4 +1,4 @@
-import { Database, KeyRound, Network, Plug, Search } from "lucide-react";
+import { Boxes, Database, KeyRound, MessagesSquare, Network, Plug, Search } from "lucide-react";
 import { useEffect, type ComponentType } from "react";
 import { useI18n } from "../lib/i18n";
 import type { TabRequest } from "../lib/uiGuide";
@@ -9,13 +9,15 @@ import { CypressWorkspacePanel } from "./CypressWorkspacePanel";
 import { IndexAddonPanel } from "./IndexAddonPanel";
 import { DbConnectionsCard } from "./DbConnectionsCard";
 import { ExternalPluginsCard } from "./ExternalPluginsCard";
+import { K8sClustersCard } from "./K8sClustersCard";
+import { AiaPeersCard } from "./AiaPeersCard";
 import { MermaidPluginPanel } from "./MermaidPluginPanel";
 import { RunnersCard } from "./RunnersCard";
 import { SettingsSubTabPanel, SettingsSubTabs, type SettingsSubTab } from "./SettingsSubTabs";
 import { SshKeysCard } from "./SshKeysCard";
 import { brandMarkIcon } from "./Shared";
 
-export type AddonsTabId = "mcp" | "ssh" | "db" | "runners" | "index" | "cypress" | "mermaid" | "claude";
+export type AddonsTabId = "mcp" | "ssh" | "db" | "k8s" | "peers" | "runners" | "index" | "cypress" | "mermaid" | "claude";
 
 // 탭 id가 도구 축으로 바뀌어 예전 값(aia·codex)은 되살릴 자리가 없다. 키를 올려 옛 선택이
 // 남아 있어도 기본 탭으로 떨어지게 한다. 자동화 탭이 워크플로 화면으로 옮겨 간 뒤에도
@@ -46,6 +48,9 @@ interface AddonsTab extends SettingsSubTab<AddonsTabId> {
  * 한 서비스가 아니라 갈래라 성격 아이콘 그대로다 — MCP는 공식 표식이 있지만 단색 글리프라
  * `<img>`로는 다크 테마에서 사라져 콘센트를 유지한다.
  *
+ * Kubernetes 는 탭 줄에서 `K8s` 로, 데이터베이스는 `DB` 로 줄여 쓴다 — 열 탭이 1280px 한 줄에
+ * 들어가는 폭이 그만큼이다(AIA 대화 탭이 더해지며 `데이터베이스` 그대로는 65px 넘쳤다).
+ *
  * `tool` — 기본도구 카탈로그에 있는 도구만 접근 경로 상세(`BuiltinToolAccess`)를 패널 맨 위에
  * 얹는다. Claude Code는 클로드 전용 라우트라 비운다. 분산처리는 에이전트가 쓰는 도구가 아니라
  * 외부 공용 자리 도구가 읽는 설정이라 역시 비운다(C21).
@@ -53,7 +58,9 @@ interface AddonsTab extends SettingsSubTab<AddonsTabId> {
 const addonsTabs: readonly AddonsTab[] = [
   { id: "mcp", icon: Plug, ko: "외부 MCP", en: "External MCP", anchor: "addons.tab.mcp", tool: "mcp", panel: ExternalPluginsCard },
   { id: "ssh", icon: KeyRound, ko: "SSH", en: "SSH", anchor: "addons.tab.ssh", tool: "ssh", panel: SshKeysCard },
-  { id: "db", icon: Database, ko: "데이터베이스", en: "Database", anchor: "addons.tab.db", tool: "db", panel: DbConnectionsCard },
+  { id: "db", icon: Database, ko: "DB", en: "DB", anchor: "addons.tab.db", tool: "db", panel: DbConnectionsCard },
+  { id: "k8s", icon: Boxes, ko: "K8s", en: "K8s", anchor: "addons.tab.k8s", tool: "k8s", panel: K8sClustersCard },
+  { id: "peers", icon: MessagesSquare, ko: "AIA 대화", en: "AIA peers", anchor: "addons.tab.peers", tool: "peer", panel: AiaPeersCard },
   { id: "runners", icon: Network, ko: "분산처리", en: "Distributed runners", anchor: "addons.tab.runners", panel: RunnersCard },
   { id: "index", icon: Search, ko: "인덱스", en: "Index", anchor: "addons.tab.index", tool: "index", panel: IndexAddonPanel },
   { id: "cypress", icon: brandMarkIcon("cypress"), ko: "Cypress", en: "Cypress", anchor: "addons.tab.cypress", tool: "cypress", panel: CypressWorkspacePanel },

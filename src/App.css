@@ -1029,6 +1029,8 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .settings-subtab-nav { align-self: flex-start; max-width: 100%; overflow-x: auto; padding: 3px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--x0b1219); scrollbar-width: none; }
 .settings-subtab-nav::-webkit-scrollbar { display: none; }
 .settings-subtab-nav > button { min-width: max-content; min-height: 30px; flex: none; padding-inline: 11px; white-space: nowrap; }
+/* 애드온 탭 줄은 열 탭이라 1280px 한 줄에 들어가려면 버튼 양옆을 1px씩 줄여야 한다(AIA 대화 탭, C23). */
+.addons-view .settings-subtab-nav > button { padding-inline: 10px; }
 /* 브랜드 표식은 원색을 유지하므로 활성 탭의 악센트 착색 대신 흐림으로 상태를 나타낸다. */
 .chat-hub-tabs button > .brand-mark { flex: none; opacity: .66; transition: opacity 140ms ease; }
 .chat-hub-tabs button:hover:not(.active) > .brand-mark { opacity: .85; }
@@ -1096,7 +1098,9 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .brand-mark.plate { border-radius: 3px; background: #fff; box-shadow: 0 0 0 2px #fff; }
 .plugin-loading-state { display: flex; align-items: center; gap: 8px; margin: 16px 18px; color: var(--faint); font-size: var(--ui-font-8); }
 .plugin-empty-state { display: flex; align-items: center; gap: 12px; margin: 16px 18px 0; padding: 18px; border: 1px dashed var(--border); border-radius: 11px; background: rgba(var(--accent-rgb), .025); }
-.plugin-empty-state > i { display: grid; width: 42px; height: 42px; flex: none; place-items: center; border-radius: 10px; background: #fff; font-style: normal; }
+.plugin-empty-state > i { display: grid; width: 42px; height: 42px; flex: none; place-items: center; border: 1px solid rgba(var(--accent-rgb), .18); border-radius: 10px; background: rgba(var(--accent-rgb), .09); color: var(--green); font-style: normal; }
+/* 브랜드 로고(검은 Notion 마크)만 흰 바탕이 필요하다. 선 아이콘을 흰 바탕에 두면 밝은 글자색을 물려받아 거의 사라진다. */
+.plugin-empty-state > i.plugin-empty-brand { border-color: transparent; background: #fff; }
 .plugin-empty-state > div { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
 .plugin-empty-state strong { color: var(--xd8e1ea); font-size: var(--ui-font-10); }
 .plugin-empty-state small { color: var(--faint); font-size: var(--ui-font-8); line-height: 1.45; }
@@ -1123,7 +1127,6 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .ssh-key-location strong { color: var(--faint); font-size: var(--ui-font-7); }
 .ssh-key-location code, .ssh-key-fingerprint { overflow-wrap: anywhere; color: var(--muted); font-size: var(--ui-font-7); }
 .ssh-key-empty { margin-bottom: 16px; }
-.ssh-key-empty > i { background: rgba(var(--accent-rgb), .09); color: var(--green); }
 .ssh-key-list .plugin-status { justify-self: end; }
 .ssh-key-issues { display: flex; margin: 0 18px 16px; flex-direction: column; gap: 5px; padding: 10px 12px; border: 1px solid rgba(233, 190, 93, .28); border-radius: 9px; background: rgba(233, 190, 93, .07); }
 .ssh-key-issues strong { color: var(--xe9be5d); font-size: var(--ui-font-8); }
@@ -1147,6 +1150,12 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .db-connection-toggle input { width: 15px; height: 15px; accent-color: rgb(var(--accent-rgb)); cursor: pointer; }
 .db-connection-receipt { margin: 4px 0 0; color: var(--green); font-size: var(--ui-font-7); line-height: 1.5; overflow-wrap: anywhere; }
 .db-connection-receipt.failed { color: var(--xe9be5d); }
+/* C23 AIA 대화 탭 — 상대 AIA 의 답은 신뢰하지 않는 글이라 본문 그대로 접어 보여 준다. */
+.aia-peer-answer { max-height: 320px; margin: 6px 0 0; padding: 10px 12px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: rgba(var(--accent-rgb), .04); color: var(--muted); font-size: var(--ui-font-7); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.aia-peer-policy { border-top: 1px solid var(--border-soft); }
+.aia-peer-skills ul { margin: 6px 0 0; padding-left: 18px; }
+.aia-peer-skills li { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 4px 0; }
+.aia-peer-empty, .aia-peer-notice { margin: 0 18px 12px; }
 .db-connection-editor { display: flex; flex-direction: column; gap: 10px; margin: 0 18px 18px; padding: 12px 13px; border: 1px solid rgba(var(--accent-rgb), .24); border-radius: 9px; background: rgba(var(--accent-rgb), .055); }
 .db-connection-editor label { display: flex; flex-direction: column; gap: 4px; }
 .db-connection-editor label > span { color: var(--faint); font-size: var(--ui-font-7); }
@@ -1157,6 +1166,13 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .db-connection-editor textarea { resize: vertical; }
 .db-connection-hint { margin: 0; color: var(--faint); font-size: var(--ui-font-7); line-height: 1.5; }
 .db-connection-editor-actions { display: flex; justify-content: flex-end; gap: 8px; }
+/* 분산처리 탭의 보낼 프로젝트: 프로젝트 활성여부 카드와 같은 줄(이름·경로·스위치)에 보내는 상태를 한 줄 더한다. */
+.runner-projects-note { margin: 6px 18px 10px; color: var(--faint); font-size: var(--ui-font-7); line-height: 1.5; }
+.runner-project-rows { margin-bottom: 4px; }
+.runner-project-rows .project-registry-main { gap: 2px; }
+.runner-project-note { color: var(--faint); font-size: var(--ui-font-7); line-height: 1.5; overflow-wrap: anywhere; }
+.runner-project-note.warn { color: var(--danger); }
+.runner-project-actions { display: inline-flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
 .ssh-key-form { margin: 0 18px 18px; }
 .ssh-key-form .plugin-form-note { display: flex; align-items: flex-start; gap: 6px; }
 .ssh-key-form .plugin-form-note svg { flex: none; margin-top: 2px; color: var(--xe9be5d); }
@@ -1230,7 +1246,6 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .ssh-server-form .form-row > small { grid-column: 2; }
 .ssh-key-badge { display: inline-flex; align-items: center; gap: 3px; padding: 1px 7px; border: 1px solid rgba(var(--accent-rgb), .35); border-radius: 99px; background: rgba(var(--accent-rgb), .1); color: var(--green); font-size: var(--ui-font-6); font-style: normal; font-weight: 750; }
 .ssh-server-empty { margin-bottom: 16px; }
-.ssh-server-empty > i { background: rgba(var(--accent-rgb), .09); color: var(--green); }
 .ssh-server-empty > .button { flex: none; margin-left: auto; }
 .ssh-key-passphrase-form { display: flex; grid-column: 2 / -1; flex-direction: column; gap: 6px; margin-top: 4px; padding: 10px 11px; border: 1px solid rgba(var(--accent-rgb), .24); border-radius: 8px; background: rgba(var(--accent-rgb), .055); }
 .ssh-key-passphrase-form label { color: var(--faint); font-size: var(--ui-font-7); }
@@ -1617,6 +1632,19 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .week-column > span { overflow: hidden; color: var(--faint); font-size: var(--ui-font-7); text-align: center; text-overflow: clip; white-space: nowrap; }
 .week-bar { display: flex; min-height: 4px; flex-direction: column; justify-content: flex-end; overflow: hidden; border-radius: 3px 3px 1px 1px; background: var(--x1b2631); }
 .week-bar > span { min-height: 1px; }.bar-claude { background: var(--orange); }.bar-codex { background: var(--x51e97d); }.bar-antigravity { background: var(--blue); }.bar-local { background: var(--violet); }
+/* V2: 좁은 화면에서도 12개 날짜를 모두 읽도록 눈금을 두 줄로 엇갈려 놓는다. */
+@media (max-width: 600px) {
+  .weekly-chart:not(.account-usage-chart) { padding-bottom: 27px; }
+  .weekly-chart:not(.account-usage-chart) > .week-column > span { width: max-content; flex-shrink: 0; align-self: center; overflow: visible; }
+  .weekly-chart:not(.account-usage-chart) > .week-column:nth-child(odd) > span { transform: translateY(14px); }
+}
+/* 더 좁아지면 같은 줄의 날짜 사이에 막대 두 개를 두어 겹치지 않게 한다. */
+@media (max-width: 360px) {
+  .weekly-chart:not(.account-usage-chart) { padding-bottom: 41px; }
+  .weekly-chart:not(.account-usage-chart) > .week-column:nth-child(3n + 1) > span { transform: none; }
+  .weekly-chart:not(.account-usage-chart) > .week-column:nth-child(3n + 2) > span { transform: translateY(14px); }
+  .weekly-chart:not(.account-usage-chart) > .week-column:nth-child(3n) > span { transform: translateY(28px); }
+}
 .rank-list, .project-list, .recent-list { padding: 10px 13px 13px; }
 .rank-row { display: grid; grid-template-columns: 20px minmax(0, 1fr) 35px; align-items: center; gap: 8px; min-height: 28px; padding: 0 6px; border-bottom: 1px solid var(--t-divider); }
 .rank-row > span { color: var(--faint); font-size: var(--ui-font-9); }.rank-row code { overflow: hidden; color: var(--xbac5d2); font-size: var(--ui-font-9); text-overflow: ellipsis; white-space: nowrap; }.rank-row strong { font-size: var(--ui-font-9); text-align: right; }
@@ -2113,7 +2141,7 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 @keyframes app-toast-countdown { from { transform: scaleX(1); } to { transform: scaleX(0); } }
 @media (prefers-reduced-motion: reduce) { .app-toast { animation: none; } }
 
-.state-panel, .empty-state { display: flex; min-height: 125px; align-items: center; justify-content: center; flex-direction: column; gap: 8px; padding: 20px; color: var(--muted); text-align: center; }.state-panel p, .empty-state p { max-width: 360px; margin: 0; color: var(--faint); font-size: var(--ui-font-9); line-height: 1.5; }.empty-state > span { color: var(--x405165); font-size: 21px; }.empty-state strong { font-size: var(--ui-font-10); }.spinner { width: 18px; height: 18px; border: 2px solid var(--x263442); border-top-color: var(--green); border-radius: 50%; animation: spin 900ms linear infinite; }.error-banner { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid rgba(255, 129, 120, 0.29); border-radius: 8px; background: rgba(255, 129, 120, 0.07); color: var(--xffa098); font-size: var(--ui-font-9); line-height: 1.5; white-space: pre-wrap; }.notice-banner { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--muted); font-size: var(--ui-font-9); line-height: 1.5; white-space: pre-wrap; }.notice-banner span { word-break: break-word; }.error-banner strong { color: var(--xffb0aa); font-size: var(--ui-font-8); }.error-banner code { margin-left: 4px; color: var(--xf38f87); font-size: var(--ui-font-7); }.error-banner span { color: var(--xe9aaa5); word-break: break-word; }
+.state-panel, .empty-state { display: flex; min-height: 125px; align-items: center; justify-content: center; flex-direction: column; gap: 8px; padding: 20px; color: var(--muted); text-align: center; }.state-panel p, .empty-state p { max-width: 360px; margin: 0; color: var(--faint); font-size: var(--ui-font-9); line-height: 1.5; }.empty-state > span { color: var(--x405165); font-size: 21px; }.empty-state strong { font-size: var(--ui-font-10); }.spinner { width: 18px; height: 18px; border: 2px solid var(--x263442); border-top-color: var(--green); border-radius: 50%; animation: spin 900ms linear infinite; }.error-banner { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid rgba(255, 129, 120, 0.29); border-radius: 8px; background: rgba(255, 129, 120, 0.07); color: var(--xffa098); font-size: var(--ui-font-9); line-height: 1.5; white-space: pre-wrap; }.notice-banner { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--muted); font-size: var(--ui-font-9); line-height: 1.5; white-space: pre-wrap; }.notice-banner span { word-break: break-word; }.error-banner strong { color: var(--xffb0aa); font-size: var(--ui-font-8); }.error-banner code { margin-left: 4px; color: var(--xf38f87); font-size: var(--ui-font-7); }.error-banner span { color: var(--xe9aaa5); word-break: break-word; }.error-banner.caution { border-color: rgba(255, 202, 76, 0.32); background: rgba(255, 202, 76, 0.07); color: var(--xdcb958); }.error-banner.caution strong, .error-banner.caution code, .error-banner.caution span { color: var(--xdcb958); }
 
 /* 화면 하나가 렌더에 실패했을 때의 자리. 경계가 없으면 이 영역이 아니라 앱 전체가 빈다. */
 .view-error { display: flex; min-height: 180px; flex-direction: column; align-items: center; justify-content: center; gap: 9px; padding: 24px; text-align: center; }.view-error-mark { color: var(--xffa098); }.view-error strong { color: var(--xffb0aa); font-size: var(--ui-font-11); }.view-error p { max-width: 400px; margin: 0; color: var(--muted); font-size: var(--ui-font-9); line-height: 1.5; }.view-error-detail { max-width: 460px; color: var(--faint); font-size: var(--ui-font-7); line-height: 1.45; word-break: break-word; }.view-error-actions { display: flex; gap: 8px; margin-top: 4px; }
@@ -4238,6 +4266,9 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .round-report-list li { overflow-wrap: anywhere; }
 .round-decision { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border: 1px dashed rgba(233, 190, 93, .45); border-radius: 8px; }
 .round-decision > p { margin: 0; }
+/* 보고·결정 글에 공백 없는 긴 경로·시험 이름이 오면 창 밖으로 밀지 않고 줄을 바꾼다. 표 칸은 최소 폭 계산에도 들도록 break-word 가 아니라 anywhere 다. */
+.round-decision > p, .round-decision > small, .round-report-body > small, .round-report-table td { overflow-wrap: anywhere; }
+.round-decision-form > .button { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
 .round-decision > p.round-decision-lead { font-weight: 600; }
 .round-decision-form.path-field-group { flex-direction: row; flex-wrap: wrap; align-items: center; }
 .round-decision-form > input { min-width: 200px; flex: 1; }

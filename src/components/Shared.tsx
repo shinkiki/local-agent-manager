@@ -458,11 +458,18 @@ function ConfirmDialog({ request, onSettle }: { request: ConfirmRequest; onSettl
 }
 
 /**
+ * 실패 배너의 단계. `caution`은 응답 지연·갱신 겹침처럼 다시 하면 풀리는 일이라 빨간
+ * 실패 대신 노란 주의로 보인다.
+ */
+export type ErrorBannerTone = "error" | "caution";
+
+/**
  * 실패 배너. 어떤 요청이 실제로 실패했을 때만 쓴다 — 머리말과 오류코드를 무조건 붙이므로,
  * 실패가 아닌 안내를 여기로 보내면 "무언가 실패했다"는 신호와 문의용 코드가 잘못 붙는다
- * (QA #59). 사전 조건·환경 제한 같은 안내는 `NoticeBanner`.
+ * (QA #59). 사전 조건·환경 제한 같은 안내는 `NoticeBanner`. 요청이 늦거나 겹쳐 아직 끝나지
+ * 못한 것은 `tone="caution"`으로 노란 주의 머리말을 단다.
  */
-export function ErrorBanner({ message }: { message: string }) {
+export function ErrorBanner({ message, tone = "error" }: { message: string; tone?: ErrorBannerTone }) {
   const { text } = useI18n();
   const banner = useRef<HTMLDivElement | null>(null);
   /**
@@ -474,14 +481,19 @@ export function ErrorBanner({ message }: { message: string }) {
   useEffect(() => {
     banner.current?.scrollIntoView({ block: "nearest" });
   }, [message]);
-  return <div className="error-banner" ref={banner}><strong>{text("요청을 처리하지 못했습니다.", "The request could not be completed.")} <code>{stableErrorCode(message)}</code></strong><span>{message}</span></div>;
+  const caution = tone === "caution";
+  const heading = caution
+    ? text("요청이 지연되고 있습니다.", "The request is taking longer than expected.")
+    : text("요청을 처리하지 못했습니다.", "The request could not be completed.");
+  return <div className={caution ? "error-banner caution" : "error-banner"} data-tone={tone} ref={banner}><strong>{heading} <code>{stableErrorCode(message)}</code></strong><span>{message}</span></div>;
 }
 
 function stableErrorCode(message: string): string {
   if (/권한|forbidden|permission/i.test(message)) return "APP_ACCESS_DENIED";
   if (/보안 저장소|secure storage/i.test(message)) return "APP_CREDENTIALS";
   if (/찾을 수 없|not found/i.test(message)) return "APP_NOT_FOUND";
-  if (/시간이 초과|timeout/i.test(message)) return "APP_TIMEOUT";
+  if (/시간이 초과|안에 끝나지 않았|timeout/i.test(message)) return "APP_TIMEOUT";
+  if (/진행 중입니다|in progress/i.test(message)) return "APP_BUSY";
   if (/충돌|conflict|already|계정을 전환할 수 없|전환될 때까지 대기/i.test(message)) return "APP_CONFLICT";
   if (/연결|websocket|network/i.test(message)) return "APP_CONNECTION";
   if (/입력|invalid/i.test(message)) return "APP_INVALID_INPUT";

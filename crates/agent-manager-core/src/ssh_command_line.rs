@@ -288,15 +288,11 @@ impl WordBuilder {
                 self.text
             )));
         }
-        let word = Word {
-            text: std::mem::take(&mut self.text),
-            force_quote: self.expansion_quoted,
-        };
-        self.started = false;
-        self.expansion_bare = false;
-        self.expansion_quoted = false;
-        self.quoted = false;
-        Ok(Some(word))
+        let finished = std::mem::take(self);
+        Ok(Some(Word {
+            text: finished.text,
+            force_quote: finished.expansion_quoted,
+        }))
     }
 
     /// 앞에 붙은 파일 서술자 숫자인지. `2>&1`의 `2`가 단어가 아니라 방향 표시인 자리다.

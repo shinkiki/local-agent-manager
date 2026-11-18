@@ -524,6 +524,45 @@ mod tests {
         assert_eq!(history.accounts[0].account_id, "b");
     }
 
+    /// G7/V2: 보관 상한의 직전·정확 경계·초과에서 최신 주기를 남긴다.
+    #[test]
+    fn g7_v2_retention_keeps_the_newest_cycles_at_the_limit_boundary() {
+        for count in [
+            MAX_RECORDS_PER_ACCOUNT - 1,
+            MAX_RECORDS_PER_ACCOUNT,
+            MAX_RECORDS_PER_ACCOUNT + 1,
+            MAX_RECORDS_PER_ACCOUNT * 2 + 1,
+        ] {
+            let mut store = HistoryStore::default();
+            // 공급자가 오래된 주기를 나중에 돌려줘도 시간 순서로 보관해야 한다.
+            for cycle in (0..count).rev() {
+                let at = cycle as i64 * 7 * DAY;
+                apply(
+                    &mut store,
+                    "acct",
+                    &usage(vec![("7일", (cycle % 101) as f64, Some(at + 7 * DAY))], at),
+                );
+            }
+            let series = &store.accounts["acct"];
+            assert_eq!(series.observed_since, 0);
+            let first_kept = count.saturating_sub(MAX_RECORDS_PER_ACCOUNT);
+            let expected: Vec<_> = (first_kept..count)
+                .map(|cycle| {
+                    let at = cycle as i64 * 7 * DAY;
+                    UsageCycleRecord {
+                        window_label: "7일".to_owned(),
+                        window_length_ms: 7 * DAY,
+                        resets_at: at + 7 * DAY,
+                        peak_used_percent: (cycle % 101) as f64,
+                        first_observed_at: at,
+                        last_observed_at: at,
+                    }
+                })
+                .collect();
+            assert_eq!(series.cycles, expected, "input cycle count: {count}");
+        }
+    }
+
     #[test]
     fn first_load_seeds_from_pacing_samples() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -395,8 +395,12 @@ impl ScopeDocuments {
     ) -> bool {
         ClaudeSettingsScopeKind::PRECEDENCE
             .into_iter()
-            .filter_map(|kind| self.raw(section, key, kind))
-            .any(|value| parse(value).is_none())
+            .filter_map(|kind| self.document(kind)?.root.as_ref()?.get(section))
+            .any(|section| match section.as_object() {
+                // C8-2: 쓰기 경로가 거절하는 비객체 섹션도 잠가 실패할 토글을 내밀지 않는다.
+                None => true,
+                Some(entries) => entries.get(key).is_some_and(|value| parse(value).is_none()),
+            })
     }
 
     /// 항목 하나의 갈래별 값과 우선순위 판정을 한 번에 읽는다. 값을 읽는 쪽과 이긴
@@ -1072,6 +1076,110 @@ mod tests {
             &plugin_request(Some(true)),
         )
         .is_err());
+    }
+
+    #[test]
+    fn c8_2_non_object_sections_lock_the_affected_entries_in_every_scope() {
+        let (_root, home, _app_data) = fixture();
+        let settings = home.join(".claude/settings.json");
+        for section in ["enabledPlugins", "skillOverrides"] {
+            for (value, locked) in [
+                (Value::Null, true),
+                (serde_json::json!(false), true),
+                (serde_json::json!(7), true),
+                (serde_json::json!("custom"), true),
+                (serde_json::json!([]), true),
+                (serde_json::json!({}), false),
+                (serde_json::json!({"unrelated": []}), false),
+            ] {
+                fs::write(
+                    &settings,
+                    serde_json::to_vec(&serde_json::json!({
+                        (section): value,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                let document = read_scope_document(&settings);
+                assert!(document.status.parse_error.is_none());
+                for kind in ClaudeSettingsScopeKind::ALL {
+                    let mut documents = ScopeDocuments {
+                        user: read_scope_document(&home.join("missing-settings.json")),
+                        project: None,
+                        local: None,
+                        policy: None,
+                    };
+                    match kind {
+                        ClaudeSettingsScopeKind::User => documents.user = document.clone(),
+                        ClaudeSettingsScopeKind::Project => {
+                            documents.project = Some(document.clone())
+                        }
+                        ClaudeSettingsScopeKind::Local => documents.local = Some(document.clone()),
+                        ClaudeSettingsScopeKind::Policy => {
+                            documents.policy = Some(document.clone())
+                        }
+                    }
+                    let plugins = plugin_states(&home, &documents);
+                    let mut skills = Vec::new();
+                    scan_skill_overrides(
+                        &home.join(".claude/skills"),
+                        "personal",
+                        None,
+                        &documents,
+                        &mut skills,
+                    );
+                    assert_eq!(
+                        plugins[0].locked,
+                        section == "enabledPlugins" && locked,
+                        "{kind}: {section}={value}"
+                    );
+                    assert_eq!(
+                        skills[0].locked,
+                        section == "skillOverrides" && locked,
+                        "{kind}: {section}={value}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn c8_2_non_object_sections_report_locked_and_leave_files_and_backups_untouched() {
+        for section in ["enabledPlugins", "skillOverrides"] {
+            let (_root, home, app_data) = fixture();
+            let settings = home.join(".claude/settings.json");
+            let original = serde_json::to_vec(&serde_json::json!({
+                (section): [], "theme": "dark",
+            }))
+            .unwrap();
+            fs::write(&settings, &original).unwrap();
+            let snapshot = load_claude_settings_states_with_home(&home, None).unwrap();
+            let result = if section == "enabledPlugins" {
+                assert!(snapshot.plugins[0].locked);
+                set_claude_plugin_enabled_with_home(
+                    &app_data,
+                    &home,
+                    None,
+                    &plugin_request(Some(true)),
+                )
+            } else {
+                assert!(snapshot.skills[0].locked);
+                set_claude_skill_override_with_home(
+                    &app_data,
+                    &home,
+                    None,
+                    &SetClaudeSkillOverrideRequest {
+                        override_key: "personal-skill".to_owned(),
+                        scope: ClaudeSettingsWriteScope::User,
+                        project_path: None,
+                        value: Some(SkillOverrideValue::Off),
+                    },
+                )
+            };
+            assert!(matches!(result, Err(CoreError::InvalidInput(_))));
+            assert_eq!(fs::read(&settings).unwrap(), original);
+            assert!(!app_data.join(BACKUP_STORE).exists());
+        }
     }
 
     #[test]

@@ -81,7 +81,14 @@ const POPOUT_SPECS: { [K in PopoutKind]: PopoutKindSpec<Extract<PopoutRequest, {
   // 싣고 새 창이 다시 읽는다. 같은 파일·같은 대상을 다시 열면 기존 창이 앞으로 온다.
   gitDiff: {
     defaultTitle: { ko: "변경 내용", en: "Diff" },
-    targetId: (request) => `${request.worktreePath ? `${request.worktreePath}-` : ""}${request.rangeFrom && request.rangeTo ? `${request.rangeFrom}...${request.rangeTo}` : request.commit ?? (request.staged ? "staged" : "worktree")}-${request.path}`,
+    targetId: (request) => {
+      const root = request.worktreePath || request.projectPath;
+      const scope =
+        request.rangeFrom && request.rangeTo
+          ? `${request.rangeFrom}...${request.rangeTo}`
+          : (request.commit ?? (request.staged ? "staged" : "worktree"));
+      return `${root}-${scope}-${request.path}`;
+    },
     populateParams: (request, params) => {
       params.set("project", request.projectPath);
       params.set("path", request.path);

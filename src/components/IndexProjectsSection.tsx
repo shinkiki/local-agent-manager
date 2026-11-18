@@ -24,7 +24,7 @@ export function toggledIndexProjects(mode: IndexProjectMode, selected: string[],
  * 인덱스 애드온의 적용 프로젝트 목록. 프로젝트 활성여부 카드와 같은 줄(이름·경로·스위치)로 그리고,
  * 켠 프로젝트의 폴더는 백엔드가 인덱스에 자동 등록·색인한다. 기본은 전체 적용(새 프로젝트 포함).
  */
-export function IndexProjectsSection({ snapshot, projects, registryFailed, busy, onSave, onRefresh }: {
+export function IndexProjectsSection({ snapshot, projects, registryFailed, busy, onSave, onRefresh, onShowExclusions }: {
   snapshot: IndexSnapshot | null;
   /** 활성이면서 폴더가 있는 프로젝트. */
   projects: IndexProjectOption[];
@@ -32,6 +32,7 @@ export function IndexProjectsSection({ snapshot, projects, registryFailed, busy,
   busy: boolean;
   onSave: (mode: IndexProjectMode, projects: string[]) => void;
   onRefresh: (source: IndexSource) => void;
+  onShowExclusions: (source: IndexSource) => void;
 }) {
   const { text } = useI18n();
   const mode = snapshot?.projectMode ?? "all";
@@ -53,7 +54,8 @@ export function IndexProjectsSection({ snapshot, projects, registryFailed, busy,
     // 같은 경로를 직접 등록해 둔 폴더는 그 폴더 설정(에이전트 사용·적용 범위)을 따른다.
     if (source.projectPath === null && !source.agentEnabled) return { tone: "warn", label: text("직접 등록한 같은 폴더가 있어 자동 등록하지 않았습니다. 아래 직접 등록한 폴더에서 에이전트 사용을 켜 주세요", "A folder you added has the same path, so it was not added automatically. Turn on agent use for it under Folders you added") };
     const manual = source.projectPath === null ? text(" · 직접 등록한 폴더로 적용 중", " · applied through a folder you added") : "";
-    if (source.indexedAt === null && source.lastError) return { tone: "warn", label: text(`색인 실패(30분 뒤 다시 시도): ${source.lastError}`, `Indexing failed (retrying in 30 minutes): ${source.lastError}`), source };
+    if (source.progress) return { tone: "", label: text(`색인 중 · 확인 ${source.progress.scannedEntries}개 · 본문 읽기 ${source.progress.readFiles}개`, `Indexing · ${source.progress.scannedEntries} entries checked · ${source.progress.readFiles} files read`), source };
+    if (source.lastError) return { tone: "warn", label: `${text(`갱신 실패: ${source.lastError}`, `Refresh failed: ${source.lastError}`)}${source.indexedAt !== null ? ` · ${text("마지막 성공", "Last success")} ${new Date(source.indexedAt).toLocaleString()}` : ""}${source.nextRetryAt ? ` · ${text("다음 재시도", "Next retry")} ${new Date(source.nextRetryAt).toLocaleString()}` : ""}`, source };
     if (source.indexedAt === null) return { tone: "", label: text("색인 대기 중 (1분 안에 시작합니다)", "Waiting to index (starts within a minute)") + manual, source };
     return {
       tone: "",
@@ -66,7 +68,7 @@ export function IndexProjectsSection({ snapshot, projects, registryFailed, busy,
     <section className="settings-subsection index-addon-apply" aria-label={text("적용 프로젝트", "Applied projects")}>
       <header><div>
         <strong>{text("적용 프로젝트", "Applied projects")}</strong>
-        <small>{text("켠 프로젝트의 폴더를 인덱스에 자동으로 등록하고 색인합니다. 폴더 경로를 따로 넣지 않아도 됩니다. 기본은 전체 적용이라 새로 생기는 프로젝트도 자동으로 들어가고, 프로젝트를 하나 끄면 전체 적용이 풀립니다. 각 프로젝트 폴더는 그 프로젝트(하위 폴더·워크트리 포함)에서 실행한 대화의 인덱스 검색에 쓰이고, 작업 경로를 알 수 없는 실행(Antigravity 등)은 보지 않습니다. 자동 갱신은 프로젝트 폴더를 10분마다 다시 훑습니다.", "Folders of the projects you turn on are added to the index and indexed automatically, with no paths to enter. All projects is the default, so new projects are included too; turning off a project clears it. Each project folder is used by index searches from chats running in that project (including subfolders and worktrees); runs whose working path is unknown (such as Antigravity) do not see it. Auto refresh rescans project folders every 10 minutes.")}</small>
+        <small>{text("켠 프로젝트의 폴더를 인덱스에 자동으로 등록하고 색인합니다. 폴더 경로를 따로 넣지 않아도 됩니다. 기본은 전체 적용이라 새로 생기는 프로젝트도 자동으로 들어가고, 프로젝트를 하나 끄면 전체 적용이 풀립니다. 각 프로젝트 폴더는 그 프로젝트(하위 폴더·워크트리 포함)에서 실행한 대화의 인덱스 검색에 쓰이고, 작업 경로를 알 수 없는 실행(Antigravity 등)은 보지 않습니다. 자동 갱신은 변경을 5초마다 확인하고 전체 내용을 10분마다 다시 대조합니다.", "Folders of the projects you turn on are added to the index and indexed automatically, with no paths to enter. All projects is the default, so new projects are included too; turning off a project clears it. Each project folder is used by index searches from chats running in that project (including subfolders and worktrees); runs whose working path is unknown (such as Antigravity) do not see it. Auto refresh checks changes every 5 seconds and reconciles all contents every 10 minutes.")}</small>
       </div></header>
       <div className="index-addon-body">
         <ul className="project-registry-list index-addon-project-rows">
@@ -87,7 +89,10 @@ export function IndexProjectsSection({ snapshot, projects, registryFailed, busy,
                 <span className={`index-addon-scope-note${tone ? ` ${tone}` : ""}`}>{label}</span>
               </div>
               <span className="index-addon-row-actions">
-                {source && source.indexedAt !== null ? <button type="button" className="button compact" disabled={busy} title={text("인덱스 갱신", "Refresh index")} aria-label={text(`${project.name} 인덱스 갱신`, `Refresh ${project.name} index`)} onClick={() => onRefresh(source)}><RefreshCw size={14} /></button> : null}
+                {source ? <>
+                  <button type="button" className="button compact" onClick={() => onShowExclusions(source)} aria-label={text(`${project.name} 제외 사유`, `${project.name} exclusions`)}>{text("제외 사유", "Exclusions")}</button>
+                  <button type="button" className="button compact" disabled={busy || source.refreshState === "indexing"} title={text("인덱스 갱신", "Refresh index")} aria-label={text(`${project.name} 인덱스 갱신`, `Refresh ${project.name} index`)} onClick={() => onRefresh(source)}><RefreshCw size={14} />{source.lastError ? text("다시 시도", "Retry") : null}</button>
+                </> : null}
                 <AppToggle checked={checked} disabled={busy || snapshot === null} label={text(`${project.name} 인덱스 적용`, `Index ${project.name}`)} onChange={() => onSave("selected", toggledIndexProjects(mode, selected, listed, project.path))} />
               </span>
             </li>;

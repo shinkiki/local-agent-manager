@@ -6,7 +6,9 @@ use std::path::PathBuf;
 pub fn run_index_cli(args: impl Iterator<Item = String>) -> Result<(), CoreError> {
     let mut args = args;
     let operation = args.next().ok_or_else(|| {
-        CoreError::InvalidInput("index list | search | read | refresh 작업이 필요합니다".into())
+        CoreError::InvalidInput(
+            "index list | search | read | exclusions | refresh 작업이 필요합니다".into(),
+        )
     })?;
     let mut fields = serde_json::Map::new();
     let mut app: Option<PathBuf> = None;
@@ -29,13 +31,17 @@ pub fn run_index_cli(args: impl Iterator<Item = String>) -> Result<(), CoreError
             "--start" => "startLine",
             "--end" => "endLine",
             "--limit" => "limit",
+            "--offset" => "offset",
+            "--mode" => "mode",
+            "--path-prefix" => "pathPrefix",
+            "--extension" => "extension",
             _ => {
                 return Err(CoreError::InvalidInput(format!(
                     "알 수 없는 인덱스 옵션: {flag}"
                 )))
             }
         };
-        let value = if matches!(key, "startLine" | "endLine" | "limit") {
+        let value = if matches!(key, "startLine" | "endLine" | "limit" | "offset") {
             json!(value
                 .parse::<usize>()
                 .map_err(|_| CoreError::InvalidInput(format!("{flag}에는 양수가 필요합니다")))?)
@@ -64,6 +70,16 @@ pub fn run_index_cli(args: impl Iterator<Item = String>) -> Result<(), CoreError
             &app,
             serde_json::from_value(value)?,
         )?)?,
+        "exclusions" => {
+            let mut request = value;
+            if let Some(source) = request.as_object_mut().and_then(|r| r.remove("sourceId")) {
+                request.as_object_mut().unwrap().insert("id".into(), source);
+            }
+            serde_json::to_value(crate::index_addon::get_index_exclusions(
+                &app,
+                serde_json::from_value(request)?,
+            )?)?
+        }
         "read" => serde_json::to_value(crate::index_addon::read_index_excerpt(
             &app,
             serde_json::from_value(value)?,
@@ -86,7 +102,7 @@ pub fn run_index_cli(args: impl Iterator<Item = String>) -> Result<(), CoreError
         }
         _ => {
             return Err(CoreError::InvalidInput(
-                "index list | search | read | refresh 작업을 확인해 주세요".into(),
+                "index list | search | read | exclusions | refresh 작업을 확인해 주세요".into(),
             ))
         }
     };

@@ -978,6 +978,41 @@ mod tests {
     }
 
     #[test]
+    fn c10_9_sqlite_engine_refuses_writes_even_without_statement_classification() {
+        let (dir, id) = fixture();
+        let connection = connection_of(dir.path(), &id).expect("connection");
+        for sql in [
+            "INSERT INTO tb_member (name) VALUES ('다')",
+            "UPDATE tb_member SET name = '다'",
+            "DELETE FROM tb_member",
+        ] {
+            // C10-9: bypass parse_sql so only the engine can enforce read-only access.
+            match query(&connection, sql, 10) {
+                Err(CoreError::Sqlite(rusqlite::Error::SqliteFailure(error, _))) => {
+                    assert_eq!(error.code, rusqlite::ErrorCode::ReadOnly, "{sql}");
+                }
+                Err(error) => panic!("expected SQLite read-only refusal for {sql}: {error}"),
+                Ok(_) => panic!("SQLite query path accepted a write: {sql}"),
+            }
+            let receipt = run_db_query(
+                dir.path(),
+                DbQueryRequest {
+                    connection_id: id.clone(),
+                    sql: "SELECT name FROM tb_member ORDER BY id".to_owned(),
+                    max_rows: None,
+                },
+            )
+            .expect("read after refused write");
+            assert_eq!(
+                receipt.rows,
+                vec![vec![Some("가".to_owned())], vec![Some("나".to_owned())]],
+                "refused statement must preserve every row: {sql}"
+            );
+            assert!(!receipt.truncated);
+        }
+    }
+
+    #[test]
     fn c10_12_a_write_without_a_gate_is_refused_and_changes_nothing() {
         let (dir, id) = fixture();
         let error = run_db_statement(

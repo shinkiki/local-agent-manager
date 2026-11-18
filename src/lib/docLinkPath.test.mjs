@@ -8,6 +8,20 @@ test("링크 표기에서 꺾쇠·인코딩·쿼리·해시·줄 번호를 걷�
   assert.equal(parseLinkPath("src\\notes\\a.md:12"), "src/notes/a.md");
 });
 
+for (const [href, expectedPath] of [
+  ["guide.md#100%-완료", "guide.md"],
+  ["guide.md?rate=50%", "guide.md"],
+  ["docs/issue%231.md#intro", "docs/issue#1.md"],
+  ["docs/q%3Fa.md?raw=1", "docs/q?a.md"],
+]) {
+  test(`V4: 쿼리·프래그먼트를 디코딩 전에 분리해 문서 경로를 보존한다: ${href}`, () => {
+    const path = parseLinkPath(href);
+    assert.equal(path, expectedPath);
+    assert.equal(isMarkdownPath(path), true);
+    assert.equal(resolveDocLinkPath("/r", "current.md", path), expectedPath);
+  });
+}
+
 test("디코드할 수 없는 링크는 버린다", () => {
   assert.equal(parseLinkPath("bad%E0%A4%A.md"), null);
 });

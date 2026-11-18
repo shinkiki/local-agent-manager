@@ -294,6 +294,30 @@ mod tests {
     }
 
     #[test]
+    fn v2_failed_reconcile_preserves_the_last_success_and_staleness() {
+        let mut state = HealthState::new(START);
+        let last_success = START + 10;
+        state.begin_reconcile();
+        state.finish_reconcile(last_success, Ok(42));
+        assert!(!state.view(last_success + STALE_AFTER_MS).stale);
+
+        let failed_at = last_success + STALE_AFTER_MS + 1;
+        state.begin_reconcile();
+        state.note_resource_scan(failed_at, 7);
+        state.finish_reconcile(failed_at, Err("조정 실패".to_owned()));
+
+        // V2: a recent attempt or a resource scan must not freshen old session data.
+        let view = state.view(failed_at);
+        assert_eq!(view.session_revision, 42);
+        assert_eq!(view.last_reconciled_at, Some(last_success));
+        assert_eq!(view.last_reconcile_error.as_deref(), Some("조정 실패"));
+        assert!(!view.reconcile_in_flight);
+        assert_eq!(view.resource_revision, 7);
+        assert_eq!(view.last_resource_scan_at, Some(failed_at));
+        assert!(view.stale);
+    }
+
+    #[test]
     fn an_in_flight_reconcile_is_reported_until_it_finishes() {
         let mut state = HealthState::new(START);
         state.begin_reconcile();

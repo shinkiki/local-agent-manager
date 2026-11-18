@@ -34,6 +34,7 @@ import { CopyAction } from "./CopyAction";
 import { SpeechPlaybackAction } from "./VoiceControls";
 import { isReadableFinalResponse } from "../lib/voice";
 import { liveMessageKey } from "../lib/readingAnchor";
+import { chatMessageRoleLabel } from "../lib/chatMessageLabels";
 import { useI18n } from "../lib/i18n";
 
 import { runtimeText } from "../lib/i18nRuntime";
@@ -441,15 +442,6 @@ export function ChatConversationTurn({ turn, chatId, className = "", onDecision,
   );
 }
 
-/** 메시지 역할 및 성격에 따른 표시 라벨 */
-function messageRoleLabel(role: string, kind: string): string {
-  if (kind === "reasoning") return "진행 상황";
-  // 앱이 직접 적은 알림은 에이전트가 한 말이 아니다. 답 없이 끝난 턴을 알리는 자리가
-  // 그것인데, 같은 라벨을 달면 모델이 그렇게 말한 것으로 읽힌다.
-  if (role === "system") return "시스템";
-  return role === "user" ? "사용자" : "에이전트";
-}
-
 /**
  * 대화 메시지 한 칸의 껍데기. 일반 대화와 AIA 팝업이 각자 같은 다섯 줄을 적고 있었다 —
  * 역할 클래스가 붙은 `article`, 이름표, 읽어주기·복사 단추의 등장 조건, 본문 마크다운,
@@ -529,7 +521,7 @@ function ChatMessageEntryView({
       copyReady={copyReady}
       speechReady={speechReady}
       text={text}
-      label={messageRoleLabel(entry.role, entry.kind)}
+      label={chatMessageRoleLabel(entry.role, entry.kind)}
       messageKey={liveMessageKey(entry.id, entry.kind)}
       meta={<AgentMessageMetaList meta={meta} />}
       onOpenLocalLink={onOpenLocalLink}

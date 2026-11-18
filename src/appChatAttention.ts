@@ -16,6 +16,7 @@ import type { SettingsTabId } from "./components/SettingsView";
 import type { WorkflowsTabId } from "./components/WorkflowsView";
 import { roundDecisionGoalId } from "./lib/attentionGroups";
 import { adoptFoundSession, resolveAttentionRoute } from "./lib/attentionRoute";
+import { createAttentionUpdates } from "./lib/attentionUpdates";
 import {
   clearReadAttentionLocally,
   dismissAttentionLocally,
@@ -83,24 +84,23 @@ export function useChatAttentionCenter({ popoutRequest, snapshotRef, activateVie
   // 알림 조작은 화면을 먼저 바꾸고 요청을 뒤로 보낸다. 이 세대 번호와 진행 수는 그 사이
   // 떠 있던 폴링 응답이나 앞선 요청의 응답이 뒤늦게 도착해 방금 바꾼 목록을 되돌리는 것을
   // 막는다. 요청이 실패하면 되돌리지 않고 폴링이 서버 상태로 맞추게 둔다.
-  const attentionRevision = useRef(0);
-  const attentionPending = useRef(0);
+  const [attentionUpdates] = useState(createAttentionUpdates);
   const handledAttentionRequests = useRef(new Set<number>());
 
   // 조회가 실패하면 그대로 던진다. 현재 알림 목록은 유지되고 폴링 루프(`usePoll`)만 백오프한다.
   const pollAttention = useCallback(async () => {
-    const revision = attentionRevision.current;
+    const canApply = attentionUpdates.pollGuard();
     const next = await getChatAttentionSnapshot();
     // 이 응답을 기다리는 사이 사용자가 읽음·삭제를 눌렀으면, 서버가 그 요청을 반영하기
     // 전에 뜬 목록이다. 그대로 올리면 방금 사라진 알림이 되살아나 깜빡인다. 버리고
     // 다음 폴링을 기다린다.
-    if (attentionPending.current > 0 || attentionRevision.current !== revision) return;
+    if (!canApply()) return;
     setChatAttention(keepIfSame(next));
     setAttentionLoaded(true);
     // AIA는 일반 인앱 알림창에서만 분리한다. 기기 알림은 모든 프로필을 알려야 한다.
     // 중복 알림을 막기 위해 팝아웃 창은 표출하지 않는다(본 창이 대표로 보낸다).
     if (!popoutRequest) void notifyNewAttention(next.items, snapshotRef.current?.sessions ?? []);
-  }, [popoutRequest]);
+  }, [attentionUpdates, popoutRequest]);
   usePoll(pollAttention, 2_000);
 
   // 주소로 받은 열 대상은 읽은 즉시 주소에서 뗀다. 새로고침이 같은 알림을 다시 열지 않게.
@@ -125,20 +125,11 @@ export function useChatAttentionCenter({ popoutRequest, snapshotRef, activateVie
   const applyAttentionMutation = useCallback((
     optimistic: (current: ChatAttentionSnapshot) => ChatAttentionSnapshot,
     request: () => Promise<ChatAttentionSnapshot>,
-  ) => {
-    attentionRevision.current += 1;
-    attentionPending.current += 1;
-    const revision = attentionRevision.current;
-    setChatAttention(optimistic);
-    return request()
-      .then((next) => {
-        // 뒤이어 다른 조작이 끼어들었으면 그쪽 결과가 더 새롭다. 이 응답은 버린다.
-        if (attentionRevision.current === revision) setChatAttention(next);
-        return true;
-      })
-      .catch(() => false)
-      .finally(() => { attentionPending.current -= 1; });
-  }, []);
+  ) => attentionUpdates.mutate(
+    () => setChatAttention(optimistic),
+    request,
+    setChatAttention,
+  ), [attentionUpdates]);
 
   const markAttentionRead = useCallback((id: string) => applyAttentionMutation(
     (current) => markAttentionReadLocally(current, id),

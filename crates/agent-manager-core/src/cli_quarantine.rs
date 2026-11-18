@@ -148,6 +148,13 @@ fn release_in(
         })
         .collect::<Vec<_>>();
     candidates.sort();
+    if candidates.len() > MAX_CANDIDATES {
+        // C18-4: 상한 뒤의 파일은 아직 확인하지 않았으므로 완료로 기억하지 않는다.
+        outcome.refused.push((
+            dir.to_path_buf(),
+            format!("격리 속성을 확인할 일반 파일이 {MAX_CANDIDATES}개 상한을 넘었습니다"),
+        ));
+    }
     candidates.truncate(MAX_CANDIDATES);
 
     for path in candidates {
@@ -341,6 +348,66 @@ mod tests {
         release_cask_quarantine(&executable);
         let settled_after_recovery = settled_dirs().lock().unwrap().remove(&bin);
         assert!(settled_after_recovery);
+    }
+
+    #[test]
+    fn c18_4_candidate_limit_reports_incomplete_scans_without_exceeding_the_limit() {
+        for count in [MAX_CANDIDATES - 1, MAX_CANDIDATES, MAX_CANDIDATES + 1] {
+            let temp = tempfile::tempdir().unwrap();
+            let bin = cask_bin(temp.path(), "codex");
+            let files = (0..count)
+                .map(|index| bin.join(format!("file-{index:03}")))
+                .collect::<Vec<_>>();
+            for file in &files {
+                fs::write(file, b"x").unwrap();
+            }
+            // C18-1: 하위 폴더는 일반 파일 상한에 세지 않는다.
+            fs::create_dir(bin.join("nested")).unwrap();
+            let seen = RefCell::new(Vec::new());
+            let outcome = release_in(
+                &bin,
+                "2DC432GLL2",
+                |path| {
+                    seen.borrow_mut().push(path.to_path_buf());
+                    Ok(true)
+                },
+                |_, team| {
+                    assert_eq!(team, "2DC432GLL2");
+                    Ok(())
+                },
+                |_| Ok(()),
+            );
+            let expected = &files[..count.min(MAX_CANDIDATES)];
+            assert_eq!(seen.into_inner(), expected);
+            assert_eq!(outcome.released, expected);
+            if count > MAX_CANDIDATES {
+                assert_eq!(outcome.refused.len(), 1);
+                assert_eq!(outcome.refused[0].0, bin);
+                assert!(outcome.refused[0].1.contains("상한"));
+            } else {
+                assert!(outcome.refused.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn c18_4_candidate_limit_does_not_settle_the_folder_and_allows_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = cask_bin(temp.path(), "codex");
+        let executable = bin.join("codex");
+        for index in 0..=MAX_CANDIDATES {
+            fs::write(bin.join(format!("file-{index:03}")), b"x").unwrap();
+        }
+
+        release_cask_quarantine(&executable);
+        assert!(!settled_dirs().lock().unwrap().contains(&bin));
+
+        // 새로 만든 파일만 지워 플랫폼 속성 API와 무관하게 재검사 완료를 확인한다.
+        for index in 0..=MAX_CANDIDATES {
+            fs::remove_file(bin.join(format!("file-{index:03}"))).unwrap();
+        }
+        release_cask_quarantine(&executable);
+        assert!(settled_dirs().lock().unwrap().remove(&bin));
     }
 
     #[test]

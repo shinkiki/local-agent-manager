@@ -724,7 +724,9 @@ fn open_public_key_no_follow(path: &Path) -> Result<File, CoreError> {
 
     Ok(OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        // C9-1/G10: a regular file can become a FIFO after the path metadata check.
+        // Do not wait for a writer before the opened descriptor can be rejected.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)?)
 }
 
@@ -1932,6 +1934,42 @@ mod tests {
             validate_file_name("id_agent-manager.1").unwrap(),
             "id_agent-manager.1"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c9_1_public_key_open_does_not_wait_for_a_fifo_writer() {
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+        use std::sync::mpsc;
+
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("replaced.pub");
+        let fifo_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+        // SAFETY: fifo_path is a valid NUL-terminated path retained for this call.
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+
+        // Exercise the open after a replacement, without a scheduling-dependent rename race.
+        let (sender, receiver) = mpsc::channel();
+        let replaced = path.clone();
+        let reader = thread::spawn(move || {
+            let result = open_public_key_no_follow(&replaced);
+            let _ = sender.send(result);
+        });
+        let opened = receiver.recv_timeout(Duration::from_secs(2));
+        // Unblock the old implementation before asserting, so a regression cannot hang Cargo.
+        let peer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .expect("FIFO peer for cleanup");
+        reader.join().expect("reader thread");
+        drop(peer);
+        let file = opened
+            .expect("C9-1: opening a replaced public key must not wait for a writer")
+            .expect("open FIFO without waiting");
+        assert!(!file.metadata().expect("opened metadata").is_file());
+        assert!(read_public_key_line(root.path(), &path).is_err());
     }
 
     #[cfg(unix)]

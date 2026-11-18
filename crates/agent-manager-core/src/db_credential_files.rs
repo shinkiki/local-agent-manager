@@ -142,6 +142,9 @@ pub(crate) fn read_pgpass_password(
         return Ok(None);
     }
     let raw = Zeroizing::new(std::fs::read_to_string(path)?);
+    // 접속값은 탐색 중 변하지 않으므로 후보 줄마다 다시 만들지 않는다.
+    let port = port.to_string();
+    let values = [host, port.as_str(), database, user];
     // libpq처럼 줄 끝의 개행만 떼고 공백은 남긴다 — 공백으로 끝나는 비밀번호도 값이다.
     for line in raw.lines() {
         if line.is_empty() || line.starts_with('#') {
@@ -150,8 +153,6 @@ pub(crate) fn read_pgpass_password(
         let Some((patterns, password)) = split_pgpass_line(line) else {
             continue;
         };
-        let port = port.to_string();
-        let values = [host, port.as_str(), database, user];
         if patterns
             .iter()
             .zip(values)

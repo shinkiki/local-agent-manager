@@ -436,7 +436,7 @@ pub fn add_workspace(
         ensure_template_files(&project)?;
     }
     let module_dir = match module_dir.map(str::trim).filter(|value| !value.is_empty()) {
-        // 모듈 위치는 없으면 만든다(있는 상위 아래 한 칸). 새 프로젝트에서 모듈만 따로 두려는
+        // 모듈 위치는 없으면 만든다(있는 상위 아래 최대 세 칸, C6-4). 새 프로젝트에서 모듈만 따로 두려는
         // 입력이 흔하고, 설치가 그 폴더에서 돌아야 하므로 등록 시점에 실재하게 한다.
         Some(raw) => Some(crate::user_path::create_user_directory(app_data_dir, raw)?),
         None => None,
@@ -730,8 +730,14 @@ pub fn list_files(workspace: &CypressWorkspace) -> Result<CypressWorkspaceFileLi
 }
 
 fn read_text_limited(path: &Path) -> Result<String, CoreError> {
-    let metadata = fs::metadata(path)
-        .map_err(|_| CoreError::NotFound(format!("{MISSING_FILE_PREFIX}{}", path.display())))?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        // C7-4: only NotFound lets the editor treat this path as a new file.
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CoreError::NotFound(format!("{MISSING_FILE_PREFIX}{}", path.display()))
+        } else {
+            CoreError::Io(error)
+        }
+    })?;
     if !metadata.is_file() {
         return Err(CoreError::InvalidInput(format!(
             "파일이 아닙니다: {}",
@@ -957,6 +963,62 @@ mod tests {
         let id = &view.workspaces[0].workspace.id;
         let workspace = workspace(data.path(), id).expect("registered workspace");
         (data, project, workspace)
+    }
+
+    /// C7-4/V2: only a missing file may open as a blank new file in the editor.
+    #[test]
+    fn c7_4_file_reads_preserve_missing_regular_directory_and_size_results() {
+        let (_data, _project, workspace) = fixture();
+        let root = workspace.project_dir();
+        fs::write(root.join("e2e/readable.txt"), "existing content").expect("file");
+        assert_eq!(
+            read_file(&workspace, "e2e/readable.txt")
+                .expect("read")
+                .content,
+            "existing content"
+        );
+
+        let missing = read_file(&workspace, "e2e/missing.txt").expect_err("missing");
+        assert!(matches!(missing, CoreError::NotFound(_)));
+        assert!(missing.to_string().contains(MISSING_FILE_PREFIX));
+        assert!(!root.join("e2e/missing.txt").exists());
+        assert!(matches!(
+            read_file(&workspace, "e2e"),
+            Err(CoreError::InvalidInput(_))
+        ));
+
+        fs::File::create(root.join("e2e/large.txt"))
+            .expect("large file")
+            .set_len(MAX_TEXT_BYTES + 1)
+            .expect("size");
+        assert!(matches!(
+            read_file(&workspace, "e2e/large.txt"),
+            Err(CoreError::TooLarge(MAX_TEXT_BYTES))
+        ));
+    }
+
+    /// C7-4/G10/V2: metadata failures must not advertise a new editable file.
+    #[cfg(unix)]
+    #[test]
+    fn c7_4_metadata_errors_are_not_reported_as_missing_files() {
+        let (_data, _project, workspace) = fixture();
+        let root = workspace.project_dir();
+        fs::write(root.join("e2e/existing.txt"), "keep me").expect("file");
+        std::os::unix::fs::symlink("loop.txt", root.join("e2e/loop.txt"))
+            .expect("self-referencing symlink");
+
+        for (relative, errno) in [
+            ("e2e/existing.txt/child.txt", libc::ENOTDIR),
+            ("e2e/loop.txt", libc::ELOOP),
+        ] {
+            let error = read_file(&workspace, relative).expect_err("metadata error");
+            assert!(!error.to_string().contains(MISSING_FILE_PREFIX), "{error}");
+            assert!(matches!(error, CoreError::Io(ref io) if io.raw_os_error() == Some(errno)));
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("e2e/existing.txt")).expect("unchanged"),
+            "keep me"
+        );
     }
 
     /// C7-2: 작업공간 안에서 env 파일을 가리키는 링크로도 원문을 읽거나 덮어쓸 수 없다.

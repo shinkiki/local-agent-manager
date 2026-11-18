@@ -676,6 +676,8 @@ impl RuntimeWrapper {
                 option,
                 "-r" | "--require" | "--import" | "--preload" | "--conditions"
             ),
+            // C1-9: --inspect[=host:port] 계열은 다음 토큰을 소비하지 않는다.
+            // 스크립트를 건너뛰면 그 뒤의 CLI 이름 인자로 무관한 프로세스를 고를 수 있다.
             Self::Deno => matches!(
                 option,
                 "--import-map"
@@ -685,9 +687,6 @@ impl RuntimeWrapper {
                     | "--location"
                     | "--seed"
                     | "--v8-flags"
-                    | "--inspect"
-                    | "--inspect-brk"
-                    | "--inspect-wait"
             ),
         }
     }
@@ -929,6 +928,55 @@ mod tests {
         assert!(!matches_provider_command(codex, "npm exec codex-acp"));
         assert!(!matches_provider_command(claude, "codex app-server"));
         assert!(!matches_provider_command(claude, "grep claude"));
+    }
+
+    #[test]
+    fn c1_9_deno_inspector_flags_preserve_the_script_position() {
+        for flag in ["--inspect", "--inspect-brk", "--inspect-wait"] {
+            for address in ["", "=9230", "=127.0.0.1:9230"] {
+                let option = format!("{flag}{address}");
+                assert!(
+                    matches_provider_command(
+                        ProviderId::Codex,
+                        &format!("deno {option} /opt/tools/codex.js --version")
+                    ),
+                    "공급자 스크립트를 놓쳤다: {option}"
+                );
+                assert!(
+                    !matches_provider_command(
+                        ProviderId::Codex,
+                        &format!("deno {option} /opt/tools/worker.js /opt/tools/codex.js")
+                    ),
+                    "스크립트 인자를 공급자로 오인했다: {option}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn c1_9_c1_10_deno_inspector_selects_only_the_provider_script_tree() {
+        for flag in ["--inspect", "--inspect-brk", "--inspect-wait"] {
+            let entries = vec![
+                entry(100, 1, 501, "agent-manager"),
+                entry(
+                    200,
+                    1,
+                    501,
+                    &format!("deno {flag} /opt/tools/worker.js /opt/tools/codex.js"),
+                ),
+                entry(201, 200, 501, "worker-child"),
+                entry(
+                    300,
+                    1,
+                    501,
+                    &format!("deno {flag} /opt/tools/codex.js --version"),
+                ),
+                entry(301, 300, 501, "mcp-server"),
+            ];
+            let selected = select_external_processes(ProviderId::Codex, &entries, 100, 501);
+            let pids: Vec<u32> = selected.iter().map(|process| process.pid).collect();
+            assert_eq!(pids, vec![300, 301], "종료 대상이 어긋났다: {flag}");
+        }
     }
 
     /// C1-9. 매칭은 공급자 id 가 아니라 CLI 실행 파일 이름으로 한다. Antigravity 의 CLI 는

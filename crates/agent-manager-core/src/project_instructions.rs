@@ -4644,6 +4644,51 @@ mod tests {
     }
 
     #[test]
+    fn prepare_linked_doc_dir_refuses_symlink_directory_and_file_conflict() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).expect("root");
+        fs::create_dir(&outside).expect("outside");
+
+        // 1. 정상적으로 중첩된 디렉터리 생성
+        let nested = root.join("docs").join("guide");
+        prepare_linked_doc_dir(&root, &nested).expect("nested created");
+        assert!(nested.is_dir());
+
+        // 이미 존재하는 디렉터리는 다시 호출해도 통과
+        prepare_linked_doc_dir(&root, &nested).expect("idempotent");
+
+        // 2. 루트 밖 경로는 거부
+        let escaped = outside.join("docs");
+        assert!(matches!(
+            prepare_linked_doc_dir(&root, &escaped),
+            Err(CoreError::InvalidInput(_))
+        ));
+
+        // 3. 경로 중간에 파일이 있으면 Conflict
+        let file_path = root.join("file.txt");
+        fs::write(&file_path, "not a dir").expect("write file");
+        let blocked_by_file = file_path.join("sub");
+        assert!(matches!(
+            prepare_linked_doc_dir(&root, &blocked_by_file),
+            Err(CoreError::Conflict(_))
+        ));
+
+        // 4. 경로 중간에 심볼릭 링크 폴더가 있으면 InvalidInput 거부
+        #[cfg(unix)]
+        {
+            let symlink_dir = root.join("linked_dir");
+            std::os::unix::fs::symlink(&outside, &symlink_dir).expect("symlink dir");
+            let target_inside_symlink = symlink_dir.join("sub");
+            assert!(matches!(
+                prepare_linked_doc_dir(&root, &target_inside_symlink),
+                Err(CoreError::InvalidInput(_))
+            ));
+        }
+    }
+
+    #[test]
     fn projects_come_from_all_provider_sessions_and_exclude_hidden_or_aia() {
         let temp = tempfile::tempdir().expect("temp");
         let shared = temp.path().join("shared");

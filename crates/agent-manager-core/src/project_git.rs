@@ -897,16 +897,18 @@ impl GitRunner {
                     .into_owned(),
             ));
         }
-        runner.root = path_guard::child_facing(&toplevel);
         runner.git_dir = PathBuf::from(git_dir);
         runner.common_dir = {
             let common = PathBuf::from(common_dir);
             if common.is_absolute() {
                 common
             } else {
+                // C16-1/G10. rev-parse의 상대 경로는 발견 명령을 실행한 프로젝트 폴더
+                // 기준이다. 하위 프로젝트를 저장소 최상위로 바꾸기 전에 해석한다.
                 runner.root.join(common)
             }
         };
+        runner.root = path_guard::child_facing(&toplevel);
         // 저장소가 정해진 뒤에는 그 부모가 천장이다. 이후 명령은 최상위에서 돌므로
         // 위로 올라갈 일 자체가 없지만, 한 번 더 못박아 둔다.
         runner.ceiling = runner
@@ -4667,6 +4669,13 @@ def456\x1fdef\x1f\x1fAn\x1fan@x\x1f1699999999\x1fCn\x1f1699999999\x1f\x1fRoot\x1
             .expect("worktree status");
         assert_eq!(status.unstaged_count, 1);
         assert_eq!(status.head.branch.as_deref(), Some("side"));
+        // C16-1/G10. 하위 폴더에 등록한 프로젝트도 같은 저장소의 워크트리를 읽는다.
+        let nested = repo.root.join("apps/web");
+        std::fs::create_dir_all(&nested).expect("nested project");
+        let nested_status = project_git_status(&repo.app_data, &nested, Some(&linked_text))
+            .expect("worktree status from nested project");
+        assert_eq!(nested_status.unstaged_count, 1);
+        assert_eq!(nested_status.head.branch.as_deref(), Some("side"));
         let diff = project_git_diff(
             &repo.app_data,
             &repo.root,
@@ -5570,6 +5579,16 @@ mine
             Err(failure) => panic!("{}", CoreError::from(failure)),
         };
         assert_eq!(git.root, path_guard::child_facing(&repo.root));
+        assert_eq!(
+            std::fs::canonicalize(&git.common_dir).expect("common git directory"),
+            std::fs::canonicalize(repo.root.join(".git")).expect("repository git directory"),
+            "C16-1/G10: discovery paths must use the nested project's working directory"
+        );
+        assert!(
+            !overview_with(&git)
+                .expect("nested overview")
+                .is_linked_worktree
+        );
 
         let plain = repo.root.parent().expect("parent").join("plain");
         std::fs::create_dir_all(&plain).expect("plain");

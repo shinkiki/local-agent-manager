@@ -8,9 +8,9 @@ export interface DisplayUsageWindow {
   /** 특정 모델에만 걸린 창인지. 표시에는 남기고 대표 소진율에서는 뺀다. */
   modelScoped: boolean;
   /**
-   * 모델군 창들을 합쳐 만든 계정 대표 창인지(Antigravity). 가장 빡빡한 모델군의
-   * 복사본이라 대표 소진율에는 쓰지만 소진 판정에서는 뺀다
-   * (`accountExhaustionWindows`).
+   * 모델군 창들을 합쳐 만든 계정 대표 창인지(Antigravity). 아직 열린 모델군 중 가장
+   * 빡빡한 쪽의 복사본이고 모든 모델군이 찼을 때만 100%다. 대표 소진율에는 쓰지만 소진
+   * 판정에서는 뺀다(`accountExhaustionWindows`).
    */
   aggregate: boolean;
 }
