@@ -56,7 +56,7 @@ zeroize = "1"
 # 검증한다. QR은 서버가 SVG로 그려 화면은 `<img>`에 넣기만 한다.
 argon2 = "0.6"
 rand_core = { version = "0.6", features = ["getrandom"] }
-hmac = "0.12"
+hmac = "0.13"
 sha1 = "0.10"
 subtle = "2"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
